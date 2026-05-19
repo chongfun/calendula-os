@@ -1,0 +1,10 @@
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor --ignore-app-descriptor"
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+  # Required to work with portable-atomic for CAS operations on single-core riscv32
+  "--cfg", "portable_atomic_unsafe_assume_single_core",
+]
+
+[build]
+target = "riscv32imc-unknown-none-elf"
