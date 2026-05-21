@@ -530,6 +530,18 @@ fn write_landscape_home_mockups(out: &Path) -> std::io::Result<()> {
             "home-landscape-skeuo-library",
             LandscapeHomeVariant::SkeuoLibrary,
         ),
+        (
+            "home-landscape-ive-pure",
+            LandscapeHomeVariant::IvePure,
+        ),
+        (
+            "home-landscape-ive-glass",
+            LandscapeHomeVariant::IveGlass,
+        ),
+        (
+            "home-landscape-ive-object",
+            LandscapeHomeVariant::IveObject,
+        ),
         ("home-landscape-tabs", LandscapeHomeVariant::Tabs),
         ("home-landscape-book", LandscapeHomeVariant::BookFirst),
     ];
@@ -551,6 +563,9 @@ enum LandscapeHomeVariant {
     SkeuoButtons,
     SkeuoBookplate,
     SkeuoLibrary,
+    IvePure,
+    IveGlass,
+    IveObject,
     Tabs,
     BookFirst,
 }
@@ -565,6 +580,9 @@ fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
         LandscapeHomeVariant::SkeuoButtons => draw_landscape_home_skeuo_buttons(fb),
         LandscapeHomeVariant::SkeuoBookplate => draw_landscape_home_skeuo_bookplate(fb),
         LandscapeHomeVariant::SkeuoLibrary => draw_landscape_home_skeuo_library(fb),
+        LandscapeHomeVariant::IvePure => draw_landscape_home_ive_pure(fb),
+        LandscapeHomeVariant::IveGlass => draw_landscape_home_ive_glass(fb),
+        LandscapeHomeVariant::IveObject => draw_landscape_home_ive_object(fb),
         LandscapeHomeVariant::Tabs => draw_landscape_home_tabs(fb),
         LandscapeHomeVariant::BookFirst => draw_landscape_home_book_first(fb),
     }
@@ -660,6 +678,43 @@ fn draw_landscape_home_skeuo_library(fb: &mut Framebuffer) {
     draw_text_centered(fb, body_font, "Daniel Keyes", 527, 418);
     draw_thin_progress(fb, 474, 446, 106, 420);
     draw_text(fb, body_font, "42%", 592, 454, false);
+}
+
+fn draw_landscape_home_ive_pure(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_ive_action_rail(fb, 56, 86, 204, 300);
+    fill_rect(fb, Rect::new(312, 84, 1, 300), false);
+    draw_cover_art_minimal(fb, 454, 58, 178, 267);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 543, 374);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 543, 404);
+    draw_ive_progress(fb, 496, 438, 94, 420);
+}
+
+fn draw_landscape_home_ive_glass(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_ive_glass_rail(fb, 34, 58, 250, 340);
+    fill_rect(fb, Rect::new(328, 52, 1, 360), false);
+    fill_rect(fb, Rect::new(334, 88, 1, 288), false);
+    draw_cover_art_minimal(fb, 448, 52, 190, 285);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 543, 386);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 543, 416);
+    draw_ive_progress(fb, 488, 450, 110, 420);
+}
+
+fn draw_landscape_home_ive_object(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_ive_action_rail(fb, 50, 104, 176, 264);
+    fill_rect(fb, Rect::new(270, 68, 1, 344), false);
+    draw_cover_art_minimal(fb, 388, 34, 232, 348);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 504, 424);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 504, 454);
+    draw_ive_progress(fb, 654, 206, 78, 420);
 }
 
 fn draw_landscape_home_tabs(fb: &mut Framebuffer) {
@@ -778,6 +833,82 @@ fn draw_spine_actions(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
         );
         fill_rect(fb, Rect::new(x + w - 58, row_y + row_h / 2 - 1, 26, 2), true);
     }
+}
+
+fn draw_ive_action_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        draw_text(
+            fb,
+            font,
+            label,
+            x as i16,
+            row_y as i16 + row_h as i16 / 2 + 8,
+            false,
+        );
+        fill_rect(
+            fb,
+            Rect::new(x + w - 20, row_y + row_h / 2, 20, 1),
+            false,
+        );
+    }
+}
+
+fn draw_ive_glass_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    stroke_rect_direct(fb, x, y, w, h);
+    fill_rect(fb, Rect::new(x + 8, y + 8, w - 16, 1), false);
+    fill_rect(fb, Rect::new(x + 8, y + h - 10, w - 16, 1), false);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        if index > 0 {
+            fill_rect(fb, Rect::new(x + 22, row_y, w - 44, 1), false);
+        }
+        draw_text(
+            fb,
+            font,
+            label,
+            x as i16 + 32,
+            row_y as i16 + row_h as i16 / 2 + 8,
+            false,
+        );
+        fill_rect(
+            fb,
+            Rect::new(x + w - 48, row_y + row_h / 2, 24, 1),
+            false,
+        );
+    }
+}
+
+fn draw_cover_art_minimal(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    stroke_rect_direct(fb, x, y, w, h);
+    fill_rect(fb, Rect::new(x + 12, y + 14, w - 24, 1), false);
+    fill_rect(fb, Rect::new(x + 22, y + 44, w - 44, 2), false);
+    fill_rect(fb, Rect::new(x + 32, y + 72, w - 64, 1), false);
+    for row in 0..6 {
+        let yy = y + 108 + row * 22;
+        let inset = 26 + (row % 2) * 12;
+        fill_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 2), false);
+    }
+    fill_rect(fb, Rect::new(x + 26, y + h - 40, w - 52, 1), false);
+}
+
+fn draw_battery_landscape_minimal(fb: &mut Framebuffer, x: u16, y: u16, percent: u8) {
+    stroke_rect_direct(fb, x, y, 38, 16);
+    fill_rect(fb, Rect::new(x + 38, y + 5, 3, 6), false);
+    let fill_w = ((percent.min(100) as u16 * 30) / 100).max(1);
+    fill_rect(fb, Rect::new(x + 4, y + 4, fill_w, 8), false);
+}
+
+fn draw_ive_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u16) {
+    fill_rect(fb, Rect::new(x, y, w, 1), false);
+    let fill_w = ((w as u32 * permille.min(1000) as u32) / 1000) as u16;
+    fill_rect(fb, Rect::new(x, y.saturating_sub(1), fill_w.max(1), 3), false);
 }
 
 fn draw_paper_panel(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
