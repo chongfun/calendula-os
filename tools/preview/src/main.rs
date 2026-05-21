@@ -554,6 +554,18 @@ fn write_landscape_home_mockups(out: &Path) -> std::io::Result<()> {
             "home-landscape-hybrid-slab",
             LandscapeHomeVariant::HybridSlab,
         ),
+        (
+            "home-landscape-affordance-edge",
+            LandscapeHomeVariant::AffordanceEdge,
+        ),
+        (
+            "home-landscape-affordance-connectors",
+            LandscapeHomeVariant::AffordanceConnectors,
+        ),
+        (
+            "home-landscape-affordance-dock",
+            LandscapeHomeVariant::AffordanceDock,
+        ),
         ("home-landscape-tabs", LandscapeHomeVariant::Tabs),
         ("home-landscape-book", LandscapeHomeVariant::BookFirst),
     ];
@@ -581,6 +593,9 @@ enum LandscapeHomeVariant {
     HybridSoft,
     HybridWells,
     HybridSlab,
+    AffordanceEdge,
+    AffordanceConnectors,
+    AffordanceDock,
     Tabs,
     BookFirst,
 }
@@ -601,6 +616,11 @@ fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
         LandscapeHomeVariant::HybridSoft => draw_landscape_home_hybrid_soft(fb),
         LandscapeHomeVariant::HybridWells => draw_landscape_home_hybrid_wells(fb),
         LandscapeHomeVariant::HybridSlab => draw_landscape_home_hybrid_slab(fb),
+        LandscapeHomeVariant::AffordanceEdge => draw_landscape_home_affordance_edge(fb),
+        LandscapeHomeVariant::AffordanceConnectors => {
+            draw_landscape_home_affordance_connectors(fb);
+        }
+        LandscapeHomeVariant::AffordanceDock => draw_landscape_home_affordance_dock(fb),
         LandscapeHomeVariant::Tabs => draw_landscape_home_tabs(fb),
         LandscapeHomeVariant::BookFirst => draw_landscape_home_book_first(fb),
     }
@@ -770,6 +790,42 @@ fn draw_landscape_home_hybrid_slab(fb: &mut Framebuffer) {
     draw_text_centered(fb, title_font, "Flowers for Algernon", 548, 398);
     draw_text_centered(fb, body_font, "Daniel Keyes", 548, 428);
     draw_ive_progress(fb, 496, 458, 104, 420);
+}
+
+fn draw_landscape_home_affordance_edge(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_affordance_edge_rail(fb, 32, 58, 252, 340);
+    fill_rect(fb, Rect::new(326, 52, 1, 360), false);
+    draw_cover_art_minimal(fb, 448, 50, 196, 294);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 546, 390);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 546, 420);
+    draw_ive_progress(fb, 490, 452, 112, 420);
+}
+
+fn draw_landscape_home_affordance_connectors(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_affordance_connector_rail(fb, 26, 64, 258, 328);
+    fill_rect(fb, Rect::new(326, 58, 1, 348), false);
+    draw_cover_art_minimal(fb, 448, 50, 196, 294);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 546, 390);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 546, 420);
+    draw_ive_progress(fb, 490, 452, 112, 420);
+}
+
+fn draw_landscape_home_affordance_dock(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_affordance_dock_rail(fb, 28, 56, 258, 344);
+    fill_rect(fb, Rect::new(328, 52, 1, 360), false);
+    draw_cover_art_minimal(fb, 448, 50, 196, 294);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 546, 390);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 546, 420);
+    draw_ive_progress(fb, 490, 452, 112, 420);
 }
 
 fn draw_landscape_home_tabs(fb: &mut Framebuffer) {
@@ -1004,6 +1060,77 @@ fn draw_hybrid_slab_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
         );
         draw_mini_recess(fb, x + w - 52, row_y + row_h / 2 - 9, 30, 18);
     }
+}
+
+fn draw_affordance_edge_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    stroke_rect_direct(fb, x, y, w, h);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        if index > 0 {
+            fill_rect(fb, Rect::new(x + 28, row_y, w - 56, 1), false);
+        }
+        draw_edge_button_mark(fb, x + 8, row_y + row_h / 2 - 18);
+        draw_text(
+            fb,
+            font,
+            label,
+            x as i16 + 54,
+            row_y as i16 + row_h as i16 / 2 + 8,
+            false,
+        );
+        fill_rect(
+            fb,
+            Rect::new(x + w - 42, row_y + row_h / 2, 24, 1),
+            false,
+        );
+    }
+}
+
+fn draw_affordance_connector_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        let center_y = row_y + row_h / 2;
+        draw_edge_button_mark(fb, x, center_y - 18);
+        fill_rect(fb, Rect::new(x + 34, center_y, 34, 1), false);
+        fill_rect(fb, Rect::new(x + 68, center_y - 10, 1, 20), false);
+        draw_text(fb, font, label, x as i16 + 86, center_y as i16 + 8, false);
+        draw_mini_recess(fb, x + w - 38, center_y - 9, 30, 18);
+    }
+}
+
+fn draw_affordance_dock_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    draw_soft_slot(fb, x, y, w, h);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        let center_y = row_y + row_h / 2;
+        if index > 0 {
+            fill_rect(fb, Rect::new(x + 22, row_y, w - 44, 1), false);
+        }
+        draw_left_dock_notch(fb, x + 8, center_y - 14);
+        draw_text(fb, font, label, x as i16 + 44, center_y as i16 + 8, false);
+        draw_mini_recess(fb, x + w - 48, center_y - 9, 30, 18);
+    }
+}
+
+fn draw_edge_button_mark(fb: &mut Framebuffer, x: u16, y: u16) {
+    stroke_rect_direct(fb, x, y, 28, 36);
+    fill_rect(fb, Rect::new(x + 5, y + 8, 18, 2), false);
+    fill_rect(fb, Rect::new(x + 5, y + 26, 18, 1), false);
+}
+
+fn draw_left_dock_notch(fb: &mut Framebuffer, x: u16, y: u16) {
+    fill_rect(fb, Rect::new(x, y, 3, 28), false);
+    fill_rect(fb, Rect::new(x + 6, y + 5, 1, 18), false);
+    fill_rect(fb, Rect::new(x + 6, y + 14, 18, 1), false);
 }
 
 fn draw_soft_slot(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
