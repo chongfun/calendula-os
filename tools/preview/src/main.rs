@@ -518,6 +518,18 @@ fn write_landscape_home_mockups(out: &Path) -> std::io::Result<()> {
             "home-landscape-rail-hardware",
             LandscapeHomeVariant::RailHardware,
         ),
+        (
+            "home-landscape-skeuo-buttons",
+            LandscapeHomeVariant::SkeuoButtons,
+        ),
+        (
+            "home-landscape-skeuo-bookplate",
+            LandscapeHomeVariant::SkeuoBookplate,
+        ),
+        (
+            "home-landscape-skeuo-library",
+            LandscapeHomeVariant::SkeuoLibrary,
+        ),
         ("home-landscape-tabs", LandscapeHomeVariant::Tabs),
         ("home-landscape-book", LandscapeHomeVariant::BookFirst),
     ];
@@ -536,6 +548,9 @@ enum LandscapeHomeVariant {
     RailQuiet,
     RailCover,
     RailHardware,
+    SkeuoButtons,
+    SkeuoBookplate,
+    SkeuoLibrary,
     Tabs,
     BookFirst,
 }
@@ -547,6 +562,9 @@ fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
         LandscapeHomeVariant::RailQuiet => draw_landscape_home_rail_quiet(fb),
         LandscapeHomeVariant::RailCover => draw_landscape_home_rail_cover(fb),
         LandscapeHomeVariant::RailHardware => draw_landscape_home_rail_hardware(fb),
+        LandscapeHomeVariant::SkeuoButtons => draw_landscape_home_skeuo_buttons(fb),
+        LandscapeHomeVariant::SkeuoBookplate => draw_landscape_home_skeuo_bookplate(fb),
+        LandscapeHomeVariant::SkeuoLibrary => draw_landscape_home_skeuo_library(fb),
         LandscapeHomeVariant::Tabs => draw_landscape_home_tabs(fb),
         LandscapeHomeVariant::BookFirst => draw_landscape_home_book_first(fb),
     }
@@ -603,6 +621,45 @@ fn draw_landscape_home_rail_hardware(fb: &mut Framebuffer) {
     draw_text_centered(fb, body_font, "Daniel Keyes", 547, 418);
     draw_thin_progress(fb, 492, 448, 110, 420);
     draw_text(fb, body_font, "42%", 614, 456, false);
+}
+
+fn draw_landscape_home_skeuo_buttons(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape(fb, 724, 22, 82);
+    draw_skeuo_button_stack(fb, 26, 52, 246, 352);
+    draw_paper_gutter(fb, 308, 34, 392);
+    draw_cover_art_skeuo(fb, 426, 46, 208, 312);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 530, 394);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 530, 424);
+    draw_thin_progress(fb, 474, 452, 112, 420);
+    draw_text(fb, body_font, "42%", 598, 460, false);
+}
+
+fn draw_landscape_home_skeuo_bookplate(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape(fb, 724, 22, 82);
+    draw_paper_panel(fb, 20, 44, 270, 364);
+    draw_bookplate_actions(fb, 42, 82, 226);
+    draw_cover_art_skeuo(fb, 424, 34, 224, 336);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 536, 412);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 536, 442);
+    draw_thin_progress(fb, 662, 214, 70, 420);
+    draw_text(fb, body_font, "42%", 672, 248, false);
+}
+
+fn draw_landscape_home_skeuo_library(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape(fb, 724, 22, 82);
+    draw_spine_actions(fb, 18, 42, 274, 386);
+    draw_paper_gutter(fb, 326, 36, 400);
+    draw_cover_art_skeuo(fb, 430, 56, 194, 291);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 527, 388);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 527, 418);
+    draw_thin_progress(fb, 474, 446, 106, 420);
+    draw_text(fb, body_font, "42%", 592, 454, false);
 }
 
 fn draw_landscape_home_tabs(fb: &mut Framebuffer) {
@@ -676,6 +733,78 @@ fn draw_landscape_action_stack_hardware(
             selected_row,
         );
     }
+}
+
+fn draw_skeuo_button_stack(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        draw_recessed_slot(fb, x, row_y + 6, w, row_h - 16);
+        draw_text(fb, font, label, x as i16 + 26, row_y as i16 + row_h as i16 / 2 + 7, false);
+        draw_button_well(fb, x + w - 44, row_y + row_h / 2 - 11);
+    }
+}
+
+fn draw_bookplate_actions(fb: &mut Framebuffer, x: u16, y: u16, w: u16) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * 72;
+        fill_rect(fb, Rect::new(x + 8, row_y, w - 16, 1), false);
+        draw_text(fb, font, label, x as i16 + 26, row_y as i16 + 42, false);
+        draw_button_well(fb, x + w - 48, row_y + 22);
+    }
+    fill_rect(fb, Rect::new(x + 8, y + 288, w - 16, 1), false);
+}
+
+fn draw_spine_actions(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        fill_rect(fb, Rect::new(x + 8, row_y + 4, w - 24, row_h - 12), false);
+        stroke_rect_direct(fb, x + 12, row_y + 8, w - 32, row_h - 20);
+        fill_rect(fb, Rect::new(x + 24, row_y + 12, 1, row_h - 28), true);
+        draw_text(
+            fb,
+            font,
+            label,
+            x as i16 + 44,
+            row_y as i16 + row_h as i16 / 2 + 7,
+            true,
+        );
+        fill_rect(fb, Rect::new(x + w - 58, row_y + row_h / 2 - 1, 26, 2), true);
+    }
+}
+
+fn draw_paper_panel(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    stroke_rect_direct(fb, x, y, w, h);
+    fill_rect(fb, Rect::new(x + 6, y + 6, w - 12, 1), false);
+    fill_rect(fb, Rect::new(x + 6, y + h - 8, w - 12, 1), false);
+    for inset in [18, 22, 26] {
+        fill_rect(fb, Rect::new(x + inset, y + 18, 1, h - 36), false);
+    }
+}
+
+fn draw_paper_gutter(fb: &mut Framebuffer, x: u16, y: u16, h: u16) {
+    fill_rect(fb, Rect::new(x, y, 1, h), false);
+    fill_rect(fb, Rect::new(x + 5, y + 16, 1, h - 32), false);
+}
+
+fn draw_recessed_slot(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    stroke_rect_direct(fb, x, y, w, h);
+    fill_rect(fb, Rect::new(x + 4, y + 4, w - 8, 1), false);
+    fill_rect(fb, Rect::new(x + 4, y + h - 6, w - 8, 2), false);
+    fill_rect(fb, Rect::new(x + 8, y + 8, 1, h - 16), false);
+}
+
+fn draw_button_well(fb: &mut Framebuffer, x: u16, y: u16) {
+    stroke_rect_direct(fb, x, y, 28, 22);
+    fill_rect(fb, Rect::new(x + 5, y + 6, 18, 2), false);
+    fill_rect(fb, Rect::new(x + 5, y + 14, 18, 1), false);
 }
 
 fn draw_landscape_home_book_first(fb: &mut Framebuffer) {
@@ -763,6 +892,30 @@ fn draw_cover_art(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
         "ALGERNON",
         x as usize + 42,
         y as usize + h as usize - 40,
+        false,
+    );
+}
+
+fn draw_cover_art_skeuo(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    fill_rect(fb, Rect::new(x + 8, y + 8, w, h), false);
+    fill_rect(fb, Rect::new(x + 9, y + 9, w - 2, h - 2), true);
+    stroke_rect_direct(fb, x, y, w, h);
+    stroke_rect_direct(fb, x + 8, y + 8, w - 16, h - 16);
+    fill_rect(fb, Rect::new(x + 18, y + 22, 2, h - 44), false);
+    fill_rect(fb, Rect::new(x + 30, y + 36, w - 60, 3), false);
+    fill_rect(fb, Rect::new(x + 30, y + 66, w - 60, 1), false);
+    for row in 0..7 {
+        let yy = y + 104 + row * 22;
+        let inset = 32 + (row % 2) * 16;
+        fill_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 3), false);
+    }
+    fill_rect(fb, Rect::new(x + 34, y + h - 56, w - 68, 2), false);
+    draw_ascii(fb, "FLOWERS", x as usize + 50, y as usize + 46, false);
+    draw_ascii(
+        fb,
+        "ALGERNON",
+        x as usize + 44,
+        y as usize + h as usize - 38,
         false,
     );
 }
