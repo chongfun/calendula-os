@@ -512,6 +512,12 @@ fn write_static_previews(out: &Path) -> std::io::Result<()> {
 fn write_landscape_home_mockups(out: &Path) -> std::io::Result<()> {
     let variants = [
         ("home-landscape-rail", LandscapeHomeVariant::Rail),
+        ("home-landscape-rail-quiet", LandscapeHomeVariant::RailQuiet),
+        ("home-landscape-rail-cover", LandscapeHomeVariant::RailCover),
+        (
+            "home-landscape-rail-hardware",
+            LandscapeHomeVariant::RailHardware,
+        ),
         ("home-landscape-tabs", LandscapeHomeVariant::Tabs),
         ("home-landscape-book", LandscapeHomeVariant::BookFirst),
     ];
@@ -527,6 +533,9 @@ fn write_landscape_home_mockups(out: &Path) -> std::io::Result<()> {
 #[derive(Clone, Copy)]
 enum LandscapeHomeVariant {
     Rail,
+    RailQuiet,
+    RailCover,
+    RailHardware,
     Tabs,
     BookFirst,
 }
@@ -535,6 +544,9 @@ fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
     fb.clear(true);
     match variant {
         LandscapeHomeVariant::Rail => draw_landscape_home_rail(fb),
+        LandscapeHomeVariant::RailQuiet => draw_landscape_home_rail_quiet(fb),
+        LandscapeHomeVariant::RailCover => draw_landscape_home_rail_cover(fb),
+        LandscapeHomeVariant::RailHardware => draw_landscape_home_rail_hardware(fb),
         LandscapeHomeVariant::Tabs => draw_landscape_home_tabs(fb),
         LandscapeHomeVariant::BookFirst => draw_landscape_home_book_first(fb),
     }
@@ -554,6 +566,45 @@ fn draw_landscape_home_rail(fb: &mut Framebuffer) {
     draw_text(fb, small_font, "42%", 612, 450, false);
 }
 
+fn draw_landscape_home_rail_quiet(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape(fb, 724, 22, 82);
+    draw_landscape_action_stack_quiet(fb, 34, 62, 224, 332, 0);
+    fill_rect(fb, Rect::new(292, 54, 1, 360), false);
+    draw_cover_art(fb, 438, 44, 194, 290);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 535, 376);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 535, 406);
+    draw_thin_progress(fb, 480, 438, 112, 420);
+    draw_text(fb, body_font, "42%", 604, 446, false);
+}
+
+fn draw_landscape_home_rail_cover(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape(fb, 724, 22, 82);
+    draw_landscape_action_stack_quiet(fb, 26, 74, 202, 308, 0);
+    fill_rect(fb, Rect::new(260, 42, 1, 390), false);
+    draw_cover_art(fb, 376, 28, 236, 354);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 494, 420);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 494, 450);
+    draw_thin_progress(fb, 642, 206, 90, 420);
+    draw_text(fb, body_font, "42%", 666, 238, false);
+}
+
+fn draw_landscape_home_rail_hardware(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape(fb, 724, 22, 82);
+    draw_landscape_action_stack_hardware(fb, 20, 36, 266, 396, 0);
+    fill_rect(fb, Rect::new(320, 28, 1, 424), false);
+    draw_cover_art(fb, 444, 42, 206, 308);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 547, 388);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 547, 418);
+    draw_thin_progress(fb, 492, 448, 110, 420);
+    draw_text(fb, body_font, "42%", 614, 456, false);
+}
+
 fn draw_landscape_home_tabs(fb: &mut Framebuffer) {
     let title_font = literata(FontStyle::Bold);
     let body_font = literata(FontStyle::Regular);
@@ -567,6 +618,64 @@ fn draw_landscape_home_tabs(fb: &mut Framebuffer) {
     draw_text(fb, body_font, "Current book", 58, 238, false);
     draw_text(fb, body_font, "Chapter 7", 58, 272, false);
     draw_bottom_tabs(fb, 16, 416, 768, 52, 0);
+}
+
+fn draw_landscape_action_stack_quiet(
+    fb: &mut Framebuffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    selected: usize,
+) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        if index == selected {
+            fill_rect(fb, Rect::new(x, row_y + row_h - 8, w, 3), false);
+            fill_rect(fb, Rect::new(x, row_y + 12, 4, row_h - 26), false);
+        }
+        let text_x = x as i16 + 22;
+        let text_y = row_y as i16 + row_h as i16 / 2 + 8;
+        draw_text(fb, font, label, text_x, text_y, false);
+        fill_rect(
+            fb,
+            Rect::new(x + w - 34, row_y + row_h / 2 - 1, 24, 2),
+            false,
+        );
+    }
+}
+
+fn draw_landscape_action_stack_hardware(
+    fb: &mut Framebuffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    selected: usize,
+) {
+    let labels = ["Read", "Files", "Sync", "Settings"];
+    let font = literata(FontStyle::Regular);
+    let row_h = h / labels.len() as u16;
+    for (index, label) in labels.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        let selected_row = index == selected;
+        if selected_row {
+            fill_rect(fb, Rect::new(x, row_y, w, row_h - 6), false);
+        } else {
+            stroke_rect_direct(fb, x, row_y, w, row_h - 6);
+        }
+        let text_x = x as i16 + 28;
+        let text_y = row_y as i16 + row_h as i16 / 2 + 7;
+        draw_text(fb, font, label, text_x, text_y, selected_row);
+        fill_rect(
+            fb,
+            Rect::new(x + w - 40, row_y + row_h / 2 - 1, 24, 2),
+            selected_row,
+        );
+    }
 }
 
 fn draw_landscape_home_book_first(fb: &mut Framebuffer) {
