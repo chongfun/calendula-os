@@ -32,7 +32,7 @@ Current code status:
 | Deep sleep | Timer wake + display-sleep handshake present, GPIO wake pending |
 | Partial refresh | Deferred; full-screen fast refresh present |
 | NVM progress | Deferred |
-| Storage / EPUB / Wi-Fi | EPUB stream reader and SD pins/dependency present; physical FAT scanning still pending |
+| Storage / EPUB / Wi-Fi | EPUB stream reader, FAT scan, `/books` then card-root discovery, and selected-book preview loading present; Wi-Fi still pending |
 | Typography | Literata Latin-1 bitmap assets generated; Reading uses Literata for demo text |
 
 ## Phase 2: measured board support
@@ -76,14 +76,17 @@ Current code status:
   `ReadAt` interface, so EPUBs no longer need to fit in memory.
 - `proto::text` defines Literata/Bookerly-ready font/style roles and a
   deterministic one-screen paginator over bounded styled runs.
-- Firmware Files/Home/Reading now consume the shared catalog model. The current
-  in-flash demo book is a placeholder source until the SD bus is wired.
+- `proto::cache` defines bounded binary cache records for book, TOC, section,
+  page, line, word, and block data.
+- Firmware Files/Home/Reading now consume the shared catalog/cache model through
+  the refactored `ReaderStore`. The current in-flash demo book remains a
+  fallback source while SD EPUB loading is hardened.
 - X4 SD pins are configured on the shared SPI bus: SCK GPIO8, MOSI GPIO10, MISO
   GPIO7, SD CS GPIO12. `embedded-sdmmc` is present with default features
   disabled.
-- Next: finish the single board-I/O owner for serialized EPD and SD
-  transactions, scan `/books` first then card root, and open selected EPUBs
-  through the parser path.
+- The display task remains the single runtime coordinator for serialized EPD and
+  SD transactions, while SD discovery, EPUB cache construction, reader layout,
+  view drawing, and EPD flushing now live in deeper `fw` modules.
 
 ## Phase 4b: typography and preview
 

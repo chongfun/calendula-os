@@ -8,3 +8,6 @@ publish = false
 
 [dependencies]
 display = { path = "../../display" }
+proto = { path = "../../proto" }
+ui = { path = "../../ui" }
+png = "0.17"

@@ -28,7 +28,7 @@ display/   framebuffer, drawing primitives, SSD1677 constants and address math
 hal-ext/   thin async wrappers over ESP HAL peripherals
 fw/        boot, Embassy executor, task wiring, board-owned peripherals
 ui/        bounded layout data structures for later UI work
-proto/     bounded book/storage/text models plus ZIP/EPUB/XHTML parser pieces
+proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
 ```
 
 ## Embassy tasks
@@ -132,8 +132,8 @@ flash bytes -> zip entry -> inflate window -> XML token -> line box -> glyph bli
 No DOM, no `Vec<Node>`, no retained chapter tree unless measurements prove it is
 worth the memory.
 
-`proto` owns the reader data contracts shared by Home, Files, Reading, and
-Chapters:
+`proto` owns the reader data contracts shared by Home, Files, Reading, Chapters,
+and the host preview tool:
 
 - `BookMeta`, `BookProgress`, and `ChapterMeta` for catalog and progress data.
 - `BookStorage` and `FileCandidate` for microSD-backed `.epub` discovery.
@@ -144,12 +144,16 @@ Chapters:
 - `EpubPackage` for container/OPF metadata, manifest, and spine.
 - `TextRun`, `TextRole`, `FontStyle`, and `paginate_screen` for text-only XHTML
   reading and deterministic one-screen pagination.
+- `BookCacheHeader`, `SectionHeader`, `PageCacheHeader`, `TocRecord`,
+  `PageRecord`, `LineRecord`, `WordRecord`, and `BlockRecord` for bounded binary
+  cache records used by firmware and preview pagination.
 
-The firmware still ships one built-in catalog entry while the physical microSD
-FAT scanner is finished. The X4 SD pins are configured on the shared SPI bus
-(SCK GPIO8, MOSI GPIO10, MISO GPIO7, SD CS GPIO12), but real SD transactions are
-kept behind the pending single board-I/O owner so display refresh and SD reads
-cannot overlap.
+The firmware still ships one built-in catalog entry as a fallback, but the
+display task now also owns the shared SPI bus while it scans FAT16/FAT32
+microSD cards for EPUBs under `/books` and then the card root. X4 SD pins are
+configured on the shared SPI bus (SCK GPIO8, MOSI GPIO10, MISO GPIO7, SD CS
+GPIO12). SD transactions and display refreshes remain serialized by that single
+board-I/O owner.
 
 Reading typography uses generated Literata bitmap assets. The host generator
 downloads OFL Literata TTFs and emits Latin-1 glyph metrics/bitmaps for Regular,
@@ -176,9 +180,43 @@ small battery percentage because it is a status surface. GPIO0 is sampled as the
 current rough battery source using a 2:1 divider assumption and a simple
 3300-4200 mV LiPo percentage curve. The current book is a built-in catalog entry
 backed by static text pages. Real EPUB support now has parser/storage contracts
-in `proto`; the next hardware step is FAT scanning on microSD, filling
-`BookMeta` from `/books/*.epub`, then opening the selected EPUB into the same
-current book id, chapter index, and screen offset fields.
+in `proto`; the current firmware path scans the card and opens a selected EPUB
+into the same current book id, chapter index, and screen offset fields. The next
+cleanup step is to move the SD catalog/cache owner out of the display renderer
+without letting display refresh and SD reads overlap.
+
+## Current module map
+
+`fw/src/tasks/display.rs` is intentionally the only task touching the EPD bus and
+coordinating SD access. It is now the orchestration layer:
+
+```text
+display task orchestration
+  receives DisplayCommand
+  triggers SD scan and EPUB cache loading when needed
+  calls view rendering into the framebuffer
+  selects refresh mode
+  flushes or sleeps the panel
+  publishes display/power/library events
+```
+
+The deeper modules keep implementation complexity behind narrow data-oriented
+interfaces:
+
+```text
+fw::display_flush  SSD1677 init, RAM streaming, sleep, and byte transforms
+fw::library_sd     FAT scan, SD chip-select handling, and file discovery
+fw::reader_cache   EPUB-to-cache loading into bounded proto::cache records
+fw::reader_layout  page indexing, line wrapping, style markers, measurements
+fw::reader_store   bounded loaded-book/library state shared by cache and views
+fw::views          Home/Files/Reading/Chapters/Settings drawing
+fw::tasks::display task loop, refresh policy, and event publishing
+```
+
+Do not split this by moving bus access into a second task unless there is also a
+proper request/response protocol for the shared SPI bus. The current invariant
+that display refresh and SD reads cannot overlap is more important than file
+size.
 
 Persistent app state is represented by `hal_ext::nvm::AppStateRecord`, a compact
 versioned/checksummed record for book id, chapter, rendered screen, shell

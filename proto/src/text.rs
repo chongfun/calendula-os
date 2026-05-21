@@ -23,15 +23,66 @@ pub enum TextRole {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Justify,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextRun<'a> {
     pub text: &'a str,
     pub role: TextRole,
     pub style: FontStyle,
+    pub align: TextAlign,
 }
 
 impl<'a> TextRun<'a> {
     pub const fn new(text: &'a str, role: TextRole, style: FontStyle) -> Self {
-        Self { text, role, style }
+        Self {
+            text,
+            role,
+            style,
+            align: TextAlign::Left,
+        }
+    }
+
+    pub const fn aligned(
+        text: &'a str,
+        role: TextRole,
+        style: FontStyle,
+        align: TextAlign,
+    ) -> Self {
+        Self {
+            text,
+            role,
+            style,
+            align,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextBlock<const N: usize> {
+    pub text: heapless::String<N>,
+    pub role: TextRole,
+    pub style: FontStyle,
+    pub align: TextAlign,
+}
+
+impl<const N: usize> TextBlock<N> {
+    pub const fn new(
+        text: heapless::String<N>,
+        role: TextRole,
+        style: FontStyle,
+        align: TextAlign,
+    ) -> Self {
+        Self {
+            text,
+            role,
+            style,
+            align,
+        }
     }
 }
 

@@ -20,8 +20,7 @@ pub struct GlyphMetric {
 }
 
 pub struct BitmapFont {
-    pub first: u16,
-    pub last: u16,
+    pub codepoints: &'static [u16],
     pub line_height: u8,
     pub baseline: u8,
     pub metrics: &'static [GlyphMetric],
@@ -30,10 +29,7 @@ pub struct BitmapFont {
 
 impl BitmapFont {
     pub fn glyph(&self, codepoint: u16) -> Option<(&GlyphMetric, &'static [u8])> {
-        if codepoint < self.first || codepoint > self.last {
-            return None;
-        }
-        let index = (codepoint - self.first) as usize;
+        let index = self.codepoints.binary_search(&codepoint).ok()?;
         let metric = self.metrics.get(index)?;
         Some((
             metric,
@@ -130,7 +126,14 @@ pub fn draw_text_mirrored_y_glyphs(
 pub fn measure_text(font: &BitmapFont, text: &str) -> u16 {
     text.chars()
         .map(|ch| {
-            font.glyph(ch as u16)
+            let codepoint = ch as u32;
+            if codepoint > u16::MAX as u32 {
+                return font
+                    .glyph(b'?' as u16)
+                    .map(|(m, _)| m.advance as u16)
+                    .unwrap_or(8);
+            }
+            font.glyph(codepoint as u16)
                 .map(|(metric, _)| metric.advance as u16)
                 .unwrap_or(
                     font.glyph(b'?' as u16)

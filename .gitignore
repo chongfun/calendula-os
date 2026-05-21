@@ -5,3 +5,4 @@ Cargo.lock.bak
 .antigravitycli/
 .claude/
 /tools/fonts/
+.venv-font/

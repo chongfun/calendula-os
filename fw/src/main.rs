@@ -64,7 +64,13 @@ use static_cell::StaticCell;
 use tasks::input::InputPins;
 
 pub mod catalog;
+mod display_flush;
+mod library_sd;
+mod reader_cache;
+mod reader_layout;
+mod reader_store;
 pub mod tasks;
+mod views;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
@@ -151,7 +157,19 @@ pub enum DisplayEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibraryEvent {
-    Scanned { count: u8 },
+    Scanned {
+        count: u8,
+    },
+    Loaded {
+        book_id: u32,
+        pages: u32,
+        chapters: u8,
+    },
+    ChapterPage {
+        book_id: u32,
+        chapter: u8,
+        page: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,7 +183,7 @@ pub enum PowerEvent {
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
 pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 1> = Channel::new();
 pub static DISPLAY_EVENTS: Channel<CriticalSectionRawMutex, DisplayEvent, 4> = Channel::new();
-pub static LIBRARY_EVENTS: Channel<CriticalSectionRawMutex, LibraryEvent, 4> = Channel::new();
+pub static LIBRARY_EVENTS: Channel<CriticalSectionRawMutex, LibraryEvent, 64> = Channel::new();
 pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Channel::new();
 
 #[panic_handler]

@@ -8,6 +8,7 @@ use embassy_futures::select::{select3, Either3};
 use hal_ext::nvm::AppStateRecord;
 
 const SETTINGS_ITEMS: u8 = 3;
+const MAX_SD_CHAPTERS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReaderState {
@@ -25,6 +26,9 @@ struct ReaderState {
     battery_mv: u16,
     battery_percent: u8,
     library_count: u8,
+    sd_page_count: u32,
+    sd_chapter_count: u8,
+    sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     dirty: Rect,
 }
 
@@ -36,7 +40,7 @@ impl ReaderState {
             selection: 0,
             chapter: 0,
             book_id: 1,
-            orientation: DisplayOrientation::LandscapeButtonsTop,
+            orientation: DisplayOrientation::LandscapeButtonsBottom,
             refresh_policy: RefreshPolicy::FullOnWake,
             last_button: None,
             aux_raw: 0,
@@ -45,6 +49,9 @@ impl ReaderState {
             battery_mv: 0,
             battery_percent: 100,
             library_count: 0,
+            sd_page_count: 1,
+            sd_chapter_count: 1,
+            sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             dirty: Rect::FULL,
         }
     }
@@ -100,6 +107,9 @@ impl ReaderState {
                     next.chapter = 0;
                     next.selection = 0;
                     next.page = 0;
+                    next.sd_page_count = 1;
+                    next.sd_chapter_count = 1;
+                    next.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
                 } else if let Some(book) = catalog::book_at(self.selection as usize) {
                     next.book_id = book.id.0;
                     next.view = AppView::Reading;
@@ -112,18 +122,44 @@ impl ReaderState {
             }
 
             (AppView::Reading, Some(Button::Next)) => {
-                next.chapter = wrap_next(self.chapter, catalog::chapter_count());
-                next.selection = next.chapter;
-                next.page = 0;
+                if self.book_id >= 2 {
+                    if self.page + 1 < self.sd_page_count {
+                        next.page = self.page + 1;
+                    } else if self.chapter + 1 < self.sd_chapter_count {
+                        next.chapter = self.chapter + 1;
+                        next.selection = next.chapter;
+                        next.page = 0;
+                    } else {
+                        next.page = self.sd_page_count.saturating_sub(1);
+                    }
+                } else {
+                    next.chapter = wrap_next(self.chapter, catalog::chapter_count());
+                    next.selection = next.chapter;
+                    next.page = 0;
+                }
             }
             (AppView::Reading, Some(Button::Previous)) => {
-                next.chapter = wrap_prev(self.chapter, catalog::chapter_count());
-                next.selection = next.chapter;
-                next.page = 0;
+                if self.book_id >= 2 {
+                    if self.page > 0 {
+                        next.page = self.page - 1;
+                    } else if self.chapter > 0 {
+                        next.chapter = self.chapter - 1;
+                        next.selection = next.chapter;
+                        next.page = 0;
+                    }
+                } else {
+                    next.chapter = wrap_prev(self.chapter, catalog::chapter_count());
+                    next.selection = next.chapter;
+                    next.page = 0;
+                }
             }
             (AppView::Reading, Some(Button::Confirm)) => {
                 next.view = AppView::Chapters;
-                next.selection = self.chapter;
+                next.selection = if self.book_id >= 2 {
+                    self.sd_chapter_for_page(self.page)
+                } else {
+                    self.chapter
+                };
             }
             (AppView::Reading, Some(Button::Back)) => {
                 next.view = AppView::Home;
@@ -131,10 +167,10 @@ impl ReaderState {
             }
 
             (AppView::Chapters, Some(Button::Next)) => {
-                next.selection = wrap_next(self.selection, catalog::chapter_count());
+                next.selection = wrap_next(self.selection, self.chapter_item_count());
             }
             (AppView::Chapters, Some(Button::Previous)) => {
-                next.selection = wrap_prev(self.selection, catalog::chapter_count());
+                next.selection = wrap_prev(self.selection, self.chapter_item_count());
             }
             (AppView::Chapters, Some(Button::Confirm)) => {
                 next.chapter = self.selection;
@@ -170,14 +206,44 @@ impl ReaderState {
     }
 
     fn apply_library_event(mut self, event: LibraryEvent) -> Self {
-        let LibraryEvent::Scanned { count } = event;
-        self.library_count = count;
-        if self.view == AppView::Library {
-            if count == 0 {
-                self.selection = 0;
-            } else if self.selection >= count {
-                self.selection = count - 1;
+        match event {
+            LibraryEvent::Scanned { count } => {
+                self.library_count = count;
+                if self.view == AppView::Library {
+                    if count == 0 {
+                        self.selection = 0;
+                    } else if self.selection >= count {
+                        self.selection = count - 1;
+                    }
+                    self.dirty = Rect::FULL;
+                }
             }
+            LibraryEvent::Loaded {
+                book_id,
+                pages,
+                chapters,
+            } => {
+                if self.book_id == book_id {
+                    self.sd_page_count = pages.max(1);
+                    self.sd_chapter_count = chapters.max(1);
+                    self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
+                    self.page = self.page.min(self.sd_page_count.saturating_sub(1));
+                    self.dirty = Rect::FULL;
+                }
+            }
+            LibraryEvent::ChapterPage {
+                book_id,
+                chapter,
+                page,
+            } => {
+                if self.book_id == book_id {
+                    if let Some(slot) = self.sd_chapter_pages.get_mut(chapter as usize) {
+                        *slot = page.min(u16::MAX as u32) as u16;
+                    }
+                }
+            }
+        }
+        if self.view == AppView::Library {
             self.dirty = Rect::FULL;
         }
         self
@@ -185,6 +251,26 @@ impl ReaderState {
 
     fn library_item_count(self) -> u8 {
         self.library_count.max(catalog::book_count()).max(1)
+    }
+
+    fn chapter_item_count(self) -> u8 {
+        if self.book_id >= 2 {
+            self.sd_chapter_count.max(1)
+        } else {
+            catalog::chapter_count()
+        }
+    }
+
+    fn sd_chapter_for_page(self, page: u32) -> u8 {
+        let mut selected = 0u8;
+        for index in 0..self.sd_chapter_count.min(MAX_SD_CHAPTERS as u8) {
+            if u32::from(self.sd_chapter_pages[index as usize]) <= page {
+                selected = index;
+            } else {
+                break;
+            }
+        }
+        selected
     }
 
     fn persisted(self) -> AppStateRecord {

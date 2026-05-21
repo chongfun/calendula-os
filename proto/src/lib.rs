@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod book;
+pub mod cache;
 pub mod epub;
 pub mod storage;
 pub mod text;

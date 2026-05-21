@@ -1,0 +1,663 @@
+use crate::text::{FontStyle, TextAlign, TextRole};
+
+pub const CACHE_MAGIC: u32 = 0x5834_5244; // X4RD
+pub const CACHE_VERSION: u16 = 1;
+pub const BOOK_HEADER_BYTES: usize = 16;
+pub const SPINE_RECORD_BYTES: usize = 12;
+pub const TOC_RECORD_BYTES: usize = 24;
+pub const SECTION_HEADER_BYTES: usize = 40;
+pub const PAGE_HEADER_BYTES: usize = 28;
+pub const PAGE_RECORD_BYTES: usize = 4;
+pub const LINE_RECORD_BYTES: usize = 12;
+pub const WORD_RECORD_BYTES: usize = 12;
+pub const BLOCK_RECORD_BYTES: usize = 12;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheError {
+    BufferTooSmall,
+    BadMagic,
+    BadVersion,
+    BadLength,
+    Utf8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookCacheHeader {
+    pub spine_count: u16,
+    pub toc_count: u16,
+    pub string_bytes: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpineRecord {
+    pub href_offset: u32,
+    pub href_len: u16,
+    pub toc_index: i16,
+    pub byte_size: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TocRecord {
+    pub title_offset: u32,
+    pub title_len: u16,
+    pub href_offset: u32,
+    pub href_len: u16,
+    pub anchor_offset: u32,
+    pub anchor_len: u16,
+    pub level: u8,
+    pub spine_index: i16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionHeader {
+    pub page_count: u16,
+    pub block_count: u16,
+    pub line_count: u16,
+    pub word_count: u16,
+    pub text_bytes: u32,
+    pub viewport_width: u16,
+    pub viewport_height: u16,
+    pub font_config: u16,
+    pub bytes_consumed: u32,
+    pub total_bytes: u32,
+    pub partial: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageCacheHeader {
+    pub page_count: u16,
+    pub block_count: u16,
+    pub text_bytes: u32,
+    pub viewport_width: u16,
+    pub viewport_height: u16,
+    pub font_config: u16,
+    pub bytes_consumed: u32,
+    pub partial: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageRecord {
+    pub first_block: u16,
+    pub block_count: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineRecord {
+    pub first_word: u16,
+    pub word_count: u16,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub align: TextAlign,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WordRecord {
+    pub text_offset: u32,
+    pub text_len: u16,
+    pub x: i16,
+    pub width: u16,
+    pub style: FontStyle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockRecord {
+    pub text_offset: u32,
+    pub text_len: u16,
+    pub line_count: u8,
+    pub role: TextRole,
+    pub style: FontStyle,
+    pub align: TextAlign,
+}
+
+pub fn book_cache_size(header: BookCacheHeader) -> usize {
+    BOOK_HEADER_BYTES
+        + header.spine_count as usize * SPINE_RECORD_BYTES
+        + header.toc_count as usize * TOC_RECORD_BYTES
+        + header.string_bytes as usize
+}
+
+pub fn page_cache_size(header: PageCacheHeader) -> usize {
+    PAGE_HEADER_BYTES
+        + header.page_count as usize * PAGE_RECORD_BYTES
+        + header.block_count as usize * BLOCK_RECORD_BYTES
+        + header.text_bytes as usize
+}
+
+pub fn section_cache_size(header: SectionHeader) -> usize {
+    SECTION_HEADER_BYTES
+        + header.page_count as usize * PAGE_RECORD_BYTES
+        + header.block_count as usize * BLOCK_RECORD_BYTES
+        + header.line_count as usize * LINE_RECORD_BYTES
+        + header.word_count as usize * WORD_RECORD_BYTES
+        + header.text_bytes as usize
+}
+
+pub fn encode_book_header(header: BookCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, BOOK_HEADER_BYTES)?;
+    write_u32(out, 0, CACHE_MAGIC);
+    write_u16(out, 4, CACHE_VERSION);
+    write_u16(out, 6, header.spine_count);
+    write_u16(out, 8, header.toc_count);
+    write_u16(out, 10, 0);
+    write_u32(out, 12, header.string_bytes);
+    Ok(BOOK_HEADER_BYTES)
+}
+
+pub fn decode_book_header(input: &[u8]) -> Result<BookCacheHeader, CacheError> {
+    require(input, BOOK_HEADER_BYTES)?;
+    if read_u32(input, 0)? != CACHE_MAGIC {
+        return Err(CacheError::BadMagic);
+    }
+    if read_u16(input, 4)? != CACHE_VERSION {
+        return Err(CacheError::BadVersion);
+    }
+    Ok(BookCacheHeader {
+        spine_count: read_u16(input, 6)?,
+        toc_count: read_u16(input, 8)?,
+        string_bytes: read_u32(input, 12)?,
+    })
+}
+
+pub fn encode_spine(record: SpineRecord, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, SPINE_RECORD_BYTES)?;
+    write_u32(out, 0, record.href_offset);
+    write_u16(out, 4, record.href_len);
+    write_i16(out, 6, record.toc_index);
+    write_u32(out, 8, record.byte_size);
+    Ok(SPINE_RECORD_BYTES)
+}
+
+pub fn decode_spine(input: &[u8]) -> Result<SpineRecord, CacheError> {
+    require(input, SPINE_RECORD_BYTES)?;
+    Ok(SpineRecord {
+        href_offset: read_u32(input, 0)?,
+        href_len: read_u16(input, 4)?,
+        toc_index: read_i16(input, 6)?,
+        byte_size: read_u32(input, 8)?,
+    })
+}
+
+pub fn encode_toc(record: TocRecord, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, TOC_RECORD_BYTES)?;
+    write_u32(out, 0, record.title_offset);
+    write_u16(out, 4, record.title_len);
+    write_u16(out, 6, 0);
+    write_u32(out, 8, record.href_offset);
+    write_u16(out, 12, record.href_len);
+    write_u16(out, 14, 0);
+    write_u32(out, 16, record.anchor_offset);
+    write_u16(out, 20, record.anchor_len);
+    out[22] = record.level;
+    out[23] = 0;
+    write_i16(out, 14, record.spine_index);
+    Ok(TOC_RECORD_BYTES)
+}
+
+pub fn decode_toc(input: &[u8]) -> Result<TocRecord, CacheError> {
+    require(input, TOC_RECORD_BYTES)?;
+    Ok(TocRecord {
+        title_offset: read_u32(input, 0)?,
+        title_len: read_u16(input, 4)?,
+        href_offset: read_u32(input, 8)?,
+        href_len: read_u16(input, 12)?,
+        anchor_offset: read_u32(input, 16)?,
+        anchor_len: read_u16(input, 20)?,
+        level: input[22],
+        spine_index: read_i16(input, 14)?,
+    })
+}
+
+pub fn encode_page_header(header: PageCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, PAGE_HEADER_BYTES)?;
+    write_u32(out, 0, CACHE_MAGIC);
+    write_u16(out, 4, CACHE_VERSION);
+    write_u16(out, 6, header.page_count);
+    write_u16(out, 8, header.block_count);
+    out[10] = header.partial as u8;
+    out[11] = 0;
+    write_u32(out, 12, header.text_bytes);
+    write_u16(out, 16, header.viewport_width);
+    write_u16(out, 18, header.viewport_height);
+    write_u16(out, 20, header.font_config);
+    write_u16(out, 22, 0);
+    write_u32(out, 24, header.bytes_consumed);
+    Ok(PAGE_HEADER_BYTES)
+}
+
+pub fn encode_section_header(header: SectionHeader, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, SECTION_HEADER_BYTES)?;
+    write_u32(out, 0, CACHE_MAGIC);
+    write_u16(out, 4, CACHE_VERSION);
+    write_u16(out, 6, header.page_count);
+    write_u16(out, 8, header.block_count);
+    write_u16(out, 10, header.line_count);
+    write_u16(out, 12, header.word_count);
+    out[14] = header.partial as u8;
+    out[15] = 0;
+    write_u32(out, 16, header.text_bytes);
+    write_u16(out, 20, header.viewport_width);
+    write_u16(out, 22, header.viewport_height);
+    write_u16(out, 24, header.font_config);
+    write_u16(out, 26, 0);
+    write_u32(out, 28, header.bytes_consumed);
+    write_u32(out, 32, header.total_bytes);
+    write_u32(out, 36, 0);
+    Ok(SECTION_HEADER_BYTES)
+}
+
+pub fn decode_section_header(input: &[u8]) -> Result<SectionHeader, CacheError> {
+    require(input, SECTION_HEADER_BYTES)?;
+    if read_u32(input, 0)? != CACHE_MAGIC {
+        return Err(CacheError::BadMagic);
+    }
+    if read_u16(input, 4)? != CACHE_VERSION {
+        return Err(CacheError::BadVersion);
+    }
+    Ok(SectionHeader {
+        page_count: read_u16(input, 6)?,
+        block_count: read_u16(input, 8)?,
+        line_count: read_u16(input, 10)?,
+        word_count: read_u16(input, 12)?,
+        partial: input[14] != 0,
+        text_bytes: read_u32(input, 16)?,
+        viewport_width: read_u16(input, 20)?,
+        viewport_height: read_u16(input, 22)?,
+        font_config: read_u16(input, 24)?,
+        bytes_consumed: read_u32(input, 28)?,
+        total_bytes: read_u32(input, 32)?,
+    })
+}
+
+pub fn decode_page_header(input: &[u8]) -> Result<PageCacheHeader, CacheError> {
+    require(input, PAGE_HEADER_BYTES)?;
+    if read_u32(input, 0)? != CACHE_MAGIC {
+        return Err(CacheError::BadMagic);
+    }
+    if read_u16(input, 4)? != CACHE_VERSION {
+        return Err(CacheError::BadVersion);
+    }
+    Ok(PageCacheHeader {
+        page_count: read_u16(input, 6)?,
+        block_count: read_u16(input, 8)?,
+        partial: input[10] != 0,
+        text_bytes: read_u32(input, 12)?,
+        viewport_width: read_u16(input, 16)?,
+        viewport_height: read_u16(input, 18)?,
+        font_config: read_u16(input, 20)?,
+        bytes_consumed: read_u32(input, 24)?,
+    })
+}
+
+pub fn encode_page(record: PageRecord, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, PAGE_RECORD_BYTES)?;
+    write_u16(out, 0, record.first_block);
+    write_u16(out, 2, record.block_count);
+    Ok(PAGE_RECORD_BYTES)
+}
+
+pub fn decode_page(input: &[u8]) -> Result<PageRecord, CacheError> {
+    require(input, PAGE_RECORD_BYTES)?;
+    Ok(PageRecord {
+        first_block: read_u16(input, 0)?,
+        block_count: read_u16(input, 2)?,
+    })
+}
+
+pub fn encode_line(record: LineRecord, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, LINE_RECORD_BYTES)?;
+    write_u16(out, 0, record.first_word);
+    write_u16(out, 2, record.word_count);
+    write_i16(out, 4, record.x);
+    write_i16(out, 6, record.y);
+    write_u16(out, 8, record.width);
+    out[10] = align_byte(record.align);
+    out[11] = 0;
+    Ok(LINE_RECORD_BYTES)
+}
+
+pub fn decode_line(input: &[u8]) -> Result<LineRecord, CacheError> {
+    require(input, LINE_RECORD_BYTES)?;
+    Ok(LineRecord {
+        first_word: read_u16(input, 0)?,
+        word_count: read_u16(input, 2)?,
+        x: read_i16(input, 4)?,
+        y: read_i16(input, 6)?,
+        width: read_u16(input, 8)?,
+        align: align_from_byte(input[10])?,
+    })
+}
+
+pub fn encode_word(record: WordRecord, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, WORD_RECORD_BYTES)?;
+    write_u32(out, 0, record.text_offset);
+    write_u16(out, 4, record.text_len);
+    write_i16(out, 6, record.x);
+    write_u16(out, 8, record.width);
+    out[10] = style_byte(record.style);
+    out[11] = 0;
+    Ok(WORD_RECORD_BYTES)
+}
+
+pub fn decode_word(input: &[u8]) -> Result<WordRecord, CacheError> {
+    require(input, WORD_RECORD_BYTES)?;
+    Ok(WordRecord {
+        text_offset: read_u32(input, 0)?,
+        text_len: read_u16(input, 4)?,
+        x: read_i16(input, 6)?,
+        width: read_u16(input, 8)?,
+        style: style_from_byte(input[10])?,
+    })
+}
+
+pub fn encode_block(record: BlockRecord, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, BLOCK_RECORD_BYTES)?;
+    write_u32(out, 0, record.text_offset);
+    write_u16(out, 4, record.text_len);
+    out[6] = record.line_count;
+    out[7] = role_byte(record.role);
+    out[8] = style_byte(record.style);
+    out[9] = align_byte(record.align);
+    write_u16(out, 10, 0);
+    Ok(BLOCK_RECORD_BYTES)
+}
+
+pub fn decode_block(input: &[u8]) -> Result<BlockRecord, CacheError> {
+    require(input, BLOCK_RECORD_BYTES)?;
+    Ok(BlockRecord {
+        text_offset: read_u32(input, 0)?,
+        text_len: read_u16(input, 4)?,
+        line_count: input[6],
+        role: role_from_byte(input[7])?,
+        style: style_from_byte(input[8])?,
+        align: align_from_byte(input[9])?,
+    })
+}
+
+fn require(slice: &[u8], len: usize) -> Result<(), CacheError> {
+    if slice.len() < len {
+        Err(CacheError::BufferTooSmall)
+    } else {
+        Ok(())
+    }
+}
+
+fn read_u16(input: &[u8], offset: usize) -> Result<u16, CacheError> {
+    require(&input[offset.min(input.len())..], 2)?;
+    Ok(u16::from_le_bytes([input[offset], input[offset + 1]]))
+}
+
+fn read_i16(input: &[u8], offset: usize) -> Result<i16, CacheError> {
+    Ok(read_u16(input, offset)? as i16)
+}
+
+fn read_u32(input: &[u8], offset: usize) -> Result<u32, CacheError> {
+    require(&input[offset.min(input.len())..], 4)?;
+    Ok(u32::from_le_bytes([
+        input[offset],
+        input[offset + 1],
+        input[offset + 2],
+        input[offset + 3],
+    ]))
+}
+
+fn write_u16(out: &mut [u8], offset: usize, value: u16) {
+    out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_i16(out: &mut [u8], offset: usize, value: i16) {
+    out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(out: &mut [u8], offset: usize, value: u32) {
+    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn role_byte(role: TextRole) -> u8 {
+    match role {
+        TextRole::Body => 0,
+        TextRole::Heading1 => 1,
+        TextRole::Heading2 => 2,
+        TextRole::Heading3 => 3,
+        TextRole::BlockQuote => 4,
+    }
+}
+
+fn role_from_byte(byte: u8) -> Result<TextRole, CacheError> {
+    match byte {
+        0 => Ok(TextRole::Body),
+        1 => Ok(TextRole::Heading1),
+        2 => Ok(TextRole::Heading2),
+        3 => Ok(TextRole::Heading3),
+        4 => Ok(TextRole::BlockQuote),
+        _ => Err(CacheError::BadLength),
+    }
+}
+
+fn style_byte(style: FontStyle) -> u8 {
+    match style {
+        FontStyle::Regular => 0,
+        FontStyle::Italic => 1,
+        FontStyle::Bold => 2,
+        FontStyle::BoldItalic => 3,
+    }
+}
+
+fn style_from_byte(byte: u8) -> Result<FontStyle, CacheError> {
+    match byte {
+        0 => Ok(FontStyle::Regular),
+        1 => Ok(FontStyle::Italic),
+        2 => Ok(FontStyle::Bold),
+        3 => Ok(FontStyle::BoldItalic),
+        _ => Err(CacheError::BadLength),
+    }
+}
+
+fn align_byte(align: TextAlign) -> u8 {
+    match align {
+        TextAlign::Left => 0,
+        TextAlign::Center => 1,
+        TextAlign::Justify => 2,
+    }
+}
+
+fn align_from_byte(byte: u8) -> Result<TextAlign, CacheError> {
+    match byte {
+        0 => Ok(TextAlign::Left),
+        1 => Ok(TextAlign::Center),
+        2 => Ok(TextAlign::Justify),
+        _ => Err(CacheError::BadLength),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_cache_records_round_trip() {
+        let header = PageCacheHeader {
+            page_count: 2,
+            block_count: 3,
+            text_bytes: 17,
+            viewport_width: 800,
+            viewport_height: 480,
+            font_config: 1,
+            bytes_consumed: 4096,
+            partial: true,
+        };
+        let page = PageRecord {
+            first_block: 1,
+            block_count: 2,
+        };
+        let block = BlockRecord {
+            text_offset: 42,
+            text_len: 11,
+            line_count: 2,
+            role: TextRole::Heading2,
+            style: FontStyle::BoldItalic,
+            align: TextAlign::Center,
+        };
+
+        let mut bytes = [0u8; 48];
+        encode_page_header(header, &mut bytes[..PAGE_HEADER_BYTES]).expect("header encodes");
+        encode_page(
+            page,
+            &mut bytes[PAGE_HEADER_BYTES..PAGE_HEADER_BYTES + PAGE_RECORD_BYTES],
+        )
+        .expect("page encodes");
+        encode_block(
+            block,
+            &mut bytes[PAGE_HEADER_BYTES + PAGE_RECORD_BYTES
+                ..PAGE_HEADER_BYTES + PAGE_RECORD_BYTES + BLOCK_RECORD_BYTES],
+        )
+        .expect("block encodes");
+
+        assert_eq!(
+            decode_page_header(&bytes[..PAGE_HEADER_BYTES]).unwrap(),
+            header
+        );
+        assert_eq!(
+            decode_page(&bytes[PAGE_HEADER_BYTES..PAGE_HEADER_BYTES + PAGE_RECORD_BYTES]).unwrap(),
+            page
+        );
+        assert_eq!(
+            decode_block(
+                &bytes[PAGE_HEADER_BYTES + PAGE_RECORD_BYTES
+                    ..PAGE_HEADER_BYTES + PAGE_RECORD_BYTES + BLOCK_RECORD_BYTES],
+            )
+            .unwrap(),
+            block
+        );
+    }
+
+    #[test]
+    fn book_cache_records_round_trip() {
+        let header = BookCacheHeader {
+            spine_count: 1,
+            toc_count: 1,
+            string_bytes: 27,
+        };
+        let spine = SpineRecord {
+            href_offset: 7,
+            href_len: 12,
+            toc_index: -1,
+            byte_size: 1234,
+        };
+        let toc = TocRecord {
+            title_offset: 20,
+            title_len: 5,
+            href_offset: 7,
+            href_len: 12,
+            anchor_offset: 0,
+            anchor_len: 0,
+            level: 2,
+            spine_index: -1,
+        };
+        let mut bytes = [0u8; BOOK_HEADER_BYTES + SPINE_RECORD_BYTES + TOC_RECORD_BYTES];
+        encode_book_header(header, &mut bytes[..BOOK_HEADER_BYTES]).expect("book header encodes");
+        encode_spine(
+            spine,
+            &mut bytes[BOOK_HEADER_BYTES..BOOK_HEADER_BYTES + SPINE_RECORD_BYTES],
+        )
+        .expect("spine encodes");
+        encode_toc(
+            toc,
+            &mut bytes[BOOK_HEADER_BYTES + SPINE_RECORD_BYTES
+                ..BOOK_HEADER_BYTES + SPINE_RECORD_BYTES + TOC_RECORD_BYTES],
+        )
+        .expect("toc encodes");
+
+        assert_eq!(
+            decode_book_header(&bytes[..BOOK_HEADER_BYTES]).unwrap(),
+            header
+        );
+        assert_eq!(
+            decode_spine(&bytes[BOOK_HEADER_BYTES..BOOK_HEADER_BYTES + SPINE_RECORD_BYTES])
+                .unwrap(),
+            spine
+        );
+        assert_eq!(
+            decode_toc(
+                &bytes[BOOK_HEADER_BYTES + SPINE_RECORD_BYTES
+                    ..BOOK_HEADER_BYTES + SPINE_RECORD_BYTES + TOC_RECORD_BYTES],
+            )
+            .unwrap(),
+            toc
+        );
+    }
+
+    #[test]
+    fn section_cache_records_round_trip() {
+        let header = SectionHeader {
+            page_count: 1,
+            block_count: 1,
+            line_count: 1,
+            word_count: 2,
+            text_bytes: 13,
+            viewport_width: 800,
+            viewport_height: 480,
+            font_config: 2,
+            bytes_consumed: 8192,
+            total_bytes: 12_000,
+            partial: true,
+        };
+        let line = LineRecord {
+            first_word: 0,
+            word_count: 2,
+            x: 8,
+            y: 24,
+            width: 760,
+            align: TextAlign::Justify,
+        };
+        let word = WordRecord {
+            text_offset: 6,
+            text_len: 7,
+            x: 120,
+            width: 54,
+            style: FontStyle::Italic,
+        };
+        let mut bytes = [0u8; SECTION_HEADER_BYTES + LINE_RECORD_BYTES + WORD_RECORD_BYTES];
+
+        encode_section_header(header, &mut bytes[..SECTION_HEADER_BYTES])
+            .expect("section header encodes");
+        encode_line(
+            line,
+            &mut bytes[SECTION_HEADER_BYTES..SECTION_HEADER_BYTES + LINE_RECORD_BYTES],
+        )
+        .expect("line encodes");
+        encode_word(
+            word,
+            &mut bytes[SECTION_HEADER_BYTES + LINE_RECORD_BYTES
+                ..SECTION_HEADER_BYTES + LINE_RECORD_BYTES + WORD_RECORD_BYTES],
+        )
+        .expect("word encodes");
+
+        assert_eq!(
+            decode_section_header(&bytes[..SECTION_HEADER_BYTES]).unwrap(),
+            header
+        );
+        assert_eq!(
+            decode_line(&bytes[SECTION_HEADER_BYTES..SECTION_HEADER_BYTES + LINE_RECORD_BYTES])
+                .unwrap(),
+            line
+        );
+        assert_eq!(
+            decode_word(
+                &bytes[SECTION_HEADER_BYTES + LINE_RECORD_BYTES
+                    ..SECTION_HEADER_BYTES + LINE_RECORD_BYTES + WORD_RECORD_BYTES],
+            )
+            .unwrap(),
+            word
+        );
+        assert_eq!(
+            section_cache_size(header),
+            SECTION_HEADER_BYTES
+                + PAGE_RECORD_BYTES
+                + BLOCK_RECORD_BYTES
+                + LINE_RECORD_BYTES
+                + WORD_RECORD_BYTES * 2
+                + 13
+        );
+    }
+}
