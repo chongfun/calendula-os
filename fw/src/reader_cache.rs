@@ -39,6 +39,7 @@ const CACHE_COVER_FILE: &str = "COVER.BIN";
 const STATE_FILE: &str = "STATE.BIN";
 const COVER_MAGIC: &[u8; 4] = b"X4CV";
 const COVER_VERSION: u8 = 1;
+const COVER_SIDECAR_ENABLED: bool = false;
 
 pub(crate) struct ReaderCacheScratch {
     tail: [u8; 4096],
@@ -449,7 +450,9 @@ where
     let mut section_incomplete = false;
     let start_spine = requested_start_spine(&package, library, requested_chapter);
     let _ = ensure_cache_dirs(root, cache_key.as_str());
-    load_cover_cache(root, cache_key.as_str(), library);
+    if COVER_SIDECAR_ENABLED {
+        load_cover_cache(root, cache_key.as_str(), library);
+    }
     write_book_cache(root, cache_key.as_str(), &package, library);
     if let Some(cached_pages) =
         load_section_cache(root, cache_key.as_str(), start_spine as u16, library)

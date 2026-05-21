@@ -29,7 +29,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let tx_band = TX_BAND.init([0; BAND_BYTES]);
     static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch> =
         static_cell::StaticCell::new();
-    let epub_scratch = EPUB_SCRATCH.init(ReaderCacheScratch::new());
+    let mut epub_scratch = None;
 
     esp_println::println!("display: init start");
     display_flush::init_panel(&mut epd).await;
@@ -72,6 +72,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         } else {
                             INITIAL_SECTION_PAGES
                         };
+                        let scratch = epub_scratch
+                            .get_or_insert_with(|| EPUB_SCRATCH.init(ReaderCacheScratch::new()));
                         reader_cache::build_or_load_book_cache(
                             &mut epd,
                             &mut sd_cs,
@@ -79,7 +81,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             index,
                             requested_chapter,
                             target_pages,
-                            epub_scratch,
+                            scratch,
                         );
                         let _ = LIBRARY_EVENTS.try_send(LibraryEvent::Loaded {
                             book_id: request.book_id,
