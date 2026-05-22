@@ -1,6 +1,6 @@
 use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
 use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, MAX_LIBRARY_BOOKS};
-use crate::{catalog, AppView, RenderRequest};
+use crate::{catalog, AppView, ReaderSource, RenderRequest};
 use display::fb::Framebuffer;
 use display::render::{draw_ascii, fill_rect, stroke_rect};
 use display::{Rect, WIDTH};
@@ -14,7 +14,7 @@ const SHOW_INPUT_DEBUG: bool = false;
 const MAX_UI_CHAPTERS: usize = 64;
 
 pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    if request.view == AppView::Reading && request.book_id >= 2 {
+    if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
         fb.clear(true);
         draw_sd_reader_page(fb, request, sd_library);
         mirror_framebuffer_long_axis(fb);
@@ -91,7 +91,7 @@ fn fill_chapters<'a>(
     request: RenderRequest,
     sd_library: &'a ReaderStore,
 ) -> usize {
-    if request.book_id >= 2 && sd_library.toc_count() > 0 {
+    if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.toc_count() > 0 {
         let count = sd_library.toc_count().min(chapters.len());
         for (index, item) in chapters.iter_mut().take(count).enumerate() {
             if let Some(toc_item) = sd_library.toc_item(index) {

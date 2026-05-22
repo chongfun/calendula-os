@@ -5,6 +5,47 @@ use display::{epd::RefreshMode, Rect};
 
 pub const SETTINGS_ITEMS: u8 = 3;
 pub const MAX_SD_CHAPTERS: usize = 64;
+pub const FIRST_SD_BOOK_ID: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderSource {
+    BuiltIn { book_id: u32 },
+    Sd { index: u8 },
+}
+
+impl ReaderSource {
+    pub fn from_book_id(book_id: u32) -> Self {
+        if book_id >= FIRST_SD_BOOK_ID {
+            Self::Sd {
+                index: book_id.saturating_sub(FIRST_SD_BOOK_ID).min(u8::MAX as u32) as u8,
+            }
+        } else {
+            Self::BuiltIn { book_id }
+        }
+    }
+
+    pub const fn sd(index: u8) -> Self {
+        Self::Sd { index }
+    }
+
+    pub const fn book_id(self) -> u32 {
+        match self {
+            Self::BuiltIn { book_id } => book_id,
+            Self::Sd { index } => FIRST_SD_BOOK_ID + index as u32,
+        }
+    }
+
+    pub const fn sd_index(self) -> Option<u8> {
+        match self {
+            Self::BuiltIn { .. } => None,
+            Self::Sd { index } => Some(index),
+        }
+    }
+
+    pub const fn is_sd(self) -> bool {
+        matches!(self, Self::Sd { .. })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
@@ -358,7 +399,7 @@ impl ReaderState {
             }
             (AppView::Library, Some(Button::Confirm)) => {
                 if self.selection < self.library_count {
-                    next.book_id = self.selection as u32 + 2;
+                    next.book_id = ReaderSource::sd(self.selection).book_id();
                     next.view = AppView::Reading;
                     next.chapter = 0;
                     next.selection = 0;
@@ -375,7 +416,7 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Next)) => {
-                if self.book_id >= 2 {
+                if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page + 1 < self.sd_page_count {
                         next.page = self.page + 1;
                     } else if self.chapter + 1 < self.sd_chapter_count {
@@ -392,7 +433,7 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Previous)) => {
-                if self.book_id >= 2 {
+                if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page > 0 {
                         next.page = self.page - 1;
                     } else if self.chapter > 0 {
@@ -408,7 +449,7 @@ impl ReaderState {
             }
             (AppView::Reading, Some(Button::Confirm)) => {
                 next.view = AppView::Chapters;
-                next.selection = if self.book_id >= 2 {
+                next.selection = if ReaderSource::from_book_id(self.book_id).is_sd() {
                     self.sd_chapter_for_page(self.page)
                 } else {
                     self.chapter
@@ -510,7 +551,8 @@ impl ReaderState {
                     self.view = AppView::Reading;
                     self.selection = chapter;
                 } else if self.view == AppView::Library {
-                    let restored_index = book_id.saturating_sub(2).min(u8::MAX as u32) as u8;
+                    let restored_index =
+                        ReaderSource::from_book_id(book_id).sd_index().unwrap_or(0);
                     self.selection = restored_index.min(self.library_count.saturating_sub(1));
                 } else {
                     self.selection = chapter;
@@ -573,7 +615,7 @@ impl ReaderState {
     }
 
     pub fn chapter_item_count(self, ctx: ReducerContext) -> u8 {
-        if self.book_id >= 2 {
+        if ReaderSource::from_book_id(self.book_id).is_sd() {
             self.sd_chapter_count.max(1)
         } else {
             ctx.builtin_chapter_count.max(1)
@@ -644,7 +686,7 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
     state.read_request_pending = false;
     match action {
         HomeAction::Read => {
-            if state.book_id >= 2 {
+            if ReaderSource::from_book_id(state.book_id).is_sd() {
                 state.view = AppView::Reading;
                 state.selection = state.chapter;
             } else if state.library_count > 0 {
@@ -724,6 +766,17 @@ mod tests {
             press(ReaderState::boot(), Button::Next).view,
             AppView::Settings
         );
+    }
+
+    #[test]
+    fn reader_source_maps_sd_catalog_indices_to_book_ids() {
+        assert_eq!(
+            ReaderSource::from_book_id(1),
+            ReaderSource::BuiltIn { book_id: 1 }
+        );
+        assert_eq!(ReaderSource::sd(0).book_id(), 2);
+        assert_eq!(ReaderSource::sd(7).book_id(), 9);
+        assert_eq!(ReaderSource::from_book_id(9).sd_index(), Some(7));
     }
 
     #[test]

@@ -111,6 +111,10 @@ fn demo_model<'a>(
 }
 
 fn progress_permille(request: app_core::RenderRequest) -> u16 {
-    let total = if request.book_id >= 2 { 24 } else { 4 };
+    let total = if app_core::ReaderSource::from_book_id(request.book_id).is_sd() {
+        24
+    } else {
+        4
+    };
     (((request.page + request.chapter as u32) * 1000) / total).min(1000) as u16
 }

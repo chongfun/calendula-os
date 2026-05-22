@@ -1,7 +1,7 @@
 use crate::{
-    catalog, Button, DisplayCommand, DisplayEvent, InputEvent, PowerEvent, RenderKind,
-    StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS, INPUT_EVENTS, LIBRARY_EVENTS, POWER_EVENTS,
-    STORAGE_COMMANDS,
+    catalog, Button, DisplayCommand, DisplayEvent, InputEvent, PowerEvent, ReaderSource,
+    RenderKind, StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS, INPUT_EVENTS, LIBRARY_EVENTS,
+    POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::{AppView, ReaderState, ReducerContext};
 use display::Rect;
@@ -122,11 +122,13 @@ fn storage_command_for_transition(
     previous: ReaderState,
     next: ReaderState,
 ) -> Option<StorageCommand> {
-    if next.view != AppView::Reading || next.book_id < 2 {
+    let Some(index) = ReaderSource::from_book_id(next.book_id).sd_index() else {
+        return None;
+    };
+    if next.view != AppView::Reading {
         return None;
     }
 
-    let index = next.book_id.saturating_sub(2).min(u8::MAX as u32) as u8;
     if previous.book_id != next.book_id
         || previous.chapter != next.chapter
         || previous.view != AppView::Reading

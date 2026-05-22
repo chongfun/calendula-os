@@ -49,7 +49,7 @@ pub static _ESP_APP_DESC: EspAppDesc = EspAppDesc {
 
 pub use app_core::{
     AppView, Button, DisplayCommand, DisplayEvent, DisplayOrientation, InputEvent, LibraryEvent,
-    PowerEvent, RefreshPolicy, RenderKind, RenderRequest, StorageCommand,
+    PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, StorageCommand,
 };
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;

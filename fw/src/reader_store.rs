@@ -1,4 +1,5 @@
 use crate::{LibraryEvent, LIBRARY_EVENTS};
+use app_core::ReaderSource;
 use display::font::FontStyle;
 use heapless::String;
 use proto::cache::{
@@ -200,7 +201,9 @@ impl ReaderStore {
     }
 
     pub(crate) fn selected_book_index(book_id: u32) -> Option<usize> {
-        book_id.checked_sub(2).map(|index| index as usize)
+        ReaderSource::from_book_id(book_id)
+            .sd_index()
+            .map(|index| index as usize)
     }
 
     pub(crate) fn source_identity(&self, book_id: u32) -> (u32, u32) {
@@ -461,7 +464,7 @@ impl ReaderStore {
         fallback_title: &'a str,
         fallback_author: &'a str,
     ) -> (&'a str, &'a str) {
-        if book_id < 2 {
+        if !ReaderSource::from_book_id(book_id).is_sd() {
             return (fallback_title, fallback_author);
         }
         if self.reader_status == BookLoadStatus::Ready
@@ -486,7 +489,7 @@ impl ReaderStore {
     }
 
     pub(crate) fn selected_cover(&self, book_id: u32) -> Option<ReaderCover<'_>> {
-        if book_id < 2
+        if !ReaderSource::from_book_id(book_id).is_sd()
             || self.current_index != Self::selected_book_index(book_id)
             || !self.cover_ready
         {
