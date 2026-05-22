@@ -27,10 +27,13 @@ use proto::epub::{
 };
 use proto::text::{TextAlign, TextRole};
 
-const READER_COMPRESSED_SCRATCH: usize = 32_768;
-const READER_OPF_SCRATCH: usize = 20_480;
-const READER_CSS_SCRATCH: usize = 8_192;
-const READER_XHTML_SCRATCH: usize = 36_864;
+pub(crate) const READER_TAIL_SCRATCH: usize = 4096;
+pub(crate) const READER_HEADER_SCRATCH: usize = 46;
+pub(crate) const READER_COMPRESSED_SCRATCH: usize = 24_576;
+pub(crate) const READER_CONTAINER_SCRATCH: usize = 4096;
+pub(crate) const READER_OPF_SCRATCH: usize = 16_384;
+pub(crate) const READER_CSS_SCRATCH: usize = 8_192;
+pub(crate) const READER_XHTML_SCRATCH: usize = 24_576;
 const CACHE_ROOT_DIR: &str = "XTEINK";
 const CACHE_DIR: &str = "CACHE";
 const CACHE_SECTIONS_DIR: &str = "SECTIONS";
@@ -41,15 +44,15 @@ const COVER_MAGIC: &[u8; 4] = b"X4CV";
 const COVER_VERSION: u8 = 1;
 const COVER_SIDECAR_ENABLED: bool = true;
 
-pub(crate) struct ReaderCacheScratch {
-    tail: [u8; 4096],
-    header: [u8; 46],
-    name: [u8; MAX_ENTRY_NAME_BYTES],
-    compressed: [u8; READER_COMPRESSED_SCRATCH],
-    container: [u8; 4096],
-    opf: [u8; READER_OPF_SCRATCH],
-    css: [u8; READER_CSS_SCRATCH],
-    xhtml: [u8; READER_XHTML_SCRATCH],
+pub(crate) struct ReaderCacheScratch<'a> {
+    tail: &'a mut [u8; READER_TAIL_SCRATCH],
+    header: &'a mut [u8; READER_HEADER_SCRATCH],
+    name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
+    compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
+    container: &'a mut [u8; READER_CONTAINER_SCRATCH],
+    opf: &'a mut [u8; READER_OPF_SCRATCH],
+    css: &'a mut [u8; READER_CSS_SCRATCH],
+    xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
     zip_inflate: ZipInflateScratch,
 }
 
@@ -94,18 +97,27 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
     }
 }
 
-impl ReaderCacheScratch {
-    #[allow(clippy::large_stack_arrays)]
-    pub(crate) fn new() -> Self {
+impl<'a> ReaderCacheScratch<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        tail: &'a mut [u8; READER_TAIL_SCRATCH],
+        header: &'a mut [u8; READER_HEADER_SCRATCH],
+        name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
+        compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
+        container: &'a mut [u8; READER_CONTAINER_SCRATCH],
+        opf: &'a mut [u8; READER_OPF_SCRATCH],
+        css: &'a mut [u8; READER_CSS_SCRATCH],
+        xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+    ) -> Self {
         Self {
-            tail: [0; 4096],
-            header: [0; 46],
-            name: [0; MAX_ENTRY_NAME_BYTES],
-            compressed: [0; READER_COMPRESSED_SCRATCH],
-            container: [0; 4096],
-            opf: [0; READER_OPF_SCRATCH],
-            css: [0; READER_CSS_SCRATCH],
-            xhtml: [0; READER_XHTML_SCRATCH],
+            tail,
+            header,
+            name,
+            compressed,
+            container,
+            opf,
+            css,
+            xhtml,
             zip_inflate: ZipInflateScratch::new(),
         }
     }
@@ -118,7 +130,7 @@ pub(crate) fn build_or_load_book_cache(
     index: usize,
     requested_chapter: u8,
     target_pages: usize,
-    scratch: &mut ReaderCacheScratch,
+    scratch: &mut ReaderCacheScratch<'_>,
 ) {
     esp_println::println!(
         "epub: cache open index {} chapter {} target {}",
@@ -355,7 +367,7 @@ fn build_or_load_epub_cache_from_file<
     requested_chapter: u8,
     target_pages: usize,
     library: &mut ReaderStore,
-    scratch: &mut ReaderCacheScratch,
+    scratch: &mut ReaderCacheScratch<'_>,
 ) -> Result<(), ReaderCacheError>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -368,28 +380,24 @@ where
     let _ = library.cache_key.push_str(cache_key.as_str());
 
     let reader = SdFileReadAt { file };
-    let mut zip = ZipStream::new(reader, &mut scratch.tail)?;
+    let mut zip = ZipStream::new(reader, scratch.tail)?;
     esp_println::println!(
         "epub: zip ready after {} ms",
         open_started.elapsed().as_millis()
     );
 
-    let container_entry = zip.find_entry(
-        "META-INF/container.xml",
-        &mut scratch.header,
-        &mut scratch.name,
-    )?;
+    let container_entry = zip.find_entry("META-INF/container.xml", scratch.header, scratch.name)?;
     let container_len = zip.read_entry_streamed(
         container_entry,
-        &mut scratch.compressed,
-        &mut scratch.container,
+        scratch.compressed,
+        scratch.container,
         &mut scratch.zip_inflate,
     )?;
     let container_xml = core::str::from_utf8(&scratch.container[..container_len])
         .map_err(|_| ReaderCacheError::Utf8)?;
     let opf_path = find_full_path(container_xml).ok_or(ReaderCacheError::MissingOpfPath)?;
 
-    let opf_entry = zip.find_entry(opf_path, &mut scratch.header, &mut scratch.name)?;
+    let opf_entry = zip.find_entry(opf_path, scratch.header, scratch.name)?;
     esp_println::println!(
         "epub: opf compressed={} uncompressed={}",
         opf_entry.compressed_size,
@@ -397,8 +405,8 @@ where
     );
     let opf_len = zip.read_entry_streamed(
         opf_entry,
-        &mut scratch.compressed,
-        &mut scratch.opf,
+        scratch.compressed,
+        scratch.opf,
         &mut scratch.zip_inflate,
     )?;
     let opf_xml =
@@ -418,10 +426,10 @@ where
         &package,
         library,
         TocScratch {
-            header: &mut scratch.header,
-            name: &mut scratch.name,
-            compressed: &mut scratch.compressed,
-            xhtml: &mut scratch.xhtml,
+            header: scratch.header,
+            name: scratch.name,
+            compressed: scratch.compressed,
+            xhtml: scratch.xhtml,
             zip_inflate: &mut scratch.zip_inflate,
         },
     );
@@ -437,10 +445,10 @@ where
         opf_path,
         &package,
         CssScratch {
-            header: &mut scratch.header,
-            name: &mut scratch.name,
-            compressed: &mut scratch.compressed,
-            css: &mut scratch.css,
+            header: scratch.header,
+            name: scratch.name,
+            compressed: scratch.compressed,
+            css: scratch.css,
             zip_inflate: &mut scratch.zip_inflate,
         },
         &mut css_rules,
@@ -485,8 +493,7 @@ where
     {
         saw_spine = true;
         resolve_epub_href(opf_path, spine.href, &mut xhtml_path)?;
-        let Ok(xhtml_entry) = zip.find_entry(&xhtml_path, &mut scratch.header, &mut scratch.name)
-        else {
+        let Ok(xhtml_entry) = zip.find_entry(&xhtml_path, scratch.header, scratch.name) else {
             continue;
         };
         esp_println::println!(
@@ -497,8 +504,8 @@ where
         );
         let (xhtml_len, xhtml_complete) = zip.read_entry_prefix_streamed(
             xhtml_entry,
-            &mut scratch.compressed,
-            &mut scratch.xhtml,
+            scratch.compressed,
+            scratch.xhtml,
             &mut scratch.zip_inflate,
         )?;
         let xhtml_len = valid_utf8_prefix_len(&scratch.xhtml[..xhtml_len], xhtml_complete)?;
