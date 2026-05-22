@@ -193,6 +193,12 @@ impl ReaderStore {
         self.entries.get(index).filter(|_| index < self.count)
     }
 
+    pub(crate) fn set_catalog_entry_source_hash(&mut self, index: usize, source_hash: u32) {
+        if let Some(entry) = self.entries.get_mut(index).filter(|_| index < self.count) {
+            entry.source_hash = source_hash;
+        }
+    }
+
     pub(crate) fn selected_book_index(book_id: u32) -> Option<usize> {
         book_id.checked_sub(2).map(|index| index as usize)
     }
@@ -238,6 +244,145 @@ impl ReaderStore {
             *page = EMPTY_PAGE_RECORD;
             self.page_spine[index] = 0;
         }
+    }
+
+    pub(crate) fn begin_book_load(&mut self) {
+        self.loaded_index = None;
+        self.reader_status = BookLoadStatus::Loading;
+        self.title.clear();
+        self.author.clear();
+        self.error.clear();
+        self.clear_toc();
+        self.clear_lines();
+    }
+
+    pub(crate) fn finish_book_load(&mut self, index: usize, chapter: u8, status: BookLoadStatus) {
+        if matches!(status, BookLoadStatus::Ready) {
+            self.set_current_index(index);
+        }
+        if matches!(status, BookLoadStatus::Ready | BookLoadStatus::Error) {
+            self.loaded_index = Some(index);
+            self.loaded_chapter = chapter;
+        }
+        self.reader_status = status;
+    }
+
+    pub(crate) fn set_reader_status(&mut self, status: BookLoadStatus) {
+        self.reader_status = status;
+    }
+
+    pub(crate) fn set_reader_error(&mut self, message: &str) {
+        self.error.clear();
+        let _ = self.error.push_str(message);
+    }
+
+    pub(crate) fn set_cache_key(&mut self, key: &str) {
+        self.cache_key.clear();
+        let _ = self.cache_key.push_str(key);
+    }
+
+    pub(crate) fn set_book_labels(&mut self, title: &str, author: &str) {
+        copy_string(&mut self.title, title);
+        copy_string(&mut self.author, author);
+    }
+
+    pub(crate) fn page_capacity(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub(crate) fn block_capacity(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub(crate) fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    pub(crate) fn can_hold_section(
+        &self,
+        page_count: usize,
+        block_count: usize,
+        text_bytes: usize,
+    ) -> bool {
+        page_count <= self.pages.len()
+            && block_count <= self.blocks.len()
+            && text_bytes <= self.text.len()
+    }
+
+    pub(crate) fn set_cached_page(&mut self, index: usize, page: PageRecord, spine: u16) -> bool {
+        if index >= self.pages.len() {
+            return false;
+        }
+        self.pages[index] = page;
+        self.page_spine[index] = spine;
+        true
+    }
+
+    pub(crate) fn set_cached_block(
+        &mut self,
+        index: usize,
+        block: BlockRecord,
+        style: FontStyle,
+        spine: u16,
+    ) -> bool {
+        if index >= self.blocks.len() {
+            return false;
+        }
+        self.blocks[index] = block;
+        self.block_styles[index] = style;
+        self.block_spine[index] = spine;
+        true
+    }
+
+    pub(crate) fn set_cached_paragraph_end(&mut self, index: usize, paragraph_end: bool) -> bool {
+        let Some(slot) = self.block_paragraph_end.get_mut(index) else {
+            return false;
+        };
+        *slot = paragraph_end;
+        true
+    }
+
+    pub(crate) fn mark_last_block_paragraph_end(&mut self) {
+        if self.block_count > 0 {
+            self.block_paragraph_end[self.block_count - 1] = true;
+        }
+    }
+
+    pub(crate) fn cached_text_mut(&mut self, text_bytes: usize) -> Option<&mut [u8]> {
+        self.text.get_mut(..text_bytes)
+    }
+
+    pub(crate) fn finish_cached_section(
+        &mut self,
+        spine: u16,
+        page_count: usize,
+        block_count: usize,
+        text_len: usize,
+        partial: bool,
+    ) {
+        self.page_count = page_count;
+        self.block_count = block_count;
+        self.text_len = text_len;
+        self.cached_spine = spine;
+        self.section_partial = partial;
+    }
+
+    pub(crate) fn cover_bits_mut(&mut self) -> &mut [u8; COVER_BYTES] {
+        &mut self.cover_bits
+    }
+
+    pub(crate) fn set_cover_cache(&mut self, width: u16, height: u16) {
+        self.cover_width = width;
+        self.cover_height = height;
+        self.cover_ready = true;
+    }
+
+    pub(crate) fn set_section_partial(&mut self, partial: bool) {
+        self.section_partial = partial;
+    }
+
+    pub(crate) fn set_cached_spine(&mut self, spine: u16) {
+        self.cached_spine = spine;
     }
 
     pub(crate) fn force_next_block_to_new_page(&mut self) {
@@ -438,6 +583,59 @@ impl ReaderStore {
         if index < self.count {
             self.current_index = Some(index);
         }
+    }
+
+    pub(crate) fn push_line_block(
+        &mut self,
+        line: &str,
+        style: FontStyle,
+        role: TextRole,
+        align: TextAlign,
+        paragraph_end: bool,
+        spine_index: u16,
+    ) -> bool {
+        let line = line.trim();
+        if line.is_empty() || self.block_count >= self.blocks.len() {
+            return true;
+        }
+        let start = self.text_len;
+        let bytes = line.as_bytes();
+        if start + bytes.len() > self.text.len() || bytes.len() > u16::MAX as usize {
+            return false;
+        }
+        self.text[start..start + bytes.len()].copy_from_slice(bytes);
+        self.text_len += bytes.len();
+        self.blocks[self.block_count] = BlockRecord {
+            text_offset: start as u32,
+            text_len: bytes.len() as u16,
+            line_count: 1,
+            role,
+            style: proto_style_for_display_style(style),
+            align,
+        };
+        self.block_styles[self.block_count] = style;
+        self.block_spine[self.block_count] = spine_index;
+        self.block_paragraph_end[self.block_count] = paragraph_end;
+        self.block_count += 1;
+        true
+    }
+}
+
+fn copy_string<const N: usize>(out: &mut String<N>, value: &str) {
+    out.clear();
+    for ch in value.chars() {
+        if out.push(ch).is_err() {
+            break;
+        }
+    }
+}
+
+fn proto_style_for_display_style(style: FontStyle) -> proto::text::FontStyle {
+    match style {
+        FontStyle::Regular => proto::text::FontStyle::Regular,
+        FontStyle::Italic => proto::text::FontStyle::Italic,
+        FontStyle::Bold => proto::text::FontStyle::Bold,
+        FontStyle::BoldItalic => proto::text::FontStyle::BoldItalic,
     }
 }
 

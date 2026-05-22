@@ -207,7 +207,7 @@ fn handle_storage_command(
                 chapter,
                 target_pages
             );
-            sd_library.reader_status = BookLoadStatus::Loading;
+            sd_library.set_reader_status(BookLoadStatus::Loading);
             let scratch = epub_scratch.get_or_insert_with(init_scratch);
             reader_cache::build_or_load_book_cache(
                 epd,
@@ -225,7 +225,7 @@ fn handle_storage_command(
             });
             esp_println::println!(
                 "storage: open complete status={:?} pages={} chapters={}",
-                sd_library.reader_status,
+                sd_library.reader_status(),
                 sd_library.advertised_page_count(),
                 sd_library.chapter_count_for_ui()
             );

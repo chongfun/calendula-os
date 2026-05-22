@@ -211,37 +211,39 @@ where
     let page_count = header.page_count as usize;
     let block_count = header.block_count as usize;
     let text_bytes = header.text_bytes as usize;
-    if page_count > library.pages.len()
-        || block_count > library.blocks.len()
-        || text_bytes > library.text.len()
-    {
+    if !library.can_hold_section(page_count, block_count, text_bytes) {
         return None;
     }
 
     let mut record_bytes = [0u8; 16];
     for index in 0..page_count {
         read_exact_file(&file, &mut record_bytes[..PAGE_RECORD_BYTES]).ok()?;
-        library.pages[index] = decode_page(&record_bytes[..PAGE_RECORD_BYTES]).ok()?;
-        library.page_spine[index] = spine;
+        let page = decode_page(&record_bytes[..PAGE_RECORD_BYTES]).ok()?;
+        if !library.set_cached_page(index, page, spine) {
+            return None;
+        }
     }
     for index in 0..block_count {
         read_exact_file(&file, &mut record_bytes[..BLOCK_RECORD_BYTES]).ok()?;
         let block = decode_block(&record_bytes[..BLOCK_RECORD_BYTES]).ok()?;
-        library.blocks[index] = block;
-        library.block_styles[index] = display_style_for_proto_style(block.style);
-        library.block_spine[index] = spine;
+        if !library.set_cached_block(
+            index,
+            block,
+            display_style_for_proto_style(block.style),
+            spine,
+        ) {
+            return None;
+        }
     }
     for index in 0..block_count {
         let mut flag = [0u8; 1];
         read_exact_file(&file, &mut flag).ok()?;
-        library.block_paragraph_end[index] = flag[0] != 0;
+        if !library.set_cached_paragraph_end(index, flag[0] != 0) {
+            return None;
+        }
     }
-    read_exact_file(&file, &mut library.text[..text_bytes]).ok()?;
-    library.page_count = page_count;
-    library.block_count = block_count;
-    library.text_len = text_bytes;
-    library.cached_spine = spine;
-    library.section_partial = header.partial;
+    read_exact_file(&file, library.cached_text_mut(text_bytes)?).ok()?;
+    library.finish_cached_section(spine, page_count, block_count, text_bytes, header.partial);
     Some(page_count)
 }
 
@@ -260,12 +262,12 @@ pub(crate) fn load_cover_cache<
     T: TimeSource,
 {
     library.clear_cover();
-    let Some((width, height, bits)) = read_cover_cache(root, key, &mut library.cover_bits) else {
+    let Some((width, height, bits)) = read_cover_cache(root, key, library.cover_bits_mut()) else {
         return;
     };
-    library.cover_width = width;
-    library.cover_height = height;
-    library.cover_ready = bits == COVER_BYTES;
+    if bits == COVER_BYTES {
+        library.set_cover_cache(width, height);
+    }
 }
 
 fn read_cover_cache<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(

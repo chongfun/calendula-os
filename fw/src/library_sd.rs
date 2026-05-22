@@ -145,9 +145,10 @@ where
             u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
         );
         let last_index = library.catalog_count().saturating_sub(1);
-        if let Some(entry) = library.entries.get_mut(last_index) {
-            entry.source_hash = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        }
+        library.set_catalog_entry_source_hash(
+            last_index,
+            u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
+        );
     }
     library.status = if library.catalog_is_empty() {
         LibraryScanStatus::Empty

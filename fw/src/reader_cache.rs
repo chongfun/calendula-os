@@ -10,7 +10,6 @@ use esp_hal::gpio::Output;
 use hal_ext::nvm::AppStateRecord;
 use heapless::String;
 use proto::book::BookId;
-use proto::cache::BlockRecord;
 use proto::epub::{
     parse_css_text_align, parse_epub2_ncx_to_sink, parse_epub3_nav_to_sink, parse_opf,
     xhtml_blocks_to_sink, CssRules, EpubTocSink, ReadAt, TocError, XhtmlBlockSink, XhtmlError,
@@ -121,17 +120,11 @@ pub(crate) fn build_or_load_book_cache(
         requested_chapter,
         target_pages
     );
-    library.loaded_index = None;
-    library.reader_status = BookLoadStatus::Loading;
-    library.title.clear();
-    library.author.clear();
-    library.error.clear();
-    library.clear_toc();
-    library.clear_lines();
+    library.begin_book_load();
 
-    if index >= library.count {
+    if library.catalog_entry(index).is_none() {
         set_preview_error(library, "BAD INDEX");
-        library.reader_status = BookLoadStatus::Error;
+        library.set_reader_status(BookLoadStatus::Error);
         return;
     }
 
@@ -140,9 +133,12 @@ pub(crate) fn build_or_load_book_cache(
         esp_println::println!("epub: open root");
         let mut open_name = String::<16>::new();
         let mut display_name = String::<64>::new();
-        let in_books_dir = library.entries[index].in_books_dir;
-        let _ = open_name.push_str(&library.entries[index].open_name);
-        let _ = display_name.push_str(&library.entries[index].display_name);
+        let Some(entry) = library.catalog_entry(index) else {
+            return BookLoadStatus::Error;
+        };
+        let in_books_dir = entry.in_books_dir;
+        let _ = open_name.push_str(&entry.open_name);
+        let _ = display_name.push_str(&entry.display_name);
 
         if in_books_dir {
             let load_result = match root.open_dir("BOOKS") {
@@ -195,14 +191,7 @@ pub(crate) fn build_or_load_book_cache(
         BookLoadStatus::Error
     });
 
-    if matches!(status, BookLoadStatus::Ready | BookLoadStatus::Error) {
-        if matches!(status, BookLoadStatus::Ready) {
-            library.set_current_index(index);
-        }
-        library.loaded_index = Some(index);
-        library.loaded_chapter = requested_chapter;
-    }
-    library.reader_status = status;
+    library.finish_book_load(index, requested_chapter, status);
 }
 
 pub(crate) fn store_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>, record: AppStateRecord) {
@@ -212,8 +201,7 @@ pub(crate) fn store_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>, record
 }
 
 fn set_preview_error(library: &mut ReaderStore, message: &str) {
-    library.error.clear();
-    let _ = library.error.push_str(message);
+    library.set_reader_error(message);
 }
 
 fn status_for_load_result(
@@ -317,8 +305,7 @@ where
     let open_started = Instant::now();
     let source_len = file.length();
     let cache_key = proto::cache::cache_key_for(source_path, source_len);
-    library.cache_key.clear();
-    let _ = library.cache_key.push_str(cache_key.as_str());
+    library.set_cache_key(cache_key.as_str());
 
     let reader = SdFileReadAt { file };
     let mut zip = ZipStream::new(reader, scratch.tail)?;
@@ -358,8 +345,7 @@ where
         open_started.elapsed().as_millis()
     );
 
-    copy_string(&mut library.title, package.meta.title);
-    copy_string(&mut library.author, package.meta.author);
+    library.set_book_labels(package.meta.title, package.meta.author);
     library.clear_cover();
     load_epub_toc(
         &mut zip,
@@ -456,10 +442,10 @@ where
         section_incomplete |= !xhtml_complete;
         let xhtml = core::str::from_utf8(&scratch.xhtml[..xhtml_len])
             .map_err(|_| ReaderCacheError::Utf8)?;
-        if library.block_count > 0 {
+        if library.block_count() > 0 {
             library.force_next_block_to_new_page();
         }
-        let target_pages = target_pages.max(1).min(library.pages.len());
+        let target_pages = target_pages.max(1).min(library.page_capacity());
         let mut sink = LibraryBlockSink {
             library,
             spine_index: spine_index.min(u16::MAX as usize) as u16,
@@ -475,7 +461,7 @@ where
         xhtml_blocks_to_sink(xhtml, Some(&css_rules), &mut sink)?;
         let stopped = sink.stopped;
         reader_layout::rebuild_page_index(library, 22, 472);
-        if library.block_count >= library.blocks.len().saturating_sub(4) {
+        if library.block_count() >= library.block_capacity().saturating_sub(4) {
             break;
         }
         if !xhtml_complete || stopped || library.page_count >= target_pages {
@@ -483,24 +469,26 @@ where
         }
     }
 
-    if library.block_count > 0 {
+    if library.block_count() > 0 {
         reader_layout::rebuild_page_index(library, 22, 472);
         reader_layout::rebuild_toc_page_targets(library);
-        library.cached_spine = start_spine.min(u16::MAX as usize) as u16;
-        library.section_partial = section_incomplete
-            || library.page_count >= target_pages
-            || library.block_count >= library.blocks.len().saturating_sub(4);
+        library.set_cached_spine(start_spine.min(u16::MAX as usize) as u16);
+        library.set_section_partial(
+            section_incomplete
+                || library.page_count >= target_pages
+                || library.block_count() >= library.block_capacity().saturating_sub(4),
+        );
         reader_cache_files::write_section_cache(
             root,
             cache_key.as_str(),
-            library.cached_spine,
+            start_spine.min(u16::MAX as usize) as u16,
             library,
         );
         esp_println::println!(
             "epub: initial cache ready after {} ms ({} page(s), {} block(s), key {})",
             open_started.elapsed().as_millis(),
             library.page_count,
-            library.block_count,
+            library.block_count(),
             cache_key.as_str()
         );
         Ok(())
@@ -721,15 +709,6 @@ fn href_matches_spine(toc_href: &str, spine_href: &str) -> bool {
         || spine_href.ends_with(toc_href.rsplit('/').next().unwrap_or(toc_href))
 }
 
-fn copy_string<const N: usize>(out: &mut String<N>, value: &str) {
-    out.clear();
-    for ch in value.chars() {
-        if out.push(ch).is_err() {
-            break;
-        }
-    }
-}
-
 struct LibraryBlockSink<'a> {
     library: &'a mut ReaderStore,
     spine_index: u16,
@@ -755,7 +734,7 @@ impl XhtmlBlockSink for LibraryBlockSink<'_> {
         if self.stopped {
             return Ok(());
         }
-        if self.library.block_count >= self.library.blocks.len() {
+        if self.library.block_count() >= self.library.block_capacity() {
             return Ok(());
         }
         push_styled_preview_fragment(
@@ -768,7 +747,7 @@ impl XhtmlBlockSink for LibraryBlockSink<'_> {
         );
         reader_layout::rebuild_page_index(self.library, 22, 472);
         self.stopped = self.library.page_count >= self.target_pages
-            || self.library.block_count >= self.library.blocks.len().saturating_sub(4);
+            || self.library.block_count() >= self.library.block_capacity().saturating_sub(4);
         Ok(())
     }
 }
@@ -914,8 +893,8 @@ fn append_style_marker<const N: usize>(line: &mut String<N>, style: FontStyle) -
 
 fn flush_styled_preview_line(sink: &mut LibraryBlockSink<'_>, paragraph_end: bool) {
     if sink.line.is_empty() {
-        if paragraph_end && sink.library.block_count > 0 {
-            sink.library.block_paragraph_end[sink.library.block_count - 1] = true;
+        if paragraph_end {
+            sink.library.mark_last_block_paragraph_end();
         }
         return;
     }
@@ -924,14 +903,13 @@ fn flush_styled_preview_line(sink: &mut LibraryBlockSink<'_>, paragraph_end: boo
     let role = sink.line_role;
     let align = sink.line_align;
     let style = reader_layout::first_styled_line_style(line.as_str()).unwrap_or(FontStyle::Regular);
-    let _ = push_preview_line_record(
+    let _ = sink.library.push_line_block(
         line.as_str(),
         style,
         role,
         align,
         paragraph_end,
         sink.spine_index,
-        sink.library,
     );
     sink.line.clear();
     sink.line_style = FontStyle::Regular;
@@ -948,50 +926,6 @@ fn is_leading_punctuation_word(word: &str) -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-fn push_preview_line_record(
-    line: &str,
-    style: FontStyle,
-    role: TextRole,
-    align: TextAlign,
-    paragraph_end: bool,
-    spine_index: u16,
-    library: &mut ReaderStore,
-) -> bool {
-    let line = line.trim();
-    if line.is_empty() || library.block_count >= library.blocks.len() {
-        return true;
-    }
-    let start = library.text_len;
-    let bytes = line.as_bytes();
-    if start + bytes.len() > library.text.len() || bytes.len() > u16::MAX as usize {
-        return false;
-    }
-    library.text[start..start + bytes.len()].copy_from_slice(bytes);
-    library.text_len += bytes.len();
-    library.blocks[library.block_count] = BlockRecord {
-        text_offset: start as u32,
-        text_len: bytes.len() as u16,
-        line_count: 1,
-        role,
-        style: proto_style_for_display_style(style),
-        align,
-    };
-    library.block_styles[library.block_count] = style;
-    library.block_spine[library.block_count] = spine_index;
-    library.block_paragraph_end[library.block_count] = paragraph_end;
-    library.block_count += 1;
-    true
-}
-
-fn proto_style_for_display_style(style: FontStyle) -> proto::text::FontStyle {
-    match style {
-        FontStyle::Regular => proto::text::FontStyle::Regular,
-        FontStyle::Italic => proto::text::FontStyle::Italic,
-        FontStyle::Bold => proto::text::FontStyle::Bold,
-        FontStyle::BoldItalic => proto::text::FontStyle::BoldItalic,
-    }
 }
 
 fn block_align_for(run_align: TextAlign, block: &str, role: TextRole) -> TextAlign {
