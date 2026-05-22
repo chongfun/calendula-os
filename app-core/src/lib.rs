@@ -250,11 +250,6 @@ impl ReaderState {
             (_, None) => {}
             (_, Some(Button::Power)) => {}
             (AppView::Home, Some(Button::Back)) => {
-                next.view = AppView::Library;
-                next.selection = 0;
-                next.read_request_pending = false;
-            }
-            (AppView::Home, Some(Button::Confirm)) => {
                 if self.book_id >= 2 {
                     next.view = AppView::Reading;
                     next.selection = self.chapter;
@@ -272,8 +267,13 @@ impl ReaderState {
                 } else {
                     next.view = AppView::Library;
                     next.selection = 0;
-                    next.read_request_pending = true;
+                    next.read_request_pending = false;
                 }
+            }
+            (AppView::Home, Some(Button::Confirm)) => {
+                next.view = AppView::Library;
+                next.selection = 0;
+                next.read_request_pending = false;
             }
             (AppView::Home, Some(Button::Previous)) => {
                 next.view = AppView::Sync;
@@ -399,18 +399,7 @@ impl ReaderState {
         match event {
             LibraryEvent::Scanned { count } => {
                 self.library_count = count;
-                if self.read_request_pending && count > 0 {
-                    self.book_id = 2;
-                    self.view = AppView::Reading;
-                    self.chapter = 0;
-                    self.selection = 0;
-                    self.page = 0;
-                    self.sd_page_count = 1;
-                    self.sd_chapter_count = 1;
-                    self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
-                    self.read_request_pending = false;
-                    self.dirty = Rect::FULL;
-                } else if self.view == AppView::Library {
+                if self.view == AppView::Library {
                     if count == 0 {
                         self.selection = 0;
                     } else if self.selection >= count {
@@ -639,7 +628,7 @@ mod tests {
 
     #[test]
     fn library_selection_opens_sd_book() {
-        let state = press(ReaderState::boot(), Button::Back)
+        let state = press(ReaderState::boot(), Button::Confirm)
             .apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
         let state = press(press(state, Button::Next), Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
@@ -669,14 +658,14 @@ mod tests {
     }
 
     #[test]
-    fn home_read_opens_first_sd_book_after_scan() {
+    fn catalog_scan_does_not_auto_open_from_files() {
         let state = press(ReaderState::boot(), Button::Confirm);
         assert_eq!(state.view, AppView::Library);
-        assert!(state.read_request_pending);
+        assert!(!state.read_request_pending);
 
         let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
-        assert_eq!(state.view, AppView::Reading);
-        assert_eq!(state.book_id, 2);
+        assert_eq!(state.view, AppView::Library);
+        assert_eq!(state.library_count, 2);
         assert!(!state.read_request_pending);
     }
 

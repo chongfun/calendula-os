@@ -6,6 +6,9 @@ library = "Scanned"
 count = 1
 
 [[steps]]
+button = "Confirm"
+
+[[steps]]
 library = "Loaded"
 book_id = 2
 pages = 3
