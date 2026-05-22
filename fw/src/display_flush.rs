@@ -3,7 +3,7 @@ use display::epd::{
     update_control_1, update_control_2, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
     CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2, CMD_MASTER_ACTIVATION,
     CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER, CMD_SET_RAM_Y_RANGE,
-    CMD_WRITE_RAM_BW, INIT_SEQUENCE,
+    CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, INIT_SEQUENCE,
 };
 use display::fb::Framebuffer;
 use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
@@ -37,7 +37,7 @@ pub(crate) async fn init_panel(epd: &mut Epd) {
 pub(crate) async fn flush(
     epd: &mut Epd,
     fb: &Framebuffer,
-    _prev_fb: &Framebuffer,
+    prev_fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
     screen_on: bool,
     mode: RefreshMode,
@@ -47,6 +47,13 @@ pub(crate) async fn flush(
 > {
     esp_println::println!("display: write BW RAM {:?}", mode);
     write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
+    if mode == RefreshMode::Fast {
+        esp_println::println!("display: write RED RAM previous");
+        write_ram(epd, CMD_WRITE_RAM_RED, prev_fb, tx_band).await?;
+    } else {
+        esp_println::println!("display: write RED RAM current");
+        write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await?;
+    }
 
     esp_println::println!("display: refresh activate");
     epd.command(CMD_DISPLAY_UPDATE_CTRL1, &update_control_1(mode))
