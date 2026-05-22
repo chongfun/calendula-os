@@ -2,7 +2,6 @@ use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
 use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, MAX_LIBRARY_BOOKS};
 use crate::{catalog, AppView, RenderRequest};
 use display::fb::Framebuffer;
-use display::font::literata;
 use display::render::{draw_ascii, fill_rect, stroke_rect};
 use display::{Rect, WIDTH};
 use proto::text::TextAlign;
@@ -137,82 +136,83 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
             draw_ascii(fb, sd_library.reader_error(), 20, 104, false);
         }
         BookLoadStatus::Ready => {
-            let page_top = 22i16;
-            let page_bottom = 472i16;
-            let page_count = reader_layout::reader_page_count(sd_library, page_top, page_bottom);
-            let requested_page = request.page.min(page_count - 1) as usize;
-            let page =
-                reader_layout::reader_page_at(sd_library, requested_page, page_top, page_bottom);
-            let mut y = page_bottom - 8;
-
-            for offset in 0..page.block_count as usize {
-                let index = page.first_block as usize + offset;
-                let Some(record) = sd_library.block_record(index) else {
-                    break;
-                };
-                let role = record.role;
-                let align = record.align;
-                let text = sd_library.block_text(index);
-                let advance = reader_layout::line_advance_for(role);
-                let style = sd_library.block_style(index);
-                let font = literata(style);
-                if y < page_top {
-                    break;
-                }
-
+            let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
+            let _ = plan.page_count();
+            plan.for_each_block(sd_library, |block| {
+                let role = block.record.role;
+                let align = block.record.align;
                 match align {
                     TextAlign::Left => {
                         let x = reader_layout::reader_x_for(role);
-                        if record.line_count == 1 {
-                            reader_layout::draw_styled_line(fb, text, x, y, style);
+                        if block.record.line_count == 1 {
+                            reader_layout::draw_styled_line(
+                                fb,
+                                block.text,
+                                x,
+                                block.y,
+                                block.style,
+                            );
                         } else {
                             reader_layout::draw_wrapped_literata(
                                 fb,
-                                font,
-                                text,
+                                block.font,
+                                block.text,
                                 x,
-                                y,
+                                block.y,
                                 reader_layout::reader_max_x_for(role, align),
-                                advance,
+                                block.advance,
                             );
                         }
                     }
                     TextAlign::Justify => {
                         let x = reader_layout::reader_x_for(role);
-                        if record.line_count == 1 {
-                            reader_layout::draw_styled_line(fb, text, x, y, style);
+                        if block.record.line_count == 1 {
+                            reader_layout::draw_styled_line(
+                                fb,
+                                block.text,
+                                x,
+                                block.y,
+                                block.style,
+                            );
                         } else {
                             reader_layout::draw_justified_wrapped_literata(
                                 fb,
-                                font,
-                                text,
+                                block.font,
+                                block.text,
                                 x,
-                                y,
+                                block.y,
                                 reader_layout::reader_max_x_for(role, align),
-                                advance,
+                                block.advance,
                             );
                         }
                     }
                     TextAlign::Center => {
-                        if record.line_count == 1 {
-                            let width = reader_layout::styled_text_ink_width(text, font)
-                                .min(READER_RIGHT_X - READER_LEFT_X);
+                        if block.record.line_count == 1 {
+                            let width =
+                                reader_layout::styled_text_ink_width(block.text, block.font)
+                                    .min(READER_RIGHT_X - READER_LEFT_X);
                             let x = ((WIDTH as i16 - width) / 2).max(READER_LEFT_X);
-                            reader_layout::draw_styled_line(fb, text, x, y, style);
+                            reader_layout::draw_styled_line(
+                                fb,
+                                block.text,
+                                x,
+                                block.y,
+                                block.style,
+                            );
                         } else {
                             reader_layout::draw_centered_wrapped_literata(
                                 fb,
-                                font,
-                                text,
-                                y,
+                                block.font,
+                                block.text,
+                                block.y,
                                 READER_RIGHT_X - READER_LEFT_X,
-                                advance,
+                                block.advance,
                             );
                         }
                     }
                 };
-                y -= advance + reader_layout::paragraph_gap_after(sd_library, index);
-            }
+                true
+            });
         }
     }
 }

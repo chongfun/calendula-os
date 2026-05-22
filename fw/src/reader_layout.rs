@@ -2,13 +2,78 @@ use crate::reader_store::ReaderStore;
 use display::fb::Framebuffer;
 use display::font::{draw_text_mirrored_y_glyphs, literata, measure_text, BitmapFont, FontStyle};
 use display::WIDTH;
-use proto::cache::PageRecord;
+use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
 
+pub(crate) const READER_PAGE_TOP: i16 = 22;
+pub(crate) const READER_PAGE_BOTTOM: i16 = 472;
 pub(crate) const READER_LEFT_X: i16 = 8;
 pub(crate) const READER_RIGHT_X: i16 = 792;
 pub(crate) const READER_WRAP_SAFETY: i16 = 4;
 pub(crate) const STYLE_MARKER: char = '\u{1b}';
+
+pub(crate) struct ReaderPagePlan {
+    page_count: u32,
+    page: PageRecord,
+}
+
+pub(crate) struct ReaderDrawableBlock<'a> {
+    pub(crate) record: BlockRecord,
+    pub(crate) text: &'a str,
+    pub(crate) y: i16,
+    pub(crate) advance: i16,
+    pub(crate) style: FontStyle,
+    pub(crate) font: &'static BitmapFont,
+}
+
+impl ReaderPagePlan {
+    pub(crate) fn new(sd_library: &ReaderStore, requested_page: u32) -> Self {
+        let page_count = reader_page_count(sd_library, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+        let requested_page = requested_page.min(page_count - 1) as usize;
+        let page = reader_page_at(
+            sd_library,
+            requested_page,
+            READER_PAGE_TOP,
+            READER_PAGE_BOTTOM,
+        );
+        Self { page_count, page }
+    }
+
+    pub(crate) fn page_count(&self) -> u32 {
+        self.page_count
+    }
+
+    pub(crate) fn for_each_block(
+        &self,
+        sd_library: &ReaderStore,
+        mut visit: impl FnMut(ReaderDrawableBlock<'_>) -> bool,
+    ) {
+        let mut y = READER_PAGE_BOTTOM - 8;
+        for offset in 0..self.page.block_count as usize {
+            let index = self.page.first_block as usize + offset;
+            let Some(record) = sd_library.block_record(index) else {
+                break;
+            };
+            let text = sd_library.block_text(index);
+            let advance = line_advance_for(record.role);
+            let style = sd_library.block_style(index);
+            if y < READER_PAGE_TOP {
+                break;
+            }
+            if !visit(ReaderDrawableBlock {
+                record,
+                text,
+                y,
+                advance,
+                style,
+                font: literata(style),
+            }) {
+                break;
+            }
+            y -= advance + paragraph_gap_after(sd_library, index);
+        }
+    }
+}
 
 pub(crate) fn reader_page_count(sd_library: &ReaderStore, page_top: i16, page_bottom: i16) -> u32 {
     if sd_library.page_count > 0 {

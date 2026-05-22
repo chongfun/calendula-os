@@ -460,7 +460,11 @@ where
         };
         xhtml_blocks_to_sink(xhtml, Some(&css_rules), &mut sink)?;
         let stopped = sink.stopped;
-        reader_layout::rebuild_page_index(library, 22, 472);
+        reader_layout::rebuild_page_index(
+            library,
+            reader_layout::READER_PAGE_TOP,
+            reader_layout::READER_PAGE_BOTTOM,
+        );
         if library.block_count() >= library.block_capacity().saturating_sub(4) {
             break;
         }
@@ -470,7 +474,11 @@ where
     }
 
     if library.block_count() > 0 {
-        reader_layout::rebuild_page_index(library, 22, 472);
+        reader_layout::rebuild_page_index(
+            library,
+            reader_layout::READER_PAGE_TOP,
+            reader_layout::READER_PAGE_BOTTOM,
+        );
         reader_layout::rebuild_toc_page_targets(library);
         library.set_cached_spine(start_spine.min(u16::MAX as usize) as u16);
         library.set_section_partial(
@@ -745,7 +753,11 @@ impl XhtmlBlockSink for LibraryBlockSink<'_> {
             align,
             paragraph_end,
         );
-        reader_layout::rebuild_page_index(self.library, 22, 472);
+        reader_layout::rebuild_page_index(
+            self.library,
+            reader_layout::READER_PAGE_TOP,
+            reader_layout::READER_PAGE_BOTTOM,
+        );
         self.stopped = self.library.page_count >= self.target_pages
             || self.library.block_count() >= self.library.block_capacity().saturating_sub(4);
         Ok(())
