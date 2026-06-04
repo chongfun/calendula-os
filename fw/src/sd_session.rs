@@ -24,13 +24,12 @@ impl TimeSource for StaticTime {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SdDelay;
 
 impl DelayNs for SdDelay {
     fn delay_ns(&mut self, ns: u32) {
-        for _ in 0..ns.saturating_div(100).max(1) {
-            core::hint::spin_loop();
-        }
+        sd_spi_pace(ns.saturating_div(100).max(1));
     }
 }
 
@@ -40,7 +39,16 @@ pub(crate) struct SdSpiDevice<'a, SPI, CS> {
     pub(crate) delay: SdDelay,
 }
 
-const SD_SPI_CHUNK_BYTES: usize = 512;
+const SD_SPI_CHUNK_BYTES: usize = 64;
+
+#[repr(align(4))]
+struct AlignedSdChunk([u8; SD_SPI_CHUNK_BYTES]);
+
+fn sd_spi_pace(iterations: u32) {
+    for _ in 0..iterations {
+        core::hint::spin_loop();
+    }
+}
 
 impl<SPI, CS> embedded_hal::spi::ErrorType for SdSpiDevice<'_, SPI, CS>
 where
@@ -87,15 +95,18 @@ where
 {
     fn read_with_sd_clocks(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            chunk.fill(0xFF);
-            self.spi.transfer_in_place(chunk)?;
+            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
+            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+            chunk.copy_from_slice(&bounce.0[..chunk.len()]);
         }
         Ok(())
     }
 
     fn write_chunked(&mut self, buffer: &[u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks(SD_SPI_CHUNK_BYTES) {
-            self.spi.write(chunk)?;
+            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
+            bounce.0[..chunk.len()].copy_from_slice(chunk);
+            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
         }
         Ok(())
     }
@@ -109,11 +120,11 @@ where
             .chunks_mut(SD_SPI_CHUNK_BYTES)
             .zip(write_common.chunks(SD_SPI_CHUNK_BYTES))
         {
-            let mut in_place = [0xFF; SD_SPI_CHUNK_BYTES];
-            in_place[..write_chunk.len()].copy_from_slice(write_chunk);
+            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
+            bounce.0[..write_chunk.len()].copy_from_slice(write_chunk);
             self.spi
-                .transfer_in_place(&mut in_place[..write_chunk.len()])?;
-            read_chunk.copy_from_slice(&in_place[..read_chunk.len()]);
+                .transfer_in_place(&mut bounce.0[..write_chunk.len()])?;
+            read_chunk.copy_from_slice(&bounce.0[..read_chunk.len()]);
         }
         if !read_tail.is_empty() {
             self.read_with_sd_clocks(read_tail)?;
@@ -126,13 +137,17 @@ where
 
     fn transfer_in_place_chunked(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            self.spi.transfer_in_place(chunk)?;
+            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
+            bounce.0[..chunk.len()].copy_from_slice(chunk);
+            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+            chunk.copy_from_slice(&bounce.0[..chunk.len()]);
         }
         Ok(())
     }
 }
 
 type SdSpi<'a> = SdSpiDevice<'a, SpiDmaBus<'static, SPI2, FullDuplexMode, Async>, Output<'static>>;
+
 type SdCardDevice<'a> = SdCard<SdSpi<'a>, SdDelay>;
 pub(crate) type SdRoot<'a> = Directory<'a, SdCardDevice<'a>, StaticTime, 8, 8, 1>;
 
@@ -190,5 +205,6 @@ pub(crate) fn with_root<R>(
     };
 
     esp_println::println!("sd: session exit");
+    sd_cs.set_high();
     result
 }

@@ -60,7 +60,16 @@ pub async fn run() {
                 state = state.apply_input(ctx, event);
                 let _pending_persist = state.persisted();
                 if let Some(command) = storage_command_for_transition(previous, state) {
-                    pending_storage = Some(command);
+                    if should_send_storage_immediately(command) {
+                        log_storage_command("send", command);
+                        if STORAGE_COMMANDS.try_send(command).is_err() {
+                            log_storage_command("queue", command);
+                            pending_storage = Some(command);
+                        }
+                    } else {
+                        log_storage_command("queue", command);
+                        pending_storage = Some(command);
+                    }
                 }
                 if rendering {
                     render_pending = true;
@@ -75,11 +84,15 @@ pub async fn run() {
                     rendering = false;
                     if !catalog_refresh_requested {
                         catalog_refresh_requested = true;
-                        STORAGE_COMMANDS
-                            .send(StorageCommand::LoadCatalogCache)
-                            .await;
+                        if STORAGE_COMMANDS
+                            .try_send(StorageCommand::LoadCatalogCache)
+                            .is_err()
+                        {
+                            esp_println::println!("app: storage queue full for catalog cache");
+                        }
                     }
                     if let Some(command) = pending_storage.take() {
+                        log_storage_command("send", command);
                         STORAGE_COMMANDS.send(command).await;
                     }
                     if render_pending {
@@ -105,7 +118,11 @@ pub async fn run() {
                 }
             },
             Either3::Third(event) => {
+                let should_render = library_event_affects_view(state, event);
                 state = state.apply_library_event(ctx, event);
+                if !should_render {
+                    continue;
+                }
                 if rendering {
                     render_pending = true;
                 } else {
@@ -118,10 +135,77 @@ pub async fn run() {
     }
 }
 
+fn library_event_affects_view(state: ReaderState, event: crate::LibraryEvent) -> bool {
+    match event {
+        crate::LibraryEvent::Scanned { count } => {
+            state.view == AppView::Library && state.library_count != count
+        }
+        crate::LibraryEvent::Loaded {
+            book_id,
+            pages,
+            chapters,
+        } => {
+            state.book_id == book_id
+                && (state.sd_page_count != pages.max(1)
+                    || state.sd_chapter_count != chapters.max(1))
+        }
+        crate::LibraryEvent::ChapterPage {
+            book_id,
+            chapter,
+            page,
+        } => {
+            state.book_id == book_id
+                && state
+                    .sd_chapter_pages
+                    .get(chapter as usize)
+                    .map(|stored| *stored != page.min(u16::MAX as u32) as u16)
+                    .unwrap_or(false)
+        }
+        crate::LibraryEvent::Restored { .. } => true,
+    }
+}
+
+fn should_send_storage_immediately(command: StorageCommand) -> bool {
+    matches!(
+        command,
+        StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }
+    )
+}
+
 async fn send_render(kind: RenderKind, state: ReaderState) {
     DISPLAY_COMMANDS
         .send(DisplayCommand::Render(state.render_request(kind)))
         .await;
+}
+
+fn log_storage_command(label: &str, command: StorageCommand) {
+    match command {
+        StorageCommand::OpenBook {
+            book_id,
+            index,
+            chapter,
+            target_pages,
+        } => esp_println::println!(
+            "app: storage {label} open book_id={book_id} index={index} chapter={chapter} target={target_pages}"
+        ),
+        StorageCommand::ExtendSection {
+            book_id,
+            index,
+            chapter,
+            target_pages,
+        } => esp_println::println!(
+            "app: storage {label} extend book_id={book_id} index={index} chapter={chapter} target={target_pages}"
+        ),
+        StorageCommand::StoreProgress(_) => {
+            esp_println::println!("app: storage {label} progress")
+        }
+        StorageCommand::LoadCatalogCache => {
+            esp_println::println!("app: storage {label} load catalog cache")
+        }
+        StorageCommand::RefreshCatalog => {
+            esp_println::println!("app: storage {label} refresh catalog")
+        }
+    }
 }
 
 fn reducer_context() -> ReducerContext {

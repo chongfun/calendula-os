@@ -17,6 +17,23 @@ use esp_hal::gpio::Output;
 use hal_ext::nvm::AppStateRecord;
 use static_cell::ConstStaticCell;
 
+static EPUB_TAIL: ConstStaticCell<[u8; READER_TAIL_SCRATCH]> =
+    ConstStaticCell::new([0; READER_TAIL_SCRATCH]);
+static EPUB_HEADER: ConstStaticCell<[u8; READER_HEADER_SCRATCH]> =
+    ConstStaticCell::new([0; READER_HEADER_SCRATCH]);
+static EPUB_NAME: ConstStaticCell<[u8; proto::epub::MAX_ENTRY_NAME_BYTES]> =
+    ConstStaticCell::new([0; proto::epub::MAX_ENTRY_NAME_BYTES]);
+static EPUB_COMPRESSED: ConstStaticCell<[u8; READER_COMPRESSED_SCRATCH]> =
+    ConstStaticCell::new([0; READER_COMPRESSED_SCRATCH]);
+static EPUB_CONTAINER: ConstStaticCell<[u8; READER_CONTAINER_SCRATCH]> =
+    ConstStaticCell::new([0; READER_CONTAINER_SCRATCH]);
+static EPUB_OPF: ConstStaticCell<[u8; READER_OPF_SCRATCH]> =
+    ConstStaticCell::new([0; READER_OPF_SCRATCH]);
+static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
+    ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
+static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
+    static_cell::StaticCell::new();
+
 #[embassy_executor::task]
 pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     esp_println::println!("display: started");
@@ -27,31 +44,14 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let prev_fb = PREV_FB.init(Framebuffer::new());
     static TX_BAND: static_cell::StaticCell<[u8; BAND_BYTES]> = static_cell::StaticCell::new();
     let tx_band = TX_BAND.init([0; BAND_BYTES]);
-    static EPUB_TAIL: ConstStaticCell<[u8; READER_TAIL_SCRATCH]> =
-        ConstStaticCell::new([0; READER_TAIL_SCRATCH]);
-    static EPUB_HEADER: ConstStaticCell<[u8; READER_HEADER_SCRATCH]> =
-        ConstStaticCell::new([0; READER_HEADER_SCRATCH]);
-    static EPUB_NAME: ConstStaticCell<[u8; proto::epub::MAX_ENTRY_NAME_BYTES]> =
-        ConstStaticCell::new([0; proto::epub::MAX_ENTRY_NAME_BYTES]);
-    static EPUB_COMPRESSED: ConstStaticCell<[u8; READER_COMPRESSED_SCRATCH]> =
-        ConstStaticCell::new([0; READER_COMPRESSED_SCRATCH]);
-    static EPUB_CONTAINER: ConstStaticCell<[u8; READER_CONTAINER_SCRATCH]> =
-        ConstStaticCell::new([0; READER_CONTAINER_SCRATCH]);
-    static EPUB_OPF: ConstStaticCell<[u8; READER_OPF_SCRATCH]> =
-        ConstStaticCell::new([0; READER_OPF_SCRATCH]);
-    static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
-        ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
-    static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
-        static_cell::StaticCell::new();
     let mut epub_scratch = None;
+    let mut refresh_planner = RefreshPlanner::new();
+    static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
+    let sd_library = SD_LIBRARY.take();
 
     esp_println::println!("display: init start");
     display_flush::init_panel(&mut epd).await;
     esp_println::println!("display: init complete");
-
-    let mut refresh_planner = RefreshPlanner::new();
-    static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
-    let sd_library = SD_LIBRARY.take();
     loop {
         match select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await {
             Either::First(DisplayCommand::Render(request)) => {
@@ -125,19 +125,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut sd_cs,
                     sd_library,
                     &mut epub_scratch,
-                    || {
-                        EPUB_SCRATCH.init_with(|| {
-                            ReaderCacheScratch::new(
-                                EPUB_TAIL.take(),
-                                EPUB_HEADER.take(),
-                                EPUB_NAME.take(),
-                                EPUB_COMPRESSED.take(),
-                                EPUB_CONTAINER.take(),
-                                EPUB_OPF.take(),
-                                EPUB_XHTML.take(),
-                            )
-                        })
-                    },
                 );
             }
         }
@@ -156,21 +143,19 @@ fn handle_storage_command(
     sd_cs: &mut Output<'static>,
     sd_library: &mut ReaderStore,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
-    init_scratch: impl FnOnce() -> &'static mut ReaderCacheScratch<'static>,
 ) {
     match command {
         StorageCommand::LoadCatalogCache => {
             if crate::library_sd::load_catalog_cache(epd, sd_cs, sd_library) {
-                let _ = LIBRARY_EVENTS.try_send(LibraryEvent::Scanned {
-                    count: sd_library.catalog_count_u8(),
-                });
+                let count = sd_library.catalog_count_u8();
+                send_library_event(LibraryEvent::Scanned { count });
             } else {
                 let _ = STORAGE_COMMANDS.try_send(StorageCommand::RefreshCatalog);
             }
         }
         StorageCommand::RefreshCatalog => {
             crate::library_sd::scan_books(epd, sd_cs, sd_library);
-            let _ = LIBRARY_EVENTS.try_send(LibraryEvent::Scanned {
+            send_library_event(LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u8(),
             });
         }
@@ -194,7 +179,7 @@ fn handle_storage_command(
                 target_pages
             );
             sd_library.set_reader_status(BookLoadStatus::Loading);
-            let scratch = epub_scratch.get_or_insert_with(init_scratch);
+            let scratch = ensure_epub_scratch(epub_scratch);
             reader_cache::build_or_load_book_cache(
                 epd,
                 sd_cs,
@@ -204,7 +189,7 @@ fn handle_storage_command(
                 target_pages as usize,
                 scratch,
             );
-            let _ = LIBRARY_EVENTS.try_send(LibraryEvent::Loaded {
+            send_library_event(LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
@@ -235,6 +220,26 @@ fn handle_storage_command(
             );
         }
     }
+}
+
+fn ensure_epub_scratch<'a>(
+    epub_scratch: &'a mut Option<&'static mut ReaderCacheScratch<'static>>,
+) -> &'a mut ReaderCacheScratch<'static> {
+    if epub_scratch.is_none() {
+        esp_println::println!("storage: init epub scratch");
+        *epub_scratch = Some(EPUB_SCRATCH.init_with(|| {
+            ReaderCacheScratch::new(
+                EPUB_TAIL.take(),
+                EPUB_HEADER.take(),
+                EPUB_NAME.take(),
+                EPUB_COMPRESSED.take(),
+                EPUB_CONTAINER.take(),
+                EPUB_OPF.take(),
+                EPUB_XHTML.take(),
+            )
+        }));
+    }
+    epub_scratch.as_deref_mut().unwrap()
 }
 
 fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {

@@ -615,18 +615,6 @@ impl ReaderStore {
         self.reader_status
     }
 
-    pub(crate) fn reader_status_for(&self, book_id: u32) -> BookLoadStatus {
-        let selected_index = Self::selected_book_index(book_id);
-        match self.reader_status {
-            BookLoadStatus::Ready | BookLoadStatus::Error
-                if self.loaded_index != selected_index =>
-            {
-                BookLoadStatus::Loading
-            }
-            status => status,
-        }
-    }
-
     pub(crate) fn reader_error(&self) -> &str {
         self.error.as_str()
     }

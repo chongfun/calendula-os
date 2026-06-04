@@ -12,6 +12,7 @@ const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 const CATALOG_VERSION: u8 = 1;
 const CATALOG_HEADER_BYTES: usize = 8;
 const CATALOG_RECORD_BYTES: usize = 92;
+const LEGACY_CACHE_MIGRATION_ENABLED: bool = false;
 
 pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &mut ReaderStore) {
     esp_println::println!("sd: scan start");
@@ -62,6 +63,10 @@ fn migrate_reader_cache<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if !LEGACY_CACHE_MIGRATION_ENABLED {
+        esp_println::println!("cache: legacy migration disabled");
+        return;
+    }
     for entry in library.catalog_entries() {
         let key = proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size);
         match reader_cache_files::migrate_v1_cache_for_entry(

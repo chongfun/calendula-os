@@ -24,14 +24,13 @@ use proto::text::{TextAlign, TextRole};
 
 pub(crate) const READER_TAIL_SCRATCH: usize = 4096;
 pub(crate) const READER_HEADER_SCRATCH: usize = 46;
-pub(crate) const READER_COMPRESSED_SCRATCH: usize = 24_576;
+pub(crate) const READER_COMPRESSED_SCRATCH: usize = 16_384;
 pub(crate) const READER_CONTAINER_SCRATCH: usize = 4096;
 pub(crate) const READER_OPF_SCRATCH: usize = 16_384;
-pub(crate) const READER_XHTML_SCRATCH: usize = 61_440;
+pub(crate) const READER_XHTML_SCRATCH: usize = 24_576;
 const EPUB_READ_AT_CHUNK_BYTES: usize = 2048;
-const EPUB_OPEN_READ_OP_LIMIT: u16 = 4096;
-const EPUB_OPEN_READ_BYTE_LIMIT: u32 = 4 * 1024 * 1024;
-const QUICK_OPEN_MAX_SECTIONS: usize = 4;
+const EPUB_OPEN_READ_OP_LIMIT: u32 = 65_536;
+const EPUB_OPEN_READ_BYTE_LIMIT: u32 = 64 * 1024 * 1024;
 
 pub(crate) struct ReaderCacheScratch<'a> {
     tail: &'a mut [u8; READER_TAIL_SCRATCH],
@@ -124,47 +123,65 @@ pub(crate) fn build_or_load_book_cache(
     }
 
     let status = sd_session::with_root(epd, sd_cs, |root| {
-        esp_println::println!("epub: card init begin");
-        esp_println::println!("epub: open root");
-        let mut open_name = String::<16>::new();
-        let mut display_name = String::<64>::new();
-        let Some(entry) = library.catalog_entry(index) else {
-            return BookLoadStatus::Error;
-        };
-        let in_books_dir = entry.in_books_dir;
-        let _ = open_name.push_str(&entry.open_name);
-        let _ = display_name.push_str(&entry.display_name);
+        build_or_load_book_cache_from_root(
+            root,
+            library,
+            index,
+            requested_chapter,
+            target_pages,
+            scratch,
+        )
+    })
+    .unwrap_or_else(|err| {
+        esp_println::println!("epub: session failed: {:?}", err);
+        set_preview_error(library, session_error_label(err));
+        BookLoadStatus::Error
+    });
 
-        if in_books_dir {
-            let load_result = match root.open_dir("BOOKS") {
-                Ok(books) => match books.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
-                    Ok(file) => Some(build_or_load_epub_cache_from_file(
-                        file,
-                        &root,
-                        &display_name,
-                        requested_chapter,
-                        target_pages,
-                        library,
-                        scratch,
-                    )),
-                    Err(err) => {
-                        esp_println::println!("epub: open file failed: {:?}", err);
-                        set_preview_error(library, "FILE");
-                        None
-                    }
-                },
-                Err(err) => {
-                    esp_println::println!("epub: open /books failed: {:?}", err);
-                    set_preview_error(library, "BOOKS DIR");
-                    None
-                }
-            };
-            status_for_load_result(load_result, library)
-        } else {
-            let load_result = match root.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
+    library.finish_book_load(index, requested_chapter, status);
+}
+
+pub(crate) fn build_or_load_book_cache_from_root<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &mut ReaderStore,
+    index: usize,
+    requested_chapter: u8,
+    target_pages: usize,
+    scratch: &mut ReaderCacheScratch<'_>,
+) -> BookLoadStatus
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    esp_println::println!("epub: card init begin");
+    esp_println::println!("epub: open root");
+    let mut open_name = String::<16>::new();
+    let mut display_name = String::<64>::new();
+    let Some(entry) = library.catalog_entry(index) else {
+        return BookLoadStatus::Error;
+    };
+    let in_books_dir = entry.in_books_dir;
+    let _ = open_name.push_str(&entry.open_name);
+    let _ = display_name.push_str(&entry.display_name);
+    esp_println::println!(
+        "epub: catalog entry display='{}' open='{}' books={}",
+        display_name,
+        open_name,
+        in_books_dir
+    );
+
+    if in_books_dir {
+        let load_result = match root.open_dir("BOOKS") {
+            Ok(books) => match books.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
                 Ok(file) => Some(build_or_load_epub_cache_from_file(
                     file,
-                    &root,
+                    root,
                     &display_name,
                     requested_chapter,
                     target_pages,
@@ -176,17 +193,33 @@ pub(crate) fn build_or_load_book_cache(
                     set_preview_error(library, "FILE");
                     None
                 }
-            };
-            status_for_load_result(load_result, library)
-        }
-    })
-    .unwrap_or_else(|err| {
-        esp_println::println!("epub: session failed: {:?}", err);
-        set_preview_error(library, session_error_label(err));
-        BookLoadStatus::Error
-    });
-
-    library.finish_book_load(index, requested_chapter, status);
+            },
+            Err(err) => {
+                esp_println::println!("epub: open /books failed: {:?}", err);
+                set_preview_error(library, "BOOKS DIR");
+                None
+            }
+        };
+        status_for_load_result(load_result, library)
+    } else {
+        let load_result = match root.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
+            Ok(file) => Some(build_or_load_epub_cache_from_file(
+                file,
+                root,
+                &display_name,
+                requested_chapter,
+                target_pages,
+                library,
+                scratch,
+            )),
+            Err(err) => {
+                esp_println::println!("epub: open file failed: {:?}", err);
+                set_preview_error(library, "FILE");
+                None
+            }
+        };
+        status_for_load_result(load_result, library)
+    }
 }
 
 pub(crate) fn store_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>, record: AppStateRecord) {
@@ -308,6 +341,7 @@ where
     esp_println::println!("epub: zip open len={}", source_len);
     let reader = SdFileReadAt {
         file,
+        len: source_len,
         read_ops: 0,
         read_bytes: 0,
     };
@@ -472,15 +506,6 @@ where
             Err(err) => return Err(err.into()),
         }
         sink.finish_spine(!xhtml_complete);
-        if section_count >= QUICK_OPEN_MAX_SECTIONS {
-            book_partial = true;
-            esp_println::println!(
-                "epub: bounded open publishing partial book after {} section(s), {} page(s)",
-                section_count,
-                total_pages
-            );
-            break;
-        }
     }
 
     if section_count > 0 && total_pages > 0 {
@@ -626,7 +651,8 @@ struct SdFileReadAt<
     T: TimeSource,
 {
     file: File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    read_ops: u16,
+    len: u32,
+    read_ops: u32,
     read_bytes: u32,
 }
 
@@ -639,7 +665,7 @@ where
     type Error = ();
 
     fn len(&mut self) -> Result<u32, Self::Error> {
-        Ok(self.file.length())
+        Ok(self.len)
     }
 
     fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
@@ -656,9 +682,11 @@ where
         }
         let requested = out.len();
         let remaining_budget = EPUB_OPEN_READ_BYTE_LIMIT.saturating_sub(self.read_bytes) as usize;
+        let sector_remaining = 512usize - (offset as usize & 511);
         let read_len = requested
             .min(EPUB_READ_AT_CHUNK_BYTES)
-            .min(remaining_budget);
+            .min(remaining_budget)
+            .min(sector_remaining);
         if read_len == 0 {
             return Err(());
         }
@@ -668,8 +696,10 @@ where
                 last_err = Some(err);
                 continue;
             }
-            match self.file.read(&mut out[..read_len]) {
+            let mut read_bounce = [0u8; 512];
+            match self.file.read(&mut read_bounce[..read_len]) {
                 Ok(count) => {
+                    out[..count].copy_from_slice(&read_bounce[..count]);
                     self.read_ops = self.read_ops.saturating_add(1);
                     self.read_bytes = self.read_bytes.saturating_add(count as u32);
                     if attempt > 0 {
@@ -794,6 +824,9 @@ where
             self.stopped = true;
             return false;
         }
+        if partial {
+            *self.book_partial = true;
+        }
 
         self.library.set_cached_spine(self.spine_index);
         self.library.set_section_partial(partial);
@@ -817,10 +850,6 @@ where
         };
         *self.total_pages = (*self.total_pages).saturating_add(self.library.page_count as u32);
         *self.section_count += 1;
-        if *self.section_count >= QUICK_OPEN_MAX_SECTIONS {
-            *self.book_partial = true;
-            self.stopped = true;
-        }
         self.library.clear_lines();
         true
     }

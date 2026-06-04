@@ -8,6 +8,7 @@ const POLL_MS: u64 = 40;
 const CALIBRATION_ONLY: bool = false;
 const RAW_LOG_ENABLED: bool = false;
 const DEBOUNCE_TICKS: u8 = 2;
+const REPEAT_COOLDOWN_TICKS: u8 = 12;
 const NAV_BACK_MIN_MV: u16 = 2400;
 const NAV_BACK_MAX_MV: u16 = 2700;
 const RAW_LOG_TICKS: u8 = 25;
@@ -37,6 +38,8 @@ struct StableButton {
     candidate: Option<HardwareButton>,
     current: Option<HardwareButton>,
     ticks: u8,
+    armed: bool,
+    cooldown: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,16 +169,14 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
 }
 
 async fn emit(button: Option<Button>, sample: RawSample) {
-    let _ = INPUT_EVENTS
-        .send(InputEvent::Sample {
-            button,
-            aux_raw: sample.aux,
-            nav_raw: sample.nav,
-            page_raw: sample.page,
-            battery_mv: battery_mv(sample.aux),
-            battery_percent: battery_percent(sample.aux),
-        })
-        .await;
+    let _ = INPUT_EVENTS.try_send(InputEvent::Sample {
+        button,
+        aux_raw: sample.aux,
+        nav_raw: sample.nav,
+        page_raw: sample.page,
+        battery_mv: battery_mv(sample.aux),
+        battery_percent: battery_percent(sample.aux),
+    });
 }
 
 fn battery_mv(aux_mv: u16) -> u16 {
@@ -207,10 +208,13 @@ impl StableButton {
             candidate: None,
             current: None,
             ticks: 0,
+            armed: true,
+            cooldown: 0,
         }
     }
 
     fn update(&mut self, next: Option<HardwareButton>) -> Option<StableEvent> {
+        self.cooldown = self.cooldown.saturating_sub(1);
         if next == self.candidate {
             self.ticks = self.ticks.saturating_add(1);
         } else {
@@ -223,6 +227,15 @@ impl StableButton {
         }
 
         self.current = self.candidate;
+        if self.current.is_none() {
+            self.armed = true;
+            return None;
+        }
+        if !self.armed || self.cooldown > 0 {
+            return None;
+        }
+        self.armed = false;
+        self.cooldown = REPEAT_COOLDOWN_TICKS;
         self.current.map(StableEvent::Changed)
     }
 }
