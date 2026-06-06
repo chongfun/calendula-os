@@ -60,7 +60,8 @@ pub async fn run() {
                 let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
                 let next_persisted = state.persisted();
-                if let Some(command) = storage_command_for_transition(previous, state) {
+                let storage_command = storage_command_for_transition(previous, state);
+                if let Some(command) = storage_command {
                     if should_send_storage_immediately(command) {
                         log_storage_command("send", command);
                         if STORAGE_COMMANDS.try_send(command).is_err() {
@@ -77,6 +78,13 @@ pub async fn run() {
                     if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
                         pending_storage = Some(command);
                     }
+                }
+                if storage_command
+                    .map(should_wait_for_loaded_before_render)
+                    .unwrap_or(false)
+                {
+                    render_pending = false;
+                    continue;
                 }
                 if rendering {
                     render_pending = true;
@@ -169,6 +177,13 @@ fn library_event_affects_view(state: ReaderState, event: crate::LibraryEvent) ->
 }
 
 fn should_send_storage_immediately(command: StorageCommand) -> bool {
+    matches!(
+        command,
+        StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }
+    )
+}
+
+fn should_wait_for_loaded_before_render(command: StorageCommand) -> bool {
     matches!(
         command,
         StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }

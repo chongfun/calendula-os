@@ -338,6 +338,39 @@ where
 
     esp_println::println!("epub: stage ResolveCatalogEntry key={}", cache_key.as_str());
     esp_println::println!("epub: stage OpenSdFile len={}", source_len);
+    let requested_global_page = target_pages as u32;
+    esp_println::println!(
+        "epub: stage TryV2BookIndexFast page={}",
+        requested_global_page
+    );
+    match reader_cache_files::load_v2_book_index(root, cache_key.as_str(), source_identity, library)
+    {
+        BookIndexLoadResult::Hit => {
+            match reader_cache_files::load_v2_section_by_global_page(
+                root,
+                cache_key.as_str(),
+                source_identity,
+                requested_global_page,
+                library,
+            ) {
+                CacheLoadResult::Hit { pages } => {
+                    library.set_book_labels(source_path, "");
+                    reader_layout::rebuild_toc_page_targets(library);
+                    esp_println::println!(
+                        "epub: v2 fast book cache ready after {} ms (total={} section_pages={})",
+                        open_started.elapsed().as_millis(),
+                        library.advertised_page_count(),
+                        pages
+                    );
+                    return Ok(());
+                }
+                other => esp_println::println!("epub: fast book index section load {:?}", other),
+            }
+        }
+        BookIndexLoadResult::Invalid => esp_println::println!("epub: v2 fast book index invalid"),
+        BookIndexLoadResult::Miss => esp_println::println!("epub: v2 fast book index miss"),
+    }
+
     esp_println::println!("epub: zip open len={}", source_len);
     let reader = SdFileReadAt {
         file,
@@ -412,7 +445,6 @@ where
     );
     let css_rules = CssRules::new();
 
-    let requested_global_page = target_pages as u32;
     esp_println::println!("epub: stage TryV2BookIndex page={}", requested_global_page);
     match reader_cache_files::load_v2_book_index(root, cache_key.as_str(), source_identity, library)
     {
