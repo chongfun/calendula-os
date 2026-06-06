@@ -1,9 +1,12 @@
 use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
 use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, MAX_LIBRARY_BOOKS};
 use crate::{catalog, AppView, ReaderSource, RenderRequest};
+use core::fmt::Write;
 use display::fb::Framebuffer;
+use display::font::{draw_text, literata, measure_text, FontStyle};
 use display::render::{draw_ascii, fill_rect, stroke_rect};
 use display::{Rect, WIDTH};
+use heapless::String;
 use proto::text::TextAlign;
 use ui::{
     app_render::{self, UiRenderModel},
@@ -180,7 +183,7 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
         }
         BookLoadStatus::Ready => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
-            let _ = plan.page_count();
+            let page_count = plan.page_count().max(1);
             plan.for_each_block(sd_library, |block| {
                 let role = block.record.role;
                 let align = block.record.align;
@@ -256,7 +259,72 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
                 };
                 true
             });
+            draw_reader_footer(fb, request, sd_library, page_count);
         }
+    }
+}
+
+fn draw_reader_footer(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    page_count: u32,
+) {
+    let font = literata(FontStyle::Italic);
+    fill_rect(
+        fb,
+        Rect::new(8, reader_layout::READER_FOOTER_TOP as u16, 784, 1),
+        false,
+    );
+    let fallback = catalog::active_book(request.book_id);
+    let (title, _) = sd_library.active_book_labels(request.book_id, fallback.title, "");
+    draw_text_truncated_local(fb, font, title, 12, 462, 560);
+
+    let mut label = String::<32>::new();
+    let current = request.page.saturating_add(1).min(page_count);
+    let _ = write!(label, "Page {}/{}", current, page_count);
+    let label_width = measure_text(font, label.as_str()) as i16;
+    draw_text(
+        fb,
+        font,
+        label.as_str(),
+        (READER_RIGHT_X - label_width).max(600),
+        462,
+        false,
+    );
+}
+
+fn draw_text_truncated_local(
+    fb: &mut Framebuffer,
+    font: &'static display::font::BitmapFont,
+    text: &str,
+    x: i16,
+    y: i16,
+    max_width: i16,
+) {
+    if measure_text(font, text) as i16 <= max_width {
+        draw_text(fb, font, text, x, y, false);
+        return;
+    }
+    let mut end = text.len();
+    while end > 0 {
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = &text[..end];
+        if measure_text(font, candidate) as i16 <= max_width - 18 {
+            draw_text(fb, font, candidate, x, y, false);
+            draw_text(
+                fb,
+                font,
+                "...",
+                x + measure_text(font, candidate) as i16 + 4,
+                y,
+                false,
+            );
+            return;
+        }
+        end = end.saturating_sub(1);
     }
 }
 

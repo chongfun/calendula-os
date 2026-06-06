@@ -5,11 +5,13 @@ use display::WIDTH;
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
 
-pub(crate) const READER_PAGE_TOP: i16 = 22;
-pub(crate) const READER_PAGE_BOTTOM: i16 = 472;
+pub(crate) const READER_PAGE_TOP: i16 = 28;
+pub(crate) const READER_FOOTER_TOP: i16 = 438;
+pub(crate) const READER_PAGE_BOTTOM: i16 = READER_FOOTER_TOP - 14;
 pub(crate) const READER_LEFT_X: i16 = 8;
 pub(crate) const READER_RIGHT_X: i16 = 792;
 pub(crate) const READER_WRAP_SAFETY: i16 = 4;
+pub(crate) const READER_LAYOUT_CONFIG: u16 = 2;
 pub(crate) const STYLE_MARKER: char = '\u{1b}';
 
 pub(crate) struct ReaderPagePlan {
@@ -48,7 +50,7 @@ impl ReaderPagePlan {
         sd_library: &ReaderStore,
         mut visit: impl FnMut(ReaderDrawableBlock<'_>) -> bool,
     ) {
-        let mut y = READER_PAGE_BOTTOM - 8;
+        let mut y = READER_PAGE_TOP;
         for offset in 0..self.page.block_count as usize {
             let index = self.page.first_block as usize + offset;
             let Some(record) = sd_library.block_record(index) else {
@@ -57,20 +59,21 @@ impl ReaderPagePlan {
             let text = sd_library.block_text(index);
             let advance = line_advance_for(record.role);
             let style = sd_library.block_style(index);
-            if y < READER_PAGE_TOP {
+            let block_height = sd_block_height(sd_library, index);
+            if y + block_height > READER_PAGE_BOTTOM && y > READER_PAGE_TOP {
                 break;
             }
             if !visit(ReaderDrawableBlock {
                 record,
                 text,
-                y,
+                y: y + advance,
                 advance,
                 style,
                 font: literata(style),
             }) {
                 break;
             }
-            y -= advance + paragraph_gap_after(sd_library, index);
+            y += block_height;
         }
     }
 }

@@ -1,3 +1,4 @@
+use crate::reader_layout;
 use crate::reader_store::{
     ReaderStore, EMPTY_BOOK_SECTION_RECORD, EMPTY_TOC_RECORD, MAX_BOOK_SECTIONS, MAX_SD_TOC_ITEMS,
     MAX_SD_TOC_TEXT_BYTES,
@@ -20,7 +21,7 @@ const MIGRATE_MAX_SECTIONS: u16 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CacheLoadResult {
-    Hit { pages: usize },
+    Hit { pages: usize, repaginated: bool },
     Miss,
     Invalid,
     TooShort { pages: usize },
@@ -219,7 +220,7 @@ where
                 .min(u32::MAX as usize) as u32,
             viewport_width: 800,
             viewport_height: 480,
-            font_config: 1,
+            font_config: reader_layout::READER_LAYOUT_CONFIG,
             partial,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
@@ -294,8 +295,11 @@ where
         section.page_count as usize,
         library,
     );
-    if matches!(result, CacheLoadResult::Hit { .. }) {
-        library.set_current_section_range(section.start_page, section.page_count as usize);
+    if let CacheLoadResult::Hit { pages, repaginated } = result {
+        library.set_current_section_range(section.start_page, pages);
+        if repaginated {
+            let _ = write_v2_section_cache(root, key, source_identity, section.section, library);
+        }
     }
     result
 }
@@ -357,14 +361,25 @@ where
         {
             return CacheLoadResult::Invalid;
         }
+        let layout_matches = header.font_config == reader_layout::READER_LAYOUT_CONFIG;
         if !load_v2_section_body(file, header, library) {
             return CacheLoadResult::Invalid;
         }
-        let pages = header.page_count as usize;
+        if !layout_matches {
+            reader_layout::rebuild_page_index(
+                library,
+                reader_layout::READER_PAGE_TOP,
+                reader_layout::READER_PAGE_BOTTOM,
+            );
+        }
+        let pages = library.page_count;
         if pages < target_pages {
             CacheLoadResult::TooShort { pages }
         } else {
-            CacheLoadResult::Hit { pages }
+            CacheLoadResult::Hit {
+                pages,
+                repaginated: !layout_matches,
+            }
         }
     })
     .unwrap_or(CacheLoadResult::Miss)
@@ -701,7 +716,7 @@ where
         text_bytes: library.text_len.min(u32::MAX as usize) as u32,
         viewport_width: 800,
         viewport_height: 480,
-        font_config: 1,
+        font_config: reader_layout::READER_LAYOUT_CONFIG,
         bytes_consumed: 0,
         total_bytes: 0,
         partial: library.section_partial,

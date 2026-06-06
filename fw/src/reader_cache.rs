@@ -354,7 +354,7 @@ where
                 requested_global_page,
                 library,
             ) {
-                CacheLoadResult::Hit { pages } => {
+                CacheLoadResult::Hit { pages, .. } => {
                     library.set_book_labels(source_path, "");
                     reader_layout::rebuild_toc_page_targets(library);
                     esp_println::println!(
@@ -482,7 +482,7 @@ where
                 requested_global_page,
                 library,
             ) {
-                CacheLoadResult::Hit { pages } => {
+                CacheLoadResult::Hit { pages, .. } => {
                     reader_layout::rebuild_toc_page_targets(library);
                     esp_println::println!(
                         "epub: v2 book cache ready after {} ms (total={} section_pages={} toc={})",
