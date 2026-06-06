@@ -196,8 +196,10 @@ impl RefreshPlanner {
     }
 
     fn needs_clean_selection_refresh(request: RenderRequest, last: RenderRequest) -> bool {
-        matches!(request.view, AppView::Chapters | AppView::Settings)
-            && request.selection != last.selection
+        matches!(
+            request.view,
+            AppView::Library | AppView::Chapters | AppView::Settings
+        ) && request.selection != last.selection
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
@@ -920,7 +922,7 @@ mod tests {
         planner.record_render(request, RefreshMode::Full);
 
         request.kind = RenderKind::Page;
-        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+        assert_eq!(planner.mode_for(request), RefreshMode::Full);
 
         request.view = AppView::Settings;
         assert_eq!(planner.mode_for(request), RefreshMode::Full);

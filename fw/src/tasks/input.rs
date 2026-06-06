@@ -38,7 +38,6 @@ struct StableButton {
     candidate: Option<HardwareButton>,
     current: Option<HardwareButton>,
     ticks: u8,
-    armed: bool,
     cooldown: u8,
 }
 
@@ -169,14 +168,16 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
 }
 
 async fn emit(button: Option<Button>, sample: RawSample) {
-    let _ = INPUT_EVENTS.try_send(InputEvent::Sample {
-        button,
-        aux_raw: sample.aux,
-        nav_raw: sample.nav,
-        page_raw: sample.page,
-        battery_mv: battery_mv(sample.aux),
-        battery_percent: battery_percent(sample.aux),
-    });
+    INPUT_EVENTS
+        .send(InputEvent::Sample {
+            button,
+            aux_raw: sample.aux,
+            nav_raw: sample.nav,
+            page_raw: sample.page,
+            battery_mv: battery_mv(sample.aux),
+            battery_percent: battery_percent(sample.aux),
+        })
+        .await;
 }
 
 fn battery_mv(aux_mv: u16) -> u16 {
@@ -208,7 +209,6 @@ impl StableButton {
             candidate: None,
             current: None,
             ticks: 0,
-            armed: true,
             cooldown: 0,
         }
     }
@@ -222,22 +222,36 @@ impl StableButton {
             self.ticks = 1;
         }
 
-        if self.ticks < DEBOUNCE_TICKS || self.candidate == self.current {
+        if self.ticks < DEBOUNCE_TICKS {
             return None;
         }
 
-        self.current = self.candidate;
-        if self.current.is_none() {
-            self.armed = true;
+        if self.candidate != self.current {
+            self.current = self.candidate;
+            if let Some(current) = self.current {
+                self.cooldown = REPEAT_COOLDOWN_TICKS;
+                return Some(StableEvent::Changed(current));
+            }
+            self.cooldown = 0;
             return None;
         }
-        if !self.armed || self.cooldown > 0 {
+
+        let Some(current) = self.current else {
+            return None;
+        };
+        if self.cooldown > 0 || !is_repeatable(current) {
             return None;
         }
-        self.armed = false;
         self.cooldown = REPEAT_COOLDOWN_TICKS;
-        self.current.map(StableEvent::Changed)
+        Some(StableEvent::Changed(current))
     }
+}
+
+fn is_repeatable(button: HardwareButton) -> bool {
+    matches!(
+        button,
+        HardwareButton::Left | HardwareButton::Right | HardwareButton::Up | HardwareButton::Down
+    )
 }
 
 fn debounce_active_low(raw_pressed: bool, ticks: &mut u8) -> bool {
