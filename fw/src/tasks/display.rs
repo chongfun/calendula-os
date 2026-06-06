@@ -88,10 +88,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 {
                     refresh_planner.record_render(request, mode);
                     prev_fb.copy_from(fb);
-                    let _ = DISPLAY_EVENTS.try_send(DisplayEvent::Settled);
+                    DISPLAY_EVENTS.send(DisplayEvent::Settled).await;
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
                 } else {
                     esp_println::println!("display: SPI transfer failed");
+                    DISPLAY_EVENTS.send(DisplayEvent::Settled).await;
                 }
             }
             Either::First(DisplayCommand::Sleep) => {
@@ -110,11 +111,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 }
                 if display_flush::sleep_panel(&mut epd).await.is_ok() {
                     refresh_planner.record_sleep();
-                    let _ = DISPLAY_EVENTS.try_send(DisplayEvent::Asleep);
+                    DISPLAY_EVENTS.send(DisplayEvent::Asleep).await;
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
                 } else {
                     esp_println::println!("display: sleep command failed");
-                    let _ = DISPLAY_EVENTS.try_send(DisplayEvent::Asleep);
+                    DISPLAY_EVENTS.send(DisplayEvent::Asleep).await;
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
                 }
             }

@@ -122,7 +122,11 @@ pub async fn run() {
                     render_pending = false;
                 }
                 DisplayEvent::Library(event) => {
+                    let should_render = library_event_affects_view(state, event);
                     state = state.apply_library_event(ctx, event);
+                    if !should_render {
+                        continue;
+                    }
                     if rendering {
                         render_pending = true;
                     } else {
