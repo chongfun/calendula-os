@@ -88,11 +88,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 {
                     refresh_planner.record_render(request, mode);
                     prev_fb.copy_from(fb);
-                    DISPLAY_EVENTS.send(DisplayEvent::Settled).await;
+                    send_required_display_event(DisplayEvent::Settled);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
                 } else {
                     esp_println::println!("display: SPI transfer failed");
-                    DISPLAY_EVENTS.send(DisplayEvent::Settled).await;
+                    send_required_display_event(DisplayEvent::Settled);
                 }
             }
             Either::First(DisplayCommand::Sleep) => {
@@ -111,11 +111,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 }
                 if display_flush::sleep_panel(&mut epd).await.is_ok() {
                     refresh_planner.record_sleep();
-                    DISPLAY_EVENTS.send(DisplayEvent::Asleep).await;
+                    send_required_display_event(DisplayEvent::Asleep);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
                 } else {
                     esp_println::println!("display: sleep command failed");
-                    DISPLAY_EVENTS.send(DisplayEvent::Asleep).await;
+                    send_required_display_event(DisplayEvent::Asleep);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
                 }
             }
@@ -248,6 +248,21 @@ fn send_loaded_library_event(event: LibraryEvent) {
         return;
     }
     send_required_library_event(event);
+}
+
+fn send_required_display_event(event: DisplayEvent) {
+    const RETRIES: usize = 8;
+    for _ in 0..RETRIES {
+        if DISPLAY_EVENTS.try_send(event).is_ok() {
+            return;
+        }
+        if let Ok(DisplayEvent::Library(library_event)) = DISPLAY_EVENTS.try_receive() {
+            send_required_library_event(library_event);
+        }
+    }
+    if DISPLAY_EVENTS.try_send(event).is_err() {
+        esp_println::println!("display: required display event queue full");
+    }
 }
 
 fn ensure_epub_scratch<'a>(

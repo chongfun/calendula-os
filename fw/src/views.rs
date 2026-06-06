@@ -178,15 +178,20 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
 }
 
 fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    match sd_library.reader_status() {
-        BookLoadStatus::Empty | BookLoadStatus::Loading => {
+    let selected_book_loaded =
+        sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id);
+    match (sd_library.reader_status(), selected_book_loaded) {
+        (_, false) => {
             draw_ascii(fb, "OPENING EPUB", 20, 72, false);
         }
-        BookLoadStatus::Error => {
+        (BookLoadStatus::Empty | BookLoadStatus::Loading, _) => {
+            draw_ascii(fb, "OPENING EPUB", 20, 72, false);
+        }
+        (BookLoadStatus::Error, _) => {
             draw_ascii(fb, "COULD NOT OPEN EPUB", 20, 72, false);
             draw_ascii(fb, sd_library.reader_error(), 20, 104, false);
         }
-        BookLoadStatus::Ready => {
+        (BookLoadStatus::Ready, _) => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
             plan.for_each_block(sd_library, |block| {
