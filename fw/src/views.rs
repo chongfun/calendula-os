@@ -59,7 +59,12 @@ fn ui_model<'a>(
         .take(library_count)
         .enumerate()
     {
-        library_entries[index] = entry.display_name.as_str();
+        library_entries[index] =
+            if sd_library.loaded_index == Some(index) && !sd_library.title.is_empty() {
+                sd_library.title.as_str()
+            } else {
+                entry.display_name.as_str()
+            };
     }
     let chapter_count = fill_chapters(chapters, request, sd_library);
 
@@ -271,27 +276,31 @@ fn draw_reader_footer(
     page_count: u32,
 ) {
     let font = literata(FontStyle::Italic);
-    fill_rect(
-        fb,
-        Rect::new(8, reader_layout::READER_FOOTER_TOP as u16, 784, 1),
-        false,
-    );
     let fallback = catalog::active_book(request.book_id);
     let (title, _) = sd_library.active_book_labels(request.book_id, fallback.title, "");
-    draw_text_truncated_local(fb, font, title, 12, 462, 560);
+
+    let section_total = if sd_library.current_section_page_count > 0 {
+        sd_library.current_section_page_count as u32
+    } else {
+        page_count
+    }
+    .max(1);
+    let section_current = if sd_library.current_section_page_count > 0 {
+        request
+            .page
+            .saturating_sub(sd_library.current_section_start_page)
+            .saturating_add(1)
+    } else {
+        request.page.saturating_add(1)
+    }
+    .min(section_total);
 
     let mut label = String::<32>::new();
-    let current = request.page.saturating_add(1).min(page_count);
-    let _ = write!(label, "Page {}/{}", current, page_count);
+    let _ = write!(label, "{}/{}", section_current, section_total);
     let label_width = measure_text(font, label.as_str()) as i16;
-    draw_text(
-        fb,
-        font,
-        label.as_str(),
-        (READER_RIGHT_X - label_width).max(600),
-        462,
-        false,
-    );
+    let label_x = (READER_RIGHT_X - label_width).max(620);
+    draw_text_truncated_local(fb, font, title, 8, 476, label_x - 18);
+    draw_text(fb, font, label.as_str(), label_x, 476, false);
 }
 
 fn draw_text_truncated_local(

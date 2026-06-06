@@ -5,13 +5,13 @@ use display::WIDTH;
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
 
-pub(crate) const READER_PAGE_TOP: i16 = 28;
-pub(crate) const READER_FOOTER_TOP: i16 = 438;
-pub(crate) const READER_PAGE_BOTTOM: i16 = READER_FOOTER_TOP - 14;
+pub(crate) const READER_PAGE_TOP: i16 = 6;
+pub(crate) const READER_FOOTER_TOP: i16 = 462;
+pub(crate) const READER_PAGE_BOTTOM: i16 = READER_FOOTER_TOP - 6;
 pub(crate) const READER_LEFT_X: i16 = 8;
 pub(crate) const READER_RIGHT_X: i16 = 792;
 pub(crate) const READER_WRAP_SAFETY: i16 = 4;
-pub(crate) const READER_LAYOUT_CONFIG: u16 = 2;
+pub(crate) const READER_LAYOUT_CONFIG: u16 = 3;
 pub(crate) const STYLE_MARKER: char = '\u{1b}';
 
 pub(crate) struct ReaderPagePlan {

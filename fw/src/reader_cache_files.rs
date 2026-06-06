@@ -112,6 +112,7 @@ where
             || header.section_count as usize > MAX_BOOK_SECTIONS
             || header.toc_count as usize > MAX_SD_TOC_ITEMS
             || header.toc_text_bytes as usize > MAX_SD_TOC_TEXT_BYTES
+            || header.title_text_bytes as usize > 64
             || header.total_pages == 0
         {
             return BookIndexLoadResult::Invalid;
@@ -162,6 +163,17 @@ where
                 library.toc_page[index] = 0;
             }
         }
+        if header.title_text_bytes > 0 {
+            let mut title = [0u8; 64];
+            let title_len = header.title_text_bytes as usize;
+            if read_exact_file(file, &mut title[..title_len]).is_err() {
+                return BookIndexLoadResult::Invalid;
+            }
+            let Ok(title) = core::str::from_utf8(&title[..title_len]) else {
+                return BookIndexLoadResult::Invalid;
+            };
+            library.set_book_labels(title, "");
+        }
         library.set_book_index(
             header.total_pages,
             header.partial,
@@ -202,6 +214,7 @@ where
             .toc_count
             .min(MAX_SD_TOC_ITEMS)
             .min(u16::MAX as usize);
+        let title_text_bytes = library.title.len().min(64) as u32;
         let header = BookV2Header {
             source_hash: source_identity.0,
             source_size: source_identity.1,
@@ -218,6 +231,7 @@ where
                 .toc_text_len
                 .min(MAX_SD_TOC_TEXT_BYTES)
                 .min(u32::MAX as usize) as u32,
+            title_text_bytes,
             viewport_width: 800,
             viewport_height: 480,
             font_config: reader_layout::READER_LAYOUT_CONFIG,
@@ -244,6 +258,13 @@ where
         if header.toc_text_bytes > 0
             && file
                 .write(&library.toc_text[..header.toc_text_bytes as usize])
+                .is_err()
+        {
+            return false;
+        }
+        if header.title_text_bytes > 0
+            && file
+                .write(&library.title.as_bytes()[..header.title_text_bytes as usize])
                 .is_err()
         {
             return false;
