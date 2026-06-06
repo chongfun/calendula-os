@@ -3,7 +3,8 @@ use heapless::String;
 
 pub const CACHE_MAGIC: u32 = 0x5834_5244; // X4RD
 pub const CACHE_VERSION: u16 = 1;
-pub const CACHE_V2_VERSION: u16 = 10;
+pub const CACHE_V2_VERSION: u16 = 9;
+const CACHE_V2_COMPAT_VERSION: u16 = 10;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
 pub const CACHE_DIR: &str = "CACHE";
 pub const CACHE_V2_DIR: &str = "CACHE2";
@@ -413,7 +414,7 @@ pub fn decode_section_v2_header(input: &[u8]) -> Result<SectionV2Header, CacheEr
     if read_u32(input, 0)? != CACHE_MAGIC {
         return Err(CacheError::BadMagic);
     }
-    if read_u16(input, 4)? != CACHE_V2_VERSION {
+    if !valid_cache_v2_version(read_u16(input, 4)?) {
         return Err(CacheError::BadVersion);
     }
     Ok(SectionV2Header {
@@ -460,7 +461,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
     if read_u32(input, 0)? != CACHE_MAGIC {
         return Err(CacheError::BadMagic);
     }
-    if read_u16(input, 4)? != CACHE_V2_VERSION {
+    if !valid_cache_v2_version(read_u16(input, 4)?) {
         return Err(CacheError::BadVersion);
     }
     Ok(BookV2Header {
@@ -502,6 +503,10 @@ pub fn decode_book_v2_section(input: &[u8]) -> Result<BookV2SectionRecord, Cache
         page_count: read_u16(input, 8)?,
         partial: input[10] != 0,
     })
+}
+
+fn valid_cache_v2_version(version: u16) -> bool {
+    version == CACHE_V2_VERSION || version == CACHE_V2_COMPAT_VERSION
 }
 
 pub fn decode_page_header(input: &[u8]) -> Result<PageCacheHeader, CacheError> {
