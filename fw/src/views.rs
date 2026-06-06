@@ -3,7 +3,6 @@ use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, MAX_LI
 use crate::{catalog, AppView, ReaderSource, RenderRequest};
 use core::fmt::Write;
 use display::fb::Framebuffer;
-use display::font::{draw_text, literata, measure_text, FontStyle};
 use display::render::{draw_ascii, fill_rect, stroke_rect};
 use display::{Rect, WIDTH};
 use heapless::String;
@@ -280,7 +279,6 @@ fn draw_reader_footer(
     sd_library: &ReaderStore,
     page_count: u32,
 ) {
-    let font = literata(FontStyle::Regular);
     let fallback = catalog::active_book(request.book_id);
     let (title, _) = sd_library.active_book_labels(request.book_id, fallback.title, "");
 
@@ -302,49 +300,65 @@ fn draw_reader_footer(
 
     let mut label = String::<32>::new();
     let _ = write!(label, "{}/{}", section_current, section_total);
-    let label_width = measure_text(font, label.as_str()) as i16;
-    let footer_y = 477;
+    let label_width = small_ascii_width(label.as_str());
+    let footer_y = 468;
     let footer_pad = 16;
     let label_x = READER_RIGHT_X - label_width - footer_pad;
     let title_right = label_x - 14;
-    draw_text_centered_truncated_local(fb, font, title, footer_pad, title_right, footer_y);
-    draw_text(fb, font, label.as_str(), label_x, footer_y, false);
+    draw_small_ascii_centered_truncated(fb, title, footer_pad, title_right, footer_y, true);
+    draw_small_ascii(fb, label.as_str(), label_x, footer_y, false);
 }
 
-fn draw_text_centered_truncated_local(
+fn draw_small_ascii_centered_truncated(
     fb: &mut Framebuffer,
-    font: &'static display::font::BitmapFont,
     text: &str,
     left: i16,
     right: i16,
     y: i16,
+    bold: bool,
 ) {
     let max_width = (right - left).max(0);
     if max_width == 0 {
         return;
     }
-    let width = measure_text(font, text) as i16;
-    if width <= max_width {
-        draw_text(fb, font, text, left + (max_width - width) / 2, y, false);
+    let max_chars = (max_width / 8).max(0) as usize;
+    if max_chars == 0 {
         return;
     }
+    let mut fitted = String::<96>::new();
+    push_small_ascii_fitted(&mut fitted, text, max_chars);
+    let width = small_ascii_width(fitted.as_str());
+    let x = left + (max_width - width) / 2;
+    draw_small_ascii(fb, fitted.as_str(), x, y, bold);
+}
 
-    let mut end = text.len();
-    while end > 0 {
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let candidate = &text[..end];
-        let candidate_width = measure_text(font, candidate) as i16;
-        let ellipsis_width = measure_text(font, "...") as i16;
-        if candidate_width + ellipsis_width <= max_width {
-            let x = left + (max_width - candidate_width - ellipsis_width) / 2;
-            draw_text(fb, font, candidate, x, y, false);
-            draw_text(fb, font, "...", x + candidate_width, y, false);
-            return;
-        }
-        end = end.saturating_sub(1);
+fn push_small_ascii_fitted(out: &mut String<96>, text: &str, max_chars: usize) {
+    let total = text.chars().count();
+    let keep = if total > max_chars && max_chars > 3 {
+        max_chars - 3
+    } else {
+        max_chars
+    };
+    for ch in text.chars().take(keep) {
+        let ch = if ch.is_ascii() { ch } else { '?' };
+        let _ = out.push(ch);
     }
+    if total > max_chars && max_chars > 3 {
+        let _ = out.push_str("...");
+    }
+}
+
+fn draw_small_ascii(fb: &mut Framebuffer, text: &str, x: i16, y: i16, bold: bool) {
+    let x = x.max(0) as usize;
+    let y = y.max(0) as usize;
+    draw_ascii(fb, text, x, y, false);
+    if bold {
+        draw_ascii(fb, text, x + 1, y, false);
+    }
+}
+
+fn small_ascii_width(text: &str) -> i16 {
+    text.chars().count().min(i16::MAX as usize / 8) as i16 * 8
 }
 
 fn draw_input_sample(fb: &mut Framebuffer, request: RenderRequest) {
