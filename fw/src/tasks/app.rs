@@ -18,6 +18,7 @@ pub async fn run() {
     let mut catalog_refresh_requested = false;
     let mut pending_storage: Option<StorageCommand> = None;
     let mut opening_book: Option<u32> = None;
+    let mut suppress_input_until_open_settled = false;
     send_render(RenderKind::Boot, state).await;
 
     loop {
@@ -56,7 +57,7 @@ pub async fn run() {
                     continue;
                 }
 
-                if opening_book.is_some() {
+                if opening_book.is_some() || suppress_input_until_open_settled {
                     esp_println::println!("app: input ignored while book open pending");
                     continue;
                 }
@@ -72,6 +73,7 @@ pub async fn run() {
                         log_storage_command("send", command);
                         if let Some(book_id) = open_book_id(command) {
                             opening_book = Some(book_id);
+                            suppress_input_until_open_settled = true;
                         }
                         if STORAGE_COMMANDS.try_send(command).is_err() {
                             log_storage_command("queue", command);
@@ -81,6 +83,7 @@ pub async fn run() {
                         log_storage_command("queue", command);
                         if let Some(book_id) = open_book_id(command) {
                             opening_book = Some(book_id);
+                            suppress_input_until_open_settled = true;
                         }
                         pending_storage = Some(command);
                     }
@@ -122,6 +125,7 @@ pub async fn run() {
                         log_storage_command("send", command);
                         if let Some(book_id) = open_book_id(command) {
                             opening_book = Some(book_id);
+                            suppress_input_until_open_settled = true;
                         }
                         STORAGE_COMMANDS.send(command).await;
                     }
@@ -129,12 +133,16 @@ pub async fn run() {
                         send_render(RenderKind::Page, state).await;
                         rendering = true;
                         render_pending = false;
+                    } else if suppress_input_until_open_settled && opening_book.is_none() {
+                        suppress_input_until_open_settled = false;
                     }
                 }
                 DisplayEvent::Asleep => {
                     esp_println::println!("app: display asleep");
                     rendering = false;
                     render_pending = false;
+                    opening_book = None;
+                    suppress_input_until_open_settled = false;
                 }
                 DisplayEvent::Library(event) => {
                     if let Some(book_id) = loaded_book_id(event) {
