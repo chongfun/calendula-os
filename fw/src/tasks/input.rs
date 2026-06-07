@@ -144,7 +144,7 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
 
         let power_pressed = debounce_active_low(pins.power.is_low(), &mut power_ticks);
         if power_pressed && !last_power {
-            emit(Some(Button::Power), sample).await;
+            emit(Some(Button::Power), sample);
             log_input(Some(Button::Power), sample);
         }
         last_power = power_pressed;
@@ -153,7 +153,7 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
         if let Some(nav) = nav {
             let StableEvent::Changed(hardware) = nav;
             let button = map_hardware(hardware);
-            emit(Some(button), sample).await;
+            emit(Some(button), sample);
             log_input(Some(button), sample);
         }
 
@@ -161,23 +161,28 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
         if let Some(page) = page {
             let StableEvent::Changed(hardware) = page;
             let button = map_hardware(hardware);
-            emit(Some(button), sample).await;
+            emit(Some(button), sample);
             log_input(Some(button), sample);
         }
     }
 }
 
-async fn emit(button: Option<Button>, sample: RawSample) {
-    INPUT_EVENTS
-        .send(InputEvent::Sample {
-            button,
-            aux_raw: sample.aux,
-            nav_raw: sample.nav,
-            page_raw: sample.page,
-            battery_mv: battery_mv(sample.aux),
-            battery_percent: battery_percent(sample.aux),
-        })
-        .await;
+fn emit(button: Option<Button>, sample: RawSample) {
+    let event = InputEvent::Sample {
+        button,
+        aux_raw: sample.aux,
+        nav_raw: sample.nav,
+        page_raw: sample.page,
+        battery_mv: battery_mv(sample.aux),
+        battery_percent: battery_percent(sample.aux),
+    };
+    if INPUT_EVENTS.try_send(event).is_ok() {
+        return;
+    }
+    let _ = INPUT_EVENTS.try_receive();
+    if INPUT_EVENTS.try_send(event).is_err() {
+        esp_println::println!("input: event queue full");
+    }
 }
 
 fn battery_mv(aux_mv: u16) -> u16 {
