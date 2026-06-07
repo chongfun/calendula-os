@@ -17,6 +17,7 @@ pub async fn run() {
     let mut sleeping = false;
     let mut catalog_refresh_requested = false;
     let mut pending_storage: Option<StorageCommand> = None;
+    let mut opening_book: Option<u32> = None;
     send_render(RenderKind::Boot, state).await;
 
     loop {
@@ -55,6 +56,11 @@ pub async fn run() {
                     continue;
                 }
 
+                if opening_book.is_some() {
+                    esp_println::println!("app: input ignored while book open pending");
+                    continue;
+                }
+
                 let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
                 let previous = state;
                 let previous_persisted = state.persisted();
@@ -64,12 +70,18 @@ pub async fn run() {
                 if let Some(command) = storage_command {
                     if should_send_storage_immediately(command) {
                         log_storage_command("send", command);
+                        if let Some(book_id) = open_book_id(command) {
+                            opening_book = Some(book_id);
+                        }
                         if STORAGE_COMMANDS.try_send(command).is_err() {
                             log_storage_command("queue", command);
                             pending_storage = Some(command);
                         }
                     } else {
                         log_storage_command("queue", command);
+                        if let Some(book_id) = open_book_id(command) {
+                            opening_book = Some(book_id);
+                        }
                         pending_storage = Some(command);
                     }
                 }
@@ -108,6 +120,9 @@ pub async fn run() {
                     }
                     if let Some(command) = pending_storage.take() {
                         log_storage_command("send", command);
+                        if let Some(book_id) = open_book_id(command) {
+                            opening_book = Some(book_id);
+                        }
                         STORAGE_COMMANDS.send(command).await;
                     }
                     if render_pending {
@@ -122,6 +137,11 @@ pub async fn run() {
                     render_pending = false;
                 }
                 DisplayEvent::Library(event) => {
+                    if let Some(book_id) = loaded_book_id(event) {
+                        if opening_book == Some(book_id) {
+                            opening_book = None;
+                        }
+                    }
                     let should_render = library_event_affects_view(state, event);
                     state = state.apply_library_event(ctx, event);
                     if !should_render {
@@ -137,6 +157,11 @@ pub async fn run() {
                 }
             },
             Either3::Third(event) => {
+                if let Some(book_id) = loaded_book_id(event) {
+                    if opening_book == Some(book_id) {
+                        opening_book = None;
+                    }
+                }
                 let should_render = library_event_affects_view(state, event);
                 state = state.apply_library_event(ctx, event);
                 if !should_render {
@@ -192,6 +217,20 @@ fn should_wait_for_loaded_before_render(command: StorageCommand) -> bool {
         command,
         StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }
     )
+}
+
+fn open_book_id(command: StorageCommand) -> Option<u32> {
+    match command {
+        StorageCommand::OpenBook { book_id, .. } => Some(book_id),
+        _ => None,
+    }
+}
+
+fn loaded_book_id(event: crate::LibraryEvent) -> Option<u32> {
+    match event {
+        crate::LibraryEvent::Loaded { book_id, .. } => Some(book_id),
+        _ => None,
+    }
 }
 
 async fn send_render(kind: RenderKind, state: ReaderState) {
