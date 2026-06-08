@@ -3,12 +3,15 @@ use crate::reader_cache::{
     self, ReaderCacheScratch, READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH,
     READER_HEADER_SCRATCH, READER_OPF_SCRATCH, READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
 };
-use crate::reader_store::{BookLoadStatus, ReaderStore};
+use crate::reader_store::{
+    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
+};
 use crate::{
     DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
-    DISPLAY_EVENTS, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
+    DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::RefreshPlanner;
+use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::BAND_BYTES;
@@ -31,6 +34,8 @@ static EPUB_OPF: ConstStaticCell<[u8; READER_OPF_SCRATCH]> =
     ConstStaticCell::new([0; READER_OPF_SCRATCH]);
 static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
     ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
+static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; MAX_BOOK_SECTIONS]> =
+    ConstStaticCell::new([EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS]);
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
@@ -161,19 +166,32 @@ fn handle_storage_command(
             });
         }
         StorageCommand::OpenBook {
+            request_id,
             book_id,
             index,
             chapter,
             target_pages,
         }
         | StorageCommand::ExtendSection {
+            request_id,
             book_id,
             index,
             chapter,
             target_pages,
         } => {
+            if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
+                esp_println::println!(
+                    "storage: stale open skipped request={} latest={} book_id={} index={}",
+                    request_id,
+                    LATEST_READER_REQUEST_ID.load(Ordering::Relaxed),
+                    book_id,
+                    index
+                );
+                return;
+            }
             esp_println::println!(
-                "storage: open command book_id={} index={} chapter={} target={}",
+                "storage: open command request={} book_id={} index={} chapter={} target={}",
+                request_id,
                 book_id,
                 index,
                 chapter,
@@ -194,6 +212,7 @@ fn handle_storage_command(
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
+                chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
             });
             esp_println::println!(
                 "storage: open complete status={:?} pages={} chapters={}",
@@ -201,7 +220,6 @@ fn handle_storage_command(
                 sd_library.advertised_page_count(),
                 sd_library.chapter_count_for_ui()
             );
-            crate::reader_store::publish_chapter_pages(book_id, sd_library);
         }
         StorageCommand::StoreProgress(record) => {
             let (source_hash, source_size) = source_identity(sd_library, record.book_id);
@@ -221,10 +239,6 @@ fn handle_storage_command(
             );
         }
     }
-}
-
-pub(crate) fn send_optional_library_event(event: LibraryEvent) -> bool {
-    LIBRARY_EVENTS.try_send(event).is_ok()
 }
 
 fn send_required_library_event(event: LibraryEvent) {
@@ -279,6 +293,7 @@ fn ensure_epub_scratch<'a>(
                 EPUB_CONTAINER.take(),
                 EPUB_OPF.take(),
                 EPUB_XHTML.take(),
+                EPUB_BOOK_SECTIONS.take(),
             )
         }));
     }

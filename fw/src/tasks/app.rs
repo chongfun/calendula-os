@@ -1,11 +1,15 @@
 use crate::{
     catalog, Button, DisplayCommand, DisplayEvent, InputEvent, PowerEvent, ReaderSource,
-    RenderKind, StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS, INPUT_EVENTS, LIBRARY_EVENTS,
-    POWER_EVENTS, STORAGE_COMMANDS,
+    RenderKind, StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS, INPUT_EVENTS,
+    LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::{AppView, ReaderState, ReducerContext};
+use core::sync::atomic::Ordering;
 use display::Rect;
 use embassy_futures::select::{select3, Either3};
+use embassy_time::{Duration, Instant};
+
+const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
 
 #[embassy_executor::task]
 pub async fn run() {
@@ -19,6 +23,7 @@ pub async fn run() {
     let mut pending_storage: Option<StorageCommand> = None;
     let mut opening_book: Option<u32> = None;
     let mut suppress_input_until_open_settled = false;
+    let mut block_confirm_until: Option<Instant> = None;
     send_render(RenderKind::Boot, state).await;
 
     loop {
@@ -57,9 +62,15 @@ pub async fn run() {
                     continue;
                 }
 
+                if state.view == AppView::Reading
+                    && should_block_post_open_confirm(event, &mut block_confirm_until)
+                {
+                    esp_println::println!("app: confirm ignored after book open");
+                    continue;
+                }
+
                 if opening_book.is_some() || suppress_input_until_open_settled {
                     esp_println::println!("app: input ignored while book open pending");
-                    drain_input_events();
                     continue;
                 }
 
@@ -135,8 +146,10 @@ pub async fn run() {
                         rendering = true;
                         render_pending = false;
                     } else if suppress_input_until_open_settled && opening_book.is_none() {
-                        drain_input_events();
                         suppress_input_until_open_settled = false;
+                        block_confirm_until = Some(
+                            Instant::now() + Duration::from_millis(POST_OPEN_CONFIRM_BLOCK_MS),
+                        );
                     }
                 }
                 DisplayEvent::Asleep => {
@@ -145,12 +158,12 @@ pub async fn run() {
                     render_pending = false;
                     opening_book = None;
                     suppress_input_until_open_settled = false;
+                    block_confirm_until = None;
                 }
                 DisplayEvent::Library(event) => {
                     if let Some(book_id) = loaded_book_id(event) {
                         if opening_book == Some(book_id) {
                             opening_book = None;
-                            drain_input_events();
                         }
                     }
                     let should_render = library_event_affects_view(state, event);
@@ -171,7 +184,6 @@ pub async fn run() {
                 if let Some(book_id) = loaded_book_id(event) {
                     if opening_book == Some(book_id) {
                         opening_book = None;
-                        drain_input_events();
                     }
                 }
                 let should_render = library_event_affects_view(state, event);
@@ -200,6 +212,7 @@ fn library_event_affects_view(state: ReaderState, event: crate::LibraryEvent) ->
             book_id,
             pages: _,
             chapters: _,
+            chapter_pages: _,
         } => state.book_id == book_id,
         crate::LibraryEvent::ChapterPage {
             book_id,
@@ -233,8 +246,7 @@ fn should_wait_for_loaded_before_render(command: StorageCommand) -> bool {
 
 fn open_book_id(command: StorageCommand) -> Option<u32> {
     match command {
-        StorageCommand::OpenBook { book_id, .. }
-        | StorageCommand::ExtendSection { book_id, .. } => Some(book_id),
+        StorageCommand::OpenBook { book_id, .. } => Some(book_id),
         _ => None,
     }
 }
@@ -246,8 +258,21 @@ fn loaded_book_id(event: crate::LibraryEvent) -> Option<u32> {
     }
 }
 
-fn drain_input_events() {
-    while INPUT_EVENTS.try_receive().is_ok() {}
+fn should_block_post_open_confirm(event: InputEvent, block_until: &mut Option<Instant>) -> bool {
+    let Some(until) = *block_until else {
+        return false;
+    };
+    if Instant::now() >= until {
+        *block_until = None;
+        return false;
+    }
+    matches!(
+        event,
+        InputEvent::Sample {
+            button: Some(Button::Confirm),
+            ..
+        }
+    )
 }
 
 async fn send_render(kind: RenderKind, state: ReaderState) {
@@ -259,20 +284,22 @@ async fn send_render(kind: RenderKind, state: ReaderState) {
 fn log_storage_command(label: &str, command: StorageCommand) {
     match command {
         StorageCommand::OpenBook {
+            request_id,
             book_id,
             index,
             chapter,
             target_pages,
         } => esp_println::println!(
-            "app: storage {label} open book_id={book_id} index={index} chapter={chapter} target={target_pages}"
+            "app: storage {label} open request={request_id} book_id={book_id} index={index} chapter={chapter} target={target_pages}"
         ),
         StorageCommand::ExtendSection {
+            request_id,
             book_id,
             index,
             chapter,
             target_pages,
         } => esp_println::println!(
-            "app: storage {label} extend book_id={book_id} index={index} chapter={chapter} target={target_pages}"
+            "app: storage {label} extend request={request_id} book_id={book_id} index={index} chapter={chapter} target={target_pages}"
         ),
         StorageCommand::StoreProgress(_) => {
             esp_println::println!("app: storage {label} progress")
@@ -313,7 +340,11 @@ fn storage_command_for_transition(
                 None
             };
         }
-        return Some(open_book_command(next, index));
+        return if previous.page != next.page || previous.chapter != next.chapter {
+            Some(extend_section_command(next, index))
+        } else {
+            None
+        };
     }
 
     if previous.page != next.page || previous.chapter != next.chapter {
@@ -324,7 +355,9 @@ fn storage_command_for_transition(
 }
 
 fn open_book_command(state: ReaderState, index: u8) -> StorageCommand {
+    let request_id = next_reader_request_id();
     StorageCommand::OpenBook {
+        request_id,
         book_id: state.book_id,
         index,
         chapter: state.chapter,
@@ -333,10 +366,21 @@ fn open_book_command(state: ReaderState, index: u8) -> StorageCommand {
 }
 
 fn extend_section_command(state: ReaderState, index: u8) -> StorageCommand {
+    let request_id = next_reader_request_id();
     StorageCommand::ExtendSection {
+        request_id,
         book_id: state.book_id,
         index,
         chapter: state.chapter,
         target_pages: state.page.min(u16::MAX as u32) as u16,
     }
+}
+
+fn next_reader_request_id() -> u32 {
+    let next = LATEST_READER_REQUEST_ID
+        .load(Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1);
+    LATEST_READER_REQUEST_ID.store(next, Ordering::Relaxed);
+    next
 }

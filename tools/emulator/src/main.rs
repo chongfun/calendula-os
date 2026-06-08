@@ -347,6 +347,7 @@ fn storage_command_for_transition(
         || previous.view != AppView::Reading
     {
         return Some(StorageCommand::OpenBook {
+            request_id: 0,
             book_id: next.book_id,
             index,
             chapter: next.chapter,
@@ -356,6 +357,7 @@ fn storage_command_for_transition(
 
     if next.page.saturating_add(2) >= next.sd_page_count {
         return Some(StorageCommand::ExtendSection {
+            request_id: 0,
             book_id: next.book_id,
             index,
             chapter: next.chapter,

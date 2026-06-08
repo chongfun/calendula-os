@@ -1,5 +1,4 @@
-use crate::LibraryEvent;
-use app_core::ReaderSource;
+use app_core::{ReaderSource, MAX_SD_CHAPTERS};
 use display::font::FontStyle;
 use heapless::String;
 use proto::cache::{
@@ -8,9 +7,9 @@ use proto::cache::{
 };
 use proto::text::{TextAlign, TextRole};
 
-pub(crate) const MAX_LIBRARY_BOOKS: usize = 8;
+pub(crate) const MAX_LIBRARY_BOOKS: usize = 16;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 64;
-pub(crate) const MAX_BOOK_SECTIONS: usize = 96;
+pub(crate) const MAX_BOOK_SECTIONS: usize = 160;
 const MAX_PUBLISHED_CHAPTER_EVENTS: usize = 24;
 pub(crate) const MAX_SD_TOC_TEXT_BYTES: usize = 4096;
 pub(crate) const MAX_READER_BLOCKS: usize = 384;
@@ -66,6 +65,7 @@ pub(crate) enum BookLoadStatus {
 
 pub(crate) struct LibraryBookEntry {
     pub(crate) display_name: String<64>,
+    pub(crate) display_label: String<64>,
     pub(crate) open_name: String<16>,
     pub(crate) in_books_dir: bool,
     pub(crate) byte_size: u32,
@@ -76,6 +76,7 @@ impl LibraryBookEntry {
     pub(crate) const fn new() -> Self {
         Self {
             display_name: String::new(),
+            display_label: String::new(),
             open_name: String::new(),
             in_books_dir: false,
             byte_size: 0,
@@ -189,6 +190,7 @@ impl ReaderStore {
         self.count = 0;
         for entry in self.entries.iter_mut() {
             entry.display_name.clear();
+            entry.display_label.clear();
             entry.open_name.clear();
             entry.in_books_dir = false;
             entry.byte_size = 0;
@@ -252,6 +254,13 @@ impl ReaderStore {
         self.cover_width = COVER_WIDTH as u16;
         self.cover_height = COVER_HEIGHT as u16;
         self.cover_bits.fill(0);
+    }
+
+    pub(crate) fn set_cover_bits(&mut self, width: u16, height: u16, bits: &[u8; COVER_BYTES]) {
+        self.cover_width = width;
+        self.cover_height = height;
+        self.cover_bits.copy_from_slice(bits);
+        self.cover_ready = true;
     }
 
     pub(crate) fn clear_lines(&mut self) {
@@ -595,7 +604,7 @@ impl ReaderStore {
         }
         Self::selected_book_index(book_id)
             .and_then(|index| self.catalog_entry(index))
-            .map(|entry| (entry.display_name.as_str(), ""))
+            .map(|entry| (entry.display_label.as_str(), ""))
             .unwrap_or((fallback_title, fallback_author))
     }
 
@@ -648,8 +657,10 @@ impl ReaderStore {
         }
         let entry = &mut self.entries[self.count];
         entry.display_name.clear();
+        entry.display_label.clear();
         entry.open_name.clear();
         let _ = entry.display_name.push_str(display_name);
+        push_catalog_label(display_name, open_name, &mut entry.display_label);
         let _ = entry.open_name.push_str(open_name);
         entry.in_books_dir = in_books_dir;
         entry.byte_size = byte_size;
@@ -701,6 +712,64 @@ impl ReaderStore {
     }
 }
 
+fn push_catalog_label(display_name: &str, open_name: &str, out: &mut String<64>) {
+    if open_name.eq_ignore_ascii_case("HPMOR.EPU") || open_name.eq_ignore_ascii_case("HPMOR.EPUB") {
+        let _ = out.push_str("Harry Potter and the Methods of Rationality");
+        return;
+    }
+
+    let file_name = display_name
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(display_name);
+    let stem = strip_epub_suffix(file_name).unwrap_or(file_name);
+    push_pretty_file_stem(stem, out);
+    if out.is_empty() {
+        let _ = out.push_str(display_name);
+    }
+}
+
+fn strip_epub_suffix(name: &str) -> Option<&str> {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".epub") {
+        return Some(&name[..name.len() - 5]);
+    }
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".epu") {
+        return Some(&name[..name.len() - 4]);
+    }
+    None
+}
+
+fn push_pretty_file_stem(stem: &str, out: &mut String<64>) {
+    let mut capitalize_next = true;
+    for byte in stem.bytes() {
+        let ch = match byte {
+            b'-' | b'_' => {
+                capitalize_next = true;
+                b' '
+            }
+            b'a'..=b'z' if capitalize_next => {
+                capitalize_next = false;
+                byte - b'a' + b'A'
+            }
+            b'A'..=b'Z' | b'0'..=b'9' => {
+                capitalize_next = false;
+                byte
+            }
+            b'.' => break,
+            _ => byte,
+        };
+        if ch == b' ' && out.as_str().ends_with(' ') {
+            continue;
+        }
+        let _ = out.push(ch as char);
+    }
+    while out.as_str().ends_with(' ') {
+        out.pop();
+    }
+}
+
 fn should_break_before_block(role: TextRole, previous: Option<&BlockRecord>) -> bool {
     is_major_heading(role)
         && previous
@@ -730,7 +799,8 @@ fn proto_style_for_display_style(style: FontStyle) -> proto::text::FontStyle {
     }
 }
 
-pub(crate) fn publish_chapter_pages(book_id: u32, store: &ReaderStore) {
+pub(crate) fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
+    let mut pages = [0u16; MAX_SD_CHAPTERS];
     if store.toc_count > 0 {
         for index in 0..store
             .toc_count
@@ -738,14 +808,7 @@ pub(crate) fn publish_chapter_pages(book_id: u32, store: &ReaderStore) {
             .min(MAX_PUBLISHED_CHAPTER_EVENTS)
             .min(u8::MAX as usize)
         {
-            if !crate::tasks::display::send_optional_library_event(LibraryEvent::ChapterPage {
-                book_id,
-                chapter: index as u8,
-                page: store.toc_page[index] as u32,
-            }) {
-                esp_println::println!("display: chapter page event queue full");
-                break;
-            }
+            pages[index] = store.toc_page[index];
         }
     } else {
         for index in 0..store
@@ -754,16 +817,10 @@ pub(crate) fn publish_chapter_pages(book_id: u32, store: &ReaderStore) {
             .min(MAX_PUBLISHED_CHAPTER_EVENTS)
             .min(u8::MAX as usize)
         {
-            if !crate::tasks::display::send_optional_library_event(LibraryEvent::ChapterPage {
-                book_id,
-                chapter: index as u8,
-                page: store.book_sections[index].start_page,
-            }) {
-                esp_println::println!("display: chapter page event queue full");
-                break;
-            }
+            pages[index] = store.book_sections[index].start_page.min(u16::MAX as u32) as u16;
         }
     }
+    pages
 }
 
 pub(crate) fn source_hash(path: &str, byte_size: u32) -> u32 {

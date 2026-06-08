@@ -9,7 +9,7 @@ use heapless::String;
 const CATALOG_ROOT_DIR: &str = "XTEINK";
 const CATALOG_FILE: &str = "CATALOG.BIN";
 const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
-const CATALOG_VERSION: u8 = 1;
+const CATALOG_VERSION: u8 = 2;
 const CATALOG_HEADER_BYTES: usize = 8;
 const CATALOG_RECORD_BYTES: usize = 92;
 const LEGACY_CACHE_MIGRATION_ENABLED: bool = false;
@@ -23,11 +23,9 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         esp_println::println!("sd: open root");
         library.clear_catalog();
         library.status = LibraryScanStatus::Scanning;
+        collect_epubs(&root, "/", false, library);
         if let Ok(books) = root.open_dir("BOOKS") {
             collect_epubs(&books, "/books/", true, library);
-        }
-        if library.catalog_is_empty() {
-            collect_epubs(&root, "/", false, library);
         }
 
         if library.catalog_is_empty() {
@@ -317,13 +315,23 @@ fn push_prefixed(
 
 fn is_epub_name(name: &str) -> bool {
     let bytes = name.as_bytes();
-    if bytes.len() < 5 {
-        return false;
+    if bytes.len() >= 5 {
+        let ext = &bytes[bytes.len() - 5..];
+        if ext[0] == b'.'
+            && ext[1].eq_ignore_ascii_case(&b'e')
+            && ext[2].eq_ignore_ascii_case(&b'p')
+            && ext[3].eq_ignore_ascii_case(&b'u')
+            && ext[4].eq_ignore_ascii_case(&b'b')
+        {
+            return true;
+        }
     }
-    let ext = &bytes[bytes.len() - 5..];
-    ext[0] == b'.'
-        && ext[1].eq_ignore_ascii_case(&b'e')
-        && ext[2].eq_ignore_ascii_case(&b'p')
-        && ext[3].eq_ignore_ascii_case(&b'u')
-        && ext[4].eq_ignore_ascii_case(&b'b')
+    if bytes.len() >= 4 {
+        let ext = &bytes[bytes.len() - 4..];
+        return ext[0] == b'.'
+            && ext[1].eq_ignore_ascii_case(&b'e')
+            && ext[2].eq_ignore_ascii_case(&b'p')
+            && ext[3].eq_ignore_ascii_case(&b'u');
+    }
+    false
 }

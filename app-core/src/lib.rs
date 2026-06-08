@@ -235,12 +235,14 @@ pub enum StorageCommand {
     LoadCatalogCache,
     RefreshCatalog,
     OpenBook {
+        request_id: u32,
         book_id: u32,
         index: u8,
         chapter: u8,
         target_pages: u16,
     },
     ExtendSection {
+        request_id: u32,
         book_id: u32,
         index: u8,
         chapter: u8,
@@ -265,6 +267,7 @@ pub enum LibraryEvent {
         book_id: u32,
         pages: u32,
         chapters: u8,
+        chapter_pages: [u16; MAX_SD_CHAPTERS],
     },
     ChapterPage {
         book_id: u32,
@@ -517,11 +520,12 @@ impl ReaderState {
                 book_id,
                 pages,
                 chapters,
+                chapter_pages,
             } => {
                 if self.book_id == book_id {
                     self.sd_page_count = pages.max(1);
                     self.sd_chapter_count = chapters.max(1);
-                    self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
+                    self.sd_chapter_pages = chapter_pages;
                     self.page = self.page.min(self.sd_page_count.saturating_sub(1));
                     self.dirty = Rect::FULL;
                 }

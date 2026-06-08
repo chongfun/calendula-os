@@ -51,7 +51,7 @@ pub use app_core::{
     AppView, Button, DisplayCommand, DisplayEvent, DisplayOrientation, InputEvent, LibraryEvent,
     PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, StorageCommand,
 };
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -81,6 +81,7 @@ mod views;
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
 pub static INPUT_START: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 pub static INPUT_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 4> = Channel::new();
 pub static DISPLAY_EVENTS: Channel<CriticalSectionRawMutex, DisplayEvent, 16> = Channel::new();
 pub static LIBRARY_EVENTS: Channel<CriticalSectionRawMutex, LibraryEvent, 64> = Channel::new();

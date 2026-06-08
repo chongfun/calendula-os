@@ -78,8 +78,22 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         return;
     }
 
+    let visible_rows = 8usize;
+    let selected_index = shell.selection as usize;
+    let start = if selected_index >= visible_rows {
+        selected_index + 1 - visible_rows
+    } else {
+        0
+    }
+    .min(shell.library_entries.len().saturating_sub(visible_rows));
     let mut baseline_y = 142i16;
-    for (index, entry) in shell.library_entries.iter().take(8).enumerate() {
+    for (index, entry) in shell
+        .library_entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+    {
         let selected = index == shell.selection as usize;
         if selected {
             fill_rect(fb, Rect::new(46, (baseline_y - 25) as u16, 708, 34), false);

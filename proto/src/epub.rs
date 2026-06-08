@@ -116,6 +116,13 @@ pub struct ZipStream<'a, R> {
     central_cache: Option<&'a [u8]>,
 }
 
+pub struct ZipLocalStream<R> {
+    reader: R,
+    cursor: u32,
+    pending_payload_offset: u32,
+    pending_payload_remaining: u32,
+}
+
 pub struct ZipInflateScratch {
     state: InflateState,
 }
@@ -131,6 +138,205 @@ impl ZipInflateScratch {
 impl Default for ZipInflateScratch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<R> ZipLocalStream<R>
+where
+    R: ByteStream,
+{
+    pub const fn new(reader: R) -> Self {
+        Self {
+            reader,
+            cursor: 0,
+            pending_payload_offset: 0,
+            pending_payload_remaining: 0,
+        }
+    }
+
+    pub fn find_entry(
+        &mut self,
+        name: &str,
+        header_scratch: &mut [u8; 46],
+        name_scratch: &mut [u8],
+    ) -> Result<OwnedZipEntry, ZipError> {
+        loop {
+            read_exact_stream(&mut self.reader, &mut header_scratch[..30])?;
+            let signature = read_u32(header_scratch, 0)?;
+            if signature == 0x0201_4b50 || signature == 0x0605_4b50 {
+                return Err(ZipError::EntryNotFound);
+            }
+            if signature != 0x0403_4b50 {
+                return Err(ZipError::BadLocalHeader);
+            }
+            let flags = read_u16(header_scratch, 6)?;
+            let compression_method = read_u16(header_scratch, 8)?;
+            let compressed_size = read_u32(header_scratch, 18)?;
+            let uncompressed_size = read_u32(header_scratch, 22)?;
+            let name_len = read_u16(header_scratch, 26)? as usize;
+            let extra_len = read_u16(header_scratch, 28)? as usize;
+            if flags & 0x0008 != 0 {
+                return Err(ZipError::UnsupportedCompression);
+            }
+            if name_len > name_scratch.len() {
+                return Err(ZipError::EntryBufferTooSmall);
+            }
+            read_exact_stream(&mut self.reader, &mut name_scratch[..name_len])?;
+            skip_stream(&mut self.reader, extra_len)?;
+            let payload_offset = self
+                .cursor
+                .checked_add(30 + name_len as u32 + extra_len as u32)
+                .ok_or(ZipError::BadLocalHeader)?;
+            let entry_matches = core::str::from_utf8(&name_scratch[..name_len])
+                .map(|entry_name| entry_name == name)
+                .unwrap_or(false);
+            if entry_matches {
+                self.pending_payload_offset = payload_offset;
+                self.pending_payload_remaining = compressed_size;
+                return Ok(OwnedZipEntry {
+                    compression_method,
+                    compressed_size,
+                    uncompressed_size,
+                    local_header_offset: payload_offset,
+                });
+            }
+            skip_stream(&mut self.reader, compressed_size as usize)?;
+            self.cursor = payload_offset
+                .checked_add(compressed_size)
+                .ok_or(ZipError::BadLocalHeader)?;
+        }
+    }
+
+    pub fn read_entry_streamed(
+        &mut self,
+        entry: OwnedZipEntry,
+        compressed_scratch: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+    ) -> Result<usize, ZipError> {
+        if entry.uncompressed_size as usize > output.len() {
+            return Err(ZipError::OutputTooSmall);
+        }
+        let (len, complete) =
+            self.read_entry_prefix_streamed(entry, compressed_scratch, output, inflate_scratch)?;
+        if complete {
+            Ok(len)
+        } else {
+            Err(ZipError::OutputTooSmall)
+        }
+    }
+
+    pub fn read_entry_prefix_streamed(
+        &mut self,
+        entry: OwnedZipEntry,
+        input: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+    ) -> Result<(usize, bool), ZipError> {
+        if entry.local_header_offset != self.pending_payload_offset
+            || entry.compressed_size != self.pending_payload_remaining
+        {
+            return Err(ZipError::BadLocalHeader);
+        }
+        match entry.compression_method {
+            0 => {
+                let output_len = output.len().min(entry.uncompressed_size as usize);
+                read_exact_stream(&mut self.reader, &mut output[..output_len])?;
+                let unread = entry.compressed_size.saturating_sub(output_len as u32);
+                skip_stream(&mut self.reader, unread as usize)?;
+                self.cursor = self
+                    .pending_payload_offset
+                    .checked_add(entry.compressed_size)
+                    .ok_or(ZipError::BadLocalHeader)?;
+                self.pending_payload_remaining = 0;
+                Ok((output_len, output_len == entry.uncompressed_size as usize))
+            }
+            8 => self.inflate_entry_prefix(entry.compressed_size, input, output, inflate_scratch),
+            _ => Err(ZipError::UnsupportedCompression),
+        }
+    }
+
+    fn inflate_entry_prefix(
+        &mut self,
+        compressed_size: u32,
+        input: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+    ) -> Result<(usize, bool), ZipError> {
+        if input.is_empty() || output.is_empty() {
+            return Err(ZipError::OutputTooSmall);
+        }
+        inflate_scratch.state.reset(DataFormat::Raw);
+        let mut compressed_read = 0u32;
+        let mut output_pos = 0usize;
+        while compressed_read < compressed_size {
+            let remaining = (compressed_size - compressed_read) as usize;
+            let input_len = input.len().min(remaining);
+            read_exact_stream(&mut self.reader, &mut input[..input_len])?;
+            compressed_read += input_len as u32;
+            let flush = if compressed_read == compressed_size {
+                MZFlush::Finish
+            } else {
+                MZFlush::None
+            };
+            let mut consumed = 0usize;
+            while consumed < input_len || flush == MZFlush::Finish {
+                if output_pos == output.len() {
+                    skip_stream(
+                        &mut self.reader,
+                        compressed_size.saturating_sub(compressed_read) as usize,
+                    )?;
+                    self.cursor = self
+                        .pending_payload_offset
+                        .checked_add(compressed_size)
+                        .ok_or(ZipError::BadLocalHeader)?;
+                    self.pending_payload_remaining = 0;
+                    return Ok((output_pos, false));
+                }
+                let result = inflate(
+                    &mut inflate_scratch.state,
+                    &input[consumed..input_len],
+                    &mut output[output_pos..],
+                    flush,
+                );
+                consumed += result.bytes_consumed;
+                output_pos += result.bytes_written;
+                match result.status {
+                    Ok(MZStatus::StreamEnd) => {
+                        self.cursor = self
+                            .pending_payload_offset
+                            .checked_add(compressed_size)
+                            .ok_or(ZipError::BadLocalHeader)?;
+                        self.pending_payload_remaining = 0;
+                        return Ok((output_pos, true));
+                    }
+                    Ok(MZStatus::Ok) => {
+                        if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                            break;
+                        }
+                        if consumed == input_len {
+                            break;
+                        }
+                    }
+                    Ok(_) => return Err(ZipError::Inflate),
+                    Err(_) => {
+                        if output_pos == output.len() {
+                            return Ok((output_pos, false));
+                        }
+                        return Err(ZipError::Inflate);
+                    }
+                }
+            }
+        }
+        self.cursor = self
+            .pending_payload_offset
+            .checked_add(compressed_size)
+            .ok_or(ZipError::BadLocalHeader)?;
+        self.pending_payload_remaining = 0;
+        Ok((
+            output_pos,
+            inflate_scratch.state.last_status() == miniz_oxide::inflate::TINFLStatus::Done,
+        ))
     }
 }
 
@@ -2179,6 +2385,34 @@ where
             return Err(ZipError::Io);
         }
         filled += count;
+    }
+    Ok(())
+}
+
+fn read_exact_stream<R>(reader: &mut R, mut out: &mut [u8]) -> Result<(), ZipError>
+where
+    R: ByteStream,
+{
+    while !out.is_empty() {
+        let count = reader.read(out).map_err(|_| ZipError::Io)?;
+        if count == 0 {
+            return Err(ZipError::Io);
+        }
+        let tmp = out;
+        out = &mut tmp[count..];
+    }
+    Ok(())
+}
+
+fn skip_stream<R>(reader: &mut R, mut bytes: usize) -> Result<(), ZipError>
+where
+    R: ByteStream,
+{
+    let mut scratch = [0u8; 512];
+    while bytes > 0 {
+        let count = bytes.min(scratch.len());
+        read_exact_stream(reader, &mut scratch[..count])?;
+        bytes -= count;
     }
     Ok(())
 }

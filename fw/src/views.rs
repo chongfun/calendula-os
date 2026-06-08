@@ -63,7 +63,7 @@ fn ui_model<'a>(
             if sd_library.loaded_index == Some(index) && !sd_library.title.is_empty() {
                 sd_library.title.as_str()
             } else {
-                entry.display_name.as_str()
+                entry.display_label.as_str()
             };
     }
     let chapter_count = fill_chapters(chapters, request, sd_library);
