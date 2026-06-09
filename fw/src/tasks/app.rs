@@ -106,13 +106,13 @@ pub async fn run() {
                         pending_storage = Some(command);
                     }
                 }
-                if storage_command
-                    .map(should_wait_for_loaded_before_render)
-                    .unwrap_or(false)
-                {
-                    render_pending = false;
-                    continue;
-                }
+                // We used to suppress the render when an open was inflight
+                // and wait for the Loaded event. That's fine when the cache
+                // hits and the open returns in milliseconds, but on a cache
+                // miss the rebuild can take a minute and the UI looks frozen
+                // on the previous screen. Let the render through immediately:
+                // the Reading view draws "OPENING EPUB" while sd_library's
+                // loaded_index doesn't match the requested book.
                 if rendering {
                     render_pending = true;
                 } else {
@@ -231,13 +231,6 @@ fn library_event_affects_view(state: ReaderState, event: crate::LibraryEvent) ->
 }
 
 fn should_send_storage_immediately(command: StorageCommand) -> bool {
-    matches!(
-        command,
-        StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }
-    )
-}
-
-fn should_wait_for_loaded_before_render(command: StorageCommand) -> bool {
     matches!(
         command,
         StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }
