@@ -14,3 +14,12 @@ opt-level = "s"          # Size over speed
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# Hot data-path crates get speed; fw and HAL glue stay size-optimized.
+# Stack impact re-measured with -Zemit-stack-sizes when this changed:
+# the EPUB open chain must stay inside the 30-43 KB region.
+[profile.release.package.proto]
+opt-level = 3
+
+[profile.release.package.display]
+opt-level = 3
