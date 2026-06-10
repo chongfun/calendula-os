@@ -41,6 +41,7 @@ pub(crate) async fn flush(
     tx_band: &mut [u8; BAND_BYTES],
     screen_on: bool,
     mode: RefreshMode,
+    red_holds_prev: bool,
 ) -> Result<
     (),
     <SpiDmaBus<'static, SPI2, FullDuplexMode, Async> as embedded_hal_async::spi::ErrorType>::Error,
@@ -48,8 +49,14 @@ pub(crate) async fn flush(
     esp_println::println!("display: write BW RAM {:?}", mode);
     write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
     if mode == RefreshMode::Fast {
-        esp_println::println!("display: write RED RAM previous");
-        write_ram(epd, CMD_WRITE_RAM_RED, prev_fb, tx_band).await?;
+        if red_holds_prev {
+            // The previous frame was prestaged into RED RAM right after the
+            // last refresh settled, so this page turn streams only BW.
+            esp_println::println!("display: RED RAM already holds previous");
+        } else {
+            esp_println::println!("display: write RED RAM previous");
+            write_ram(epd, CMD_WRITE_RAM_RED, prev_fb, tx_band).await?;
+        }
     } else {
         esp_println::println!("display: write RED RAM current");
         write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await?;
@@ -69,6 +76,20 @@ pub(crate) async fn flush(
     let elapsed = start.elapsed();
     esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
     Ok(())
+}
+
+/// Stage `fb` (the frame just shown) into RED RAM while the panel is idle,
+/// so the next fast refresh can skip its previous-frame write entirely.
+/// Runs off the page-turn critical path, right after a refresh settles.
+pub(crate) async fn prestage_red(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    tx_band: &mut [u8; BAND_BYTES],
+) -> Result<
+    (),
+    <SpiDmaBus<'static, SPI2, FullDuplexMode, Async> as embedded_hal_async::spi::ErrorType>::Error,
+> {
+    write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await
 }
 
 pub(crate) async fn sleep_panel(
