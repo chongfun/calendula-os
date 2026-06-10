@@ -8,6 +8,32 @@ pub enum FontStyle {
     BoldItalic,
 }
 
+/// Escape character that introduces an inline style change in cached reader
+/// text. The byte after it is a [`style_marker_code`] digit.
+pub const STYLE_MARKER: char = '\u{1b}';
+
+/// Encode a style as the single marker digit stored after [`STYLE_MARKER`]
+/// in cached text. Firmware rendering and host preview share this format.
+pub fn style_marker_code(style: FontStyle) -> char {
+    match style {
+        FontStyle::Regular => '0',
+        FontStyle::Italic => '1',
+        FontStyle::Bold => '2',
+        FontStyle::BoldItalic => '3',
+    }
+}
+
+/// Decode a [`style_marker_code`] digit back into a style.
+pub fn style_from_marker_code(code: char) -> Option<FontStyle> {
+    match code {
+        '0' => Some(FontStyle::Regular),
+        '1' => Some(FontStyle::Italic),
+        '2' => Some(FontStyle::Bold),
+        '3' => Some(FontStyle::BoldItalic),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlyphMetric {
     pub offset: usize,

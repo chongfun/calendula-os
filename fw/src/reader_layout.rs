@@ -1,6 +1,7 @@
 use crate::reader_store::ReaderStore;
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata, measure_text, BitmapFont, FontStyle};
+pub(crate) use display::font::{style_from_marker_code, style_marker_code, STYLE_MARKER};
 use display::WIDTH;
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
@@ -12,7 +13,6 @@ pub(crate) const READER_LEFT_X: i16 = 8;
 pub(crate) const READER_RIGHT_X: i16 = 792;
 pub(crate) const READER_WRAP_SAFETY: i16 = 4;
 pub(crate) const READER_LAYOUT_CONFIG: u16 = 4;
-pub(crate) const STYLE_MARKER: char = '\u{1b}';
 
 pub(crate) struct ReaderPagePlan {
     page_count: u32,
@@ -364,25 +364,6 @@ pub(crate) fn styled_text_ink_width(text: &str, default_font: &'static BitmapFon
         advance += metric.advance as i16;
     }
     right.max(advance)
-}
-
-pub(crate) fn style_marker_code(style: FontStyle) -> char {
-    match style {
-        FontStyle::Regular => '0',
-        FontStyle::Italic => '1',
-        FontStyle::Bold => '2',
-        FontStyle::BoldItalic => '3',
-    }
-}
-
-fn style_from_marker_code(code: char) -> Option<FontStyle> {
-    match code {
-        '0' => Some(FontStyle::Regular),
-        '1' => Some(FontStyle::Italic),
-        '2' => Some(FontStyle::Bold),
-        '3' => Some(FontStyle::BoldItalic),
-        _ => None,
-    }
 }
 
 pub(crate) fn first_styled_line_style(text: &str) -> Option<FontStyle> {

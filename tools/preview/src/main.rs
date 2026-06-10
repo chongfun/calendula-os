@@ -1,15 +1,19 @@
 use display::fb::Framebuffer;
-use display::font::{draw_text, literata, measure_text, BitmapFont, FontStyle};
+use display::font::{
+    draw_text, literata, measure_text, style_from_marker_code, style_marker_code, BitmapFont,
+    FontStyle, STYLE_MARKER,
+};
 use display::render::{draw_ascii, fill_rect};
 use display::{Rect, HEIGHT, WIDTH};
 use proto::book::BookId;
-use proto::epub::{
-    load_epub_package, parse_css_text_align, xhtml_blocks_to_sink, CssRules, EpubPackage,
-    SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive, ZipEntry,
-};
 use proto::cache::{
     cache_key_for, encode_cover_header, CoverCacheHeader, CACHE_COVER_FILE, CACHE_DIR,
     CACHE_ROOT_DIR, COVER_BYTES, COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH,
+};
+use proto::epub::{
+    decode_html_entity, load_epub_package, parse_css_text_align, strip_fragment,
+    xhtml_blocks_to_sink, CssRules, EpubPackage, SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive,
+    ZipEntry,
 };
 use proto::text::{TextAlign, TextRole};
 use std::env;
@@ -26,7 +30,6 @@ const PAGE_BOTTOM: i16 = 472;
 const READER_LEFT_X: i16 = 8;
 const READER_RIGHT_X: i16 = 792;
 const READER_WRAP_SAFETY: i16 = 4;
-const STYLE_MARKER: char = '\u{1b}';
 const MAX_PREVIEW_LINES: usize = 4096;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,7 +76,9 @@ impl Args {
                     pages = value.parse().map_err(|_| "--pages needs a number")?;
                 }
                 "--cover-bin" => {
-                    cover_bin = Some(PathBuf::from(iter.next().ok_or("--cover-bin needs a path")?))
+                    cover_bin = Some(PathBuf::from(
+                        iter.next().ok_or("--cover-bin needs a path")?,
+                    ))
                 }
                 "--sd-root" => {
                     sd_root = Some(PathBuf::from(iter.next().ok_or("--sd-root needs a path")?))
@@ -661,18 +666,9 @@ fn write_landscape_home_mockups(out: &Path) -> std::io::Result<()> {
             "home-landscape-skeuo-library",
             LandscapeHomeVariant::SkeuoLibrary,
         ),
-        (
-            "home-landscape-ive-pure",
-            LandscapeHomeVariant::IvePure,
-        ),
-        (
-            "home-landscape-ive-glass",
-            LandscapeHomeVariant::IveGlass,
-        ),
-        (
-            "home-landscape-ive-object",
-            LandscapeHomeVariant::IveObject,
-        ),
+        ("home-landscape-ive-pure", LandscapeHomeVariant::IvePure),
+        ("home-landscape-ive-glass", LandscapeHomeVariant::IveGlass),
+        ("home-landscape-ive-object", LandscapeHomeVariant::IveObject),
         (
             "home-landscape-hybrid-soft",
             LandscapeHomeVariant::HybridSoft,
@@ -701,26 +697,14 @@ fn write_landscape_home_mockups(out: &Path) -> std::io::Result<()> {
             "home-landscape-dock-refined",
             LandscapeHomeVariant::DockRefined,
         ),
-        (
-            "home-landscape-dock-paper",
-            LandscapeHomeVariant::DockPaper,
-        ),
+        ("home-landscape-dock-paper", LandscapeHomeVariant::DockPaper),
         (
             "home-landscape-dock-widebook",
             LandscapeHomeVariant::DockWideBook,
         ),
-        (
-            "home-landscape-dock-clean",
-            LandscapeHomeVariant::DockClean,
-        ),
-        (
-            "home-landscape-dock-open",
-            LandscapeHomeVariant::DockOpen,
-        ),
-        (
-            "home-landscape-dock-panel",
-            LandscapeHomeVariant::DockPanel,
-        ),
+        ("home-landscape-dock-clean", LandscapeHomeVariant::DockClean),
+        ("home-landscape-dock-open", LandscapeHomeVariant::DockOpen),
+        ("home-landscape-dock-panel", LandscapeHomeVariant::DockPanel),
         ("home-landscape-tabs", LandscapeHomeVariant::Tabs),
         ("home-landscape-book", LandscapeHomeVariant::BookFirst),
     ];
@@ -1147,7 +1131,14 @@ fn draw_skeuo_button_stack(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16)
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         draw_recessed_slot(fb, x, row_y + 6, w, row_h - 16);
-        draw_text(fb, font, label, x as i16 + 26, row_y as i16 + row_h as i16 / 2 + 7, false);
+        draw_text(
+            fb,
+            font,
+            label,
+            x as i16 + 26,
+            row_y as i16 + row_h as i16 / 2 + 7,
+            false,
+        );
         draw_button_well(fb, x + w - 44, row_y + row_h / 2 - 11);
     }
 }
@@ -1181,7 +1172,11 @@ fn draw_spine_actions(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
             row_y as i16 + row_h as i16 / 2 + 7,
             true,
         );
-        fill_rect(fb, Rect::new(x + w - 58, row_y + row_h / 2 - 1, 26, 2), true);
+        fill_rect(
+            fb,
+            Rect::new(x + w - 58, row_y + row_h / 2 - 1, 26, 2),
+            true,
+        );
     }
 }
 
@@ -1199,11 +1194,7 @@ fn draw_ive_action_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
             row_y as i16 + row_h as i16 / 2 + 8,
             false,
         );
-        fill_rect(
-            fb,
-            Rect::new(x + w - 20, row_y + row_h / 2, 20, 1),
-            false,
-        );
+        fill_rect(fb, Rect::new(x + w - 20, row_y + row_h / 2, 20, 1), false);
     }
 }
 
@@ -1227,11 +1218,7 @@ fn draw_ive_glass_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
             row_y as i16 + row_h as i16 / 2 + 8,
             false,
         );
-        fill_rect(
-            fb,
-            Rect::new(x + w - 48, row_y + row_h / 2, 24, 1),
-            false,
-        );
+        fill_rect(fb, Rect::new(x + w - 48, row_y + row_h / 2, 24, 1), false);
     }
 }
 
@@ -1320,11 +1307,7 @@ fn draw_affordance_edge_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u1
             row_y as i16 + row_h as i16 / 2 + 8,
             false,
         );
-        fill_rect(
-            fb,
-            Rect::new(x + w - 42, row_y + row_h / 2, 24, 1),
-            false,
-        );
+        fill_rect(fb, Rect::new(x + w - 42, row_y + row_h / 2, 24, 1), false);
     }
 }
 
@@ -1502,7 +1485,12 @@ fn draw_cover_art_varied(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
         if dy + 8 < h {
             fill_rect(
                 fb,
-                Rect::new(x + inset, y + dy, line_w.min(w.saturating_sub(inset + 18)), line_h),
+                Rect::new(
+                    x + inset,
+                    y + dy,
+                    line_w.min(w.saturating_sub(inset + 18)),
+                    line_h,
+                ),
                 false,
             );
         }
@@ -1521,7 +1509,11 @@ fn draw_battery_landscape_minimal(fb: &mut Framebuffer, x: u16, y: u16, percent:
 fn draw_ive_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u16) {
     fill_rect(fb, Rect::new(x, y, w, 1), false);
     let fill_w = ((w as u32 * permille.min(1000) as u32) / 1000) as u16;
-    fill_rect(fb, Rect::new(x, y.saturating_sub(1), fill_w.max(1), 3), false);
+    fill_rect(
+        fb,
+        Rect::new(x, y.saturating_sub(1), fill_w.max(1), 3),
+        false,
+    );
 }
 
 fn draw_paper_panel(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
@@ -1598,7 +1590,11 @@ fn draw_landscape_action_stack(
         if index == selected {
             fill_rect(fb, Rect::new(x + 10, row_y + 10, 4, row_h - 22), true);
         } else {
-            fill_rect(fb, Rect::new((text_x + text_w + 18) as u16, row_y + row_h / 2, 32, 1), false);
+            fill_rect(
+                fb,
+                Rect::new((text_x + text_w + 18) as u16, row_y + row_h / 2, 32, 1),
+                false,
+            );
         }
     }
 }
@@ -1676,7 +1672,11 @@ fn draw_battery_landscape(fb: &mut Framebuffer, x: u16, y: u16, percent: u8) {
 fn draw_thin_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u16) {
     fill_rect(fb, Rect::new(x, y, w, 1), false);
     let fill_w = ((w as u32 * permille.min(1000) as u32) / 1000) as u16;
-    fill_rect(fb, Rect::new(x, y.saturating_sub(2), fill_w.max(1), 5), false);
+    fill_rect(
+        fb,
+        Rect::new(x, y.saturating_sub(2), fill_w.max(1), 5),
+        false,
+    );
 }
 
 fn draw_text_centered(fb: &mut Framebuffer, font: &BitmapFont, text: &str, center_x: i16, y: i16) {
@@ -1691,12 +1691,7 @@ fn stroke_rect_direct(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     fill_rect(fb, Rect::new(x + w - 1, y, 1, h), false);
 }
 
-fn write_shell_preview(
-    out: &Path,
-    name: &str,
-    view: UiView,
-    selection: u8,
-) -> std::io::Result<()> {
+fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u8) -> std::io::Result<()> {
     let mut fb = Framebuffer::new();
     let entries = [
         "/books/Flowers for Algernon.epub",
@@ -1748,7 +1743,10 @@ fn write_shell_preview(
     render_shell(&mut fb, &shell);
     write_pbm(&out.join(format!("{name}.pbm")), &fb)?;
     write_png(&out.join(format!("{name}.png")), &fb)?;
-    if matches!(view, UiView::Home | UiView::Library | UiView::Settings | UiView::Sync) {
+    if matches!(
+        view,
+        UiView::Home | UiView::Library | UiView::Settings | UiView::Sync
+    ) {
         write_portrait_left_png(&out.join(format!("{name}-upright.png")), &fb)?;
     } else {
         write_panel_png(&out.join(format!("{name}-panel.png")), &fb)?;
@@ -1925,7 +1923,7 @@ fn normalize_text(text: &str) -> String {
     let mut cursor = 0usize;
     while cursor < text.len() {
         let rest = &text[cursor..];
-        let (ch, advance) = if let Some(decoded) = decode_entity(rest) {
+        let (ch, advance) = if let Some(decoded) = decode_html_entity(rest) {
             (decoded, rest.find(';').map(|index| index + 1).unwrap_or(1))
         } else {
             let Some(ch) = rest.chars().next() else {
@@ -1953,55 +1951,6 @@ fn normalize_char(ch: char) -> char {
         ch if ch as u32 <= u16::MAX as u32 => ch,
         _ => '?',
     }
-}
-
-fn decode_entity(input: &str) -> Option<char> {
-    if let Some(decoded) = decode_numeric_entity(input) {
-        Some(decoded)
-    } else if input.starts_with("&amp;") {
-        Some('&')
-    } else if input.starts_with("&lt;") {
-        Some('<')
-    } else if input.starts_with("&gt;") {
-        Some('>')
-    } else if input.starts_with("&quot;") {
-        Some('"')
-    } else if input.starts_with("&apos;") {
-        Some('\'')
-    } else if input.starts_with("&nbsp;") {
-        Some(' ')
-    } else if input.starts_with("&mdash;") {
-        Some('—')
-    } else if input.starts_with("&ndash;") {
-        Some('–')
-    } else if input.starts_with("&lsquo;") {
-        Some('‘')
-    } else if input.starts_with("&rsquo;") {
-        Some('’')
-    } else if input.starts_with("&ldquo;") {
-        Some('“')
-    } else if input.starts_with("&rdquo;") {
-        Some('”')
-    } else if input.starts_with("&hellip;") {
-        Some('…')
-    } else {
-        None
-    }
-}
-
-fn decode_numeric_entity(input: &str) -> Option<char> {
-    let rest = input.strip_prefix("&#")?;
-    let end = rest.find(';')?;
-    let entity = &rest[..end];
-    let value = if let Some(hex) = entity
-        .strip_prefix('x')
-        .or_else(|| entity.strip_prefix('X'))
-    {
-        u32::from_str_radix(hex, 16).ok()?
-    } else {
-        entity.parse::<u32>().ok()?
-    };
-    char::from_u32(value)
 }
 
 fn sanitize_preview_block(block: &mut String) -> bool {
@@ -2120,25 +2069,6 @@ fn is_leading_punctuation_word(word: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn style_marker_code(style: FontStyle) -> char {
-    match style {
-        FontStyle::Regular => '0',
-        FontStyle::Italic => '1',
-        FontStyle::Bold => '2',
-        FontStyle::BoldItalic => '3',
-    }
-}
-
-fn style_from_marker_code(code: char) -> Option<FontStyle> {
-    match code {
-        '0' => Some(FontStyle::Regular),
-        '1' => Some(FontStyle::Italic),
-        '2' => Some(FontStyle::Bold),
-        '3' => Some(FontStyle::BoldItalic),
-        _ => None,
-    }
-}
-
 fn first_styled_line_style(text: &str) -> Option<FontStyle> {
     let mut chars = text.chars();
     while let Some(ch) = chars.next() {
@@ -2245,10 +2175,6 @@ fn styled_text_snapshot(text: &str) -> String {
         out.push(ch);
     }
     out
-}
-
-fn strip_fragment(value: &str) -> &str {
-    value.split('#').next().unwrap_or(value)
 }
 
 fn resolve_epub_href(opf_path: &str, href: &str) -> String {

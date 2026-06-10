@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 heapless = "0.8.0"
 miniz_oxide = { version = "0.9.1", default-features = false }
+
+[dev-dependencies]
+# Tests deflate their own fixtures; firmware builds never see this feature.
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }

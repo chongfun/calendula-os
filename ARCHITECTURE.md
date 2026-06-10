@@ -220,6 +220,10 @@ and the host preview tool:
   `ReadAt` interface, which is the path storage-backed EPUBs use. Firmware ZIP
   reads stream deflate input through a reusable inflater scratch state, so large
   compressed members do not have to fit in the compressed scratch buffer.
+- `EpubZipOps` as the narrow zip-entry interface cache loaders program
+  against. Both zip front-ends implement it, and one shared streaming inflate
+  engine sits behind them, so entry reads behave identically regardless of
+  whether compressed bytes come from random-access or forward-only storage.
 - `EpubPackage` for container/OPF metadata, manifest, and spine.
 - `TextRun`, `TextRole`, `FontStyle`, and `paginate_screen` for text-only XHTML
   reading and deterministic one-screen pagination.
