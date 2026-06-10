@@ -83,7 +83,8 @@ app-core/ app state reducer and Copy message contracts shared by firmware/tools
 display/   framebuffer, drawing primitives, SSD1677 constants and address math
 hal-ext/   thin async wrappers over ESP HAL peripherals
 fw/        boot, Embassy executor, task wiring, board-owned peripherals
-ui/        bounded layout data structures for later UI work
+ui/        shared shell rendering plus ui::reading, the reader page-plan seam
+           (page bounds, ink measurement, wrapping) used by fw and host tools
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
 tools/emulator/ host-side development emulator and scenario runner
 ```
@@ -130,12 +131,16 @@ renders the latest state once.
 
 Storage is also explicit. Files/Home/Reading transitions enqueue
 `StorageCommand`s after the visible render settles; render commands never scan
-FAT, open EPUBs, build caches, or write progress. The board I/O task is still
+FAT, open EPUBs, build caches, or write progress. Open/extend requests whose
+page already sits inside the loaded section window are answered from RAM
+without an SD session, and reading-progress writes are coalesced (at most one
+STATE.BIN write per 15 s, flushed before display sleep). The board I/O task is still
 the single SPI owner, so display refresh and SD transactions cannot overlap, but
 the user-facing view is always drawn from the latest already-owned snapshot.
 SD/FAT access goes through an SD session: the board I/O task deselects the
-display, prepares the card on the shared SPI bus, opens the FAT root, performs
-one storage action, and restores display-speed SPI before returning to EPD work.
+display, clocks the bus down for the card (400 kHz identification with wake
+clocks, then 20 MHz data), opens the FAT root, performs one storage action, and
+restores 40 MHz display SPI before returning to EPD work.
 
 ## Display model
 
@@ -225,8 +230,8 @@ and the host preview tool:
   engine sits behind them, so entry reads behave identically regardless of
   whether compressed bytes come from random-access or forward-only storage.
 - `EpubPackage` for container/OPF metadata, manifest, and spine.
-- `TextRun`, `TextRole`, `FontStyle`, and `paginate_screen` for text-only XHTML
-  reading and deterministic one-screen pagination.
+- `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
+  single XHTML extraction path feeding bounded block records.
 - `BookCacheHeader`, `SectionHeader`, `PageCacheHeader`, `TocRecord`,
   `PageRecord`, `LineRecord`, `WordRecord`, and `BlockRecord` for bounded binary
   cache records used by firmware and preview pagination.
