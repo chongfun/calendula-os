@@ -161,32 +161,40 @@ where
             return BookIndexLoadResult::Invalid;
         }
         let mut sections = [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS];
-        for slot in sections.iter_mut().take(header.section_count as usize) {
-            let mut record_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
-            if read_exact_file(file, &mut record_bytes).is_err() {
-                return BookIndexLoadResult::Invalid;
-            }
-            let Ok(record) = decode_book_v2_section(&record_bytes) else {
-                return BookIndexLoadResult::Invalid;
-            };
-            if record.page_count == 0 {
-                return BookIndexLoadResult::Invalid;
-            }
-            *slot = record;
+        if !read_records_batched(
+            file,
+            BOOK_V2_SECTION_RECORD_BYTES,
+            header.section_count as usize,
+            |index, bytes| {
+                let Ok(record) = decode_book_v2_section(bytes) else {
+                    return false;
+                };
+                if record.page_count == 0 {
+                    return false;
+                }
+                sections[index] = record;
+                true
+            },
+        ) {
+            return BookIndexLoadResult::Invalid;
         }
         let mut toc = [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS];
-        for slot in toc.iter_mut().take(header.toc_count as usize) {
-            let mut record_bytes = [0u8; TOC_RECORD_BYTES];
-            if read_exact_file(file, &mut record_bytes).is_err() {
-                return BookIndexLoadResult::Invalid;
-            }
-            let Ok(record) = decode_toc(&record_bytes) else {
-                return BookIndexLoadResult::Invalid;
-            };
-            if !toc_record_fits_text(record, header.toc_text_bytes) {
-                return BookIndexLoadResult::Invalid;
-            }
-            *slot = record;
+        if !read_records_batched(
+            file,
+            TOC_RECORD_BYTES,
+            header.toc_count as usize,
+            |index, bytes| {
+                let Ok(record) = decode_toc(bytes) else {
+                    return false;
+                };
+                if !toc_record_fits_text(record, header.toc_text_bytes) {
+                    return false;
+                }
+                toc[index] = record;
+                true
+            },
+        ) {
+            return BookIndexLoadResult::Invalid;
         }
         library.clear_toc();
         if header.toc_text_bytes > 0 {
@@ -752,41 +760,31 @@ where
         return false;
     }
     library.clear_lines();
-    let mut record_bytes = [0u8; 16];
-    for index in 0..page_count {
-        if read_exact_file(file, &mut record_bytes[..PAGE_RECORD_BYTES]).is_err() {
-            return false;
-        }
-        let Ok(page) = decode_page(&record_bytes[..PAGE_RECORD_BYTES]) else {
+    if !read_records_batched(file, PAGE_RECORD_BYTES, page_count, |index, bytes| {
+        let Ok(page) = decode_page(bytes) else {
             return false;
         };
-        if !library.set_cached_page(index, page, header.spine) {
-            return false;
-        }
+        library.set_cached_page(index, page, header.spine)
+    }) {
+        return false;
     }
-    for index in 0..block_count {
-        if read_exact_file(file, &mut record_bytes[..BLOCK_RECORD_BYTES]).is_err() {
-            return false;
-        }
-        let Ok(block) = decode_block(&record_bytes[..BLOCK_RECORD_BYTES]) else {
+    if !read_records_batched(file, BLOCK_RECORD_BYTES, block_count, |index, bytes| {
+        let Ok(block) = decode_block(bytes) else {
             return false;
         };
-        if !library.set_cached_block(
+        library.set_cached_block(
             index,
             block,
             display_style_for_proto_style(block.style),
             header.spine,
-        ) {
-            return false;
-        }
+        )
+    }) {
+        return false;
     }
-    for index in 0..block_count {
-        let mut flag = [0u8; 1];
-        if read_exact_file(file, &mut flag).is_err()
-            || !library.set_cached_paragraph_end(index, flag[0] != 0)
-        {
-            return false;
-        }
+    if !read_records_batched(file, 1, block_count, |index, bytes| {
+        library.set_cached_paragraph_end(index, bytes[0] != 0)
+    }) {
+        return false;
     }
     let Some(text) = library.cached_text_mut(text_bytes) else {
         return false;
@@ -887,6 +885,51 @@ where
     if file.write(&library.text[..library.text_len]).is_err() {
         esp_println::println!("cache: write text failed");
         return false;
+    }
+    true
+}
+
+/// Staging size for batched record reads. Kept small: this sits on the
+/// stack inside the EPUB open path, alongside copy_file_bytes' 512-byte
+/// scratch in the same budget region.
+const RECORD_STAGE_BYTES: usize = 256;
+
+/// Read `count` fixed-size records through one staging buffer instead of
+/// one embedded-sdmmc read call per record; the FAT layer pays per-call
+/// overhead, so 4-16 byte reads dominate section and index load time.
+fn read_records_batched<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    record_len: usize,
+    count: usize,
+    mut apply: impl FnMut(usize, &[u8]) -> bool,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if record_len == 0 || record_len > RECORD_STAGE_BYTES {
+        return false;
+    }
+    let mut stage = [0u8; RECORD_STAGE_BYTES];
+    let per_batch = (RECORD_STAGE_BYTES / record_len) * record_len;
+    let mut index = 0usize;
+    while index < count {
+        let take = ((count - index) * record_len).min(per_batch);
+        if read_exact_file(file, &mut stage[..take]).is_err() {
+            return false;
+        }
+        for chunk in stage[..take].chunks_exact(record_len) {
+            if !apply(index, chunk) {
+                return false;
+            }
+            index += 1;
+        }
     }
     true
 }
