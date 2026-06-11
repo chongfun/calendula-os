@@ -1082,7 +1082,9 @@ where
         let local_header_offset = read_u32(&header, 42)?;
 
         let mut hash = FNV_OFFSET;
-        let mut name_cursor = cursor.checked_add(46).ok_or(ZipError::BadCentralDirectory)?;
+        let mut name_cursor = cursor
+            .checked_add(46)
+            .ok_or(ZipError::BadCentralDirectory)?;
         let mut remaining = name_len;
         while remaining > 0 {
             let take = (remaining as usize).min(name_chunk.len());
@@ -1604,7 +1606,7 @@ fn collect_fallback_spine_items<'a>(
     Ok(())
 }
 
-fn collect_spine_idrefs<'a>(opf_xml: &'a str) -> Vec<&'a str, MAX_SPINE_ITEMS> {
+fn collect_spine_idrefs(opf_xml: &str) -> Vec<&str, MAX_SPINE_ITEMS> {
     let mut idrefs = Vec::new();
     let mut in_spine = false;
     let mut cursor = XmlCursor::new(opf_xml);
@@ -1650,7 +1652,7 @@ fn manifest_item_needed(
     properties: &str,
     spine_idrefs: &Vec<&str, MAX_SPINE_ITEMS>,
 ) -> bool {
-    spine_idrefs.iter().any(|idref| *idref == id)
+    spine_idrefs.contains(&id)
         || properties
             .split_ascii_whitespace()
             .any(|prop| prop == "nav" || prop == "cover-image")
@@ -2202,6 +2204,12 @@ pub struct StreamingXmlTokenizer {
     tag_overflow: bool,
 }
 
+impl Default for StreamingXmlTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingXmlTokenizer {
     pub fn new() -> Self {
         Self {
@@ -2437,6 +2445,12 @@ pub struct NcxStreamParser {
     href_set: bool,
 }
 
+impl Default for NcxStreamParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NcxStreamParser {
     pub fn new() -> Self {
         Self {
@@ -2531,6 +2545,12 @@ pub struct Epub3NavStreamParser {
     href_set: bool,
     title: heapless::String<160>,
     level: u8,
+}
+
+impl Default for Epub3NavStreamParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Epub3NavStreamParser {
@@ -4549,8 +4569,9 @@ mod tests {
         let names: StdVec<std::string::String> = (0..16)
             .map(|index| std::format!("OPS/chapter-{index:02}.xhtml"))
             .collect();
-        let bodies: StdVec<std::string::String> =
-            (0..16).map(|index| std::format!("body {index:02}")).collect();
+        let bodies: StdVec<std::string::String> = (0..16)
+            .map(|index| std::format!("body {index:02}"))
+            .collect();
         let files: StdVec<(&str, &[u8])> = names
             .iter()
             .zip(bodies.iter())
@@ -4587,8 +4608,9 @@ mod tests {
         let names: StdVec<std::string::String> = (0..10)
             .map(|index| std::format!("OPS/chapter-{index:02}.xhtml"))
             .collect();
-        let bodies: StdVec<std::string::String> =
-            (0..10).map(|index| std::format!("body {index:02}")).collect();
+        let bodies: StdVec<std::string::String> = (0..10)
+            .map(|index| std::format!("body {index:02}"))
+            .collect();
         let files: StdVec<(&str, &[u8])> = names
             .iter()
             .zip(bodies.iter())

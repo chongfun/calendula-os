@@ -47,9 +47,15 @@ pub static _ESP_APP_DESC: EspAppDesc = EspAppDesc {
     reserv2: [0; 18],
 };
 
+// The only allocator user is the Wi-Fi sync session; reader paths stay
+// allocation-free because no region exists until sync_mem donates the
+// loaned buffers.
+extern crate alloc;
+
 pub use app_core::{
     AppView, Button, DisplayCommand, DisplayEvent, DisplayOrientation, InputEvent, LibraryEvent,
     PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, StorageCommand,
+    SyncCommand, SyncEvent,
 };
 use core::sync::atomic::{AtomicBool, AtomicU32};
 use embassy_executor::Spawner;
@@ -78,6 +84,7 @@ mod reader_cache_files;
 mod reader_layout;
 mod reader_store;
 mod sd_session;
+mod sync_mem;
 pub mod tasks;
 mod views;
 
@@ -90,6 +97,9 @@ pub static DISPLAY_EVENTS: Channel<CriticalSectionRawMutex, DisplayEvent, 16> = 
 pub static LIBRARY_EVENTS: Channel<CriticalSectionRawMutex, LibraryEvent, 8> = Channel::new();
 pub static STORAGE_COMMANDS: Channel<CriticalSectionRawMutex, StorageCommand, 4> = Channel::new();
 pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Channel::new();
+pub static SYNC_COMMANDS: Channel<CriticalSectionRawMutex, SyncCommand, 2> = Channel::new();
+pub static SYNC_EVENTS: Channel<CriticalSectionRawMutex, SyncEvent, 4> = Channel::new();
+pub static SYNC_LOANS: Channel<CriticalSectionRawMutex, sync_mem::SyncLoan, 1> = Channel::new();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -171,8 +181,17 @@ fn main() -> ! {
         esp_println::println!("main: spawn display");
         spawner.spawn(tasks::display::run(epd_bus, sd_cs)).unwrap();
         let _lpwr = peripherals.LPWR;
-        let _wifi = peripherals.WIFI;
         esp_println::println!("main: spawn app");
         spawner.spawn(tasks::app::run()).unwrap();
+        esp_println::println!("main: spawn wifi");
+        spawner
+            .spawn(tasks::wifi::run(
+                spawner,
+                peripherals.WIFI,
+                peripherals.SYSTIMER,
+                peripherals.RNG,
+                peripherals.RADIO_CLK,
+            ))
+            .unwrap();
     })
 }

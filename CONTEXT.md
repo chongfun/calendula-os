@@ -32,6 +32,18 @@ The resolved page-level reading plan produced from Reader store blocks, typograp
 
 Use this term for the deepened pagination/rendering seam that firmware reading views and host preview tooling should share. Avoid duplicating wrapping, style-marker interpretation, and page slicing separately in preview and firmware render paths.
 
+### Sync session
+
+The one-way Wi-Fi mode that exchanges reading progress with a kosync
+server. Entering it loans the EPUB scratch (plus the dram2 segment) to the
+radio as heap, so the reader pipeline is gone until the session ends in a
+software reset. The display task keeps serving renders and progress writes
+during the session; it refuses every scratch-using storage command.
+
+Use this term for the wifi task's lifecycle. Keep kosync protocol encoding
+(`proto::kosync`) and the memory loan plumbing (`fw::sync_mem`) out of
+radio and UI language.
+
 ### Refresh plan
 
 The display-policy decision that maps render history, view/book context, selection changes, library changes, sleep/wake state, and refresh policy into an SSD1677 refresh mode.

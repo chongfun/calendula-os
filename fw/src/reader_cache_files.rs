@@ -13,8 +13,8 @@ use proto::cache::{
     encode_toc, section_file_name, BookV2Header, BookV2SectionRecord, SectionV2Header,
     BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE,
     CACHE_COVER_FILE, CACHE_DIR, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES,
-    CACHE_STATE_FILE, CACHE_V2_DIR, COVER_HEADER_BYTES, PAGE_RECORD_BYTES,
-    SECTION_HEADER_BYTES, SECTION_V2_HEADER_BYTES, TOC_RECORD_BYTES,
+    CACHE_STATE_FILE, CACHE_V2_DIR, COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_HEADER_BYTES,
+    SECTION_V2_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 
 const MIGRATE_MAX_SECTIONS: u16 = 16;
@@ -568,7 +568,6 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut saw_v1 = false;
     let mut migrated = false;
     let mut invalid = false;
     for spine in 0..MIGRATE_MAX_SECTIONS {
@@ -580,7 +579,6 @@ where
         }) else {
             continue;
         };
-        saw_v1 = true;
         match result {
             MigrationResult::Migrated => migrated = true,
             MigrationResult::Invalid => invalid = true,
@@ -591,9 +589,8 @@ where
         MigrationResult::Migrated
     } else if invalid {
         MigrationResult::Invalid
-    } else if saw_v1 {
-        MigrationResult::Skipped
     } else {
+        // saw_v1 and the no-state case both land on Skipped.
         MigrationResult::Skipped
     }
 }

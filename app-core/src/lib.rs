@@ -134,6 +134,12 @@ pub struct RefreshPlanner {
     panel_shows_sleep_screen: bool,
 }
 
+impl Default for RefreshPlanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RefreshPlanner {
     pub const fn new() -> Self {
         Self {
@@ -273,8 +279,15 @@ pub enum StorageCommand {
         type_settings: TypeSettings,
     },
     StoreProgress(PersistedAppState),
+    /// Hand the EPUB scratch to the wifi task as sync-session heap. One
+    /// way: after this the display task refuses scratch-using commands
+    /// until the session's software reset reboots the reader.
+    LoanSyncMemory,
 }
 
+// Bounded Copy messages by design: chapter_pages rides inside the event
+// because firmware has no heap to box large variants into.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayEvent {
     Settled,
@@ -282,6 +295,7 @@ pub enum DisplayEvent {
     Library(LibraryEvent),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibraryEvent {
     Scanned {
@@ -857,7 +871,11 @@ fn sync_entry_status(ctx: ReducerContext) -> SyncStatus {
     }
 }
 
-fn apply_home_action(mut state: ReaderState, ctx: ReducerContext, action: HomeAction) -> ReaderState {
+fn apply_home_action(
+    mut state: ReaderState,
+    ctx: ReducerContext,
+    action: HomeAction,
+) -> ReaderState {
     state.selection = 0;
     state.read_request_pending = false;
     match action {

@@ -263,9 +263,7 @@ impl StableButton {
             return None;
         }
 
-        let Some(current) = self.current else {
-            return None;
-        };
+        let current = self.current?;
         if self.cooldown > 0 || !is_repeatable(current) {
             return None;
         }

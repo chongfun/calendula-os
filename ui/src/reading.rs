@@ -183,11 +183,7 @@ pub fn for_each_drawable_block(
 
 /// Draw one page of reading-body blocks: the single rendering of cached
 /// reader content shared by firmware views and host tooling.
-pub fn draw_reading_page_body(
-    fb: &mut Framebuffer,
-    source: &impl ReadingBlocks,
-    page: PageRecord,
-) {
+pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks, page: PageRecord) {
     let settings = source.type_settings();
     for_each_drawable_block(source, page, |block| {
         let role = block.record.role;

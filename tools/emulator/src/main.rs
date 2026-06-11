@@ -292,6 +292,7 @@ impl Emulator {
             Some(StorageCommand::OpenBook { .. }) => Some("OpenBook"),
             Some(StorageCommand::ExtendSection { .. }) => Some("ExtendSection"),
             Some(StorageCommand::StoreProgress(_)) => Some("StoreProgress"),
+            Some(StorageCommand::LoanSyncMemory) => Some("LoanSyncMemory"),
             None => None,
         }
     }

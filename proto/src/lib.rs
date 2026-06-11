@@ -4,6 +4,7 @@
 pub mod book;
 pub mod cache;
 pub mod epub;
+pub mod kosync;
 pub mod storage;
 pub mod text;
 pub mod wifi_sync;

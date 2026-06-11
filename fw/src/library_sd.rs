@@ -24,7 +24,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         esp_println::println!("sd: open root");
         library.clear_catalog();
         library.status = LibraryScanStatus::Scanning;
-        collect_epubs(&root, "/", false, library);
+        collect_epubs(root, "/", false, library);
         if let Ok(books) = root.open_dir("BOOKS") {
             collect_epubs(&books, "/books/", true, library);
         }
@@ -32,8 +32,8 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         if library.catalog_is_empty() {
             LibraryScanStatus::Empty
         } else {
-            let _ = write_catalog_cache(&root, library);
-            migrate_reader_cache(&root, library);
+            let _ = write_catalog_cache(root, library);
+            migrate_reader_cache(root, library);
             LibraryScanStatus::Ready
         }
     })
@@ -95,8 +95,8 @@ pub(crate) fn load_catalog_cache(
     esp_println::println!("sd: catalog cache load start");
 
     let loaded = sd_session::with_root(epd, sd_cs, |root| {
-        if read_catalog_cache(&root, library).is_ok() {
-            migrate_reader_cache(&root, library);
+        if read_catalog_cache(root, library).is_ok() {
+            migrate_reader_cache(root, library);
             true
         } else {
             false

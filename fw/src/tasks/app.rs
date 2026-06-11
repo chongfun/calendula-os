@@ -1,12 +1,13 @@
 use crate::{
     catalog, Button, DisplayCommand, DisplayEvent, InputEvent, PowerEvent, ReaderSource,
-    RenderKind, StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS, INPUT_EVENTS,
-    LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
+    RenderKind, StorageCommand, SyncCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS, INPUT_EVENTS,
+    LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS, SYNC_COMMANDS,
+    SYNC_EVENTS,
 };
-use app_core::{AppView, ReaderState, ReducerContext};
+use app_core::{AppView, ReaderState, ReducerContext, SyncError, SyncStatus};
 use core::sync::atomic::Ordering;
 use display::Rect;
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select4, Either4};
 use embassy_time::{Duration, Instant};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
@@ -28,17 +29,18 @@ pub async fn run() {
     let mut opening_book: Option<u32> = None;
     let mut suppress_input_until_open_settled = false;
     let mut block_confirm_until: Option<Instant> = None;
-    send_render(RenderKind::Boot, state).await;
+    send_render(RenderKind::Boot, &state).await;
 
     loop {
-        match select3(
+        match select4(
             INPUT_EVENTS.receive(),
             DISPLAY_EVENTS.receive(),
             LIBRARY_EVENTS.receive(),
+            SYNC_EVENTS.receive(),
         )
         .await
         {
-            Either3::First(event) => {
+            Either4::First(event) => {
                 if matches!(
                     event,
                     InputEvent::Sample {
@@ -51,7 +53,7 @@ pub async fn run() {
                         sleeping = false;
                         state.view = AppView::Home;
                         state.dirty = Rect::FULL;
-                        send_render(RenderKind::Page, state).await;
+                        send_render(RenderKind::Page, &state).await;
                         rendering = true;
                         render_pending = false;
                     } else {
@@ -89,13 +91,13 @@ pub async fn run() {
                 if previous.type_settings() != state.type_settings() {
                     reader_relayout_pending = true;
                 }
-                let mut storage_command = storage_command_for_transition(previous, state);
+                let mut storage_command = storage_command_for_transition(&previous, &state);
                 if storage_command.is_none()
                     && reader_relayout_pending
                     && state.view == AppView::Reading
                 {
                     if let Some(index) = ReaderSource::from_book_id(state.book_id).sd_index() {
-                        storage_command = Some(extend_section_command(state, index));
+                        storage_command = Some(extend_section_command(&state, index));
                     }
                 }
                 if storage_command.is_some() {
@@ -129,6 +131,12 @@ pub async fn run() {
                         pending_storage = Some(command);
                     }
                 }
+                if let Some(command) = sync_command_for_transition(&previous, &state) {
+                    esp_println::println!("app: sync command {:?}", command);
+                    if SYNC_COMMANDS.try_send(command).is_err() {
+                        esp_println::println!("app: sync command queue full");
+                    }
+                }
                 // We used to suppress the render when an open was inflight
                 // and wait for the Loaded event. That's fine when the cache
                 // hits and the open returns in milliseconds, but on a cache
@@ -139,12 +147,12 @@ pub async fn run() {
                 if rendering {
                     render_pending = true;
                 } else {
-                    send_render(RenderKind::Page, state).await;
+                    send_render(RenderKind::Page, &state).await;
                     rendering = true;
                     render_pending = false;
                 }
             }
-            Either3::Second(event) => match event {
+            Either4::Second(event) => match event {
                 DisplayEvent::Settled => {
                     rendering = false;
                     if !catalog_refresh_requested {
@@ -165,7 +173,7 @@ pub async fn run() {
                         STORAGE_COMMANDS.send(command).await;
                     }
                     if render_pending && !sleeping {
-                        send_render(RenderKind::Page, state).await;
+                        send_render(RenderKind::Page, &state).await;
                         rendering = true;
                         render_pending = false;
                     } else if suppress_input_until_open_settled && opening_book.is_none() {
@@ -184,12 +192,12 @@ pub async fn run() {
                     block_confirm_until = None;
                 }
                 DisplayEvent::Library(event) => {
-                    if let Some(book_id) = loaded_book_id(event) {
+                    if let Some(book_id) = loaded_book_id(&event) {
                         if opening_book == Some(book_id) {
                             opening_book = None;
                         }
                     }
-                    let should_render = library_event_affects_view(state, event);
+                    let should_render = library_event_affects_view(&state, &event);
                     state = state.apply_library_event(ctx, event);
                     if !should_render || sleeping {
                         continue;
@@ -197,19 +205,19 @@ pub async fn run() {
                     if rendering {
                         render_pending = true;
                     } else {
-                        send_render(RenderKind::Page, state).await;
+                        send_render(RenderKind::Page, &state).await;
                         rendering = true;
                         render_pending = false;
                     }
                 }
             },
-            Either3::Third(event) => {
-                if let Some(book_id) = loaded_book_id(event) {
+            Either4::Third(event) => {
+                if let Some(book_id) = loaded_book_id(&event) {
                     if opening_book == Some(book_id) {
                         opening_book = None;
                     }
                 }
-                let should_render = library_event_affects_view(state, event);
+                let should_render = library_event_affects_view(&state, &event);
                 state = state.apply_library_event(ctx, event);
                 if !should_render || sleeping {
                     continue;
@@ -217,7 +225,20 @@ pub async fn run() {
                 if rendering {
                     render_pending = true;
                 } else {
-                    send_render(RenderKind::Page, state).await;
+                    send_render(RenderKind::Page, &state).await;
+                    rendering = true;
+                    render_pending = false;
+                }
+            }
+            Either4::Fourth(event) => {
+                state = state.apply_sync_event(event);
+                if state.view != AppView::Sync || sleeping {
+                    continue;
+                }
+                if rendering {
+                    render_pending = true;
+                } else {
+                    send_render(RenderKind::Page, &state).await;
                     rendering = true;
                     render_pending = false;
                 }
@@ -226,8 +247,8 @@ pub async fn run() {
     }
 }
 
-fn library_event_affects_view(state: ReaderState, event: crate::LibraryEvent) -> bool {
-    match event {
+fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) -> bool {
+    match *event {
         crate::LibraryEvent::Scanned { count } => {
             state.view == AppView::Library && state.library_count != count
         }
@@ -267,8 +288,8 @@ fn open_book_id(command: StorageCommand) -> Option<u32> {
     }
 }
 
-fn loaded_book_id(event: crate::LibraryEvent) -> Option<u32> {
-    match event {
+fn loaded_book_id(event: &crate::LibraryEvent) -> Option<u32> {
+    match *event {
         crate::LibraryEvent::Loaded { book_id, .. } => Some(book_id),
         _ => None,
     }
@@ -291,7 +312,7 @@ fn should_block_post_open_confirm(event: InputEvent, block_until: &mut Option<In
     )
 }
 
-async fn send_render(kind: RenderKind, state: ReaderState) {
+async fn send_render(kind: RenderKind, state: &ReaderState) {
     DISPLAY_COMMANDS
         .send(DisplayCommand::Render(state.render_request(kind)))
         .await;
@@ -328,20 +349,44 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         StorageCommand::RefreshCatalog => {
             esp_println::println!("app: storage {label} refresh catalog")
         }
+        StorageCommand::LoanSyncMemory => {
+            esp_println::println!("app: storage {label} loan sync memory")
+        }
     }
 }
 
 fn reducer_context() -> ReducerContext {
     ReducerContext::new(catalog::book_count(), catalog::chapter_count())
+        .with_sync_credentials(crate::tasks::wifi::credentials().is_some())
+}
+
+/// Confirm on the Sync screen arms `Starting`; leaving the screen after
+/// the radio ran has to reset the device because the loaned memory can
+/// never come back. `Error(NoCredentials)` is the one failure that
+/// happens before the radio touches anything.
+fn sync_command_for_transition(previous: &ReaderState, next: &ReaderState) -> Option<SyncCommand> {
+    if previous.sync_status != SyncStatus::Starting && next.sync_status == SyncStatus::Starting {
+        return Some(SyncCommand::Start);
+    }
+    if previous.view == AppView::Sync && next.view != AppView::Sync {
+        let radio_ran = !matches!(
+            previous.sync_status,
+            SyncStatus::NotConfigured
+                | SyncStatus::Idle
+                | SyncStatus::Error(SyncError::NoCredentials)
+        );
+        if radio_ran {
+            return Some(SyncCommand::Exit);
+        }
+    }
+    None
 }
 
 fn storage_command_for_transition(
-    previous: ReaderState,
-    next: ReaderState,
+    previous: &ReaderState,
+    next: &ReaderState,
 ) -> Option<StorageCommand> {
-    let Some(index) = ReaderSource::from_book_id(next.book_id).sd_index() else {
-        return None;
-    };
+    let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
     if next.view != AppView::Reading {
         return None;
     }
@@ -375,7 +420,7 @@ fn storage_command_for_transition(
     None
 }
 
-fn open_book_command(state: ReaderState, index: u8) -> StorageCommand {
+fn open_book_command(state: &ReaderState, index: u8) -> StorageCommand {
     let request_id = next_reader_request_id();
     StorageCommand::OpenBook {
         request_id,
@@ -387,7 +432,7 @@ fn open_book_command(state: ReaderState, index: u8) -> StorageCommand {
     }
 }
 
-fn extend_section_command(state: ReaderState, index: u8) -> StorageCommand {
+fn extend_section_command(state: &ReaderState, index: u8) -> StorageCommand {
     let request_id = next_reader_request_id();
     StorageCommand::ExtendSection {
         request_id,

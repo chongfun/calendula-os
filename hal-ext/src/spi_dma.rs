@@ -84,8 +84,7 @@ where
         // immediately if the pin is already low, replacing the 20 ms poll
         // loop's wake-ups and exit jitter; the ceiling matches the poll
         // loop's previous ~15 s give-up.
-        let _ =
-            embassy_time::with_timeout(Duration::from_secs(15), self.busy.wait_for_low()).await;
+        let _ = embassy_time::with_timeout(Duration::from_secs(15), self.busy.wait_for_low()).await;
     }
 
     pub fn deselect_display(&mut self) {

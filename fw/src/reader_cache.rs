@@ -85,6 +85,7 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
 }
 
 impl<'a> ReaderCacheScratch<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tail: &'a mut [u8; READER_TAIL_SCRATCH],
         header: &'a mut [u8; READER_HEADER_SCRATCH],
@@ -107,6 +108,103 @@ impl<'a> ReaderCacheScratch<'a> {
             zip_inflate: ZipInflateScratch::new(),
         }
     }
+}
+
+/// Tears the built scratch down into the raw regions the sync session
+/// loans to the radio. One-way: the regions alias the scratch's borrowed
+/// arrays and its own struct storage (the inflate state is the bulk of
+/// it), so the scratch must never be used as a scratch again — only the
+/// session-ending software reset brings the reader pipeline back.
+#[allow(unsafe_code)]
+pub(crate) fn dismantle_scratch(
+    scratch: &'static mut ReaderCacheScratch<'static>,
+) -> crate::sync_mem::SyncLoan {
+    use crate::sync_mem::{RawRegion, SyncLoan};
+
+    // Raw field pointers first; they chain provenance through the field
+    // borrows into the separate backing statics, not into the struct.
+    let xhtml = RawRegion {
+        ptr: scratch.xhtml.as_mut_ptr(),
+        len: READER_XHTML_SCRATCH,
+    };
+    let opf_ptr = scratch.opf.as_mut_ptr();
+    let compressed_ptr = scratch.compressed.as_mut_ptr();
+    let container_ptr = scratch.container.as_mut_ptr();
+    let tail_ptr = scratch.tail.as_mut_ptr();
+
+    // The struct's own storage becomes a heap region, dead references,
+    // padding, and all. Nothing reads it as a struct afterwards.
+    let struct_region = RawRegion {
+        ptr: (scratch as *mut ReaderCacheScratch<'static>).cast::<u8>(),
+        len: core::mem::size_of::<ReaderCacheScratch<'static>>(),
+    };
+
+    // Safety: each pointer addresses a distinct 'static allocation whose
+    // only other path is the scratch struct this function retires.
+    unsafe {
+        SyncLoan {
+            heap_a: struct_region,
+            heap_b: xhtml,
+            tcp_rx: core::slice::from_raw_parts_mut(opf_ptr, READER_OPF_SCRATCH),
+            tcp_tx: core::slice::from_raw_parts_mut(compressed_ptr, READER_COMPRESSED_SCRATCH),
+            http_a: core::slice::from_raw_parts_mut(container_ptr, READER_CONTAINER_SCRATCH),
+            http_b: core::slice::from_raw_parts_mut(tail_ptr, READER_TAIL_SCRATCH),
+            book: None,
+        }
+    }
+}
+
+/// KOReader's partial-MD5 document id for a catalog entry's EPUB file,
+/// computed in its own SD session. Eleven 1 KB samples, so this costs a
+/// few SD reads, not a file scan.
+#[inline(never)]
+pub(crate) fn partial_md5_for_index(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    index: usize,
+) -> Option<[u8; 16]> {
+    let entry = library.catalog_entry(index)?;
+    let mut open_name = String::<16>::new();
+    let _ = open_name.push_str(&entry.open_name);
+    let in_books_dir = entry.in_books_dir;
+    sd_session::with_root(epd, sd_cs, |root| {
+        if in_books_dir {
+            let books = root.open_dir("BOOKS").ok()?;
+            let file = books
+                .open_file_in_dir(open_name.as_str(), Mode::ReadOnly)
+                .ok()?;
+            Some(partial_md5_of_file(&file))
+        } else {
+            let file = root
+                .open_file_in_dir(open_name.as_str(), Mode::ReadOnly)
+                .ok()?;
+            Some(partial_md5_of_file(&file))
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+fn partial_md5_of_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> [u8; 16]
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    proto::kosync::partial_md5(&mut |offset, out| {
+        if offset >= file.length() || file.seek_from_start(offset).is_err() {
+            return 0;
+        }
+        file.read(out).unwrap_or(0)
+    })
 }
 
 /// Kept out of line: the storage dispatcher's frame must stay small, and the
@@ -265,6 +363,8 @@ pub(crate) fn store_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>, record
 /// Kept out of line for the same stack discipline as the store side.
 #[inline(never)]
 pub(crate) fn load_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>) -> Option<AppStateRecord> {
+    // Not point-free: the generic fn item fails the closure's HRTB check.
+    #[allow(clippy::redundant_closure)]
     sd_session::with_root(epd, sd_cs, |root| reader_cache_files::read_state_file(root))
         .ok()
         .flatten()
@@ -488,6 +588,7 @@ struct ZipBuildScratch<'a> {
 }
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn build_or_load_epub_cache_from_zip<
     Z,
     D,
@@ -655,8 +756,7 @@ where
             &mut *scratch.zip_inflate,
             &mut |chunk| {
                 let parser = parser.get_or_insert_with(|| {
-                    let has_body =
-                        bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
+                    let has_body = bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
                     XhtmlBlockStreamParser::new(!has_body)
                 });
                 tokenizer
@@ -781,7 +881,9 @@ fn inferred_start_spine_index(package: &proto::epub::EpubPackage<'_>) -> usize {
 }
 
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn load_epub_toc<Z>(
@@ -1249,8 +1351,7 @@ fn push_styled_preview_fragment<
         }
         sink.line_ink.push_str(&sink.line[kept_len..]);
 
-        if !line_was_empty
-            && sink.line_ink.width() + x + reader_layout::READER_WRAP_SAFETY > max_x
+        if !line_was_empty && sink.line_ink.width() + x + reader_layout::READER_WRAP_SAFETY > max_x
         {
             sink.line.truncate(kept_len);
             sink.line_ink = kept_ink;

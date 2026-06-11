@@ -581,6 +581,15 @@ impl ReaderStore {
         self.toc_count
     }
 
+    /// 0-based spine index a TOC chapter resolved to; `None` when the
+    /// entry never matched a spine item.
+    pub(crate) fn toc_spine_index(&self, chapter: usize) -> Option<u16> {
+        if chapter >= self.toc_count {
+            return None;
+        }
+        u16::try_from(self.toc[chapter].spine_index).ok()
+    }
+
     pub(crate) fn toc_item(&self, index: usize) -> Option<TocItem<'_>> {
         if index >= self.toc_count {
             return None;
@@ -879,10 +888,7 @@ impl ui::reading::ReadingBlocks for ReaderStore {
     }
 
     fn paragraph_end(&self, index: usize) -> bool {
-        self.block_paragraph_end
-            .get(index)
-            .copied()
-            .unwrap_or(true)
+        self.block_paragraph_end.get(index).copied().unwrap_or(true)
     }
 
     fn type_settings(&self) -> TypeSettings {
@@ -893,22 +899,20 @@ impl ui::reading::ReadingBlocks for ReaderStore {
 pub(crate) fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
     let mut pages = [0u16; MAX_SD_CHAPTERS];
     if store.toc_count > 0 {
-        for index in 0..store
+        let count = store
             .toc_count
             .min(MAX_SD_TOC_ITEMS)
             .min(MAX_PUBLISHED_CHAPTER_EVENTS)
-            .min(u8::MAX as usize)
-        {
-            pages[index] = store.toc_page[index];
-        }
+            .min(u8::MAX as usize);
+        pages[..count].copy_from_slice(&store.toc_page[..count]);
     } else {
-        for index in 0..store
+        let count = store
             .book_section_count
             .min(MAX_SD_TOC_ITEMS)
             .min(MAX_PUBLISHED_CHAPTER_EVENTS)
-            .min(u8::MAX as usize)
-        {
-            pages[index] = store.book_sections[index].start_page.min(u16::MAX as u32) as u16;
+            .min(u8::MAX as usize);
+        for (page, section) in pages.iter_mut().zip(&store.book_sections[..count]) {
+            *page = section.start_page.min(u16::MAX as u32) as u16;
         }
     }
     pages

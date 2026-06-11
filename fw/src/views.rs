@@ -78,16 +78,14 @@ fn ui_model<'a>(
             title,
             author,
             progress_permille: book_progress_permille(request),
-            cover: if let Some(cover) = sd_library.selected_cover(request.book_id) {
-                Some(UiCover {
+            cover: sd_library
+                .selected_cover(request.book_id)
+                .map(|cover| UiCover {
                     width: cover.width,
                     height: cover.height,
                     stride: cover.stride,
                     bits: cover.bits,
-                })
-            } else {
-                None
-            },
+                }),
         },
         library_status: ui_library_status(sd_library.status),
         library_entries: &library_entries[..library_count],

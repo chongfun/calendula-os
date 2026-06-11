@@ -87,14 +87,7 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
     if !model.active_book.author.is_empty() {
         let caps = literata_small(FontStyle::Regular);
         let width = crate::render::ls_width(caps, model.active_book.author, 3);
-        crate::render::ls_caps(
-            fb,
-            caps,
-            model.active_book.author,
-            400 - width / 2,
-            246,
-            3,
-        );
+        crate::render::ls_caps(fb, caps, model.active_book.author, 400 - width / 2, 246, 3);
     }
 
     let permille = if request.page_count > 1 {
@@ -230,4 +223,3 @@ fn fmt_u32(n: u32, buf: &mut [u8; 10]) -> &str {
     }
     core::str::from_utf8(&buf[i..]).unwrap_or("?")
 }
-

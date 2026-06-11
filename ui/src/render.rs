@@ -139,11 +139,7 @@ pub(crate) fn draw_chapter_colophon(
 }
 
 /// Width the colophon will occupy, for centered layouts.
-pub(crate) fn chapter_colophon_width(
-    chapters: &[UiTocItem<'_>],
-    chapter: u8,
-    max_w: i16,
-) -> i16 {
+pub(crate) fn chapter_colophon_width(chapters: &[UiTocItem<'_>], chapter: u8, max_w: i16) -> i16 {
     let chapter_name = chapters
         .get(chapter as usize)
         .map(|item| item.title)

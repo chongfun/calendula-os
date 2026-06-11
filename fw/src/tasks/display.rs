@@ -51,11 +51,16 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
 
     static FB: static_cell::StaticCell<Framebuffer> = static_cell::StaticCell::new();
     let fb = FB.init(Framebuffer::new());
-    static PREV_FB: static_cell::StaticCell<Framebuffer> = static_cell::StaticCell::new();
-    let prev_fb = PREV_FB.init(Framebuffer::new());
+    // The previous-frame buffer sits in dram2 so the radio's statics fit
+    // in main DRAM; same exclusive &'static mut as the old local cell.
+    let prev_fb = crate::sync_mem::take_prev_fb().expect("prev_fb claimed once");
     static TX_BAND: static_cell::StaticCell<[u8; BAND_BYTES]> = static_cell::StaticCell::new();
     let tx_band = TX_BAND.init([0; BAND_BYTES]);
     let mut epub_scratch = None;
+    // True once the EPUB scratch is loaned to the sync session; every
+    // scratch-using storage command is refused from then on, and only the
+    // session-ending software reset brings the reader pipeline back.
+    let mut sync_loaned = false;
     let mut refresh_planner = RefreshPlanner::new();
     let mut pending_progress: Option<AppStateRecord> = None;
     let mut last_progress_write: Option<Instant> = None;
@@ -129,12 +134,12 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         prestage_start.elapsed().as_millis(),
                         Instant::now().as_millis(),
                     );
-                    send_required_display_event(DisplayEvent::Settled);
+                    send_required_display_event(&DisplayEvent::Settled);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
                 } else {
                     esp_println::println!("display: SPI transfer failed");
                     red_prestaged = false;
-                    send_required_display_event(DisplayEvent::Settled);
+                    send_required_display_event(&DisplayEvent::Settled);
                 }
             }
             Either::First(DisplayCommand::Sleep) => {
@@ -161,11 +166,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 red_prestaged = false;
                 if display_flush::sleep_panel(&mut epd).await.is_ok() {
                     refresh_planner.record_sleep();
-                    send_required_display_event(DisplayEvent::Asleep);
+                    send_required_display_event(&DisplayEvent::Asleep);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
                 } else {
                     esp_println::println!("display: sleep command failed");
-                    send_required_display_event(DisplayEvent::Asleep);
+                    send_required_display_event(&DisplayEvent::Asleep);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
                 }
             }
@@ -176,6 +181,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut sd_cs,
                     sd_library,
                     &mut epub_scratch,
+                    &mut sync_loaned,
                     &mut pending_progress,
                     &mut last_progress_write,
                     &mut state_restored,
@@ -185,8 +191,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     }
 }
 
-pub(crate) fn send_library_event(event: LibraryEvent) {
-    if LIBRARY_EVENTS.try_send(event).is_err() {
+pub(crate) fn send_library_event(event: &LibraryEvent) {
+    if LIBRARY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: library event queue full");
     }
 }
@@ -201,11 +207,46 @@ fn handle_storage_command(
     sd_cs: &mut Output<'static>,
     sd_library: &mut ReaderStore,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    sync_loaned: &mut bool,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
 ) {
+    // Progress writes stay alive during a sync session (kosync pulls can
+    // move the saved position); everything that touches the EPUB scratch
+    // is gone until the session's reset.
+    if *sync_loaned
+        && !matches!(
+            command,
+            StorageCommand::StoreProgress(_) | StorageCommand::LoanSyncMemory
+        )
+    {
+        esp_println::println!("storage: refused during sync session");
+        return;
+    }
     match command {
+        StorageCommand::LoanSyncMemory => {
+            if *sync_loaned {
+                esp_println::println!("storage: sync memory already loaned");
+                return;
+            }
+            // The kosync exchange must see the freshest position, and the
+            // book info gather below reads it back from STATE.BIN.
+            flush_pending_progress(epd, sd_cs, pending_progress, last_progress_write);
+            let book = gather_sync_book_info(epd, sd_cs, sd_library, epub_scratch);
+            ensure_epub_scratch(epub_scratch);
+            let Some(scratch) = epub_scratch.take() else {
+                return;
+            };
+            *sync_loaned = true;
+            let mut loan = reader_cache::dismantle_scratch(scratch);
+            loan.book = book;
+            if crate::SYNC_LOANS.try_send(loan).is_err() {
+                // Unreachable in practice: the wifi task requests exactly
+                // one loan per boot. The memory is gone either way.
+                esp_println::println!("storage: sync loan channel full");
+            }
+        }
         StorageCommand::LoadCatalogCache => {
             if crate::library_sd::load_catalog_cache(epd, sd_cs, sd_library) {
                 // Restored goes out first so the very next Home repaint
@@ -213,7 +254,7 @@ fn handle_storage_command(
                 // sees an SD book active and leaves it alone.
                 restore_saved_state(epd, sd_cs, sd_library, state_restored);
                 let count = sd_library.catalog_count_u8();
-                send_library_event(LibraryEvent::Scanned { count });
+                send_library_event(&LibraryEvent::Scanned { count });
             } else {
                 let _ = STORAGE_COMMANDS.try_send(StorageCommand::RefreshCatalog);
             }
@@ -221,7 +262,7 @@ fn handle_storage_command(
         StorageCommand::RefreshCatalog => {
             crate::library_sd::scan_books(epd, sd_cs, sd_library);
             restore_saved_state(epd, sd_cs, sd_library, state_restored);
-            send_library_event(LibraryEvent::Scanned {
+            send_library_event(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u8(),
             });
         }
@@ -265,7 +306,7 @@ fn handle_storage_command(
                     book_id,
                     target_pages
                 );
-                send_loaded_library_event(LibraryEvent::Loaded {
+                send_loaded_library_event(&LibraryEvent::Loaded {
                     book_id,
                     pages: sd_library.advertised_page_count(),
                     chapters: sd_library.chapter_count_for_ui(),
@@ -292,7 +333,7 @@ fn handle_storage_command(
                 target_pages as usize,
                 scratch,
             );
-            send_loaded_library_event(LibraryEvent::Loaded {
+            send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
@@ -352,22 +393,22 @@ fn handle_storage_command(
     }
 }
 
-fn send_required_library_event(event: LibraryEvent) {
+fn send_required_library_event(event: &LibraryEvent) {
     const RETRIES: usize = 8;
     for _ in 0..RETRIES {
-        if LIBRARY_EVENTS.try_send(event).is_ok() {
+        if LIBRARY_EVENTS.try_send(*event).is_ok() {
             return;
         }
         let _ = LIBRARY_EVENTS.try_receive();
     }
-    if LIBRARY_EVENTS.try_send(event).is_err() {
+    if LIBRARY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: required library event queue full");
     }
 }
 
-fn send_loaded_library_event(event: LibraryEvent) {
+fn send_loaded_library_event(event: &LibraryEvent) {
     if DISPLAY_EVENTS
-        .try_send(DisplayEvent::Library(event))
+        .try_send(DisplayEvent::Library(*event))
         .is_ok()
     {
         return;
@@ -375,19 +416,82 @@ fn send_loaded_library_event(event: LibraryEvent) {
     send_required_library_event(event);
 }
 
-fn send_required_display_event(event: DisplayEvent) {
+fn send_required_display_event(event: &DisplayEvent) {
     const RETRIES: usize = 8;
     for _ in 0..RETRIES {
-        if DISPLAY_EVENTS.try_send(event).is_ok() {
+        if DISPLAY_EVENTS.try_send(*event).is_ok() {
             return;
         }
         if let Ok(DisplayEvent::Library(library_event)) = DISPLAY_EVENTS.try_receive() {
-            send_required_library_event(library_event);
+            send_required_library_event(&library_event);
         }
     }
-    if DISPLAY_EVENTS.try_send(event).is_err() {
+    if DISPLAY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: required display event queue full");
     }
+}
+
+/// The saved book's kosync identity and position, gathered while this
+/// task still owns SD access and the scratch. Loads the book through the
+/// ordinary cache path if this boot has not yet (a v2 cache hit costs
+/// tens of milliseconds), because the position math needs page counts.
+#[inline(never)]
+fn gather_sync_book_info(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &mut ReaderStore,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+) -> Option<crate::sync_mem::SyncBookInfo> {
+    let record = reader_cache::load_app_state(epd, sd_cs)?;
+    let catalog_index =
+        sd_library.catalog_index_for_identity(record.source_hash, record.source_size)?;
+    let index = usize::from(catalog_index);
+    if sd_library.loaded_index != Some(index) {
+        let scratch = ensure_epub_scratch(epub_scratch);
+        reader_cache::build_or_load_book_cache(
+            epd,
+            sd_cs,
+            sd_library,
+            index,
+            record.chapter.min(u8::MAX as u16) as u8,
+            record.screen as usize,
+            scratch,
+        );
+        if sd_library.loaded_index != Some(index) {
+            esp_println::println!("sync: saved book failed to load");
+            return None;
+        }
+    }
+    let page_count = sd_library.advertised_page_count().max(1);
+    let position = (record.screen + 1).min(page_count);
+    let percent_permille = ((u64::from(position) * 1000) / u64::from(page_count)) as u16;
+    let doc_fragment_1based = sd_library
+        .toc_spine_index(record.chapter as usize)
+        .unwrap_or(record.chapter)
+        + 1;
+    let document_md5 = reader_cache::partial_md5_for_index(epd, sd_cs, sd_library, index)?;
+    Some(crate::sync_mem::SyncBookInfo {
+        document_md5,
+        percent_permille,
+        doc_fragment_1based,
+        page_count,
+        persisted: app_core::PersistedAppState {
+            // The volatile id is rebuilt from the catalog index instead of
+            // trusting last boot's numbering, exactly like state restore.
+            book_id: ReaderSource::sd(catalog_index).book_id(),
+            chapter: record.chapter,
+            screen: record.screen,
+            shell_orientation: record.shell_orientation,
+            reading_orientation: record.reading_orientation,
+            refresh_policy: record.refresh_policy,
+            font_size: record.font_size,
+            line_spacing: record.line_spacing,
+            source_hash: record.source_hash,
+            source_size: record.source_size,
+        },
+        chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+        chapter_count: sd_library.chapter_count_for_ui(),
+    })
 }
 
 /// Kept out of line: first-call initialization moves a multi-KB scratch
@@ -452,7 +556,7 @@ fn restore_saved_state(
         record.chapter,
         record.screen
     );
-    send_required_library_event(LibraryEvent::Restored {
+    send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
         chapter: record.chapter.min(u8::MAX as u16) as u8,
         page: record.screen,

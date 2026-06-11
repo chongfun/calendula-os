@@ -182,10 +182,30 @@ Current code status:
 
 ## Phase 5: Wi-Fi sync
 
-- Enable `esp-wifi`.
-- Keep transfer chunks caller-owned or borrowed, not embedded as large enum
-  variants.
-- Write book data directly to storage in bounded chunks.
+- esp-wifi 0.10.1 (esp-hal 0.21 pairing) linked: vendored under
+  `vendor/esp-wifi` with the upstream riscv c_char fixes, `-Trom_functions.x`
+  added to the linker flags, and trimmed buffer config in `.cargo/config.toml`.
+- RAM accounting after linking the radio: PREV_FB moved into dram2, a 16 KB
+  dram2 heap claim, and the loaned EPUB scratch give the session ~84 KB of
+  esp-alloc heap in three regions while the stack region holds at ~41 KB
+  (down from 43 KB; re-measure the EPUB open chain with -Zemit-stack-sizes
+  before deepening that path).
+- kosync progress sync implemented end to end pending hardware validation:
+  Sync screen (Home -> sync key) -> SyncCommand::Start -> memory loan ->
+  STA join -> DHCP -> GET/PUT /syncs/progress with KOReader partial-MD5
+  document ids -> SyncEvents back to the screen -> Exit resets the device.
+  Scenario coverage in `fixtures/scenarios/sync-*.toml`; protocol host tests
+  in `proto::kosync`.
+- Dev credentials are compile-time: build with `XTEINK_WIFI_SSID`,
+  `XTEINK_WIFI_PASS`, `XTEINK_KOSYNC_HOST` (host or host:port, plain HTTP),
+  `XTEINK_KOSYNC_USER`, `XTEINK_KOSYNC_PASS`.
+- Hardware validation pending: join/DHCP timing, heap high-water
+  (esp_alloc::HEAP stats), kosync round trip against a self-hosted server,
+  USB serial survival across radio init (phy-enable-usb is set).
+- Next: AP-mode web onboarding (hotspot + QR + credential form persisted to
+  /XTEINK/WIFI.BIN via edge-dhcp + captive DNS), then browser EPUB upload
+  through the same HTTP server in bounded chunks written by the board I/O
+  task.
 
 ## Verification commands
 

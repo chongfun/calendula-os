@@ -113,8 +113,43 @@ power_task
   asks display_task to sleep the SSD1677, then enters ESP32-C3 deep sleep
 
 wifi_task
-  parked placeholder until sync becomes a real phase
+  parked until SyncCommand::Start arrives from the Sync screen
+  requests StorageCommand::LoanSyncMemory, receives the dismantled EPUB
+  scratch as radio heap, joins Wi-Fi in STA mode, exchanges the active
+  book's position with a kosync server, reports SyncEvents to app_task
+  SyncCommand::Exit ends the session with a software reset
 ```
+
+## Wi-Fi sync session
+
+Sync is a one-way modal session because the radio blob needs ~80 KB of
+heap this firmware does not have while reading. `fw::sync_mem` owns the
+plumbing: the display task dismantles the EPUB scratch into raw regions
+(`reader_cache::dismantle_scratch`), and the wifi task donates them plus a
+16 KB claim on the otherwise unused dram2 boot-loader shadow segment to
+esp-alloc. The previous-frame framebuffer also lives in dram2 now so
+esp-wifi's static demand fits in main DRAM with the ~41 KB stack region
+intact. The smaller scratch buffers are reused directly as TCP socket and
+HTTP buffers. Once loaned, the reader pipeline cannot come back: leaving
+the Sync screen after the radio ran maps to `SyncCommand::Exit`, which is
+a software reset; boot restore then reloads the saved position.
+
+Progress flows both ways: before the loan, the display task flushes
+pending progress, loads the saved book through the ordinary cache path if
+needed, and ships the kosync identity (KOReader partial-MD5 of the EPUB
+file), position permille, and chapter map with the loan. The wifi task
+pulls the server position first and pushes ours only if it is ahead; a
+pulled position lands through the still-working `StoreProgress` path so it
+survives the session-ending reset. `proto::kosync` holds the sans-IO
+protocol pieces (MD5, partial digest, HTTP request building and response
+parsing) with host tests.
+
+Station and kosync credentials are compile-time `option_env!` values
+(`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`, `XTEINK_KOSYNC_HOST`/`_USER`/
+`_PASS`) for the dev phase; AP-mode web onboarding replaces them later.
+esp-wifi 0.10.1 is vendored under `vendor/esp-wifi` with the riscv c_char
+fixes its 0.11 release shipped upstream, because the workspace toolchain
+is newer than the crate.
 
 Embassy is used for cooperative waits: ADC retry delays, button polling, SPI DMA
 transfers, BUSY waits, and sleep windows all yield instead of spinning. The real

@@ -231,7 +231,6 @@ pub(crate) fn with_root<R>(
 
     esp_println::println!("sd: session exit");
     sd_cs.set_high();
-    epd.spi_mut()
-        .change_bus_frequency(DISPLAY_FREQ_MHZ.MHz());
+    epd.spi_mut().change_bus_frequency(DISPLAY_FREQ_MHZ.MHz());
     result
 }

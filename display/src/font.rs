@@ -237,4 +237,3 @@ fn draw_glyph(
 
     metric.advance as i16
 }
-
