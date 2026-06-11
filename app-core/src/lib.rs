@@ -130,6 +130,7 @@ pub struct RefreshPlanner {
     last_request: Option<RenderRequest>,
     fast_refresh_enabled: bool,
     full_refresh_interval: u8,
+    panel_shows_sleep_screen: bool,
 }
 
 impl RefreshPlanner {
@@ -140,6 +141,7 @@ impl RefreshPlanner {
             last_request: None,
             fast_refresh_enabled: true,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
+            panel_shows_sleep_screen: false,
         }
     }
 
@@ -158,21 +160,35 @@ impl RefreshPlanner {
 
     pub fn mode_for(&self, request: RenderRequest) -> RefreshMode {
         let Some(last) = self.last_request else {
-            return RefreshMode::Full;
+            // Cold boot leaves unknown pixels on the panel; only the deep
+            // full waveform reliably clears them. After a display sleep the
+            // panel still shows the sleep screen this firmware drew, so the
+            // one-flicker clean is enough to wake.
+            return if self.fast_refresh_enabled && self.panel_shows_sleep_screen {
+                RefreshMode::FastClean
+            } else {
+                RefreshMode::Full
+            };
         };
-        if !self.fast_refresh_enabled
-            || !self.screen_on
-            || last.kind == RenderKind::Boot
+        if !self.fast_refresh_enabled || !self.screen_on {
+            return RefreshMode::Full;
+        }
+        // Context changes need ghost cleanup, but the panel state is known
+        // (the frame just shown), so the one-flicker clean suffices and the
+        // multi-flash full waveform stays reserved for boot and sleep.
+        if last.kind == RenderKind::Boot
             || request.view != last.view
             || request.book_id != last.book_id
+            // A type-settings change redraws whole text columns; the clean
+            // pass avoids fast-diff ghosting across the page.
             || Self::needs_clean_library_refresh(request, last)
         {
-            return RefreshMode::Full;
+            return RefreshMode::FastClean;
         }
         match request.refresh_policy {
             RefreshPolicy::FastOnly | RefreshPolicy::FullOnWake => RefreshMode::Fast,
             RefreshPolicy::FullEveryTen if self.fast_refreshes >= self.full_refresh_interval => {
-                RefreshMode::Full
+                RefreshMode::FastClean
             }
             RefreshPolicy::FullEveryTen => RefreshMode::Fast,
         }
@@ -181,6 +197,7 @@ impl RefreshPlanner {
     pub fn record_render(&mut self, request: RenderRequest, mode: RefreshMode) {
         self.screen_on = true;
         self.last_request = Some(request);
+        self.panel_shows_sleep_screen = false;
         if mode == RefreshMode::Fast {
             self.fast_refreshes = self.fast_refreshes.saturating_add(1);
         } else {
@@ -192,6 +209,7 @@ impl RefreshPlanner {
         self.screen_on = false;
         self.fast_refreshes = 0;
         self.last_request = None;
+        self.panel_shows_sleep_screen = true;
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
@@ -934,29 +952,31 @@ mod tests {
     }
 
     #[test]
-    fn refresh_plan_uses_full_for_context_changes_and_fast_for_selection() {
+    fn refresh_plan_uses_fast_clean_for_context_changes_and_fast_for_selection() {
         let mut planner = RefreshPlanner::new();
         let mut request = ReaderState::boot().render_request(RenderKind::Boot);
 
+        // Cold boot is the only render where panel contents are unknown,
+        // so it keeps the deep multi-flash full waveform.
         assert_eq!(planner.mode_for(request), RefreshMode::Full);
         planner.record_render(request, RefreshMode::Full);
 
         request.kind = RenderKind::Page;
-        assert_eq!(planner.mode_for(request), RefreshMode::Full);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
 
         request.view = AppView::Settings;
-        assert_eq!(planner.mode_for(request), RefreshMode::Full);
-        planner.record_render(request, RefreshMode::Full);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
 
         // Cursor moves inside Settings ride the fast differential refresh
         // against the prestaged previous frame; leaving the view is a view
-        // change, which still forces the cleaning full refresh.
+        // change, which gets the one-flicker cleaning refresh.
         request.selection = 1;
         assert_eq!(planner.mode_for(request), RefreshMode::Fast);
         planner.record_render(request, RefreshMode::Fast);
 
         request.view = AppView::Home;
-        assert_eq!(planner.mode_for(request), RefreshMode::Full);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
     }
 
     #[test]
@@ -998,9 +1018,33 @@ mod tests {
             assert_eq!(planner.mode_for(request), RefreshMode::Fast);
             planner.record_render(request, RefreshMode::Fast);
         }
-        assert_eq!(planner.mode_for(request), RefreshMode::Full);
+        // Periodic mid-reading cleanup uses the one-flicker clean instead
+        // of the jarring multi-flash full waveform.
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
 
+        // After a display sleep the panel shows the sleep screen the
+        // firmware drew, so wake also needs only the one-flicker clean.
         planner.record_sleep();
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+    }
+
+    #[test]
+    fn refresh_plan_keeps_deep_full_for_cold_boot_only() {
+        let mut planner = RefreshPlanner::new();
+        let request = ReaderState::boot().render_request(RenderKind::Boot);
+
+        // Cold boot: unknown panel contents, deep full waveform.
         assert_eq!(planner.mode_for(request), RefreshMode::Full);
+        planner.record_render(request, RefreshMode::Full);
+
+        // Wake after sleep: known sleep-screen contents, one-flicker clean.
+        planner.record_sleep();
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
+        planner.record_sleep();
+
+        // Disabling fast refresh falls back to the deep full everywhere.
+        let conservative = RefreshPlanner::new().with_fast_refresh_enabled(false);
+        assert_eq!(conservative.mode_for(request), RefreshMode::Full);
     }
 }

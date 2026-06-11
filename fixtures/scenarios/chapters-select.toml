@@ -19,4 +19,4 @@ book_id = 1
 chapter = 2
 page = 0
 selection = 2
-last_refresh = "Full"
+last_refresh = "FastClean"

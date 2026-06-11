@@ -18,4 +18,4 @@ view = "Home"
 selection = 0
 orientation = "LandscapeButtonsTop"
 refresh_policy = "FullEveryTen"
-last_refresh = "Full"
+last_refresh = "FastClean"

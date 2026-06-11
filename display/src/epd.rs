@@ -6,6 +6,7 @@ pub const CMD_DEEP_SLEEP: u8 = 0x10;
 pub const CMD_DATA_ENTRY_MODE: u8 = 0x11;
 pub const CMD_SW_RESET: u8 = 0x12;
 pub const CMD_TEMP_SENSOR: u8 = 0x18;
+pub const CMD_WRITE_TEMPERATURE: u8 = 0x1A;
 pub const CMD_MASTER_ACTIVATION: u8 = 0x20;
 pub const CMD_DISPLAY_UPDATE_CTRL1: u8 = 0x21;
 pub const CMD_DISPLAY_UPDATE_CTRL2: u8 = 0x22;
@@ -20,6 +21,18 @@ pub const CMD_SET_RAM_X_COUNTER: u8 = 0x4E;
 pub const CMD_SET_RAM_Y_COUNTER: u8 = 0x4F;
 pub const DATA_ENTRY_X_INC_Y_DEC: u8 = 0x01;
 
+/// 90 C written to the temperature register before a FastClean activation.
+/// The activation sequence skips the load-temperature bit, so the OTP LUT
+/// is picked for this override instead of the sensed temperature. Same
+/// trick papyrix uses on this panel for its ~1.5 s clean.
+pub const FAST_CLEAN_TEMPERATURE: [u8; 2] = [0x5A, 0x00];
+
+/// Update sequence that only re-loads the temperature register from the
+/// internal sensor (enable clock + load temperature). Run after a
+/// FastClean settles so later Fast partials return to sensor-accurate
+/// OTP waveform timing.
+pub const UPDATE_SEQUENCE_LOAD_TEMP: u8 = 0xA0;
+
 pub const MIRROR_X: bool = true;
 pub const MIRROR_Y: bool = false;
 pub const REVERSE_BITS: bool = true;
@@ -28,6 +41,12 @@ pub const REVERSE_BITS: bool = true;
 pub enum RefreshMode {
     Full,
     Fast,
+    /// One-flicker cleaning refresh: the display-mode-1 waveform run with
+    /// the temperature register overridden upward, selecting the hotter
+    /// (shorter) OTP waveform. Cleans ghosting in roughly half the full
+    /// refresh time at a small contrast cost; the panel's rated "fast"
+    /// mode (~1.5 s vs ~3.5 s full at room temperature).
+    FastClean,
     PowerDown,
 }
 
@@ -134,6 +153,10 @@ pub const fn update_control_2(mode: RefreshMode, screen_is_on: bool, turn_off: b
     match mode {
         RefreshMode::Full => value | 0x34,
         RefreshMode::Fast => value | 0x1C,
+        // Load LUT (display mode 1) + display, deliberately without the
+        // 0x20 load-temperature bit so the FAST_CLEAN_TEMPERATURE override
+        // written via 0x1A decides which OTP waveform runs.
+        RefreshMode::FastClean => value | 0x14,
         RefreshMode::PowerDown => 0x03,
     }
 }
@@ -141,7 +164,7 @@ pub const fn update_control_2(mode: RefreshMode, screen_is_on: bool, turn_off: b
 pub const fn update_control_1(mode: RefreshMode) -> [u8; 2] {
     match mode {
         RefreshMode::Fast => [0x00, 0x00],
-        RefreshMode::Full | RefreshMode::PowerDown => [0x40, 0x00],
+        RefreshMode::Full | RefreshMode::FastClean | RefreshMode::PowerDown => [0x40, 0x00],
     }
 }
 

@@ -8,5 +8,5 @@ button = "Power"
 view = "Home"
 sleeping = false
 panel_sleeping = false
-last_refresh = "Full"
+last_refresh = "FastClean"
 history_contains = "cmd 0x10"

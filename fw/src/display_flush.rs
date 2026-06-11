@@ -3,7 +3,8 @@ use display::epd::{
     update_control_1, update_control_2, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
     CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2, CMD_MASTER_ACTIVATION,
     CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER, CMD_SET_RAM_Y_RANGE,
-    CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, INIT_SEQUENCE,
+    CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE, FAST_CLEAN_TEMPERATURE,
+    INIT_SEQUENCE, UPDATE_SEQUENCE_LOAD_TEMP,
 };
 use display::fb::Framebuffer;
 use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
@@ -76,6 +77,10 @@ pub(crate) async fn flush(
     }
 
     esp_println::println!("display: refresh activate");
+    if mode == RefreshMode::FastClean {
+        epd.command(CMD_WRITE_TEMPERATURE, &FAST_CLEAN_TEMPERATURE)
+            .await?;
+    }
     epd.command(CMD_DISPLAY_UPDATE_CTRL1, &update_control_1(mode))
         .await?;
     epd.command(
@@ -88,6 +93,15 @@ pub(crate) async fn flush(
     epd.wait_ready().await;
     let elapsed = start.elapsed();
     esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
+    if mode == RefreshMode::FastClean {
+        // Re-load the real sensor temperature so the next Fast partial
+        // picks its OTP waveform for the actual ambient temperature
+        // instead of the 90 C override.
+        epd.command(CMD_DISPLAY_UPDATE_CTRL2, &[UPDATE_SEQUENCE_LOAD_TEMP])
+            .await?;
+        epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
+        epd.wait_ready().await;
+    }
     Ok(())
 }
 

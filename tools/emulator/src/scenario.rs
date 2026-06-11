@@ -220,6 +220,7 @@ fn parse_refresh_mode(value: &str) -> Result<RefreshMode, String> {
     match value {
         "Full" | "full" => Ok(RefreshMode::Full),
         "Fast" | "fast" => Ok(RefreshMode::Fast),
+        "FastClean" | "fast-clean" | "fastclean" => Ok(RefreshMode::FastClean),
         "PowerDown" | "power-down" | "powerdown" => Ok(RefreshMode::PowerDown),
         _ => Err(format!("unknown refresh mode: {value}")),
     }

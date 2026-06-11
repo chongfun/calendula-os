@@ -97,12 +97,26 @@ impl PanelModel {
     }
 
     pub fn refresh(&mut self, mode: RefreshMode) -> Result<(), String> {
+        if mode == RefreshMode::FastClean {
+            self.command(
+                display::epd::CMD_WRITE_TEMPERATURE,
+                &display::epd::FAST_CLEAN_TEMPERATURE,
+            )?;
+        }
         self.command(CMD_DISPLAY_UPDATE_CTRL1, &display::epd::update_control_1(mode))?;
         self.command(
             CMD_DISPLAY_UPDATE_CTRL2,
             &[display::epd::update_control_2(mode, true, false)],
         )?;
         self.command(CMD_MASTER_ACTIVATION, &[])?;
+        if mode == RefreshMode::FastClean {
+            // Mirror the firmware's post-clean sensor temperature re-load.
+            self.command(
+                CMD_DISPLAY_UPDATE_CTRL2,
+                &[display::epd::UPDATE_SEQUENCE_LOAD_TEMP],
+            )?;
+            self.command(CMD_MASTER_ACTIVATION, &[])?;
+        }
         self.last_refresh = Some(mode);
         self.history.push(format!("refresh {mode:?}"));
         Ok(())
