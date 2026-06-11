@@ -647,7 +647,9 @@ impl ReaderState {
                 SyncStatus::NotConfigured | SyncStatus::Idle | SyncStatus::Error(_) => {
                     next.sync_status = SyncStatus::Starting;
                 }
-                SyncStatus::Done { .. } | SyncStatus::CredentialsSaved => {
+                SyncStatus::Done { .. }
+                | SyncStatus::CredentialsSaved
+                | SyncStatus::Serving(_) => {
                     next.view = AppView::Home;
                     next.selection = 0;
                     next.sync_status = sync_entry_status(ctx);
@@ -1063,9 +1065,11 @@ mod tests {
             })
             .apply_sync_event(SyncEvent::Serving([192, 168, 0, 233]));
         assert_eq!(state.sync_status, SyncStatus::Serving([192, 168, 0, 233]));
-        // Confirm is inert while serving; Back leaves for Home.
-        let held = state.apply_input(ctx, InputEvent::button(Button::Confirm));
-        assert_eq!(held.sync_status, SyncStatus::Serving([192, 168, 0, 233]));
+        // The screen labels Confirm "done" while serving, so it must exit
+        // exactly like Back does (the wifi task defers the reset past any
+        // in-flight transfer either way).
+        let confirmed = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        assert_eq!(confirmed.view, AppView::Home);
         let state = state.apply_input(ctx, InputEvent::button(Button::Back));
         assert_eq!(state.view, AppView::Home);
     }
