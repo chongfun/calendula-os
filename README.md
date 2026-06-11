@@ -1,48 +1,30 @@
 # xteink-x4-os
 
-From-scratch, bare-metal Rust firmware for the Xteink X4 e-ink reader:
-an ESP32-C3 with no PSRAM driving an 800x480 SSD1677 panel. A full EPUB
-reader, a typography engine, and Wi-Fi sync, fit into a microcontroller.
-
-<!-- TODO: replace the render below with a photo of the device once one exists -->
-<p align="center">
-  <img src="docs/screen-reading.png" width="640" alt="A rendered book page: Literata type, styled runs, an indented blockquote">
-</p>
-
-Every screenshot in this README is a golden frame from the host
-emulator — the exact bytes the panel receives, checked on every test
-run, so these images cannot drift from what the firmware draws.
+Bare-metal Rust firmware for the Xteink X4 e-ink reader: ESP32-C3,
+800x480 SSD1677 panel, no PSRAM.
 
 ## What it does
 
 - Reads EPUBs from the microSD card (`/BOOKS` and the card root),
-  parsed on-device into a binary cache so books reopen instantly.
-- Literata typography with adjustable type size and line spacing,
-  italic/bold runs, blockquote geometry, and chapter navigation.
-- Page turns in about half a second, with a refresh planner that
-  decides when a full anti-ghosting flash is worth the flicker.
-- Deep-sleeps the ESP32-C3 behind a visible sleep screen; reading
-  position survives sleep, reset, and battery death.
+  parsing them on-device into a binary cache so books reopen fast.
+- Literata type with adjustable size and line spacing, italic/bold
+  runs, blockquotes, and chapter navigation.
+- Page turns take about half a second; a refresh planner decides when
+  to spend a full anti-ghosting refresh.
+- Deep-sleeps the ESP32-C3 behind a sleep screen; reading position is
+  saved to the card.
 - Syncs reading progress with a [kosync](https://github.com/koreader/koreader-sync-server)
-  server, compatible with the KOReader ecosystem. The radio needs more
-  heap than the firmware has, so the sync session dismantles the EPUB
-  pipeline and loans its buffers to Wi-Fi, then resets on exit.
-- Onboards Wi-Fi credentials with a captive portal: the device raises
-  a hotspot and a QR code, your phone's sign-in sheet opens the form.
-- Serves a shelf page after each sync: drop EPUBs onto it from any
-  browser, watch upload progress, remove books.
-
-## Screens
-
-| | |
-|---|---|
-| ![Home screen](docs/screen-home.png) | ![Type settings](docs/screen-settings.png) |
-| ![Wi-Fi onboarding QR](docs/screen-sync-qr.png) | ![Browser shelf serving](docs/screen-sync-serving.png) |
+  server (KOReader-compatible). The radio needs more heap than the
+  firmware has free, so the sync session loans the reader's buffers to
+  Wi-Fi and resets on exit.
+- Onboards Wi-Fi credentials through a captive portal: the device
+  raises a hotspot with a QR code and a credential form.
+- Serves a shelf page after each sync for uploading and removing books
+  from a browser.
 
 ## How it works
 
-The design goal is not to imitate a desktop OS. It is a small data
-pipeline:
+The firmware is a small data pipeline:
 
 ```text
 buttons -> app state -> display command -> framebuffer -> SSD1677 RAM -> refresh -> sleep
@@ -51,19 +33,18 @@ buttons -> app state -> display command -> framebuffer -> SSD1677 RAM -> refresh
 Pure logic lives in host-testable crates (`app-core`, `proto`, `ui`,
 `display`); the firmware crate (`fw`) owns tasks, pins, and DMA. A host
 emulator replays TOML scenarios through the same reducer and panel
-protocol model and compares output against the golden frames in
+protocol model and compares output against golden frames in
 `fixtures/golden`.
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — tasks, memory strategy, the
-  Wi-Fi memory loan, refresh policy.
-- [CONTEXT.md](CONTEXT.md) — glossary of load-bearing terms.
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — current status and
-  on-device validation notes.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for tasks, memory strategy, and
+refresh policy, and [CONTEXT.md](CONTEXT.md) for a glossary of the
+terms used throughout.
 
 ## Building and flashing
 
-Needs a nightly Rust toolchain with the `riscv32imc-unknown-none-elf`
-target (see `rust-toolchain.toml`) and [espflash](https://github.com/esp-rs/espflash).
+Needs the pinned nightly toolchain with the `riscv32imc-unknown-none-elf`
+target (rustup picks both up from `rust-toolchain.toml`) and
+[espflash](https://github.com/esp-rs/espflash).
 
 ```sh
 cargo check --target riscv32imc-unknown-none-elf --release   # build firmware
@@ -87,6 +68,5 @@ cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwi
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --features gui -- --gui
 ```
 
-The emulator's `--gui` mode drives the full UI interactively on the
-desktop; `tools/preview` renders typography experiments without
-hardware in the loop.
+The emulator's `--gui` mode drives the full UI on the desktop;
+`tools/preview` renders typography output without hardware in the loop.
