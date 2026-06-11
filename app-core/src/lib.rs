@@ -242,6 +242,7 @@ pub struct RenderRequest {
     pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u8,
+    pub sync_status: SyncStatus,
     pub dirty: Rect,
 }
 
@@ -308,6 +309,57 @@ pub enum LibraryEvent {
     },
 }
 
+/// Wi-Fi sync session lifecycle as shown on the Sync screen. The wifi task
+/// owns the radio and reports transitions back as `SyncEvent`s; the reducer
+/// only records what the screen should say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncStatus {
+    /// The firmware was built without Wi-Fi credentials; sync cannot start.
+    NotConfigured,
+    /// Credentials exist and the radio is untouched; Confirm starts.
+    Idle,
+    /// Confirm was pressed: the app shell must emit `SyncCommand::Start`.
+    Starting,
+    Connecting,
+    /// Joined and DHCP-configured with this IPv4 address.
+    Connected([u8; 4]),
+    Syncing,
+    Done {
+        pushed: bool,
+        pulled: bool,
+    },
+    Error(SyncError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncError {
+    NoCredentials,
+    RadioInit,
+    Join,
+    Dhcp,
+    Server,
+    Protocol,
+}
+
+/// wifi task -> app task progress reports for the Sync screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncEvent {
+    Connecting,
+    Connected([u8; 4]),
+    Syncing,
+    Done { pushed: bool, pulled: bool },
+    Failed(SyncError),
+}
+
+/// app task -> wifi task session control. Starting a session loans reader
+/// memory to the radio irrevocably; Exit therefore maps to a software reset
+/// on hardware once a session has started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncCommand {
+    Start,
+    Exit,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerEvent {
     Activity,
@@ -334,6 +386,8 @@ pub struct PersistedAppState {
 pub struct ReducerContext {
     pub builtin_book_count: u8,
     pub builtin_chapter_count: u8,
+    /// Whether this build carries Wi-Fi credentials for the sync session.
+    pub sync_credentials: bool,
 }
 
 impl ReducerContext {
@@ -341,7 +395,13 @@ impl ReducerContext {
         Self {
             builtin_book_count,
             builtin_chapter_count,
+            sync_credentials: false,
         }
+    }
+
+    pub const fn with_sync_credentials(mut self, present: bool) -> Self {
+        self.sync_credentials = present;
+        self
     }
 }
 
@@ -367,6 +427,7 @@ pub struct ReaderState {
     pub sd_chapter_count: u8,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     pub read_request_pending: bool,
+    pub sync_status: SyncStatus,
     pub dirty: Rect,
 }
 
@@ -393,6 +454,7 @@ impl ReaderState {
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             read_request_pending: false,
+            sync_status: SyncStatus::Idle,
             dirty: Rect::FULL,
         }
     }
@@ -419,7 +481,7 @@ impl ReaderState {
             (_, None) => {}
             (_, Some(Button::Power)) => {}
             (AppView::Home, Some(button)) => {
-                next = apply_home_action(next, home_action_for_button(button));
+                next = apply_home_action(next, ctx, home_action_for_button(button));
             }
             (AppView::Library, Some(Button::Next)) => {
                 next.selection = wrap_next(self.selection, self.library_item_count(ctx));
@@ -510,9 +572,26 @@ impl ReaderState {
             (AppView::Chapters, Some(Button::Back)) => {
                 next.view = AppView::Reading;
             }
-            (AppView::Sync, Some(Button::Back | Button::Confirm)) => {
+            (AppView::Sync, Some(Button::Confirm)) => match self.sync_status {
+                SyncStatus::Idle | SyncStatus::Error(_) => {
+                    next.sync_status = SyncStatus::Starting;
+                }
+                SyncStatus::Done { .. } => {
+                    next.view = AppView::Home;
+                    next.selection = 0;
+                    next.sync_status = sync_entry_status(ctx);
+                }
+                // NotConfigured has nothing to start; an in-flight session
+                // ignores Confirm until it lands in Done or Error.
+                _ => {}
+            },
+            (AppView::Sync, Some(Button::Back)) => {
+                // Leaving after the radio started maps to SyncCommand::Exit
+                // in the app shell, which resets the device; the reducer
+                // still returns Home so the emulator stays navigable.
                 next.view = AppView::Home;
                 next.selection = 0;
+                next.sync_status = sync_entry_status(ctx);
             }
             (AppView::Sync, Some(Button::Previous | Button::Next)) => {}
             (AppView::Settings, Some(Button::Next)) => {
@@ -639,6 +718,18 @@ impl ReaderState {
         self
     }
 
+    pub fn apply_sync_event(mut self, event: SyncEvent) -> Self {
+        self.sync_status = match event {
+            SyncEvent::Connecting => SyncStatus::Connecting,
+            SyncEvent::Connected(ip) => SyncStatus::Connected(ip),
+            SyncEvent::Syncing => SyncStatus::Syncing,
+            SyncEvent::Done { pushed, pulled } => SyncStatus::Done { pushed, pulled },
+            SyncEvent::Failed(error) => SyncStatus::Error(error),
+        };
+        self.dirty = Rect::FULL;
+        self
+    }
+
     pub fn render_request(self, kind: RenderKind) -> RenderRequest {
         RenderRequest {
             kind,
@@ -659,6 +750,7 @@ impl ReaderState {
             battery_mv: self.battery_mv,
             battery_percent: self.battery_percent,
             library_count: self.library_count,
+            sync_status: self.sync_status,
             dirty: self.dirty,
         }
     }
@@ -757,7 +849,15 @@ fn home_action_for_button(button: Button) -> HomeAction {
     }
 }
 
-fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState {
+fn sync_entry_status(ctx: ReducerContext) -> SyncStatus {
+    if ctx.sync_credentials {
+        SyncStatus::Idle
+    } else {
+        SyncStatus::NotConfigured
+    }
+}
+
+fn apply_home_action(mut state: ReaderState, ctx: ReducerContext, action: HomeAction) -> ReaderState {
     state.selection = 0;
     state.read_request_pending = false;
     match action {
@@ -777,6 +877,7 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
         }
         HomeAction::Sync => {
             state.view = AppView::Sync;
+            state.sync_status = sync_entry_status(ctx);
         }
         HomeAction::Settings => {
             state.view = AppView::Settings;
@@ -852,6 +953,66 @@ mod tests {
             press(ReaderState::boot(), Button::Next).view,
             AppView::Settings
         );
+    }
+
+    #[test]
+    fn sync_without_credentials_reports_not_configured_and_never_starts() {
+        let state = press(ReaderState::boot(), Button::Previous);
+        assert_eq!(state.view, AppView::Sync);
+        assert_eq!(state.sync_status, SyncStatus::NotConfigured);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.view, AppView::Sync);
+        assert_eq!(state.sync_status, SyncStatus::NotConfigured);
+    }
+
+    #[test]
+    fn sync_with_credentials_starts_on_confirm_and_tracks_events() {
+        let ctx = CTX.with_sync_credentials(true);
+        let state = ReaderState::boot().apply_input(ctx, InputEvent::button(Button::Previous));
+        assert_eq!(state.sync_status, SyncStatus::Idle);
+        let state = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        assert_eq!(state.sync_status, SyncStatus::Starting);
+
+        let state = state.apply_sync_event(SyncEvent::Connecting);
+        assert_eq!(state.sync_status, SyncStatus::Connecting);
+        // In-flight Confirm presses are ignored.
+        let held = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        assert_eq!(held.sync_status, SyncStatus::Connecting);
+        let state = state.apply_sync_event(SyncEvent::Connected([192, 168, 1, 23]));
+        assert_eq!(state.sync_status, SyncStatus::Connected([192, 168, 1, 23]));
+        let state = state.apply_sync_event(SyncEvent::Done {
+            pushed: true,
+            pulled: false,
+        });
+
+        // Done returns Home on Confirm with the entry status restored.
+        let state = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        assert_eq!(state.view, AppView::Home);
+        assert_eq!(state.sync_status, SyncStatus::Idle);
+    }
+
+    #[test]
+    fn sync_error_can_be_retried_with_confirm() {
+        let ctx = CTX.with_sync_credentials(true);
+        let state = ReaderState::boot()
+            .apply_input(ctx, InputEvent::button(Button::Previous))
+            .apply_input(ctx, InputEvent::button(Button::Confirm))
+            .apply_sync_event(SyncEvent::Failed(SyncError::Join));
+        assert_eq!(state.sync_status, SyncStatus::Error(SyncError::Join));
+        let state = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        assert_eq!(state.sync_status, SyncStatus::Starting);
+    }
+
+    #[test]
+    fn sync_back_returns_home_and_resets_status() {
+        let ctx = CTX.with_sync_credentials(true);
+        let state = ReaderState::boot()
+            .apply_input(ctx, InputEvent::button(Button::Previous))
+            .apply_input(ctx, InputEvent::button(Button::Confirm))
+            .apply_sync_event(SyncEvent::Connecting)
+            .apply_input(ctx, InputEvent::button(Button::Back));
+        assert_eq!(state.view, AppView::Home);
+        assert_eq!(state.sync_status, SyncStatus::Idle);
     }
 
     #[test]

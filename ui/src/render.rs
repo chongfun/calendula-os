@@ -7,7 +7,9 @@
 //! slots 3-4 the paired browse keys. Apparatus shows battery percent
 //! only — the device does not tell time.
 
-use crate::{UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiTocItem, UiView};
+use crate::{
+    UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem, UiView,
+};
 use display::fb::Framebuffer;
 use display::font::{
     draw_text, literata, literata_display, literata_small, measure_text, BitmapFont, FontStyle,
@@ -346,21 +348,90 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     dash_key(fb, 0, "home", false);
-    dash_unused(fb, 1);
+    match shell.sync_status {
+        UiSyncStatus::Idle => dash_key(fb, 1, "sync", true),
+        UiSyncStatus::Error(_) => dash_key(fb, 1, "again", true),
+        UiSyncStatus::Done { .. } => dash_key(fb, 1, "done", true),
+        _ => dash_unused(fb, 1),
+    }
     dash_unused(fb, 2);
     dash_unused(fb, 3);
     heading(fb, "Sync");
 
-    centered_note(fb, "sync is not configured");
-    draw_text_centered(
-        fb,
-        literata_small(FontStyle::Italic),
-        "add EPUB files to /books on the card",
-        HEADING_CX,
-        280,
-    );
+    let hint_y = 280;
+    match shell.sync_status {
+        UiSyncStatus::NotConfigured => {
+            centered_note(fb, "sync is not configured");
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Italic),
+                "this build carries no wi-fi credentials",
+                HEADING_CX,
+                hint_y,
+            );
+        }
+        UiSyncStatus::Idle => {
+            centered_note(fb, "share reading progress over wi-fi");
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Italic),
+                "reading pauses until the device restarts",
+                HEADING_CX,
+                hint_y,
+            );
+        }
+        UiSyncStatus::Starting | UiSyncStatus::Connecting => {
+            centered_note(fb, "joining wi-fi \u{2026}");
+        }
+        UiSyncStatus::Connected(ip) => {
+            let mut buf = [0u8; 40];
+            let mut cursor = 0;
+            push_str(&mut buf, &mut cursor, "connected at ");
+            push_ipv4(&mut buf, &mut cursor, ip);
+            centered_note(fb, text_in(&buf, cursor));
+        }
+        UiSyncStatus::Syncing => {
+            centered_note(fb, "syncing reading progress \u{2026}");
+        }
+        UiSyncStatus::Done { pushed, pulled } => {
+            centered_note(fb, "progress synced");
+            let detail = match (pushed, pulled) {
+                (true, true) => "position exchanged with the server",
+                (true, false) => "position sent to the server",
+                (false, true) => "position updated from the server",
+                (false, false) => "nothing to exchange",
+            };
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Italic),
+                detail,
+                HEADING_CX,
+                hint_y,
+            );
+        }
+        UiSyncStatus::Error(reason) => {
+            let mut buf = [0u8; 64];
+            let mut cursor = 0;
+            push_str(&mut buf, &mut cursor, "sync failed \u{00B7} ");
+            push_str(&mut buf, &mut cursor, reason);
+            centered_note(fb, text_in(&buf, cursor));
+        }
+    }
 
     finish_working_screen(fb, shell);
+}
+
+fn push_ipv4(buf: &mut [u8], cursor: &mut usize, ip: [u8; 4]) {
+    for (index, octet) in ip.iter().enumerate() {
+        if index > 0 {
+            push_str(buf, cursor, ".");
+        }
+        push_usize(buf, cursor, *octet as usize);
+    }
+}
+
+fn text_in(buf: &[u8], len: usize) -> &str {
+    core::str::from_utf8(&buf[..len]).unwrap_or("?")
 }
 
 // ------------------------------------------------------------------

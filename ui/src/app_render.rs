@@ -1,8 +1,10 @@
 use crate::{
     render::render_shell, UiBook, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell,
-    UiTocItem, UiView,
+    UiSyncStatus, UiTocItem, UiView,
 };
-use app_core::{AppView, Button, DisplayOrientation, RefreshPolicy, RenderRequest};
+use app_core::{
+    AppView, Button, DisplayOrientation, RefreshPolicy, RenderRequest, SyncError, SyncStatus,
+};
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata_display, literata_small, measure_text, FontStyle};
 use display::render::draw_ascii;
@@ -37,8 +39,33 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         library_status: model.library_status,
         library_entries: model.library_entries,
         chapters: model.chapters,
+        sync_status: ui_sync_status(request.sync_status),
     };
     render_shell(fb, &shell);
+}
+
+fn ui_sync_status(status: SyncStatus) -> UiSyncStatus {
+    match status {
+        SyncStatus::NotConfigured => UiSyncStatus::NotConfigured,
+        SyncStatus::Idle => UiSyncStatus::Idle,
+        SyncStatus::Starting => UiSyncStatus::Starting,
+        SyncStatus::Connecting => UiSyncStatus::Connecting,
+        SyncStatus::Connected(ip) => UiSyncStatus::Connected(ip),
+        SyncStatus::Syncing => UiSyncStatus::Syncing,
+        SyncStatus::Done { pushed, pulled } => UiSyncStatus::Done { pushed, pulled },
+        SyncStatus::Error(error) => UiSyncStatus::Error(sync_error_label(error)),
+    }
+}
+
+fn sync_error_label(error: SyncError) -> &'static str {
+    match error {
+        SyncError::NoCredentials => "no credentials",
+        SyncError::RadioInit => "radio failed",
+        SyncError::Join => "wi-fi join failed",
+        SyncError::Dhcp => "no network address",
+        SyncError::Server => "server unreachable",
+        SyncError::Protocol => "server answered oddly",
+    }
 }
 
 /// The sleep bookplate: no key is listening, so there is no margin
@@ -117,38 +144,6 @@ fn draw_font_centered_fit(
     }
     let x = cx - measure_text(font, shown) as i16 / 2;
     draw_text(fb, font, shown, x, y, false);
-}
-
-fn push_bytes(buf: &mut [u8], cursor: &mut usize, value: &str) {
-    for byte in value.bytes() {
-        if *cursor >= buf.len() {
-            return;
-        }
-        buf[*cursor] = byte;
-        *cursor += 1;
-    }
-}
-
-fn push_number(buf: &mut [u8], cursor: &mut usize, value: usize) {
-    let mut digits = [0u8; 20];
-    let mut len = 0;
-    let mut value = value;
-    if value == 0 {
-        digits[0] = b'0';
-        len = 1;
-    }
-    while value > 0 && len < digits.len() {
-        digits[len] = b'0' + (value % 10) as u8;
-        value /= 10;
-        len += 1;
-    }
-    for index in (0..len).rev() {
-        if *cursor >= buf.len() {
-            return;
-        }
-        buf[*cursor] = digits[index];
-        *cursor += 1;
-    }
 }
 
 fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {

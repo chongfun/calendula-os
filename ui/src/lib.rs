@@ -30,6 +30,20 @@ pub enum UiRefreshPolicy {
     FullEveryTen,
 }
 
+/// Sync screen lifecycle, mirrored from app-core so the renderer stays
+/// decoupled from reducer types the way UiView mirrors AppView.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiSyncStatus {
+    NotConfigured,
+    Idle,
+    Starting,
+    Connecting,
+    Connected([u8; 4]),
+    Syncing,
+    Done { pushed: bool, pulled: bool },
+    Error(&'static str),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiLibraryStatus {
     NotScanned,
@@ -79,4 +93,5 @@ pub struct UiShell<'a> {
     pub library_status: UiLibraryStatus,
     pub library_entries: &'a [&'a str],
     pub chapters: &'a [UiTocItem<'a>],
+    pub sync_status: UiSyncStatus,
 }

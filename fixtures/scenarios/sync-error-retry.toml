@@ -1,0 +1,23 @@
+# A failed join lands on the error screen, Confirm re-arms the session
+# (Starting), and Back abandons sync for Home with the status reset.
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+sync = "Failed"
+error = "join"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Back"
+
+[expect]
+view = "Home"
+sync_status = "idle"
+last_refresh = "FastClean"

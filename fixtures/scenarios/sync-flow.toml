@@ -1,0 +1,28 @@
+# Walk the whole sync session: Previous opens Sync from Home, Confirm
+# starts it, and scripted wifi-task events advance the screen through
+# connecting, connected, syncing, and the final done summary.
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+sync = "Connecting"
+
+[[steps]]
+sync = "Connected"
+ip = [192, 168, 1, 23]
+
+[[steps]]
+sync = "Syncing"
+
+[[steps]]
+sync = "Done"
+pushed = true
+pulled = true
+
+[expect]
+view = "Sync"
+sync_status = "done"

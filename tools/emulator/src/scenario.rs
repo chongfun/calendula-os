@@ -1,5 +1,8 @@
 use crate::Emulator;
-use app_core::{AppView, Button, DisplayOrientation, LibraryEvent, RefreshPolicy};
+use app_core::{
+    AppView, Button, DisplayOrientation, LibraryEvent, RefreshPolicy, SyncError, SyncEvent,
+    SyncStatus,
+};
 use display::epd::RefreshMode;
 use serde::Deserialize;
 use std::path::Path;
@@ -22,6 +25,11 @@ struct Step {
     chapters: Option<u8>,
     chapter: Option<u8>,
     page: Option<u32>,
+    sync: Option<String>,
+    ip: Option<[u8; 4]>,
+    pushed: Option<bool>,
+    pulled: Option<bool>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -43,6 +51,7 @@ struct Expect {
     history_contains: Option<String>,
     pending_storage: Option<String>,
     reader_status: Option<String>,
+    sync_status: Option<String>,
 }
 
 impl Scenario {
@@ -58,6 +67,9 @@ impl Scenario {
             }
             if let Some(library) = &step.library {
                 emu.library_event(parse_library_event(library, step)?);
+            }
+            if let Some(sync) = &step.sync {
+                emu.sync_event(parse_sync_event(sync, step)?);
             }
         }
         Ok(())
@@ -168,7 +180,54 @@ impl Scenario {
                 ));
             }
         }
+        if let Some(expected) = &self.expect.sync_status {
+            let actual = sync_status_name(emu.state().sync_status);
+            if actual != expected {
+                return Err(format!("expected sync_status {expected:?}, got {actual:?}"));
+            }
+        }
         Ok(())
+    }
+}
+
+fn parse_sync_event(kind: &str, step: &Step) -> Result<SyncEvent, String> {
+    match kind {
+        "Connecting" | "connecting" => Ok(SyncEvent::Connecting),
+        "Connected" | "connected" => Ok(SyncEvent::Connected(step.ip.unwrap_or([192, 168, 1, 2]))),
+        "Syncing" | "syncing" => Ok(SyncEvent::Syncing),
+        "Done" | "done" => Ok(SyncEvent::Done {
+            pushed: step.pushed.unwrap_or(true),
+            pulled: step.pulled.unwrap_or(false),
+        }),
+        "Failed" | "failed" => Ok(SyncEvent::Failed(parse_sync_error(
+            step.error.as_deref().unwrap_or("server"),
+        )?)),
+        _ => Err(format!("unknown sync event: {kind}")),
+    }
+}
+
+fn parse_sync_error(value: &str) -> Result<SyncError, String> {
+    match value {
+        "no-credentials" => Ok(SyncError::NoCredentials),
+        "radio" => Ok(SyncError::RadioInit),
+        "join" => Ok(SyncError::Join),
+        "dhcp" => Ok(SyncError::Dhcp),
+        "server" => Ok(SyncError::Server),
+        "protocol" => Ok(SyncError::Protocol),
+        _ => Err(format!("unknown sync error: {value}")),
+    }
+}
+
+fn sync_status_name(status: SyncStatus) -> &'static str {
+    match status {
+        SyncStatus::NotConfigured => "not-configured",
+        SyncStatus::Idle => "idle",
+        SyncStatus::Starting => "starting",
+        SyncStatus::Connecting => "connecting",
+        SyncStatus::Connected(_) => "connected",
+        SyncStatus::Syncing => "syncing",
+        SyncStatus::Done { .. } => "done",
+        SyncStatus::Error(_) => "error",
     }
 }
 

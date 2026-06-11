@@ -1763,6 +1763,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u8) -> s
         library_status: UiLibraryStatus::Ready,
         library_entries: &entries,
         chapters: &chapters,
+        sync_status: ui::UiSyncStatus::Idle,
     };
     render_shell(&mut fb, &shell);
     write_pbm(&out.join(format!("{name}.pbm")), &fb)?;

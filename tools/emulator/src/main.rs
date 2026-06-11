@@ -205,7 +205,10 @@ impl Emulator {
     pub fn boot(sd_root: Option<PathBuf>) -> Self {
         let mut emu = Self {
             state: app_core::ReaderState::boot(),
-            ctx: app_core::ReducerContext::new(1, 4),
+            // Credentials present: scenarios must be able to walk the whole
+            // sync flow; the no-credential screen stays pinned by app-core
+            // unit tests instead of a scenario.
+            ctx: app_core::ReducerContext::new(1, 4).with_sync_credentials(true),
             refresh_planner: RefreshPlanner::new(),
             panel: PanelModel::new(),
             fb: display::fb::Framebuffer::new(),
@@ -258,6 +261,11 @@ impl Emulator {
             self.sd_reader_status = EmulatedReaderStatus::Ready;
         }
         self.state = self.state.apply_library_event(self.ctx, event);
+        self.render(app_core::RenderKind::Page);
+    }
+
+    pub fn sync_event(&mut self, event: app_core::SyncEvent) {
+        self.state = self.state.apply_sync_event(event);
         self.render(app_core::RenderKind::Page);
     }
 
