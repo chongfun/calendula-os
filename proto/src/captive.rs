@@ -156,8 +156,11 @@ fn option_value(options: &[u8], wanted: u8) -> Option<&[u8]> {
 // DNS catch-all
 // ------------------------------------------------------------------
 
-/// Answers any single-question A/ANY query with the portal address, the
-/// whole point of a captive portal's DNS. Returns the response length.
+/// Answers every single-question query so resolvers never stall: A and
+/// ANY get the portal address, every other type (phones fire AAAA and
+/// HTTPS alongside A) gets an immediate empty NOERROR. Silence here is
+/// what breaks captive-portal detection — the probe waits out a DNS
+/// timeout and the phone never raises its sign-in sheet.
 pub fn dns_answer(query: &[u8], portal_ip: [u8; 4], out: &mut [u8]) -> Option<usize> {
     if query.len() < 12 || query[2] & 0x80 != 0 {
         return None; // not a query
@@ -181,28 +184,27 @@ pub fn dns_answer(query: &[u8], portal_ip: [u8; 4], out: &mut [u8]) -> Option<us
     }
     let qtype = u16::from_be_bytes([*query.get(at)?, *query.get(at + 1)?]);
     let question_end = at + 4;
-    if qtype != 1 && qtype != 255 {
-        return None; // only A/ANY get the captive answer
-    }
+    let answers = if qtype == 1 || qtype == 255 { 1u16 } else { 0u16 };
 
-    let answer_len = question_end + 16;
+    let answer_len = question_end + usize::from(answers) * 16;
     if out.len() < answer_len {
         return None;
     }
     out[..question_end].copy_from_slice(&query[..question_end]);
     out[2] = 0x84; // response, authoritative
     out[3] = 0x00;
-    out[6] = 0;
-    out[7] = 1; // ancount = 1
+    out[6..8].copy_from_slice(&answers.to_be_bytes());
     out[8..12].fill(0);
-    let answer = &mut out[question_end..answer_len];
-    answer[0] = 0xC0; // pointer to the question name
-    answer[1] = 0x0C;
-    answer[2..4].copy_from_slice(&1u16.to_be_bytes()); // type A
-    answer[4..6].copy_from_slice(&1u16.to_be_bytes()); // class IN
-    answer[6..10].copy_from_slice(&60u32.to_be_bytes()); // ttl
-    answer[10..12].copy_from_slice(&4u16.to_be_bytes());
-    answer[12..16].copy_from_slice(&portal_ip);
+    if answers == 1 {
+        let answer = &mut out[question_end..answer_len];
+        answer[0] = 0xC0; // pointer to the question name
+        answer[1] = 0x0C;
+        answer[2..4].copy_from_slice(&1u16.to_be_bytes()); // type A
+        answer[4..6].copy_from_slice(&1u16.to_be_bytes()); // class IN
+        answer[6..10].copy_from_slice(&60u32.to_be_bytes()); // ttl
+        answer[10..12].copy_from_slice(&4u16.to_be_bytes());
+        answer[12..16].copy_from_slice(&portal_ip);
+    }
     Some(answer_len)
 }
 
@@ -395,11 +397,16 @@ mod tests {
         assert_eq!(reply[2] & 0x80, 0x80); // response bit
         assert_eq!(&reply[6..8], &[0, 1]); // one answer
         assert_eq!(&reply[len - 4..], &PORTAL);
-        // AAAA queries get no captive answer.
+        // AAAA (and HTTPS-type) queries get an immediate empty NOERROR
+        // instead of silence, or the phone's captive probe stalls out.
         let mut aaaa = query.clone();
         let qtype_at = len - 16 - 4; // question qtype offset
         aaaa[qtype_at + 1] = 28;
-        assert!(dns_answer(&aaaa, PORTAL, &mut out).is_none());
+        let empty_len = dns_answer(&aaaa, PORTAL, &mut out).unwrap();
+        let empty = &out[..empty_len];
+        assert_eq!(empty[2] & 0x80, 0x80);
+        assert_eq!(&empty[6..8], &[0, 0]); // zero answers
+        assert_eq!(empty_len, len - 16); // question only, no answer record
     }
 
     #[test]
