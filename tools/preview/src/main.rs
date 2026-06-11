@@ -30,11 +30,19 @@ use ui::reading::{
     styled_text_ink_width, READER_LEFT_X, READER_PAGE_BOTTOM as PAGE_BOTTOM,
     READER_PAGE_TOP as PAGE_TOP, READER_RIGHT_X, READER_WRAP_SAFETY,
 };
+
+mod design_mockups;
+mod mockup_fonts_generated;
+
 const MAX_PREVIEW_LINES: usize = 4096;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse()?;
     create_dir_all(&args.out_dir)?;
+    if args.design_mockups {
+        design_mockups::write_design_mockups(&args.out_dir)?;
+        return Ok(());
+    }
     if let Some(epub) = args.epub {
         preview_epub(
             &epub,
@@ -57,6 +65,7 @@ struct Args {
     cover_bin: Option<PathBuf>,
     sd_root: Option<PathBuf>,
     source_path: Option<String>,
+    design_mockups: bool,
 }
 
 impl Args {
@@ -67,9 +76,11 @@ impl Args {
         let mut cover_bin = None;
         let mut sd_root = None;
         let mut source_path = None;
+        let mut design_mockups = false;
         let mut iter = env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--design-mockups" => design_mockups = true,
                 "--out" => out_dir = PathBuf::from(iter.next().ok_or("--out needs a path")?),
                 "--pages" => {
                     let value = iter.next().ok_or("--pages needs a count")?;
@@ -103,6 +114,7 @@ impl Args {
             cover_bin,
             sd_root,
             source_path,
+            design_mockups,
         })
     }
 }
@@ -1702,26 +1714,32 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u8) -> s
         UiTocItem {
             title: "The Time Machine",
             level: 1,
+            page: 1,
         },
         UiTocItem {
             title: "I. Introduction",
             level: 1,
+            page: 1,
         },
         UiTocItem {
             title: "II. The Machine",
             level: 1,
+            page: 9,
         },
         UiTocItem {
             title: "III. The Time Traveller Returns",
             level: 1,
+            page: 21,
         },
         UiTocItem {
             title: "IV. Time Travelling",
             level: 1,
+            page: 30,
         },
         UiTocItem {
             title: "V. In the Golden Age",
             level: 1,
+            page: 44,
         },
     ];
     let shell = UiShell {
@@ -1729,6 +1747,9 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u8) -> s
         orientation: UiOrientation::LandscapeButtonsBottom,
         refresh_policy: UiRefreshPolicy::FullOnWake,
         selection,
+        chapter: 2,
+        page: 141,
+        page_count: 380,
         battery_percent: 82,
         active_book: UiBook {
             title: "Flowers for Algernon",
@@ -1797,7 +1818,7 @@ fn write_pbm(path: &Path, fb: &Framebuffer) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_png(path: &Path, fb: &Framebuffer) -> std::io::Result<()> {
+pub(crate) fn write_png(path: &Path, fb: &Framebuffer) -> std::io::Result<()> {
     let file = BufWriter::new(File::create(path)?);
     let mut encoder = png::Encoder::new(file, WIDTH as u32, HEIGHT as u32);
     encoder.set_color(png::ColorType::Grayscale);
