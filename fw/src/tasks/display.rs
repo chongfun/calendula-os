@@ -10,7 +10,7 @@ use crate::{
     DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
-use app_core::RefreshPlanner;
+use app_core::{ReaderSource, RefreshPlanner};
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
@@ -59,6 +59,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let mut refresh_planner = RefreshPlanner::new();
     let mut pending_progress: Option<AppStateRecord> = None;
     let mut last_progress_write: Option<Instant> = None;
+    // STATE.BIN is consulted once per boot, after the first catalog with
+    // entries lands; later catalog refreshes must not yank reading state.
+    let mut state_restored = false;
     // True while RED RAM is known to hold exactly prev_fb's content, letting
     // a fast refresh skip its previous-frame stream. Reset on any failure,
     // sleep, or panel re-init; false just means the next flush writes RED.
@@ -175,6 +178,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut epub_scratch,
                     &mut pending_progress,
                     &mut last_progress_write,
+                    &mut state_restored,
                 );
             }
         }
@@ -199,10 +203,15 @@ fn handle_storage_command(
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
+    state_restored: &mut bool,
 ) {
     match command {
         StorageCommand::LoadCatalogCache => {
             if crate::library_sd::load_catalog_cache(epd, sd_cs, sd_library) {
+                // Restored goes out first so the very next Home repaint
+                // already shows the saved book; the Scanned default then
+                // sees an SD book active and leaves it alone.
+                restore_saved_state(epd, sd_cs, sd_library, state_restored);
                 let count = sd_library.catalog_count_u8();
                 send_library_event(LibraryEvent::Scanned { count });
             } else {
@@ -211,6 +220,7 @@ fn handle_storage_command(
         }
         StorageCommand::RefreshCatalog => {
             crate::library_sd::scan_books(epd, sd_cs, sd_library);
+            restore_saved_state(epd, sd_cs, sd_library, state_restored);
             send_library_event(LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u8(),
             });
@@ -407,6 +417,50 @@ fn ensure_epub_scratch<'a>(
 
 fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
     library.source_identity(book_id)
+}
+
+/// One boot-time attempt to map `/XTEINK/STATE.BIN` back onto the scanned
+/// catalog by stable source identity (path hash + byte size) and hand the
+/// saved position to the app as a `Restored` event. The volatile book id
+/// stored in the record is never trusted directly.
+fn restore_saved_state(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    state_restored: &mut bool,
+) {
+    if *state_restored || library.catalog_is_empty() {
+        return;
+    }
+    *state_restored = true;
+    let Some(record) = reader_cache::load_app_state(epd, sd_cs) else {
+        esp_println::println!("restore: no usable STATE.BIN");
+        return;
+    };
+    let Some(index) = library.catalog_index_for_identity(record.source_hash, record.source_size)
+    else {
+        esp_println::println!(
+            "restore: no catalog match hash={:08x} size={}",
+            record.source_hash,
+            record.source_size
+        );
+        return;
+    };
+    esp_println::println!(
+        "restore: index={} chapter={} screen={}",
+        index,
+        record.chapter,
+        record.screen
+    );
+    send_required_library_event(LibraryEvent::Restored {
+        book_id: ReaderSource::sd(index).book_id(),
+        chapter: record.chapter.min(u8::MAX as u16) as u8,
+        page: record.screen,
+        reading_orientation: record.reading_orientation,
+        refresh_policy: record.refresh_policy,
+        font_size: record.font_size,
+        line_spacing: record.line_spacing,
+    });
 }
 
 fn flush_pending_progress(

@@ -10,6 +10,7 @@ count = 3
 
 [expect]
 view = "Library"
-book_id = 1
+# The scan adopts the first SD entry as the resting active book.
+book_id = 2
 library_count = 3
 selection = 0

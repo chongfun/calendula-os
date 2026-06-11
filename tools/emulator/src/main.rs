@@ -319,6 +319,7 @@ impl Emulator {
         crate::render::render_sleep(
             &mut self.fb,
             self.state.render_request(app_core::RenderKind::Page),
+            &self.library_entries,
         );
         self.panel
             .write_framebuffer_bw(&self.fb)

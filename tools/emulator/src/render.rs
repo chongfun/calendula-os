@@ -46,8 +46,13 @@ pub fn render_request(
     render_shared_request(fb, request, &model);
 }
 
-pub fn render_sleep(fb: &mut Framebuffer, request: app_core::RenderRequest) {
-    let model = demo_model(request, &[]);
+pub fn render_sleep(
+    fb: &mut Framebuffer,
+    request: app_core::RenderRequest,
+    library_entries: &[String],
+) {
+    let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
+    let model = demo_model(request, &borrowed_entries);
     render_shared_sleep(fb, request, &model);
 }
 
@@ -97,10 +102,19 @@ fn demo_model<'a>(
     request: app_core::RenderRequest,
     library_entries: &'a [&'a str],
 ) -> UiRenderModel<'a> {
+    // SD books take their title from the scanned entry, mirroring the
+    // firmware's catalog labels; the built-in demo book keeps its own.
+    let sd_entry = app_core::ReaderSource::from_book_id(request.book_id)
+        .sd_index()
+        .and_then(|index| library_entries.get(index as usize).copied());
+    let (title, author) = match sd_entry {
+        Some(entry) => (entry, ""),
+        None => (DEMO_TITLE, DEMO_AUTHOR),
+    };
     UiRenderModel {
         active_book: UiBook {
-            title: DEMO_TITLE,
-            author: DEMO_AUTHOR,
+            title,
+            author,
             progress_permille: progress_permille(request),
             cover: None,
         },

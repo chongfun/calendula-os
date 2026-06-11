@@ -216,7 +216,9 @@ impl RefreshPlanner {
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
-        request.library_count != last.library_count
+        // Only the library list actually redraws when the scan count moves;
+        // other views repaint identical pixels and can ride the partial.
+        request.view == AppView::Library && request.library_count != last.library_count
     }
 }
 
@@ -535,6 +537,21 @@ impl ReaderState {
         match event {
             LibraryEvent::Scanned { count } => {
                 self.library_count = count;
+                // Boot points at the built-in demo book until the scan
+                // proves the card has real books; the title page then
+                // adopts the first catalog entry instead of the
+                // placeholder. Saved progress (Restored) arrives after
+                // and overrides this default, and a demo book that is
+                // actually open stays put.
+                if count > 0
+                    && !ReaderSource::from_book_id(self.book_id).is_sd()
+                    && !matches!(self.view, AppView::Reading | AppView::Chapters)
+                {
+                    self.book_id = ReaderSource::sd(0).book_id();
+                    self.chapter = 0;
+                    self.page = 0;
+                    self.dirty = Rect::FULL;
+                }
                 if self.view == AppView::Library {
                     if count == 0 {
                         self.selection = 0;
@@ -592,7 +609,9 @@ impl ReaderState {
                     let restored_index =
                         ReaderSource::from_book_id(book_id).sd_index().unwrap_or(0);
                     self.selection = restored_index.min(self.library_count.saturating_sub(1));
-                } else {
+                } else if self.view == AppView::Chapters {
+                    // Home/Settings keep their own key selection; only the
+                    // chapter list tracks the restored chapter cursor.
                     self.selection = chapter;
                 }
                 self.read_request_pending = false;
@@ -861,7 +880,9 @@ mod tests {
             .apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
         let state = press(press(state, Button::Next), Button::Back);
         assert_eq!(state.view, AppView::Home);
-        assert_eq!(state.book_id, 1);
+        // Browsing did not open anything: the active book is still the
+        // scan-time default (first catalog entry), not the browsed row.
+        assert_eq!(state.book_id, ReaderSource::sd(0).book_id());
     }
 
     #[test]
@@ -954,6 +975,65 @@ mod tests {
         assert_eq!(state.view, AppView::Library);
         assert_eq!(state.library_count, 2);
         assert!(!state.read_request_pending);
+    }
+
+    #[test]
+    fn scan_defaults_home_to_first_sd_book_until_restore() {
+        let state = ReaderState::boot();
+        assert_eq!(state.book_id, 1);
+
+        let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 3 });
+        assert_eq!(state.book_id, ReaderSource::sd(0).book_id());
+        assert_eq!(state.chapter, 0);
+        assert_eq!(state.page, 0);
+
+        // Saved progress arriving after the scan wins over the default.
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Restored {
+                book_id: ReaderSource::sd(2).book_id(),
+                chapter: 4,
+                page: 12,
+                reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
+                refresh_policy: RefreshPolicy::FullOnWake as u8,
+                font_size: FontSize::Medium as u8,
+                line_spacing: LineSpacing::Normal as u8,
+            },
+        );
+        assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
+
+        // A later rescan must not yank the restored book back.
+        let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 3 });
+        assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
+    }
+
+    #[test]
+    fn scan_keeps_an_open_builtin_book() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 3 });
+        assert_eq!(state.book_id, 1);
+    }
+
+    #[test]
+    fn restore_keeps_home_key_selection() {
+        let state = ReaderState::boot();
+        let home_selection = state.selection;
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Restored {
+                book_id: ReaderSource::sd(1).book_id(),
+                chapter: 9,
+                page: 70,
+                reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
+                refresh_policy: RefreshPolicy::FullOnWake as u8,
+                font_size: FontSize::Medium as u8,
+                line_spacing: LineSpacing::Normal as u8,
+            },
+        );
+        assert_eq!(state.selection, home_selection);
+        assert_eq!(state.chapter, 9);
+        assert_eq!(state.page, 70);
     }
 
     #[test]

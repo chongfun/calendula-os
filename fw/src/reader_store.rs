@@ -264,6 +264,25 @@ impl ReaderStore {
         (entry.source_hash, entry.byte_size)
     }
 
+    /// Map a stored (path-hash, byte-size) identity back to its catalog
+    /// index: the reverse of `source_identity`, used by boot restore.
+    pub(crate) fn catalog_index_for_identity(
+        &self,
+        source_hash: u32,
+        byte_size: u32,
+    ) -> Option<u8> {
+        if source_hash == 0 && byte_size == 0 {
+            return None;
+        }
+        (0..self.catalog_count().min(u8::MAX as usize))
+            .find(|&index| {
+                self.catalog_entry(index)
+                    .map(|entry| entry.source_hash == source_hash && entry.byte_size == byte_size)
+                    .unwrap_or(false)
+            })
+            .map(|index| index as u8)
+    }
+
     pub(crate) fn clear_toc(&mut self) {
         self.toc_text_len = 0;
         self.toc_count = 0;

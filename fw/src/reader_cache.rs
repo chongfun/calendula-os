@@ -262,6 +262,14 @@ pub(crate) fn store_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>, record
     });
 }
 
+/// Kept out of line for the same stack discipline as the store side.
+#[inline(never)]
+pub(crate) fn load_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>) -> Option<AppStateRecord> {
+    sd_session::with_root(epd, sd_cs, |root| reader_cache_files::read_state_file(root))
+        .ok()
+        .flatten()
+}
+
 #[inline(never)]
 fn try_load_v2_book_cache<
     D,

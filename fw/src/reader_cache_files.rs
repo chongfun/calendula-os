@@ -90,6 +90,32 @@ where
     file.write(&record.encode()).map_err(|_| ())
 }
 
+/// Read and decode `/XTEINK/STATE.BIN`. Returns None when the directory
+/// or file is missing, short, or fails the record checksum.
+pub(crate) fn read_state_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<hal_ext::nvm::AppStateRecord>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let file = xteink
+        .open_file_in_dir(CACHE_STATE_FILE, Mode::ReadOnly)
+        .ok()?;
+    let mut bytes = [0u8; hal_ext::nvm::AppStateRecord::ENCODED_LEN];
+    // One read suffices for a 32-byte record; shorter V1/V2 files decode
+    // from their actual length.
+    let len = file.read(&mut bytes).ok()?;
+    hal_ext::nvm::AppStateRecord::decode(&bytes[..len])
+}
+
 pub(crate) fn load_v2_cover_cache<
     D,
     T,
