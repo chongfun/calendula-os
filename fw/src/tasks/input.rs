@@ -116,6 +116,7 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
     let mut nav_stable = StableButton::new();
     let mut page_stable = StableButton::new();
     let mut raw_log_ticks = 0u8;
+    let mut reported_percent: Option<u8> = None;
 
     loop {
         Timer::after_millis(POLL_MS).await;
@@ -142,9 +143,11 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
             continue;
         }
 
+        let percent = stable_percent(&mut reported_percent, battery_percent(sample.aux));
+
         let power_pressed = debounce_active_low(pins.power.is_low(), &mut power_ticks);
         if power_pressed && !last_power {
-            emit(Some(Button::Power), sample);
+            emit(Some(Button::Power), sample, percent);
             log_input(Some(Button::Power), sample);
         }
         last_power = power_pressed;
@@ -153,7 +156,7 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
         if let Some(nav) = nav {
             let StableEvent::Changed(hardware) = nav;
             let button = map_hardware(hardware);
-            emit(Some(button), sample);
+            emit(Some(button), sample, percent);
             log_input(Some(button), sample);
         }
 
@@ -161,20 +164,33 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
         if let Some(page) = page {
             let StableEvent::Changed(hardware) = page;
             let button = map_hardware(hardware);
-            emit(Some(button), sample);
+            emit(Some(button), sample, percent);
             log_input(Some(button), sample);
         }
     }
 }
 
-fn emit(button: Option<Button>, sample: RawSample) {
+/// ADC noise straddling a percent boundary makes the displayed battery
+/// flip between adjacent values on every refresh. Hold the reported
+/// percent until the raw reading moves at least two points.
+fn stable_percent(reported: &mut Option<u8>, raw: u8) -> u8 {
+    match reported {
+        Some(current) if raw.abs_diff(*current) < 2 => *current,
+        _ => {
+            *reported = Some(raw);
+            raw
+        }
+    }
+}
+
+fn emit(button: Option<Button>, sample: RawSample, battery_percent: u8) {
     let event = InputEvent::Sample {
         button,
         aux_raw: sample.aux,
         nav_raw: sample.nav,
         page_raw: sample.page,
         battery_mv: battery_mv(sample.aux),
-        battery_percent: battery_percent(sample.aux),
+        battery_percent,
     };
     if INPUT_EVENTS.try_send(event).is_ok() {
         return;

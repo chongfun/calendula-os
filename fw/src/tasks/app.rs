@@ -53,6 +53,9 @@ pub async fn run() {
                     } else {
                         esp_println::println!("app: sleep");
                         sleeping = true;
+                        // Drop any queued repaint: a stale render arriving
+                        // after the sleep command would wake the panel.
+                        render_pending = false;
                         let _ = DISPLAY_COMMANDS.send(DisplayCommand::Sleep).await;
                     }
                     continue;
@@ -141,7 +144,7 @@ pub async fn run() {
                         }
                         STORAGE_COMMANDS.send(command).await;
                     }
-                    if render_pending {
+                    if render_pending && !sleeping {
                         send_render(RenderKind::Page, state).await;
                         rendering = true;
                         render_pending = false;
@@ -168,7 +171,7 @@ pub async fn run() {
                     }
                     let should_render = library_event_affects_view(state, event);
                     state = state.apply_library_event(ctx, event);
-                    if !should_render {
+                    if !should_render || sleeping {
                         continue;
                     }
                     if rendering {
@@ -188,7 +191,7 @@ pub async fn run() {
                 }
                 let should_render = library_event_affects_view(state, event);
                 state = state.apply_library_event(ctx, event);
-                if !should_render {
+                if !should_render || sleeping {
                     continue;
                 }
                 if rendering {
