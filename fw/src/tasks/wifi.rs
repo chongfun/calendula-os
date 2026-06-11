@@ -944,18 +944,28 @@ impl Session {
             .await?;
         let response =
             kosync::parse_response(&self.http_b[..response_len]).ok_or(SyncError::Protocol)?;
-        let server_permille = match response.status {
-            200 => kosync::parse_percentage_permille(response.body),
+        let (server_permille, server_is_foreign) = match response.status {
+            200 => {
+                let mut id_buf = [0u8; 32];
+                let foreign = kosync::parse_device_id(response.body, &mut id_buf)
+                    .map(|len| id_buf[..len] != device_id[..len.min(32)])
+                    .unwrap_or(true);
+                (kosync::parse_percentage_permille(response.body), foreign)
+            }
             // 404/502 from kosync mean "no position stored yet".
-            404 | 502 => None,
+            404 | 502 => (None, false),
             401 | 403 => return Err(SyncError::Protocol),
             _ => return Err(SyncError::Protocol),
         };
 
         let local_permille = book.percent_permille;
+        // Pulls require a position another device wrote: our own echo
+        // must never move us (otherwise adding books over a sync session
+        // can derail the current read). Pushes keep our record current
+        // either way.
         let (push, pull) = match server_permille {
-            Some(server) if server > local_permille => (false, true),
-            Some(server) if server < local_permille => (true, false),
+            Some(server) if server > local_permille && server_is_foreign => (false, true),
+            Some(server) if server != local_permille => (true, false),
             Some(_) => (false, false),
             None => (true, false),
         };

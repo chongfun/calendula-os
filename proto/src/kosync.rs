@@ -377,6 +377,29 @@ pub fn parse_percentage_permille(body: &[u8]) -> Option<u16> {
     Some(permille.min(1000) as u16)
 }
 
+/// Pulls `"device_id": "<hex>"` out of a progress body. Sync clients
+/// must ignore their own echoes on pull, or a single device can be
+/// yanked around by positions it wrote itself.
+pub fn parse_device_id(body: &[u8], out: &mut [u8; 32]) -> Option<usize> {
+    let key = b"\"device_id\"";
+    let key_at = body.windows(key.len()).position(|window| window == key)?;
+    let mut rest = &body[key_at + key.len()..];
+    while let Some((&first, tail)) = rest.split_first() {
+        match first {
+            b':' | b' ' | b'\t' => rest = tail,
+            _ => break,
+        }
+    }
+    let (&quote, tail) = rest.split_first()?;
+    if quote != b'\"' {
+        return None;
+    }
+    let end = tail.iter().position(|byte| *byte == b'\"')?;
+    let value = &tail[..end.min(32)];
+    out[..value.len()].copy_from_slice(value);
+    Some(value.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +526,15 @@ mod tests {
         let response = parse_response(raw).unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(parse_percentage_permille(response.body), Some(618));
+    }
+
+    #[test]
+    fn parses_device_id_for_self_echo_detection() {
+        let body = b"{\"device\":\"kobo\",\"device_id\":\"a1b2c3\",\"percentage\":0.5}";
+        let mut out = [0u8; 32];
+        let len = parse_device_id(body, &mut out).unwrap();
+        assert_eq!(&out[..len], b"a1b2c3");
+        assert!(parse_device_id(b"{}", &mut out).is_none());
     }
 
     #[test]
