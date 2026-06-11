@@ -37,7 +37,8 @@ use esp_wifi::EspWifiController;
 use proto::captive;
 use proto::kosync;
 
-const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+// Measured first-association joins ran ~21 s; give them headroom.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEVICE_NAME: &str = "xteink-x4";
@@ -96,6 +97,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         http_b,
         book,
         wifi: stored_credentials,
+        catalog_len,
         ..
     } = loan;
 
@@ -182,6 +184,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         tcp_rx,
         tcp_tx,
         http_a,
+        http_b,
         controller: _controller,
         ..
     } = session;
@@ -193,7 +196,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
     send_event(SyncEvent::Serving(ip));
     select(
         exit_after_uploads(),
-        upload_server(stack, tcp_rx, tcp_tx, http_a),
+        upload_server(stack, tcp_rx, tcp_tx, http_a, http_b, catalog_len),
     )
     .await;
     unreachable!()
@@ -221,37 +224,87 @@ async fn exit_after_uploads() -> ! {
 // ------------------------------------------------------------------
 
 const UPLOAD_PAGE: &str = concat!(
-    "<!doctype html><html><head>",
-    "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
-    "<title>XTEINK X4 \u{00b7} books</title>",
-    "<style>body{font-family:Georgia,serif;margin:2.5em auto;max-width:24em;",
-    "padding:0 1em;color:#222}h1{font-size:1.25em;letter-spacing:.08em}",
-    "input{margin:1em 0}button{font-size:1.05em;padding:.6em 1.6em;",
-    "border:1px solid #222;background:#222;color:#fff;border-radius:4px}",
-    "li{margin:.3em 0}#done{margin-top:1.5em;font-style:italic}",
-    "</style></head><body><h1>XTEINK&nbsp;X4</h1>",
-    "<p>Send EPUB files to the reader's card.</p>",
-    "<input id=files type=file accept=.epub multiple>",
-    "<br><button onclick=go()>Send</button><ul id=log></ul><p id=done></p>",
-    "<script>async function go(){const fs=document.getElementById('files').files;",
-    "const log=document.getElementById('log');",
-    "for(const f of fs){const li=document.createElement('li');",
-    "li.textContent=f.name+' \u{2026}';log.appendChild(li);",
-    "try{const r=await fetch('/upload?name='+encodeURIComponent(f.name),",
-    "{method:'POST',body:f});",
-    "li.textContent=f.name+(r.ok?' \u{2713}':' failed');}",
-    "catch(e){li.textContent=f.name+' failed';}}",
-    "document.getElementById('done').textContent=",
-    "'Press done on the reader; books appear after it restarts.';}",
-    "</script></body></html>",
+    r##"<!doctype html><html><head>"##,
+    r##"<meta name=viewport content="width=device-width,initial-scale=1">"##,
+    r##"<title>Xteink X4 · The Shelf</title><style>"##,
+    r##"body{font-family:Georgia,'Times New Roman',serif;margin:3em auto;"##,
+    r##"max-width:26em;padding:0 1.2em;color:#1a1a1a;background:#fbfbf8}"##,
+    r##"h1{font-size:1em;font-weight:600;letter-spacing:.35em;"##,
+    r##"text-transform:uppercase;text-align:center;margin:0 0 .4em}"##,
+    r##"hr{border:0;border-top:1px solid #1a1a1a;margin:.2em 0 2em}"##,
+    r##"h2{font-size:.8em;font-weight:600;letter-spacing:.25em;"##,
+    r##"text-transform:uppercase;margin:2.2em 0 .8em}"##,
+    r##"h2:before{content:'— '}"##,
+    r##"ul{list-style:none;margin:0;padding:0}"##,
+    r##"li{display:flex;align-items:baseline;justify-content:space-between;"##,
+    r##"gap:1em;padding:.45em 0;border-bottom:1px dotted #bbb}"##,
+    r##"li i{color:#777}"##,
+    r##"a.del{font-size:.7em;letter-spacing:.2em;text-transform:uppercase;"##,
+    r##"color:#888;text-decoration:none;white-space:nowrap;cursor:pointer}"##,
+    r##"a.del:hover{color:#1a1a1a}"##,
+    r##"#drop{border:1px dashed #999;border-radius:3px;padding:2.2em 1em;"##,
+    r##"text-align:center;color:#666;font-style:italic;cursor:pointer}"##,
+    r##"#drop.over{border-color:#1a1a1a;color:#1a1a1a}"##,
+    r##"progress{width:7em;height:.45em;accent-color:#1a1a1a}"##,
+    r##"footer{margin-top:3em;text-align:center;font-style:italic;"##,
+    r##"color:#777;font-size:.85em}"##,
+    r##"</style></head><body><h1>Xteink X4</h1><hr>"##,
+    r##"<h2>On the shelf</h2><ul id=shelf><li><i>reading the card …</i></li></ul>"##,
+    r##"<h2>Add books</h2>"##,
+    r##"<div id=drop>drop EPUB files here — or click to choose</div>"##,
+    r##"<input id=files type=file accept=.epub multiple hidden>"##,
+    r##"<ul id=queue></ul>"##,
+    r##"<footer>changes appear on the reader after it restarts ·"##,
+    r##" press <b>done</b> there to finish</footer>"##,
+    r##"<script>"##,
+    r##"const shelf=document.getElementById('shelf'),"##,
+    r##"queue=document.getElementById('queue'),"##,
+    r##"drop=document.getElementById('drop'),"##,
+    r##"input=document.getElementById('files');"##,
+    r##"function row(label){const li=document.createElement('li');"##,
+    r##"const span=document.createElement('span');span.textContent=label;"##,
+    r##"li.appendChild(span);return li}"##,
+    r##"async function load(){const r=await fetch('/list');"##,
+    r##"const text=await r.text();shelf.textContent='';"##,
+    r##"const lines=text.split('
+').filter(Boolean);"##,
+    r##"if(!lines.length){shelf.appendChild(row('— nothing yet —'))}"##,
+    r##"for(const line of lines){const[flag,open,label]=line.split('|');"##,
+    r##"const li=row(label||open);"##,
+    r##"if(flag==='B'){const a=document.createElement('a');a.className='del';"##,
+    r##"a.textContent='remove';a.onclick=async()=>{"##,
+    r##"if(!confirm('Remove '+(label||open)+' from the card?'))return;"##,
+    r##"const r=await fetch('/delete?name='+encodeURIComponent(open),"##,
+    r##"{method:'POST'});if(r.ok)li.remove()};li.appendChild(a)}"##,
+    r##"shelf.appendChild(li)}}"##,
+    r##"function send(files){[...files].reduce((chain,f)=>chain.then(()=>new Promise(done=>{"##,
+    r##"const li=row(f.name);const bar=document.createElement('progress');"##,
+    r##"bar.max=1;bar.value=0;li.appendChild(bar);queue.appendChild(li);"##,
+    r##"const xhr=new XMLHttpRequest();"##,
+    r##"xhr.open('POST','/upload?name='+encodeURIComponent(f.name));"##,
+    r##"xhr.upload.onprogress=e=>{if(e.lengthComputable)bar.value=e.loaded/e.total};"##,
+    r##"xhr.onloadend=()=>{bar.remove();"##,
+    r##"li.appendChild(document.createTextNode(xhr.status===200?' ✓':' — failed'));"##,
+    r##"done()};xhr.send(f)})),Promise.resolve())}"##,
+    r##"drop.onclick=()=>input.click();"##,
+    r##"input.onchange=()=>send(input.files);"##,
+    r##"drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};"##,
+    r##"drop.ondragleave=()=>drop.classList.remove('over');"##,
+    r##"drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');"##,
+    r##"send(e.dataTransfer.files)};"##,
+    r##"load();"##,
+    r##"</script></body></html>"##,
 );
 
-/// Serves the upload page and streams POSTed books to the display task.
+/// Serves the shelf page, streams POSTed books to the display task,
+/// lists the catalog snapshot, and deletes /BOOKS entries on request.
 async fn upload_server(
     stack: Stack<'static>,
     tcp_rx: &'static mut [u8],
     tcp_tx: &'static mut [u8],
     request_buf: &'static mut [u8],
+    catalog: &'static mut [u8],
+    catalog_len: usize,
 ) -> ! {
     // Staging ping-pong buffers live in the loaned heap.
     let mut pool: heapless::Vec<&'static mut [u8], 2> = heapless::Vec::new();
@@ -303,15 +356,44 @@ async fn upload_server(
                 .map(|p| p.starts_with(b"/upload"))
                 .unwrap_or(false);
 
-        if is_upload_post {
+        let path = request_buf.get(path_at..path_at + path_len).unwrap_or(b"/");
+        let is_list = path.starts_with(b"/list");
+        let is_delete = request_buf
+            .get(..method_len)
+            .map(|m| m == b"POST")
+            .unwrap_or(false)
+            && path.starts_with(b"/delete");
+
+        if is_list {
+            let listing =
+                core::str::from_utf8(&catalog[..catalog_len.min(catalog.len())]).unwrap_or("");
+            let _ = write_http_response(&mut socket, "200 OK", listing).await;
+        } else if is_delete {
+            let name = request_buf
+                .get(path_at..path_at + path_len)
+                .and_then(raw_query_name)
+                .and_then(valid_short_name);
+            let ok = match name {
+                Some(name) => {
+                    if !session_started {
+                        STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
+                        session_started = true;
+                    }
+                    UPLOAD_BEGINS.send(UploadBegin { name, delete: true }).await;
+                    UPLOAD_RESULTS.receive().await
+                }
+                None => false,
+            };
+            let _ = write_http_response(
+                &mut socket,
+                if ok { "200 OK" } else { "404 Not Found" },
+                if ok { "deleted" } else { "failed" },
+            )
+            .await;
+        } else if is_upload_post {
             let client_name = request_buf
                 .get(path_at..path_at + path_len)
-                .and_then(|p| {
-                    let query_at = p.iter().position(|b| *b == b'?')? + 1;
-                    p[query_at..]
-                        .split(|b| *b == b'&')
-                        .find_map(|pair| pair.strip_prefix(b"name="))
-                })
+                .and_then(raw_query_name)
                 .unwrap_or(b"book");
             let name = sanitized_name(client_name);
 
@@ -359,7 +441,12 @@ async fn stream_book(
 ) -> bool {
     esp_println::println!("upload: '{}' {} bytes", name, content_length);
     crate::upload::UPLOAD_IN_FLIGHT.store(true, portable_atomic::Ordering::SeqCst);
-    UPLOAD_BEGINS.send(UploadBegin { name }).await;
+    UPLOAD_BEGINS
+        .send(UploadBegin {
+            name,
+            delete: false,
+        })
+        .await;
 
     let mut leftover = &request_buf[leftover];
     if leftover.len() > content_length {
@@ -634,6 +721,30 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
     true
 }
 
+/// Raw (undecoded) `name=` value from a path's query string.
+fn raw_query_name(path: &[u8]) -> Option<&[u8]> {
+    let query_at = path.iter().position(|byte| *byte == b'?')? + 1;
+    path[query_at..]
+        .split(|byte| *byte == b'&')
+        .find_map(|pair| pair.strip_prefix(b"name="))
+}
+
+/// Accepts an existing 8.3 catalog open-name verbatim: short, printable
+/// ASCII, no path separators. Deletion must not invent or mangle names.
+fn valid_short_name(raw: &[u8]) -> Option<crate::upload::UploadName> {
+    if raw.is_empty() || raw.len() > 12 {
+        return None;
+    }
+    let mut name = crate::upload::UploadName::new();
+    for byte in raw.iter().copied() {
+        if !byte.is_ascii_graphic() || byte == b'/' || byte == b'\\' {
+            return None;
+        }
+        let _ = name.push(byte as char);
+    }
+    Some(name)
+}
+
 async fn write_http_page(
     socket: &mut TcpSocket<'_>,
     body: &str,
@@ -729,6 +840,11 @@ impl Session {
         .map_err(|_| SyncError::Dhcp)?;
         let ip = config.address.address().octets();
         esp_println::println!("wifi: up at {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        esp_println::println!(
+            "wifi: heap used={} free={}",
+            esp_alloc::HEAP.used(),
+            esp_alloc::HEAP.free()
+        );
         send_event(SyncEvent::Connected(ip));
 
         let Some((host_port, username, password)) = kosync_account() else {

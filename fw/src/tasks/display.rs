@@ -259,6 +259,7 @@ fn handle_storage_command(
                     password_len: record.password_len,
                 }
             });
+            loan.catalog_len = write_catalog_listing(sd_library, loan.http_b);
             if crate::SYNC_LOANS.try_send(loan).is_err() {
                 // Unreachable in practice: the wifi task requests exactly
                 // one loan per boot. The memory is gone either way.
@@ -464,6 +465,33 @@ fn send_required_display_event(event: &DisplayEvent) {
     if DISPLAY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: required display event queue full");
     }
+}
+
+/// Writes `flag|open_name|label` lines for the shelf page into the
+/// loaned buffer: B marks /BOOKS entries (deletable over the air), R
+/// marks card-root ones.
+fn write_catalog_listing(sd_library: &ReaderStore, out: &mut [u8]) -> usize {
+    let mut at = 0;
+    for entry in sd_library.catalog_entries() {
+        let label = entry.display_label.as_str();
+        let line_len = 1 + 1 + entry.open_name.len() + 1 + label.len() + 1;
+        if at + line_len > out.len() {
+            break;
+        }
+        out[at] = if entry.in_books_dir { b'B' } else { b'R' };
+        at += 1;
+        out[at] = b'|';
+        at += 1;
+        out[at..at + entry.open_name.len()].copy_from_slice(entry.open_name.as_bytes());
+        at += entry.open_name.len();
+        out[at] = b'|';
+        at += 1;
+        out[at..at + label.len()].copy_from_slice(label.as_bytes());
+        at += label.len();
+        out[at] = b'\n';
+        at += 1;
+    }
+    at
 }
 
 /// The saved book's kosync identity and position, gathered while this

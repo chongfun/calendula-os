@@ -151,6 +151,7 @@ pub(crate) fn dismantle_scratch(
             http_b: core::slice::from_raw_parts_mut(tail_ptr, READER_TAIL_SCRATCH),
             book: None,
             wifi: None,
+            catalog_len: 0,
         }
     }
 }

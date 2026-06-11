@@ -19,6 +19,8 @@ pub type UploadName = String<12>;
 
 pub struct UploadBegin {
     pub name: UploadName,
+    /// True removes the named book from /BOOKS instead of writing one.
+    pub delete: bool,
 }
 
 pub struct UploadChunk {
