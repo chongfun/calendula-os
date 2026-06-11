@@ -199,9 +199,15 @@ Current code status:
 - Dev credentials are compile-time: build with `XTEINK_WIFI_SSID`,
   `XTEINK_WIFI_PASS`, `XTEINK_KOSYNC_HOST` (host or host:port, plain HTTP),
   `XTEINK_KOSYNC_USER`, `XTEINK_KOSYNC_PASS`.
-- Hardware validation pending: join/DHCP timing, heap high-water
-  (esp_alloc::HEAP stats), kosync round trip against a self-hosted server,
-  USB serial survival across radio init (phy-enable-usb is set).
+- On-device validation (June 11 2026, esp-hal 0.23 stack): the full session
+  ran on hardware — Confirm started it, the loan + book gather + radio init
+  completed, the station joined and got 192.168.0.233 via DHCP (~21 s from
+  Start to address; the 20 s join timeout deserves headroom or scan tuning),
+  status repaints rode the 438 ms fast refresh, USB serial survived radio
+  init, Back reset the device, and the saved position (page 619/ch 87) came
+  back intact after reboot. Still pending: a kosync round trip against a
+  real server (this build had no kosync account), and a heap high-water
+  reading (log esp_alloc::HEAP stats during a session).
 - Next: AP-mode web onboarding (hotspot + QR + credential form persisted to
   /XTEINK/WIFI.BIN via edge-dhcp + captive DNS), then browser EPUB upload
   through the same HTTP server in bounded chunks written by the board I/O
