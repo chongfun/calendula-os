@@ -44,19 +44,40 @@ pub fn sanitized_name(client_name: &[u8]) -> UploadName {
         .iter()
         .rposition(|byte| *byte == b'.')
         .unwrap_or(client_name.len());
-    let stem_source = client_name[..stem_end].iter().copied();
+    let stem = &client_name[..stem_end];
     let mut name = UploadName::new();
-    for byte in stem_source {
-        if name.len() == 8 {
-            break;
-        }
+    let mut at = 0;
+    while at < stem.len() && name.len() < 8 {
+        // Decode %XX escapes so "High%20Output" stems as HIGHOUTP, not
+        // HIGH20OU; undecodable escapes fall through as literal bytes.
+        let byte = if stem[at] == b'%' && at + 2 < stem.len() {
+            match (hex_nibble(stem[at + 1]), hex_nibble(stem[at + 2])) {
+                (Some(high), Some(low)) => {
+                    at += 2;
+                    (high << 4) | low
+                }
+                _ => stem[at],
+            }
+        } else {
+            stem[at]
+        };
         if byte.is_ascii_alphanumeric() {
             let _ = name.push(byte.to_ascii_uppercase() as char);
         }
+        at += 1;
     }
     if name.is_empty() {
         let _ = name.push_str("BOOK");
     }
     let _ = name.push_str(".EPU");
     name
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }

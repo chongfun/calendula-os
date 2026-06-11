@@ -356,10 +356,49 @@ where
 }
 
 #[inline(never)]
-pub(crate) fn store_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>, record: AppStateRecord) {
+pub(crate) fn store_app_state(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    record: AppStateRecord,
+) {
+    // The same session lands the global record and, for SD books, the
+    // per-book position beside that book's cache, so switching books
+    // never abandons the previous one's place.
+    let book_key = app_core::ReaderSource::from_book_id(record.book_id)
+        .sd_index()
+        .and_then(|index| library.catalog_entry(index as usize))
+        .map(|entry| proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size));
     let _ = sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::write_state_file(root, record)
+        let state = reader_cache_files::write_state_file(root, record);
+        if let Some(key) = &book_key {
+            let _ = reader_cache_files::write_position_file(
+                root,
+                key.as_str(),
+                record.chapter,
+                record.screen,
+            );
+        }
+        state
     });
+}
+
+/// The saved per-book position for a catalog entry, if any.
+#[inline(never)]
+pub(crate) fn load_position(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    index: usize,
+) -> Option<(u16, u32)> {
+    let key = library
+        .catalog_entry(index)
+        .map(|entry| proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size))?;
+    sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::read_position_file(root, key.as_str())
+    })
+    .ok()
+    .flatten()
 }
 
 #[inline(never)]

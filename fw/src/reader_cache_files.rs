@@ -69,6 +69,87 @@ where
     Ok(())
 }
 
+const POSITION_FILE: &str = "POS.BIN";
+const POSITION_MAGIC: &[u8; 4] = b"X4PS";
+const POSITION_VERSION: u8 = 1;
+const POSITION_BYTES: usize = 15;
+
+fn encode_position(chapter: u16, screen: u32) -> [u8; POSITION_BYTES] {
+    let mut out = [0u8; POSITION_BYTES];
+    out[..4].copy_from_slice(POSITION_MAGIC);
+    out[4] = POSITION_VERSION;
+    out[5..7].copy_from_slice(&chapter.to_le_bytes());
+    out[7..11].copy_from_slice(&screen.to_le_bytes());
+    let sum: u32 = out[..11].iter().map(|byte| *byte as u32).sum();
+    out[11..15].copy_from_slice(&sum.to_le_bytes());
+    out
+}
+
+fn decode_position(bytes: &[u8]) -> Option<(u16, u32)> {
+    if bytes.len() < POSITION_BYTES || &bytes[..4] != POSITION_MAGIC || bytes[4] != POSITION_VERSION
+    {
+        return None;
+    }
+    let sum: u32 = bytes[..11].iter().map(|byte| *byte as u32).sum();
+    if bytes[11..15] != sum.to_le_bytes() {
+        return None;
+    }
+    let chapter = u16::from_le_bytes([bytes[5], bytes[6]]);
+    let screen = u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]);
+    Some((chapter, screen))
+}
+
+/// Per-book reading position beside the book's cache records, so
+/// switching books no longer abandons the previous one's place.
+pub(crate) fn write_position_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    chapter: u16,
+    screen: u32,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    let cache = open_or_make_dir(&xteink, CACHE_V2_DIR)?;
+    let book = open_or_make_dir(&cache, key)?;
+    let file = book
+        .open_file_in_dir(POSITION_FILE, Mode::ReadWriteCreateOrTruncate)
+        .map_err(|_| ())?;
+    file.write(&encode_position(chapter, screen))
+        .map_err(|_| ())
+}
+
+pub(crate) fn read_position_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> Option<(u16, u32)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let book = cache.open_dir(key).ok()?;
+    let file = book.open_file_in_dir(POSITION_FILE, Mode::ReadOnly).ok()?;
+    let mut bytes = [0u8; POSITION_BYTES];
+    let len = file.read(&mut bytes).ok()?;
+    decode_position(&bytes[..len])
+}
+
 pub(crate) fn write_state_file<
     D,
     T,
