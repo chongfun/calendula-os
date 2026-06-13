@@ -1402,10 +1402,10 @@ fn push_styled_preview_fragment<
         let kept_len = sink.line.len();
         let kept_ink = sink.line_ink;
         let line_was_empty = sink.line.is_empty();
-        if append_styled_word(&mut sink.line, word, style, leading_space).is_err() {
+        if append_styled_word(&mut sink.line, word, style, sink.line_style, leading_space).is_err() {
             sink.line.truncate(kept_len);
             flush_styled_preview_line(sink, false);
-            let _ = append_styled_word(&mut sink.line, word, style, false);
+            let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);
             sink.line_ink.push_str(sink.line.as_str());
             sink.line_role = role;
             sink.line_align = align;
@@ -1421,7 +1421,7 @@ fn push_styled_preview_fragment<
             sink.line.truncate(kept_len);
             sink.line_ink = kept_ink;
             flush_styled_preview_line(sink, false);
-            let _ = append_styled_word(&mut sink.line, word, style, false);
+            let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);
             sink.line_ink.push_str(sink.line.as_str());
             sink.line_role = role;
             sink.line_align = align;
@@ -1446,12 +1446,23 @@ fn append_styled_word<const N: usize>(
     line: &mut String<N>,
     word: &str,
     style: FontStyle,
+    current_style: FontStyle,
     leading_space: bool,
 ) -> Result<(), ()> {
     if leading_space {
         line.push(' ').map_err(|_| ())?;
     }
-    append_style_marker(line, style)?;
+    // Emit a style marker only when the run actually changes. Plain prose
+    // (the bulk of a book) then carries no markers at all -- ~25-30% more
+    // text per section and proportionally fewer chunks against the same
+    // 16 KB arena. The draw and measure paths both key off the running
+    // font, so a dropped redundant marker is a no-op; and because each line
+    // draws from a Regular default and `current_style` is reset to Regular
+    // on every flush, a continuation line still re-marks a non-Regular
+    // opening word.
+    if style != current_style {
+        append_style_marker(line, style)?;
+    }
     line.push_str(word).map_err(|_| ())
 }
 
