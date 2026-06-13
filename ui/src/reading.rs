@@ -253,9 +253,12 @@ pub const READER_PAGE_BOTTOM: i16 = 457;
 pub const READER_LEFT_X: i16 = 8;
 pub const READER_RIGHT_X: i16 = 792;
 pub const READER_WRAP_SAFETY: i16 = 4;
-/// Version of the wrap rules and page constants in this module. Bump when
-/// layout changes for unchanged type settings.
-const READER_LAYOUT_VERSION: u16 = 7;
+/// Version of the wrap rules and page constants in this module, and of the
+/// cached section content keyed off it. Bump when layout changes for
+/// unchanged type settings, or when the cache encoding changes so stale
+/// sections rebuild. v8: chapters no longer truncate at the text budget and
+/// style markers are stored only on run change.
+const READER_LAYOUT_VERSION: u16 = 8;
 
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a

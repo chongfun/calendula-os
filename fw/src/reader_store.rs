@@ -9,7 +9,13 @@ use proto::text::{TextAlign, TextRole};
 
 pub(crate) const MAX_LIBRARY_BOOKS: usize = 16;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
-pub(crate) const MAX_BOOK_SECTIONS: usize = 160;
+// ~14 pages per 16 KB section at the default size, so 320 covers ~4,500
+// pages -- enough for very long books (e.g. HPMOR) to cache whole rather
+// than tripping book_partial partway. The two persistent arrays this sizes
+// (here and EPUB_BOOK_SECTIONS) live in static cells, not the stack; the
+// one stack-resident copy is on the shallow book-index load path, clear of
+// the deep EPUB-build watermark.
+pub(crate) const MAX_BOOK_SECTIONS: usize = 320;
 const MAX_PUBLISHED_CHAPTER_EVENTS: usize = MAX_SD_CHAPTERS;
 // Titles only (hrefs/anchors are no longer stored), so 4 KB covers the full
 // 128-item TOC at ~32 bytes per title and the saved RAM widens the stack
