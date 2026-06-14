@@ -732,10 +732,6 @@ impl ReaderStore {
         self.text_holds_toc = true;
     }
 
-    pub(crate) fn clear_toc_in_text(&mut self) {
-        self.text_holds_toc = false;
-    }
-
     pub(crate) fn text_holds_toc(&self) -> bool {
         self.text_holds_toc
     }
