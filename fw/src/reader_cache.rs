@@ -415,6 +415,26 @@ pub(crate) fn load_position(
     .flatten()
 }
 
+/// Load the book's full chapter list from TOC.BIN into the reader's section
+/// buffer for the Chapters overview. The reading section reloads on exit.
+#[inline(never)]
+pub(crate) fn load_chapters_into_store(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: usize,
+) -> bool {
+    let Some(entry) = library.catalog_entry(index) else {
+        return false;
+    };
+    let source_identity = (entry.source_hash, entry.byte_size);
+    let key = proto::cache::cache_key_for(entry.display_name.as_str(), source_identity.1);
+    sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::load_v2_toc_into_text(root, key.as_str(), source_identity, library)
+    })
+    .unwrap_or(false)
+}
+
 #[inline(never)]
 pub(crate) fn store_wifi_credentials(
     epd: &mut Epd,

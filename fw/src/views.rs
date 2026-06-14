@@ -13,7 +13,9 @@ use ui::{
 };
 
 const SHOW_INPUT_DEBUG: bool = false;
-const MAX_UI_CHAPTERS: usize = app_core::MAX_SD_CHAPTERS;
+// Decoupled from the 128-entry event/resident caps: the overview reads the
+// full chapter list from the card, so the render window must hold it.
+const MAX_UI_CHAPTERS: usize = 256;
 
 pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
@@ -98,6 +100,19 @@ fn fill_chapters<'a>(
     request: RenderRequest,
     sd_library: &'a ReaderStore,
 ) -> usize {
+    // The full chapter list, read from the card into the section buffer
+    // while the overview is open.
+    if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.text_holds_toc() {
+        let count = sd_library.overview_chapter_count().min(chapters.len());
+        for (index, item) in chapters.iter_mut().take(count).enumerate() {
+            *item = UiTocItem {
+                title: sd_library.overview_title_at(index),
+                level: sd_library.overview_level_at(index),
+                page: u32::from(sd_library.overview_page_at(index)),
+            };
+        }
+        return count;
+    }
     if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.toc_count() > 0 {
         let count = sd_library.toc_count().min(chapters.len());
         for (index, item) in chapters.iter_mut().take(count).enumerate() {

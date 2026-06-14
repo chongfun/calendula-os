@@ -404,6 +404,62 @@ fn handle_storage_command(
                 sd_library.chapter_count_for_ui()
             );
         }
+        StorageCommand::LoadChapters {
+            request_id,
+            book_id,
+            index,
+        } => {
+            if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
+                return;
+            }
+            let ok = reader_cache::load_chapters_into_store(epd, sd_cs, sd_library, index as usize);
+            esp_println::println!(
+                "storage: chapters loaded book_id={} ok={} count={}",
+                book_id,
+                ok,
+                sd_library.overview_chapter_count()
+            );
+            // Re-render the overview with the full list resident, syncing the
+            // selection range to the full chapter count.
+            send_loaded_library_event(&LibraryEvent::Loaded {
+                book_id,
+                pages: sd_library.advertised_page_count(),
+                chapters: sd_library.chapter_count_for_ui(),
+                chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+            });
+        }
+        StorageCommand::JumpChapter {
+            request_id,
+            book_id,
+            index,
+            chapter,
+            type_settings,
+        } => {
+            if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
+                return;
+            }
+            sd_library.set_type_settings(type_settings);
+            // The TOC is still in the buffer; resolve the chapter's start page
+            // before loading the section overwrites it.
+            let target_page = sd_library.overview_page_at(chapter as usize);
+            let scratch = ensure_epub_scratch(epub_scratch);
+            reader_cache::build_or_load_book_cache(
+                epd,
+                sd_cs,
+                sd_library,
+                index as usize,
+                chapter,
+                target_page as usize,
+                scratch,
+            );
+            send_loaded_library_event(&LibraryEvent::Loaded {
+                book_id,
+                pages: sd_library.advertised_page_count(),
+                chapters: sd_library.chapter_count_for_ui(),
+                chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+            });
+            send_resumed_position(book_id, chapter, target_page, last_request);
+        }
         StorageCommand::ReceiveUpload => {
             // Handled in the task loop before dispatch; reaching here means
             // the loop refused it already.

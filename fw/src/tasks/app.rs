@@ -277,7 +277,10 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
 fn should_send_storage_immediately(command: StorageCommand) -> bool {
     matches!(
         command,
-        StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }
+        StorageCommand::OpenBook { .. }
+            | StorageCommand::ExtendSection { .. }
+            | StorageCommand::LoadChapters { .. }
+            | StorageCommand::JumpChapter { .. }
     )
 }
 
@@ -358,6 +361,22 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         StorageCommand::ReceiveUpload => {
             esp_println::println!("app: storage {label} receive upload")
         }
+        StorageCommand::LoadChapters {
+            request_id,
+            book_id,
+            index,
+        } => esp_println::println!(
+            "app: storage {label} load chapters request={request_id} book_id={book_id} index={index}"
+        ),
+        StorageCommand::JumpChapter {
+            request_id,
+            book_id,
+            index,
+            chapter,
+            ..
+        } => esp_println::println!(
+            "app: storage {label} jump chapter request={request_id} book_id={book_id} index={index} chapter={chapter}"
+        ),
     }
 }
 
@@ -393,6 +412,11 @@ fn storage_command_for_transition(
     next: &ReaderState,
 ) -> Option<StorageCommand> {
     let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
+    // Entering the overview loads the full chapter list into the section
+    // buffer; the reading section reloads on exit.
+    if next.view == AppView::Chapters && previous.view != AppView::Chapters {
+        return Some(load_chapters_command(next, index));
+    }
     if next.view != AppView::Reading {
         return None;
     }
@@ -403,12 +427,13 @@ fn storage_command_for_transition(
 
     if previous.view != AppView::Reading {
         if previous.view == AppView::Chapters {
-            // Chapters is only reachable from Reading, so the book is
-            // loaded; backing out unchanged needs no request.
-            return if previous.page != next.page || previous.chapter != next.chapter {
-                Some(extend_section_command(next, index))
+            // The buffer held the TOC, so the section always reloads. A new
+            // chapter selection resolves its page from the on-disk TOC; a
+            // plain back-out just reloads the page we left.
+            return if next.chapter != previous.chapter {
+                Some(jump_chapter_command(next, index))
             } else {
-                None
+                Some(extend_section_command(next, index))
             };
         }
         // An unchanged book id no longer proves the store holds its
@@ -446,6 +471,24 @@ fn extend_section_command(state: &ReaderState, index: u8) -> StorageCommand {
         index,
         chapter: state.chapter,
         target_pages: state.page.min(u16::MAX as u32) as u16,
+        type_settings: state.type_settings(),
+    }
+}
+
+fn load_chapters_command(state: &ReaderState, index: u8) -> StorageCommand {
+    StorageCommand::LoadChapters {
+        request_id: next_reader_request_id(),
+        book_id: state.book_id,
+        index,
+    }
+}
+
+fn jump_chapter_command(state: &ReaderState, index: u8) -> StorageCommand {
+    StorageCommand::JumpChapter {
+        request_id: next_reader_request_id(),
+        book_id: state.book_id,
+        index,
+        chapter: state.chapter,
         type_settings: state.type_settings(),
     }
 }

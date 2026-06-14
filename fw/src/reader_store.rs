@@ -529,6 +529,9 @@ impl ReaderStore {
         self.text_len = text_len;
         self.cached_spine = spine;
         self.section_partial = partial;
+        // A real section now occupies the text buffer, replacing any TOC the
+        // overview had loaded there.
+        self.text_holds_toc = false;
         self.current_section_page_count = page_count.min(u16::MAX as usize) as u16;
     }
 
@@ -570,6 +573,7 @@ impl ReaderStore {
     pub(crate) fn covers_global_page(&self, index: usize, global_page: u32) -> bool {
         self.loaded_index == Some(index)
             && matches!(self.reader_status, BookLoadStatus::Ready)
+            && !self.text_holds_toc
             && !self.section_partial
             && self.page_count > 0
             && global_page >= self.current_section_start_page
@@ -862,17 +866,17 @@ impl ReaderStore {
     }
 
     pub(crate) fn chapter_count_for_ui(&self) -> u8 {
-        if self.toc_count > 0 {
+        // The full on-disk count (when known) drives the overview's
+        // selection range; it can run past the 128-entry resident/event
+        // caps, so only the u8 message width bounds it.
+        let count = if self.toc_total > 0 {
+            self.toc_total
+        } else if self.toc_count > 0 {
             self.toc_count
-                .min(MAX_PUBLISHED_CHAPTER_EVENTS)
-                .min(u8::MAX as usize)
-                .max(1) as u8
         } else {
             self.book_section_count
-                .min(MAX_PUBLISHED_CHAPTER_EVENTS)
-                .min(u8::MAX as usize)
-                .max(1) as u8
-        }
+        };
+        count.min(u8::MAX as usize).max(1) as u8
     }
 
     pub(crate) fn push(

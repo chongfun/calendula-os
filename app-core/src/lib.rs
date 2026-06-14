@@ -278,6 +278,23 @@ pub enum StorageCommand {
         target_pages: u16,
         type_settings: TypeSettings,
     },
+    /// Load the full chapter list (TOC.BIN) into the reader's section buffer
+    /// for the Chapters overview. The reading section reloads on exit.
+    LoadChapters {
+        request_id: u32,
+        book_id: u32,
+        index: u8,
+    },
+    /// Jump to a chapter from the overview. The display task resolves the
+    /// chapter's start page from the on-disk TOC (the reducer's chapter-page
+    /// map is capped at 128) and loads that section.
+    JumpChapter {
+        request_id: u32,
+        book_id: u32,
+        index: u8,
+        chapter: u8,
+        type_settings: TypeSettings,
+    },
     StoreProgress(PersistedAppState),
     /// Hand the EPUB scratch to the wifi task as sync-session heap. One
     /// way: after this the display task refuses scratch-using commands
