@@ -3,7 +3,7 @@ use display::font::{FontStyle, TypeSettings};
 use heapless::String;
 use proto::cache::{
     BlockRecord, BookV2SectionRecord, PageRecord, TocRecord, CACHE_KEY_BYTES, COVER_BYTES,
-    COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH,
+    COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH, TOC_CHAPTER_RECORD_BYTES, TOC_CHAPTER_TITLE_BYTES,
 };
 use proto::text::{TextAlign, TextRole};
 
@@ -138,6 +138,12 @@ pub(crate) struct ReaderStore {
     pub(crate) toc: [TocRecord; MAX_SD_TOC_ITEMS],
     pub(crate) toc_page: [u16; MAX_SD_TOC_ITEMS],
     pub(crate) toc_count: usize,
+    /// Full chapter count from TOC.BIN (the on-disk list), which can exceed
+    /// the resident `toc_count`. The Chapters overview reads the full list.
+    pub(crate) toc_total: usize,
+    /// While the Chapters view is open, `text` holds the on-disk TOC records
+    /// instead of section content; the reading section is reloaded on exit.
+    pub(crate) text_holds_toc: bool,
     pub(crate) text: [u8; MAX_READER_TEXT_BYTES],
     pub(crate) text_len: usize,
     pub(crate) blocks: [BlockRecord; MAX_READER_BLOCKS],
@@ -184,6 +190,8 @@ impl ReaderStore {
             toc: [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS],
             toc_page: [0; MAX_SD_TOC_ITEMS],
             toc_count: 0,
+            toc_total: 0,
+            text_holds_toc: false,
             text: [0; MAX_READER_TEXT_BYTES],
             text_len: 0,
             blocks: [EMPTY_BLOCK_RECORD; MAX_READER_BLOCKS],
@@ -710,6 +718,81 @@ impl ReaderStore {
         self.toc_page[self.toc_count] = 0;
         self.toc_count += 1;
         true
+    }
+
+    /// Mark `text` as holding the on-disk TOC records (full chapter list),
+    /// loaded for the Chapters overview. The reading section is reloaded on
+    /// exit because its content was overwritten.
+    pub(crate) fn set_toc_in_text(&mut self, total: usize) {
+        self.toc_total = total;
+        self.text_holds_toc = true;
+    }
+
+    pub(crate) fn clear_toc_in_text(&mut self) {
+        self.text_holds_toc = false;
+    }
+
+    pub(crate) fn text_holds_toc(&self) -> bool {
+        self.text_holds_toc
+    }
+
+    /// Chapters to show in the overview: the full on-disk count when the TOC
+    /// is loaded, else the resident count.
+    pub(crate) fn overview_chapter_count(&self) -> usize {
+        if self.text_holds_toc {
+            self.toc_total
+        } else {
+            self.toc_count
+        }
+    }
+
+    /// Title of overview chapter `index`, read straight from the TOC records
+    /// in `text` (borrowed, no copy).
+    pub(crate) fn overview_title_at(&self, index: usize) -> &str {
+        if !self.text_holds_toc {
+            return "";
+        }
+        let base = index * TOC_CHAPTER_RECORD_BYTES;
+        if base + TOC_CHAPTER_RECORD_BYTES > self.text.len() {
+            return "";
+        }
+        let title_len = (self.text[base + 3] as usize).min(TOC_CHAPTER_TITLE_BYTES);
+        core::str::from_utf8(&self.text[base + 4..base + 4 + title_len]).unwrap_or("")
+    }
+
+    pub(crate) fn overview_level_at(&self, index: usize) -> u8 {
+        let base = index * TOC_CHAPTER_RECORD_BYTES;
+        if !self.text_holds_toc || base + 3 >= self.text.len() {
+            return 1;
+        }
+        self.text[base + 2]
+    }
+
+    pub(crate) fn overview_spine_at(&self, index: usize) -> i16 {
+        let base = index * TOC_CHAPTER_RECORD_BYTES;
+        if !self.text_holds_toc || base + 2 > self.text.len() {
+            return -1;
+        }
+        i16::from_le_bytes([self.text[base], self.text[base + 1]])
+    }
+
+    /// Global page a chapter starts on, computed from the section index by
+    /// its spine -- so no resident chapter-page array is needed.
+    pub(crate) fn page_for_spine(&self, spine: u16) -> u32 {
+        self.book_sections
+            .iter()
+            .take(self.book_section_count)
+            .find(|section| section.spine == spine)
+            .map(|section| section.start_page)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn overview_page_at(&self, index: usize) -> u16 {
+        let spine = self.overview_spine_at(index);
+        if spine < 0 {
+            return 0;
+        }
+        self.page_for_spine(spine as u16).min(u16::MAX as u32) as u16
     }
 
     fn append_toc_text(&mut self, value: &str) -> bool {

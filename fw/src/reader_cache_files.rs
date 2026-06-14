@@ -10,12 +10,12 @@ use proto::cache::{
     decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
     decode_section_header, decode_section_v2_header, decode_toc, encode_block,
     encode_book_v2_header, encode_book_v2_section, encode_page, encode_section_v2_header,
-    encode_toc, encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord,
-    SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
+    decode_toc_file_header, encode_toc, encode_toc_file_header, section_file_name, BookV2Header,
+    BookV2SectionRecord, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
     BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_DIR, CACHE_ROOT_DIR,
     CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR,
     COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_HEADER_BYTES, SECTION_V2_HEADER_BYTES,
-    TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
+    TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 
 const MIGRATE_MAX_SECTIONS: u16 = 16;
@@ -893,6 +893,49 @@ where
     let book_dir = cache.open_dir(key).ok()?;
     let file = book_dir.open_file_in_dir(CACHE_TOC_FILE, mode).ok()?;
     Some(f(&file))
+}
+
+/// Load the on-disk chapter list (TOC.BIN) into the store's text buffer for
+/// the Chapters overview. Reuses the section text buffer -- the reading
+/// section is reloaded on exit -- so no resident RAM is spent on the list.
+pub(crate) fn load_v2_toc_into_text<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_toc_file(root, key, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return false;
+        }
+        let Ok(header) = decode_toc_file_header(&header_bytes) else {
+            return false;
+        };
+        if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
+            return false;
+        }
+        let bytes = (header.chapter_count as usize).saturating_mul(TOC_CHAPTER_RECORD_BYTES);
+        let Some(buf) = library.cached_text_mut(bytes) else {
+            return false;
+        };
+        if read_exact_file(file, buf).is_err() {
+            return false;
+        }
+        library.set_toc_in_text(header.chapter_count as usize);
+        true
+    })
+    .unwrap_or(false)
 }
 
 /// Write the full chapter list to TOC.BIN: a header plus `chapter_count`
