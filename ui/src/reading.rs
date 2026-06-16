@@ -262,8 +262,10 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// section) so chunk seams no longer leave a short, half-empty page. v10:
 /// the full chapter list is written to its own TOC.BIN at build time and
 /// read on demand for the overview, so a long book's TOC is no longer capped
-/// at 128; existing caches rebuild to produce that file.
-const READER_LAYOUT_VERSION: u16 = 10;
+/// at 128; existing caches rebuild to produce that file. v11: the TOC.BIN
+/// chapter-title budget grew 44->60 bytes (record 48->64), so the colophon
+/// shows longer chapter names; existing caches rebuild to widen their records.
+const READER_LAYOUT_VERSION: u16 = 11;
 
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a

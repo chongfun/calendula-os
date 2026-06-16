@@ -15,7 +15,7 @@ pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
 pub(crate) const MAX_OVERVIEW_CHAPTERS: usize = 256;
 /// Longest current-chapter title kept resident for the Home/sleep colophon;
 /// read on demand from TOC.BIN as the chapter changes.
-const MAX_CURRENT_CHAPTER_TITLE: usize = 48;
+const MAX_CURRENT_CHAPTER_TITLE: usize = 60;
 // ~14 pages per 16 KB section at the default size, so 320 covers ~4,500
 // pages -- enough for very long books (e.g. HPMOR) to cache whole rather
 // than tripping book_partial partway. The two persistent arrays this sizes
