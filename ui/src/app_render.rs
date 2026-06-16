@@ -105,8 +105,16 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
     };
     crate::render::progress_rule(fb, 280, 302, 240, permille);
 
-    let colophon_w =
-        crate::render::chapter_colophon_width(model.chapters, request.chapter, model.chapter_title, 600);
+    // The sleep colophon is centered on the full 800px panel, so it can run
+    // wider than Home's left-column colophon before a long chapter name needs
+    // truncating.
+    const SLEEP_COLOPHON_MAX_W: i16 = 720;
+    let colophon_w = crate::render::chapter_colophon_width(
+        model.chapters,
+        request.chapter,
+        model.chapter_title,
+        SLEEP_COLOPHON_MAX_W,
+    );
     crate::render::draw_chapter_colophon(
         fb,
         model.chapters,
@@ -114,7 +122,7 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
         model.chapter_title,
         400 - colophon_w / 2,
         340,
-        600,
+        SLEEP_COLOPHON_MAX_W,
     );
 
     draw_font_centered_fit(

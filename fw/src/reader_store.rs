@@ -168,6 +168,11 @@ pub(crate) struct ReaderStore {
     /// Home/sleep colophon and the overview's starting selection.
     pub(crate) current_chapter: u16,
     pub(crate) current_chapter_title: String<MAX_CURRENT_CHAPTER_TITLE>,
+    /// Source identity (hash, size) of the book `current_chapter_title` belongs
+    /// to, so a colophon shows it only for that book -- the resolved title
+    /// outlives a single load (it is also set on boot restore, before the book
+    /// is opened, so wake-to-Home names the chapter without a full open).
+    pub(crate) current_chapter_source: (u32, u32),
     pub(crate) text: [u8; MAX_READER_TEXT_BYTES],
     pub(crate) text_len: usize,
     pub(crate) blocks: [BlockRecord; MAX_READER_BLOCKS],
@@ -221,6 +226,7 @@ impl ReaderStore {
             chapter_page_token: (0, 0, 0),
             current_chapter: 0,
             current_chapter_title: String::new(),
+            current_chapter_source: (0, 0),
             text: [0; MAX_READER_TEXT_BYTES],
             text_len: 0,
             blocks: [EMPTY_BLOCK_RECORD; MAX_READER_BLOCKS],
@@ -839,8 +845,9 @@ impl ReaderStore {
         selected
     }
 
-    pub(crate) fn set_current_chapter(&mut self, chapter: u16, title: &str) {
+    pub(crate) fn set_current_chapter(&mut self, chapter: u16, title: &str, source: (u32, u32)) {
         self.current_chapter = chapter;
+        self.current_chapter_source = source;
         self.current_chapter_title.clear();
         for ch in title.chars() {
             if self.current_chapter_title.push(ch).is_err() {
@@ -855,6 +862,11 @@ impl ReaderStore {
 
     pub(crate) fn current_chapter_title(&self) -> &str {
         self.current_chapter_title.as_str()
+    }
+
+    /// Source identity of the book `current_chapter_title` was resolved for.
+    pub(crate) fn current_chapter_source(&self) -> (u32, u32) {
+        self.current_chapter_source
     }
 
     fn append_toc_text(&mut self, value: &str) -> bool {

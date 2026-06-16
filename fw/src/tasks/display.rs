@@ -720,7 +720,7 @@ fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
 fn restore_saved_state(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
-    library: &ReaderStore,
+    library: &mut ReaderStore,
     state_restored: &mut bool,
 ) {
     if *state_restored || library.catalog_is_empty() {
@@ -746,6 +746,10 @@ fn restore_saved_state(
         record.chapter,
         record.screen
     );
+    // Resolve the chapter title now so wake-to-Home (rendered before the book
+    // is opened) names the chapter; without this the colophon shows a numeral
+    // until the book is first opened this session.
+    reader_cache::restore_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
         chapter: record.chapter.min(u8::MAX as u16) as u8,

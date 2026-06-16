@@ -468,6 +468,42 @@ pub(crate) fn load_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>) -> Opti
         .flatten()
 }
 
+/// Read just the saved chapter's title from the book's TOC.BIN at boot restore,
+/// so wake-to-Home (which renders before the book is opened) can name the
+/// chapter instead of falling back to a bare numeral. Tags the resolved title
+/// with the book's source identity; a colophon shows it only for that book.
+#[inline(never)]
+pub(crate) fn restore_chapter_title(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    index: usize,
+    chapter: u16,
+    library: &mut ReaderStore,
+) {
+    let Some(entry) = library.catalog_entry(index) else {
+        return;
+    };
+    let source_identity = (entry.source_hash, entry.byte_size);
+    let mut display_name = String::<64>::new();
+    let _ = display_name.push_str(&entry.display_name);
+    let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
+    let found = sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::read_v2_toc_chapter_title(
+            root,
+            cache_key.as_str(),
+            source_identity,
+            chapter,
+            library,
+        )
+    })
+    .unwrap_or(false);
+    if !found {
+        // Tag the source even on a miss so a stale title from another book is
+        // never shown; the colophon falls back to a numeral for this chapter.
+        library.set_current_chapter(chapter, "", source_identity);
+    }
+}
+
 #[inline(never)]
 fn try_load_v2_book_cache<
     D,
@@ -577,7 +613,7 @@ fn refresh_chapter_tracking<
     {
         // No title on the card (or a short read): still advance the index so
         // the cursor tracks; the colophon falls back to a numeral.
-        library.set_current_chapter(current, "");
+        library.set_current_chapter(current, "", source_identity);
     }
 }
 

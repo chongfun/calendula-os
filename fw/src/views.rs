@@ -75,9 +75,12 @@ fn ui_model<'a>(
     let (title, author) =
         sd_library.active_book_labels(request.book_id, fallback_book.title, fallback_book.author);
 
-    // The firmware-resolved current-chapter title, but only for the book that
-    // is actually loaded -- so a colophon never names another book's chapter.
-    let chapter_title = if sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
+    // The firmware-resolved current-chapter title, shown only for the book it
+    // was resolved for -- so a colophon never names another book's chapter.
+    // Keyed on source identity (not the loaded book) so it survives boot
+    // restore, where the title is read before the book is opened.
+    let chapter_title = if !sd_library.current_chapter_title().is_empty()
+        && sd_library.current_chapter_source() == sd_library.source_identity(request.book_id)
     {
         sd_library.current_chapter_title()
     } else {

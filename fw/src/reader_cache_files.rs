@@ -1045,7 +1045,7 @@ where
         let Ok(parsed) = decode_toc_chapter(&record) else {
             return false;
         };
-        library.set_current_chapter(chapter, parsed.title_str());
+        library.set_current_chapter(chapter, parsed.title_str(), source_identity);
         true
     })
     .unwrap_or(false)
