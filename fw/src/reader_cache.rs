@@ -530,6 +530,29 @@ pub(crate) fn load_chapter_title(
     }
 }
 
+/// Read the book's total page count from its V2 index header at boot restore so
+/// the Home progress bar has a denominator before the book is opened. Returns 0
+/// if unavailable (caller leaves the bar on its fallback).
+#[inline(never)]
+pub(crate) fn restore_book_page_count(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    index: usize,
+    library: &ReaderStore,
+) -> u32 {
+    let Some(entry) = library.catalog_entry(index) else {
+        return 0;
+    };
+    let source_identity = (entry.source_hash, entry.byte_size);
+    let mut display_name = String::<64>::new();
+    let _ = display_name.push_str(&entry.display_name);
+    let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
+    sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::read_v2_book_total_pages(root, cache_key.as_str(), source_identity)
+    })
+    .unwrap_or(0)
+}
+
 #[inline(never)]
 fn try_load_v2_book_cache<
     D,

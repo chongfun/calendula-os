@@ -604,6 +604,8 @@ fn send_resumed_position(
         book_id,
         chapter,
         page: target_pages as u32,
+        // The book is loaded here, so carry its known total page count.
+        page_count: request.page_count,
         reading_orientation: request.orientation as u8,
         refresh_policy: request.refresh_policy as u8,
         font_size: request.font_size as u8,
@@ -767,10 +769,14 @@ fn restore_saved_state(
     // is opened) names the chapter; without this the colophon shows a numeral
     // until the book is first opened this session.
     reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
+    // The book's total page count, so the Home progress bar has a denominator
+    // on wake before the book is opened (read from the cache index header).
+    let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
         chapter: record.chapter.min(u8::MAX as u16) as u8,
         page: record.screen,
+        page_count,
         reading_orientation: record.reading_orientation,
         refresh_policy: record.refresh_policy,
         font_size: record.font_size,

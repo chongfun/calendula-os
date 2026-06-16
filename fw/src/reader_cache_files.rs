@@ -279,6 +279,41 @@ where
     .unwrap_or(CoverLoadResult::Miss)
 }
 
+/// Read just the book's total page count from the V2 index header (48 bytes),
+/// without loading any section records. Used at boot restore so the Home
+/// progress bar has a denominator before the book is opened. Returns 0 if the
+/// index is missing, stale, or for another book.
+pub(crate) fn read_v2_book_total_pages<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+) -> u32
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return 0;
+        }
+        let Ok(header) = decode_book_v2_header(&header_bytes) else {
+            return 0;
+        };
+        if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
+            return 0;
+        }
+        header.total_pages
+    })
+    .unwrap_or(0)
+}
+
 pub(crate) fn load_v2_book_index<
     D,
     T,

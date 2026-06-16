@@ -389,6 +389,10 @@ pub enum LibraryEvent {
         book_id: u32,
         chapter: u8,
         page: u32,
+        /// The book's total page count, read from the cache index header at
+        /// restore so the Home progress bar has a denominator before the book
+        /// is opened. 0 when unavailable (the bar keeps its fallback).
+        page_count: u32,
         reading_orientation: u8,
         refresh_policy: u8,
         font_size: u8,
@@ -792,6 +796,7 @@ impl ReaderState {
                 book_id,
                 chapter,
                 page,
+                page_count,
                 reading_orientation,
                 refresh_policy,
                 font_size,
@@ -800,6 +805,11 @@ impl ReaderState {
                 self.book_id = book_id;
                 self.chapter = chapter;
                 self.page = page;
+                // Give the Home progress bar a real denominator on wake, before
+                // the book opens; the Loaded event refreshes it once read.
+                if page_count > 0 {
+                    self.sd_page_count = page_count;
+                }
                 if self.read_request_pending {
                     self.view = AppView::Reading;
                     self.selection = chapter;
@@ -1319,6 +1329,7 @@ mod tests {
                 book_id: ReaderSource::sd(2).book_id(),
                 chapter: 4,
                 page: 12,
+                page_count: 0,
                 reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
                 refresh_policy: RefreshPolicy::FullOnWake as u8,
                 font_size: FontSize::Medium as u8,
@@ -1350,6 +1361,7 @@ mod tests {
                 book_id: ReaderSource::sd(1).book_id(),
                 chapter: 9,
                 page: 70,
+                page_count: 0,
                 reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
                 refresh_policy: RefreshPolicy::FullOnWake as u8,
                 font_size: FontSize::Medium as u8,
@@ -1411,6 +1423,7 @@ mod tests {
                 book_id: 2,
                 chapter: 4,
                 page: 12,
+                page_count: 0,
                 reading_orientation: DisplayOrientation::PortraitButtonsRight as u8,
                 refresh_policy: RefreshPolicy::FastOnly as u8,
                 font_size: FontSize::Large as u8,
