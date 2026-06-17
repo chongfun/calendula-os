@@ -832,17 +832,28 @@ impl ReaderStore {
 
     /// The chapter a page falls in, over the full chapter-page map -- so it
     /// keeps advancing past the 128-entry resident/event caps.
+    ///
+    /// `chapter_page` is not strictly increasing: several TOC chapters can
+    /// share one spine (so they share a start page), and an entry with no
+    /// resolvable spine is 0. So we cannot stop at the first entry past the
+    /// page. Instead take the greatest start page not beyond `page`, then name
+    /// the FIRST chapter at that page -- the chapter that opens the spine the
+    /// reader is in, rather than the last one swept up by a plateau of zeros.
     pub(crate) fn current_chapter_for_page(&self, page: u32) -> u16 {
         let count = self.chapter_page_count.min(MAX_OVERVIEW_CHAPTERS);
-        let mut selected = 0u16;
+        let mut best_page = 0u32;
         for index in 0..count {
-            if u32::from(self.chapter_page[index]) <= page {
-                selected = index as u16;
-            } else {
-                break;
+            let start = u32::from(self.chapter_page[index]);
+            if start <= page && start >= best_page {
+                best_page = start;
             }
         }
-        selected
+        for index in 0..count {
+            if u32::from(self.chapter_page[index]) == best_page {
+                return index as u16;
+            }
+        }
+        0
     }
 
     pub(crate) fn set_current_chapter(&mut self, chapter: u16, title: &str, source: (u32, u32)) {
