@@ -500,9 +500,21 @@ fn handle_storage_command(
         }
         StorageCommand::StoreProgress(record) => {
             let (source_hash, source_size) = source_identity(sd_library, record.book_id);
+            // The reducer derives chapter from the 128-capped sd_chapter_for_page,
+            // so a deep position would save a stuck chapter that the sleep/boot
+            // colophon then shows wrong until the book reopens. The firmware
+            // tracks the true chapter over the whole book; adopt it for the
+            // loaded SD book so saved/restored state names the chapter right.
+            let chapter = if ReaderSource::from_book_id(record.book_id).is_sd()
+                && sd_library.loaded_index == ReaderStore::selected_book_index(record.book_id)
+            {
+                sd_library.current_chapter()
+            } else {
+                record.chapter
+            };
             let record = AppStateRecord {
                 book_id: record.book_id,
-                chapter: record.chapter,
+                chapter,
                 screen: record.screen,
                 shell_orientation: record.shell_orientation,
                 reading_orientation: record.reading_orientation,
