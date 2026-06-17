@@ -297,6 +297,17 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         return;
     }
 
+    // The full chapter list streams off the card (~a second); until it lands
+    // the resident list can be shorter than the reading position. A cursor
+    // past its end must not snap back to the last resident row -- that paints
+    // a wrong chapter that "jumps" forward on the first key. Hold a note until
+    // the real list arrives and the selection is in range.
+    if shell.selection as usize >= shell.chapters.len() {
+        centered_note(fb, "loading contents\u{2026}");
+        finish_working_screen(fb, shell);
+        return;
+    }
+
     let selected = (shell.selection as usize).min(shell.chapters.len().saturating_sub(1));
     let start = if selected >= TOC_VISIBLE_ROWS {
         selected + 1 - TOC_VISIBLE_ROWS
