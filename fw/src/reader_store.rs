@@ -333,6 +333,7 @@ impl ReaderStore {
         in_books_dir: bool,
         byte_size: u32,
         source_hash: u32,
+        label_override: Option<&str>,
     ) {
         if self.window_len >= self.window.len() {
             return;
@@ -345,6 +346,7 @@ impl ReaderStore {
             in_books_dir,
             byte_size,
             source_hash,
+            label_override,
         );
         self.window_len += 1;
     }
@@ -359,6 +361,7 @@ impl ReaderStore {
         in_books_dir: bool,
         byte_size: u32,
         source_hash: u32,
+        label_override: Option<&str>,
     ) {
         fill_entry(
             &mut self.active_entry,
@@ -367,8 +370,28 @@ impl ReaderStore {
             in_books_dir,
             byte_size,
             source_hash,
+            label_override,
         );
         self.active_index = Some(index);
+    }
+
+    /// Copy the loaded book's title into the resident catalog entries for
+    /// `index` -- the list window entry when it is on screen, and the active
+    /// entry when it is the active book -- so the list shows the real title
+    /// right after an open and keeps showing it when the cursor moves on.
+    fn note_loaded_title(&mut self, index: usize) {
+        if self.title.is_empty() {
+            return;
+        }
+        if self.active_index == Some(index) {
+            copy_label(&mut self.active_entry.display_label, self.title.as_str());
+        }
+        if index >= self.window_start {
+            let offset = index - self.window_start;
+            if offset < self.window_len {
+                copy_label(&mut self.window[offset].display_label, self.title.as_str());
+            }
+        }
     }
 
     pub(crate) fn catalog_entry(&self, index: usize) -> Option<&LibraryBookEntry> {
@@ -522,6 +545,12 @@ impl ReaderStore {
         if matches!(status, BookLoadStatus::Ready | BookLoadStatus::Error) {
             self.loaded_index = Some(index);
             self.loaded_chapter = chapter;
+            // Bake the just-learned title into the resident list/active entries
+            // so the Library keeps showing it once the cursor moves to another
+            // book -- without waiting for the next window refill from the card.
+            // A later refill re-reads the same title from the book's cache, so
+            // the label also survives scrolling away and reboots.
+            self.note_loaded_title(index);
         }
         self.reader_status = status;
     }
@@ -1079,6 +1108,11 @@ impl ReaderStore {
 /// Populate a catalog entry slot from a record's fields, deriving the display
 /// label. Shared by the list window and the active-book entry; both are read
 /// straight from CATALOG.BIN, which already carries the stored `source_hash`.
+///
+/// `label_override` is the EPUB title saved when the book was last opened: when
+/// present it becomes the display label, so a book whose on-disk name can't
+/// carry a real title (an 8.3 upload name) still reads as its title. With no
+/// override the label falls back to the prettified file stem.
 fn fill_entry(
     entry: &mut LibraryBookEntry,
     display_name: &str,
@@ -1086,16 +1120,29 @@ fn fill_entry(
     in_books_dir: bool,
     byte_size: u32,
     source_hash: u32,
+    label_override: Option<&str>,
 ) {
     entry.display_name.clear();
     entry.display_label.clear();
     entry.open_name.clear();
     let _ = entry.display_name.push_str(display_name);
-    push_catalog_label(display_name, open_name, &mut entry.display_label);
+    match label_override {
+        Some(label) if !label.is_empty() => {
+            let _ = entry.display_label.push_str(label);
+        }
+        _ => push_catalog_label(display_name, open_name, &mut entry.display_label),
+    }
     let _ = entry.open_name.push_str(open_name);
     entry.in_books_dir = in_books_dir;
     entry.byte_size = byte_size;
     entry.source_hash = source_hash;
+}
+
+/// Overwrite a resident entry's display label with `label`. Used to bake a
+/// freshly-loaded book's title into the list without a card re-read.
+fn copy_label(out: &mut String<64>, label: &str) {
+    out.clear();
+    let _ = out.push_str(label);
 }
 
 /// The list label a catalog record shows, derived from its file name. Exposed

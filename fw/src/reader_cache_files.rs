@@ -431,6 +431,68 @@ where
     .unwrap_or(BookIndexLoadResult::Miss)
 }
 
+/// Read just the stored EPUB title from a book's v2 cache index, skipping the
+/// section records and the rest of the body. The Library list uses this to
+/// label books whose on-disk name can't carry a real title (8.3 upload names)
+/// with the title learned the last time the book was opened. Returns false
+/// (leaving `out` untouched) when there is no cache for the book, the cached
+/// identity doesn't match, or the cache holds no title.
+pub(crate) fn read_cached_book_title<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+    out: &mut String<64>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return false;
+        }
+        let Ok(header) = decode_book_v2_header(&header_bytes) else {
+            return false;
+        };
+        if header.source_hash != source_identity.0
+            || header.source_size != source_identity.1
+            || header.title_text_bytes == 0
+            || header.title_text_bytes as usize > 64
+        {
+            return false;
+        }
+        // The title text sits after the header, the section records, and the
+        // TOC block (records + text) -- the same body order write_v2_book_index
+        // lays down and load_v2_book_index reads through.
+        let title_offset = BOOK_V2_HEADER_BYTES as u32
+            + header.section_count as u32 * BOOK_V2_SECTION_RECORD_BYTES as u32
+            + header.toc_count as u32 * TOC_RECORD_BYTES as u32
+            + header.toc_text_bytes;
+        if file.seek_from_start(title_offset).is_err() {
+            return false;
+        }
+        let title_len = header.title_text_bytes as usize;
+        let mut title = [0u8; 64];
+        if read_exact_file(file, &mut title[..title_len]).is_err() {
+            return false;
+        }
+        let Ok(title_str) = core::str::from_utf8(&title[..title_len]) else {
+            return false;
+        };
+        out.clear();
+        let _ = out.push_str(title_str);
+        true
+    })
+    .unwrap_or(false)
+}
+
 pub(crate) fn write_v2_book_index<
     D,
     T,

@@ -239,12 +239,18 @@ where
         for _ in 0..take {
             read_exact_file(file, &mut record)?;
             let decoded = decode_record(&record);
+            // Prefer the title saved when the book was last opened over the
+            // file-stem label, so uploaded books (8.3 names) read as their
+            // real titles. A miss (never opened) falls back to the stem.
+            let mut title = String::<64>::new();
+            let label = cached_title_label(root, &decoded, &mut title);
             library.push_window_entry(
                 decoded.display_name.as_str(),
                 decoded.open_name.as_str(),
                 decoded.in_books_dir,
                 decoded.byte_size,
                 decoded.source_hash,
+                label,
             );
         }
         Ok(())
@@ -390,6 +396,40 @@ fn decode_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogRecord {
     }
 }
 
+/// The list label override for a catalog record: the EPUB title saved in the
+/// book's cache when it was last opened, read into `title` in place. Returns a
+/// borrow of `title` on a hit, or `None` (file-stem fallback) when the book has
+/// never been opened. Cheap for uncached books -- the cache dir lookup fails
+/// before any file read.
+fn cached_title_label<
+    'a,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    decoded: &CatalogRecord,
+    title: &'a mut String<64>,
+) -> Option<&'a str>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let key = proto::cache::cache_key_for(decoded.display_name.as_str(), decoded.byte_size);
+    if crate::reader_cache_files::read_cached_book_title(
+        root,
+        key.as_str(),
+        (decoded.source_hash, decoded.byte_size),
+        title,
+    ) {
+        Some(title.as_str())
+    } else {
+        None
+    }
+}
+
 /// Refill the resident list window so it covers the visible rows around
 /// `selection`, reading from the card only when the window doesn't already
 /// cover them. Called before each Library render; cheap behind the panel.
@@ -427,11 +467,19 @@ pub(crate) fn load_active_entry(
     if library.active_index() == Some(index) {
         return true;
     }
-    let record = sd_session::with_root(epd, sd_cs, |root| read_catalog_record_at(root, index))
-        .ok()
-        .flatten();
-    match record {
-        Some(record) => {
+    // Read the record and, in the same session, the title saved when the book
+    // was last opened, so the active book's fallback label (Home colophon
+    // before a reopen) matches what the list shows.
+    let resolved = sd_session::with_root(epd, sd_cs, |root| {
+        let record = read_catalog_record_at(root, index)?;
+        let mut title = String::<64>::new();
+        let has_title = cached_title_label(root, &record, &mut title).is_some();
+        Some((record, if has_title { Some(title) } else { None }))
+    })
+    .ok()
+    .flatten();
+    match resolved {
+        Some((record, title)) => {
             library.set_active_entry(
                 index,
                 record.display_name.as_str(),
@@ -439,6 +487,7 @@ pub(crate) fn load_active_entry(
                 record.in_books_dir,
                 record.byte_size,
                 record.source_hash,
+                title.as_deref(),
             );
             true
         }
