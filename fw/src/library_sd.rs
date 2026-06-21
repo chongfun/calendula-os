@@ -396,11 +396,12 @@ fn decode_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogRecord {
     }
 }
 
-/// The list label override for a catalog record: the EPUB title saved in the
-/// book's cache when it was last opened, read into `title` in place. Returns a
-/// borrow of `title` on a hit, or `None` (file-stem fallback) when the book has
-/// never been opened. Cheap for uncached books -- the cache dir lookup fails
-/// before any file read.
+/// The list label override for a catalog record, read into `title` in place,
+/// in order of authority: the EPUB title saved in the book's cache when it was
+/// last opened, then the readable filename stashed at upload (for uploads not
+/// yet opened, whose 8.3 name is unreadable). Returns `None` (file-stem
+/// fallback) when neither exists. Cheap for the common case -- each lookup is a
+/// dir open that fails before any file read.
 fn cached_title_label<
     'a,
     D,
@@ -423,7 +424,8 @@ where
         key.as_str(),
         (decoded.source_hash, decoded.byte_size),
         title,
-    ) {
+    ) || crate::reader_cache_files::read_upload_label(root, decoded.open_name.as_str(), title)
+    {
         Some(title.as_str())
     } else {
         None

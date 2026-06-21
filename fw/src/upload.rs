@@ -24,7 +24,16 @@ pub struct UploadBegin {
     /// Whether the name lives in /BOOKS (uploads always do; deletions
     /// follow the catalog's location flag).
     pub in_books: bool,
+    /// The client's original filename, decoded but otherwise untouched.
+    /// The 8.3 `name` can't carry a real title, so this is stashed in a
+    /// label sidecar and shown in the Library until the book is first opened
+    /// (which learns the EPUB title). Empty for deletions.
+    pub label: UploadLabel,
 }
+
+/// Display-name budget for the upload label sidecar, matched to the catalog
+/// label width.
+pub type UploadLabel = String<64>;
 
 pub struct UploadChunk {
     /// `None` only on aborts that have no buffer left to hand over.
@@ -71,6 +80,48 @@ pub fn sanitized_name(client_name: &[u8]) -> UploadName {
     }
     let _ = name.push_str(".EPU");
     name
+}
+
+/// Decodes a percent-encoded client filename into a readable label source,
+/// preserving spaces and case (unlike `sanitized_name`, which forces 8.3).
+/// The catalog label derivation later strips the extension and prettifies it,
+/// so the result is shaped exactly like a copied book's filename label.
+/// Falls back to ASCII-only if the decoded bytes aren't valid UTF-8 (e.g. a
+/// multibyte escape truncated at the buffer edge).
+pub fn readable_filename(client_name: &[u8]) -> UploadLabel {
+    let mut bytes = [0u8; 64];
+    let mut len = 0;
+    let mut at = 0;
+    while at < client_name.len() && len < bytes.len() {
+        let byte = if client_name[at] == b'%' && at + 2 < client_name.len() {
+            match (hex_nibble(client_name[at + 1]), hex_nibble(client_name[at + 2])) {
+                (Some(high), Some(low)) => {
+                    at += 2;
+                    (high << 4) | low
+                }
+                _ => client_name[at],
+            }
+        } else {
+            client_name[at]
+        };
+        at += 1;
+        bytes[len] = byte;
+        len += 1;
+    }
+    let mut out = UploadLabel::new();
+    match core::str::from_utf8(&bytes[..len]) {
+        Ok(text) => {
+            let _ = out.push_str(text);
+        }
+        Err(_) => {
+            for &byte in &bytes[..len] {
+                if byte.is_ascii() && byte >= 0x20 {
+                    let _ = out.push(byte as char);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {

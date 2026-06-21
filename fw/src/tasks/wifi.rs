@@ -393,6 +393,7 @@ async fn upload_server(
                             name,
                             delete: true,
                             in_books,
+                            label: crate::upload::UploadLabel::new(),
                         })
                         .await;
                     UPLOAD_RESULTS.receive().await
@@ -411,6 +412,7 @@ async fn upload_server(
                 .and_then(raw_query_name)
                 .unwrap_or(b"book");
             let name = sanitized_name(client_name);
+            let label = crate::upload::readable_filename(client_name);
 
             if !session_started {
                 STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
@@ -423,6 +425,7 @@ async fn upload_server(
                 leftover_range,
                 content_length,
                 name,
+                label,
                 &mut pool,
             )
             .await;
@@ -452,6 +455,7 @@ async fn stream_book(
     leftover: core::ops::Range<usize>,
     content_length: usize,
     name: crate::upload::UploadName,
+    label: crate::upload::UploadLabel,
     pool: &mut heapless::Vec<&'static mut [u8], 2>,
 ) -> bool {
     esp_println::println!("upload: '{}' {} bytes", name, content_length);
@@ -461,6 +465,7 @@ async fn stream_book(
             name,
             delete: false,
             in_books: true,
+            label,
         })
         .await;
 

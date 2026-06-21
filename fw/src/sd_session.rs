@@ -392,13 +392,27 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
     loop {
         let begin = UPLOAD_BEGINS.receive().await;
         let ok = if begin.delete {
-            if begin.in_books {
+            let removed = if begin.in_books {
                 books.delete_file_in_dir(begin.name.as_str()).is_ok()
             } else {
                 root.delete_file_in_dir(begin.name.as_str()).is_ok()
+            };
+            if removed {
+                crate::reader_cache_files::delete_upload_label(&root, begin.name.as_str());
             }
+            removed
         } else {
-            write_one_book(&books, &begin).await
+            let written = write_one_book(&books, &begin).await;
+            // Stash the readable filename so the Library can label the book
+            // before it is ever opened; the 8.3 name on the card can't carry it.
+            if written && !begin.label.is_empty() {
+                crate::reader_cache_files::write_upload_label(
+                    &root,
+                    begin.name.as_str(),
+                    begin.label.as_str(),
+                );
+            }
+            written
         };
         esp_println::println!(
             "upload: '{}' {} ok={}",
