@@ -46,6 +46,11 @@ Use this term for the wifi task's lifecycle. Keep kosync protocol encoding
 (`proto::kosync`), the memory loan plumbing (`fw::sync_mem`), and the
 upload streaming plumbing (`fw::upload`) out of radio and UI language.
 
+The session's storage-admission rules — which storage commands may run
+before and after the loan — live in `app_core::SyncSession` beside the
+message contracts, not in display-task flags. Ask the session
+(`admits`, `active`) rather than re-deriving the whitelist at call sites.
+
 ### Refresh plan
 
 The display-policy decision that maps render history, view/book context, selection changes, library changes, sleep/wake state, and refresh policy into an SSD1677 refresh mode.

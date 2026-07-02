@@ -310,6 +310,52 @@ pub enum StorageCommand {
     ReceiveUpload,
 }
 
+/// The sync session's storage-admission rules. Granting the loan is one-way:
+/// the EPUB scratch becomes radio heap, so every scratch-using storage command
+/// is refused from then on and only the session-ending software reset brings
+/// the reader pipeline back. Progress writes stay alive (kosync pulls move the
+/// saved position), the portal stores credentials, and uploads only make sense
+/// while the browser shelf is being served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SyncSession {
+    /// The reader pipeline owns the scratch; ordinary storage work runs.
+    #[default]
+    Idle,
+    /// The scratch is loaned to the radio until the session-ending reset.
+    Loaned,
+}
+
+impl SyncSession {
+    /// Whether a storage command may run in the current session state.
+    pub fn admits(&self, command: &StorageCommand) -> bool {
+        match self {
+            // Uploads arrive from the browser shelf, which only exists once
+            // the session is serving; outside it the command is a stray.
+            SyncSession::Idle => !matches!(command, StorageCommand::ReceiveUpload),
+            SyncSession::Loaned => matches!(
+                command,
+                StorageCommand::StoreProgress(_)
+                    | StorageCommand::StoreWifiCredentials(_)
+                    | StorageCommand::ReceiveUpload
+            ),
+        }
+    }
+
+    /// Whether the session is running, i.e. the loan has been granted.
+    /// Render-path catalog reads stop once this is true: the browser shelf
+    /// may be rewriting the card underneath, and the visible surface is the
+    /// Sync screen anyway.
+    pub fn active(&self) -> bool {
+        matches!(self, SyncSession::Loaned)
+    }
+
+    /// One-way transition: the display task has dismantled the scratch and
+    /// shipped it to the wifi task.
+    pub fn loan_granted(&mut self) {
+        *self = SyncSession::Loaned;
+    }
+}
+
 /// Station credentials as a bounded Copy message: what the onboarding
 /// portal captures and what `/XTEINK/WIFI.BIN` stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1553,5 +1599,94 @@ mod tests {
         // Disabling fast refresh falls back to the deep full everywhere.
         let conservative = RefreshPlanner::new().with_fast_refresh_enabled(false);
         assert_eq!(conservative.mode_for(request), RefreshMode::Full);
+    }
+
+    /// One of every StorageCommand variant, so the admission table below is
+    /// exhaustive by construction: a new variant fails the count assertion
+    /// until it is classified here.
+    fn every_storage_command() -> [StorageCommand; 9] {
+        let persisted = PersistedAppState {
+            book_id: 0,
+            chapter: 0,
+            screen: 0,
+            shell_orientation: 0,
+            reading_orientation: 0,
+            refresh_policy: 0,
+            font_size: 0,
+            line_spacing: 0,
+            source_hash: 0,
+            source_size: 0,
+        };
+        let credentials = WifiCredentials::from_strs("ssid", "pass").unwrap();
+        [
+            StorageCommand::LoadCatalogCache,
+            StorageCommand::RefreshCatalog,
+            StorageCommand::OpenBook {
+                request_id: 1,
+                book_id: 1,
+                index: 0,
+                chapter: 0,
+                target_pages: 0,
+                type_settings: TypeSettings::DEFAULT,
+            },
+            StorageCommand::ExtendSection {
+                request_id: 1,
+                book_id: 1,
+                index: 0,
+                chapter: 0,
+                target_pages: 0,
+                type_settings: TypeSettings::DEFAULT,
+            },
+            StorageCommand::LoadChapters {
+                request_id: 1,
+                book_id: 1,
+                index: 0,
+            },
+            StorageCommand::JumpChapter {
+                request_id: 1,
+                book_id: 1,
+                index: 0,
+                chapter: 0,
+                type_settings: TypeSettings::DEFAULT,
+            },
+            StorageCommand::StoreProgress(persisted),
+            StorageCommand::LoanSyncMemory,
+            StorageCommand::StoreWifiCredentials(credentials),
+        ]
+    }
+
+    #[test]
+    fn idle_sync_session_admits_everything_but_upload() {
+        let session = SyncSession::Idle;
+        assert!(!session.active());
+        for command in every_storage_command() {
+            assert!(session.admits(&command), "refused idle: {command:?}");
+        }
+        // Uploads only exist while the browser shelf is being served.
+        assert!(!session.admits(&StorageCommand::ReceiveUpload));
+    }
+
+    #[test]
+    fn loaned_sync_session_admits_only_loan_safe_commands() {
+        let mut session = SyncSession::default();
+        session.loan_granted();
+        assert!(session.active());
+        let mut admitted = 0;
+        for command in every_storage_command() {
+            let loan_safe = matches!(
+                command,
+                StorageCommand::StoreProgress(_) | StorageCommand::StoreWifiCredentials(_)
+            );
+            assert_eq!(
+                session.admits(&command),
+                loan_safe,
+                "wrong admission while loaned: {command:?}"
+            );
+            admitted += usize::from(loan_safe);
+        }
+        assert_eq!(admitted, 2);
+        assert!(session.admits(&StorageCommand::ReceiveUpload));
+        // Notably refused: a second loan of memory that is already gone.
+        assert!(!session.admits(&StorageCommand::LoanSyncMemory));
     }
 }

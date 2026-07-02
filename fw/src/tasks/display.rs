@@ -10,7 +10,7 @@ use crate::{
     DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
-use app_core::{AppView, ReaderSource, RefreshPlanner, RenderRequest};
+use app_core::{AppView, ReaderSource, RefreshPlanner, RenderRequest, SyncSession};
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
@@ -57,10 +57,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     static TX_BAND: static_cell::StaticCell<[u8; BAND_BYTES]> = static_cell::StaticCell::new();
     let tx_band = TX_BAND.init([0; BAND_BYTES]);
     let mut epub_scratch = None;
-    // True once the EPUB scratch is loaned to the sync session; every
-    // scratch-using storage command is refused from then on, and only the
-    // session-ending software reset brings the reader pipeline back.
-    let mut sync_loaned = false;
+    // Storage-command admission for the sync session lifecycle; the loan
+    // transition and refusal rules live in app-core with the contracts.
+    let mut sync_session = SyncSession::default();
     let mut refresh_planner = RefreshPlanner::new();
     let mut pending_progress: Option<AppStateRecord> = None;
     let mut last_progress_write: Option<Instant> = None;
@@ -88,8 +87,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 // view needs resident before the (pure) render reads it. Library
                 // pulls the list window around the selection; other views need
                 // the active book's entry, refreshed only when the book changes.
-                // Skipped once the card is loaned to the sync session.
-                if !sync_loaned {
+                // Skipped once the sync session is running.
+                if !sync_session.active() {
                     if request.view == AppView::Library {
                         crate::library_sd::ensure_library_window(
                             &mut epd,
@@ -219,7 +218,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 }
             }
             Either::Second(StorageCommand::ReceiveUpload) => {
-                if sync_loaned {
+                if sync_session.admits(&StorageCommand::ReceiveUpload) {
                     // Diverges: the display task becomes the upload writer
                     // for the rest of the sync session.
                     crate::sd_session::upload_session(&mut epd, &mut sd_cs).await;
@@ -233,7 +232,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut sd_cs,
                     sd_library,
                     &mut epub_scratch,
-                    &mut sync_loaned,
+                    &mut sync_session,
                     &mut pending_progress,
                     &mut last_progress_write,
                     &mut state_restored,
@@ -260,33 +259,22 @@ fn handle_storage_command(
     sd_cs: &mut Output<'static>,
     sd_library: &mut ReaderStore,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
-    sync_loaned: &mut bool,
+    sync_session: &mut SyncSession,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
     last_request: Option<RenderRequest>,
 ) {
     let is_open_book = matches!(command, StorageCommand::OpenBook { .. });
-    // Progress writes stay alive during a sync session (kosync pulls can
-    // move the saved position); everything that touches the EPUB scratch
-    // is gone until the session's reset.
-    if *sync_loaned
-        && !matches!(
-            command,
-            StorageCommand::StoreProgress(_)
-                | StorageCommand::LoanSyncMemory
-                | StorageCommand::StoreWifiCredentials(_)
-        )
-    {
+    // The session decides what may run: progress writes stay alive during a
+    // sync session (kosync pulls can move the saved position); everything
+    // that touches the EPUB scratch is gone until the session's reset.
+    if !sync_session.admits(&command) {
         esp_println::println!("storage: refused during sync session");
         return;
     }
     match command {
         StorageCommand::LoanSyncMemory => {
-            if *sync_loaned {
-                esp_println::println!("storage: sync memory already loaned");
-                return;
-            }
             // The kosync exchange must see the freshest position, and the
             // book info gather below reads it back from STATE.BIN.
             flush_pending_progress(
@@ -301,7 +289,7 @@ fn handle_storage_command(
             let Some(scratch) = epub_scratch.take() else {
                 return;
             };
-            *sync_loaned = true;
+            sync_session.loan_granted();
             let mut loan = reader_cache::dismantle_scratch(scratch);
             loan.book = book;
             loan.wifi = reader_cache::load_wifi_credentials(epd, sd_cs).map(|record| {
