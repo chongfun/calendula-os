@@ -22,6 +22,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary-int"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993a810118f8f37e9c4411c86f1c4c940a09a7ab34b7bf2d88d06f50c553fab7"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -40,6 +46,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bitbybit"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71d2a3353d70ac1091a33cbf31fc7e77b19091538a7e306e3740712af19807ca"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -310,7 +327,7 @@ dependencies = [
  "embassy-time",
  "embedded-io-async",
  "embedded-nal-async",
- "heapless",
+ "heapless 0.8.0",
  "managed",
  "smoltcp",
 ]
@@ -332,7 +349,7 @@ dependencies = [
  "embedded-io-async",
  "futures-sink",
  "futures-util",
- "heapless",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -346,7 +363,7 @@ dependencies = [
  "embedded-io-async",
  "futures-core",
  "futures-sink",
- "heapless",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -381,7 +398,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc55c748d16908a65b166d09ce976575fb8852cf60ccd06174092b41064d8f83"
 dependencies = [
  "embassy-executor",
- "heapless",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -445,12 +462,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
 name = "embedded-io-async"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ff09972d4073aa8c299395be75161d582e7629cd663171d62af73c8d50dba3f"
 dependencies = [
- "embedded-io",
+ "embedded-io 0.6.1",
 ]
 
 [[package]]
@@ -475,13 +498,16 @@ dependencies = [
 [[package]]
 name = "embedded-sdmmc"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce3c7f9ea039eeafc4a49597b7bd5ae3a1c8e51b2803a381cb0f29ce90fe1ec6"
+source = "git+https://github.com/rust-embedded-community/embedded-sdmmc-rs.git?rev=ce5710f8f9f5651912d3c275b321b0451dd6e89f#ce5710f8f9f5651912d3c275b321b0451dd6e89f"
 dependencies = [
+ "arbitrary-int",
+ "bitbybit",
+ "bitflags 2.11.1",
  "byteorder",
  "embedded-hal 1.0.0",
- "embedded-io",
- "heapless",
+ "embedded-io 0.7.1",
+ "heapless 0.9.3",
+ "thiserror",
 ]
 
 [[package]]
@@ -603,7 +629,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-hal-nb",
- "embedded-io",
+ "embedded-io 0.6.1",
  "embedded-io-async",
  "enumset",
  "esp-build",
@@ -711,7 +737,7 @@ dependencies = [
  "document-features",
  "embassy-net-driver",
  "embassy-sync 0.6.2",
- "embedded-io",
+ "embedded-io 0.6.1",
  "embedded-io-async",
  "enumset",
  "esp-alloc",
@@ -721,7 +747,7 @@ dependencies = [
  "esp-metadata",
  "esp-wifi-sys",
  "fugit",
- "heapless",
+ "heapless 0.8.0",
  "libm",
  "num-derive",
  "num-traits",
@@ -814,7 +840,7 @@ dependencies = [
  "esp-println",
  "esp-wifi",
  "hal-ext",
- "heapless",
+ "heapless 0.8.0",
  "nb 1.1.0",
  "portable-atomic",
  "proto",
@@ -862,6 +888,16 @@ checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
  "hash32",
  "portable-atomic",
+ "stable_deref_trait",
+]
+
+[[package]]
+name = "heapless"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
+dependencies = [
+ "hash32",
  "stable_deref_trait",
 ]
 
@@ -1097,7 +1133,7 @@ dependencies = [
 name = "proto"
 version = "0.1.0"
 dependencies = [
- "heapless",
+ "heapless 0.8.0",
  "miniz_oxide",
 ]
 
@@ -1217,7 +1253,7 @@ dependencies = [
  "bitflags 1.3.2",
  "byteorder",
  "cfg-if",
- "heapless",
+ "heapless 0.8.0",
  "managed",
 ]
 
@@ -1282,6 +1318,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1367,7 +1423,7 @@ version = "0.1.0"
 dependencies = [
  "app-core",
  "display",
- "heapless",
+ "heapless 0.8.0",
  "proto",
 ]
 

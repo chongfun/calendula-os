@@ -612,7 +612,7 @@ pub(crate) fn delete_upload_label<
     };
     let mut file_name = String::<12>::new();
     label_file_name(open_name, &mut file_name);
-    let _ = labels.delete_file_in_dir(file_name.as_str());
+    let _ = labels.delete_entry_in_dir(file_name.as_str());
 }
 
 /// Read a book cache's v2 header (for its stored source identity and section
@@ -640,10 +640,11 @@ where
     .flatten()
 }
 
-/// Delete the data files of one book cache: every section file, plus BOOK/TOC/
-/// COVER. embedded-sdmmc 0.9 can't remove directories, so the empty `<key>/`
-/// and `SECTIONS/` shells stay, but the bytes (and any stale BOOK.BIN) are
-/// reclaimed. The global reading position in XTEINK/STATE.BIN is never touched.
+/// Delete one book cache completely: every section file, BOOK/TOC/COVER, then
+/// the emptied `SECTIONS/` and `<key>/` directories themselves. Directory
+/// deletion refuses non-empty targets, so a cache whose header undercounts its
+/// sections just leaves its shells for the next sweep pass. The global reading
+/// position in XTEINK/STATE.BIN is never touched.
 pub(crate) fn empty_cache_dir<
     D,
     T,
@@ -664,20 +665,26 @@ pub(crate) fn empty_cache_dir<
     let Ok(cache) = xteink.open_dir(CACHE_V2_DIR) else {
         return;
     };
-    let Ok(book) = cache.open_dir(key) else {
-        return;
-    };
-    if let Ok(sections) = book.open_dir(CACHE_SECTIONS_DIR) {
-        let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-        for spine in 0..section_count {
-            name.clear();
-            section_file_name(spine, &mut name);
-            let _ = sections.delete_file_in_dir(name.as_str());
+    {
+        let Ok(book) = cache.open_dir(key) else {
+            return;
+        };
+        if let Ok(sections) = book.open_dir(CACHE_SECTIONS_DIR) {
+            let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+            for spine in 0..section_count {
+                name.clear();
+                section_file_name(spine, &mut name);
+                let _ = sections.delete_entry_in_dir(name.as_str());
+            }
         }
+        // The SECTIONS handle has dropped; the empty directory can go now.
+        let _ = book.delete_entry_in_dir(CACHE_SECTIONS_DIR);
+        let _ = book.delete_entry_in_dir(CACHE_BOOK_FILE);
+        let _ = book.delete_entry_in_dir(CACHE_TOC_FILE);
+        let _ = book.delete_entry_in_dir(CACHE_COVER_FILE);
     }
-    let _ = book.delete_file_in_dir(CACHE_BOOK_FILE);
-    let _ = book.delete_file_in_dir(CACHE_TOC_FILE);
-    let _ = book.delete_file_in_dir(CACHE_COVER_FILE);
+    // Likewise the book handle: closed by the scope above, deletable here.
+    let _ = cache.delete_entry_in_dir(key);
 }
 
 pub(crate) fn write_v2_book_index<
