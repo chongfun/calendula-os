@@ -546,16 +546,15 @@ fn sweep_orphan_caches<
         if let Ok(cache) = xteink.open_dir(proto::cache::CACHE_V2_DIR) {
             let _ = cache.iterate_dir(|entry| {
                 if !entry.attributes.is_directory() {
-                    return core::ops::ControlFlow::Continue(());
+                    return;
                 }
                 let mut name = String::<8>::new();
                 let _ = write!(name, "{}", entry.name);
                 if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
-                    return core::ops::ControlFlow::Continue(());
+                    return;
                 }
                 // Past capacity silently drops; the leftover keys sweep next scan.
                 let _ = keys.push(name);
-                core::ops::ControlFlow::Continue(())
             });
         }
     }
@@ -699,9 +698,8 @@ fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
     let mut lfn_storage = [0u8; 192];
     let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
     let _ = dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
-        use core::ops::ControlFlow;
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
-            return ControlFlow::Continue(());
+            return;
         }
 
         let mut name = String::<64>::new();
@@ -711,16 +709,15 @@ fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
         let Some(file_name) = long_name else {
             let _ = write!(name, "{}", entry.name);
             if !is_epub_name(&name) {
-                return ControlFlow::Continue(());
+                return;
             }
             visit_prefixed(prefix, &name, &open_name, in_books_dir, entry.size, visit);
-            return ControlFlow::Continue(());
+            return;
         };
 
         if is_epub_name(file_name) {
             visit_prefixed(prefix, file_name, &open_name, in_books_dir, entry.size, visit);
         }
-        ControlFlow::Continue(())
     });
 }
 

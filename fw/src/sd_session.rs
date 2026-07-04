@@ -186,7 +186,7 @@ fn remembered_card_type() -> Option<CardType> {
     match WARM_CARD_CODE.load(Ordering::Relaxed) {
         1 => Some(CardType::SD1),
         2 => Some(CardType::SD2),
-        3 => Some(CardType::SdhcSdxc),
+        3 => Some(CardType::SDHC),
         _ => None,
     }
 }
@@ -195,7 +195,7 @@ fn remember_card_type(card_type: CardType) {
     let code = match card_type {
         CardType::SD1 => 1,
         CardType::SD2 => 2,
-        CardType::SdhcSdxc => 3,
+        CardType::SDHC => 3,
     };
     WARM_CARD_CODE.store(code, Ordering::Relaxed);
 }
@@ -375,7 +375,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
     // New books invalidate the catalog snapshot: the next boot's cache
     // load misses and runs a full scan, which is how uploads surface.
     if let Ok(xteink) = root.open_dir("XTEINK") {
-        let _ = xteink.delete_entry_in_dir("CATALOG.BIN");
+        let _ = xteink.delete_file_in_dir("CATALOG.BIN");
         esp_println::println!("upload: catalog snapshot invalidated");
     }
     let books = match root.open_dir("BOOKS") {
@@ -393,9 +393,9 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         let begin = UPLOAD_BEGINS.receive().await;
         let ok = if begin.delete {
             let removed = if begin.in_books {
-                books.delete_entry_in_dir(begin.name.as_str()).is_ok()
+                books.delete_file_in_dir(begin.name.as_str()).is_ok()
             } else {
-                root.delete_entry_in_dir(begin.name.as_str()).is_ok()
+                root.delete_file_in_dir(begin.name.as_str()).is_ok()
             };
             if removed {
                 crate::reader_cache_files::delete_upload_label(&root, begin.name.as_str());
@@ -463,7 +463,7 @@ where
     }
     drop(file);
     if failed || aborted {
-        let _ = books.delete_entry_in_dir(begin.name.as_str());
+        let _ = books.delete_file_in_dir(begin.name.as_str());
         return false;
     }
     true
