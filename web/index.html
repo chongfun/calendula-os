@@ -211,7 +211,6 @@
     display: block;
     width: 100%;
     height: auto;
-    image-rendering: pixelated;
   }
   .led {
     position: absolute;
@@ -336,7 +335,32 @@
   const SAVE_KEY = "x4-progress-v1";
 
   const canvas = document.getElementById("panel");
-  const ctx = canvas.getContext("2d");
+  const screenCtx = canvas.getContext("2d");
+
+  // All frame compositing happens on an offscreen canvas at the panel's
+  // native 800x480; present() then scales it onto the visible canvas whose
+  // backing store matches the displayed size times devicePixelRatio. CSS
+  // used to nearest-neighbor-scale the native canvas instead, and at
+  // fractional scales that dropped single pixel rows -- visibly clipping
+  // glyph tops, bottoms, and crossbars.
+  const page = document.createElement("canvas");
+  page.width = WIDTH; page.height = HEIGHT;
+  const ctx = page.getContext("2d");
+
+  function present() {
+    const dpr = window.devicePixelRatio || 1;
+    const cssWidth = canvas.getBoundingClientRect().width || WIDTH;
+    const width = Math.max(1, Math.round(cssWidth * dpr));
+    const height = Math.max(1, Math.round((width * HEIGHT) / WIDTH));
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    screenCtx.imageSmoothingEnabled = true;
+    screenCtx.imageSmoothingQuality = "high";
+    screenCtx.drawImage(page, 0, 0, width, height);
+  }
+  addEventListener("resize", present);
   const led = document.getElementById("led");
   const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
@@ -376,6 +400,7 @@
       inv[i] = 255 - inv[i]; inv[i + 1] = 255 - inv[i + 1]; inv[i + 2] = 255 - inv[i + 2];
     }
     ctx.putImageData(new ImageData(inv, WIDTH, HEIGHT), 0, 0);
+    present();
   }
   function putFinal(pixels) {
     ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), WIDTH, HEIGHT), 0, 0);
@@ -384,6 +409,7 @@
       ctx.drawImage(ghost, 0, 0);
       ctx.globalAlpha = 1;
     }
+    present();
   }
 
   let busy = false;
@@ -402,7 +428,7 @@
       // A fast update does not flash: changed pixels just redraw, and a
       // faint imprint of the outgoing page stays behind until a cleaning
       // refresh. The panel is still busy for the rated 421 ms.
-      workCtx.drawImage(canvas, 0, 0);
+      workCtx.drawImage(page, 0, 0);
       ghostCtx.drawImage(work, 0, 0);
       ghosting = true;
       putFinal(pixels);
@@ -416,9 +442,11 @@
         await sleep(150);
         ctx.fillStyle = "#161614";
         ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        present();
         await sleep(120);
         ctx.fillStyle = "#eeece2";
         ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        present();
         await sleep(120);
       }
       ghosting = false;
