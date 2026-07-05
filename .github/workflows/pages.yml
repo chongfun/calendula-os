@@ -31,14 +31,8 @@ jobs:
         run: |
           rustup toolchain install nightly-2025-10-01 --profile minimal
           rustup target add wasm32-unknown-unknown --toolchain nightly-2025-10-01
-      - name: Build wasm emulator
-        working-directory: tools/web-emulator
-        run: cargo +nightly-2025-10-01 build --target wasm32-unknown-unknown --release
-      - name: Assemble site
-        run: |
-          mkdir -p _site
-          cp web/index.html _site/
-          cp tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emulator.wasm _site/
+      - name: Build wasm emulators (all boards) and assemble site
+        run: ./tools/build-web.sh _site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
