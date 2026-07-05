@@ -27,6 +27,15 @@ pub trait ReadingBlocks {
     fn block_style(&self, index: usize) -> FontStyle;
     fn page_break_before(&self, index: usize) -> bool;
     fn paragraph_end(&self, index: usize) -> bool;
+    /// True when block `index` opens a paragraph: the block right after a
+    /// paragraph end, and the very first block. Only the opening line of a
+    /// Body paragraph takes the first-line indent. The default derives it
+    /// from `paragraph_end`; a store that carries a half-finished paragraph
+    /// into the next section overrides this with a persisted flag, so a
+    /// carried continuation line is not mistaken for a fresh paragraph.
+    fn paragraph_start(&self, index: usize) -> bool {
+        index == 0 || self.paragraph_end(index.wrapping_sub(1))
+    }
     /// Type settings the blocks were laid out under. Every height,
     /// pagination, and drawing call in this module reads them from the
     /// source, so a store can never paginate with one size and draw with
@@ -43,6 +52,9 @@ pub struct ReaderDrawableBlock<'a> {
     pub advance: i16,
     pub style: FontStyle,
     pub font: &'static BitmapFont,
+    /// First-line indent for the block's opening line; 0 for continuation
+    /// lines, headings, and centered text.
+    pub indent: i16,
 }
 
 pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
@@ -60,6 +72,7 @@ pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
             record.role,
             record.align,
             advance,
+            block_first_line_indent(source, index),
         )
     };
     height + paragraph_gap_after(source, index)
@@ -174,6 +187,7 @@ pub fn for_each_drawable_block(
             advance,
             style,
             font: body_font(settings, style),
+            indent: block_first_line_indent(source, index),
         }) {
             break;
         }
@@ -191,7 +205,14 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
             TextAlign::Left => {
                 let x = reader_x_for(role);
                 if block.record.line_count == 1 {
-                    draw_styled_line(fb, settings, block.text, x, block.y, block.style);
+                    draw_styled_line(
+                        fb,
+                        settings,
+                        block.text,
+                        x + block.indent,
+                        block.y,
+                        block.style,
+                    );
                 } else {
                     draw_wrapped_literata(
                         fb,
@@ -201,13 +222,21 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
                         block.y,
                         READER_RIGHT_X,
                         block.advance,
+                        block.indent,
                     );
                 }
             }
             TextAlign::Justify => {
                 let x = reader_x_for(role);
                 if block.record.line_count == 1 {
-                    draw_styled_line(fb, settings, block.text, x, block.y, block.style);
+                    draw_styled_line(
+                        fb,
+                        settings,
+                        block.text,
+                        x + block.indent,
+                        block.y,
+                        block.style,
+                    );
                 } else {
                     draw_justified_wrapped_literata(
                         fb,
@@ -217,6 +246,7 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
                         block.y,
                         READER_RIGHT_X,
                         block.advance,
+                        block.indent,
                     );
                 }
             }
@@ -265,7 +295,11 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// at 128; existing caches rebuild to produce that file. v11: the TOC.BIN
 /// chapter-title budget grew 44->60 bytes (record 48->64), so the colophon
 /// shows longer chapter names; existing caches rebuild to widen their records.
-const READER_LAYOUT_VERSION: u16 = 11;
+/// v12: Body paragraphs take a book-style first-line indent instead of an
+/// inter-paragraph gap. The indent narrows each paragraph's opening line, so
+/// wrap points and the persisted paragraph-start flag change; existing caches
+/// rebuild.
+const READER_LAYOUT_VERSION: u16 = 12;
 
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a
@@ -307,7 +341,38 @@ pub fn paragraph_gap(role: TextRole) -> i16 {
         TextRole::Heading1 | TextRole::Heading2 => 10,
         TextRole::Heading3 => 6,
         TextRole::BlockQuote => 6,
-        TextRole::Body => 3,
+        // Body paragraphs separate by their first-line indent, book-style,
+        // rather than an inter-paragraph gap: the two together read as
+        // redundant. See [`paragraph_indent`].
+        TextRole::Body => 0,
+    }
+}
+
+/// First-line paragraph indent, in pixels, scaled to the body size. This is
+/// the book-style paragraph cue that replaces the inter-paragraph gap for
+/// Body text (see [`paragraph_gap`]). Roughly 1.3em at each size.
+pub fn paragraph_indent(size: FontSize) -> i16 {
+    match size {
+        FontSize::Small => 24,
+        FontSize::Medium => 28,
+        FontSize::Large => 34,
+    }
+}
+
+/// The first-line indent block `index` draws with, or 0 when it takes none:
+/// non-Body roles, centered text, and continuation lines of a paragraph that
+/// wrapped or carried across a section boundary all stay flush left.
+pub fn block_first_line_indent(source: &impl ReadingBlocks, index: usize) -> i16 {
+    let Some(record) = source.block(index) else {
+        return 0;
+    };
+    if matches!(record.role, TextRole::Body)
+        && matches!(record.align, TextAlign::Left | TextAlign::Justify)
+        && source.paragraph_start(index)
+    {
+        paragraph_indent(source.type_settings().size)
+    } else {
+        0
     }
 }
 
@@ -475,12 +540,21 @@ pub fn next_wrapped_line(
     Some((cursor, best_end, best_next.max(best_end)))
 }
 
-pub fn wrapped_line_count(font: &'static BitmapFont, text: &str, max_width: i16) -> u16 {
+pub fn wrapped_line_count(
+    font: &'static BitmapFont,
+    text: &str,
+    max_width: i16,
+    first_indent: i16,
+) -> u16 {
     let mut cursor = 0usize;
     let bytes = text.as_bytes();
     let mut lines = 0u16;
-    while let Some((_, _, next_cursor)) = next_wrapped_line(text, cursor, font, 0, max_width) {
+    // The opening line starts `first_indent` in, so it holds fewer words;
+    // every following line runs the full width.
+    let mut x = first_indent;
+    while let Some((_, _, next_cursor)) = next_wrapped_line(text, cursor, font, x, max_width) {
         lines = lines.saturating_add(1);
+        x = 0;
         cursor = next_cursor;
         if cursor >= bytes.len() {
             break;
@@ -495,6 +569,7 @@ pub fn wrapped_block_height(
     role: TextRole,
     align: TextAlign,
     line_advance: i16,
+    first_indent: i16,
 ) -> i16 {
     let max_width = READER_RIGHT_X
         - if align == TextAlign::Center {
@@ -502,7 +577,7 @@ pub fn wrapped_block_height(
         } else {
             reader_x_for(role)
         };
-    wrapped_line_count(font, text, max_width).max(1) as i16 * line_advance
+    wrapped_line_count(font, text, max_width, first_indent).max(1) as i16 * line_advance
 }
 
 pub fn draw_styled_line(
@@ -586,14 +661,24 @@ pub fn draw_wrapped_literata(
     mut baseline_y: i16,
     max_x: i16,
     line_advance: i16,
+    first_indent: i16,
 ) -> i16 {
     let mut cursor = 0usize;
     let bytes = text.as_bytes();
+    let mut line_x = x + first_indent;
     while let Some((line_start, line_end, next_cursor)) =
-        next_wrapped_line(text, cursor, font, x, max_x)
+        next_wrapped_line(text, cursor, font, line_x, max_x)
     {
-        draw_text(fb, font, &text[line_start..line_end], x, baseline_y, false);
+        draw_text(
+            fb,
+            font,
+            &text[line_start..line_end],
+            line_x,
+            baseline_y,
+            false,
+        );
         baseline_y += line_advance;
+        line_x = x;
         cursor = next_cursor;
         if cursor >= bytes.len() {
             break;
@@ -611,23 +696,26 @@ pub fn draw_justified_wrapped_literata(
     mut baseline_y: i16,
     max_x: i16,
     line_advance: i16,
+    first_indent: i16,
 ) -> i16 {
     let mut cursor = 0usize;
     let bytes = text.as_bytes();
+    let mut line_x = x + first_indent;
     while let Some((line_start, line_end, next_cursor)) =
-        next_wrapped_line(text, cursor, font, x, max_x)
+        next_wrapped_line(text, cursor, font, line_x, max_x)
     {
         let is_last_line = next_cursor >= bytes.len();
         draw_justified_line(
             fb,
             font,
             &text[line_start..line_end],
-            x,
+            line_x,
             baseline_y,
             max_x,
             is_last_line,
         );
         baseline_y += line_advance;
+        line_x = x;
         cursor = next_cursor;
         if cursor >= bytes.len() {
             break;
@@ -688,6 +776,90 @@ fn draw_justified_line(
 mod tests {
     use super::*;
     use display::font::style_marker_code;
+
+    /// Minimal blocks for exercising the indent predicate: roles, aligns, and
+    /// paragraph-end flags, with the default `paragraph_start` derivation.
+    struct IndentBlocks<'a> {
+        roles: &'a [TextRole],
+        aligns: &'a [TextAlign],
+        ends: &'a [bool],
+    }
+
+    impl ReadingBlocks for IndentBlocks<'_> {
+        fn block_count(&self) -> usize {
+            self.roles.len()
+        }
+        fn block(&self, index: usize) -> Option<BlockRecord> {
+            Some(BlockRecord {
+                text_offset: 0,
+                text_len: 0,
+                line_count: 1,
+                role: *self.roles.get(index)?,
+                style: proto::text::FontStyle::Regular,
+                align: self.aligns[index],
+            })
+        }
+        fn block_text(&self, _index: usize) -> &str {
+            ""
+        }
+        fn block_style(&self, _index: usize) -> FontStyle {
+            FontStyle::Regular
+        }
+        fn page_break_before(&self, _index: usize) -> bool {
+            false
+        }
+        fn paragraph_end(&self, index: usize) -> bool {
+            self.ends.get(index).copied().unwrap_or(true)
+        }
+    }
+
+    #[test]
+    fn only_body_paragraph_openings_take_the_first_line_indent() {
+        let blocks = IndentBlocks {
+            //                0               1               2
+            roles: &[
+                TextRole::Body,
+                TextRole::Body,
+                TextRole::Body,
+                TextRole::Heading1,
+                TextRole::Body,
+                TextRole::BlockQuote,
+            ],
+            aligns: &[
+                TextAlign::Justify,
+                TextAlign::Justify,
+                TextAlign::Left,
+                TextAlign::Center,
+                TextAlign::Center,
+                TextAlign::Left,
+            ],
+            // block 0 opens (index 0); block 1 continues it (0 did not end a
+            // paragraph); block 2 opens (1 ended one); the rest each open.
+            ends: &[false, true, true, true, true, true],
+        };
+        let indent = paragraph_indent(FontSize::Medium);
+        assert_eq!(block_first_line_indent(&blocks, 0), indent, "opening line");
+        assert_eq!(block_first_line_indent(&blocks, 1), 0, "continuation line");
+        assert_eq!(block_first_line_indent(&blocks, 2), indent, "next opening");
+        assert_eq!(block_first_line_indent(&blocks, 3), 0, "heading");
+        assert_eq!(block_first_line_indent(&blocks, 4), 0, "centered body");
+        assert_eq!(block_first_line_indent(&blocks, 5), 0, "blockquote");
+    }
+
+    #[test]
+    fn first_line_indent_never_reduces_the_wrapped_line_count() {
+        let font = body_font(TypeSettings::DEFAULT, FontStyle::Regular);
+        let indent = paragraph_indent(FontSize::Medium);
+        let max_width = READER_RIGHT_X - READER_LEFT_X;
+        for sample in SAMPLES {
+            let flush = wrapped_line_count(font, sample, max_width, 0);
+            let indented = wrapped_line_count(font, sample, max_width, indent);
+            assert!(
+                indented >= flush,
+                "indent must not drop lines: {sample:?} {flush} -> {indented}"
+            );
+        }
+    }
 
     /// Reference implementation: measure the whole string from scratch,
     /// exactly as the pre-incremental firmware code did.

@@ -1316,7 +1316,8 @@ where
         return false;
     }
     if !read_records_batched(file, 1, block_count, |index, bytes| {
-        library.set_cached_paragraph_end(index, bytes[0] != 0)
+        library.set_cached_paragraph_end(index, bytes[0] & 0b01 != 0)
+            && library.set_cached_paragraph_start(index, bytes[0] & 0b10 != 0)
     }) {
         return false;
     }
@@ -1405,13 +1406,13 @@ where
             return false;
         }
     }
-    for flag in library
-        .block_paragraph_end
-        .iter()
-        .take(library.block_count)
-        .copied()
-    {
-        if file.write(&[flag as u8]).is_err() {
+    // One flag byte per block: bit 0 marks a paragraph end, bit 1 a
+    // paragraph start (the indented opening line).
+    for index in 0..library.block_count {
+        let end = library.block_paragraph_end[index];
+        let start = library.block_paragraph_start[index];
+        let flag = (end as u8) | ((start as u8) << 1);
+        if file.write(&[flag]).is_err() {
             esp_println::println!("cache: write paragraph flag failed");
             return false;
         }

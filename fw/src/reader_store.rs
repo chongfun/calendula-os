@@ -206,6 +206,11 @@ pub(crate) struct ReaderStore {
     pub(crate) block_spine: [u16; MAX_READER_BLOCKS],
     pub(crate) block_page_break_before: [bool; MAX_READER_BLOCKS],
     pub(crate) block_paragraph_end: [bool; MAX_READER_BLOCKS],
+    /// True for a block that opens a paragraph (its opening line takes the
+    /// first-line indent). Persisted rather than derived so a section that
+    /// carries a half-finished paragraph in at its front keeps that
+    /// continuation line flush left.
+    pub(crate) block_paragraph_start: [bool; MAX_READER_BLOCKS],
     pub(crate) block_count: usize,
     pub(crate) pages: [PageRecord; MAX_READER_PAGES],
     pub(crate) page_spine: [u16; MAX_READER_PAGES],
@@ -266,6 +271,7 @@ impl ReaderStore {
             block_spine: [0; MAX_READER_BLOCKS],
             block_page_break_before: [false; MAX_READER_BLOCKS],
             block_paragraph_end: [true; MAX_READER_BLOCKS],
+            block_paragraph_start: [false; MAX_READER_BLOCKS],
             block_count: 0,
             pages: [EMPTY_PAGE_RECORD; MAX_READER_PAGES],
             page_spine: [0; MAX_READER_PAGES],
@@ -480,6 +486,7 @@ impl ReaderStore {
             self.block_spine[index] = 0;
             self.block_page_break_before[index] = false;
             self.block_paragraph_end[index] = true;
+            self.block_paragraph_start[index] = false;
         }
         for (index, page) in self.pages.iter_mut().enumerate() {
             *page = EMPTY_PAGE_RECORD;
@@ -510,6 +517,7 @@ impl ReaderStore {
             self.block_spine[offset] = self.block_spine[src];
             self.block_page_break_before[offset] = self.block_page_break_before[src];
             self.block_paragraph_end[offset] = self.block_paragraph_end[src];
+            self.block_paragraph_start[offset] = self.block_paragraph_start[src];
         }
         for index in carried_blocks..self.block_count {
             self.blocks[index] = EMPTY_BLOCK_RECORD;
@@ -517,6 +525,7 @@ impl ReaderStore {
             self.block_spine[index] = 0;
             self.block_page_break_before[index] = false;
             self.block_paragraph_end[index] = true;
+            self.block_paragraph_start[index] = false;
         }
         self.block_count = carried_blocks;
         self.text_len = carried_text;
@@ -651,6 +660,18 @@ impl ReaderStore {
             return false;
         };
         *slot = paragraph_end;
+        true
+    }
+
+    pub(crate) fn set_cached_paragraph_start(
+        &mut self,
+        index: usize,
+        paragraph_start: bool,
+    ) -> bool {
+        let Some(slot) = self.block_paragraph_start.get_mut(index) else {
+            return false;
+        };
+        *slot = paragraph_start;
         true
     }
 
@@ -1136,6 +1157,15 @@ impl ReaderStore {
         self.block_page_break_before[self.block_count] =
             should_break_before_block(role, self.blocks.get(self.block_count.wrapping_sub(1)));
         self.block_paragraph_end[self.block_count] = paragraph_end;
+        // A line opens a paragraph when the previous block closed one (and the
+        // first block always does). This mirrors the indent budget the build
+        // wrap charged this line, so draw and pagination agree.
+        self.block_paragraph_start[self.block_count] = self.block_count == 0
+            || self
+                .block_paragraph_end
+                .get(self.block_count.wrapping_sub(1))
+                .copied()
+                .unwrap_or(true);
         self.block_count += 1;
         true
     }
@@ -1300,6 +1330,13 @@ impl ui::reading::ReadingBlocks for ReaderStore {
 
     fn paragraph_end(&self, index: usize) -> bool {
         self.block_paragraph_end.get(index).copied().unwrap_or(true)
+    }
+
+    fn paragraph_start(&self, index: usize) -> bool {
+        self.block_paragraph_start
+            .get(index)
+            .copied()
+            .unwrap_or(false)
     }
 
     fn type_settings(&self) -> TypeSettings {

@@ -1648,6 +1648,17 @@ fn push_styled_preview_fragment<
     let align = block_align_for(align, normalized.as_str(), role);
     let x = reader_layout::reader_x_for(role);
     let max_x = reader_layout::READER_RIGHT_X;
+    // Book-style first-line indent: a Body paragraph's opening line wraps
+    // against a narrower column. Only Left/Justify Body takes it, matching
+    // `ui::reading::block_first_line_indent`, so the built line breaks agree
+    // with how the page later draws them.
+    let indent = if matches!(role, TextRole::Body)
+        && matches!(align, TextAlign::Left | TextAlign::Justify)
+    {
+        reader_layout::paragraph_indent(sink.library.type_settings().size)
+    } else {
+        0
+    };
 
     if !sink.line.is_empty() && (sink.line_role != role || sink.line_align != align) {
         flush_styled_preview_line(sink, false);
@@ -1681,7 +1692,20 @@ fn push_styled_preview_fragment<
         }
         sink.line_ink.push_str(&sink.line[kept_len..]);
 
-        if !line_was_empty && sink.line_ink.width() + x + reader_layout::READER_WRAP_SAFETY > max_x
+        // The line in progress opens a paragraph while no line of it has
+        // flushed yet: the previous block still closes a paragraph. Once the
+        // first line flushes (as a non-end block) this goes false and the
+        // continuation lines wrap at the full width.
+        let opens_paragraph = sink.library.block_count == 0
+            || sink
+                .library
+                .block_paragraph_end
+                .get(sink.library.block_count.wrapping_sub(1))
+                .copied()
+                .unwrap_or(true);
+        let x_eff = if opens_paragraph { x + indent } else { x };
+        if !line_was_empty
+            && sink.line_ink.width() + x_eff + reader_layout::READER_WRAP_SAFETY > max_x
         {
             sink.line.truncate(kept_len);
             sink.line_ink = kept_ink;
