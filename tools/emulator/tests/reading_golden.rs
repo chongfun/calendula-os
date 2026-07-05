@@ -2,8 +2,12 @@
 //! synthetic cached blocks through `ui::reading` — the exact code firmware
 //! uses for SD reading pages — and compare against checked-in frames.
 //!
+//! The goldens and the exact line-count assertions are pinned to the X4's
+//! 800x480 geometry, so the suite only runs under `board-x4`.
+//!
 //! Regenerate after intentional typography changes with:
 //! `REGEN_READING_GOLDEN=1 cargo test --manifest-path tools/emulator/Cargo.toml --target <host> --test reading_golden`
+#![cfg(feature = "board-x4")]
 
 use std::path::{Path, PathBuf};
 

@@ -7,13 +7,18 @@ publish = false
 [workspace]
 
 [features]
-default = []
+default = ["board-x4"]
 gui = ["dep:eframe", "dep:egui"]
+# Exactly one board feature selects the emulated panel and geometry; it is
+# forwarded to the app-core/display/ui crates. `board-x4`/`board-x3` are
+# mutually exclusive (build X3 with `--no-default-features --features board-x3`).
+board-x4 = ["app-core/board-x4", "display/board-x4", "ui/board-x4"]
+board-x3 = ["app-core/board-x3", "display/board-x3", "ui/board-x3"]
 
 [dependencies]
-app-core = { path = "../../app-core" }
-display = { path = "../../display" }
-ui = { path = "../../ui" }
+app-core = { path = "../../app-core", default-features = false }
+display = { path = "../../display", default-features = false }
+ui = { path = "../../ui", default-features = false }
 eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"], optional = true }
 egui = { version = "0.28", optional = true }
 png = "0.17"

@@ -1,3 +1,7 @@
+#[cfg(feature = "board-x4")]
+mod panel;
+#[cfg(feature = "board-x3")]
+#[path = "panel_x3.rs"]
 mod panel;
 mod render;
 mod scenario;
