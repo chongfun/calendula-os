@@ -201,6 +201,54 @@ pub fn run_selftest() -> bool {
     true
 }
 
+/// True when the recovery combo — `Back` (front ladder) + `Up` (side ladder) —
+/// is held, given the two calibrated ADC readings in millivolts. The bands
+/// mirror `tasks::input`'s NAV/PAGE tables; they're on separate pins, so the
+/// combo is unambiguous.
+pub fn recovery_combo_held(nav_mv: u16, page_mv: u16) -> bool {
+    (2400..=2700).contains(&nav_mv) && (1500..=1800).contains(&page_mv)
+}
+
+/// Boot-time escape hatch (the FreeInk SDK `RecoveryBoot` pattern): when the
+/// combo is held at reset and we are running from a slot other than 0, repoint
+/// `otadata` at slot 0 and return `true` so the caller resets into it. Slot 0
+/// is the recovery anchor — the firmware first installed there — so this backs
+/// out of an update in the far slot that boots but misbehaves.
+///
+/// No-op (returns `false`) when already effectively on slot 0, or when slot 0
+/// doesn't hold a valid image (so the combo can't switch into an empty slot).
+/// The stock bootloader can't read buttons, so this is the earliest point a
+/// held combo can be honoured — it must run before the main app takes over.
+pub fn recover_to_slot0() -> bool {
+    let mut flash = FlashStorage::new();
+    let (s0, s1) = match read_otadata(&mut flash) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // Only act when running from a non-zero slot. `None` (erased otadata) means
+    // the bootloader already defaults to slot 0, so there's nothing to undo.
+    if ota::active_app_slot(&s0, &s1, OTA_COUNT) != Some(1) {
+        return false;
+    }
+    // Refuse to switch into a slot 0 that isn't a bootable image.
+    let mut head = [0u8; 4];
+    if flash.read(OTA_SLOT_OFFSET[0], &mut head).is_err() || head[0] != ota::IMAGE_MAGIC {
+        esp_println::println!("recovery: slot 0 has no valid image; ignoring combo");
+        return false;
+    }
+    let switch = ota::plan_switch(&s0, &s1, 0, OTA_COUNT);
+    if write_select_entry(&mut flash, switch.target_sector, &switch.entry).is_err() {
+        esp_println::println!("recovery: otadata write failed");
+        return false;
+    }
+    esp_println::println!(
+        "recovery: combo held; otadata sector {} -> seq {} (slot 0)",
+        switch.target_sector,
+        switch.entry.ota_seq
+    );
+    true
+}
+
 fn read_otadata(
     flash: &mut FlashStorage,
 ) -> Result<([u8; SELECT_ENTRY_LEN], [u8; SELECT_ENTRY_LEN]), UpdateError> {

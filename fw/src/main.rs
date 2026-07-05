@@ -62,7 +62,9 @@ use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use esp_backtrace as _;
-use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcConfig, Attenuation};
+use esp_hal::analog::adc::{
+    Adc, AdcCalCurve, AdcCalScheme, AdcChannel, AdcConfig, AdcPin, Attenuation,
+};
 use esp_hal::gpio::{Input, Level, Output, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::interrupt::Priority;
@@ -114,6 +116,26 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 static INPUT_EXECUTOR: StaticCell<InterruptExecutor<0>> = StaticCell::new();
 
+/// Blocking median-of-three ADC read for the boot-time recovery combo check,
+/// before the async input task exists. Median rejects a single noisy sample.
+fn median3_adc<P, CS>(adc: &mut Adc<'static, ADC1>, pin: &mut AdcPin<P, ADC1, CS>) -> u16
+where
+    P: AdcChannel,
+    CS: AdcCalScheme<ADC1>,
+{
+    let mut v = [0u16; 3];
+    for slot in v.iter_mut() {
+        *slot = loop {
+            match adc.read_oneshot(pin) {
+                Ok(mv) => break mv,
+                Err(nb::Error::WouldBlock) => {}
+                Err(_) => break 0,
+            }
+        };
+    }
+    v[0].max(v[1]).min(v[0].min(v[1]).max(v[2]))
+}
+
 #[esp_hal::main]
 fn main() -> ! {
     // Config::default() leaves the ESP32-C3 at 80 MHz; layout, panel byte
@@ -137,11 +159,27 @@ fn main() -> ! {
     let mut adc_config = AdcConfig::new();
     let aux_adc = adc_config
         .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO0, Attenuation::_11dB);
-    let nav_adc = adc_config
+    let mut nav_adc = adc_config
         .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO1, Attenuation::_11dB);
-    let page_adc = adc_config
+    let mut page_adc = adc_config
         .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO2, Attenuation::_11dB);
-    let adc1 = Adc::new(peripherals.ADC1, adc_config);
+    let mut adc1 = Adc::new(peripherals.ADC1, adc_config);
+
+    // RecoveryBoot escape hatch: holding Back + Up at reset repoints otadata at
+    // slot 0 and reboots into it — a way back if the far slot's firmware boots
+    // but misbehaves. Sampled here, the earliest point, before any task owns the
+    // ADC; the stock bootloader can't read buttons, so only the running firmware
+    // can honour the combo. Median-of-3 so a single noisy read can't trip it.
+    {
+        let nav_mv = median3_adc(&mut adc1, &mut nav_adc);
+        let page_mv = median3_adc(&mut adc1, &mut page_adc);
+        if ota_update::recovery_combo_held(nav_mv, page_mv) {
+            esp_println::println!("recovery: Back+Up held (nav={} page={})", nav_mv, page_mv);
+            if ota_update::recover_to_slot0() {
+                esp_hal::reset::software_reset();
+            }
+        }
+    }
 
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(8000);
     let dma_rx = esp_hal::dma::DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();

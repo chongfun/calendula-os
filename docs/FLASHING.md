@@ -132,6 +132,13 @@ booting the current slot until a complete, valid image flips `otadata`. This
 works on an unlocked unit too (espflash's bootloader is ESP-IDF and honours
 `otadata`), which is how to test it without a locked device.
 
+If an update lands you on a firmware that boots but misbehaves, hold **Back + Up**
+at reset: the recovery hatch repoints `otadata` back at slot 0 (the firmware
+first installed there) and reboots into it. It can't help a firmware that won't
+boot far enough to run the check — that would need a custom bootloader, which no
+app-level firmware provides — so treat it as a strong safety net, not a
+guarantee against every brick.
+
 ## Status
 
 Implemented and verified on host tooling:
@@ -169,14 +176,22 @@ Implemented and verified on host tooling:
       is now exercised even though a full `FWUPDATE.BIN` run awaits a card
       reader (the author's machine has none).
 
+- [x] **Boot-time recovery combo** (`fw::ota_update::recover_to_slot0`) — holding
+      **Back + Up** at reset repoints `otadata` at slot 0 and reboots into it,
+      the FreeInk `RecoveryBoot` escape hatch for backing out of a far-slot
+      firmware that boots but misbehaves. Sampled in `main()` before any task
+      owns the ADC. Verified on device that it does **not** false-trigger on an
+      idle boot; the band values are the same ones the input task uses daily, and
+      the otadata switch is the mechanism the self-test already proved.
+
 Not yet done:
 
 - [ ] **End-to-end `FWUPDATE.BIN` run** — the whole SD trigger in one go (drop
       the file, reboot, watch it flash + delete + reboot). Needs a way to write
       the card root; blocked only by the missing card reader, not by code.
-- [ ] **Boot-time recovery combo** (hold a combo at reset → repoint otadata at
-      `ota_0`), mirroring the SDK's `RecoveryBoot`, plus optional on-panel
-      progress during the update.
+- [ ] **Live recovery-combo press** — confirm a physical Back+Up hold detects and
+      switches on device (detection reuses the input task's proven bands, so this
+      is a formality). Optional on-panel progress during an update.
 - [ ] **Locked-unit confirmation** — that our app-descriptor eFuse range
       satisfies the stock gate and the OEM SD updater accepts our `update.bin`.
       Needs a locked device; the author's is unlocked.
