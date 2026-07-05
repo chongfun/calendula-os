@@ -196,6 +196,7 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
         == display::font::TypeSettings {
             size: request.font_size,
             spacing: request.line_spacing,
+            weight: request.font_weight,
         };
     // While the Chapters overview borrows the reading text buffer for the
     // on-disk TOC, page/block records still point at the old section but the

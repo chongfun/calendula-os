@@ -409,6 +409,13 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         FIRST_ROW_Y + 192,
         shell.selection == 3,
     );
+    index_row(
+        fb,
+        "Type weight",
+        font_weight_label(shell.font_weight),
+        FIRST_ROW_Y + 256,
+        shell.selection == 4,
+    );
 
     finish_working_screen(fb, shell);
 }
@@ -924,6 +931,13 @@ fn line_spacing_label(spacing: display::font::LineSpacing) -> &'static str {
         display::font::LineSpacing::Compact => "compact",
         display::font::LineSpacing::Normal => "normal",
         display::font::LineSpacing::Relaxed => "relaxed",
+    }
+}
+
+fn font_weight_label(weight: display::font::FontWeight) -> &'static str {
+    match weight {
+        display::font::FontWeight::Normal => "regular",
+        display::font::FontWeight::Heavy => "heavier",
     }
 }
 

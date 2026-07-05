@@ -579,6 +579,7 @@ fn handle_storage_command(
                 refresh_policy: record.refresh_policy,
                 font_size: record.font_size,
                 line_spacing: record.line_spacing,
+                font_weight: record.font_weight,
                 source_hash,
                 source_size,
             };
@@ -680,6 +681,7 @@ fn send_resumed_position(
         refresh_policy: request.refresh_policy as u8,
         font_size: request.font_size as u8,
         line_spacing: request.line_spacing as u8,
+        font_weight: request.font_weight as u8,
     });
 }
 
@@ -747,6 +749,7 @@ fn gather_sync_book_info(
             refresh_policy: record.refresh_policy,
             font_size: record.font_size,
             line_spacing: record.line_spacing,
+            font_weight: record.font_weight,
             source_hash: record.source_hash,
             source_size: record.source_size,
         },
@@ -842,6 +845,7 @@ fn restore_saved_state(
         refresh_policy: record.refresh_policy,
         font_size: record.font_size,
         line_spacing: record.line_spacing,
+        font_weight: record.font_weight,
     });
 }
 

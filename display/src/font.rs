@@ -104,6 +104,27 @@ impl LineSpacing {
     }
 }
 
+/// Reader body weight behind the Type Weight setting. `Heavy` renders regular
+/// prose one step up (Literata SemiBold) for easier reading; bold emphasis
+/// keeps the heavier Bold face so it stays distinct. UI furniture is
+/// unaffected — only reading content changes weight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FontWeight {
+    #[default]
+    Normal,
+    Heavy,
+}
+
+impl FontWeight {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Normal),
+            1 => Some(Self::Heavy),
+            _ => None,
+        }
+    }
+}
+
 /// The reader type settings that change page layout. Carried from the app
 /// reducer through storage commands into the cache build, so pagination,
 /// cached sections, and drawing always agree on one pair.
@@ -111,12 +132,14 @@ impl LineSpacing {
 pub struct TypeSettings {
     pub size: FontSize,
     pub spacing: LineSpacing,
+    pub weight: FontWeight,
 }
 
 impl TypeSettings {
     pub const DEFAULT: Self = Self {
         size: FontSize::Medium,
         spacing: LineSpacing::Normal,
+        weight: FontWeight::Normal,
     };
 }
 
@@ -142,6 +165,38 @@ pub fn literata_sized(size: FontSize, style: FontStyle) -> &'static BitmapFont {
         (FontSize::Large, FontStyle::Italic) => &sizes::LITERATA_26_ITALIC,
         (FontSize::Large, FontStyle::Bold) => &sizes::LITERATA_26_BOLD,
         (FontSize::Large, FontStyle::BoldItalic) => &sizes::LITERATA_26_BOLD_ITALIC,
+    }
+}
+
+/// The reading body face for a size, weight, and style run. `Heavy` renders
+/// regular and italic prose in SemiBold; bold emphasis keeps the Bold face so
+/// it stays a step heavier than the surrounding heavier body.
+pub fn literata_weighted(
+    size: FontSize,
+    weight: FontWeight,
+    style: FontStyle,
+) -> &'static BitmapFont {
+    match weight {
+        FontWeight::Normal => literata_sized(size, style),
+        FontWeight::Heavy => match style {
+            FontStyle::Regular => semibold_sized(size, false),
+            FontStyle::Italic => semibold_sized(size, true),
+            FontStyle::Bold => literata_sized(size, FontStyle::Bold),
+            FontStyle::BoldItalic => literata_sized(size, FontStyle::BoldItalic),
+        },
+    }
+}
+
+/// The SemiBold body face at a reading size, upright or italic.
+fn semibold_sized(size: FontSize, italic: bool) -> &'static BitmapFont {
+    use crate::literata_semibold_generated as sb;
+    match (size, italic) {
+        (FontSize::Small, false) => &sb::LITERATA_19_SEMIBOLD,
+        (FontSize::Small, true) => &sb::LITERATA_19_SEMIBOLD_ITALIC,
+        (FontSize::Medium, false) => &sb::LITERATA_22_SEMIBOLD,
+        (FontSize::Medium, true) => &sb::LITERATA_22_SEMIBOLD_ITALIC,
+        (FontSize::Large, false) => &sb::LITERATA_26_SEMIBOLD,
+        (FontSize::Large, true) => &sb::LITERATA_26_SEMIBOLD_ITALIC,
     }
 }
 

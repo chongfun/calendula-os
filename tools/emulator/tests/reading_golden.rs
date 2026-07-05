@@ -8,7 +8,9 @@
 use std::path::{Path, PathBuf};
 
 use display::fb::Framebuffer;
-use display::font::{style_marker_code, FontSize, FontStyle, LineSpacing, TypeSettings, STYLE_MARKER};
+use display::font::{
+    style_marker_code, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings, STYLE_MARKER,
+};
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
 use ui::reading::{
@@ -239,6 +241,7 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
     let source = fixture(TypeSettings {
         size: FontSize::Large,
         spacing: LineSpacing::Relaxed,
+        weight: FontWeight::Normal,
     });
     let default_pages =
         paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);
@@ -249,6 +252,20 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
     );
 
     assert_page_matches_golden(&source, 0, "reading-page-large-relaxed-0");
+}
+
+/// The same blocks at the default size in the Heavier (SemiBold) weight:
+/// regular and italic runs render one step heavier while bold emphasis keeps
+/// the Bold face. Wider glyphs shift wrap points, so the frame differs from
+/// the Normal-weight page; page 0 is pinned.
+#[test]
+fn reading_page_bodies_match_goldens_heavy() {
+    let source = fixture(TypeSettings {
+        size: FontSize::Medium,
+        spacing: LineSpacing::Normal,
+        weight: FontWeight::Heavy,
+    });
+    assert_page_matches_golden(&source, 0, "reading-page-heavy-0");
 }
 
 /// The default grid holds exactly seventeen body lines: a paragraph
@@ -289,6 +306,7 @@ fn small_compact_paginates_no_worse_than_default() {
     let source = fixture(TypeSettings {
         size: FontSize::Small,
         spacing: LineSpacing::Compact,
+        weight: FontWeight::Normal,
     });
     let default_pages =
         paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);

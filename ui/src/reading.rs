@@ -9,8 +9,8 @@
 
 use display::fb::Framebuffer;
 use display::font::{
-    draw_text, literata_sized, measure_text, style_from_marker_code, BitmapFont, FontSize,
-    FontStyle, LineSpacing, TypeSettings, STYLE_MARKER,
+    draw_text, literata_weighted, measure_text, style_from_marker_code, BitmapFont, FontSize,
+    FontStyle, FontWeight, LineSpacing, TypeSettings, STYLE_MARKER,
 };
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
@@ -299,18 +299,28 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// inter-paragraph gap. The indent narrows each paragraph's opening line, so
 /// wrap points and the persisted paragraph-start flag change; existing caches
 /// rebuild.
-const READER_LAYOUT_VERSION: u16 = 12;
+/// v13: the Type Weight setting joins the layout config. Heavier (SemiBold)
+/// body glyphs are wider than Regular, so wrap points change with weight;
+/// existing caches rebuild on a weight change.
+const READER_LAYOUT_VERSION: u16 = 13;
 
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a
 /// mismatch on load invalidates the cached pagination and rebuilds it.
+/// Bit layout: spacing in bits 0-1 (a spacing change only re-walks heights,
+/// so the load check masks these off), size in bits 2-3, weight in bit 4,
+/// version above. Size and weight both change wrap points, so a change in
+/// either forces a full rebuild.
 pub fn reader_layout_config(settings: TypeSettings) -> u16 {
-    (READER_LAYOUT_VERSION << 4) | ((settings.size as u16) << 2) | settings.spacing as u16
+    (READER_LAYOUT_VERSION << 5)
+        | ((settings.weight as u16) << 4)
+        | ((settings.size as u16) << 2)
+        | settings.spacing as u16
 }
 
 /// The reading body face for the given settings and style run.
 pub fn body_font(settings: TypeSettings, style: FontStyle) -> &'static BitmapFont {
-    literata_sized(settings.size, style)
+    literata_weighted(settings.size, settings.weight, style)
 }
 
 /// Baseline-to-baseline advance. Body values per (size, spacing); H1/H2
@@ -439,6 +449,7 @@ pub fn text_ink_width(font: &'static BitmapFont, text: &str) -> i16 {
 pub struct StyledInkCursor {
     ink: InkCursor,
     size: FontSize,
+    weight: FontWeight,
     font: &'static BitmapFont,
 }
 
@@ -447,7 +458,8 @@ impl StyledInkCursor {
         Self {
             ink: InkCursor::new(),
             size: settings.size,
-            font: literata_sized(settings.size, default_style),
+            weight: settings.weight,
+            font: literata_weighted(settings.size, settings.weight, default_style),
         }
     }
 
@@ -458,8 +470,9 @@ impl StyledInkCursor {
         while let Some(ch) = chars.next() {
             if ch == STYLE_MARKER {
                 if let Some(code) = chars.next() {
-                    self.font = literata_sized(
+                    self.font = literata_weighted(
                         self.size,
+                        self.weight,
                         style_from_marker_code(code).unwrap_or(FontStyle::Regular),
                     );
                 }
@@ -965,6 +978,7 @@ mod tests {
                 out[i * 3 + j] = TypeSettings {
                     size: sizes[i],
                     spacing: spacings[j],
+                    weight: FontWeight::Normal,
                 };
                 j += 1;
             }

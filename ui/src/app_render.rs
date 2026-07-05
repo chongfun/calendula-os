@@ -40,6 +40,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         refresh_policy: ui_refresh_policy(request.refresh_policy),
         font_size: request.font_size,
         line_spacing: request.line_spacing,
+        font_weight: request.font_weight,
         selection: request.selection,
         chapter: request.chapter,
         chapter_title: model.chapter_title,
