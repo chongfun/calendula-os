@@ -759,6 +759,38 @@ enum LandscapeHomeVariant {
     BookFirst,
 }
 
+/// The landscape home mockups and the `--design-mockups` studies are authored
+/// in an 800x480 design space (the X4 panel). On a board with a different
+/// panel, center that design on the actual framebuffer so the composition
+/// keeps its proportions instead of anchoring to the top-left corner; the
+/// outermost design margins clip. A no-op on the X4, where the design space
+/// already matches the panel.
+pub(crate) fn fit_design_to_board(fb: &mut Framebuffer) {
+    const DESIGN_W: i16 = 800;
+    const DESIGN_H: i16 = 480;
+    let dx = (WIDTH as i16 - DESIGN_W) / 2;
+    let dy = (HEIGHT as i16 - DESIGN_H) / 2;
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let mut src = vec![true; WIDTH * HEIGHT];
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            src[y * WIDTH + x] = fb.pixel(x, y);
+        }
+    }
+    fb.clear(true);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let tx = x as i16 + dx;
+            let ty = y as i16 + dy;
+            if tx >= 0 && ty >= 0 && (tx as usize) < WIDTH && (ty as usize) < HEIGHT {
+                fb.set_pixel(tx as usize, ty as usize, src[y * WIDTH + x]);
+            }
+        }
+    }
+}
+
 fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
     fb.clear(true);
     match variant {
@@ -789,6 +821,7 @@ fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
         LandscapeHomeVariant::Tabs => draw_landscape_home_tabs(fb),
         LandscapeHomeVariant::BookFirst => draw_landscape_home_book_first(fb),
     }
+    fit_design_to_board(fb);
 }
 
 fn draw_landscape_home_rail(fb: &mut Framebuffer) {
