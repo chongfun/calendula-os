@@ -128,24 +128,37 @@
   }
   .body {
     display: flex;
-    gap: clamp(10px, 1.8vw, 18px);
+    gap: clamp(20px, 3.2vw, 34px);
     align-items: stretch;
   }
   .sidekeys {
     position: relative;
-    width: clamp(16px, 2.4vw, 22px);
+    width: clamp(20px, 3vw, 27px);
     flex: none;
   }
-  /* Two long two-in-one bars. The firmware draws the key legend at panel
-     rows 120/200/280/360 of 480; each rocker half sits level with its
-     row, so the bars center at 33.3% and 66.7% and each spans a third of
-     the panel height. */
-  .rocker {
+  /* Two long two-in-one bars, each seated in a recessed notch that
+     wraps around it, as on the hardware chin. Halves still land near
+     the legend rows the firmware draws for them. */
+  .slot {
     position: absolute;
     left: 0;
     width: 100%;
-    height: 33.4%;
+    height: 34%;
     transform: translateY(-50%);
+    padding: 3px;
+    box-sizing: border-box;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #c3c0ba, #cfccc6 20%, #cfccc6 80%, #d8d6d1);
+    box-shadow:
+      0 1px 3px rgba(50,46,38,.28) inset,
+      0 1px 0 rgba(255,255,255,.65);
+  }
+  .slot.s1 { top: 32%; }
+  .slot.s2 { top: 68%; }
+  .rocker {
+    position: relative;
+    width: 100%;
+    height: 100%;
     display: flex;
     flex-direction: column;
     background: linear-gradient(180deg, var(--key-edge), var(--key) 60%);
@@ -156,8 +169,6 @@
       0 2px 3px rgba(90,84,70,.30);
     overflow: hidden;
   }
-  .rocker.r1 { top: 33.33%; }
-  .rocker.r2 { top: 66.67%; }
   .rocker button,
   .edgetab button {
     appearance: none;
@@ -273,14 +284,14 @@
 <div class="device" aria-label="Simulated Xteink X4 e-reader">
   <div class="body">
     <div class="sidekeys">
-      <div class="rocker r1">
+      <div class="slot s1"><div class="rocker">
         <button id="k-back" title="Upper half — the screen names it" aria-label="Top rocker, upper half"></button>
         <button id="k-ok" title="Lower half — the screen names it" aria-label="Top rocker, lower half"></button>
-      </div>
-      <div class="rocker r2">
+      </div></div>
+      <div class="slot s2"><div class="rocker">
         <button id="k-prev" title="Upper half — the screen names it" aria-label="Bottom rocker, upper half"></button>
         <button id="k-next" title="Lower half — the screen names it" aria-label="Bottom rocker, lower half"></button>
-      </div>
+      </div></div>
     </div>
     <div class="screen"><canvas id="panel" width="800" height="480"></canvas></div>
   </div>
