@@ -163,64 +163,10 @@ pub(crate) fn dismantle_scratch(
             tcp_tx: core::slice::from_raw_parts_mut(compressed_ptr, READER_COMPRESSED_SCRATCH),
             http_a: core::slice::from_raw_parts_mut(container_ptr, READER_CONTAINER_SCRATCH),
             http_b: core::slice::from_raw_parts_mut(tail_ptr, READER_TAIL_SCRATCH),
-            book: None,
             wifi: None,
             catalog_len: 0,
         }
     }
-}
-
-/// KOReader's partial-MD5 document id for a catalog entry's EPUB file,
-/// computed in its own SD session. Eleven 1 KB samples, so this costs a
-/// few SD reads, not a file scan.
-#[inline(never)]
-pub(crate) fn partial_md5_for_index(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    library: &ReaderStore,
-    index: usize,
-) -> Option<[u8; 16]> {
-    let entry = library.catalog_entry(index)?;
-    let mut open_name = String::<16>::new();
-    let _ = open_name.push_str(&entry.open_name);
-    let in_books_dir = entry.in_books_dir;
-    sd_session::with_root(epd, sd_cs, |root| {
-        if in_books_dir {
-            let books = root.open_dir("BOOKS").ok()?;
-            let file = books
-                .open_file_in_dir(open_name.as_str(), Mode::ReadOnly)
-                .ok()?;
-            Some(partial_md5_of_file(&file))
-        } else {
-            let file = root
-                .open_file_in_dir(open_name.as_str(), Mode::ReadOnly)
-                .ok()?;
-            Some(partial_md5_of_file(&file))
-        }
-    })
-    .ok()
-    .flatten()
-}
-
-fn partial_md5_of_file<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-) -> [u8; 16]
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    proto::kosync::partial_md5(&mut |offset, out| {
-        if offset >= file.length() || file.seek_from_start(offset).is_err() {
-            return 0;
-        }
-        file.read(out).unwrap_or(0)
-    })
 }
 
 /// Kept out of line: the storage dispatcher's frame must stay small, and the

@@ -32,19 +32,21 @@ The resolved page-level reading plan produced from Reader store blocks, typograp
 
 Use this term for the deepened pagination/rendering seam that firmware reading views and host preview tooling should share. Avoid duplicating wrapping, style-marker interpretation, and page slicing separately in preview and firmware render paths.
 
-### Sync session
+### Wireless session
 
-The one-way Wi-Fi mode that exchanges reading progress with a kosync
-server, then keeps serving the browser shelf page (catalog listing, EPUB
-upload, book removal) until the done press. Entering it loans the EPUB
-scratch (plus the dram2 segment) to the radio as heap, so the reader
-pipeline is gone until the session ends in a software reset. The display
-task keeps serving renders, progress writes, and upload writes during the
-session; it refuses every scratch-using storage command.
+The one-way Wi-Fi mode behind the Wireless screen: join the saved
+network and serve the browser shelf page (catalog listing, EPUB upload,
+book removal) until the done press, or run the onboarding portal when no
+network is saved. Entering it loans the EPUB scratch (plus the dram2
+segment) to the radio as heap, so the reader pipeline is gone until the
+session ends in a software reset. The display task keeps serving
+renders, progress writes, and upload writes during the session; it
+refuses every scratch-using storage command.
 
-Use this term for the wifi task's lifecycle. Keep kosync protocol encoding
-(`proto::kosync`), the memory loan plumbing (`fw::sync_mem`), and the
-upload streaming plumbing (`fw::upload`) out of radio and UI language.
+Use this term for the wifi task's lifecycle. Keep the captive-portal
+codecs (`proto::captive`), the memory loan plumbing (`fw::sync_mem`), and
+the upload streaming plumbing (`fw::upload`) out of radio and UI
+language.
 
 The session's storage-admission rules — which storage commands may run
 before and after the loan — live in `app_core::SyncSession` beside the

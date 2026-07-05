@@ -27,8 +27,6 @@ struct Step {
     page: Option<u32>,
     sync: Option<String>,
     ip: Option<[u8; 4]>,
-    pushed: Option<bool>,
-    pulled: Option<bool>,
     error: Option<String>,
     ssid: Option<String>,
 }
@@ -215,11 +213,6 @@ fn parse_sync_event(kind: &str, step: &Step) -> Result<SyncEvent, String> {
     match kind {
         "Connecting" | "connecting" => Ok(SyncEvent::Connecting),
         "Connected" | "connected" => Ok(SyncEvent::Connected(step.ip.unwrap_or([192, 168, 1, 2]))),
-        "Syncing" | "syncing" => Ok(SyncEvent::Syncing),
-        "Done" | "done" => Ok(SyncEvent::Done {
-            pushed: step.pushed.unwrap_or(true),
-            pulled: step.pulled.unwrap_or(false),
-        }),
         "PortalUp" | "portal-up" => Ok(SyncEvent::PortalUp),
         "Serving" | "serving" => Ok(SyncEvent::Serving(step.ip.unwrap_or([192, 168, 0, 233]))),
         "NetworkSaved" | "network-saved" => Ok(SyncEvent::NetworkSaved(
@@ -239,12 +232,9 @@ fn parse_sync_event(kind: &str, step: &Step) -> Result<SyncEvent, String> {
 
 fn parse_sync_error(value: &str) -> Result<SyncError, String> {
     match value {
-        "no-credentials" => Ok(SyncError::NoCredentials),
         "radio" => Ok(SyncError::RadioInit),
         "join" => Ok(SyncError::Join),
         "dhcp" => Ok(SyncError::Dhcp),
-        "server" => Ok(SyncError::Server),
-        "protocol" => Ok(SyncError::Protocol),
         _ => Err(format!("unknown sync error: {value}")),
     }
 }
@@ -257,8 +247,6 @@ fn sync_status_name(status: SyncStatus) -> &'static str {
         SyncStatus::Starting => "starting",
         SyncStatus::Connecting => "connecting",
         SyncStatus::Connected(_) => "connected",
-        SyncStatus::Syncing => "syncing",
-        SyncStatus::Done { .. } => "done",
         SyncStatus::PortalUp => "portal-up",
         SyncStatus::Serving(_) => "serving",
         SyncStatus::CredentialsSaved => "credentials-saved",

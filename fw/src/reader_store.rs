@@ -846,15 +846,6 @@ impl ReaderStore {
         self.toc_count
     }
 
-    /// 0-based spine index a TOC chapter resolved to; `None` when the
-    /// entry never matched a spine item.
-    pub(crate) fn toc_spine_index(&self, chapter: usize) -> Option<u16> {
-        if chapter >= self.toc_count {
-            return None;
-        }
-        u16::try_from(self.toc[chapter].spine_index).ok()
-    }
-
     pub(crate) fn toc_item(&self, index: usize) -> Option<TocItem<'_>> {
         if index >= self.toc_count {
             return None;

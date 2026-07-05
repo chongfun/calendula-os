@@ -438,9 +438,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         UiSyncStatus::NotConfigured => dash_key(fb, 1, "set up", true),
         UiSyncStatus::ForgetPending => dash_key(fb, 1, "forget", true),
         UiSyncStatus::Error(_) => dash_key(fb, 1, "again", true),
-        UiSyncStatus::Done { .. } | UiSyncStatus::CredentialsSaved | UiSyncStatus::Serving(_) => {
-            dash_key(fb, 1, "done", true)
-        }
+        UiSyncStatus::CredentialsSaved | UiSyncStatus::Serving(_) => dash_key(fb, 1, "done", true),
         _ => dash_unused(fb, 1),
     }
     match shell.sync_status {
@@ -472,7 +470,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
-                "connect to sync progress and manage books over wi-fi",
+                "connect to add and manage books from your browser",
                 HEADING_CX,
                 hint_y,
             );
@@ -508,25 +506,6 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             push_str(&mut buf, &mut cursor, "connected at ");
             push_ipv4(&mut buf, &mut cursor, ip);
             centered_note(fb, text_in(&buf, cursor));
-        }
-        UiSyncStatus::Syncing => {
-            centered_note(fb, "syncing reading progress \u{2026}");
-        }
-        UiSyncStatus::Done { pushed, pulled } => {
-            centered_note(fb, "progress synced");
-            let detail = match (pushed, pulled) {
-                (true, true) => "position exchanged with the server",
-                (true, false) => "position sent to the server",
-                (false, true) => "position updated from the server",
-                (false, false) => "nothing to exchange",
-            };
-            draw_text_centered(
-                fb,
-                literata_small(FontStyle::Italic),
-                detail,
-                HEADING_CX,
-                hint_y,
-            );
         }
         UiSyncStatus::PortalUp => {
             // The QR joins the open hotspot; the captive DNS then raises

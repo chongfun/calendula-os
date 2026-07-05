@@ -1,6 +1,6 @@
-# Walk the whole sync session: Previous opens Sync from Home, Confirm
-# starts it, and scripted wifi-task events advance the screen through
-# connecting, connected, syncing, and the final done summary.
+# Walk the whole wireless session: Previous opens Wireless from Home,
+# Confirm connects, and scripted wifi-task events advance the screen
+# through connecting and connected to the serving book shelf.
 
 [[steps]]
 button = "Previous"
@@ -16,13 +16,9 @@ sync = "Connected"
 ip = [192, 168, 1, 23]
 
 [[steps]]
-sync = "Syncing"
-
-[[steps]]
-sync = "Done"
-pushed = true
-pulled = true
+sync = "Serving"
+ip = [192, 168, 1, 23]
 
 [expect]
 view = "Wireless"
-sync_status = "done"
+sync_status = "serving"

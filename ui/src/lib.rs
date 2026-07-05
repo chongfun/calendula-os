@@ -41,8 +41,6 @@ pub enum UiSyncStatus {
     Starting,
     Connecting,
     Connected([u8; 4]),
-    Syncing,
-    Done { pushed: bool, pulled: bool },
     PortalUp,
     Serving([u8; 4]),
     CredentialsSaved,

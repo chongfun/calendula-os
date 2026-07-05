@@ -73,8 +73,6 @@ fn ui_sync_status(status: SyncStatus) -> UiSyncStatus {
         SyncStatus::Starting => UiSyncStatus::Starting,
         SyncStatus::Connecting => UiSyncStatus::Connecting,
         SyncStatus::Connected(ip) => UiSyncStatus::Connected(ip),
-        SyncStatus::Syncing => UiSyncStatus::Syncing,
-        SyncStatus::Done { pushed, pulled } => UiSyncStatus::Done { pushed, pulled },
         SyncStatus::PortalUp => UiSyncStatus::PortalUp,
         SyncStatus::Serving(ip) => UiSyncStatus::Serving(ip),
         SyncStatus::CredentialsSaved => UiSyncStatus::CredentialsSaved,
@@ -84,12 +82,9 @@ fn ui_sync_status(status: SyncStatus) -> UiSyncStatus {
 
 fn sync_error_label(error: SyncError) -> &'static str {
     match error {
-        SyncError::NoCredentials => "no credentials",
         SyncError::RadioInit => "radio failed",
         SyncError::Join => "wi-fi join failed",
         SyncError::Dhcp => "no network address",
-        SyncError::Server => "server unreachable",
-        SyncError::Protocol => "server answered oddly",
     }
 }
 

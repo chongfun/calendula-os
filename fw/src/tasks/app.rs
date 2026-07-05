@@ -4,7 +4,7 @@ use crate::{
     LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS, SYNC_COMMANDS,
     SYNC_EVENTS,
 };
-use app_core::{AppView, ReaderState, ReducerContext, SyncError, SyncStatus};
+use app_core::{AppView, ReaderState, ReducerContext, SyncStatus};
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select4, Either4};
 use embassy_time::{Duration, Instant};
@@ -443,8 +443,7 @@ fn reducer_context() -> ReducerContext {
 
 /// Confirm on the Wireless screen arms `Starting`; leaving the screen after
 /// the radio ran has to reset the device because the loaned memory can
-/// never come back. `Error(NoCredentials)` is the one failure that
-/// happens before the radio touches anything.
+/// never come back.
 fn sync_command_for_transition(previous: &ReaderState, next: &ReaderState) -> Option<SyncCommand> {
     if previous.sync_status != SyncStatus::Starting && next.sync_status == SyncStatus::Starting {
         return Some(SyncCommand::Start);
@@ -452,10 +451,7 @@ fn sync_command_for_transition(previous: &ReaderState, next: &ReaderState) -> Op
     if previous.view == AppView::Wireless && next.view != AppView::Wireless {
         let radio_ran = !matches!(
             previous.sync_status,
-            SyncStatus::NotConfigured
-                | SyncStatus::Idle
-                | SyncStatus::ForgetPending
-                | SyncStatus::Error(SyncError::NoCredentials)
+            SyncStatus::NotConfigured | SyncStatus::Idle | SyncStatus::ForgetPending
         );
         if radio_ran {
             return Some(SyncCommand::Exit);

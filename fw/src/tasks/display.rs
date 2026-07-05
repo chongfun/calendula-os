@@ -380,7 +380,7 @@ fn handle_storage_command(
 ) {
     let is_open_book = matches!(command, StorageCommand::OpenBook { .. });
     // The session decides what may run: progress writes stay alive during a
-    // sync session (kosync pulls can move the saved position); everything
+    // sync session (they are cheap and harmless); everything
     // that touches the EPUB scratch is gone until the session's reset.
     if !sync_session.admits(&command) {
         esp_println::println!("storage: refused during sync session");
@@ -388,8 +388,8 @@ fn handle_storage_command(
     }
     match command {
         StorageCommand::LoanSyncMemory => {
-            // The kosync exchange must see the freshest position, and the
-            // book info gather below reads it back from STATE.BIN.
+            // The session only ends in a reset, so any coalesced position
+            // must reach the card before the scratch is dismantled.
             flush_pending_progress(
                 epd,
                 sd_cs,
@@ -397,14 +397,12 @@ fn handle_storage_command(
                 pending_progress,
                 last_progress_write,
             );
-            let book = gather_sync_book_info(epd, sd_cs, sd_library, epub_scratch);
             ensure_epub_scratch(epub_scratch);
             let Some(scratch) = epub_scratch.take() else {
                 return;
             };
             sync_session.loan_granted();
             let mut loan = reader_cache::dismantle_scratch(scratch);
-            loan.book = book;
             loan.wifi = reader_cache::load_wifi_credentials(epd, sd_cs).map(|record| {
                 app_core::WifiCredentials {
                     ssid: record.ssid,
@@ -791,80 +789,6 @@ fn send_resumed_position(
         font_weight: request.font_weight as u8,
         font_family: request.font_family as u8,
     });
-}
-
-/// The saved book's kosync identity and position, gathered while this
-/// task still owns SD access and the scratch. Loads the book through the
-/// ordinary cache path if this boot has not yet (a v2 cache hit costs
-/// tens of milliseconds), because the position math needs page counts.
-#[inline(never)]
-fn gather_sync_book_info(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    sd_library: &mut ReaderStore,
-    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
-) -> Option<crate::sync_mem::SyncBookInfo> {
-    let record = reader_cache::load_app_state(epd, sd_cs)?;
-    let hint = ReaderSource::from_book_id(record.book_id).sd_index();
-    let catalog_index = crate::library_sd::find_index_by_identity(
-        epd,
-        sd_cs,
-        record.source_hash,
-        record.source_size,
-        hint,
-    )?;
-    let index = usize::from(catalog_index);
-    // Stage the book's catalog entry so the cache path and partial_md5 below
-    // resolve it from the card, not the list window.
-    crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index);
-    if sd_library.loaded_index != Some(index) {
-        let scratch = ensure_epub_scratch(epub_scratch);
-        reader_cache::build_or_load_book_cache(
-            epd,
-            sd_cs,
-            sd_library,
-            index,
-            record.chapter.min(u8::MAX as u16) as u8,
-            record.screen as usize,
-            scratch,
-        );
-        if sd_library.loaded_index != Some(index) {
-            esp_println::println!("sync: saved book failed to load");
-            return None;
-        }
-    }
-    let page_count = sd_library.advertised_page_count().max(1);
-    let position = (record.screen + 1).min(page_count);
-    let percent_permille = ((u64::from(position) * 1000) / u64::from(page_count)) as u16;
-    let doc_fragment_1based = sd_library
-        .toc_spine_index(record.chapter as usize)
-        .unwrap_or(record.chapter)
-        + 1;
-    let document_md5 = reader_cache::partial_md5_for_index(epd, sd_cs, sd_library, index)?;
-    Some(crate::sync_mem::SyncBookInfo {
-        document_md5,
-        percent_permille,
-        doc_fragment_1based,
-        page_count,
-        persisted: app_core::PersistedAppState {
-            // The volatile id is rebuilt from the catalog index instead of
-            // trusting last boot's numbering, exactly like state restore.
-            book_id: ReaderSource::sd(catalog_index).book_id(),
-            chapter: record.chapter,
-            screen: record.screen,
-            shell_orientation: record.shell_orientation,
-            reading_orientation: record.reading_orientation,
-            refresh_policy: record.refresh_policy,
-            font_size: record.font_size,
-            line_spacing: record.line_spacing,
-            font_weight: record.font_weight,
-            font_family: record.font_family,
-            source_hash: record.source_hash,
-            source_size: record.source_size,
-        },
-        chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
-        chapter_count: sd_library.chapter_count_for_ui(),
-    })
 }
 
 /// Kept out of line: first-call initialization moves a multi-KB scratch

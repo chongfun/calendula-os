@@ -115,15 +115,14 @@ power_task
 wifi_task
   parked until SyncCommand::Start arrives from the Wireless screen
   requests StorageCommand::LoanSyncMemory, receives the dismantled EPUB
-  scratch as radio heap, joins Wi-Fi in STA mode, exchanges the active
-  book's position with a kosync server, reports SyncEvents to app_task
-  then serves the browser shelf page at the device's LAN address
+  scratch as radio heap, joins Wi-Fi in STA mode, reports SyncEvents to
+  app_task, then serves the browser shelf page at the device's LAN address
   SyncCommand::Exit (the done press) ends the session with a software reset
 ```
 
-## Wi-Fi sync session
+## Wireless session
 
-Sync is a one-way modal session because the radio blob needs ~100 KB of
+The wireless session is one-way and modal because the radio blob needs ~100 KB of
 heap this firmware does not have while reading. `fw::sync_mem` owns the
 plumbing: the display task dismantles the EPUB scratch into raw regions
 (`reader_cache::dismantle_scratch`), and the wifi task donates them plus a
@@ -135,20 +134,14 @@ HTTP buffers. Once loaned, the reader pipeline cannot come back: leaving
 the Wireless screen after the radio ran maps to `SyncCommand::Exit`, which is
 a software reset; boot restore then reloads the saved position.
 
-Progress flows both ways: before the loan, the display task flushes
-pending progress, loads the saved book through the ordinary cache path if
-needed, and ships the kosync identity (KOReader partial-MD5 of the EPUB
-file), position permille, and chapter map with the loan. The wifi task
-fetches the server position first and pulls it only when it is both
-ahead and written by another device; otherwise it pushes ours. A
-pulled position lands through the still-working `StoreProgress` path so it
-survives the session-ending reset. `proto::kosync` holds the sans-IO
-protocol pieces (MD5, partial digest, HTTP request building and response
-parsing) with host tests.
+Before the loan the display task flushes any coalesced reading position
+to STATE.BIN, because the session's only exit is the reset. (An earlier
+iteration also exchanged the position with a kosync server here; that
+shipped unused and was removed — the session is purely a book server.)
 
-The session does not reset right after the kosync exchange: the wifi task
-keeps serving a shelf page at the device's LAN address (the Wireless screen's
-`Serving` status hands out the URL, with Confirm as the done key). The
+Once joined, the wifi task serves a shelf page at the device's LAN
+address (the Wireless screen's `Serving` status hands out the URL, with
+Confirm as the done key). The
 page lists the catalog, shows real upload progress, and offers per-book
 removal. Routes: `GET /` serves the page, `GET /list` returns the catalog
 snapshot shipped with the loan, `POST /upload?name=` streams raw EPUB
@@ -166,8 +159,7 @@ then surfaces the new books.
 
 Station credentials come from `/XTEINK/WIFI.BIN` (written by the
 onboarding portal below), falling back to compile-time `option_env!`
-values (`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`) for dev builds. The kosync
-account stays compile-time for now (`XTEINK_KOSYNC_HOST`/`_USER`/`_PASS`).
+values (`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`) for dev builds.
 At boot the display task reads WIFI.BIN once and reports the saved
 network's name as `SyncEvent::NetworkSaved`, so the Wireless screen can
 show which network is saved and offer connect/forget honestly instead of
@@ -178,7 +170,7 @@ radio is untouched; it drops the screen back to the set-up offer — the
 recovery path for a wrong password or a changed router that used to
 require editing the card on a computer.
 
-With no credentials anywhere, starting sync raises the onboarding portal
+With no credentials anywhere, starting a session raises the onboarding portal
 instead: an open `XTEINK-X4` hotspot at 192.168.4.1 with a captive DHCP
 server, a DNS catch-all (every name resolves to the portal, which makes
 phones raise their sign-in sheet unprompted), and a credential form on

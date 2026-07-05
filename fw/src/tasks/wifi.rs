@@ -1,24 +1,23 @@
-//! The Wi-Fi sync session task.
+//! The Wi-Fi session task behind the Wireless screen.
 //!
 //! Parked until the app sends `SyncCommand::Start`. The session is one
 //! way by design: it asks the display task to loan the reader's scratch
-//! memory (plus dram2) as radio heap, joins the configured network in
-//! STA mode, exchanges the active book's position with a kosync server,
-//! and the only path back to reading is the software reset on
-//! `SyncCommand::Exit`. Credentials are compile-time options for the
-//! dev-bring-up phase; AP-mode onboarding replaces them later.
+//! memory (plus dram2) as radio heap, joins the saved network in STA
+//! mode, and serves the browser book shelf until the session ends; the
+//! only path back to reading is the software reset on
+//! `SyncCommand::Exit`. With no saved network the session runs the
+//! AP-mode onboarding portal instead.
 
-use crate::sync_mem::{self, SyncBookInfo, SyncLoan};
+use crate::sync_mem::{self, SyncLoan};
 use crate::upload::{sanitized_name, UploadBegin, UploadChunk};
 use crate::{
     StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
     SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS,
 };
-use app_core::{PersistedAppState, SyncError, WifiCredentials};
+use app_core::{SyncError, WifiCredentials};
 use embassy_executor::Spawner;
 use embassy_futures::join::join3;
 use embassy_futures::select::select;
-use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{
@@ -35,13 +34,10 @@ use esp_wifi::wifi::{
 };
 use esp_wifi::EspWifiController;
 use proto::captive;
-use proto::kosync;
 
 // Measured first-association joins ran ~21 s; give them headroom.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const DEVICE_NAME: &str = "xteink-x4";
 const PORTAL_SSID: &str = "XTEINK-X4";
 const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
 
@@ -51,16 +47,6 @@ pub fn credentials() -> Option<(&'static str, &'static str)> {
     Some((
         option_env!("XTEINK_WIFI_SSID")?,
         option_env!("XTEINK_WIFI_PASS")?,
-    ))
-}
-
-/// kosync account, also compile-time for now. Host accepts `host` or
-/// `host:port`; plain HTTP, so self-hosted servers are the v1 target.
-fn kosync_account() -> Option<(&'static str, &'static str, &'static str)> {
-    Some((
-        option_env!("XTEINK_KOSYNC_HOST")?,
-        option_env!("XTEINK_KOSYNC_USER")?,
-        option_env!("XTEINK_KOSYNC_PASS")?,
     ))
 }
 
@@ -95,7 +81,6 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         tcp_tx,
         http_a,
         http_b,
-        book,
         wifi: stored_credentials,
         catalog_len,
         ..
@@ -148,52 +133,28 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         park_until_exit().await;
     }
 
-    // The kosync exchange gets heap scratch for responses; the loaned
-    // http_b keeps the catalog listing the display task wrote for /list.
-    let kosync_response: &'static mut [u8] = alloc::vec![0u8; 2048].leak();
     let mut session = Session {
         controller,
         stack,
-        tcp_rx,
-        tcp_tx,
-        http_a,
-        http_b: kosync_response,
-        book,
         started: false,
     };
 
     // First Start already consumed; later Starts are Confirm retries
-    // from the error screen. A completed exchange falls through to the
-    // upload server, which runs until the session's reset.
-    loop {
-        let event = match session.attempt(creds.ssid(), creds.password()).await {
-            Ok(event) => event,
-            Err(error) => SyncEvent::Failed(error),
-        };
-        let done = matches!(event, SyncEvent::Done { .. });
-        send_event(event);
-        if done {
-            break;
+    // from the error screen. A successful join falls through to the
+    // book server, which runs until the session's reset.
+    let ip = loop {
+        match session.attempt(creds.ssid(), creds.password()).await {
+            Ok(ip) => break ip,
+            Err(error) => send_event(SyncEvent::Failed(error)),
         }
         // Start retries the session, Exit resets the device.
         match SYNC_COMMANDS.receive().await {
             SyncCommand::Start => {}
             SyncCommand::Exit => reset_now(),
         }
-    }
+    };
 
-    let Session {
-        stack,
-        tcp_rx,
-        tcp_tx,
-        http_a,
-        controller: _controller,
-        ..
-    } = session;
-    let ip = stack
-        .config_v4()
-        .map(|config| config.address.address().octets())
-        .unwrap_or(PORTAL_IP);
+    let stack = session.stack;
     esp_println::println!("upload: serving at {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
     send_event(SyncEvent::Serving(ip));
     select(
@@ -845,16 +806,12 @@ fn send_event(event: SyncEvent) {
 struct Session {
     controller: WifiController<'static>,
     stack: Stack<'static>,
-    tcp_rx: &'static mut [u8],
-    tcp_tx: &'static mut [u8],
-    http_a: &'static mut [u8],
-    http_b: &'static mut [u8],
-    book: Option<SyncBookInfo>,
     started: bool,
 }
 
 impl Session {
-    async fn attempt(&mut self, ssid: &str, password: &str) -> Result<SyncEvent, SyncError> {
+    /// One join attempt: associate, wait for DHCP, report the address.
+    async fn attempt(&mut self, ssid: &str, password: &str) -> Result<[u8; 4], SyncError> {
         send_event(SyncEvent::Connecting);
         self.join(ssid, password).await?;
 
@@ -876,25 +833,7 @@ impl Session {
             esp_alloc::HEAP.free()
         );
         send_event(SyncEvent::Connected(ip));
-
-        let Some((host_port, username, password)) = kosync_account() else {
-            // Wi-Fi works but there is no server to talk to; report an
-            // honest "nothing exchanged" so the screen has an ending.
-            return Ok(SyncEvent::Done {
-                pushed: false,
-                pulled: false,
-            });
-        };
-        send_event(SyncEvent::Syncing);
-        let key_hex = kosync::hex_digest(kosync::md5(password.as_bytes()));
-        let (host, port) = split_host_port(host_port);
-        let account = kosync::Account {
-            host,
-            port,
-            username,
-            key_hex: &key_hex,
-        };
-        self.exchange(&account).await
+        Ok(ip)
     }
 
     async fn join(&mut self, ssid: &str, password: &str) -> Result<(), SyncError> {
@@ -925,180 +864,5 @@ impl Session {
                 esp_println::println!("wifi: join failed: {:?}", err);
                 SyncError::Join
             })
-    }
-
-    /// GET the server position, then push or pull whichever side is
-    /// ahead. Equal positions exchange nothing.
-    async fn exchange(&mut self, account: &kosync::Account<'_>) -> Result<SyncEvent, SyncError> {
-        // Cloned so the borrow does not pin `self` across the socket work.
-        let Some(book) = self.book.clone() else {
-            return Ok(SyncEvent::Done {
-                pushed: false,
-                pulled: false,
-            });
-        };
-        let book = &book;
-        let document_hex = kosync::hex_digest(book.document_md5);
-        let device_id = kosync::hex_digest(kosync::md5(DEVICE_NAME.as_bytes()));
-
-        let address = self.resolve(account.host).await?;
-
-        let request_len = kosync::build_get_progress_request(self.http_a, account, &document_hex)
-            .ok_or(SyncError::Protocol)?;
-        let response_len = self
-            .http_round_trip(address, account.port, request_len)
-            .await?;
-        let response =
-            kosync::parse_response(&self.http_b[..response_len]).ok_or(SyncError::Protocol)?;
-        let (server_permille, server_is_foreign) = match response.status {
-            200 => {
-                let mut id_buf = [0u8; 32];
-                let foreign = kosync::parse_device_id(response.body, &mut id_buf)
-                    .map(|len| id_buf[..len] != device_id[..len.min(32)])
-                    .unwrap_or(true);
-                (kosync::parse_percentage_permille(response.body), foreign)
-            }
-            // 404/502 from kosync mean "no position stored yet".
-            404 | 502 => (None, false),
-            401 | 403 => return Err(SyncError::Protocol),
-            _ => return Err(SyncError::Protocol),
-        };
-
-        let local_permille = book.percent_permille;
-        // Pulls require a position another device wrote: our own echo
-        // must never move us (otherwise adding books over a sync session
-        // can derail the current read). Pushes keep our record current
-        // either way.
-        let (push, pull) = match server_permille {
-            Some(server) if server > local_permille && server_is_foreign => (false, true),
-            Some(server) if server != local_permille => (true, false),
-            Some(_) => (false, false),
-            None => (true, false),
-        };
-
-        if pull {
-            let server = server_permille.unwrap_or(0);
-            let record = pulled_record(book, server);
-            STORAGE_COMMANDS
-                .send(StorageCommand::StoreProgress(record))
-                .await;
-            esp_println::println!("kosync: pulled permille={}", server);
-        }
-        if push {
-            let request_len = kosync::build_put_progress_request(
-                self.http_a,
-                account,
-                &document_hex,
-                local_permille,
-                book.doc_fragment_1based as usize,
-                DEVICE_NAME,
-                &device_id,
-            )
-            .ok_or(SyncError::Protocol)?;
-            let response_len = self
-                .http_round_trip(address, account.port, request_len)
-                .await?;
-            let response =
-                kosync::parse_response(&self.http_b[..response_len]).ok_or(SyncError::Protocol)?;
-            if !matches!(response.status, 200 | 202) {
-                return Err(SyncError::Protocol);
-            }
-            esp_println::println!("kosync: pushed permille={}", local_permille);
-        }
-        Ok(SyncEvent::Done {
-            pushed: push,
-            pulled: pull,
-        })
-    }
-
-    async fn resolve(&mut self, host: &str) -> Result<IpAddress, SyncError> {
-        if let Ok(address) = host.parse::<core::net::Ipv4Addr>() {
-            return Ok(IpAddress::v4(
-                address.octets()[0],
-                address.octets()[1],
-                address.octets()[2],
-                address.octets()[3],
-            ));
-        }
-        let addresses = with_timeout(HTTP_TIMEOUT, self.stack.dns_query(host, DnsQueryType::A))
-            .await
-            .map_err(|_| SyncError::Server)?
-            .map_err(|_| SyncError::Server)?;
-        addresses.first().copied().ok_or(SyncError::Server)
-    }
-
-    /// One request/response on a fresh connection; both sides use
-    /// `connection: close`, so EOF delimits the response.
-    async fn http_round_trip(
-        &mut self,
-        address: IpAddress,
-        port: u16,
-        request_len: usize,
-    ) -> Result<usize, SyncError> {
-        let mut socket = TcpSocket::new(self.stack, self.tcp_rx, self.tcp_tx);
-        socket.set_timeout(Some(HTTP_TIMEOUT));
-        socket
-            .connect((address, port))
-            .await
-            .map_err(|_| SyncError::Server)?;
-
-        let mut written = 0;
-        while written < request_len {
-            let sent = socket
-                .write(&self.http_a[written..request_len])
-                .await
-                .map_err(|_| SyncError::Server)?;
-            if sent == 0 {
-                return Err(SyncError::Server);
-            }
-            written += sent;
-        }
-
-        let mut filled = 0;
-        loop {
-            if filled == self.http_b.len() {
-                break;
-            }
-            let read = socket
-                .read(&mut self.http_b[filled..])
-                .await
-                .map_err(|_| SyncError::Server)?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
-        socket.close();
-        Ok(filled)
-    }
-}
-
-/// Maps a pulled server position back onto a saved-state record: page
-/// from the permille, chapter from the shipped chapter start pages
-/// (mirroring the app's `sd_chapter_for_page`).
-fn pulled_record(book: &SyncBookInfo, server_permille: u16) -> PersistedAppState {
-    let page_count = book.page_count.max(1);
-    let position = (u64::from(server_permille) * u64::from(page_count)).div_ceil(1000);
-    let screen = (position.max(1) as u32 - 1).min(page_count - 1);
-    let mut chapter = 0u16;
-    for index in 0..usize::from(book.chapter_count) {
-        let start = *book.chapter_pages.get(index).unwrap_or(&0);
-        if u32::from(start) <= screen {
-            chapter = index as u16;
-        } else {
-            break;
-        }
-    }
-    PersistedAppState {
-        chapter,
-        screen,
-        ..book.persisted
-    }
-}
-
-fn split_host_port(host_port: &str) -> (&str, u16) {
-    match host_port.split_once(':') {
-        Some((host, port)) => (host, port.parse().unwrap_or(80)),
-        None => (host_port, 80),
     }
 }

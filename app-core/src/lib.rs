@@ -326,8 +326,8 @@ pub enum StorageCommand {
 /// The sync session's storage-admission rules. Granting the loan is one-way:
 /// the EPUB scratch becomes radio heap, so every scratch-using storage command
 /// is refused from then on and only the session-ending software reset brings
-/// the reader pipeline back. Progress writes stay alive (kosync pulls move the
-/// saved position), the portal stores credentials, and uploads only make sense
+/// the reader pipeline back. Progress writes stay alive (they are cheap and
+/// harmless), the portal stores credentials, and uploads only make sense
 /// while the browser shelf is being served.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SyncSession {
@@ -513,15 +513,10 @@ pub enum SyncStatus {
     Connecting,
     /// Joined and DHCP-configured with this IPv4 address.
     Connected([u8; 4]),
-    Syncing,
-    Done {
-        pushed: bool,
-        pulled: bool,
-    },
     /// The onboarding hotspot is up; the screen shows the join QR.
     PortalUp,
-    /// The exchange finished and the upload server answers at this
-    /// address until the session ends.
+    /// Connected and the book server answers at this address until the
+    /// session ends.
     Serving([u8; 4]),
     /// The portal captured and stored credentials; a fresh session will
     /// use them after the reset.
@@ -531,12 +526,9 @@ pub enum SyncStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncError {
-    NoCredentials,
     RadioInit,
     Join,
     Dhcp,
-    Server,
-    Protocol,
 }
 
 /// wifi task -> app task progress reports for the Wireless screen. The
@@ -550,11 +542,6 @@ pub enum SyncEvent {
     NetworkSaved(WifiSsid),
     Connecting,
     Connected([u8; 4]),
-    Syncing,
-    Done {
-        pushed: bool,
-        pulled: bool,
-    },
     PortalUp,
     Serving([u8; 4]),
     CredentialsSaved(WifiSsid),
@@ -815,13 +802,13 @@ impl ReaderState {
                     next.wifi_ssid_len = 0;
                     next.sync_status = SyncStatus::NotConfigured;
                 }
-                SyncStatus::Done { .. } | SyncStatus::CredentialsSaved | SyncStatus::Serving(_) => {
+                SyncStatus::CredentialsSaved | SyncStatus::Serving(_) => {
                     next.view = AppView::Home;
                     next.selection = 0;
                     next.sync_status = next.wireless_entry_status();
                 }
                 // An in-flight session ignores Confirm until it lands in
-                // Done, CredentialsSaved, or Error.
+                // Serving, CredentialsSaved, or Error.
                 _ => {}
             },
             (AppView::Wireless, Some(Button::Back)) => {
@@ -1016,8 +1003,6 @@ impl ReaderState {
             }
             SyncEvent::Connecting => SyncStatus::Connecting,
             SyncEvent::Connected(ip) => SyncStatus::Connected(ip),
-            SyncEvent::Syncing => SyncStatus::Syncing,
-            SyncEvent::Done { pushed, pulled } => SyncStatus::Done { pushed, pulled },
             SyncEvent::PortalUp => SyncStatus::PortalUp,
             SyncEvent::Serving(ip) => SyncStatus::Serving(ip),
             SyncEvent::CredentialsSaved(ssid) => {
@@ -1310,13 +1295,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_serving_state_follows_done_and_back_exits() {
+    fn sync_serving_state_follows_connect_and_back_exits() {
         let state = with_saved_network(ReaderState::boot());
         let state = press(press(state, Button::Previous), Button::Confirm)
-            .apply_sync_event(SyncEvent::Done {
-                pushed: true,
-                pulled: false,
-            })
+            .apply_sync_event(SyncEvent::Connected([192, 168, 0, 233]))
             .apply_sync_event(SyncEvent::Serving([192, 168, 0, 233]));
         assert_eq!(state.sync_status, SyncStatus::Serving([192, 168, 0, 233]));
         // The screen labels Confirm "done" while serving, so it must exit
@@ -1395,12 +1377,9 @@ mod tests {
         assert_eq!(held.sync_status, SyncStatus::Connecting);
         let state = state.apply_sync_event(SyncEvent::Connected([192, 168, 1, 23]));
         assert_eq!(state.sync_status, SyncStatus::Connected([192, 168, 1, 23]));
-        let state = state.apply_sync_event(SyncEvent::Done {
-            pushed: true,
-            pulled: false,
-        });
+        let state = state.apply_sync_event(SyncEvent::Serving([192, 168, 1, 23]));
 
-        // Done returns Home on Confirm with the entry status restored.
+        // The done press returns Home with the entry status restored.
         let state = press(state, Button::Confirm);
         assert_eq!(state.view, AppView::Home);
         assert_eq!(state.sync_status, SyncStatus::Idle);

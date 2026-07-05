@@ -1,5 +1,5 @@
-# After the exchange the session lingers as a book-upload server; the
-# screen hands out the browser address until done ends the session.
+# The serving screen hands out the browser address until the done press
+# ends the session and returns Home.
 
 [[steps]]
 button = "Previous"
@@ -8,13 +8,12 @@ button = "Previous"
 button = "Confirm"
 
 [[steps]]
-sync = "Done"
-pushed = true
-
-[[steps]]
 sync = "Serving"
 ip = [192, 168, 0, 233]
 
+[[steps]]
+button = "Confirm"
+
 [expect]
-view = "Wireless"
-sync_status = "serving"
+view = "Home"
+sync_status = "idle"

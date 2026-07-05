@@ -1,6 +1,6 @@
 //! Captive-portal protocol pieces for the onboarding hotspot.
 //!
-//! Sans-IO like `kosync`: a minimal DHCP server codec (enough to lease
+//! Sans-IO: a minimal DHCP server codec (enough to lease
 //! addresses to a phone), a DNS catch-all responder (every name resolves
 //! to the portal), and HTTP request parsing for the credential form. The
 //! firmware's wifi task owns the sockets; host tests drive everything

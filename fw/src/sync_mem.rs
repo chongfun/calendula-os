@@ -35,29 +35,9 @@ pub struct RawRegion {
 // loaning side never touches the memory again.
 unsafe impl Send for RawRegion {}
 
-/// The active book's kosync identity and position, gathered by the
-/// display task while it still owns SD access. `None` when no SD book
-/// has a saved position to exchange.
-#[derive(Clone)]
-pub struct SyncBookInfo {
-    /// KOReader partial-MD5 of the EPUB file, the cross-device document id.
-    pub document_md5: [u8; 16],
-    /// Whole-book position, 0..=1000.
-    pub percent_permille: u16,
-    /// 1-based spine index for the DocFragment xpath KOReader jumps to.
-    pub doc_fragment_1based: u16,
-    pub page_count: u32,
-    /// Saved state to base a pulled-position StoreProgress on.
-    pub persisted: app_core::PersistedAppState,
-    /// 0-based chapter start pages, for mapping a pulled page to a chapter.
-    pub chapter_pages: [u16; app_core::MAX_SD_CHAPTERS],
-    pub chapter_count: u8,
-}
-
 /// Everything the display task hands the wifi task: two heap regions
 /// (the dismantled scratch struct and the XHTML window) plus initialized
-/// buffers reused directly as socket and HTTP scratch, and the active
-/// book's sync identity.
+/// buffers reused directly as socket and HTTP scratch.
 pub struct SyncLoan {
     pub heap_a: RawRegion,
     pub heap_b: RawRegion,
@@ -65,7 +45,6 @@ pub struct SyncLoan {
     pub tcp_tx: &'static mut [u8],
     pub http_a: &'static mut [u8],
     pub http_b: &'static mut [u8],
-    pub book: Option<SyncBookInfo>,
     /// Credentials from /XTEINK/WIFI.BIN; `None` sends the wifi task into
     /// the onboarding portal unless the build carries compile-time ones.
     pub wifi: Option<app_core::WifiCredentials>,
