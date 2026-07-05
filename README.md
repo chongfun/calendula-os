@@ -2,12 +2,6 @@
 
 ![Home screen](docs/home.png)
 
-The Xteink X4 is my daily driver for reading ebooks. It is pocket-sized,
-with a 4.3″ e-ink display, a 650 mAh battery, a magnetic back, and an
-SD-card slot prefitted with a 16 GB card. This firmware reads
-full-length EPUBs from the card; books are added and removed through
-your browser. There is no heap allocation in the reading path.
-
 If you would like to explore the OS without flashing a device,
 you may [try it in your browser](https://jon-vii.github.io/xteink-x4-os/),
 the same code compiled to WebAssembly, with simulated e-ink and a selection of public-domain books.
