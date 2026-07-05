@@ -517,13 +517,20 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 160,
                 5,
             );
-            draw_text_centered(
-                fb,
-                literata_small(FontStyle::Regular),
-                "scan to join \u{201c}XTEINK-X4\u{201d}",
-                HEADING_CX,
-                348,
-            );
+            {
+                let mut buf = [0u8; 40];
+                let mut cursor = 0;
+                push_str(&mut buf, &mut cursor, "scan to join \u{201c}");
+                push_str(&mut buf, &mut cursor, display::board::PORTAL_SSID);
+                push_str(&mut buf, &mut cursor, "\u{201d}");
+                draw_text_centered(
+                    fb,
+                    literata_small(FontStyle::Regular),
+                    text_in(&buf, cursor),
+                    HEADING_CX,
+                    348,
+                );
+            }
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),

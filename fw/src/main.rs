@@ -62,10 +62,7 @@ use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use esp_backtrace as _;
-use esp_hal::analog::adc::{
-    Adc, AdcCalCurve, AdcCalScheme, AdcChannel, AdcConfig, AdcPin, Attenuation,
-};
-use esp_hal::gpio::{Input, Level, Output, Pull};
+use esp_hal::analog::adc::{Adc, AdcCalScheme, AdcChannel, AdcPin};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::interrupt::Priority;
 use esp_hal::peripherals::ADC1;
@@ -76,6 +73,7 @@ use esp_hal_embassy::{Executor, InterruptExecutor};
 use static_cell::StaticCell;
 use tasks::input::InputPins;
 
+mod board;
 pub mod catalog;
 mod display_flush;
 mod library_sd;
@@ -145,25 +143,35 @@ fn main() -> ! {
     let peripherals = esp_hal::init(config);
     esp_println::println!("xteink-x4-os: boot");
 
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let timg1 = TimerGroup::new(peripherals.TIMG1);
+    let board::BoardResources {
+        epd_cs,
+        epd_dc,
+        epd_rst,
+        epd_busy,
+        epd_sck,
+        epd_mosi,
+        epd_miso,
+        sd_cs,
+        power_button,
+        mut adc1,
+        aux_adc_pin: aux_adc,
+        nav_adc_pin: mut nav_adc,
+        page_adc_pin: mut page_adc,
+        timg0,
+        timg1,
+        spi2,
+        dma_ch0,
+        sw_interrupt,
+        lpwr,
+        wifi,
+        systimer,
+        rng,
+        radio_clk,
+    } = board::take(peripherals);
+
+    let timg0 = TimerGroup::new(timg0);
+    let timg1 = TimerGroup::new(timg1);
     esp_hal_embassy::init([AnyTimer::from(timg0.timer0), AnyTimer::from(timg1.timer0)]);
-
-    let epd_cs = Output::new(peripherals.GPIO21, Level::High);
-    let epd_dc = Output::new(peripherals.GPIO4, Level::High);
-    let epd_rst = Output::new(peripherals.GPIO5, Level::High);
-    let epd_busy = Input::new(peripherals.GPIO6, Pull::None);
-    let sd_cs = Output::new(peripherals.GPIO12, Level::High);
-    let power_button = Input::new(peripherals.GPIO3, Pull::Up);
-
-    let mut adc_config = AdcConfig::new();
-    let aux_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO0, Attenuation::_11dB);
-    let mut nav_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO1, Attenuation::_11dB);
-    let mut page_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO2, Attenuation::_11dB);
-    let mut adc1 = Adc::new(peripherals.ADC1, adc_config);
 
     // RecoveryBoot escape hatch: holding Back + Up at reset repoints otadata at
     // slot 0 and reboots into it — a way back if the far slot's firmware boots
@@ -185,16 +193,16 @@ fn main() -> ! {
     let dma_rx = esp_hal::dma::DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
     let dma_tx = esp_hal::dma::DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
     let epd_spi = Spi::new(
-        peripherals.SPI2,
+        spi2,
         SpiConfig::default()
-            .with_frequency(40_u32.MHz())
+            .with_frequency(display::board::DISPLAY_SPI_MHZ.MHz())
             .with_mode(esp_hal::spi::Mode::_0),
     )
     .expect("SPI2 config")
-    .with_sck(peripherals.GPIO8)
-    .with_mosi(peripherals.GPIO10)
-    .with_miso(peripherals.GPIO7)
-    .with_dma(peripherals.DMA_CH0)
+    .with_sck(epd_sck)
+    .with_mosi(epd_mosi)
+    .with_miso(epd_miso)
+    .with_dma(dma_ch0)
     .with_buffers(dma_rx, dma_tx)
     .into_async();
     let epd_bus = hal_ext::spi_dma::EpdBus::new(epd_spi, epd_cs, epd_dc, epd_busy, epd_rst);
@@ -203,7 +211,7 @@ fn main() -> ! {
     // keeps running while the thread executor blocks on SD/EPUB work; a
     // cold cache build no longer deafens the buttons. Channels between the
     // tasks already use CriticalSectionRawMutex, so handoff is unchanged.
-    let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    let sw_ints = SoftwareInterruptControl::new(sw_interrupt);
     let input_executor = INPUT_EXECUTOR.init(InterruptExecutor::new(sw_ints.software_interrupt0));
     let input_spawner = input_executor.start(Priority::Priority1);
     esp_println::println!("main: spawn input");
@@ -224,18 +232,12 @@ fn main() -> ! {
         esp_println::println!("main: spawn display");
         spawner.spawn(tasks::display::run(epd_bus, sd_cs)).unwrap();
         esp_println::println!("main: spawn power");
-        spawner.spawn(tasks::power::run(peripherals.LPWR)).unwrap();
+        spawner.spawn(tasks::power::run(lpwr)).unwrap();
         esp_println::println!("main: spawn app");
         spawner.spawn(tasks::app::run()).unwrap();
         esp_println::println!("main: spawn wifi");
         spawner
-            .spawn(tasks::wifi::run(
-                spawner,
-                peripherals.WIFI,
-                peripherals.SYSTIMER,
-                peripherals.RNG,
-                peripherals.RADIO_CLK,
-            ))
+            .spawn(tasks::wifi::run(spawner, wifi, systimer, rng, radio_clk))
             .unwrap();
     })
 }

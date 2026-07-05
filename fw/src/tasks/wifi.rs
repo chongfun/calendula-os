@@ -38,7 +38,7 @@ use proto::captive;
 // Measured first-association joins ran ~21 s; give them headroom.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
-const PORTAL_SSID: &str = "XTEINK-X4";
+const PORTAL_SSID: &str = display::board::PORTAL_SSID;
 const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
 
 /// Compile-time station credentials for the dev phase:

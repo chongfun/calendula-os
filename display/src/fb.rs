@@ -83,14 +83,14 @@ mod tests {
     fn flip_vertical_mirrors_rows() {
         let mut fb = Framebuffer::new();
         fb.set_pixel(0, 0, false);
-        fb.set_pixel(799, 0, false);
+        fb.set_pixel(WIDTH - 1, 0, false);
         fb.set_pixel(13, 7, false);
         fb.set_pixel(400, 239, false);
         fb.set_pixel(401, 240, false);
 
         let mut expected = Framebuffer::new();
         expected.set_pixel(0, HEIGHT - 1, false);
-        expected.set_pixel(799, HEIGHT - 1, false);
+        expected.set_pixel(WIDTH - 1, HEIGHT - 1, false);
         expected.set_pixel(13, HEIGHT - 1 - 7, false);
         expected.set_pixel(400, HEIGHT - 1 - 239, false);
         expected.set_pixel(401, HEIGHT - 1 - 240, false);
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn flip_vertical_twice_is_identity() {
         let mut fb = Framebuffer::new();
-        for (i, x) in [3usize, 99, 200, 798].iter().enumerate() {
+        for (i, x) in [3usize, 99, 200, WIDTH - 2].iter().enumerate() {
             fb.set_pixel(*x, i * 123 % HEIGHT, false);
         }
         let original = *fb.bytes();

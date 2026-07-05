@@ -17,11 +17,7 @@ use esp_alloc::{HeapRegion, MemoryCapability};
 // riscv32imc has no CAS; portable-atomic provides swap on single-core.
 use portable_atomic::{AtomicBool, Ordering};
 
-/// Bytes claimed from `dram2_seg` for the radio heap. The segment is
-/// ~64.8 KB and also hosts the previous-frame framebuffer (below), which
-/// was moved here so esp-wifi's static demand fits in main DRAM without
-/// eating the stack region.
-pub const DRAM2_HEAP_BYTES: usize = 16 * 1024;
+pub(crate) use crate::board::DRAM2_HEAP_BYTES;
 
 /// A loanable byte region described by raw parts. Heap donations use raw
 /// pointers rather than slices because the scratch-struct region is

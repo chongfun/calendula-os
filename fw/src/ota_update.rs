@@ -206,7 +206,8 @@ pub fn run_selftest() -> bool {
 /// mirror `tasks::input`'s NAV/PAGE tables; they're on separate pins, so the
 /// combo is unambiguous.
 pub fn recovery_combo_held(nav_mv: u16, page_mv: u16) -> bool {
-    (2400..=2700).contains(&nav_mv) && (1500..=1800).contains(&page_mv)
+    crate::board::RECOVERY_NAV_MV.contains(&nav_mv)
+        && crate::board::RECOVERY_PAGE_MV.contains(&page_mv)
 }
 
 /// Boot-time escape hatch (the FreeInk SDK `RecoveryBoot` pattern): when the

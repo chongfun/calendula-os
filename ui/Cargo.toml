@@ -3,6 +3,12 @@ name = "ui"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["board-x4"]
+# One board feature must be enabled; it selects ui's baked QR codes and is
+# forwarded to display so both crates agree on a board.
+board-x4 = ["display/board-x4"]
+
 [dependencies]
 app-core = { path = "../app-core" }
 display = { path = "../display" }

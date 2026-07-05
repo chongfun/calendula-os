@@ -1,7 +1,6 @@
 use crate::{DisplayCommand, PowerEvent, DISPLAY_COMMANDS, POWER_EVENTS};
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
-use esp_hal::gpio::{Flex, GpioPin};
 use esp_hal::peripherals::LPWR;
 use esp_hal::rtc_cntl::Rtc;
 
@@ -54,21 +53,11 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
         match POWER_EVENTS.receive().await {
             PowerEvent::DisplayAsleep => {
                 esp_println::println!("power: deep sleep");
-                let mut button = steal_wake_button();
+                let mut button = crate::board::steal_wake_button();
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
             PowerEvent::Activity => return,
             PowerEvent::DisplaySettled | PowerEvent::SleepNow => {}
         }
     }
-}
-
-/// Re-materialises the Power button (GPIO3) as a deep-sleep wake source.
-///
-/// SAFETY: only reached on the terminal deep-sleep path. The input task's
-/// `Input<'static>` handle on GPIO3 is about to be torn down by the chip reset
-/// that ends deep sleep, so this second handle never coexists with a live one.
-#[allow(unsafe_code)]
-fn steal_wake_button() -> Flex<'static> {
-    Flex::new(unsafe { GpioPin::<3>::steal() })
 }

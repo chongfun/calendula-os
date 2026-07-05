@@ -5,6 +5,10 @@ edition = "2021"
 default-run = "fw"
 
 [features]
+default = ["board-x4"]
+# One board feature must be enabled; it selects fw::board's active module and
+# is forwarded to the display/ui crates so the whole stack agrees on a board.
+board-x4 = ["display/board-x4", "ui/board-x4"]
 # Temporary on-device validation of the flash + otadata path without an SD card:
 # on first boot, copy the running image into the inactive slot and switch
 # otadata to it. Never enabled in a release build. See fw::ota_update.

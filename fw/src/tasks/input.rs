@@ -1,7 +1,8 @@
+use crate::board::{AuxAdcPin, Band, HardwareButton, NavAdcPin, PageAdcPin, NAV, PAGE};
 use crate::{Button, InputEvent, INPUT_EVENTS};
 use embassy_time::{Instant, Timer};
-use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
-use esp_hal::gpio::{GpioPin, Input};
+use esp_hal::analog::adc::{Adc, AdcCalScheme, AdcPin};
+use esp_hal::gpio::Input;
 use esp_hal::peripherals::ADC1;
 
 // 15 ms polling puts press-to-event latency at 30-45 ms (two debounce
@@ -14,22 +15,13 @@ const DEBOUNCE_TICKS: u8 = 2;
 // ~480 ms between held-button repeats, matching the fast-refresh settle
 // cadence so one repeat advances one displayed page.
 const REPEAT_COOLDOWN_TICKS: u8 = 32;
-const NAV_BACK_MIN_MV: u16 = 2400;
-const NAV_BACK_MAX_MV: u16 = 2700;
 const RAW_LOG_TICKS: u8 = 67;
-
-#[derive(Clone, Copy)]
-struct Band {
-    min: u16,
-    max: u16,
-    button: HardwareButton,
-}
 
 pub struct InputPins {
     pub power: Input<'static>,
-    pub aux_pin: AdcPin<GpioPin<0>, ADC1, AdcCalCurve<ADC1>>,
-    pub nav_pin: AdcPin<GpioPin<1>, ADC1, AdcCalCurve<ADC1>>,
-    pub page_pin: AdcPin<GpioPin<2>, ADC1, AdcCalCurve<ADC1>>,
+    pub aux_pin: AuxAdcPin,
+    pub nav_pin: NavAdcPin,
+    pub page_pin: PageAdcPin,
 }
 
 #[derive(Clone, Copy)]
@@ -44,16 +36,6 @@ struct StableButton {
     current: Option<HardwareButton>,
     ticks: u8,
     cooldown: u8,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HardwareButton {
-    Back,
-    Confirm,
-    Left,
-    Right,
-    Up,
-    Down,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,45 +54,6 @@ enum SideLayout {
 
 const FRONT_LAYOUT: FrontLayout = FrontLayout::BackConfirmLeftRight;
 const SIDE_LAYOUT: SideLayout = SideLayout::PrevNext;
-
-const NAV: &[Band] = &[
-    // X4 front-button ladder on GPIO1. These bands scale Adafruit's current
-    // 16-bit CircuitPython X4 thresholds to the 12-bit esp-hal ADC reads.
-    Band {
-        min: NAV_BACK_MIN_MV,
-        max: NAV_BACK_MAX_MV,
-        button: HardwareButton::Back,
-    },
-    Band {
-        min: 1800,
-        max: 2150,
-        button: HardwareButton::Confirm,
-    },
-    Band {
-        min: 1000,
-        max: 1250,
-        button: HardwareButton::Left,
-    },
-    Band {
-        min: 0,
-        max: 100,
-        button: HardwareButton::Right,
-    },
-];
-
-const PAGE: &[Band] = &[
-    // X4 side-button ladder on GPIO2, scaled from Adafruit's thresholds.
-    Band {
-        min: 1500,
-        max: 1800,
-        button: HardwareButton::Up,
-    },
-    Band {
-        min: 0,
-        max: 100,
-        button: HardwareButton::Down,
-    },
-];
 
 #[embassy_executor::task]
 pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {

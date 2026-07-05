@@ -3,6 +3,11 @@ name = "display"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["board-x4"]
+# One board feature must be enabled; it selects display::board's active module.
+board-x4 = []
+
 [dependencies]
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"

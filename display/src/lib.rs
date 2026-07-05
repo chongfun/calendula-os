@@ -1,6 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod board;
 pub mod merriweather_generated;
 pub mod epd;
 pub mod fb;
@@ -11,15 +12,11 @@ pub mod literata_semibold_generated;
 pub mod literata_sizes_generated;
 pub mod render;
 
-pub const WIDTH: usize = 800;
-pub const HEIGHT: usize = 480;
+pub use board::{BAND_ROWS, HEIGHT, WIDTH};
+
 pub const ROW_BYTES: usize = WIDTH / 8;
 pub const FB_BYTES: usize = ROW_BYTES * HEIGHT;
-pub const BAND_ROWS: usize = 80;
 pub const BAND_BYTES: usize = ROW_BYTES * BAND_ROWS;
-
-const _: () = assert!(FB_BYTES == 48_000);
-const _: () = assert!(BAND_BYTES == 8_000);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {

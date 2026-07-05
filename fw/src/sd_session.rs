@@ -13,12 +13,12 @@ use esp_hal::time::RateExtU32;
 use esp_hal::Async;
 
 /// SD SPI-mode identification must run at 100-400 kHz; data transfer is
-/// specced to 25 MHz. The shared bus otherwise runs at the SSD1677's
-/// 40 MHz, which is out of SD spec entirely and what the read-retry
-/// machinery in the EPUB path was quietly absorbing.
+/// specced to 25 MHz. The shared bus otherwise runs at the display
+/// controller's clock, which is out of SD spec entirely and what the
+/// read-retry machinery in the EPUB path was quietly absorbing.
 const SD_IDENT_FREQ_KHZ: u32 = 400;
 const SD_DATA_FREQ_MHZ: u32 = 20;
-const DISPLAY_FREQ_MHZ: u32 = 40;
+const DISPLAY_FREQ_MHZ: u32 = display::board::DISPLAY_SPI_MHZ;
 
 pub(crate) struct StaticTime;
 
