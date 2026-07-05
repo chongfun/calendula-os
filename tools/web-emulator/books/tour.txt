@@ -32,4 +32,4 @@ The real device syncs reading progress over Wi-Fi with a KOReader-compatible syn
 
 In this simulation the radio is pretend, but the screens are real: open Sync from Home and press Confirm to watch a session connect, exchange progress, and land back at Done.
 
-That is the whole tour. The other two books on the shelf are better company than this one. Press Back, then open the Library.
+That is the whole tour. The other three books on the shelf are better company than this one. Press Back, then open the Library.

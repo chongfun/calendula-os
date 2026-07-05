@@ -17,21 +17,26 @@ pub struct BookSource {
     pub text: &'static str,
 }
 
-pub const SHELF: [BookSource; 3] = [
+pub const SHELF: [BookSource; 4] = [
     BookSource {
         title: "A Short Tour",
         author: "The X4 Firmware",
         text: include_str!("../books/tour.txt"),
     },
     BookSource {
-        title: "Four Fables",
-        author: "After Aesop",
-        text: include_str!("../books/fables.txt"),
+        title: "Alice's Adventures in Wonderland",
+        author: "Lewis Carroll",
+        text: include_str!("../books/alice.txt"),
     },
     BookSource {
-        title: "Paper Light",
-        author: "Verses for E-Ink",
-        text: include_str!("../books/verse.txt"),
+        title: "A Christmas Carol",
+        author: "Charles Dickens",
+        text: include_str!("../books/carol.txt"),
+    },
+    BookSource {
+        title: "Aesop's Fables",
+        author: "Townsend translation",
+        text: include_str!("../books/aesop.txt"),
     },
 ];
 

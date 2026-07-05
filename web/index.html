@@ -84,19 +84,19 @@
     width: min(920px, 100%);
     background: linear-gradient(168deg, var(--bezel-edge), var(--bezel) 30%);
     border: 1px solid var(--bezel-line);
-    border-radius: 26px;
-    padding: clamp(10px, 1.8vw, 18px) clamp(14px, 2.6vw, 26px) clamp(14px, 2.6vw, 26px);
+    border-radius: 30px;
+    padding: clamp(16px, 2.8vw, 28px) clamp(16px, 2.8vw, 28px) clamp(8px, 1.4vw, 14px);
     box-shadow:
       0 1px 0 rgba(255,255,255,.9) inset,
       0 2px 6px rgba(90,84,70,.18),
       0 24px 60px -18px rgba(90,84,70,.45);
   }
-  .topedge {
+  .bottomedge {
     display: flex;
     justify-content: flex-end;
     align-items: center;
     gap: 12px;
-    padding: 2px 2px clamp(8px, 1.4vw, 14px);
+    padding: clamp(8px, 1.4vw, 14px) 2px 2px;
   }
   .body {
     display: flex;
@@ -150,9 +150,9 @@
     appearance: none;
     background: linear-gradient(180deg, var(--key-edge), var(--key) 60%);
     border: 1px solid var(--key-line);
-    border-radius: 10px;
-    width: clamp(30px, 4.6vw, 44px);
-    height: clamp(34px, 5.2vw, 52px);
+    border-radius: 999px;
+    width: clamp(28px, 4.2vw, 40px);
+    height: clamp(44px, 6.8vw, 68px);
     cursor: pointer;
     box-shadow:
       0 1px 0 rgba(255,255,255,.85) inset,
@@ -166,8 +166,8 @@
   }
   button.key:focus-visible { outline: 2px solid var(--led); outline-offset: 2px; }
   button.key.power {
-    width: clamp(44px, 6.5vw, 62px);
-    height: clamp(20px, 2.8vw, 26px);
+    width: clamp(48px, 7vw, 68px);
+    height: clamp(16px, 2.2vw, 20px);
     border-radius: 999px;
   }
 
@@ -226,10 +226,6 @@
 </header>
 
 <div class="device" aria-label="Simulated Xteink X4 e-reader">
-  <div class="topedge">
-    <span class="led" id="led" aria-hidden="true"></span>
-    <button class="key power" id="k-power" title="Power — sleep and wake" aria-label="Power"></button>
-  </div>
   <div class="body">
     <div class="sidekeys">
       <button class="key" id="k-back" title="Top key — the screen names it" aria-label="Top key"></button>
@@ -238,6 +234,10 @@
       <button class="key" id="k-next" title="Bottom key — the screen names it" aria-label="Bottom key"></button>
     </div>
     <div class="screen"><canvas id="panel" width="800" height="480"></canvas></div>
+  </div>
+  <div class="bottomedge">
+    <span class="led" id="led" aria-hidden="true"></span>
+    <button class="key power" id="k-power" title="Power — sleep and wake" aria-label="Power"></button>
   </div>
 </div>
 
@@ -321,7 +321,7 @@
   function putFinal(pixels) {
     ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), WIDTH, HEIGHT), 0, 0);
     if (ghosting) {
-      ctx.globalAlpha = 0.055;
+      ctx.globalAlpha = 0.035;
       ctx.drawImage(ghost, 0, 0);
       ctx.globalAlpha = 1;
     }
