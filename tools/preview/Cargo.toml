@@ -6,9 +6,17 @@ publish = false
 
 [workspace]
 
+[features]
+default = ["board-x4"]
+# Exactly one board feature selects the preview geometry; it is forwarded to
+# the display/ui crates (ui in turn forwards app-core). Render X3 previews with
+# `--no-default-features --features board-x3`.
+board-x4 = ["display/board-x4", "ui/board-x4"]
+board-x3 = ["display/board-x3", "ui/board-x3"]
+
 [dependencies]
-display = { path = "../../display" }
+display = { path = "../../display", default-features = false }
 proto = { path = "../../proto" }
-ui = { path = "../../ui" }
+ui = { path = "../../ui", default-features = false }
 png = "0.17"
 image = { version = "0.25.6", default-features = false, features = ["png", "jpeg"] }

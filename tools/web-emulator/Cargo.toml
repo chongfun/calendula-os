@@ -9,11 +9,20 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["board-x4"]
+# Exactly one board feature selects the emulated panel geometry; it is
+# forwarded to the app-core/display/ui crates. Build the X3 wasm with
+# `--no-default-features --features board-x3` and serve it as
+# `x3_web_emulator.wasm` alongside the X4 build (see web/index.html).
+board-x4 = ["app-core/board-x4", "display/board-x4", "ui/board-x4"]
+board-x3 = ["app-core/board-x3", "display/board-x3", "ui/board-x3"]
+
 [dependencies]
-app-core = { path = "../../app-core" }
-display = { path = "../../display" }
+app-core = { path = "../../app-core", default-features = false }
+display = { path = "../../display", default-features = false }
 proto = { path = "../../proto" }
-ui = { path = "../../ui" }
+ui = { path = "../../ui", default-features = false }
 
 [profile.release]
 opt-level = "s"
