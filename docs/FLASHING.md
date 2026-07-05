@@ -111,13 +111,22 @@ Implemented and verified on host tooling:
 - [x] Reproducible `firmware.bin` + `update.bin` release images
       (`tools/build-release.sh`).
 - [x] `cargo run` flashes the stock-compatible layout.
+- [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
+      (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
+      before any candidate `.bin` is written to the inactive slot. Streaming,
+      no heap; host-tested against synthetic valid and corrupt images.
 
 Not yet done (needed before locked-device install is safe):
 
-- [ ] **In-app recovery/update path** — a Rust port of the FreeInk SDK's
-      otadata switch + SD/OTA firmware flasher, so an update can be applied
-      (and a bad one recovered from) without USB. This is the anti-brick net;
-      it is the single most important remaining piece.
+- [ ] **Flash + otadata write** — wire `proto::ota::validate_image` to real
+      flash access (`esp-storage`) and an otadata switch so a validated image
+      can be written to the inactive slot and selected. Prefer the official
+      `esp-bootloader-esp-idf` crate for the otadata CRC/seq handling over a
+      hand-rolled copy, and validate the switch against the device's real
+      `otadata` (the CRC convention must match the ROM exactly).
+- [ ] **SD update activity** — pick a `.bin` from the card, validate, flash,
+      switch, reset. This is the anti-brick net; it is the single most
+      important remaining piece.
 - [ ] **Boot-time recovery combo** (hold a combo at reset → repoint otadata at
       `ota_0`), mirroring the SDK's `RecoveryBoot`.
 - [ ] **Confirm the stock SD-updater container** and the eFuse-gate assumption
