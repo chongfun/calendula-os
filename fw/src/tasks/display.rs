@@ -81,8 +81,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     // into the inactive OTA slot and reboot into it before the reader starts.
     // Runs here because SD access lives behind this task's shared SPI bus, and
     // the radio is still idle so the flash writes are safe.
-    match crate::sd_session::with_root(&mut epd, &mut sd_cs, crate::ota_update::apply_pending_update)
-    {
+    match crate::sd_session::with_root(
+        &mut epd,
+        &mut sd_cs,
+        crate::ota_update::apply_pending_update,
+    ) {
         Ok(true) => {
             esp_println::println!("display: firmware update staged; resetting");
             embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
@@ -126,10 +129,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
                             if content_context_changed {
                                 crate::library_sd::load_active_entry(
-                                    &mut epd,
-                                    &mut sd_cs,
-                                    sd_library,
-                                    index,
+                                    &mut epd, &mut sd_cs, sd_library, index,
                                 );
                             }
                             // Long TOCs are windowed like the catalog; slide
@@ -271,9 +271,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 // shows the plate through the normal render path (the book
                 // isn't loaded yet), so it is skipped here.
                 if refresh_planner.screen_on() {
-                    if let Some(loading_request) =
-                        open_loading_plate_request(&command, sd_library, refresh_planner.last_request())
-                    {
+                    if let Some(loading_request) = open_loading_plate_request(
+                        &command,
+                        sd_library,
+                        refresh_planner.last_request(),
+                    ) {
                         crate::views::render(fb, loading_request, sd_library);
                         let mode = refresh_planner.mode_for(loading_request);
                         if display_flush::flush(
@@ -419,6 +421,16 @@ fn handle_storage_command(
             }
         }
         StorageCommand::LoadCatalogCache => {
+            // Boot-time probe: name the saved network so the Wireless
+            // screen can offer connect/forget honestly. The command runs
+            // once per boot, before any session can start.
+            if let Some(record) = reader_cache::load_wifi_credentials(epd, sd_cs) {
+                let ssid = app_core::WifiSsid {
+                    bytes: record.ssid,
+                    len: record.ssid_len,
+                };
+                let _ = crate::SYNC_EVENTS.try_send(crate::SyncEvent::NetworkSaved(ssid));
+            }
             if crate::library_sd::load_catalog_cache(epd, sd_cs, sd_library) {
                 // Restored goes out first so the very next Home repaint
                 // already shows the saved book; the Scanned default then
@@ -602,7 +614,13 @@ fn handle_storage_command(
             // The TOC is still in the buffer; resolve the chapter's start page
             // before loading the section overwrites it. Re-ensure the window
             // covers the selection in case it slid since the overview render.
-            reader_cache::ensure_toc_window(epd, sd_cs, sd_library, index as usize, chapter as usize);
+            reader_cache::ensure_toc_window(
+                epd,
+                sd_cs,
+                sd_library,
+                index as usize,
+                chapter as usize,
+            );
             let target_page = sd_library.overview_page_at(chapter as usize);
             let scratch = ensure_epub_scratch(epub_scratch);
             reader_cache::build_or_load_book_cache(
@@ -639,6 +657,10 @@ fn handle_storage_command(
                 },
             );
             esp_println::println!("storage: wifi credentials stored={}", stored);
+        }
+        StorageCommand::ForgetWifiCredentials => {
+            let forgotten = reader_cache::forget_wifi_credentials(epd, sd_cs);
+            esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
         StorageCommand::StoreProgress(record) => {
             let (source_hash, source_size) = source_identity(sd_library, record.book_id);

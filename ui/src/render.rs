@@ -48,7 +48,7 @@ pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         UiView::Home => render_home(fb, shell),
         UiView::Library => render_library(fb, shell),
         UiView::Chapters => render_chapters(fb, shell),
-        UiView::Sync => render_sync(fb, shell),
+        UiView::Wireless => render_wireless(fb, shell),
         UiView::Settings => render_settings(fb, shell),
     }
 }
@@ -63,7 +63,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     dash_key(fb, 0, "library", false);
     dash_key(fb, 1, "continue", true);
-    dash_key(fb, 2, "sync", false);
+    dash_key(fb, 2, "wireless", false);
     dash_key(fb, 3, "settings", false);
 
     // Long titles wrap to a second line that grows upward, keeping the
@@ -427,21 +427,28 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     finish_working_screen(fb, shell);
 }
 
-fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    dash_key(fb, 0, "home", false);
     match shell.sync_status {
-        UiSyncStatus::Idle => dash_key(fb, 1, "sync", true),
+        UiSyncStatus::ForgetPending => dash_key(fb, 0, "cancel", false),
+        _ => dash_key(fb, 0, "home", false),
+    }
+    match shell.sync_status {
+        UiSyncStatus::Idle => dash_key(fb, 1, "connect", true),
         UiSyncStatus::NotConfigured => dash_key(fb, 1, "set up", true),
+        UiSyncStatus::ForgetPending => dash_key(fb, 1, "forget", true),
         UiSyncStatus::Error(_) => dash_key(fb, 1, "again", true),
-        UiSyncStatus::Done { .. }
-        | UiSyncStatus::CredentialsSaved
-        | UiSyncStatus::Serving(_) => dash_key(fb, 1, "done", true),
+        UiSyncStatus::Done { .. } | UiSyncStatus::CredentialsSaved | UiSyncStatus::Serving(_) => {
+            dash_key(fb, 1, "done", true)
+        }
         _ => dash_unused(fb, 1),
     }
-    dash_unused(fb, 2);
+    match shell.sync_status {
+        UiSyncStatus::Idle => dash_key(fb, 2, "forget", false),
+        _ => dash_unused(fb, 2),
+    }
     dash_unused(fb, 3);
-    heading(fb, "Sync");
+    heading(fb, "Wireless");
 
     let hint_y = 280;
     match shell.sync_status {
@@ -456,11 +463,38 @@ fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             );
         }
         UiSyncStatus::Idle => {
-            centered_note(fb, "share reading progress over wi-fi");
+            let mut buf = [0u8; 48];
+            let mut cursor = 0;
+            push_str(&mut buf, &mut cursor, "network \u{201C}");
+            push_str(&mut buf, &mut cursor, shell.wifi_ssid);
+            push_str(&mut buf, &mut cursor, "\u{201D}");
+            centered_note(fb, text_in(&buf, cursor));
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Italic),
+                "connect to sync progress and manage books over wi-fi",
+                HEADING_CX,
+                hint_y,
+            );
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "reading pauses until the device restarts",
+                HEADING_CX,
+                hint_y + 34,
+            );
+        }
+        UiSyncStatus::ForgetPending => {
+            let mut buf = [0u8; 48];
+            let mut cursor = 0;
+            push_str(&mut buf, &mut cursor, "forget \u{201C}");
+            push_str(&mut buf, &mut cursor, shell.wifi_ssid);
+            push_str(&mut buf, &mut cursor, "\u{201D}?");
+            centered_note(fb, text_in(&buf, cursor));
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Italic),
+                "removes the saved wi-fi network \u{00b7} set up runs again next time",
                 HEADING_CX,
                 hint_y,
             );
@@ -548,7 +582,7 @@ fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
-                "press done to restart, then sync again to connect",
+                "press done to restart, then connect from this screen",
                 HEADING_CX,
                 hint_y,
             );
@@ -556,7 +590,7 @@ fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         UiSyncStatus::Error(reason) => {
             let mut buf = [0u8; 64];
             let mut cursor = 0;
-            push_str(&mut buf, &mut cursor, "sync failed \u{00B7} ");
+            push_str(&mut buf, &mut cursor, "could not connect \u{00B7} ");
             push_str(&mut buf, &mut cursor, reason);
             centered_note(fb, text_in(&buf, cursor));
         }

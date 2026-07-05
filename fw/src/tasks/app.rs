@@ -16,6 +16,14 @@ pub async fn run() {
     esp_println::println!("app: started");
     let ctx = reducer_context();
     let mut state = ReaderState::boot();
+    // Compile-time dev credentials name the network immediately; the
+    // display task's boot probe of /XTEINK/WIFI.BIN arrives later and
+    // overrides, matching the wifi task's stored-beats-built-in order.
+    if let Some((ssid, _)) = crate::tasks::wifi::credentials() {
+        if let Some(ssid) = app_core::WifiSsid::from_str(ssid) {
+            state = state.apply_sync_event(app_core::SyncEvent::NetworkSaved(ssid));
+        }
+    }
     let mut rendering = false;
     let mut render_pending = false;
     let mut catalog_refresh_requested = true;
@@ -150,6 +158,12 @@ pub async fn run() {
                         pending_storage = Some(command);
                     }
                 }
+                if let Some(command) = forget_command_for_transition(&previous, &state) {
+                    log_storage_command("send", command);
+                    if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
+                        pending_storage = Some(command);
+                    }
+                }
                 if let Some(command) = sync_command_for_transition(&previous, &state) {
                     esp_println::println!("app: sync command {:?}", command);
                     if SYNC_COMMANDS.try_send(command).is_err() {
@@ -257,7 +271,7 @@ pub async fn run() {
             }
             Either4::Fourth(event) => {
                 state = state.apply_sync_event(event);
-                if state.view != AppView::Sync {
+                if state.view != AppView::Wireless {
                     continue;
                 }
                 if rendering {
@@ -398,6 +412,9 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         StorageCommand::StoreWifiCredentials(_) => {
             esp_println::println!("app: storage {label} wifi credentials")
         }
+        StorageCommand::ForgetWifiCredentials => {
+            esp_println::println!("app: storage {label} forget wifi credentials")
+        }
         StorageCommand::ReceiveUpload => {
             esp_println::println!("app: storage {label} receive upload")
         }
@@ -422,10 +439,9 @@ fn log_storage_command(label: &str, command: StorageCommand) {
 
 fn reducer_context() -> ReducerContext {
     ReducerContext::new(catalog::book_count(), catalog::chapter_count())
-        .with_sync_credentials(crate::tasks::wifi::credentials().is_some())
 }
 
-/// Confirm on the Sync screen arms `Starting`; leaving the screen after
+/// Confirm on the Wireless screen arms `Starting`; leaving the screen after
 /// the radio ran has to reset the device because the loaned memory can
 /// never come back. `Error(NoCredentials)` is the one failure that
 /// happens before the radio touches anything.
@@ -433,11 +449,12 @@ fn sync_command_for_transition(previous: &ReaderState, next: &ReaderState) -> Op
     if previous.sync_status != SyncStatus::Starting && next.sync_status == SyncStatus::Starting {
         return Some(SyncCommand::Start);
     }
-    if previous.view == AppView::Sync && next.view != AppView::Sync {
+    if previous.view == AppView::Wireless && next.view != AppView::Wireless {
         let radio_ran = !matches!(
             previous.sync_status,
             SyncStatus::NotConfigured
                 | SyncStatus::Idle
+                | SyncStatus::ForgetPending
                 | SyncStatus::Error(SyncError::NoCredentials)
         );
         if radio_ran {
@@ -445,6 +462,19 @@ fn sync_command_for_transition(previous: &ReaderState, next: &ReaderState) -> Op
         }
     }
     None
+}
+
+/// Confirming the pending forget on the Wireless screen deletes the saved
+/// credentials from the card. Both states live before any radio work, so
+/// the storage path is still whole.
+fn forget_command_for_transition(
+    previous: &ReaderState,
+    next: &ReaderState,
+) -> Option<StorageCommand> {
+    (previous.sync_status == SyncStatus::ForgetPending
+        && next.sync_status == SyncStatus::NotConfigured
+        && next.view == AppView::Wireless)
+        .then_some(StorageCommand::ForgetWifiCredentials)
 }
 
 fn storage_command_for_transition(

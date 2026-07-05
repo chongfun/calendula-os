@@ -113,7 +113,7 @@ power_task
   asks display_task to sleep the SSD1677, then enters ESP32-C3 deep sleep
 
 wifi_task
-  parked until SyncCommand::Start arrives from the Sync screen
+  parked until SyncCommand::Start arrives from the Wireless screen
   requests StorageCommand::LoanSyncMemory, receives the dismantled EPUB
   scratch as radio heap, joins Wi-Fi in STA mode, exchanges the active
   book's position with a kosync server, reports SyncEvents to app_task
@@ -132,7 +132,7 @@ esp-alloc. The previous-frame framebuffer also lives in dram2 now so
 esp-wifi's static demand fits in main DRAM with the ~41 KB stack region
 intact. The smaller scratch buffers are reused directly as TCP socket and
 HTTP buffers. Once loaned, the reader pipeline cannot come back: leaving
-the Sync screen after the radio ran maps to `SyncCommand::Exit`, which is
+the Wireless screen after the radio ran maps to `SyncCommand::Exit`, which is
 a software reset; boot restore then reloads the saved position.
 
 Progress flows both ways: before the loan, the display task flushes
@@ -147,7 +147,7 @@ protocol pieces (MD5, partial digest, HTTP request building and response
 parsing) with host tests.
 
 The session does not reset right after the kosync exchange: the wifi task
-keeps serving a shelf page at the device's LAN address (the Sync screen's
+keeps serving a shelf page at the device's LAN address (the Wireless screen's
 `Serving` status hands out the URL, with Confirm as the done key). The
 page lists the catalog, shows real upload progress, and offers per-book
 removal. Routes: `GET /` serves the page, `GET /list` returns the catalog
@@ -168,12 +168,21 @@ Station credentials come from `/XTEINK/WIFI.BIN` (written by the
 onboarding portal below), falling back to compile-time `option_env!`
 values (`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`) for dev builds. The kosync
 account stays compile-time for now (`XTEINK_KOSYNC_HOST`/`_USER`/`_PASS`).
+At boot the display task reads WIFI.BIN once and reports the saved
+network's name as `SyncEvent::NetworkSaved`, so the Wireless screen can
+show which network is saved and offer connect/forget honestly instead of
+guessing from build flags. Forget is a two-press flow (the browse key
+arms it, Confirm deletes WIFI.BIN via
+`StorageCommand::ForgetWifiCredentials`) and is only reachable while the
+radio is untouched; it drops the screen back to the set-up offer — the
+recovery path for a wrong password or a changed router that used to
+require editing the card on a computer.
 
 With no credentials anywhere, starting sync raises the onboarding portal
 instead: an open `XTEINK-X4` hotspot at 192.168.4.1 with a captive DHCP
 server, a DNS catch-all (every name resolves to the portal, which makes
 phones raise their sign-in sheet unprompted), and a credential form on
-port 80. The Sync screen shows a baked-at-build-time join QR
+port 80. The Wireless screen shows a baked-at-build-time join QR
 (`tools/generate_qr.py`). Submitted credentials travel to the display
 task as a `StoreWifiCredentials` Copy message, land in WIFI.BIN, and the
 next session joins as a station. `proto::captive` holds the sans-IO

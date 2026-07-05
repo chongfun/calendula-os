@@ -1,9 +1,15 @@
-# First-run onboarding: with no saved network the sync screen offers
-# set up, Confirm raises the hotspot, the portal page captures
-# credentials, and the saved screen tells the reader to sync again.
+# First-run onboarding: forget the saved network first, then set up
+# raises the hotspot, the portal page captures credentials, and the
+# saved screen tells the reader to restart and connect.
 
 [[steps]]
 button = "Previous"
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Confirm"
 
 [[steps]]
 button = "Confirm"
@@ -13,7 +19,8 @@ sync = "PortalUp"
 
 [[steps]]
 sync = "CredentialsSaved"
+ssid = "HOME-WIFI"
 
 [expect]
-view = "Sync"
+view = "Wireless"
 sync_status = "credentials-saved"

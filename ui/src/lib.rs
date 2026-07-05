@@ -12,7 +12,7 @@ pub enum UiView {
     Home,
     Library,
     Chapters,
-    Sync,
+    Wireless,
     Settings,
 }
 
@@ -31,12 +31,13 @@ pub enum UiRefreshPolicy {
     FullEveryTen,
 }
 
-/// Sync screen lifecycle, mirrored from app-core so the renderer stays
+/// Wireless screen lifecycle, mirrored from app-core so the renderer stays
 /// decoupled from reducer types the way UiView mirrors AppView.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiSyncStatus {
     NotConfigured,
     Idle,
+    ForgetPending,
     Starting,
     Connecting,
     Connected([u8; 4]),
@@ -118,4 +119,7 @@ pub struct UiShell<'a> {
     /// Full chapter count on disk, independent of the resident window.
     pub chapters_total: u16,
     pub sync_status: UiSyncStatus,
+    /// The saved Wi-Fi network's name; empty when none is saved. Names
+    /// the network on the Wireless screen's idle and forget states.
+    pub wifi_ssid: &'a str,
 }

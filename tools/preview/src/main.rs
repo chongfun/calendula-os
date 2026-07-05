@@ -1772,13 +1772,14 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         chapters_window_start: 0,
         chapters_total: chapters.len() as u16,
         sync_status: ui::UiSyncStatus::Idle,
+        wifi_ssid: "HOME-WIFI",
     };
     render_shell(&mut fb, &shell);
     write_pbm(&out.join(format!("{name}.pbm")), &fb)?;
     write_png(&out.join(format!("{name}.png")), &fb)?;
     if matches!(
         view,
-        UiView::Home | UiView::Library | UiView::Settings | UiView::Sync
+        UiView::Home | UiView::Library | UiView::Settings | UiView::Wireless
     ) {
         write_portrait_left_png(&out.join(format!("{name}-upright.png")), &fb)?;
     } else {

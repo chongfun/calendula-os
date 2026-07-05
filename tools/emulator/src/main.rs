@@ -205,10 +205,7 @@ impl Emulator {
     pub fn boot(sd_root: Option<PathBuf>) -> Self {
         let mut emu = Self {
             state: app_core::ReaderState::boot(),
-            // Credentials present: scenarios must be able to walk the whole
-            // sync flow; the no-credential screen stays pinned by app-core
-            // unit tests instead of a scenario.
-            ctx: app_core::ReducerContext::new(1, 4).with_sync_credentials(true),
+            ctx: app_core::ReducerContext::new(1, 4),
             refresh_planner: RefreshPlanner::new(),
             panel: PanelModel::new(),
             fb: display::fb::Framebuffer::new(),
@@ -219,6 +216,13 @@ impl Emulator {
             sd_reader_status: EmulatedReaderStatus::Empty,
         };
         emu.panel.init_sequence().expect("panel init");
+        // A saved network, like the firmware's boot probe of WIFI.BIN:
+        // scenarios must be able to walk the whole connect flow. The
+        // no-network screen stays reachable through the forget flow (or
+        // pinned by app-core unit tests).
+        emu.state = emu.state.apply_sync_event(app_core::SyncEvent::NetworkSaved(
+            app_core::WifiSsid::from_str("HOME-WIFI").unwrap(),
+        ));
         emu.render(app_core::RenderKind::Boot);
         emu
     }
@@ -294,6 +298,7 @@ impl Emulator {
             Some(StorageCommand::StoreProgress(_)) => Some("StoreProgress"),
             Some(StorageCommand::LoanSyncMemory) => Some("LoanSyncMemory"),
             Some(StorageCommand::StoreWifiCredentials(_)) => Some("StoreWifiCredentials"),
+            Some(StorageCommand::ForgetWifiCredentials) => Some("ForgetWifiCredentials"),
             Some(StorageCommand::ReceiveUpload) => Some("ReceiveUpload"),
             Some(StorageCommand::LoadChapters { .. }) => Some("LoadChapters"),
             Some(StorageCommand::JumpChapter { .. }) => Some("JumpChapter"),

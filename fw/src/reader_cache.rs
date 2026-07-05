@@ -475,6 +475,15 @@ pub(crate) fn store_wifi_credentials(
 }
 
 #[inline(never)]
+pub(crate) fn forget_wifi_credentials(epd: &mut Epd, sd_cs: &mut Output<'static>) -> bool {
+    #[allow(clippy::redundant_closure)]
+    sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::delete_wifi_file(root)
+    })
+    .unwrap_or(false)
+}
+
+#[inline(never)]
 pub(crate) fn load_wifi_credentials(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
@@ -1678,7 +1687,8 @@ fn push_styled_preview_fragment<
         let kept_len = sink.line.len();
         let kept_ink = sink.line_ink;
         let line_was_empty = sink.line.is_empty();
-        if append_styled_word(&mut sink.line, word, style, sink.line_style, leading_space).is_err() {
+        if append_styled_word(&mut sink.line, word, style, sink.line_style, leading_space).is_err()
+        {
             sink.line.truncate(kept_len);
             flush_styled_preview_line(sink, false);
             let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);

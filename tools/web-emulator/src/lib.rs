@@ -8,7 +8,7 @@ mod books;
 
 use app_core::{
     AppView, Button, InputEvent, LibraryEvent, ReaderSource, RefreshPlanner, RenderKind,
-    StorageCommand, SyncEvent, SyncStatus, MAX_SD_CHAPTERS,
+    StorageCommand, SyncEvent, SyncStatus, WifiSsid, MAX_SD_CHAPTERS,
 };
 use books::{BookStore, SHELF};
 use display::epd::RefreshMode;
@@ -58,7 +58,7 @@ impl WebEmulator {
     fn boot() -> Self {
         let mut emu = Self {
             state: app_core::ReaderState::boot(),
-            ctx: app_core::ReducerContext::new(1, 4).with_sync_credentials(true),
+            ctx: app_core::ReducerContext::new(1, 4),
             planner: RefreshPlanner::new(),
             fb: Framebuffer::new(),
             rgba: vec![0; WIDTH * HEIGHT * 4],
@@ -77,6 +77,12 @@ impl WebEmulator {
                 count: SHELF.len() as u16,
             },
         );
+        // The firmware's boot probe of /XTEINK/WIFI.BIN, pretended: a saved
+        // network so the Wireless screen opens on the connect/forget offer.
+        // Forgetting it exposes the portal flow, which "saves" it back.
+        emu.state = emu
+            .state
+            .apply_sync_event(SyncEvent::NetworkSaved(home_network()));
         emu.render(RenderKind::Boot);
         emu
     }
@@ -131,16 +137,26 @@ impl WebEmulator {
         if self.state.sync_status == SyncStatus::Starting
             && previous.sync_status != SyncStatus::Starting
         {
-            // The real session joins the network and then serves the book
-            // upload page until the user finishes; there is no separate
-            // progress-exchange step to pretend at.
-            self.ops.push((now + 500.0, Op::Sync(SyncEvent::Connecting)));
-            self.ops
-                .push((now + 1600.0, Op::Sync(SyncEvent::Connected([192, 168, 1, 27]))));
-            self.ops
-                .push((now + 2600.0, Op::Sync(SyncEvent::Serving([192, 168, 1, 27]))));
+            if self.state.wifi_network_saved() {
+                // The real session joins the network and then serves the book
+                // upload page until the user finishes; there is no separate
+                // progress-exchange step to pretend at.
+                self.ops.push((now + 500.0, Op::Sync(SyncEvent::Connecting)));
+                self.ops
+                    .push((now + 1600.0, Op::Sync(SyncEvent::Connected([192, 168, 1, 27]))));
+                self.ops
+                    .push((now + 2600.0, Op::Sync(SyncEvent::Serving([192, 168, 1, 27]))));
+            } else {
+                // No saved network: the onboarding hotspot comes up and a
+                // pretend phone submits credentials a few seconds later.
+                self.ops.push((now + 900.0, Op::Sync(SyncEvent::PortalUp)));
+                self.ops.push((
+                    now + 7000.0,
+                    Op::Sync(SyncEvent::CredentialsSaved(home_network())),
+                ));
+            }
         }
-        if self.state.view != AppView::Sync {
+        if self.state.view != AppView::Wireless {
             self.ops.retain(|(_, op)| !matches!(op, Op::Sync(_)));
         }
 
@@ -166,7 +182,7 @@ impl WebEmulator {
             match op {
                 Op::FinishOpen { book_index } => self.finish_open(book_index),
                 Op::Sync(event) => {
-                    if self.state.view == AppView::Sync {
+                    if self.state.view == AppView::Wireless {
                         self.state = self.state.apply_sync_event(event);
                         self.render(RenderKind::Page);
                     }
@@ -375,6 +391,10 @@ impl WebEmulator {
             }
         }
     }
+}
+
+fn home_network() -> WifiSsid {
+    WifiSsid::from_str("HOME-WIFI").unwrap()
 }
 
 fn draw_centered(fb: &mut Framebuffer, font: &'static display::font::BitmapFont, text: &str, y: i16) {

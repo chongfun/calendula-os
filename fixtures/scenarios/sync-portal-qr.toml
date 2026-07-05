@@ -10,5 +10,5 @@ button = "Confirm"
 sync = "PortalUp"
 
 [expect]
-view = "Sync"
+view = "Wireless"
 sync_status = "portal-up"

@@ -735,10 +735,11 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
         return false;
     };
     esp_println::println!("portal: credentials captured for '{}'", credentials.ssid());
+    let ssid = credentials.ssid_message();
     STORAGE_COMMANDS
         .send(StorageCommand::StoreWifiCredentials(credentials))
         .await;
-    send_event(SyncEvent::CredentialsSaved);
+    send_event(SyncEvent::CredentialsSaved(ssid));
     true
 }
 

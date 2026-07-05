@@ -8,15 +8,14 @@ use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::cache::{
     decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
-    decode_section_v2_header, decode_toc, encode_block,
+    decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
     encode_book_v2_header, encode_book_v2_section, encode_page, encode_section_v2_header,
-    decode_toc_chapter, decode_toc_file_header, encode_toc, encode_toc_file_header,
-    section_file_name, BookV2Header,
-    BookV2SectionRecord, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
+    encode_toc, encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord,
+    SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
     BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR,
     CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR,
-    COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES,
-    TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
+    COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES,
+    TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +211,30 @@ where
         .open_file_in_dir(WIFI_FILE, Mode::ReadWriteCreateOrTruncate)
         .map_err(|_| ())?;
     file.write(&record.encode()).map_err(|_| ())
+}
+
+/// Delete /XTEINK/WIFI.BIN; missing file counts as success.
+pub(crate) fn delete_wifi_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) else {
+        return true;
+    };
+    match xteink.delete_file_in_dir(WIFI_FILE) {
+        Ok(()) => true,
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    }
 }
 
 /// Read /XTEINK/WIFI.BIN; None when missing, short, or corrupt.
@@ -537,8 +560,7 @@ where
     };
     let mut file_name = String::<12>::new();
     label_file_name(open_name, &mut file_name);
-    let Ok(file) =
-        labels.open_file_in_dir(file_name.as_str(), Mode::ReadWriteCreateOrTruncate)
+    let Ok(file) = labels.open_file_in_dir(file_name.as_str(), Mode::ReadWriteCreateOrTruncate)
     else {
         return false;
     };
@@ -1189,8 +1211,7 @@ where
         {
             return false;
         }
-        let offset =
-            (TOC_FILE_HEADER_BYTES + chapter as usize * TOC_CHAPTER_RECORD_BYTES) as u32;
+        let offset = (TOC_FILE_HEADER_BYTES + chapter as usize * TOC_CHAPTER_RECORD_BYTES) as u32;
         if file.seek_from_start(offset).is_err() {
             return false;
         }

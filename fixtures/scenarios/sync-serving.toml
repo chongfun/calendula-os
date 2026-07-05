@@ -16,5 +16,5 @@ sync = "Serving"
 ip = [192, 168, 0, 233]
 
 [expect]
-view = "Sync"
+view = "Wireless"
 sync_status = "serving"

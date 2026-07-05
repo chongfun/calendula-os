@@ -1,0 +1,22 @@
+# Forgetting the saved network needs its own Confirm: the browse key
+# arms it, Back cancels it once, and confirming lands on the set-up
+# offer with the network gone.
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Wireless"
+sync_status = "not-configured"

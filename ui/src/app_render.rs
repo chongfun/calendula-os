@@ -57,6 +57,10 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         chapters_window_start: model.chapters_window_start,
         chapters_total: model.chapters_total,
         sync_status: ui_sync_status(request.sync_status),
+        wifi_ssid: core::str::from_utf8(
+            &request.wifi_ssid[..request.wifi_ssid_len.min(32) as usize],
+        )
+        .unwrap_or(""),
     };
     render_shell(fb, &shell);
 }
@@ -65,6 +69,7 @@ fn ui_sync_status(status: SyncStatus) -> UiSyncStatus {
     match status {
         SyncStatus::NotConfigured => UiSyncStatus::NotConfigured,
         SyncStatus::Idle => UiSyncStatus::Idle,
+        SyncStatus::ForgetPending => UiSyncStatus::ForgetPending,
         SyncStatus::Starting => UiSyncStatus::Starting,
         SyncStatus::Connecting => UiSyncStatus::Connecting,
         SyncStatus::Connected(ip) => UiSyncStatus::Connected(ip),
@@ -195,7 +200,7 @@ fn ui_view(view: AppView) -> UiView {
         AppView::Library => UiView::Library,
         AppView::Reading => UiView::Home,
         AppView::Chapters => UiView::Chapters,
-        AppView::Sync => UiView::Sync,
+        AppView::Wireless => UiView::Wireless,
         AppView::Settings => UiView::Settings,
     }
 }

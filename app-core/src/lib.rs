@@ -18,7 +18,9 @@ impl ReaderSource {
     pub fn from_book_id(book_id: u32) -> Self {
         if book_id >= FIRST_SD_BOOK_ID {
             Self::Sd {
-                index: book_id.saturating_sub(FIRST_SD_BOOK_ID).min(u16::MAX as u32) as u16,
+                index: book_id
+                    .saturating_sub(FIRST_SD_BOOK_ID)
+                    .min(u16::MAX as u32) as u16,
             }
         } else {
             Self::BuiltIn { book_id }
@@ -103,7 +105,7 @@ pub enum AppView {
     Library,
     Reading,
     Chapters,
-    Sync,
+    Wireless,
     Settings,
 }
 
@@ -111,7 +113,7 @@ pub enum AppView {
 enum HomeAction {
     Read,
     Files,
-    Sync,
+    Wireless,
     Settings,
 }
 
@@ -253,6 +255,9 @@ pub struct RenderRequest {
     pub battery_percent: u8,
     pub library_count: u16,
     pub sync_status: SyncStatus,
+    /// Saved network name for the Wireless screen; len 0 when none.
+    pub wifi_ssid: [u8; 32],
+    pub wifi_ssid_len: u8,
     pub dirty: Rect,
 }
 
@@ -308,6 +313,10 @@ pub enum StorageCommand {
     /// /XTEINK/WIFI.BIN. Allowed during a sync session: it is the portal
     /// that sends it.
     StoreWifiCredentials(WifiCredentials),
+    /// Delete /XTEINK/WIFI.BIN. Sent when the user confirms "forget" on
+    /// the Wireless screen, which is only reachable before the radio
+    /// starts, so it never runs during a sync session.
+    ForgetWifiCredentials,
     /// Enter the upload session: the display task parks on the upload
     /// channels and writes browser-sent books to /BOOKS until the
     /// session's reset. Sent by the wifi task at the first upload.
@@ -393,6 +402,40 @@ impl WifiCredentials {
     pub fn password(&self) -> &str {
         core::str::from_utf8(&self.password[..self.password_len.min(64) as usize]).unwrap_or("")
     }
+
+    pub fn ssid_message(&self) -> WifiSsid {
+        WifiSsid {
+            bytes: self.ssid,
+            len: self.ssid_len,
+        }
+    }
+}
+
+/// A network name alone, as a bounded Copy message: what the Wireless
+/// screen shows. Events carry this instead of `WifiCredentials` so the
+/// password never travels further than the radio and the card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WifiSsid {
+    pub bytes: [u8; 32],
+    pub len: u8,
+}
+
+impl WifiSsid {
+    pub fn from_str(ssid: &str) -> Option<Self> {
+        if ssid.is_empty() || ssid.len() > 32 {
+            return None;
+        }
+        let mut message = Self {
+            bytes: [0; 32],
+            len: ssid.len() as u8,
+        };
+        message.bytes[..ssid.len()].copy_from_slice(ssid.as_bytes());
+        Some(message)
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len.min(32) as usize]).unwrap_or("")
+    }
 }
 
 // Bounded Copy messages by design: chapter_pages rides inside the event
@@ -452,15 +495,19 @@ pub enum LibraryEvent {
     },
 }
 
-/// Wi-Fi sync session lifecycle as shown on the Sync screen. The wifi task
+/// Wi-Fi session lifecycle as shown on the Wireless screen. The wifi task
 /// owns the radio and reports transitions back as `SyncEvent`s; the reducer
 /// only records what the screen should say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncStatus {
-    /// The firmware was built without Wi-Fi credentials; sync cannot start.
+    /// No Wi-Fi network is saved; Confirm starts the onboarding hotspot.
     NotConfigured,
-    /// Credentials exist and the radio is untouched; Confirm starts.
+    /// A network is saved and the radio is untouched; Confirm connects.
     Idle,
+    /// "Forget this network" awaits its confirmation: Confirm deletes the
+    /// saved credentials, Back cancels. Only reachable from Idle, so the
+    /// radio is still untouched.
+    ForgetPending,
     /// Confirm was pressed: the app shell must emit `SyncCommand::Start`.
     Starting,
     Connecting,
@@ -492,16 +539,25 @@ pub enum SyncError {
     Protocol,
 }
 
-/// wifi task -> app task progress reports for the Sync screen.
+/// wifi task -> app task progress reports for the Wireless screen. The
+/// display task also sends `NetworkSaved` once at boot, after reading
+/// /XTEINK/WIFI.BIN, so the screen can name the saved network before any
+/// session starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncEvent {
+    /// A saved network exists (on the card or compiled in); the screen
+    /// shows its name and offers connect/forget.
+    NetworkSaved(WifiSsid),
     Connecting,
     Connected([u8; 4]),
     Syncing,
-    Done { pushed: bool, pulled: bool },
+    Done {
+        pushed: bool,
+        pulled: bool,
+    },
     PortalUp,
     Serving([u8; 4]),
-    CredentialsSaved,
+    CredentialsSaved(WifiSsid),
     Failed(SyncError),
 }
 
@@ -542,8 +598,6 @@ pub struct PersistedAppState {
 pub struct ReducerContext {
     pub builtin_book_count: u8,
     pub builtin_chapter_count: u8,
-    /// Whether this build carries Wi-Fi credentials for the sync session.
-    pub sync_credentials: bool,
 }
 
 impl ReducerContext {
@@ -551,13 +605,7 @@ impl ReducerContext {
         Self {
             builtin_book_count,
             builtin_chapter_count,
-            sync_credentials: false,
         }
-    }
-
-    pub const fn with_sync_credentials(mut self, present: bool) -> Self {
-        self.sync_credentials = present;
-        self
     }
 }
 
@@ -586,6 +634,11 @@ pub struct ReaderState {
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     pub read_request_pending: bool,
     pub sync_status: SyncStatus,
+    /// The saved Wi-Fi network's name; len 0 means none is saved. Fed by
+    /// `SyncEvent::NetworkSaved` at boot and `CredentialsSaved` from the
+    /// portal, cleared by the forget flow.
+    pub wifi_ssid: [u8; 32],
+    pub wifi_ssid_len: u8,
     pub dirty: Rect,
 }
 
@@ -614,9 +667,20 @@ impl ReaderState {
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             read_request_pending: false,
-            sync_status: SyncStatus::Idle,
+            sync_status: SyncStatus::NotConfigured,
+            wifi_ssid: [0; 32],
+            wifi_ssid_len: 0,
             dirty: Rect::FULL,
         }
+    }
+
+    /// The saved network's name; empty when none is saved.
+    pub fn wifi_ssid(&self) -> &str {
+        core::str::from_utf8(&self.wifi_ssid[..self.wifi_ssid_len.min(32) as usize]).unwrap_or("")
+    }
+
+    pub fn wifi_network_saved(&self) -> bool {
+        self.wifi_ssid_len > 0
     }
 
     pub fn apply_input(self, ctx: ReducerContext, event: InputEvent) -> Self {
@@ -641,7 +705,7 @@ impl ReaderState {
             (_, None) => {}
             (_, Some(Button::Power)) => {}
             (AppView::Home, Some(button)) => {
-                next = apply_home_action(next, ctx, home_action_for_button(button));
+                next = apply_home_action(next, home_action_for_button(button));
             }
             (AppView::Library, Some(Button::Next)) => {
                 next.selection = wrap_next(self.selection, self.library_item_count(ctx));
@@ -679,9 +743,10 @@ impl ReaderState {
                     next.chapter = next.sd_chapter_for_page(next.page);
                     next.selection = next.chapter as u16;
                 } else {
-                    next.chapter =
-                        wrap_next(self.chapter as u16, (ctx.builtin_chapter_count as u16).max(1))
-                            as u8;
+                    next.chapter = wrap_next(
+                        self.chapter as u16,
+                        (ctx.builtin_chapter_count as u16).max(1),
+                    ) as u8;
                     next.selection = next.chapter as u16;
                     next.page = 0;
                 }
@@ -694,9 +759,10 @@ impl ReaderState {
                     next.chapter = next.sd_chapter_for_page(next.page);
                     next.selection = next.chapter as u16;
                 } else {
-                    next.chapter =
-                        wrap_prev(self.chapter as u16, (ctx.builtin_chapter_count as u16).max(1))
-                            as u8;
+                    next.chapter = wrap_prev(
+                        self.chapter as u16,
+                        (ctx.builtin_chapter_count as u16).max(1),
+                    ) as u8;
                     next.selection = next.chapter as u16;
                     next.page = 0;
                 }
@@ -735,33 +801,52 @@ impl ReaderState {
             (AppView::Chapters, Some(Button::Back)) => {
                 next.view = AppView::Reading;
             }
-            (AppView::Sync, Some(Button::Confirm)) => match self.sync_status {
+            (AppView::Wireless, Some(Button::Confirm)) => match self.sync_status {
                 // NotConfigured starts too: with no stored or built-in
                 // credentials the wifi task answers with the onboarding
                 // portal instead of a station join.
                 SyncStatus::NotConfigured | SyncStatus::Idle | SyncStatus::Error(_) => {
                     next.sync_status = SyncStatus::Starting;
                 }
-                SyncStatus::Done { .. }
-                | SyncStatus::CredentialsSaved
-                | SyncStatus::Serving(_) => {
+                // Confirm affirms the forget: the app shell deletes
+                // /XTEINK/WIFI.BIN on this transition.
+                SyncStatus::ForgetPending => {
+                    next.wifi_ssid = [0; 32];
+                    next.wifi_ssid_len = 0;
+                    next.sync_status = SyncStatus::NotConfigured;
+                }
+                SyncStatus::Done { .. } | SyncStatus::CredentialsSaved | SyncStatus::Serving(_) => {
                     next.view = AppView::Home;
                     next.selection = 0;
-                    next.sync_status = sync_entry_status(ctx);
+                    next.sync_status = next.wireless_entry_status();
                 }
                 // An in-flight session ignores Confirm until it lands in
                 // Done, CredentialsSaved, or Error.
                 _ => {}
             },
-            (AppView::Sync, Some(Button::Back)) => {
-                // Leaving after the radio started maps to SyncCommand::Exit
-                // in the app shell, which resets the device; the reducer
-                // still returns Home so the emulator stays navigable.
-                next.view = AppView::Home;
-                next.selection = 0;
-                next.sync_status = sync_entry_status(ctx);
+            (AppView::Wireless, Some(Button::Back)) => {
+                // Back zooms out one level: a pending forget falls back to
+                // the idle screen rather than leaving the view.
+                if self.sync_status == SyncStatus::ForgetPending {
+                    next.sync_status = SyncStatus::Idle;
+                } else {
+                    // Leaving after the radio started maps to
+                    // SyncCommand::Exit in the app shell, which resets the
+                    // device; the reducer still returns Home so the
+                    // emulator stays navigable.
+                    next.view = AppView::Home;
+                    next.selection = 0;
+                    next.sync_status = next.wireless_entry_status();
+                }
             }
-            (AppView::Sync, Some(Button::Previous | Button::Next)) => {}
+            (AppView::Wireless, Some(Button::Previous)) => {
+                // The browse key doubles as "forget" while idle; the
+                // destructive step still needs its Confirm.
+                if self.sync_status == SyncStatus::Idle {
+                    next.sync_status = SyncStatus::ForgetPending;
+                }
+            }
+            (AppView::Wireless, Some(Button::Next)) => {}
             (AppView::Settings, Some(Button::Next)) => {
                 next.selection = wrap_next(self.selection, SETTINGS_ITEMS as u16);
             }
@@ -919,17 +1004,41 @@ impl ReaderState {
 
     pub fn apply_sync_event(mut self, event: SyncEvent) -> Self {
         self.sync_status = match event {
+            // The boot-time probe names the saved network without touching
+            // the session; it only upgrades an untouched screen.
+            SyncEvent::NetworkSaved(ssid) => {
+                self.wifi_ssid = ssid.bytes;
+                self.wifi_ssid_len = ssid.len;
+                match self.sync_status {
+                    SyncStatus::NotConfigured => SyncStatus::Idle,
+                    status => status,
+                }
+            }
             SyncEvent::Connecting => SyncStatus::Connecting,
             SyncEvent::Connected(ip) => SyncStatus::Connected(ip),
             SyncEvent::Syncing => SyncStatus::Syncing,
             SyncEvent::Done { pushed, pulled } => SyncStatus::Done { pushed, pulled },
             SyncEvent::PortalUp => SyncStatus::PortalUp,
             SyncEvent::Serving(ip) => SyncStatus::Serving(ip),
-            SyncEvent::CredentialsSaved => SyncStatus::CredentialsSaved,
+            SyncEvent::CredentialsSaved(ssid) => {
+                self.wifi_ssid = ssid.bytes;
+                self.wifi_ssid_len = ssid.len;
+                SyncStatus::CredentialsSaved
+            }
             SyncEvent::Failed(error) => SyncStatus::Error(error),
         };
         self.dirty = Rect::FULL;
         self
+    }
+
+    /// What the Wireless screen shows on entry, before any session: the
+    /// connect offer when a network is saved, the set-up offer otherwise.
+    pub fn wireless_entry_status(&self) -> SyncStatus {
+        if self.wifi_network_saved() {
+            SyncStatus::Idle
+        } else {
+            SyncStatus::NotConfigured
+        }
     }
 
     pub fn render_request(self, kind: RenderKind) -> RenderRequest {
@@ -955,6 +1064,8 @@ impl ReaderState {
             battery_percent: self.battery_percent,
             library_count: self.library_count,
             sync_status: self.sync_status,
+            wifi_ssid: self.wifi_ssid,
+            wifi_ssid_len: self.wifi_ssid_len,
             dirty: self.dirty,
         }
     }
@@ -1052,24 +1163,12 @@ fn home_action_for_button(button: Button) -> HomeAction {
         // onto the shelf; Confirm affirms continuing to read.
         Button::Back => HomeAction::Files,
         Button::Confirm => HomeAction::Read,
-        Button::Previous => HomeAction::Sync,
+        Button::Previous => HomeAction::Wireless,
         Button::Next | Button::Power => HomeAction::Settings,
     }
 }
 
-fn sync_entry_status(ctx: ReducerContext) -> SyncStatus {
-    if ctx.sync_credentials {
-        SyncStatus::Idle
-    } else {
-        SyncStatus::NotConfigured
-    }
-}
-
-fn apply_home_action(
-    mut state: ReaderState,
-    ctx: ReducerContext,
-    action: HomeAction,
-) -> ReaderState {
+fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState {
     state.selection = 0;
     state.read_request_pending = false;
     match action {
@@ -1087,9 +1186,9 @@ fn apply_home_action(
         HomeAction::Files => {
             state.view = AppView::Library;
         }
-        HomeAction::Sync => {
-            state.view = AppView::Sync;
-            state.sync_status = sync_entry_status(ctx);
+        HomeAction::Wireless => {
+            state.view = AppView::Wireless;
+            state.sync_status = state.wireless_entry_status();
         }
         HomeAction::Settings => {
             state.view = AppView::Settings;
@@ -1174,7 +1273,7 @@ mod tests {
         );
         assert_eq!(
             press(ReaderState::boot(), Button::Previous).view,
-            AppView::Sync
+            AppView::Wireless
         );
         assert_eq!(
             press(ReaderState::boot(), Button::Next).view,
@@ -1182,10 +1281,16 @@ mod tests {
         );
     }
 
+    fn with_saved_network(state: ReaderState) -> ReaderState {
+        state.apply_sync_event(SyncEvent::NetworkSaved(
+            WifiSsid::from_str("latent.space").unwrap(),
+        ))
+    }
+
     #[test]
-    fn sync_without_credentials_starts_the_portal_flow() {
+    fn wireless_without_saved_network_starts_the_portal_flow() {
         let state = press(ReaderState::boot(), Button::Previous);
-        assert_eq!(state.view, AppView::Sync);
+        assert_eq!(state.view, AppView::Wireless);
         assert_eq!(state.sync_status, SyncStatus::NotConfigured);
         let state = press(state, Button::Confirm);
         assert_eq!(state.sync_status, SyncStatus::Starting);
@@ -1194,18 +1299,20 @@ mod tests {
         // Confirm is inert while the portal serves.
         let state = press(state, Button::Confirm);
         assert_eq!(state.sync_status, SyncStatus::PortalUp);
-        let state = state.apply_sync_event(SyncEvent::CredentialsSaved);
+        let state = state.apply_sync_event(SyncEvent::CredentialsSaved(
+            WifiSsid::from_str("latent.space").unwrap(),
+        ));
         assert_eq!(state.sync_status, SyncStatus::CredentialsSaved);
+        // The portal's capture names the network for the rest of the boot.
+        assert_eq!(state.wifi_ssid(), "latent.space");
         let state = press(state, Button::Confirm);
         assert_eq!(state.view, AppView::Home);
     }
 
     #[test]
     fn sync_serving_state_follows_done_and_back_exits() {
-        let ctx = CTX.with_sync_credentials(true);
-        let state = ReaderState::boot()
-            .apply_input(ctx, InputEvent::button(Button::Previous))
-            .apply_input(ctx, InputEvent::button(Button::Confirm))
+        let state = with_saved_network(ReaderState::boot());
+        let state = press(press(state, Button::Previous), Button::Confirm)
             .apply_sync_event(SyncEvent::Done {
                 pushed: true,
                 pulled: false,
@@ -1215,10 +1322,54 @@ mod tests {
         // The screen labels Confirm "done" while serving, so it must exit
         // exactly like Back does (the wifi task defers the reset past any
         // in-flight transfer either way).
-        let confirmed = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        let confirmed = press(state, Button::Confirm);
         assert_eq!(confirmed.view, AppView::Home);
-        let state = state.apply_input(ctx, InputEvent::button(Button::Back));
+        let state = press(state, Button::Back);
         assert_eq!(state.view, AppView::Home);
+    }
+
+    #[test]
+    fn boot_network_probe_names_the_saved_network() {
+        let state = with_saved_network(ReaderState::boot());
+        assert_eq!(state.wifi_ssid(), "latent.space");
+        let state = press(state, Button::Previous);
+        assert_eq!(state.view, AppView::Wireless);
+        assert_eq!(state.sync_status, SyncStatus::Idle);
+    }
+
+    #[test]
+    fn boot_network_probe_upgrades_an_open_wireless_screen() {
+        // The probe races screen entry only when the user opens Wireless
+        // within the first seconds of boot; the screen upgrades in place.
+        let state = press(ReaderState::boot(), Button::Previous);
+        assert_eq!(state.sync_status, SyncStatus::NotConfigured);
+        let state = with_saved_network(state);
+        assert_eq!(state.sync_status, SyncStatus::Idle);
+    }
+
+    #[test]
+    fn forget_needs_its_confirm_and_clears_the_network() {
+        let state = press(with_saved_network(ReaderState::boot()), Button::Previous);
+        let state = press(state, Button::Previous);
+        assert_eq!(state.sync_status, SyncStatus::ForgetPending);
+        // Back cancels without leaving the screen or the network.
+        let cancelled = press(state, Button::Back);
+        assert_eq!(cancelled.view, AppView::Wireless);
+        assert_eq!(cancelled.sync_status, SyncStatus::Idle);
+        assert!(cancelled.wifi_network_saved());
+        // Confirm forgets: the screen falls back to the set-up offer.
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.view, AppView::Wireless);
+        assert_eq!(state.sync_status, SyncStatus::NotConfigured);
+        assert!(!state.wifi_network_saved());
+    }
+
+    #[test]
+    fn forget_is_unreachable_without_a_saved_network() {
+        let state = press(ReaderState::boot(), Button::Previous);
+        assert_eq!(state.sync_status, SyncStatus::NotConfigured);
+        let state = press(state, Button::Previous);
+        assert_eq!(state.sync_status, SyncStatus::NotConfigured);
     }
 
     #[test]
@@ -1231,17 +1382,16 @@ mod tests {
     }
 
     #[test]
-    fn sync_with_credentials_starts_on_confirm_and_tracks_events() {
-        let ctx = CTX.with_sync_credentials(true);
-        let state = ReaderState::boot().apply_input(ctx, InputEvent::button(Button::Previous));
+    fn sync_with_saved_network_starts_on_confirm_and_tracks_events() {
+        let state = press(with_saved_network(ReaderState::boot()), Button::Previous);
         assert_eq!(state.sync_status, SyncStatus::Idle);
-        let state = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        let state = press(state, Button::Confirm);
         assert_eq!(state.sync_status, SyncStatus::Starting);
 
         let state = state.apply_sync_event(SyncEvent::Connecting);
         assert_eq!(state.sync_status, SyncStatus::Connecting);
         // In-flight Confirm presses are ignored.
-        let held = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        let held = press(state, Button::Confirm);
         assert_eq!(held.sync_status, SyncStatus::Connecting);
         let state = state.apply_sync_event(SyncEvent::Connected([192, 168, 1, 23]));
         assert_eq!(state.sync_status, SyncStatus::Connected([192, 168, 1, 23]));
@@ -1251,31 +1401,26 @@ mod tests {
         });
 
         // Done returns Home on Confirm with the entry status restored.
-        let state = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        let state = press(state, Button::Confirm);
         assert_eq!(state.view, AppView::Home);
         assert_eq!(state.sync_status, SyncStatus::Idle);
     }
 
     #[test]
     fn sync_error_can_be_retried_with_confirm() {
-        let ctx = CTX.with_sync_credentials(true);
-        let state = ReaderState::boot()
-            .apply_input(ctx, InputEvent::button(Button::Previous))
-            .apply_input(ctx, InputEvent::button(Button::Confirm))
-            .apply_sync_event(SyncEvent::Failed(SyncError::Join));
+        let state = press(with_saved_network(ReaderState::boot()), Button::Previous);
+        let state =
+            press(state, Button::Confirm).apply_sync_event(SyncEvent::Failed(SyncError::Join));
         assert_eq!(state.sync_status, SyncStatus::Error(SyncError::Join));
-        let state = state.apply_input(ctx, InputEvent::button(Button::Confirm));
+        let state = press(state, Button::Confirm);
         assert_eq!(state.sync_status, SyncStatus::Starting);
     }
 
     #[test]
     fn sync_back_returns_home_and_resets_status() {
-        let ctx = CTX.with_sync_credentials(true);
-        let state = ReaderState::boot()
-            .apply_input(ctx, InputEvent::button(Button::Previous))
-            .apply_input(ctx, InputEvent::button(Button::Confirm))
-            .apply_sync_event(SyncEvent::Connecting)
-            .apply_input(ctx, InputEvent::button(Button::Back));
+        let state = press(with_saved_network(ReaderState::boot()), Button::Previous);
+        let state = press(state, Button::Confirm).apply_sync_event(SyncEvent::Connecting);
+        let state = press(state, Button::Back);
         assert_eq!(state.view, AppView::Home);
         assert_eq!(state.sync_status, SyncStatus::Idle);
     }
@@ -1669,7 +1814,7 @@ mod tests {
     /// One of every StorageCommand variant, so the admission table below is
     /// exhaustive by construction: a new variant fails the count assertion
     /// until it is classified here.
-    fn every_storage_command() -> [StorageCommand; 9] {
+    fn every_storage_command() -> [StorageCommand; 10] {
         let persisted = PersistedAppState {
             book_id: 0,
             chapter: 0,
@@ -1719,6 +1864,7 @@ mod tests {
             StorageCommand::StoreProgress(persisted),
             StorageCommand::LoanSyncMemory,
             StorageCommand::StoreWifiCredentials(credentials),
+            StorageCommand::ForgetWifiCredentials,
         ]
     }
 

@@ -30,6 +30,7 @@ struct Step {
     pushed: Option<bool>,
     pulled: Option<bool>,
     error: Option<String>,
+    ssid: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -221,7 +222,14 @@ fn parse_sync_event(kind: &str, step: &Step) -> Result<SyncEvent, String> {
         }),
         "PortalUp" | "portal-up" => Ok(SyncEvent::PortalUp),
         "Serving" | "serving" => Ok(SyncEvent::Serving(step.ip.unwrap_or([192, 168, 0, 233]))),
-        "CredentialsSaved" | "credentials-saved" => Ok(SyncEvent::CredentialsSaved),
+        "NetworkSaved" | "network-saved" => Ok(SyncEvent::NetworkSaved(
+            app_core::WifiSsid::from_str(step.ssid.as_deref().unwrap_or("HOME-WIFI"))
+                .ok_or_else(|| "bad ssid".to_string())?,
+        )),
+        "CredentialsSaved" | "credentials-saved" => Ok(SyncEvent::CredentialsSaved(
+            app_core::WifiSsid::from_str(step.ssid.as_deref().unwrap_or("HOME-WIFI"))
+                .ok_or_else(|| "bad ssid".to_string())?,
+        )),
         "Failed" | "failed" => Ok(SyncEvent::Failed(parse_sync_error(
             step.error.as_deref().unwrap_or("server"),
         )?)),
@@ -245,6 +253,7 @@ fn sync_status_name(status: SyncStatus) -> &'static str {
     match status {
         SyncStatus::NotConfigured => "not-configured",
         SyncStatus::Idle => "idle",
+        SyncStatus::ForgetPending => "forget-pending",
         SyncStatus::Starting => "starting",
         SyncStatus::Connecting => "connecting",
         SyncStatus::Connected(_) => "connected",
@@ -295,7 +304,7 @@ fn parse_view(value: &str) -> Result<AppView, String> {
         "Library" | "library" => Ok(AppView::Library),
         "Reading" | "reading" => Ok(AppView::Reading),
         "Chapters" | "chapters" => Ok(AppView::Chapters),
-        "Sync" | "sync" => Ok(AppView::Sync),
+        "Wireless" | "wireless" | "Sync" | "sync" => Ok(AppView::Wireless),
         "Settings" | "settings" => Ok(AppView::Settings),
         _ => Err(format!("unknown view: {value}")),
     }
