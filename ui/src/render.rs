@@ -533,26 +533,12 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             );
         }
         UiSyncStatus::Serving(ip) => {
-            centered_note(fb, "send books from your browser");
-            let mut buf = [0u8; 40];
+            let mut buf = [0u8; 56];
             let mut cursor = 0;
-            push_str(&mut buf, &mut cursor, "http://");
+            push_str(&mut buf, &mut cursor, "visit ");
             push_ipv4(&mut buf, &mut cursor, ip);
-            push_str(&mut buf, &mut cursor, "/");
-            draw_text_centered(
-                fb,
-                literata(FontStyle::Regular),
-                text_in(&buf, cursor),
-                HEADING_CX,
-                hint_y,
-            );
-            draw_text_centered(
-                fb,
-                literata_small(FontStyle::Italic),
-                "books appear after the reader restarts \u{00b7} done finishes",
-                HEADING_CX,
-                hint_y + 50,
-            );
+            push_str(&mut buf, &mut cursor, " to add and remove books");
+            centered_note(fb, text_in(&buf, cursor));
         }
         UiSyncStatus::CredentialsSaved => {
             centered_note(fb, "wi-fi saved");
