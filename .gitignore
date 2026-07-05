@@ -7,3 +7,4 @@ Cargo.lock.bak
 .claude/
 /tools/fonts/
 .venv-font/
+/web/x4_web_emulator.wasm

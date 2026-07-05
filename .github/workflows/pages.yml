@@ -1,0 +1,54 @@
+name: Deploy web emulator to Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "tools/web-emulator/**"
+      - "app-core/**"
+      - "display/**"
+      - "ui/**"
+      - "proto/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned nightly, wasm target)
+        run: |
+          rustup toolchain install nightly-2025-10-01 --profile minimal
+          rustup target add wasm32-unknown-unknown --toolchain nightly-2025-10-01
+      - name: Build wasm emulator
+        working-directory: tools/web-emulator
+        run: cargo +nightly-2025-10-01 build --target wasm32-unknown-unknown --release
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp web/index.html _site/
+          cp tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emulator.wasm _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

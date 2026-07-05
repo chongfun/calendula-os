@@ -1,0 +1,22 @@
+[package]
+name = "x4-web-emulator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+app-core = { path = "../../app-core" }
+display = { path = "../../display" }
+proto = { path = "../../proto" }
+ui = { path = "../../ui" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

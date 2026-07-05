@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Xteink X4 — try the firmware in your browser</title>
+<meta name="description" content="The open X4 e-reader firmware, compiled to WebAssembly. Same Rust code, same fonts, same pagination — simulated e-ink included.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #eeece2;
+    --ink: #161614;
+    --desk: #dcd8cd;
+    --desk-deep: #cfcabd;
+    --bezel: #1b1917;
+    --bezel-edge: #34302b;
+    --key: #262320;
+    --key-edge: #3d3833;
+    --label: #6d675c;
+    --led: #c98a2b;
+    --body: "Literata", Georgia, serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --desk: #211e1a;
+      --desk-deep: #191713;
+      --label: #8a8375;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { background: var(--desk); }
+  body {
+    font-family: var(--body);
+    color: var(--ink);
+    background:
+      radial-gradient(120% 90% at 50% 0%, var(--desk) 55%, var(--desk-deep) 100%);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: clamp(16px, 4vw, 48px) clamp(12px, 4vw, 32px) 64px;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: var(--paper); }
+  }
+
+  header {
+    width: 100%;
+    max-width: 880px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: clamp(16px, 3vw, 32px);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    color: var(--label);
+    text-transform: uppercase;
+  }
+  header a {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--label);
+    text-decoration: none;
+    border-bottom: 1px solid color-mix(in srgb, var(--label) 40%, transparent);
+    padding-bottom: 1px;
+  }
+  header a:hover, header a:focus-visible { color: inherit; border-color: currentColor; }
+
+  /* ------------------------------------------------ the device */
+  .device {
+    width: min(880px, 100%);
+    background: linear-gradient(174deg, var(--bezel-edge), var(--bezel) 22%);
+    border-radius: 22px;
+    padding: clamp(14px, 2.6vw, 26px) clamp(14px, 2.6vw, 26px) clamp(10px, 2vw, 18px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.06) inset,
+      0 2px 6px rgba(10,8,5,.35),
+      0 24px 60px -18px rgba(10,8,5,.55);
+  }
+  .screen {
+    position: relative;
+    border-radius: 6px;
+    overflow: hidden;
+    /* recessed panel: glass sits below the bezel lip */
+    box-shadow:
+      0 0 0 1px #0c0b0a,
+      0 2px 10px rgba(0,0,0,.65) inset;
+    background: var(--paper);
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    image-rendering: pixelated;
+  }
+  .keys {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-top: clamp(10px, 1.8vw, 16px);
+  }
+  .led {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #3a352e;
+    margin-right: 6px;
+    transition: background .12s, box-shadow .12s;
+    flex: none;
+  }
+  .led.on {
+    background: var(--led);
+    box-shadow: 0 0 6px 1px color-mix(in srgb, var(--led) 70%, transparent);
+  }
+  .keys .spacer { flex: 1; }
+  button.key {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    color: #a49c8d;
+    background: linear-gradient(180deg, var(--key-edge), var(--key) 55%);
+    border: 1px solid #121110;
+    border-radius: 8px;
+    padding: 10px 0;
+    width: clamp(58px, 9vw, 84px);
+    cursor: pointer;
+    box-shadow: 0 1px 0 rgba(255,255,255,.07) inset, 0 2px 3px rgba(0,0,0,.4);
+    transition: transform .05s;
+    touch-action: manipulation;
+  }
+  button.key:active { transform: translateY(1px); box-shadow: 0 1px 0 rgba(255,255,255,.05) inset; }
+  button.key:focus-visible { outline: 2px solid var(--led); outline-offset: 2px; }
+  button.key.power {
+    width: 40px;
+    border-radius: 50%;
+    height: 40px;
+    padding: 0;
+  }
+
+  /* ------------------------------------------------ page matter */
+  .hints {
+    margin-top: 22px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--label);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 18px;
+    justify-content: center;
+  }
+  .hints kbd {
+    font-family: inherit;
+    border: 1px solid color-mix(in srgb, var(--label) 45%, transparent);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10.5px;
+  }
+  main {
+    max-width: 620px;
+    margin-top: clamp(32px, 6vw, 56px);
+    font-size: 16.5px;
+    line-height: 1.65;
+  }
+  main p + p { text-indent: 1.6em; }
+  main a { color: inherit; }
+  .colophon {
+    margin: clamp(36px, 7vw, 64px) auto 0;
+    max-width: 620px;
+    width: 100%;
+    border-top: 1px solid color-mix(in srgb, var(--label) 35%, transparent);
+    padding-top: 18px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 2;
+    color: var(--label);
+  }
+  .colophon .row { display: flex; justify-content: space-between; gap: 16px; }
+  .colophon .row span:last-child { text-align: right; }
+
+  @media (max-width: 560px) {
+    button.key { font-size: 9.5px; letter-spacing: .08em; }
+    .hints .kbonly { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="eyebrow">Xteink X4 · open firmware</span>
+  <a href="https://github.com/Jon-Vii/xteink-x4-os">source on GitHub</a>
+</header>
+
+<div class="device" aria-label="Simulated Xteink X4 e-reader">
+  <div class="screen"><canvas id="panel" width="800" height="480"></canvas></div>
+  <div class="keys">
+    <span class="led" id="led" aria-hidden="true"></span>
+    <button class="key power" id="k-power" title="Power — sleep and wake">⏻</button>
+    <span class="spacer"></span>
+    <button class="key" id="k-back">BACK</button>
+    <button class="key" id="k-prev">PREV</button>
+    <button class="key" id="k-ok">OK</button>
+    <button class="key" id="k-next">NEXT</button>
+  </div>
+</div>
+
+<div class="hints">
+  <span class="kbonly"><kbd>←</kbd> <kbd>→</kbd> turn pages</span>
+  <span class="kbonly"><kbd>Enter</kbd> confirm</span>
+  <span class="kbonly"><kbd>Esc</kbd> back</span>
+  <span class="kbonly"><kbd>Q</kbd> sleep</span>
+</div>
+
+<main>
+  <p>
+    This is the X4's firmware — the same Rust that runs on the device's
+    ESP32-C3 — compiled to WebAssembly. The screen above is its real
+    framebuffer: the same Literata bitmaps, the same line wrap, the same
+    pagination, drawn one bit deep at 800&nbsp;×&nbsp;480.
+  </p>
+  <p>
+    The hardware around it is pretend. The SD card is three small built-in
+    books, the Wi-Fi sync session is scripted, and the e-ink panel is a
+    canvas that flashes the way the real GDEQ0426T82 does: a quick
+    421&nbsp;ms update for a page turn, a full inverting clean when
+    ghosting builds up. Your place on the shelf is kept in this browser.
+  </p>
+</main>
+
+<div class="colophon">
+  <div class="row"><span>panel</span><span>GDEQ0426T82 · 800 × 480 · 1-bit</span></div>
+  <div class="row"><span>page turn</span><span>~473 ms measured, 421 ms panel busy</span></div>
+  <div class="row"><span>firmware</span><span>Rust · esp-hal · no_std on device</span></div>
+  <div class="row"><span>this page</span><span>same crates, wasm32 · no framework</span></div>
+</div>
+
+<script>
+(async function () {
+  const WIDTH = 800, HEIGHT = 480;
+  const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4 };
+  const SAVE_KEY = "x4-progress-v1";
+
+  const canvas = document.getElementById("panel");
+  const ctx = canvas.getContext("2d");
+  const led = document.getElementById("led");
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const { instance } = await WebAssembly.instantiateStreaming(
+    fetch("x4_web_emulator.wasm")
+  );
+  const wasm = instance.exports;
+  wasm.x4_boot();
+
+  // Restore the shelf position saved by a previous visit.
+  try {
+    const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
+    if (Array.isArray(saved) && saved.length === 8) {
+      wasm.x4_restore(...saved);
+    }
+  } catch (_) { /* fresh start */ }
+
+  const frame = () =>
+    new Uint8ClampedArray(wasm.memory.buffer, wasm.x4_frame_ptr(), WIDTH * HEIGHT * 4);
+
+  // Offscreen scratch for the refresh choreography.
+  const work = document.createElement("canvas");
+  work.width = WIDTH; work.height = HEIGHT;
+  const workCtx = work.getContext("2d");
+
+  // Ghost layer: fast updates leave a faint imprint of the previous page,
+  // cleared by a full or fast-clean refresh, like the real panel.
+  const ghost = document.createElement("canvas");
+  ghost.width = WIDTH; ghost.height = HEIGHT;
+  const ghostCtx = ghost.getContext("2d");
+  let ghosting = false;
+
+  function putInverted(pixels) {
+    const inv = new Uint8ClampedArray(pixels);
+    for (let i = 0; i < inv.length; i += 4) {
+      inv[i] = 255 - inv[i]; inv[i + 1] = 255 - inv[i + 1]; inv[i + 2] = 255 - inv[i + 2];
+    }
+    ctx.putImageData(new ImageData(inv, WIDTH, HEIGHT), 0, 0);
+  }
+  function putFinal(pixels) {
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), WIDTH, HEIGHT), 0, 0);
+    if (ghosting) {
+      ctx.globalAlpha = 0.055;
+      ctx.drawImage(ghost, 0, 0);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  let busy = false;
+  let queued = null;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // mode: 1 full (~3.5 s real; abridged here), 2 fast (421 ms), 3 fast-clean.
+  async function refresh(mode) {
+    const pixels = frame();
+    busy = true;
+    led.classList.add("on");
+    if (reduceMotion) {
+      ghosting = false;
+      putFinal(pixels);
+    } else if (mode === 2) {
+      // Remember the outgoing page before it is replaced.
+      workCtx.drawImage(canvas, 0, 0);
+      ghostCtx.drawImage(work, 0, 0);
+      putInverted(pixels);
+      await sleep(130);
+      ghosting = true;
+      putFinal(pixels);
+      await sleep(290);
+    } else {
+      const flashes = mode === 1 ? 3 : 2;
+      for (let i = 0; i < flashes; i++) {
+        putInverted(pixels);
+        await sleep(150);
+        ctx.fillStyle = "#161614";
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        await sleep(120);
+        ctx.fillStyle = "#eeece2";
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        await sleep(120);
+      }
+      ghosting = false;
+      putFinal(pixels);
+      await sleep(160);
+    }
+    led.classList.remove("on");
+    busy = false;
+    if (queued !== null) {
+      const next = queued;
+      queued = null;
+      press(next);
+    }
+  }
+
+  let seq = wasm.x4_frame_seq();
+  function pump() {
+    wasm.x4_tick(performance.now());
+    const now = wasm.x4_frame_seq();
+    if (now !== seq && !busy) {
+      seq = now;
+      refresh(wasm.x4_last_refresh());
+      save();
+    }
+    requestAnimationFrame(pump);
+  }
+
+  function press(button) {
+    if (busy) { queued = button; return; }
+    wasm.x4_key(button, performance.now());
+    const now = wasm.x4_frame_seq();
+    if (now !== seq) {
+      seq = now;
+      refresh(wasm.x4_last_refresh());
+      save();
+    }
+  }
+
+  function save() {
+    const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 8);
+    localStorage.setItem(SAVE_KEY, JSON.stringify([...snap]));
+  }
+
+  for (const [id, code] of [
+    ["k-power", BTN.power], ["k-back", BTN.back], ["k-ok", BTN.ok],
+    ["k-prev", BTN.prev], ["k-next", BTN.next],
+  ]) {
+    document.getElementById(id).addEventListener("click", () => press(code));
+  }
+  addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const map = {
+      ArrowLeft: BTN.prev, ArrowRight: BTN.next, Enter: BTN.ok,
+      Escape: BTN.back, q: BTN.power, Q: BTN.power,
+    };
+    if (map[event.key] !== undefined) {
+      event.preventDefault();
+      press(map[event.key]);
+    }
+  });
+
+  // First paint: the boot frame, with its full-refresh ceremony.
+  refresh(wasm.x4_last_refresh() || 1);
+  requestAnimationFrame(pump);
+})();
+</script>
+
+</body>
+</html>
