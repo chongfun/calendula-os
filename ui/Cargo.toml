@@ -5,13 +5,15 @@ edition = "2021"
 
 [features]
 default = ["board-x4"]
-# One board feature must be enabled; it selects ui's baked QR codes and is
-# forwarded to display so both crates agree on a board.
-board-x4 = ["display/board-x4"]
+# Exactly one board feature must be enabled; it selects ui's baked QR codes and
+# is forwarded to the app-core/display crates so the whole stack agrees on a
+# board. `board-x4` and `board-x3` are mutually exclusive.
+board-x4 = ["app-core/board-x4", "display/board-x4"]
+board-x3 = ["app-core/board-x3", "display/board-x3"]
 
 [dependencies]
-app-core = { path = "../app-core" }
-display = { path = "../display" }
+app-core = { path = "../app-core", default-features = false }
+display = { path = "../display", default-features = false }
 proto = { path = "../proto" }
 
 [dev-dependencies]

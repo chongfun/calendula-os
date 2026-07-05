@@ -5,8 +5,10 @@ edition = "2021"
 
 [features]
 default = ["board-x4"]
-# One board feature must be enabled; it selects display::board's active module.
+# Exactly one board feature must be enabled; it selects display::board's active
+# module. `board-x4` and `board-x3` are mutually exclusive.
 board-x4 = []
+board-x3 = []
 
 [dependencies]
 embedded-hal = "1.0.0"

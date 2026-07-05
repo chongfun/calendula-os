@@ -24,7 +24,7 @@ Current code status:
 | Task boundaries | Done |
 | Single 48 KB framebuffer | Done |
 | SSD1677 init sequence | SDK-aligned, panel responds |
-| Refresh path | Reader shell readable with `MIRROR_X=true`, `MIRROR_Y=false`, `REVERSE_BITS=true`; first update uses full refresh, normal page turns use deterministic fast differential refresh |
+| Refresh path | Reader shell readable with board-selected transforms: X4 `MIRROR_X=true`, `MIRROR_Y=false`, `REVERSE_BITS=true`; X3 `true/true/true`; first update uses full refresh, normal page turns use deterministic fast differential refresh |
 | Input backpressure | App accepts input while a render is in flight and coalesces display work to the latest state |
 | Input polling | Measured calibrated ADC ladder bands plus CrossPoint-style layout mapping applied; screen shows reader-facing `PREV`/`NEXT`/`BACK`/`OK` labels |
 | Reader app shell | Portrait Home/Library/Settings plus landscape Reading/Chapters present with catalog-backed book data |
@@ -166,8 +166,9 @@ Current code status:
 - `app-core` now owns the shared reader message types and pure `ReaderState`
   reducer. Firmware keeps the Embassy channels and task shell, while host tools
   can drive the same navigation/library/restore logic without ESP HAL.
-- `display::epd::fill_transformed_band` exposes the validated X4 panel byte/bit
-  transform so firmware and emulator stream the same panel RAM layout.
+- `display::epd::fill_transformed_band` exposes the board-selected panel
+  byte/bit/row transform so firmware and emulator stream the same panel RAM
+  layout. X3's `MIRROR_Y=true` row reversal is hardware-verified.
 - `tools/emulator` provides a deterministic headless runner plus an optional
   egui frontend behind `--features gui`. Headless mode accepts one TOML scenario
   or a scenario directory, applies scripted button/library events, validates app
@@ -253,6 +254,9 @@ cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darw
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --dump target/emulator
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --features gui -- --gui
+cargo build -p fw --target riscv32imc-unknown-none-elf --release --no-default-features --features board-x3
+cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features --features board-x3
+cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features --features board-x3 -- --scenario fixtures/scenarios
 cargo clippy --workspace --target riscv32imc-unknown-none-elf --release -- -D warnings
 cargo run --manifest-path tools/preview/Cargo.toml --target aarch64-apple-darwin
 ```

@@ -3,5 +3,12 @@ name = "app-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["board-x4"]
+# Exactly one board feature must be enabled; it is forwarded to display so the
+# whole stack agrees on a board.
+board-x4 = ["display/board-x4"]
+board-x3 = ["display/board-x3"]
+
 [dependencies]
-display = { path = "../display" }
+display = { path = "../display", default-features = false }

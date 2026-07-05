@@ -1,9 +1,13 @@
 # Flashing & release images
 
 This firmware ships as a standard ESP32-C3 application image that boots under
-the Xteink X4's **stock second-stage bootloader**. That's what makes it
+the Xteink reader's **stock second-stage bootloader**. That's what makes it
 installable the same way the other community firmwares (CrossPoint, CrossInk)
 are — including, in principle, on *locked* units.
+
+The USB development flow supports both X4 and X3. The locked-device and stock
+SD-updater evidence in this document is from X4 hardware; treat the equivalent
+X3 paths as unvalidated until they have been exercised on an X3.
 
 ## Unlocked vs. locked units
 
@@ -46,16 +50,19 @@ gate the other firmwares defeat with a build-time patch; we satisfy it directly
 in the descriptor. You can verify placement:
 
 ```sh
-xxd -s 0x20 -l 4 target/release-images/firmware.bin   # -> 3254 cdab (0xABCD5432 LE)
+xxd -s 0x20 -l 4 target/release-images/x3/firmware.bin   # -> 3254 cdab (0xABCD5432 LE)
 ```
 
 ## Building the release images
 
 ```sh
-tools/build-release.sh
+tools/build-release.sh x4
+tools/build-release.sh x3
 ```
 
-Produces, in `target/release-images/`:
+Produces board-separated artifacts in `target/release-images/x4/` or
+`target/release-images/x3/`. The board argument is required so a default X4
+image cannot silently overwrite or be mistaken for an X3 image.
 
 - **`firmware.bin`** — app image for `ota_0`. Flash to `0x10000`. Updates the
   app in place and leaves the bootloader untouched. This is what the web
@@ -78,14 +85,17 @@ Produces, in `target/release-images/`:
 ## Flashing an unlocked unit
 
 ```sh
-# Everyday dev flash + serial monitor:
+# X4: everyday dev flash + serial monitor:
 cargo run -p fw --release
 
+# X3: board selection must be explicit:
+cargo run -p fw --release --no-default-features --features board-x3
+
 # App-only, with esptool:
-esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/firmware.bin
+esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/x3/firmware.bin
 
 # Whole flash from scratch:
-esptool.py --chip esp32c3 write_flash 0x0 target/release-images/full-flash.bin
+esptool.py --chip esp32c3 write_flash 0x0 target/release-images/x3/full-flash.bin
 ```
 
 ## Flashing a locked unit

@@ -19,7 +19,9 @@ pub(crate) async fn init_panel(epd: &mut Epd) {
     for op in INIT_SEQUENCE {
         match *op {
             SpiOp::Reset => epd.reset().await,
-            SpiOp::WaitBusy => epd.wait_ready().await,
+            SpiOp::WaitBusy => {
+                let _ = epd.wait_ready(display::board::BUSY_ACTIVE_HIGH).await;
+            }
             SpiOp::Command { cmd, data } => {
                 epd.command(cmd, data).await.unwrap();
             }
@@ -79,7 +81,7 @@ pub(crate) async fn flush(
     .await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
     let start = Instant::now();
-    epd.wait_ready().await;
+    let _ = epd.wait_ready(display::board::BUSY_ACTIVE_HIGH).await;
     let elapsed = start.elapsed();
     esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
     if mode == RefreshMode::FastClean {
@@ -89,7 +91,7 @@ pub(crate) async fn flush(
         epd.command(CMD_DISPLAY_UPDATE_CTRL2, &[UPDATE_SEQUENCE_LOAD_TEMP])
             .await?;
         epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
-        epd.wait_ready().await;
+        let _ = epd.wait_ready(display::board::BUSY_ACTIVE_HIGH).await;
     }
     Ok(())
 }
@@ -115,7 +117,7 @@ pub(crate) async fn sleep_panel(
     )
     .await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
-    epd.wait_ready().await;
+    let _ = epd.wait_ready(display::board::BUSY_ACTIVE_HIGH).await;
     esp_println::println!("display: sleep deep");
     epd.command(CMD_DEEP_SLEEP, &[0x01]).await
 }

@@ -233,13 +233,17 @@ The user-facing `RefreshPolicy` in Settings selects between `FastOnly`,
 `FullOnWake` (the default), and `FullEveryTen`, which inserts a FastClean
 cleanup after every ten fast refreshes.
 
-`display::epd` contains three transform constants currently validated during bring-up:
-`MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`. The logical
-framebuffer API stays upright while firmware and host tools remap bytes/bits
-before panel-RAM writes. This fixes the X4 panel's observed horizontal byte
-order and bit order without leaking hardware orientation into app rendering.
-`MIRROR_Y=true` was tested and rejected because it made glyphs vertically
-mirrored/upside down.
+The board description contains the panel transform constants. The logical
+framebuffer API stays upright while firmware and host tools remap bytes, bits,
+and rows before panel-RAM writes:
+
+- X4: `MIRROR_X = true`, `MIRROR_Y = false`, `REVERSE_BITS = true` fixes the
+  observed SSD1677 horizontal byte and bit order. `MIRROR_Y=true` was tested and
+  rejected on X4 because it made glyphs vertically mirrored/upside down.
+- X3: `MIRROR_X = true`, `MIRROR_Y = true`, `REVERSE_BITS = true`. The UC8253
+  gate scan consumes whole-plane rows bottom-first, so the additional row
+  reversal is required. The first X3 hardware flash rendered mirrored
+  with the X4 value and rendered correctly after enabling `MIRROR_Y`.
 
 Physical orientation is an app/layout concern, not an SSD1677 streaming concern.
 The current readable build places logical top on the physical button side. The
@@ -557,9 +561,9 @@ flash/NVM fallback remains separate from the record format.
 2. Measure BUSY on GPIO6 during reset and refresh.
 3. Confirm full refresh timing.
 4. Confirm `TL`, `TR`, `BL`, and `BR` are readable and map consistently.
-   Current readable transform: `MIRROR_X=true`, `MIRROR_Y=false`,
-   `REVERSE_BITS=true`. Logical top currently appears on the physical button
-   side; handle this later through `DisplayOrientation`.
+   Current readable transforms are X4 `(MIRROR_X=true, MIRROR_Y=false,
+   REVERSE_BITS=true)` and X3 `(true, true, true)`. Logical top currently appears
+   on the physical button side; handle this later through `DisplayOrientation`.
 5. Validate the Adafruit-scaled ADC ladder bands against this physical unit.
    Current calibrated bands are GPIO1 Back `2400..2700`, Confirm `1800..2150`,
    Left `1000..1250`, Right `0..100`; GPIO2 Up `1500..1800`, Down `0..100`. Raw

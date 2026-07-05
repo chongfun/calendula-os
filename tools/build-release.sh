@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the distributable firmware images for the Xteink X4.
+# Build distributable firmware images for one Xteink board target.
 #
-# Produces, in target/release-images/:
+# Produces, in target/release-images/<board>/:
 #   firmware.bin    app image for OTA slot app0/ota_0. Flash to 0x10000. This is
 #                   what the web flasher, `esptool write_flash 0x10000`, and the
 #                   in-app SD/OTA updater consume. Leaves the bootloader intact.
@@ -19,20 +19,39 @@
 # offset 0x20) with the wide-open eFuse-revision range, which is what lets the
 # stock bootloader on a locked unit accept a non-stock image.
 #
-# Usage: tools/build-release.sh
+# Usage: tools/build-release.sh x4|x3
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: $0 x4|x3" >&2
+    exit 2
+fi
+
+BOARD=$1
+case "$BOARD" in
+    x4)
+        BOARD_FEATURES=(--no-default-features --features board-x4)
+        ;;
+    x3)
+        BOARD_FEATURES=(--no-default-features --features board-x3)
+        ;;
+    *)
+        echo "unknown board '$BOARD'; expected x4 or x3" >&2
+        exit 2
+        ;;
+esac
 
 CHIP=esp32c3
 FLASH_SIZE=16mb
 PARTS=partitions.csv
 APP_LABEL=app0                # the ota_0 partition's label in partitions.csv
 ELF=target/riscv32imc-unknown-none-elf/release/fw
-OUT=target/release-images
+OUT="target/release-images/$BOARD"
 
-echo "==> building fw (release)"
-cargo build -p fw --release
+echo "==> building fw for $BOARD (release)"
+cargo build -p fw --release "${BOARD_FEATURES[@]}"
 
 mkdir -p "$OUT"
 
@@ -57,7 +76,12 @@ echo "Artifacts in $OUT:"
 ls -la "$OUT/firmware.bin" "$OUT/update.bin" "$OUT/full-flash.bin"
 echo
 echo "Flash paths (see docs/FLASHING.md):"
-echo "  Locked (stock updater): copy update.bin to the SD card root, then power"
-echo "                          on holding Power + Up on USB power."
+if [[ "$BOARD" == x3 ]]; then
+    echo "  Locked X3            : stock SD-updater compatibility is not hardware-validated;"
+    echo "                         do not use this path without accepting brick risk."
+else
+    echo "  Locked (stock updater): copy update.bin to the SD card root, then power"
+    echo "                          on holding Power + Up on USB power."
+fi
 echo "  Unlocked, app only    : esptool.py --chip $CHIP write_flash 0x10000 $OUT/firmware.bin"
 echo "  Unlocked, whole flash : esptool.py --chip $CHIP write_flash 0x0 $OUT/full-flash.bin"

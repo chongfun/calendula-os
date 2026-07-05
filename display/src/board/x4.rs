@@ -14,5 +14,8 @@ pub const MIRROR_X: bool = true;
 pub const MIRROR_Y: bool = false;
 pub const REVERSE_BITS: bool = true;
 
+/// The SSD1677's BUSY line idles low and asserts high during a refresh.
+pub const BUSY_ACTIVE_HIGH: bool = true;
+
 const _: () = assert!(crate::FB_BYTES == 48_000);
 const _: () = assert!(crate::BAND_BYTES == 8_000);

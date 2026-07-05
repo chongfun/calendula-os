@@ -56,8 +56,9 @@ pinned in `rust-toolchain.toml`.
 
 `cargo run` flashes over USB for development. To install without a toolchain —
 from a built image, or onto a unit that shipped with USB flashing disabled —
-`tools/build-release.sh` produces the images and [docs/FLASHING.md](docs/FLASHING.md)
-covers the paths: web flasher, SD card, and the in-app update from the card.
+`tools/build-release.sh x4` or `tools/build-release.sh x3` produces
+board-separated images, and [docs/FLASHING.md](docs/FLASHING.md) covers the
+paths: web flasher, SD card, and the in-app update from the card.
 
 ## Credits
 

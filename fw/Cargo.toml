@@ -6,18 +6,20 @@ default-run = "fw"
 
 [features]
 default = ["board-x4"]
-# One board feature must be enabled; it selects fw::board's active module and
-# is forwarded to the display/ui crates so the whole stack agrees on a board.
-board-x4 = ["display/board-x4", "ui/board-x4"]
+# Exactly one board feature must be enabled; it selects fw::board's active
+# module and is forwarded to the app-core/display/ui crates so the whole stack
+# agrees on a board. `board-x4` and `board-x3` are mutually exclusive.
+board-x4 = ["app-core/board-x4", "display/board-x4", "ui/board-x4"]
+board-x3 = ["app-core/board-x3", "display/board-x3", "ui/board-x3"]
 # Temporary on-device validation of the flash + otadata path without an SD card:
 # on first boot, copy the running image into the inactive slot and switch
 # otadata to it. Never enabled in a release build. See fw::ota_update.
 ota-selftest = []
 
 [dependencies]
-app-core = { path = "../app-core" }
-display = { path = "../display" }
-ui = { path = "../ui" }
+app-core = { path = "../app-core", default-features = false }
+display = { path = "../display", default-features = false }
+ui = { path = "../ui", default-features = false }
 proto = { path = "../proto" }
 hal-ext = { path = "../hal-ext" }
 

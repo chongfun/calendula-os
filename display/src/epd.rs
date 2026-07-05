@@ -3,9 +3,13 @@ use crate::{fb::Framebuffer, Rect, BAND_BYTES, BAND_ROWS, HEIGHT, ROW_BYTES, WID
 
 #[cfg(feature = "board-x4")]
 mod x4;
-
 #[cfg(feature = "board-x4")]
 pub use x4::*;
+
+#[cfg(feature = "board-x3")]
+mod x3;
+#[cfg(feature = "board-x3")]
+pub use x3::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -83,4 +87,37 @@ pub fn fill_transformed_band(fb: &Framebuffer, band_y: usize, out: &mut [u8; BAN
     }
 
     len
+}
+
+#[cfg(all(test, feature = "board-x3"))]
+mod x3_tests {
+    use super::*;
+
+    #[test]
+    fn wire_transform_rotates_asymmetric_pixel_180_degrees() {
+        assert!(MIRROR_X);
+        assert!(MIRROR_Y);
+        assert!(REVERSE_BITS);
+
+        let source_x = 13;
+        let source_y = 7;
+        let mut fb = Framebuffer::new();
+        fb.set_pixel(source_x, source_y, false);
+
+        let panel_x = WIDTH - 1 - source_x;
+        let panel_y = HEIGHT - 1 - source_y;
+        let band_y = panel_y / BAND_ROWS * BAND_ROWS;
+        let row_in_band = panel_y - band_y;
+        let mut band = [0u8; BAND_BYTES];
+        let len = fill_transformed_band(&fb, band_y, &mut band);
+
+        assert!(row_in_band * ROW_BYTES + panel_x / 8 < len);
+        let byte = band[row_in_band * ROW_BYTES + panel_x / 8];
+        let mask = 0x80 >> (panel_x & 7);
+        assert_eq!(
+            byte & mask,
+            0,
+            "asymmetric pixel must land at 180-degree mirror"
+        );
+    }
 }
