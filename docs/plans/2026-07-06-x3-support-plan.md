@@ -52,17 +52,15 @@ before deep sleep (µA leak against the always-powered gauge).
 - **Phase 6 — on-device validation.** The only remaining work; needs the X3 + 4-pin pogo
   cable. All existing-code and new-code scaffolding is now in place and building.
 
-### The X3 button layout is a redesign, not a reposition (researched 2026-07-06)
+### Key-hint positions — DONE (2026-07-06)
 
-`KEY_YS` cannot simply move. The X3's physical buttons differ from the X4's four-down-the-
-left: **four main buttons along the bottom chin + one page-turn button on each long side**
-(left=Prev, right=Next), confirmed by both the official X3 user guide and CrossPoint's
-`BaseTheme.cpp`. CrossPoint renders X3 hints in two groups — a bottom row of four
-(`x3ButtonPositions = {38,154,268,384}`, w106×h40 at `y=pageHeight-40`) plus one 30×80
-side label per edge (`x=4` left, `x=screenWidth-34` right, `y=155`). Our Imprint shell
-puts em-dash margin-note keys down the left; adapting it to the bottom+sides topology is a
-design decision on the shell's key-hint language, not a coordinate port. Left for a design
-pass with the user. Reference coordinates recorded here so it needn't be re-researched.
+The X3 has the same button arrangement as the X4, on a physically smaller/different-sized
+panel (confirmed by the device owner; an earlier research pass over CrossPoint's hint
+renderer wrongly suggested a bottom+sides topology — disregarded). So `KEY_YS` needs no
+redesign, just the same panel-relative treatment as the other geometry constants:
+positioned as a fraction of panel height (`key_y` in `ui/src/render.rs`), identity on the
+X4, so the left-margin key column stays balanced on the X3's taller panel instead of
+bunching toward the top. Verified in the preview render.
 
 ### Deferred
 
