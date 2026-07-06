@@ -827,18 +827,50 @@ fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
     }
 }
 
+// The landscape home mockups below are authored in an 800x480 design space
+// (the X4 panel). Every draw in them routes through these axis scalers, so the
+// whole composition reflows to fill the actual panel: on the X3 the extra
+// height becomes taller covers, rails, and spacing rather than a letterbox.
+// The scale is identity on the X4, so its mockups render byte-for-byte as
+// before. (The centering fallback in `fit_design_to_board` is still used by the
+// unscaled `--design-mockups` studies.)
+fn ls_x(v: i32) -> i32 {
+    (v * WIDTH as i32 + 400) / 800
+}
+fn ls_y(v: i32) -> i32 {
+    (v * HEIGHT as i32 + 240) / 480
+}
+fn lx(v: u16) -> u16 {
+    ls_x(v as i32) as u16
+}
+fn ly(v: u16) -> u16 {
+    ls_y(v as i32) as u16
+}
+fn lxi(v: i16) -> i16 {
+    ls_x(v as i32) as i16
+}
+fn lyi(v: i16) -> i16 {
+    ls_y(v as i32) as i16
+}
+fn l_rect(fb: &mut Framebuffer, r: Rect, white: bool) {
+    fill_rect(fb, Rect::new(lx(r.x), ly(r.y), lx(r.w), ly(r.h)), white);
+}
+fn l_text(fb: &mut Framebuffer, font: &BitmapFont, text: &str, x: i16, y: i16, white: bool) -> i16 {
+    draw_text(fb, font, text, lxi(x), lyi(y), white)
+}
+
 fn draw_landscape_home_rail(fb: &mut Framebuffer) {
     let title_font = literata(FontStyle::Bold);
     let body_font = literata(FontStyle::Regular);
     let small_font = literata(FontStyle::Regular);
     draw_battery_landscape(fb, 724, 24, 82);
-    fill_rect(fb, Rect::new(316, 28, 1, 424), false);
+    l_rect(fb, Rect::new(316, 28, 1, 424), false);
     draw_landscape_action_stack(fb, 28, 56, 248, 344, 0);
     draw_cover_art(fb, 430, 48, 205, 306);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 532, 388);
     draw_text_centered(fb, body_font, "Daniel Keyes", 532, 418);
     draw_thin_progress(fb, 462, 442, 140, 420);
-    draw_text(fb, small_font, "42%", 612, 450, false);
+    l_text(fb, small_font, "42%", 612, 450, false);
 }
 
 fn draw_landscape_home_rail_quiet(fb: &mut Framebuffer) {
@@ -846,12 +878,12 @@ fn draw_landscape_home_rail_quiet(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape(fb, 724, 22, 82);
     draw_landscape_action_stack_quiet(fb, 34, 62, 224, 332, 0);
-    fill_rect(fb, Rect::new(292, 54, 1, 360), false);
+    l_rect(fb, Rect::new(292, 54, 1, 360), false);
     draw_cover_art(fb, 438, 44, 194, 290);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 535, 376);
     draw_text_centered(fb, body_font, "Daniel Keyes", 535, 406);
     draw_thin_progress(fb, 480, 438, 112, 420);
-    draw_text(fb, body_font, "42%", 604, 446, false);
+    l_text(fb, body_font, "42%", 604, 446, false);
 }
 
 fn draw_landscape_home_rail_cover(fb: &mut Framebuffer) {
@@ -859,12 +891,12 @@ fn draw_landscape_home_rail_cover(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape(fb, 724, 22, 82);
     draw_landscape_action_stack_quiet(fb, 26, 74, 202, 308, 0);
-    fill_rect(fb, Rect::new(260, 42, 1, 390), false);
+    l_rect(fb, Rect::new(260, 42, 1, 390), false);
     draw_cover_art(fb, 376, 28, 236, 354);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 494, 420);
     draw_text_centered(fb, body_font, "Daniel Keyes", 494, 450);
     draw_thin_progress(fb, 642, 206, 90, 420);
-    draw_text(fb, body_font, "42%", 666, 238, false);
+    l_text(fb, body_font, "42%", 666, 238, false);
 }
 
 fn draw_landscape_home_rail_hardware(fb: &mut Framebuffer) {
@@ -872,12 +904,12 @@ fn draw_landscape_home_rail_hardware(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape(fb, 724, 22, 82);
     draw_landscape_action_stack_hardware(fb, 20, 36, 266, 396, 0);
-    fill_rect(fb, Rect::new(320, 28, 1, 424), false);
+    l_rect(fb, Rect::new(320, 28, 1, 424), false);
     draw_cover_art(fb, 444, 42, 206, 308);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 547, 388);
     draw_text_centered(fb, body_font, "Daniel Keyes", 547, 418);
     draw_thin_progress(fb, 492, 448, 110, 420);
-    draw_text(fb, body_font, "42%", 614, 456, false);
+    l_text(fb, body_font, "42%", 614, 456, false);
 }
 
 fn draw_landscape_home_skeuo_buttons(fb: &mut Framebuffer) {
@@ -890,7 +922,7 @@ fn draw_landscape_home_skeuo_buttons(fb: &mut Framebuffer) {
     draw_text_centered(fb, title_font, "Flowers for Algernon", 530, 394);
     draw_text_centered(fb, body_font, "Daniel Keyes", 530, 424);
     draw_thin_progress(fb, 474, 452, 112, 420);
-    draw_text(fb, body_font, "42%", 598, 460, false);
+    l_text(fb, body_font, "42%", 598, 460, false);
 }
 
 fn draw_landscape_home_skeuo_bookplate(fb: &mut Framebuffer) {
@@ -903,7 +935,7 @@ fn draw_landscape_home_skeuo_bookplate(fb: &mut Framebuffer) {
     draw_text_centered(fb, title_font, "Flowers for Algernon", 536, 412);
     draw_text_centered(fb, body_font, "Daniel Keyes", 536, 442);
     draw_thin_progress(fb, 662, 214, 70, 420);
-    draw_text(fb, body_font, "42%", 672, 248, false);
+    l_text(fb, body_font, "42%", 672, 248, false);
 }
 
 fn draw_landscape_home_skeuo_library(fb: &mut Framebuffer) {
@@ -916,7 +948,7 @@ fn draw_landscape_home_skeuo_library(fb: &mut Framebuffer) {
     draw_text_centered(fb, title_font, "Flowers for Algernon", 527, 388);
     draw_text_centered(fb, body_font, "Daniel Keyes", 527, 418);
     draw_thin_progress(fb, 474, 446, 106, 420);
-    draw_text(fb, body_font, "42%", 592, 454, false);
+    l_text(fb, body_font, "42%", 592, 454, false);
 }
 
 fn draw_landscape_home_ive_pure(fb: &mut Framebuffer) {
@@ -924,7 +956,7 @@ fn draw_landscape_home_ive_pure(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_ive_action_rail(fb, 56, 86, 204, 300);
-    fill_rect(fb, Rect::new(312, 84, 1, 300), false);
+    l_rect(fb, Rect::new(312, 84, 1, 300), false);
     draw_cover_art_minimal(fb, 454, 58, 178, 267);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 543, 374);
     draw_text_centered(fb, body_font, "Daniel Keyes", 543, 404);
@@ -936,8 +968,8 @@ fn draw_landscape_home_ive_glass(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_ive_glass_rail(fb, 34, 58, 250, 340);
-    fill_rect(fb, Rect::new(328, 52, 1, 360), false);
-    fill_rect(fb, Rect::new(334, 88, 1, 288), false);
+    l_rect(fb, Rect::new(328, 52, 1, 360), false);
+    l_rect(fb, Rect::new(334, 88, 1, 288), false);
     draw_cover_art_minimal(fb, 448, 52, 190, 285);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 543, 386);
     draw_text_centered(fb, body_font, "Daniel Keyes", 543, 416);
@@ -949,7 +981,7 @@ fn draw_landscape_home_ive_object(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_ive_action_rail(fb, 50, 104, 176, 264);
-    fill_rect(fb, Rect::new(270, 68, 1, 344), false);
+    l_rect(fb, Rect::new(270, 68, 1, 344), false);
     draw_cover_art_minimal(fb, 388, 34, 232, 348);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 504, 424);
     draw_text_centered(fb, body_font, "Daniel Keyes", 504, 454);
@@ -961,7 +993,7 @@ fn draw_landscape_home_hybrid_soft(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_hybrid_soft_rail(fb, 34, 58, 250, 340);
-    fill_rect(fb, Rect::new(326, 52, 1, 360), false);
+    l_rect(fb, Rect::new(326, 52, 1, 360), false);
     draw_cover_art_minimal(fb, 448, 50, 196, 294);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 546, 390);
     draw_text_centered(fb, body_font, "Daniel Keyes", 546, 420);
@@ -973,8 +1005,8 @@ fn draw_landscape_home_hybrid_wells(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_hybrid_well_rail(fb, 38, 66, 238, 324);
-    fill_rect(fb, Rect::new(318, 66, 1, 324), false);
-    fill_rect(fb, Rect::new(324, 96, 1, 264), false);
+    l_rect(fb, Rect::new(318, 66, 1, 324), false);
+    l_rect(fb, Rect::new(324, 96, 1, 264), false);
     draw_cover_art_minimal(fb, 452, 54, 184, 276);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 544, 384);
     draw_text_centered(fb, body_font, "Daniel Keyes", 544, 414);
@@ -986,7 +1018,7 @@ fn draw_landscape_home_hybrid_slab(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_hybrid_slab_rail(fb, 24, 54, 260, 348);
-    fill_rect(fb, Rect::new(326, 54, 1, 348), false);
+    l_rect(fb, Rect::new(326, 54, 1, 348), false);
     draw_cover_art_minimal(fb, 444, 42, 208, 312);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 548, 398);
     draw_text_centered(fb, body_font, "Daniel Keyes", 548, 428);
@@ -998,7 +1030,7 @@ fn draw_landscape_home_affordance_edge(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_affordance_edge_rail(fb, 32, 58, 252, 340);
-    fill_rect(fb, Rect::new(326, 52, 1, 360), false);
+    l_rect(fb, Rect::new(326, 52, 1, 360), false);
     draw_cover_art_minimal(fb, 448, 50, 196, 294);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 546, 390);
     draw_text_centered(fb, body_font, "Daniel Keyes", 546, 420);
@@ -1010,7 +1042,7 @@ fn draw_landscape_home_affordance_connectors(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_affordance_connector_rail(fb, 26, 64, 258, 328);
-    fill_rect(fb, Rect::new(326, 58, 1, 348), false);
+    l_rect(fb, Rect::new(326, 58, 1, 348), false);
     draw_cover_art_minimal(fb, 448, 50, 196, 294);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 546, 390);
     draw_text_centered(fb, body_font, "Daniel Keyes", 546, 420);
@@ -1022,7 +1054,7 @@ fn draw_landscape_home_affordance_dock(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, 82);
     draw_affordance_dock_rail(fb, 28, 56, 258, 344);
-    fill_rect(fb, Rect::new(328, 52, 1, 360), false);
+    l_rect(fb, Rect::new(328, 52, 1, 360), false);
     draw_cover_art_minimal(fb, 448, 50, 196, 294);
     draw_text_centered(fb, title_font, "Flowers for Algernon", 546, 390);
     draw_text_centered(fb, body_font, "Daniel Keyes", 546, 420);
@@ -1106,13 +1138,13 @@ fn draw_landscape_home_tabs(fb: &mut Framebuffer) {
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape(fb, 724, 24, 82);
     draw_cover_art(fb, 468, 50, 190, 284);
-    draw_text(fb, title_font, "Flowers for Algernon", 58, 82, false);
-    draw_text(fb, body_font, "Daniel Keyes", 58, 116, false);
+    l_text(fb, title_font, "Flowers for Algernon", 58, 82, false);
+    l_text(fb, body_font, "Daniel Keyes", 58, 116, false);
     draw_thin_progress(fb, 60, 146, 232, 420);
-    draw_text(fb, body_font, "42%", 306, 153, false);
-    fill_rect(fb, Rect::new(58, 198, 318, 1), false);
-    draw_text(fb, body_font, "Current book", 58, 238, false);
-    draw_text(fb, body_font, "Chapter 7", 58, 272, false);
+    l_text(fb, body_font, "42%", 306, 153, false);
+    l_rect(fb, Rect::new(58, 198, 318, 1), false);
+    l_text(fb, body_font, "Current book", 58, 238, false);
+    l_text(fb, body_font, "Chapter 7", 58, 272, false);
     draw_bottom_tabs(fb, 16, 416, 768, 52, 0);
 }
 
@@ -1130,13 +1162,13 @@ fn draw_landscape_action_stack_quiet(
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         if index == selected {
-            fill_rect(fb, Rect::new(x, row_y + row_h - 8, w, 3), false);
-            fill_rect(fb, Rect::new(x, row_y + 12, 4, row_h - 26), false);
+            l_rect(fb, Rect::new(x, row_y + row_h - 8, w, 3), false);
+            l_rect(fb, Rect::new(x, row_y + 12, 4, row_h - 26), false);
         }
         let text_x = x as i16 + 22;
         let text_y = row_y as i16 + row_h as i16 / 2 + 8;
-        draw_text(fb, font, label, text_x, text_y, false);
-        fill_rect(
+        l_text(fb, font, label, text_x, text_y, false);
+        l_rect(
             fb,
             Rect::new(x + w - 34, row_y + row_h / 2 - 1, 24, 2),
             false,
@@ -1159,14 +1191,14 @@ fn draw_landscape_action_stack_hardware(
         let row_y = y + index as u16 * row_h;
         let selected_row = index == selected;
         if selected_row {
-            fill_rect(fb, Rect::new(x, row_y, w, row_h - 6), false);
+            l_rect(fb, Rect::new(x, row_y, w, row_h - 6), false);
         } else {
             stroke_rect_direct(fb, x, row_y, w, row_h - 6);
         }
         let text_x = x as i16 + 28;
         let text_y = row_y as i16 + row_h as i16 / 2 + 7;
-        draw_text(fb, font, label, text_x, text_y, selected_row);
-        fill_rect(
+        l_text(fb, font, label, text_x, text_y, selected_row);
+        l_rect(
             fb,
             Rect::new(x + w - 40, row_y + row_h / 2 - 1, 24, 2),
             selected_row,
@@ -1181,7 +1213,7 @@ fn draw_skeuo_button_stack(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16)
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         draw_recessed_slot(fb, x, row_y + 6, w, row_h - 16);
-        draw_text(
+        l_text(
             fb,
             font,
             label,
@@ -1198,11 +1230,11 @@ fn draw_bookplate_actions(fb: &mut Framebuffer, x: u16, y: u16, w: u16) {
     let font = literata(FontStyle::Regular);
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * 72;
-        fill_rect(fb, Rect::new(x + 8, row_y, w - 16, 1), false);
-        draw_text(fb, font, label, x as i16 + 26, row_y as i16 + 42, false);
+        l_rect(fb, Rect::new(x + 8, row_y, w - 16, 1), false);
+        l_text(fb, font, label, x as i16 + 26, row_y as i16 + 42, false);
         draw_button_well(fb, x + w - 48, row_y + 22);
     }
-    fill_rect(fb, Rect::new(x + 8, y + 288, w - 16, 1), false);
+    l_rect(fb, Rect::new(x + 8, y + 288, w - 16, 1), false);
 }
 
 fn draw_spine_actions(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
@@ -1211,10 +1243,10 @@ fn draw_spine_actions(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     let row_h = h / labels.len() as u16;
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
-        fill_rect(fb, Rect::new(x + 8, row_y + 4, w - 24, row_h - 12), false);
+        l_rect(fb, Rect::new(x + 8, row_y + 4, w - 24, row_h - 12), false);
         stroke_rect_direct(fb, x + 12, row_y + 8, w - 32, row_h - 20);
-        fill_rect(fb, Rect::new(x + 24, row_y + 12, 1, row_h - 28), true);
-        draw_text(
+        l_rect(fb, Rect::new(x + 24, row_y + 12, 1, row_h - 28), true);
+        l_text(
             fb,
             font,
             label,
@@ -1222,7 +1254,7 @@ fn draw_spine_actions(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
             row_y as i16 + row_h as i16 / 2 + 7,
             true,
         );
-        fill_rect(
+        l_rect(
             fb,
             Rect::new(x + w - 58, row_y + row_h / 2 - 1, 26, 2),
             true,
@@ -1236,7 +1268,7 @@ fn draw_ive_action_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     let row_h = h / labels.len() as u16;
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
-        draw_text(
+        l_text(
             fb,
             font,
             label,
@@ -1244,7 +1276,7 @@ fn draw_ive_action_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
             row_y as i16 + row_h as i16 / 2 + 8,
             false,
         );
-        fill_rect(fb, Rect::new(x + w - 20, row_y + row_h / 2, 20, 1), false);
+        l_rect(fb, Rect::new(x + w - 20, row_y + row_h / 2, 20, 1), false);
     }
 }
 
@@ -1252,15 +1284,15 @@ fn draw_ive_glass_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     let labels = ["Read", "Files", "Sync", "Settings"];
     let font = literata(FontStyle::Regular);
     stroke_rect_direct(fb, x, y, w, h);
-    fill_rect(fb, Rect::new(x + 8, y + 8, w - 16, 1), false);
-    fill_rect(fb, Rect::new(x + 8, y + h - 10, w - 16, 1), false);
+    l_rect(fb, Rect::new(x + 8, y + 8, w - 16, 1), false);
+    l_rect(fb, Rect::new(x + 8, y + h - 10, w - 16, 1), false);
     let row_h = h / labels.len() as u16;
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         if index > 0 {
-            fill_rect(fb, Rect::new(x + 22, row_y, w - 44, 1), false);
+            l_rect(fb, Rect::new(x + 22, row_y, w - 44, 1), false);
         }
-        draw_text(
+        l_text(
             fb,
             font,
             label,
@@ -1268,7 +1300,7 @@ fn draw_ive_glass_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
             row_y as i16 + row_h as i16 / 2 + 8,
             false,
         );
-        fill_rect(fb, Rect::new(x + w - 48, row_y + row_h / 2, 24, 1), false);
+        l_rect(fb, Rect::new(x + w - 48, row_y + row_h / 2, 24, 1), false);
     }
 }
 
@@ -1276,15 +1308,15 @@ fn draw_hybrid_soft_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     let labels = ["Read", "Files", "Sync", "Settings"];
     let font = literata(FontStyle::Regular);
     stroke_rect_direct(fb, x, y, w, h);
-    fill_rect(fb, Rect::new(x + 10, y + 10, w - 20, 1), false);
-    fill_rect(fb, Rect::new(x + 10, y + h - 12, w - 20, 1), false);
+    l_rect(fb, Rect::new(x + 10, y + 10, w - 20, 1), false);
+    l_rect(fb, Rect::new(x + 10, y + h - 12, w - 20, 1), false);
     let row_h = h / labels.len() as u16;
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         if index > 0 {
-            fill_rect(fb, Rect::new(x + 24, row_y, w - 48, 1), false);
+            l_rect(fb, Rect::new(x + 24, row_y, w - 48, 1), false);
         }
-        draw_text(
+        l_text(
             fb,
             font,
             label,
@@ -1303,7 +1335,7 @@ fn draw_hybrid_well_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         draw_soft_slot(fb, x, row_y + 8, w, row_h - 16);
-        draw_text(
+        l_text(
             fb,
             font,
             label,
@@ -1323,10 +1355,10 @@ fn draw_hybrid_slab_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         if index > 0 {
-            fill_rect(fb, Rect::new(x, row_y, w, 1), false);
+            l_rect(fb, Rect::new(x, row_y, w, 1), false);
         }
-        fill_rect(fb, Rect::new(x + 10, row_y + 10, 1, row_h - 20), false);
-        draw_text(
+        l_rect(fb, Rect::new(x + 10, row_y + 10, 1, row_h - 20), false);
+        l_text(
             fb,
             font,
             label,
@@ -1346,10 +1378,10 @@ fn draw_affordance_edge_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u1
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         if index > 0 {
-            fill_rect(fb, Rect::new(x + 28, row_y, w - 56, 1), false);
+            l_rect(fb, Rect::new(x + 28, row_y, w - 56, 1), false);
         }
         draw_edge_button_mark(fb, x + 8, row_y + row_h / 2 - 18);
-        draw_text(
+        l_text(
             fb,
             font,
             label,
@@ -1357,7 +1389,7 @@ fn draw_affordance_edge_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u1
             row_y as i16 + row_h as i16 / 2 + 8,
             false,
         );
-        fill_rect(fb, Rect::new(x + w - 42, row_y + row_h / 2, 24, 1), false);
+        l_rect(fb, Rect::new(x + w - 42, row_y + row_h / 2, 24, 1), false);
     }
 }
 
@@ -1369,9 +1401,9 @@ fn draw_affordance_connector_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, 
         let row_y = y + index as u16 * row_h;
         let center_y = row_y + row_h / 2;
         draw_edge_button_mark(fb, x, center_y - 18);
-        fill_rect(fb, Rect::new(x + 34, center_y, 34, 1), false);
-        fill_rect(fb, Rect::new(x + 68, center_y - 10, 1, 20), false);
-        draw_text(fb, font, label, x as i16 + 86, center_y as i16 + 8, false);
+        l_rect(fb, Rect::new(x + 34, center_y, 34, 1), false);
+        l_rect(fb, Rect::new(x + 68, center_y - 10, 1, 20), false);
+        l_text(fb, font, label, x as i16 + 86, center_y as i16 + 8, false);
         draw_mini_recess(fb, x + w - 38, center_y - 9, 30, 18);
     }
 }
@@ -1385,10 +1417,10 @@ fn draw_affordance_dock_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u1
         let row_y = y + index as u16 * row_h;
         let center_y = row_y + row_h / 2;
         if index > 0 {
-            fill_rect(fb, Rect::new(x + 22, row_y, w - 44, 1), false);
+            l_rect(fb, Rect::new(x + 22, row_y, w - 44, 1), false);
         }
         draw_left_dock_notch(fb, x + 8, center_y - 14);
-        draw_text(fb, font, label, x as i16 + 44, center_y as i16 + 8, false);
+        l_text(fb, font, label, x as i16 + 44, center_y as i16 + 8, false);
         draw_mini_recess(fb, x + w - 48, center_y - 9, 30, 18);
     }
 }
@@ -1414,28 +1446,28 @@ fn draw_refined_dock_rail(
     let font = literata(FontStyle::Regular);
     match style {
         DockRailStyle::Plain => {
-            fill_rect(fb, Rect::new(x + 8, y, w - 28, 1), false);
-            fill_rect(fb, Rect::new(x + 18, y + h - 1, w - 46, 1), false);
-            fill_rect(fb, Rect::new(x, y + 14, 1, h - 28), false);
-            fill_rect(fb, Rect::new(x + w - 1, y + 38, 1, h - 76), false);
+            l_rect(fb, Rect::new(x + 8, y, w - 28, 1), false);
+            l_rect(fb, Rect::new(x + 18, y + h - 1, w - 46, 1), false);
+            l_rect(fb, Rect::new(x, y + 14, 1, h - 28), false);
+            l_rect(fb, Rect::new(x + w - 1, y + 38, 1, h - 76), false);
         }
         DockRailStyle::Paper => {
             stroke_rect_direct(fb, x, y, w, h);
-            fill_rect(fb, Rect::new(x + 10, y + 8, w - 36, 1), false);
-            fill_rect(fb, Rect::new(x + 16, y + h - 10, w - 52, 1), false);
-            fill_rect(fb, Rect::new(x + 6, y + 34, 1, h - 68), false);
+            l_rect(fb, Rect::new(x + 10, y + 8, w - 36, 1), false);
+            l_rect(fb, Rect::new(x + 16, y + h - 10, w - 52, 1), false);
+            l_rect(fb, Rect::new(x + 6, y + 34, 1, h - 68), false);
         }
         DockRailStyle::Clean => {
             stroke_rect_direct(fb, x, y, w, h);
         }
         DockRailStyle::Open => {
-            fill_rect(fb, Rect::new(x, y + 12, 1, h - 24), false);
-            fill_rect(fb, Rect::new(x + w - 1, y + 22, 1, h - 44), false);
+            l_rect(fb, Rect::new(x, y + 12, 1, h - 24), false);
+            l_rect(fb, Rect::new(x + w - 1, y + 22, 1, h - 44), false);
         }
         DockRailStyle::Panel => {
             stroke_rect_direct(fb, x, y, w, h);
-            fill_rect(fb, Rect::new(x + 8, y + 8, w - 16, 1), false);
-            fill_rect(fb, Rect::new(x + 8, y + h - 10, w - 16, 1), false);
+            l_rect(fb, Rect::new(x + 8, y + 8, w - 16, 1), false);
+            l_rect(fb, Rect::new(x + 8, y + h - 10, w - 16, 1), false);
         }
     }
     let row_h = h / labels.len() as u16;
@@ -1446,10 +1478,10 @@ fn draw_refined_dock_rail(
         if index > 0 {
             let sep_w = separator_lengths[index - 1].min(w.saturating_sub(58));
             let sep_x = x + 22 + (index as u16 % 2) * 10;
-            fill_rect(fb, Rect::new(sep_x, row_y, sep_w, 1), false);
+            l_rect(fb, Rect::new(sep_x, row_y, sep_w, 1), false);
         }
         draw_refined_left_notch(fb, x + 10, center_y - 15, index);
-        draw_text(fb, font, label, x as i16 + 46, center_y as i16 + 8, false);
+        l_text(fb, font, label, x as i16 + 46, center_y as i16 + 8, false);
         draw_refined_button_well(fb, x + w - 48, center_y - 9, index);
     }
 }
@@ -1457,10 +1489,10 @@ fn draw_refined_dock_rail(
 fn draw_refined_left_notch(fb: &mut Framebuffer, x: u16, y: u16, index: usize) {
     let stem_h = [30u16, 24, 28, 22][index.min(3)];
     let arm_w = [18u16, 14, 20, 16][index.min(3)];
-    fill_rect(fb, Rect::new(x, y + (30 - stem_h) / 2, 3, stem_h), false);
-    fill_rect(fb, Rect::new(x + 6, y + 15, arm_w, 1), false);
+    l_rect(fb, Rect::new(x, y + (30 - stem_h) / 2, 3, stem_h), false);
+    l_rect(fb, Rect::new(x + 6, y + 15, arm_w, 1), false);
     if index.is_multiple_of(2) {
-        fill_rect(fb, Rect::new(x + 6, y + 7, 1, 16), false);
+        l_rect(fb, Rect::new(x + 6, y + 7, 1, 16), false);
     }
 }
 
@@ -1468,60 +1500,60 @@ fn draw_refined_button_well(fb: &mut Framebuffer, x: u16, y: u16, index: usize) 
     let widths = [28u16, 24, 30, 26];
     let w = widths[index.min(3)];
     stroke_rect_direct(fb, x + (30 - w), y, w, 18);
-    fill_rect(fb, Rect::new(x + (30 - w) + 5, y + 5, w - 10, 1), false);
+    l_rect(fb, Rect::new(x + (30 - w) + 5, y + 5, w - 10, 1), false);
     if index != 1 {
-        fill_rect(fb, Rect::new(x + (30 - w) + 5, y + 12, w - 10, 1), false);
+        l_rect(fb, Rect::new(x + (30 - w) + 5, y + 12, w - 10, 1), false);
     }
 }
 
 fn draw_section_divider(fb: &mut Framebuffer, x: u16, y: u16, h: u16) {
-    fill_rect(fb, Rect::new(x, y, 1, h), false);
-    fill_rect(fb, Rect::new(x + 5, y + 34, 1, h - 68), false);
+    l_rect(fb, Rect::new(x, y, 1, h), false);
+    l_rect(fb, Rect::new(x + 5, y + 34, 1, h - 68), false);
 }
 
 fn draw_edge_button_mark(fb: &mut Framebuffer, x: u16, y: u16) {
     stroke_rect_direct(fb, x, y, 28, 36);
-    fill_rect(fb, Rect::new(x + 5, y + 8, 18, 2), false);
-    fill_rect(fb, Rect::new(x + 5, y + 26, 18, 1), false);
+    l_rect(fb, Rect::new(x + 5, y + 8, 18, 2), false);
+    l_rect(fb, Rect::new(x + 5, y + 26, 18, 1), false);
 }
 
 fn draw_left_dock_notch(fb: &mut Framebuffer, x: u16, y: u16) {
-    fill_rect(fb, Rect::new(x, y, 3, 28), false);
-    fill_rect(fb, Rect::new(x + 6, y + 5, 1, 18), false);
-    fill_rect(fb, Rect::new(x + 6, y + 14, 18, 1), false);
+    l_rect(fb, Rect::new(x, y, 3, 28), false);
+    l_rect(fb, Rect::new(x + 6, y + 5, 1, 18), false);
+    l_rect(fb, Rect::new(x + 6, y + 14, 18, 1), false);
 }
 
 fn draw_soft_slot(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
-    fill_rect(fb, Rect::new(x + 8, y, w - 16, 1), false);
-    fill_rect(fb, Rect::new(x + 8, y + h - 1, w - 16, 1), false);
-    fill_rect(fb, Rect::new(x, y + 8, 1, h - 16), false);
-    fill_rect(fb, Rect::new(x + w - 1, y + 8, 1, h - 16), false);
+    l_rect(fb, Rect::new(x + 8, y, w - 16, 1), false);
+    l_rect(fb, Rect::new(x + 8, y + h - 1, w - 16, 1), false);
+    l_rect(fb, Rect::new(x, y + 8, 1, h - 16), false);
+    l_rect(fb, Rect::new(x + w - 1, y + 8, 1, h - 16), false);
 }
 
 fn draw_mini_recess(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     stroke_rect_direct(fb, x, y, w, h);
-    fill_rect(fb, Rect::new(x + 5, y + 5, w - 10, 1), false);
-    fill_rect(fb, Rect::new(x + 5, y + h - 6, w - 10, 1), false);
+    l_rect(fb, Rect::new(x + 5, y + 5, w - 10, 1), false);
+    l_rect(fb, Rect::new(x + 5, y + h - 6, w - 10, 1), false);
 }
 
 fn draw_cover_art_minimal(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     stroke_rect_direct(fb, x, y, w, h);
-    fill_rect(fb, Rect::new(x + 12, y + 14, w - 24, 1), false);
-    fill_rect(fb, Rect::new(x + 22, y + 44, w - 44, 2), false);
-    fill_rect(fb, Rect::new(x + 32, y + 72, w - 64, 1), false);
+    l_rect(fb, Rect::new(x + 12, y + 14, w - 24, 1), false);
+    l_rect(fb, Rect::new(x + 22, y + 44, w - 44, 2), false);
+    l_rect(fb, Rect::new(x + 32, y + 72, w - 64, 1), false);
     for row in 0..6 {
         let yy = y + 108 + row * 22;
         let inset = 26 + (row % 2) * 12;
-        fill_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 2), false);
+        l_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 2), false);
     }
-    fill_rect(fb, Rect::new(x + 26, y + h - 40, w - 52, 1), false);
+    l_rect(fb, Rect::new(x + 26, y + h - 40, w - 52, 1), false);
 }
 
 fn draw_cover_art_varied(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     stroke_rect_direct(fb, x, y, w, h);
-    fill_rect(fb, Rect::new(x + 12, y + 14, w - 24, 1), false);
-    fill_rect(fb, Rect::new(x + 24, y + 42, w - 56, 2), false);
-    fill_rect(fb, Rect::new(x + 34, y + 70, w - 72, 1), false);
+    l_rect(fb, Rect::new(x + 12, y + 14, w - 24, 1), false);
+    l_rect(fb, Rect::new(x + 24, y + 42, w - 56, 2), false);
+    l_rect(fb, Rect::new(x + 34, y + 70, w - 72, 1), false);
     let line_specs = [
         (104u16, 30u16, 122u16, 3u16),
         (126, 44, 86, 2),
@@ -1533,7 +1565,7 @@ fn draw_cover_art_varied(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     ];
     for (dy, inset, line_w, line_h) in line_specs {
         if dy + 8 < h {
-            fill_rect(
+            l_rect(
                 fb,
                 Rect::new(
                     x + inset,
@@ -1545,21 +1577,21 @@ fn draw_cover_art_varied(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
             );
         }
     }
-    fill_rect(fb, Rect::new(x + 30, y + h - 48, w - 72, 1), false);
-    fill_rect(fb, Rect::new(x + 42, y + h - 34, w - 104, 2), false);
+    l_rect(fb, Rect::new(x + 30, y + h - 48, w - 72, 1), false);
+    l_rect(fb, Rect::new(x + 42, y + h - 34, w - 104, 2), false);
 }
 
 fn draw_battery_landscape_minimal(fb: &mut Framebuffer, x: u16, y: u16, percent: u8) {
     stroke_rect_direct(fb, x, y, 38, 16);
-    fill_rect(fb, Rect::new(x + 38, y + 5, 3, 6), false);
+    l_rect(fb, Rect::new(x + 38, y + 5, 3, 6), false);
     let fill_w = ((percent.min(100) as u16 * 30) / 100).max(1);
-    fill_rect(fb, Rect::new(x + 4, y + 4, fill_w, 8), false);
+    l_rect(fb, Rect::new(x + 4, y + 4, fill_w, 8), false);
 }
 
 fn draw_ive_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u16) {
-    fill_rect(fb, Rect::new(x, y, w, 1), false);
+    l_rect(fb, Rect::new(x, y, w, 1), false);
     let fill_w = ((w as u32 * permille.min(1000) as u32) / 1000) as u16;
-    fill_rect(
+    l_rect(
         fb,
         Rect::new(x, y.saturating_sub(1), fill_w.max(1), 3),
         false,
@@ -1568,29 +1600,29 @@ fn draw_ive_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u16
 
 fn draw_paper_panel(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     stroke_rect_direct(fb, x, y, w, h);
-    fill_rect(fb, Rect::new(x + 6, y + 6, w - 12, 1), false);
-    fill_rect(fb, Rect::new(x + 6, y + h - 8, w - 12, 1), false);
+    l_rect(fb, Rect::new(x + 6, y + 6, w - 12, 1), false);
+    l_rect(fb, Rect::new(x + 6, y + h - 8, w - 12, 1), false);
     for inset in [18, 22, 26] {
-        fill_rect(fb, Rect::new(x + inset, y + 18, 1, h - 36), false);
+        l_rect(fb, Rect::new(x + inset, y + 18, 1, h - 36), false);
     }
 }
 
 fn draw_paper_gutter(fb: &mut Framebuffer, x: u16, y: u16, h: u16) {
-    fill_rect(fb, Rect::new(x, y, 1, h), false);
-    fill_rect(fb, Rect::new(x + 5, y + 16, 1, h - 32), false);
+    l_rect(fb, Rect::new(x, y, 1, h), false);
+    l_rect(fb, Rect::new(x + 5, y + 16, 1, h - 32), false);
 }
 
 fn draw_recessed_slot(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     stroke_rect_direct(fb, x, y, w, h);
-    fill_rect(fb, Rect::new(x + 4, y + 4, w - 8, 1), false);
-    fill_rect(fb, Rect::new(x + 4, y + h - 6, w - 8, 2), false);
-    fill_rect(fb, Rect::new(x + 8, y + 8, 1, h - 16), false);
+    l_rect(fb, Rect::new(x + 4, y + 4, w - 8, 1), false);
+    l_rect(fb, Rect::new(x + 4, y + h - 6, w - 8, 2), false);
+    l_rect(fb, Rect::new(x + 8, y + 8, 1, h - 16), false);
 }
 
 fn draw_button_well(fb: &mut Framebuffer, x: u16, y: u16) {
     stroke_rect_direct(fb, x, y, 28, 22);
-    fill_rect(fb, Rect::new(x + 5, y + 6, 18, 2), false);
-    fill_rect(fb, Rect::new(x + 5, y + 14, 18, 1), false);
+    l_rect(fb, Rect::new(x + 5, y + 6, 18, 2), false);
+    l_rect(fb, Rect::new(x + 5, y + 14, 18, 1), false);
 }
 
 fn draw_landscape_home_book_first(fb: &mut Framebuffer) {
@@ -1602,7 +1634,7 @@ fn draw_landscape_home_book_first(fb: &mut Framebuffer) {
     draw_text_centered(fb, title_font, "Flowers for Algernon", 458, 432);
     draw_text_centered(fb, body_font, "Daniel Keyes", 458, 460);
     draw_thin_progress(fb, 622, 156, 120, 420);
-    draw_text(fb, body_font, "42%", 660, 188, false);
+    l_text(fb, body_font, "42%", 660, 188, false);
 }
 
 fn draw_landscape_action_stack(
@@ -1619,10 +1651,10 @@ fn draw_landscape_action_stack(
     for (index, label) in labels.iter().enumerate() {
         let row_y = y + index as u16 * row_h;
         if index == selected {
-            fill_rect(fb, Rect::new(x, row_y, w, row_h.saturating_sub(2)), false);
+            l_rect(fb, Rect::new(x, row_y, w, row_h.saturating_sub(2)), false);
         } else {
-            fill_rect(fb, Rect::new(x, row_y, w, 1), false);
-            fill_rect(
+            l_rect(fb, Rect::new(x, row_y, w, 1), false);
+            l_rect(
                 fb,
                 Rect::new(x, row_y + row_h.saturating_sub(2), w, 1),
                 false,
@@ -1631,16 +1663,16 @@ fn draw_landscape_action_stack(
         let text_w = measure_text(font, label) as i16;
         let text_x = x as i16 + 24;
         let text_y = row_y as i16 + (row_h as i16 / 2) + 8;
-        draw_text(fb, font, label, text_x, text_y, index == selected);
-        fill_rect(
+        l_text(fb, font, label, text_x, text_y, index == selected);
+        l_rect(
             fb,
             Rect::new(x + w - 30, row_y + row_h / 2 - 1, 20, 2),
             index == selected,
         );
         if index == selected {
-            fill_rect(fb, Rect::new(x + 10, row_y + 10, 4, row_h - 22), true);
+            l_rect(fb, Rect::new(x + 10, row_y + 10, 4, row_h - 22), true);
         } else {
-            fill_rect(
+            l_rect(
                 fb,
                 Rect::new((text_x + text_w + 18) as u16, row_y + row_h / 2, 32, 1),
                 false,
@@ -1656,25 +1688,25 @@ fn draw_bottom_tabs(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16, select
     for (index, label) in labels.iter().enumerate() {
         let tab_x = x + index as u16 * tab_w;
         if index == selected {
-            fill_rect(fb, Rect::new(tab_x, y, tab_w, h), false);
+            l_rect(fb, Rect::new(tab_x, y, tab_w, h), false);
         } else {
             stroke_rect_direct(fb, tab_x, y, tab_w, h);
         }
         let text_x = tab_x as i16 + (tab_w as i16 - measure_text(font, label) as i16) / 2;
-        draw_text(fb, font, label, text_x, y as i16 + 34, index == selected);
+        l_text(fb, font, label, text_x, y as i16 + 34, index == selected);
     }
 }
 
 fn draw_cover_art(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     stroke_rect_direct(fb, x, y, w, h);
     stroke_rect_direct(fb, x + 8, y + 8, w - 16, h - 16);
-    fill_rect(fb, Rect::new(x + 18, y + 28, w - 36, 2), false);
-    fill_rect(fb, Rect::new(x + 18, y + 58, w - 36, 1), false);
-    fill_rect(fb, Rect::new(x + 28, y + h - 58, w - 56, 2), false);
+    l_rect(fb, Rect::new(x + 18, y + 28, w - 36, 2), false);
+    l_rect(fb, Rect::new(x + 18, y + 58, w - 36, 1), false);
+    l_rect(fb, Rect::new(x + 28, y + h - 58, w - 56, 2), false);
     for row in 0..8 {
         let yy = y + 86 + row * 20;
         let inset = 24 + (row % 3) * 10;
-        fill_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 3), false);
+        l_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 3), false);
     }
     draw_ascii(fb, "FLOWERS", x as usize + 48, y as usize + 36, false);
     draw_ascii(
@@ -1687,19 +1719,19 @@ fn draw_cover_art(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
 }
 
 fn draw_cover_art_skeuo(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
-    fill_rect(fb, Rect::new(x + 8, y + 8, w, h), false);
-    fill_rect(fb, Rect::new(x + 9, y + 9, w - 2, h - 2), true);
+    l_rect(fb, Rect::new(x + 8, y + 8, w, h), false);
+    l_rect(fb, Rect::new(x + 9, y + 9, w - 2, h - 2), true);
     stroke_rect_direct(fb, x, y, w, h);
     stroke_rect_direct(fb, x + 8, y + 8, w - 16, h - 16);
-    fill_rect(fb, Rect::new(x + 18, y + 22, 2, h - 44), false);
-    fill_rect(fb, Rect::new(x + 30, y + 36, w - 60, 3), false);
-    fill_rect(fb, Rect::new(x + 30, y + 66, w - 60, 1), false);
+    l_rect(fb, Rect::new(x + 18, y + 22, 2, h - 44), false);
+    l_rect(fb, Rect::new(x + 30, y + 36, w - 60, 3), false);
+    l_rect(fb, Rect::new(x + 30, y + 66, w - 60, 1), false);
     for row in 0..7 {
         let yy = y + 104 + row * 22;
         let inset = 32 + (row % 2) * 16;
-        fill_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 3), false);
+        l_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 3), false);
     }
-    fill_rect(fb, Rect::new(x + 34, y + h - 56, w - 68, 2), false);
+    l_rect(fb, Rect::new(x + 34, y + h - 56, w - 68, 2), false);
     draw_ascii(fb, "FLOWERS", x as usize + 50, y as usize + 46, false);
     draw_ascii(
         fb,
@@ -1713,16 +1745,16 @@ fn draw_cover_art_skeuo(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
 fn draw_battery_landscape(fb: &mut Framebuffer, x: u16, y: u16, percent: u8) {
     let font = literata(FontStyle::Regular);
     stroke_rect_direct(fb, x, y, 42, 18);
-    fill_rect(fb, Rect::new(x + 42, y + 6, 4, 6), false);
+    l_rect(fb, Rect::new(x + 42, y + 6, 4, 6), false);
     let fill_w = ((percent.min(100) as u16 * 34) / 100).max(1);
-    fill_rect(fb, Rect::new(x + 4, y + 4, fill_w, 10), false);
-    draw_text(fb, font, "82%", x as i16 - 48, y as i16 + 16, false);
+    l_rect(fb, Rect::new(x + 4, y + 4, fill_w, 10), false);
+    l_text(fb, font, "82%", x as i16 - 48, y as i16 + 16, false);
 }
 
 fn draw_thin_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u16) {
-    fill_rect(fb, Rect::new(x, y, w, 1), false);
+    l_rect(fb, Rect::new(x, y, w, 1), false);
     let fill_w = ((w as u32 * permille.min(1000) as u32) / 1000) as u16;
-    fill_rect(
+    l_rect(
         fb,
         Rect::new(x, y.saturating_sub(2), fill_w.max(1), 5),
         false,
@@ -1730,11 +1762,14 @@ fn draw_thin_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u1
 }
 
 fn draw_text_centered(fb: &mut Framebuffer, font: &BitmapFont, text: &str, center_x: i16, y: i16) {
-    let x = center_x - measure_text(font, text) as i16 / 2;
-    draw_text(fb, font, text, x, y, false);
+    // Center native-width text on the scaled center point (landscape design space).
+    let x = lxi(center_x) - measure_text(font, text) as i16 / 2;
+    draw_text(fb, font, text, x, lyi(y), false);
 }
 
 fn stroke_rect_direct(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    // Landscape design space: scale the box, keep hairlines 1px.
+    let (x, y, w, h) = (lx(x), ly(y), lx(w), ly(h));
     fill_rect(fb, Rect::new(x, y, w, 1), false);
     fill_rect(fb, Rect::new(x, y + h - 1, w, 1), false);
     fill_rect(fb, Rect::new(x, y, 1, h), false);
