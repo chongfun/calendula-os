@@ -273,15 +273,22 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
-pub const READER_FOOTER_TOP: i16 = 466;
+/// Footer band top: 14 rows up from the panel's bottom edge. Panel-relative
+/// so the X3's taller page pushes the footer to its own bottom edge; on the
+/// X4 this is the historical 466.
+pub const READER_FOOTER_TOP: i16 = display::HEIGHT as i16 - 14;
 /// Last permissible baseline row for body ink. Derived, not tuned: the
-/// page counter's '/' ink starts at row 465 (baseline 477 minus 12), and
-/// the deepest body glyph reaches 7 rows below its baseline
-/// (comma-below diacritics), so 465 - 7 - 1 keeps every possible
-/// descender a clear row away from the counter.
-pub const READER_PAGE_BOTTOM: i16 = 457;
+/// page counter's '/' ink starts 12 rows up from its baseline (the panel
+/// bottom minus 3, `fw::views`), and the deepest body glyph reaches 7 rows
+/// below its baseline (comma-below diacritics), so bottom - 3 - 12 - 7 - 1
+/// keeps every possible descender a clear row away from the counter. On the
+/// X4 this is the historical 457.
+pub const READER_PAGE_BOTTOM: i16 = display::HEIGHT as i16 - 23;
 pub const READER_LEFT_X: i16 = 8;
-pub const READER_RIGHT_X: i16 = 792;
+/// Right text margin: 8 rows in from the panel's right edge (the X4's
+/// historical 792). Panel-relative so the X3's narrower panel keeps the
+/// same inset rather than letting body ink touch the edge.
+pub const READER_RIGHT_X: i16 = display::WIDTH as i16 - 8;
 pub const READER_WRAP_SAFETY: i16 = 4;
 /// Version of the wrap rules and page constants in this module, and of the
 /// cached section content keyed off it. Bump when layout changes for

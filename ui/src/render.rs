@@ -31,17 +31,20 @@ const CONTENT_RIGHT: i16 = 740;
 const COLOPHON_RIGHT: i16 = 760;
 const HEADING_CX: i16 = 480;
 /// Right edge for the footer battery readout. It sits in the panel corner
-/// with nothing beside it, so it tucks to the same 24px inset as the reading
-/// page counter (READER_RIGHT_X - 16 = 776) rather than the content column's
-/// value margin — the corner then reads the same in a menu as when reading.
-const FOOTER_RIGHT: i16 = 776;
+/// with nothing beside it, so it tucks to a 24px inset from the panel edge
+/// rather than the content column's value margin — the corner then reads the
+/// same in a menu as when reading. Panel-relative (the X4's historical 776).
+const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
 /// Rows the Library list shows at once. Public so the firmware sizes the
 /// resident catalog window to cover the visible range it must stream in.
 pub const LIBRARY_VISIBLE_ROWS: usize = 6;
 const VISIBLE_ROWS: usize = LIBRARY_VISIBLE_ROWS;
-const FOOTER_Y: i16 = 456;
+/// Footer baseline: 24px up from the panel's bottom edge (the X4's
+/// historical 456). Panel-relative so the taller X3 keeps its apparatus in
+/// the corner rather than floating it mid-page.
+const FOOTER_Y: i16 = HEIGHT as i16 - 24;
 /// Baseline-to-baseline leading for the wrapped 46px display title,
 /// tighter than the face's default 62px line height as title blocks
 /// conventionally are.
