@@ -1,7 +1,43 @@
 # Xteink X3 Support — Implementation Plan
 
-Status: planned, not started. Blocked on hardware for final validation (an X3 plus its
-4-pin magnetic pogo cable — the 2-pin cable is charge-only and cannot flash).
+Status: **the existing-code scaffolding is done and committed** (Phases 1, 4, 5, and the
+Phase 2 *seam*); the remaining work is the new X3 drivers (UC8253 panel, BQ27220 battery)
+and on-device validation. Blocked on hardware for final validation (an X3 plus its 4-pin
+magnetic pogo cable — the 2-pin cable is charge-only and cannot flash).
+
+## Progress (2026-07-06)
+
+Done and committed — the `device-x3` build compiles, both variants pass clippy, the X4
+build is byte-identical (119 host tests + 6 reading goldens green), and the X3 shell was
+eyeballed in the preview tool (apparatus back in the corner, nothing clipped):
+
+- **Phase 1** — `device-x3` feature on the `display` crate selects 792×528; `fw` forwards
+  it; band/DMA size coincidence is now an explicit assert.
+- **Phase 2 seam only** — `display::epd` and `fw::display_flush` split into per-controller
+  modules. SSD1677 moved verbatim; `RefreshMode`/`SpiOp`/band-transform are the shared
+  surface; the X3 build compiles against `todo!()` UC8253 skeletons. Trimmed the radio's
+  dram2 heap 16→13 KB so the larger X3 framebuffer fits the segment.
+- **Layout geometry** — the reader page box and shell footer were pinned to 800×480
+  literals (`READER_RIGHT_X=792` *equals* the X3 width → edge-touching ink). Re-expressed
+  as panel-relative edge insets: identity on X4, correct margins on X3.
+- **Phase 4** — reader layout version salted with panel geometry (section caches rebuild
+  across panels); `POS.BIN` checksum salted so a cross-panel saved position resets to book
+  start (salt is 0 on X4, compile-asserted, so no existing position is wiped on upgrade).
+- **Phase 5 (partial)** — `device-x3` pass-through in the emulator/web-emulator/preview
+  manifests; the SD firmware trigger filename is per-panel (`FWUPDATE.BIN` vs
+  `FWUPDX3.BIN`) so a card is safe to move between devices; FLASHING.md updated.
+
+Still open (see phases below): **the UC8253 driver bodies (Phase 2)** and **BQ27220 +
+bring-up (Phase 3)** — the new-code core — plus **Phase 6** on-device validation. Two
+small Phase-5 tails deferred deliberately: there is no build/test CI to extend (only a
+Pages deploy workflow), so a "build both feature sets" job needs a CI pipeline decision;
+and the left-bezel key rows (`KEY_YS` in `ui/src/render.rs`) still sit at X4 positions
+because they align to physical buttons whose X3 placement needs the device.
+
+---
+
+## Original plan
+
 Everything up to the on-device phases can be built and code-reviewed without the device.
 
 ## Background
