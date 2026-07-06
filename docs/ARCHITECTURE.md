@@ -215,6 +215,13 @@ volume. Deep sleep resets the chip and clears that state.
 `display::fb::Framebuffer` is the source of truth. White is bit `1`, black is
 bit `0`, row-major, 100 bytes per row.
 
+The shared UI keeps the X4's 480-row composition as its design grid. On the
+528-row X3, main furniture and the four-button rail receive a 24-row centering
+offset, while footers anchor to the selected panel height. Reader page and
+footer bounds are also height-derived: X3 uses its additional 48 rows for body
+text instead of leaving a blank strip. This changes pagination, so reader
+layout config v16 invalidates older section caches.
+
 The SSD1677 path writes the current framebuffer to BW RAM (`0x24`). The first
 refresh after boot also writes the current framebuffer to RED RAM (`0x26`) and
 runs the multi-flash full waveform (~3.5 s), the only mode that reliably clears

@@ -273,13 +273,14 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
-pub const READER_FOOTER_TOP: i16 = 466;
+pub const READER_FOOTER_BASELINE: i16 = display::HEIGHT as i16 - 3;
+pub const READER_FOOTER_TOP: i16 = READER_FOOTER_BASELINE - 11;
 /// Last permissible baseline row for body ink. Derived, not tuned: the
-/// page counter's '/' ink starts at row 465 (baseline 477 minus 12), and
+/// page counter's '/' ink starts one row above `READER_FOOTER_TOP`, and
 /// the deepest body glyph reaches 7 rows below its baseline
-/// (comma-below diacritics), so 465 - 7 - 1 keeps every possible
+/// (comma-below diacritics), so subtracting 9 keeps every possible
 /// descender a clear row away from the counter.
-pub const READER_PAGE_BOTTOM: i16 = 457;
+pub const READER_PAGE_BOTTOM: i16 = READER_FOOTER_TOP - 9;
 pub const READER_LEFT_X: i16 = 8;
 pub const READER_RIGHT_X: i16 = 792;
 pub const READER_WRAP_SAFETY: i16 = 4;
@@ -307,8 +308,9 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// existing caches rebuild on a family change.
 /// v15: the second family changed from Bookerly to Merriweather. Its advances
 /// differ, but the family bit (1) does not, so a version bump is what retires
-/// any pagination cached under the old face.
-const READER_LAYOUT_VERSION: u16 = 15;
+/// any pagination cached under the old face. v16: page and footer bounds are
+/// derived from the selected board height, using the X3's additional 48 rows.
+const READER_LAYOUT_VERSION: u16 = 16;
 
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a

@@ -7,6 +7,20 @@ pub mod qr_generated;
 pub mod reading;
 pub mod render;
 
+/// The original UI was composed for the 480-row X4. Taller boards preserve
+/// those proportions by centering the main furniture, while bottom-anchored
+/// apparatus uses the full panel height.
+const DESIGN_HEIGHT: i16 = 480;
+pub(crate) const VERTICAL_CENTER_OFFSET: i16 = (display::HEIGHT as i16 - DESIGN_HEIGHT) / 2;
+
+pub(crate) const fn centered_y(x4_y: i16) -> i16 {
+    x4_y + VERTICAL_CENTER_OFFSET
+}
+
+pub(crate) const fn bottom_y(inset: i16) -> i16 {
+    display::HEIGHT as i16 - inset
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiView {
     Home,

@@ -2,15 +2,15 @@
 //! synthetic cached blocks through `ui::reading` — the exact code firmware
 //! uses for SD reading pages — and compare against checked-in frames.
 //!
-//! The goldens and the exact line-count assertions are pinned to the X4's
-//! 800x480 geometry, so the suite only runs under `board-x4`.
+//! Golden images are pinned to the X4's 800x480 geometry; those comparisons
+//! only run under `board-x4`. Pagination-capacity assertions run on both boards.
 //!
 //! Regenerate after intentional typography changes with:
 //! `REGEN_READING_GOLDEN=1 cargo test --manifest-path tools/emulator/Cargo.toml --target <host> --test reading_golden`
-#![cfg(feature = "board-x4")]
-
+#[cfg(feature = "board-x4")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "board-x4")]
 use display::fb::Framebuffer;
 use display::font::{
     style_marker_code, FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings,
@@ -18,10 +18,9 @@ use display::font::{
 };
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
-use ui::reading::{
-    draw_reading_page_body, page_record_at, paginate_block_pages, ReadingBlocks,
-    READER_PAGE_BOTTOM, READER_PAGE_TOP,
-};
+#[cfg(feature = "board-x4")]
+use ui::reading::{draw_reading_page_body, page_record_at};
+use ui::reading::{paginate_block_pages, ReadingBlocks, READER_PAGE_BOTTOM, READER_PAGE_TOP};
 
 struct FixtureBlock {
     record: BlockRecord,
@@ -175,6 +174,7 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
     FixtureBlocks { blocks, settings }
 }
 
+#[cfg(feature = "board-x4")]
 fn encode_png(fb: &Framebuffer) -> Vec<u8> {
     // Same mapping as the emulator's render::encode_png so frames are
     // directly comparable with the scenario goldens.
@@ -196,12 +196,14 @@ fn encode_png(fb: &Framebuffer) -> Vec<u8> {
     bytes
 }
 
+#[cfg(feature = "board-x4")]
 fn golden_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/golden")
         .join(format!("{name}.png"))
 }
 
+#[cfg(feature = "board-x4")]
 fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &str) {
     let page = page_record_at(source, page_index, READER_PAGE_TOP, READER_PAGE_BOTTOM);
     assert!(page.block_count > 0, "page {page_index} should hold blocks");
@@ -228,10 +230,14 @@ fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &
 }
 
 #[test]
+#[cfg(feature = "board-x4")]
 fn reading_page_bodies_match_goldens() {
     let source = fixture(TypeSettings::DEFAULT);
     let pages = paginate_block_pages(&source, READER_PAGE_TOP, READER_PAGE_BOTTOM);
-    assert!(pages >= 2, "fixture should span at least two pages, got {pages}");
+    assert!(
+        pages >= 2,
+        "fixture should span at least two pages, got {pages}"
+    );
 
     for page_index in 0..2 {
         assert_page_matches_golden(&source, page_index, &format!("reading-page-{page_index}"));
@@ -242,6 +248,7 @@ fn reading_page_bodies_match_goldens() {
 /// a page, so the fixture must paginate onto more pages than the default,
 /// and the first page's frame is pinned.
 #[test]
+#[cfg(feature = "board-x4")]
 fn reading_page_bodies_match_goldens_large_relaxed() {
     let source = fixture(TypeSettings {
         size: FontSize::Large,
@@ -249,8 +256,11 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
     });
-    let default_pages =
-        paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);
+    let default_pages = paginate_block_pages(
+        &fixture(TypeSettings::DEFAULT),
+        READER_PAGE_TOP,
+        READER_PAGE_BOTTOM,
+    );
     let pages = paginate_block_pages(&source, READER_PAGE_TOP, READER_PAGE_BOTTOM);
     assert!(
         pages > default_pages,
@@ -265,6 +275,7 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
 /// the Bold face. Wider glyphs shift wrap points, so the frame differs from
 /// the Normal-weight page; page 0 is pinned.
 #[test]
+#[cfg(feature = "board-x4")]
 fn reading_page_bodies_match_goldens_heavy() {
     let source = fixture(TypeSettings {
         size: FontSize::Medium,
@@ -279,6 +290,7 @@ fn reading_page_bodies_match_goldens_heavy() {
 /// Merriweather faces and its advances shift wrap points, so the frame differs
 /// from the Literata page; page 0 is pinned.
 #[test]
+#[cfg(feature = "board-x4")]
 fn reading_page_bodies_match_goldens_merriweather() {
     let source = fixture(TypeSettings {
         size: FontSize::Medium,
@@ -289,13 +301,12 @@ fn reading_page_bodies_match_goldens_merriweather() {
     assert_page_matches_golden(&source, 0, "reading-page-merriweather-0");
 }
 
-/// The default grid holds exactly seventeen body lines: a paragraph
-/// split into seventeen one-line blocks (no inner paragraph gaps) fills
-/// one page, and an eighteenth line spills. Pins both the 26px default
-/// advance and the ink-height fit rule that stops charging a trailing
-/// paragraph gap against the page edge.
+/// The default grid fills the selected panel height: seventeen body lines on
+/// X4 or nineteen on the 48-row-taller X3, with the next line spilling.
+/// Pins both the 26px default advance and the ink-height fit rule that stops
+/// charging a trailing paragraph gap against the page edge.
 #[test]
-fn default_grid_fits_seventeen_body_lines() {
+fn default_grid_uses_selected_panel_height() {
     let paragraph_of = |lines: usize| -> FixtureBlocks {
         let blocks = (0..lines)
             .map(|index| FixtureBlock {
@@ -311,12 +322,21 @@ fn default_grid_fits_seventeen_body_lines() {
             settings: TypeSettings::DEFAULT,
         }
     };
+    let fitting_lines = if cfg!(feature = "board-x3") { 19 } else { 17 };
     assert_eq!(
-        paginate_block_pages(&paragraph_of(17), READER_PAGE_TOP, READER_PAGE_BOTTOM),
+        paginate_block_pages(
+            &paragraph_of(fitting_lines),
+            READER_PAGE_TOP,
+            READER_PAGE_BOTTOM
+        ),
         1
     );
     assert_eq!(
-        paginate_block_pages(&paragraph_of(18), READER_PAGE_TOP, READER_PAGE_BOTTOM),
+        paginate_block_pages(
+            &paragraph_of(fitting_lines + 1),
+            READER_PAGE_TOP,
+            READER_PAGE_BOTTOM
+        ),
         2
     );
 }
@@ -330,8 +350,11 @@ fn small_compact_paginates_no_worse_than_default() {
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
     });
-    let default_pages =
-        paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);
+    let default_pages = paginate_block_pages(
+        &fixture(TypeSettings::DEFAULT),
+        READER_PAGE_TOP,
+        READER_PAGE_BOTTOM,
+    );
     let pages = paginate_block_pages(&source, READER_PAGE_TOP, READER_PAGE_BOTTOM);
     assert!(
         pages <= default_pages,

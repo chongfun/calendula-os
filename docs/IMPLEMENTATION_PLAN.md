@@ -169,6 +169,10 @@ Current code status:
 - `display::epd::fill_transformed_band` exposes the board-selected panel
   byte/bit/row transform so firmware and emulator stream the same panel RAM
   layout. X3's `MIRROR_Y=true` row reversal is hardware-verified.
+- Vertical UI metrics are panel-height-aware. X3 centers the four-button rail
+  and shared 480-row composition with a 24-row offset, anchors footers to the
+  528-row panel, and extends reader pagination through the extra 48 rows
+  (reader layout config v16).
 - `tools/emulator` provides a deterministic headless runner plus an optional
   egui frontend behind `--features gui`. Headless mode accepts one TOML scenario
   or a scenario directory, applies scripted button/library events, validates app

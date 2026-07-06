@@ -1,6 +1,6 @@
 use crate::{
-    render::render_shell, UiBook, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell,
-    UiSyncStatus, UiTocItem, UiView,
+    bottom_y, centered_y, render::render_shell, UiBook, UiLibraryStatus, UiOrientation,
+    UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem, UiView,
 };
 use app_core::{
     AppView, Button, DisplayOrientation, RefreshPolicy, RenderRequest, SyncError, SyncStatus,
@@ -97,17 +97,24 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
     let title_font = literata_display();
     let (first, second) = crate::render::wrap_title(title_font, model.active_book.title, 720);
     if second.is_empty() {
-        draw_font_centered_fit(fb, title_font, first, 400, 204, 720);
+        draw_font_centered_fit(fb, title_font, first, 400, centered_y(204), 720);
     } else {
         // Two-line titles grow upward so the author/rule furniture
         // below keeps its place, mirroring the home title page.
-        draw_font_centered_fit(fb, title_font, first, 400, 204 - 54, 720);
-        draw_font_centered_fit(fb, title_font, second, 400, 204, 720);
+        draw_font_centered_fit(fb, title_font, first, 400, centered_y(204) - 54, 720);
+        draw_font_centered_fit(fb, title_font, second, 400, centered_y(204), 720);
     }
     if !model.active_book.author.is_empty() {
         let caps = literata_small(FontStyle::Regular);
         let width = crate::render::ls_width(caps, model.active_book.author, 3);
-        crate::render::ls_caps(fb, caps, model.active_book.author, 400 - width / 2, 246, 3);
+        crate::render::ls_caps(
+            fb,
+            caps,
+            model.active_book.author,
+            400 - width / 2,
+            centered_y(246),
+            3,
+        );
     }
 
     let permille = if request.page_count > 1 {
@@ -116,7 +123,7 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
     } else {
         model.active_book.progress_permille
     };
-    crate::render::progress_rule(fb, 280, 302, 240, permille);
+    crate::render::progress_rule(fb, 280, centered_y(302), 240, permille);
 
     // The sleep colophon is centered on the full 800px panel, so it can run
     // wider than Home's left-column colophon before a long chapter name needs
@@ -134,7 +141,7 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
         request.chapter,
         model.chapter_title,
         400 - colophon_w / 2,
-        340,
+        centered_y(340),
         SLEEP_COLOPHON_MAX_W,
     );
 
@@ -143,7 +150,7 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
         literata_small(FontStyle::Regular),
         "\u{00B7} asleep \u{00B7}",
         400,
-        456,
+        bottom_y(24),
         600,
     );
     mirror_framebuffer_long_axis(fb);
@@ -171,20 +178,32 @@ fn draw_font_centered_fit(
 
 fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
     fb.clear(true);
-    draw_ascii(fb, "READ MODE", 64, 96, false);
-    draw_ascii(fb, model.active_book.title, 64, 136, false);
-    draw_ascii(fb, "BACK RETURNS HOME", 64, 176, false);
+    draw_ascii(fb, "READ MODE", 64, centered_y(96) as usize, false);
+    draw_ascii(
+        fb,
+        model.active_book.title,
+        64,
+        centered_y(136) as usize,
+        false,
+    );
+    draw_ascii(fb, "BACK RETURNS HOME", 64, centered_y(176) as usize, false);
     let mut chapter_buf = [0u8; 10];
-    draw_ascii(fb, "CHAPTER", 64, 232, false);
+    draw_ascii(fb, "CHAPTER", 64, centered_y(232) as usize, false);
     draw_ascii(
         fb,
         fmt_u32(request.chapter as u32 + 1, &mut chapter_buf),
         160,
-        232,
+        centered_y(232) as usize,
         false,
     );
     if let Some(button) = request.last_button {
-        draw_ascii(fb, button_label(button), 64, 280, false);
+        draw_ascii(
+            fb,
+            button_label(button),
+            64,
+            centered_y(280) as usize,
+            false,
+        );
     }
     mirror_framebuffer_long_axis(fb);
 }

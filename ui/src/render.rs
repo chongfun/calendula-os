@@ -8,8 +8,8 @@
 //! only — the device does not tell time.
 
 use crate::{
-    qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
-    UiTocItem, UiView,
+    bottom_y, centered_y, qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell,
+    UiSyncStatus, UiTocItem, UiView,
 };
 use display::fb::Framebuffer;
 use display::font::{
@@ -20,7 +20,12 @@ use display::{Rect, HEIGHT, WIDTH};
 
 /// Vertical centers of the four left-bezel buttons on screen,
 /// top to bottom: Back, Confirm, Previous, Next.
-const KEY_YS: [i16; 4] = [120, 200, 280, 360];
+const KEY_YS: [i16; 4] = [
+    centered_y(120),
+    centered_y(200),
+    centered_y(280),
+    centered_y(360),
+];
 const KEY_DASH_X: i16 = 10;
 const KEY_LABEL_X: i16 = 40;
 const CONTENT_X: i16 = 210;
@@ -36,12 +41,12 @@ const HEADING_CX: i16 = 480;
 /// value margin — the corner then reads the same in a menu as when reading.
 const FOOTER_RIGHT: i16 = 776;
 const ROW_STEP: i16 = 56;
-const FIRST_ROW_Y: i16 = 118;
+const FIRST_ROW_Y: i16 = centered_y(118);
 /// Rows the Library list shows at once. Public so the firmware sizes the
 /// resident catalog window to cover the visible range it must stream in.
 pub const LIBRARY_VISIBLE_ROWS: usize = 6;
 const VISIBLE_ROWS: usize = LIBRARY_VISIBLE_ROWS;
-const FOOTER_Y: i16 = 456;
+const FOOTER_Y: i16 = bottom_y(24);
 /// Baseline-to-baseline leading for the wrapped 46px display title,
 /// tighter than the face's default 62px line height as title blocks
 /// conventionally are.
@@ -80,10 +85,17 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         (CONTENT_RIGHT - CONTENT_X) as u16,
     );
     if second.is_empty() {
-        draw_text(fb, title_font, first, CONTENT_X, 180, false);
+        draw_text(fb, title_font, first, CONTENT_X, centered_y(180), false);
     } else {
-        draw_text(fb, title_font, first, CONTENT_X, 180 - TITLE_LEADING, false);
-        draw_text(fb, title_font, second, CONTENT_X, 180, false);
+        draw_text(
+            fb,
+            title_font,
+            first,
+            CONTENT_X,
+            centered_y(180) - TITLE_LEADING,
+            false,
+        );
+        draw_text(fb, title_font, second, CONTENT_X, centered_y(180), false);
     }
     if !shell.active_book.author.is_empty() {
         ls_caps(
@@ -91,7 +103,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             literata_small(FontStyle::Regular),
             shell.active_book.author,
             CONTENT_X,
-            222,
+            centered_y(222),
             3,
         );
     }
@@ -101,7 +113,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     } else {
         shell.active_book.progress_permille
     };
-    progress_rule(fb, CONTENT_X, 280, 240, permille);
+    progress_rule(fb, CONTENT_X, centered_y(280), 240, permille);
 
     // Colophon: the chapter name alone, in the book's italic voice —
     // the progress rule already answers "how far". Roman numeral
@@ -112,7 +124,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         shell.chapter,
         shell.chapter_title,
         CONTENT_X,
-        312,
+        centered_y(312),
         COLOPHON_RIGHT - CONTENT_X,
     );
 
@@ -453,7 +465,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_unused(fb, 3);
     heading(fb, "Wireless");
 
-    let hint_y = 280;
+    let hint_y = centered_y(280);
     match shell.sync_status {
         UiSyncStatus::NotConfigured => {
             centered_note(fb, "no wi-fi network saved yet");
@@ -514,7 +526,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 qr_generated::QR_JOIN_SIZE,
                 qr_generated::QR_JOIN_STRIDE,
                 HEADING_CX,
-                160,
+                centered_y(160),
                 5,
             );
             {
@@ -528,7 +540,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                     literata_small(FontStyle::Regular),
                     text_in(&buf, cursor),
                     HEADING_CX,
-                    348,
+                    centered_y(348),
                 );
             }
             draw_text_centered(
@@ -536,7 +548,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 literata_small(FontStyle::Italic),
                 "then enter your wi-fi in the page that opens \u{00b7} http://192.168.4.1",
                 HEADING_CX,
-                382,
+                centered_y(382),
             );
         }
         UiSyncStatus::Serving(ip) => {
@@ -665,8 +677,8 @@ fn dash_unused(fb: &mut Framebuffer, slot: usize) {
 fn heading(fb: &mut Framebuffer, text: &str) {
     let small = literata_small(FontStyle::Regular);
     let width = ls_width(small, text, 5);
-    ls_caps(fb, small, text, HEADING_CX - width / 2, 42, 5);
-    hline(fb, HEADING_CX - 160, 56, 320);
+    ls_caps(fb, small, text, HEADING_CX - width / 2, centered_y(42), 5);
+    hline(fb, HEADING_CX - 160, centered_y(56), 320);
 }
 
 /// Letterspaced all-caps, the small-caps stand-in for this bitmap set.
@@ -763,7 +775,13 @@ fn selection_arrow(fb: &mut Framebuffer, y: i16) {
 }
 
 fn centered_note(fb: &mut Framebuffer, text: &str) {
-    draw_text_centered(fb, literata(FontStyle::Italic), text, HEADING_CX, 230);
+    draw_text_centered(
+        fb,
+        literata(FontStyle::Italic),
+        text,
+        HEADING_CX,
+        centered_y(230),
+    );
 }
 
 /// "– n of m –" centered on the content column.
@@ -962,6 +980,13 @@ fn font_family_label(family: display::font::FontFamily) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertical_metrics_use_the_selected_panel_height() {
+        assert_eq!((KEY_YS[0] + KEY_YS[3]) / 2, HEIGHT as i16 / 2);
+        assert_eq!(FOOTER_Y, HEIGHT as i16 - 24);
+        assert_eq!(FIRST_ROW_Y, 118 + (HEIGHT as i16 - 480) / 2);
+    }
 
     #[test]
     fn wrap_title_keeps_short_titles_on_one_line() {
