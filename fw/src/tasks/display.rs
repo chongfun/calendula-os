@@ -69,7 +69,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     // True while RED RAM is known to hold exactly prev_fb's content, letting
     // a fast refresh skip its previous-frame stream. Reset on any failure,
     // sleep, or panel re-init; false just means the next flush writes RED.
-    let mut red_prestaged = false;
+    let mut prev_prestaged = false;
     static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
     let sd_library = SD_LIBRARY.take();
 
@@ -154,7 +154,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     esp_println::println!("display: wake init start");
                     display_flush::init_panel(&mut epd).await;
                     esp_println::println!("display: wake init complete");
-                    red_prestaged = false;
+                    prev_prestaged = false;
                 }
 
                 let mode = refresh_planner.mode_for(request);
@@ -173,7 +173,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     tx_band,
                     refresh_planner.screen_on(),
                     mode,
-                    red_prestaged,
+                    prev_prestaged,
                 )
                 .await
                 .is_ok()
@@ -182,7 +182,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     refresh_planner.record_render(request, mode);
                     prev_fb.copy_from(fb);
                     let prestage_start = Instant::now();
-                    red_prestaged = display_flush::prestage_red(&mut epd, fb, tx_band)
+                    prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
                         .await
                         .is_ok();
                     esp_println::println!(
@@ -217,7 +217,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
                 } else {
                     esp_println::println!("display: SPI transfer failed");
-                    red_prestaged = false;
+                    prev_prestaged = false;
                     send_required_display_event(&DisplayEvent::Settled);
                 }
             }
@@ -238,12 +238,12 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         tx_band,
                         refresh_planner.screen_on(),
                         RefreshMode::Full,
-                        red_prestaged,
+                        prev_prestaged,
                     )
                     .await;
                     prev_fb.copy_from(fb);
                 }
-                red_prestaged = false;
+                prev_prestaged = false;
                 if display_flush::sleep_panel(&mut epd).await.is_ok() {
                     refresh_planner.record_sleep();
                     send_required_display_event(&DisplayEvent::Asleep);
@@ -285,14 +285,14 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             tx_band,
                             refresh_planner.screen_on(),
                             mode,
-                            red_prestaged,
+                            prev_prestaged,
                         )
                         .await
                         .is_ok()
                         {
                             refresh_planner.record_render(loading_request, mode);
                             prev_fb.copy_from(fb);
-                            red_prestaged = false;
+                            prev_prestaged = false;
                         }
                     }
                 }

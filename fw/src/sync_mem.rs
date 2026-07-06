@@ -21,7 +21,15 @@ use portable_atomic::{AtomicBool, Ordering};
 /// ~64.8 KB and also hosts the previous-frame framebuffer (below), which
 /// was moved here so esp-wifi's static demand fits in main DRAM without
 /// eating the stack region.
+///
+/// The X3's 792x528 framebuffer is 4.3 KB larger than the X4's, so its
+/// build trims the radio's share to keep both in the segment. The sync
+/// session's heap watermark has NOT been validated at the smaller size —
+/// re-check it on X3 hardware before trusting a sync under load.
+#[cfg(not(feature = "device-x3"))]
 pub const DRAM2_HEAP_BYTES: usize = 16 * 1024;
+#[cfg(feature = "device-x3")]
+pub const DRAM2_HEAP_BYTES: usize = 13 * 1024;
 
 /// A loanable byte region described by raw parts. Heap donations use raw
 /// pointers rather than slices because the scratch-struct region is

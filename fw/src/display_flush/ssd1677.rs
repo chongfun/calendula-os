@@ -6,20 +6,10 @@ use display::epd::{
     CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE, FAST_CLEAN_TEMPERATURE,
     INIT_SEQUENCE, UPDATE_SEQUENCE_LOAD_TEMP,
 };
+use super::{Epd, SpiError};
 use display::fb::Framebuffer;
 use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
 use embassy_time::Instant;
-use esp_hal::gpio::{Input, Output};
-use esp_hal::spi::master::SpiDmaBus;
-use esp_hal::Async;
-
-pub(crate) type Epd = hal_ext::spi_dma::EpdBus<
-    SpiDmaBus<'static, Async>,
-    Output<'static>,
-    Output<'static>,
-    Input<'static>,
-    Output<'static>,
->;
 
 pub(crate) async fn init_panel(epd: &mut Epd) {
     for op in INIT_SEQUENCE {
@@ -40,8 +30,8 @@ pub(crate) async fn flush(
     tx_band: &mut [u8; BAND_BYTES],
     screen_on: bool,
     mode: RefreshMode,
-    red_holds_prev: bool,
-) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
+    prev_staged: bool,
+) -> Result<(), SpiError> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
     esp_println::println!(
@@ -50,7 +40,7 @@ pub(crate) async fn flush(
         bw_start.elapsed().as_millis()
     );
     if mode == RefreshMode::Fast {
-        if red_holds_prev {
+        if prev_staged {
             // The previous frame was prestaged into RED RAM right after the
             // last refresh settled, so this page turn streams only BW.
             esp_println::println!("display: RED RAM already holds previous");
@@ -103,17 +93,15 @@ pub(crate) async fn flush(
 /// Stage `fb` (the frame just shown) into RED RAM while the panel is idle,
 /// so the next fast refresh can skip its previous-frame write entirely.
 /// Runs off the page-turn critical path, right after a refresh settles.
-pub(crate) async fn prestage_red(
+pub(crate) async fn prestage_previous(
     epd: &mut Epd,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
+) -> Result<(), SpiError> {
     write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await
 }
 
-pub(crate) async fn sleep_panel(
-    epd: &mut Epd,
-) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
+pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), SpiError> {
     esp_println::println!("display: sleep start");
     epd.command(
         CMD_DISPLAY_UPDATE_CTRL2,
@@ -131,7 +119,7 @@ async fn write_ram(
     ram_command: u8,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
+) -> Result<(), SpiError> {
     let rect = Rect::FULL;
     epd.command(CMD_SET_RAM_X_RANGE, &ram_x_range(rect)).await?;
     epd.command(CMD_SET_RAM_Y_RANGE, &ram_y_range(rect)).await?;

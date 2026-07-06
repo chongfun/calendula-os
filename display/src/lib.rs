@@ -30,7 +30,7 @@ pub const BAND_BYTES: usize = ROW_BYTES * BAND_ROWS;
 
 // WIDTH must stay byte-addressable; HEIGHT need not divide into bands —
 // fill_transformed_band already emits a short final band.
-const _: () = assert!(WIDTH % 8 == 0);
+const _: () = assert!(WIDTH.is_multiple_of(8));
 
 #[cfg(not(feature = "device-x3"))]
 const _: () = assert!(FB_BYTES == 48_000 && BAND_BYTES == 8_000);
