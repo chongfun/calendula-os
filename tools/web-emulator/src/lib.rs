@@ -400,12 +400,14 @@ impl WebEmulator {
         let label = format!("{}/{}", current, total);
         let font = literata_small(FontStyle::Regular);
         let width = measure_text(font, &label) as i16;
+        // Panel-relative footer baseline, matching fw::views (HEIGHT - 3);
+        // hardcoding the X4's 477 dropped the counter into the X3's body text.
         draw_text(
             &mut self.fb,
             font,
             &label,
             ui::reading::READER_RIGHT_X - width - 16,
-            477,
+            HEIGHT as i16 - 3,
             false,
         );
     }
