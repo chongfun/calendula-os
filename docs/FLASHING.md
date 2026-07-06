@@ -149,6 +149,33 @@ boot far enough to run the check — that would need a custom bootloader, which 
 app-level firmware provides — so treat it as a strong safety net, not a
 guarantee against every brick.
 
+## X3 panel bring-up verification
+
+The X3 driver's wire protocol and its ADC/heap constants are copied and scaled
+from the hardware-proven X4 driver. They compile and pass host tests, but five
+behaviors need evidence from *this* firmware on a real X3 panel before the X3
+port can be called proven. Build the instrumented image and read the evidence
+off the serial monitor:
+
+```sh
+cargo run -p fw --release --no-default-features --features board-x3,hw-verify
+```
+
+`--release` is not optional here — esp-hal's timing-sensitive peripherals
+misbehave under the dev profile. The `hw-verify` feature is bring-up-only
+(esp-alloc Max-usage watermark + raw-ADC stream); it is never in a release
+image, since `tools/build-release.sh` passes only the board feature.
+
+Capture the log with `tools/serial_capture.py` and grep for the markers below.
+
+| Behavior | Drive it by | Serial evidence to confirm |
+|---|---|---|
+| **Full vs. fast contrast** | Cycle **Settings → refresh policy** (`FastOnly`/`FullEveryTen` drive fast turns; the sleep screen and `FullOnWake` drive a full), turning pages between changes | `display: x3 flush Full/Fast …`, `display: x3 LUT {mode}`, and `bench: render … {mode}`. Confirm by eye that `Full` is deep black with no ghost and `Fast` is the lighter/faster waveform, and that the logged mode matches what you see. |
+| **BUSY release timing** | Any refresh, sleep, or wake | `display: x3 BUSY {phase} initial=… assertion=…/{ms} release=…/{ms} final=…`. Every phase (`init`, `power-on`, `refresh`, `post-full settle`, `power-off`) must show `assertion=Reached` then `release=Reached` with sane millisecond timings — never `TimedOut` (would mean the wait sailed through a live refresh). |
+| **Sleep retention** | Press **Power**, or wait out the 10-minute idle timeout | `display: x3 deep-sleep armed check=0xa5 ok=true`, then nothing until `display: wake init` on the next Power press. The panel must hold the sleep image across that gap with the SoC powered down. |
+| **Button ladders** | Press every button once (Back, Confirm, Left, Right on the front; Up, Down on the side; Power) | `input verify: nav=…mv->Some(Button) page=…mv->Some(Button) aux=…mv`. Each physical press must classify to the intended button; any `->None` is a band window (`fw/src/board/x3.rs` `NAV`/`PAGE`) that needs re-centering around the raw millivolts shown. |
+| **Wi-Fi heap headroom** | Open **Wireless**, join a network, upload a book, press **done** | The `wifi: heap[after-loan/after-wifi-init/after-net-stack/after-dhcp]` trail plus the `heap[serving]` and `heap[post-upload]` `stats` dumps. `Max usage` in the dumps must stay clear of `Size` (the loaned budget = `DRAM2_HEAP_BYTES` + scratch); a near-full watermark or an alloc failure means the copied X3 budget is too tight. |
+
 ## Status
 
 Implemented and verified on host tooling:

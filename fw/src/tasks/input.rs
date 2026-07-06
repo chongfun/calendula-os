@@ -12,6 +12,15 @@ const POLL_MS: u64 = 15;
 const CALIBRATION_ONLY: bool = false;
 const RAW_LOG_ENABLED: bool = false;
 const DEBOUNCE_TICKS: u8 = 2;
+// Under `hw-verify`, the input task streams raw ADC readings so the X3
+// button-ladder windows (scaled from the resistor ladder, not yet measured on
+// the panel) can be validated against real presses. Event-driven: a line is
+// emitted whenever any channel moves more than this many millivolts since the
+// last log, so each press and release prints its raw triple alongside what the
+// current bands classify it as -- including presses that land outside every
+// band, which is exactly the mis-scaled-window failure this build hunts.
+#[cfg(feature = "hw-verify")]
+const RAW_VERIFY_DELTA_MV: u16 = 100;
 // ~480 ms between held-button repeats, matching the fast-refresh settle
 // cadence so one repeat advances one displayed page.
 const REPEAT_COOLDOWN_TICKS: u8 = 32;
@@ -66,6 +75,8 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
     let mut raw_log_ticks = 0u8;
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
+    #[cfg(feature = "hw-verify")]
+    let mut raw_verify_last: Option<RawSample> = None;
 
     loop {
         Timer::after_millis(POLL_MS).await;
@@ -87,6 +98,9 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
                 );
             }
         }
+
+        #[cfg(feature = "hw-verify")]
+        verify_raw_log(&mut raw_verify_last, sample);
 
         if CALIBRATION_ONLY {
             continue;
@@ -178,6 +192,31 @@ fn log_input(button: Option<Button>, sample: RawSample) {
         sample.page,
         Instant::now().as_millis(),
     );
+}
+
+/// Emits the raw ADC triple whenever a channel moves past the noise floor,
+/// annotated with what the NAV/PAGE band tables currently classify it as. A
+/// press that classifies to `None` here is a window that needs widening or
+/// re-centering. See [`RAW_VERIFY_DELTA_MV`].
+#[cfg(feature = "hw-verify")]
+fn verify_raw_log(last: &mut Option<RawSample>, sample: RawSample) {
+    let moved = last.is_none_or(|prev| {
+        sample.nav.abs_diff(prev.nav) > RAW_VERIFY_DELTA_MV
+            || sample.page.abs_diff(prev.page) > RAW_VERIFY_DELTA_MV
+            || sample.aux.abs_diff(prev.aux) > RAW_VERIFY_DELTA_MV
+    });
+    if !moved {
+        return;
+    }
+    esp_println::println!(
+        "input verify: nav={}mv->{:?} page={}mv->{:?} aux={}mv",
+        sample.nav,
+        classify(sample.nav, NAV),
+        sample.page,
+        classify(sample.page, PAGE),
+        sample.aux,
+    );
+    *last = Some(sample);
 }
 
 enum StableEvent {

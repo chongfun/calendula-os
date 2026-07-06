@@ -130,7 +130,16 @@ pub(crate) async fn sleep_panel(
 ) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
     epd.command(CMD_POWER_OFF, &[]).await?;
     wait_ready_x3(epd, "power-off").await;
-    epd.command(CMD_DEEP_SLEEP, &[DEEP_SLEEP_CHECK]).await
+    let result = epd.command(CMD_DEEP_SLEEP, &[DEEP_SLEEP_CHECK]).await;
+    // Marks the retention boundary: from here until the next `wake init` the
+    // UC8253 is in deep sleep and must hold the last-flushed image with no
+    // firmware activity. A persistent image across this gap is the evidence.
+    esp_println::println!(
+        "display: x3 deep-sleep armed check={:#04x} ok={}",
+        DEEP_SLEEP_CHECK,
+        result.is_ok(),
+    );
+    result
 }
 
 async fn wait_ready_x3(epd: &mut Epd, phase: &str) {

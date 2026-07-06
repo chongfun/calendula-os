@@ -76,6 +76,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
     STORAGE_COMMANDS.send(StorageCommand::LoanSyncMemory).await;
     let loan = SYNC_LOANS.receive().await;
     sync_mem::donate_heap(loan.heap_a, loan.heap_b);
+    heap_report("after-loan");
     let SyncLoan {
         tcp_rx,
         tcp_tx,
@@ -107,6 +108,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
     // honest here because the session never ends except by reset.
     let inited: &'static EspWifiController<'static> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(inited));
+    heap_report("after-wifi-init");
     let Some(creds) = resolved else {
         run_portal(spawner, inited, wifi, seed, tcp_rx, tcp_tx, http_a, http_b).await;
     };
@@ -132,6 +134,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         send_event(SyncEvent::Failed(SyncError::RadioInit));
         park_until_exit().await;
     }
+    heap_report("after-net-stack");
 
     let mut session = Session {
         controller,
@@ -156,6 +159,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
 
     let stack = session.stack;
     esp_println::println!("upload: serving at {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    heap_stats_dump("serving");
     send_event(SyncEvent::Serving(ip));
     select(
         exit_after_uploads(),
@@ -482,6 +486,9 @@ async fn stream_book(
     // Refill the pool for the next file.
     let result = UPLOAD_RESULTS.receive().await;
     crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
+    // Uploads carry the serving-phase heap peak (TLS/socket churn + staging);
+    // the watermark here is the tightest headroom test of the shrunken budget.
+    heap_stats_dump("post-upload");
     while pool.len() < 2 {
         match UPLOAD_RETURNS.try_receive() {
             Ok(buffer) => {
@@ -803,6 +810,27 @@ fn send_event(event: SyncEvent) {
     }
 }
 
+/// Compact heap probe at a session milestone. The X3 loans a smaller radio
+/// budget than the X4 (`DRAM2_HEAP_BYTES` shrinks to keep the larger
+/// framebuffer under the dram2 boundary), so the free-heap trail from loan ->
+/// radio init -> stack -> serving is the evidence that the copied budget
+/// actually clears the radio's real high-water mark.
+fn heap_report(stage: &str) {
+    esp_println::println!(
+        "wifi: heap[{}] used={} free={}",
+        stage,
+        esp_alloc::HEAP.used(),
+        esp_alloc::HEAP.free(),
+    );
+}
+
+/// Full `HEAP.stats()` dump, including the Max-usage watermark once
+/// `hw-verify` (esp-alloc `internal-heap-stats`) is on. Used at the points
+/// where the peak matters: entering the serving loop and after each upload.
+fn heap_stats_dump(stage: &str) {
+    esp_println::println!("wifi: heap[{}] stats:\n{}", stage, esp_alloc::HEAP.stats());
+}
+
 struct Session {
     controller: WifiController<'static>,
     stack: Stack<'static>,
@@ -827,11 +855,7 @@ impl Session {
         .map_err(|_| SyncError::Dhcp)?;
         let ip = config.address.address().octets();
         esp_println::println!("wifi: up at {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-        esp_println::println!(
-            "wifi: heap used={} free={}",
-            esp_alloc::HEAP.used(),
-            esp_alloc::HEAP.free()
-        );
+        heap_report("after-dhcp");
         send_event(SyncEvent::Connected(ip));
         Ok(ip)
     }
