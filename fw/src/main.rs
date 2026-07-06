@@ -157,6 +157,9 @@ fn main() -> ! {
     let power_button = Input::new(peripherals.GPIO3, Pull::Up);
 
     let mut adc_config = AdcConfig::new();
+    // GPIO0 is the battery ADC divider on the X4; on the X3 it is I2C SCL
+    // (paired with GPIO20 SDA) for the fuel gauge, so it is not an ADC pin.
+    #[cfg(not(feature = "device-x3"))]
     let aux_adc = adc_config
         .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO0, Attenuation::_11dB);
     let mut nav_adc = adc_config
@@ -164,6 +167,21 @@ fn main() -> ! {
     let mut page_adc = adc_config
         .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO2, Attenuation::_11dB);
     let mut adc1 = Adc::new(peripherals.ADC1, adc_config);
+
+    // X3 fuel gauge on I2C0: SCL=GPIO0, SDA=GPIO20, 400 kHz.
+    #[cfg(feature = "device-x3")]
+    let battery_gauge = {
+        let i2c = esp_hal::i2c::master::I2c::new(
+            peripherals.I2C0,
+            esp_hal::i2c::master::Config::default()
+                .with_frequency(400_u32.kHz()),
+        )
+        .expect("I2C0 config")
+        .with_scl(peripherals.GPIO0)
+        .with_sda(peripherals.GPIO20)
+        .into_async();
+        hal_ext::bq27220::Bq27220::new(i2c)
+    };
 
     // RecoveryBoot escape hatch: holding Back + Up at reset repoints otadata at
     // slot 0 and reboots into it — a way back if the far slot's firmware boots
@@ -215,9 +233,12 @@ fn main() -> ! {
             adc1,
             InputPins {
                 power: power_button,
+                #[cfg(not(feature = "device-x3"))]
                 aux_pin: aux_adc,
                 nav_pin: nav_adc,
                 page_pin: page_adc,
+                #[cfg(feature = "device-x3")]
+                gauge: battery_gauge,
             },
         ))
         .unwrap();

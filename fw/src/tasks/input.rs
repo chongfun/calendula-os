@@ -4,6 +4,12 @@ use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
 use esp_hal::gpio::{GpioPin, Input};
 use esp_hal::peripherals::ADC1;
 
+/// The X3's fuel gauge on the shared I2C bus (GPIO0/GPIO20). The X4 has no
+/// gauge; its battery comes from the aux ADC below.
+#[cfg(feature = "device-x3")]
+pub type BatteryGauge =
+    hal_ext::bq27220::Bq27220<esp_hal::i2c::master::I2c<'static, esp_hal::Async>>;
+
 // 15 ms polling puts press-to-event latency at 30-45 ms (two debounce
 // ticks) instead of the 80-120 ms a 40 ms poll cost; the tick-based
 // constants below are scaled to keep their wall-clock behavior.
@@ -27,9 +33,14 @@ struct Band {
 
 pub struct InputPins {
     pub power: Input<'static>,
+    /// X4 only: battery voltage on the GPIO0 ADC divider. On the X3 GPIO0 is
+    /// I2C SCL, so the aux channel does not exist and the gauge replaces it.
+    #[cfg(not(feature = "device-x3"))]
     pub aux_pin: AdcPin<GpioPin<0>, ADC1, AdcCalCurve<ADC1>>,
     pub nav_pin: AdcPin<GpioPin<1>, ADC1, AdcCalCurve<ADC1>>,
     pub page_pin: AdcPin<GpioPin<2>, ADC1, AdcCalCurve<ADC1>>,
+    #[cfg(feature = "device-x3")]
+    pub gauge: BatteryGauge,
 }
 
 #[derive(Clone, Copy)]
@@ -127,8 +138,9 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
     loop {
         Timer::after_millis(POLL_MS).await;
 
+        let (battery_mv, raw_percent, aux) = read_power(&mut adc, &mut pins).await;
         let sample = RawSample {
-            aux: read_adc(&mut adc, &mut pins.aux_pin).await,
+            aux,
             nav: read_adc(&mut adc, &mut pins.nav_pin).await,
             page: read_adc(&mut adc, &mut pins.page_pin).await,
         };
@@ -149,7 +161,7 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
             continue;
         }
 
-        let percent = stable_percent(&mut reported_percent, battery_percent(sample.aux));
+        let percent = stable_percent(&mut reported_percent, raw_percent);
 
         // The app boots with a placeholder 100% battery and only learns the
         // real charge from a Sample, which otherwise rides on a button press.
@@ -157,13 +169,13 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
         // (deep sleep is terminal -- wake is a cold boot) shows the true
         // charge instead of a flat 100%.
         if !battery_seeded {
-            emit(None, sample, percent);
+            emit(None, sample, battery_mv, percent);
             battery_seeded = true;
         }
 
         let power_pressed = debounce_active_low(pins.power.is_low(), &mut power_ticks);
         if power_pressed && !last_power {
-            emit(Some(Button::Power), sample, percent);
+            emit(Some(Button::Power), sample, battery_mv, percent);
             log_input(Some(Button::Power), sample);
         }
         last_power = power_pressed;
@@ -172,7 +184,7 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
         if let Some(nav) = nav {
             let StableEvent::Changed(hardware) = nav;
             let button = map_hardware(hardware);
-            emit(Some(button), sample, percent);
+            emit(Some(button), sample, battery_mv, percent);
             log_input(Some(button), sample);
         }
 
@@ -180,8 +192,29 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
         if let Some(page) = page {
             let StableEvent::Changed(hardware) = page;
             let button = map_hardware(hardware);
-            emit(Some(button), sample, percent);
+            emit(Some(button), sample, battery_mv, percent);
             log_input(Some(button), sample);
+        }
+    }
+}
+
+/// Read the battery, returning `(millivolts, percent, aux_raw)`. `aux_raw`
+/// is the debug value reported as the aux channel: the raw ADC reading on
+/// the X4, the gauge voltage on the X3 (which has no aux ADC). On an I2C
+/// error the X3 reports a flat full battery rather than a spurious 0%.
+#[cfg(not(feature = "device-x3"))]
+async fn read_power(adc: &mut Adc<'static, ADC1>, pins: &mut InputPins) -> (u16, u8, u16) {
+    let aux = read_adc(adc, &mut pins.aux_pin).await;
+    (battery_mv(aux), battery_percent(aux), aux)
+}
+
+#[cfg(feature = "device-x3")]
+async fn read_power(_adc: &mut Adc<'static, ADC1>, pins: &mut InputPins) -> (u16, u8, u16) {
+    match pins.gauge.read().await {
+        Ok((mv, percent)) => (mv, percent, mv),
+        Err(_) => {
+            esp_println::println!("input: bq27220 read failed");
+            (0, 100, 0)
         }
     }
 }
@@ -199,13 +232,13 @@ fn stable_percent(reported: &mut Option<u8>, raw: u8) -> u8 {
     }
 }
 
-fn emit(button: Option<Button>, sample: RawSample, battery_percent: u8) {
+fn emit(button: Option<Button>, sample: RawSample, battery_mv: u16, battery_percent: u8) {
     let event = InputEvent::Sample {
         button,
         aux_raw: sample.aux,
         nav_raw: sample.nav,
         page_raw: sample.page,
-        battery_mv: battery_mv(sample.aux),
+        battery_mv,
         battery_percent,
     };
     if INPUT_EVENTS.try_send(event).is_ok() {
@@ -217,10 +250,14 @@ fn emit(button: Option<Button>, sample: RawSample, battery_percent: u8) {
     }
 }
 
+/// The X4 senses battery through a 2x divider on the aux ADC. The X3 reads
+/// true voltage from its gauge, so these live only in the X4 build.
+#[cfg(not(feature = "device-x3"))]
 fn battery_mv(aux_mv: u16) -> u16 {
     aux_mv.saturating_mul(2)
 }
 
+#[cfg(not(feature = "device-x3"))]
 fn battery_percent(aux_mv: u16) -> u8 {
     let mv = battery_mv(aux_mv).clamp(3300, 4200);
     (((mv - 3300) as u32 * 100) / 900) as u8
