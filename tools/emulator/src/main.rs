@@ -1,3 +1,7 @@
+#[cfg(not(feature = "device-x3"))]
+mod panel;
+#[cfg(feature = "device-x3")]
+#[path = "panel_uc8253.rs"]
 mod panel;
 mod render;
 mod scenario;
@@ -203,6 +207,8 @@ pub struct Emulator {
     refresh_planner: RefreshPlanner,
     panel: PanelModel,
     fb: display::fb::Framebuffer,
+    prev_fb: display::fb::Framebuffer,
+    prev_prestaged: bool,
     sleeping: bool,
     _sd_root: Option<PathBuf>,
     library_entries: Vec<String>,
@@ -225,6 +231,8 @@ impl Emulator {
             refresh_planner: RefreshPlanner::new(),
             panel: PanelModel::new(),
             fb: display::fb::Framebuffer::new(),
+            prev_fb: display::fb::Framebuffer::new(),
+            prev_prestaged: false,
             sleeping: false,
             _sd_root: sd_root,
             library_entries: Vec::new(),
@@ -250,6 +258,7 @@ impl Emulator {
             if self.sleeping {
                 self.sleeping = false;
                 self.panel.init_sequence().expect("panel wake init");
+                self.prev_prestaged = false;
                 self.state.view = app_core::AppView::Home;
                 self.render(app_core::RenderKind::Page);
             } else {
@@ -345,10 +354,11 @@ impl Emulator {
         }
         let mode = self.refresh_planner.mode_for(request);
         self.panel
-            .write_framebuffer_bw(&self.fb)
-            .expect("panel framebuffer write");
-        self.panel.refresh(mode).expect("panel refresh");
+            .flush(&self.fb, &self.prev_fb, mode, self.prev_prestaged)
+            .expect("panel flush");
         self.refresh_planner.record_render(request, mode);
+        self.prev_fb.copy_from(&self.fb);
+        self.prev_prestaged = self.panel.prestage_previous(&self.fb).is_ok();
     }
 
     fn sleep_panel(&mut self) {
@@ -358,11 +368,15 @@ impl Emulator {
             &self.library_entries,
         );
         self.panel
-            .write_framebuffer_bw(&self.fb)
-            .expect("panel sleep framebuffer write");
-        self.panel
-            .refresh(display::epd::RefreshMode::Full)
-            .expect("panel sleep refresh");
+            .flush(
+                &self.fb,
+                &self.prev_fb,
+                display::epd::RefreshMode::Full,
+                self.prev_prestaged,
+            )
+            .expect("panel sleep flush");
+        self.prev_fb.copy_from(&self.fb);
+        self.prev_prestaged = false;
         self.panel.deep_sleep().expect("panel deep sleep");
         self.refresh_planner.record_sleep();
     }
@@ -372,9 +386,7 @@ fn storage_command_for_transition(
     previous: app_core::ReaderState,
     next: app_core::ReaderState,
 ) -> Option<StorageCommand> {
-    let Some(index) = ReaderSource::from_book_id(next.book_id).sd_index() else {
-        return None;
-    };
+    let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
     if next.view != AppView::Reading {
         return None;
     }
@@ -511,5 +523,25 @@ impl eframe::App for EmulatorApp {
                 ui.image((texture.id(), size));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_scenario_contracts_pass_for_selected_panel() {
+        let scenarios = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/scenarios");
+        for path in scenario_paths(Some(&scenarios)).expect("list scenarios") {
+            let mut emulator = Emulator::boot(None);
+            let scenario = Scenario::load(&path).expect("load scenario");
+            scenario
+                .run(&mut emulator)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            scenario
+                .assert(&emulator)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        }
     }
 }
