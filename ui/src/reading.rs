@@ -310,6 +310,17 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// any pagination cached under the old face.
 const READER_LAYOUT_VERSION: u16 = 15;
 
+/// Panel-geometry salt folded into the version bits: wrap points and page
+/// heights depend on the page box, so pagination cached on one panel must
+/// read as stale on the other (an SD card can move between an X4 and an
+/// X3). Zero on the X4's 800x480 keeps every existing cache valid; other
+/// geometries claim a disjoint version band well clear of routine bumps.
+const PANEL_LAYOUT_SALT: u16 = if display::WIDTH == 800 && display::HEIGHT == 480 {
+    0
+} else {
+    256
+};
+
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a
 /// mismatch on load invalidates the cached pagination and rebuilds it.
@@ -318,7 +329,7 @@ const READER_LAYOUT_VERSION: u16 = 15;
 /// family in bit 5, version above. Size, weight, and family all change wrap
 /// points, so a change in any forces a full rebuild.
 pub fn reader_layout_config(settings: TypeSettings) -> u16 {
-    (READER_LAYOUT_VERSION << 6)
+    ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 6)
         | ((settings.family as u16) << 5)
         | ((settings.weight as u16) << 4)
         | ((settings.size as u16) << 2)
