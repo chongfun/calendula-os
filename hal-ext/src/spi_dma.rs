@@ -87,6 +87,23 @@ where
         let _ = embassy_time::with_timeout(Duration::from_secs(15), self.busy.wait_for_low()).await;
     }
 
+    /// Two-phase BUSY wait for the UC8253 (Xteink X3): BUSY drops LOW while
+    /// the controller works and returns HIGH when done, the opposite sense
+    /// and shape of the SSD1677's active-high line. Wait for the falling
+    /// edge first (bounded to 1 s — a refresh so quick it never shows LOW
+    /// has already finished, so proceed), then for the return to HIGH.
+    /// Mirrors CrossPoint's `BusyPolarity::X3TwoPhase` poll.
+    pub async fn wait_two_phase(&mut self) {
+        let saw_low = embassy_time::with_timeout(Duration::from_secs(1), self.busy.wait_for_low())
+            .await
+            .is_ok();
+        if !saw_low {
+            return;
+        }
+        let _ =
+            embassy_time::with_timeout(Duration::from_secs(30), self.busy.wait_for_high()).await;
+    }
+
     pub fn deselect_display(&mut self) {
         self.deselect();
     }

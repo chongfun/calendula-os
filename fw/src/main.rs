@@ -190,7 +190,7 @@ fn main() -> ! {
     let epd_spi = Spi::new(
         peripherals.SPI2,
         SpiConfig::default()
-            .with_frequency(40_u32.MHz())
+            .with_frequency(display::epd::SPI_HZ.Hz())
             .with_mode(esp_hal::spi::Mode::_0),
     )
     .expect("SPI2 config")

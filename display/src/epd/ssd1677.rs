@@ -38,6 +38,9 @@ pub const MIRROR_X: bool = true;
 pub const MIRROR_Y: bool = false;
 pub const REVERSE_BITS: bool = true;
 
+/// Display SPI bus clock — the rated ceiling for this panel's fast refresh.
+pub const SPI_HZ: u32 = 40_000_000;
+
 pub static INIT_SEQUENCE: &[SpiOp] = &[
     SpiOp::Reset,
     SpiOp::Command {
