@@ -96,6 +96,29 @@ impl PanelModel {
         self.write_framebuffer(CMD_WRITE_RAM_RED, fb)
     }
 
+    pub fn flush(
+        &mut self,
+        current: &Framebuffer,
+        previous: &Framebuffer,
+        mode: RefreshMode,
+        previous_staged: bool,
+    ) -> Result<RefreshMode, String> {
+        self.write_framebuffer_bw(current)?;
+        if mode == RefreshMode::Fast {
+            if !previous_staged {
+                self.write_framebuffer_red(previous)?;
+            }
+        } else {
+            self.write_framebuffer_red(current)?;
+        }
+        self.refresh(mode)?;
+        Ok(mode)
+    }
+
+    pub fn prestage_previous(&mut self, fb: &Framebuffer) -> Result<(), String> {
+        self.write_framebuffer_red(fb)
+    }
+
     pub fn refresh(&mut self, mode: RefreshMode) -> Result<(), String> {
         if mode == RefreshMode::FastClean {
             self.command(
@@ -128,7 +151,9 @@ impl PanelModel {
             &[display::epd::update_control_2(RefreshMode::PowerDown, true, false)],
         )?;
         self.command(CMD_MASTER_ACTIVATION, &[])?;
-        self.command(CMD_DEEP_SLEEP, &[0x01])
+        self.command(CMD_DEEP_SLEEP, &[0x01])?;
+        self.history.push("deep_sleep".into());
+        Ok(())
     }
 
     pub fn last_refresh(&self) -> Option<RefreshMode> {

@@ -122,6 +122,175 @@ pub fn bank_for(mode: RefreshMode) -> (&'static LutBank, u8) {
     }
 }
 
+/// Controller RAM plane selected by a flush operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RamPlane {
+    Old,
+    New,
+}
+
+/// Bytes supplied to a RAM-plane write by the platform executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSource {
+    White,
+    Current,
+    Previous,
+}
+
+/// One controller-level operation in a UC8253 refresh.
+///
+/// This is the single source of truth for refresh sequencing. The firmware
+/// executor turns these operations into async SPI transfers, while the host
+/// panel model consumes the same operations to validate the transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushStep {
+    LoadBank(RefreshMode),
+    WritePlane {
+        plane: RamPlane,
+        source: FrameSource,
+    },
+    DataStop,
+    PowerOn,
+    DisplayRefresh,
+    DelayMs(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlushPlan {
+    pub requested_mode: RefreshMode,
+    pub effective_mode: RefreshMode,
+    pub steps: &'static [FlushStep],
+}
+
+const FULL_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::Full),
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::White,
+    },
+    FlushStep::DataStop,
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::PowerOn,
+    FlushStep::DisplayRefresh,
+    FlushStep::DelayMs(200),
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+];
+
+const FAST_STAGED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+];
+
+const FAST_UNSTAGED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Previous,
+    },
+    FlushStep::DataStop,
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+];
+
+const CLEAN_POWERED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::FastClean),
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::DelayMs(200),
+];
+
+const CLEAN_POWER_ON_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::FastClean),
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::PowerOn,
+    FlushStep::DisplayRefresh,
+    FlushStep::DelayMs(200),
+];
+
+/// Select the exact controller operation stream for one requested refresh.
+/// A differential Fast request cannot run with the charge pump off because
+/// DTM1 is no longer a trustworthy copy of the displayed frame; the proven
+/// driver promotes that case to the absolute FastClean waveform.
+pub const fn flush_plan(
+    requested_mode: RefreshMode,
+    screen_powered: bool,
+    previous_staged: bool,
+) -> FlushPlan {
+    let effective_mode = if matches!(requested_mode, RefreshMode::Fast) && !screen_powered {
+        RefreshMode::FastClean
+    } else {
+        requested_mode
+    };
+    let steps = match effective_mode {
+        RefreshMode::Full | RefreshMode::PowerDown => FULL_STEPS,
+        RefreshMode::Fast if previous_staged => FAST_STAGED_STEPS,
+        RefreshMode::Fast => FAST_UNSTAGED_STEPS,
+        RefreshMode::FastClean if screen_powered => CLEAN_POWERED_STEPS,
+        RefreshMode::FastClean => CLEAN_POWER_ON_STEPS,
+    };
+    FlushPlan {
+        requested_mode,
+        effective_mode,
+        steps,
+    }
+}
+
+pub const PRESTAGE_STEPS: &[FlushStep] = &[
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepStep {
+    PowerOff,
+    DeepSleep,
+}
+
+const SLEEP_POWERED_STEPS: &[SleepStep] = &[SleepStep::PowerOff, SleepStep::DeepSleep];
+const SLEEP_UNPOWERED_STEPS: &[SleepStep] = &[SleepStep::DeepSleep];
+
+pub const fn sleep_plan(screen_powered: bool) -> &'static [SleepStep] {
+    if screen_powered {
+        SLEEP_POWERED_STEPS
+    } else {
+        SLEEP_UNPOWERED_STEPS
+    }
+}
+
 pub static NORMAL: LutBank = LutBank {
     vcom: &VCOM_NORMAL,
     ww: &WW_NORMAL,
@@ -244,3 +413,114 @@ mod tables {
 }
 
 use tables::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FB_BYTES, HEIGHT, ROW_BYTES};
+
+    #[test]
+    fn fast_with_charge_pump_off_is_an_absolute_clean_plan() {
+        let plan = flush_plan(RefreshMode::Fast, false, true);
+        assert_eq!(plan.effective_mode, RefreshMode::FastClean);
+        assert_eq!(plan.steps, CLEAN_POWER_ON_STEPS);
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|step| matches!(step, FlushStep::DisplayRefresh))
+                .count(),
+            1
+        );
+        assert!(!plan.steps.iter().any(|step| matches!(
+            step,
+            FlushStep::WritePlane {
+                plane: RamPlane::Old,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn fast_plan_only_writes_previous_plane_when_not_prestaged() {
+        let staged = flush_plan(RefreshMode::Fast, true, true);
+        let unstaged = flush_plan(RefreshMode::Fast, true, false);
+        assert_eq!(staged.steps, FAST_STAGED_STEPS);
+        assert_eq!(unstaged.steps, FAST_UNSTAGED_STEPS);
+        assert!(!staged.steps.contains(&FlushStep::DataStop));
+        assert!(unstaged.steps.contains(&FlushStep::WritePlane {
+            plane: RamPlane::Old,
+            source: FrameSource::Previous,
+        }));
+    }
+
+    #[test]
+    fn clean_plan_is_absolute_and_never_rewrites_old_plane() {
+        let plan = flush_plan(RefreshMode::FastClean, true, true);
+        assert_eq!(plan.steps, CLEAN_POWERED_STEPS);
+        let (_, cdi) = bank_for(plan.effective_mode);
+        assert_eq!(cdi, CDI_ABSOLUTE);
+        assert!(!plan.steps.iter().any(|step| matches!(
+            step,
+            FlushStep::WritePlane {
+                plane: RamPlane::Old,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn full_plan_keeps_the_proven_two_refresh_settle_sequence() {
+        let plan = flush_plan(RefreshMode::Full, true, true);
+        assert_eq!(plan.steps, FULL_STEPS);
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|step| matches!(step, FlushStep::DisplayRefresh))
+                .count(),
+            2
+        );
+        assert_eq!(
+            plan.steps.last(),
+            Some(&FlushStep::DataStop),
+            "full settle must leave DTM1 synchronized"
+        );
+    }
+
+    #[test]
+    fn prestage_and_sleep_plans_pin_plane_and_power_ordering() {
+        assert_eq!(
+            PRESTAGE_STEPS,
+            &[
+                FlushStep::WritePlane {
+                    plane: RamPlane::Old,
+                    source: FrameSource::Current,
+                },
+                FlushStep::DataStop,
+            ]
+        );
+        assert_eq!(
+            sleep_plan(true),
+            &[SleepStep::PowerOff, SleepStep::DeepSleep]
+        );
+        assert_eq!(sleep_plan(false), &[SleepStep::DeepSleep]);
+    }
+
+    #[test]
+    fn transform_maps_asymmetric_corners_and_emits_short_final_band() {
+        let mut fb = Framebuffer::new();
+        fb.set_pixel(0, HEIGHT - 1, false);
+        fb.set_pixel(crate::WIDTH - 1, 0, false);
+
+        let mut band = [0xAA; crate::BAND_BYTES];
+        let first_len = fill_transformed_band(&fb, 0, &mut band);
+        assert_eq!(first_len, crate::BAND_BYTES);
+        assert_eq!(band[ROW_BYTES - 1], 0xFE);
+
+        let final_y = crate::BAND_ROWS * (HEIGHT / crate::BAND_ROWS);
+        let final_len = fill_transformed_band(&fb, final_y, &mut band);
+        assert_eq!(final_len, (HEIGHT - final_y) * ROW_BYTES);
+        assert_eq!(final_len, 48 * ROW_BYTES);
+        assert_eq!(band[(HEIGHT - final_y - 1) * ROW_BYTES], 0x7F);
+        assert_eq!(FB_BYTES, 52_272);
+    }
+}
