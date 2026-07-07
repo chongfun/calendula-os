@@ -1,4 +1,4 @@
-# xteink-x4-os
+# MarigoldOS
 
 ![The X4 home screen in the browser emulator, showing Alice's Adventures in Wonderland](docs/home.png)
 
