@@ -6,6 +6,7 @@ on:
     paths:
       - "web/**"
       - "tools/web-emulator/**"
+      - "tools/emulator/**"
       - "tools/build-web.sh"
       - "app-core/**"
       - "display/**"
