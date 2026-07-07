@@ -852,6 +852,9 @@ fn l_rect(fb: &mut Framebuffer, r: Rect, white: bool) {
 fn l_text(fb: &mut Framebuffer, font: &BitmapFont, text: &str, x: i16, y: i16, white: bool) -> i16 {
     draw_text(fb, font, text, lxi(x), lyi(y), white)
 }
+fn l_ascii(fb: &mut Framebuffer, text: &str, x: usize, y: usize, white: bool) {
+    draw_ascii(fb, text, ls_x(x as i32) as usize, ls_y(y as i32) as usize, white);
+}
 
 fn draw_landscape_home_rail(fb: &mut Framebuffer) {
     let title_font = literata(FontStyle::Bold);
@@ -1702,8 +1705,8 @@ fn draw_cover_art(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
         let inset = 24 + (row % 3) * 10;
         l_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 3), false);
     }
-    draw_ascii(fb, "FLOWERS", x as usize + 48, y as usize + 36, false);
-    draw_ascii(
+    l_ascii(fb, "FLOWERS", x as usize + 48, y as usize + 36, false);
+    l_ascii(
         fb,
         "ALGERNON",
         x as usize + 42,
@@ -1726,8 +1729,8 @@ fn draw_cover_art_skeuo(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
         l_rect(fb, Rect::new(x + inset, yy, w - inset * 2, 3), false);
     }
     l_rect(fb, Rect::new(x + 34, y + h - 56, w - 68, 2), false);
-    draw_ascii(fb, "FLOWERS", x as usize + 50, y as usize + 46, false);
-    draw_ascii(
+    l_ascii(fb, "FLOWERS", x as usize + 50, y as usize + 46, false);
+    l_ascii(
         fb,
         "ALGERNON",
         x as usize + 44,
