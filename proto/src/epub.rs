@@ -2106,7 +2106,7 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                 }
             }
             _ if !in_body || skip_depth > 0 => {}
-            Token::Start(tag) if tag_name_is(tag, "nav") => in_nav = true,
+            Token::Start(tag) if tag_name_is(tag, "nav") => in_nav = nav_start_is_toc(tag),
             Token::End(tag) if tag_name_is(tag, "nav") => in_nav = false,
             Token::Start(tag) if in_nav && tag_name_is(tag, "ol") => {
                 list_depth = list_depth.saturating_add(1);
@@ -2635,7 +2635,9 @@ impl Epub3NavStreamParser {
                 self.in_body = false;
             }
             _ if self.body_required && !self.in_body => {}
-            TokEvent::StartTag(tag) if tag_name_is(tag, "nav") => self.in_nav = true,
+            TokEvent::StartTag(tag) if tag_name_is(tag, "nav") => {
+                self.in_nav = nav_start_is_toc(tag);
+            }
             TokEvent::EndTag(tag) if tag_name_is(tag, "nav") => self.in_nav = false,
             TokEvent::StartTag(tag) if self.in_nav && tag_name_is(tag, "ol") => {
                 self.list_depth = self.list_depth.saturating_add(1);
@@ -2785,6 +2787,25 @@ fn tag_name_is(tag: &str, expected: &str) -> bool {
 fn tag_local_name(tag: &str) -> Option<&str> {
     let tag = tag.split_whitespace().next().unwrap_or(tag);
     Some(tag.trim_end_matches('/').rsplit(':').next().unwrap_or(tag))
+}
+
+/// Whether this `<nav>` start tag is the reading table of contents.
+///
+/// An EPUB 3 navigation document usually holds several `<nav>` elements
+/// distinguished by `epub:type`: the `toc`, plus a `page-list` (whose entries
+/// are page-break markers like `i`, `ii`, `1`, `2`) and `landmarks` (`Cover`,
+/// `Start Reading`). Only the `toc` lists chapters, so treating every `<nav>`
+/// as the contents injected those page markers and landmarks as phantom
+/// chapters, inflating the book's size and chapter count. Accept a nav when it
+/// is `epub:type="toc"`, or when it carries no `epub:type` at all (older
+/// single-nav documents that omit the attribute).
+fn nav_start_is_toc(tag: &str) -> bool {
+    match attr_value(tag, "epub:type") {
+        Some(value) => value
+            .split_ascii_whitespace()
+            .any(|word| word.eq_ignore_ascii_case("toc")),
+        None => true,
+    }
 }
 
 fn tag_is_hidden(tag: &str) -> bool {
@@ -3973,6 +3994,95 @@ mod tests {
             assert_eq!(a.1.as_str(), b.1.as_str());
             assert_eq!(a.2, b.2);
         }
+    }
+
+    #[test]
+    fn epub3_nav_skips_page_list_and_landmarks() {
+        // A real EPUB 3 nav document carries the `toc` alongside a `page-list`
+        // (roman-numeral / numeric page markers) and `landmarks` navs. Only the
+        // toc lists chapters; the others must not leak in as phantom chapters.
+        struct CountingSink(Vec<(heapless::String<64>, heapless::String<64>, u8), 16>);
+        impl EpubTocSink for CountingSink {
+            fn push_toc(&mut self, title: &str, href: &str, level: u8) -> Result<(), TocError> {
+                let mut t = heapless::String::<64>::new();
+                let mut h = heapless::String::<64>::new();
+                let _ = t.push_str(title);
+                let _ = h.push_str(href);
+                self.0
+                    .push((t, h, level))
+                    .map_err(|_| TocError::TooManyItems)
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc"><ol>
+                <li><a href="chapter1.xhtml">Introduction</a></li>
+                <li><a href="chapter2.xhtml">The Machine</a></li>
+              </ol></nav>
+              <nav epub:type="page-list" role="doc-pagelist"><ol>
+                <li><a href="front.xhtml#pi">i</a></li>
+                <li><a href="front.xhtml#pii">ii</a></li>
+                <li><a href="front.xhtml#piii">iii</a></li>
+                <li><a href="chapter1.xhtml#p1">1</a></li>
+                <li><a href="chapter1.xhtml#p2">2</a></li>
+              </ol></nav>
+              <nav epub:type="landmarks"><ol>
+                <li><a epub:type="cover" href="cover.xhtml">Cover</a></li>
+                <li><a epub:type="bodymatter" href="chapter1.xhtml">Start Reading</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let expected = [
+            ("Introduction", "chapter1.xhtml"),
+            ("The Machine", "chapter2.xhtml"),
+        ];
+
+        let mut slice_sink = CountingSink(Vec::new());
+        parse_epub3_nav_to_sink(nav, &mut slice_sink).expect("slice parses");
+        assert_eq!(slice_sink.0.len(), expected.len());
+        for (item, (title, href)) in slice_sink.0.iter().zip(expected.iter()) {
+            assert_eq!(item.0.as_str(), *title);
+            assert_eq!(item.1.as_str(), *href);
+        }
+
+        // The streaming parser (the one that runs on-device) must agree.
+        let mut stream = SliceByteStream::new(nav.as_bytes());
+        let mut stream_sink = CountingSink(Vec::new());
+        parse_epub3_nav_stream(&mut stream, &mut stream_sink).expect("stream parses");
+        assert_eq!(stream_sink.0.len(), expected.len());
+        for (item, (title, href)) in stream_sink.0.iter().zip(expected.iter()) {
+            assert_eq!(item.0.as_str(), *title);
+            assert_eq!(item.1.as_str(), *href);
+        }
+    }
+
+    #[test]
+    fn epub3_nav_without_epub_type_is_still_read() {
+        // Older/minimal single-nav documents omit `epub:type`; those must still
+        // parse as the table of contents.
+        struct CountingSink(Vec<heapless::String<64>, 8>);
+        impl EpubTocSink for CountingSink {
+            fn push_toc(&mut self, title: &str, _href: &str, _level: u8) -> Result<(), TocError> {
+                let mut t = heapless::String::<64>::new();
+                let _ = t.push_str(title);
+                self.0.push(t).map_err(|_| TocError::TooManyItems)
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav><ol>
+                <li><a href="chapter1.xhtml">Introduction</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let mut sink = CountingSink(Vec::new());
+        parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
+        assert_eq!(sink.0.len(), 1);
+        assert_eq!(sink.0[0].as_str(), "Introduction");
     }
 
     #[test]
