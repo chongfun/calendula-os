@@ -294,9 +294,9 @@ pub const READER_PAGE_TOP: i16 = 6;
 /// X4 this is the historical 466.
 pub const READER_FOOTER_TOP: i16 = display::HEIGHT as i16 - 14;
 /// Page-counter text baseline: as low as it goes without clipping (the
-/// slash inks 2 rows below its baseline). Used by `fw::views` so the
-/// footer's exact panel-relative position lives in one place instead of
-/// being kept in sync by hand across crates.
+/// slash inks 2 rows below its baseline). Shared by `fw::views` and the web
+/// emulator so the footer's exact panel-relative position lives in one
+/// place instead of being kept in sync by hand across crates.
 pub const READER_FOOTER_BASELINE_Y: i16 = display::HEIGHT as i16 - 3;
 /// Last permissible baseline row for body ink. Derived, not tuned: the
 /// page counter's '/' ink starts 12 rows up from its baseline
