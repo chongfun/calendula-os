@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MarigoldOS — try the firmware in your browser</title>
-<meta name="description" content="MarigoldOS e-reader firmware, compiled to WebAssembly. Same Rust code, same fonts, same pagination — simulated e-ink included.">
+<title>MarigoldOS · try the firmware in your browser</title>
+<link rel="icon" href="marigold.svg">
+<meta name="description" content="MarigoldOS e-reader firmware, compiled to WebAssembly. Same Rust code, same fonts, same pagination - simulated e-ink included.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap" rel="stylesheet">
@@ -14,8 +15,8 @@
     --ink: #161614;
     /* The desk is dark enough that the Mist Gray shell reads as an
        object on it, not a patch of the same page. */
-    --desk: #a49d90;
-    --desk-deep: #8f8779;
+    --desk: #e6ddc9;
+    --desk-deep: #d6cbb1;
     --bezel: #d9d7d2;
     --bezel-edge: #efeeeb;
     --bezel-line: #a3a099;
@@ -31,8 +32,8 @@
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --desk: #23211d;
-      --desk-deep: #181613;
+      --desk: #221d15;
+      --desk-deep: #14100a;
       --label: #8a8375;
     }
   }
@@ -83,7 +84,7 @@
   /* White shell: four blank keys on the short side, each sitting level
      with the legend row the firmware draws for it; Power alone at the far
      right of the top long edge. Keys carry no printed labels, as on the
-     hardware — the screen's rail names them in context. */
+     hardware - the screen's rail names them in context. */
   /* A 5.9 mm slab in Mist Gray: thin, even bezel, credit-card corners,
      and the page rocker + power as slivers on the bottom edge itself,
      protruding from the silhouette the way they do on the hardware. */
@@ -271,25 +272,131 @@
   @media (max-width: 560px) {
     .hints .kbonly { display: none; }
   }
+  :root{ --card:#f4f0e7; --well:#ece6d7; --line:#a29a86; }
+
+  /* ---------------------------------------------- warm landing (minimal) */
+  /* accent retuned to the vivid-orange (o1) marigold: core #cf5f0c, petal #f5871c */
+  :root{ --prose:#433d31; --mari:#cf5f0c; --mari-btn1:#f5871c; --mari-btn2:#de5f10; --mari-edge:#a54c08; }
+  @media (prefers-color-scheme: dark){ :root{ --prose:#cdc5b3; --mari:#f0851c; --mari-btn1:#f5871c; --mari-btn2:#de5f10; --mari-edge:#a54c08; --card:#241f17; --well:#191510; --line:#463f31; } }
+  body{ background:
+    radial-gradient(100% 60% at 50% -8%, rgba(201,138,43,.13), transparent 55%),
+    radial-gradient(125% 95% at 50% 0%, var(--desk) 52%, var(--desk-deep) 100%); }
+  header{ max-width:920px; align-items:center; }   /* line up with the device below; center logo + link */
+  header a{ font-family:var(--body); font-size:14px; letter-spacing:0; text-transform:none; border-bottom:0; color:var(--label); }
+  header a:hover{ color:var(--mari); }
+  header .name{ font-family:var(--body); font-size:17px; color:inherit; letter-spacing:.01em; display:inline-flex; align-items:center; gap:9px; }
+  header .name .mk{ width:34px; height:34px; }
+  /* no hairline strokes in the page chrome - but the device + its key hints keep theirs */
+  .colophon{ border-top:0; }
+  .intro{ width:min(620px,100%); text-align:center; margin:clamp(18px,4vw,40px) 0 clamp(4px,2vw,14px); }
+  .intro h1{ font-weight:400; font-size:clamp(30px,5vw,46px); letter-spacing:-.01em; line-height:1.04; }
+  .intro .lead{ margin-top:12px; color:var(--label); font-size:clamp(16px,2.1vw,18px); }
+
+  /* shared install shell + primary button (designs add their own layout) */
+  .install{ width:min(640px,100%); margin:clamp(52px,9vw,96px) auto 0; text-align:center; }
+  .install h2{ font-weight:400; font-size:clamp(25px,3.8vw,34px); letter-spacing:-.01em; }
+  .flashbtn{ display:inline-flex; align-items:center; gap:9px; font-family:var(--body); font-size:16px; color:#33220a; text-decoration:none;
+    background:linear-gradient(180deg,var(--mari-btn1),var(--mari-btn2)); border:0; border-radius:11px; padding:13px 28px;
+    box-shadow:0 2px 0 var(--mari-edge), 0 12px 24px -14px rgba(180,86,16,.85); transition:.14s; }
+  .flashbtn:hover{ transform:translateY(-1px); box-shadow:0 3px 0 var(--mari-edge), 0 16px 28px -14px rgba(180,86,16,.85); }
+  .flashbtn .ver{ font-size:12.5px; opacity:.72; }
+  .colophon .row a{ color:var(--label); }
+  .foot{ width:min(620px,100%); margin:20px auto 0; padding-top:0; font-family:var(--mono);
+    font-size:11.5px; color:var(--label); text-align:center; line-height:2; }
+  .foot a{ color:var(--label); text-decoration:none; }
+  .foot a:hover{ color:var(--mari); }
+
+  /* device edges: soft mid-gray, a touch thicker - a matte edge, not a black hairline */
+  .device{
+    border:0;
+    box-shadow:
+      0 0 0 1px #a3a099,                   /* the old outer edge, device against the ground */
+      0 1px 0 rgba(255,255,255,.8) inset,
+      0 -1px 0 rgba(70,66,58,.14) inset,
+      0 2px 6px rgba(50,46,38,.2),
+      0 18px 34px -20px rgba(40,32,18,.42),
+      0 44px 84px -30px rgba(40,30,14,.5);
+  }
+  /* recessed pane: soft-gray inner edge + matte glass margin */
+  .screen{ box-shadow:
+      0 0 0 1.5px #aaa79e,
+      0 0 0 clamp(6px,1vw,10px) #cdcbc5,
+      0 0 10px rgba(40,32,18,.28) inset,
+      0 3px 7px rgba(40,32,18,.15); }
+
+  .install .sub{ margin:10px auto 28px; color:var(--prose); font-size:16px; max-width:42ch; }
+  .flow{ text-align:left; background:var(--card); border-radius:20px; padding:clamp(22px,3.4vw,30px);
+    box-shadow:0 0 0 1px var(--line),
+      0 1px 0 rgba(255,255,255,.5) inset,
+      0 -1px 0 color-mix(in srgb,var(--line) 55%, transparent) inset,
+      0 22px 50px -30px rgba(70,50,20,.5), 0 3px 8px -4px rgba(70,50,20,.13); }
+  .stage + .stage{ margin-top:26px; }
+  .stitle{ font-size:13px; color:var(--label); margin-bottom:12px; }
+  .stitle .no{ color:var(--mari); font-weight:600; margin-right:8px; }
+  .devs{ display:grid; grid-template-columns:1fr 1fr; gap:11px; }
+  .dev{ font:inherit; text-align:left; color:inherit; cursor:pointer; transition:.14s;
+    background:var(--well); border:0; border-radius:14px; padding:14px 16px; }
+  .dev b{ display:block; font-weight:600; font-size:15px; margin-bottom:2px; }
+  .dev span{ font-size:12.5px; color:var(--label); }
+  .dev:hover{ background:color-mix(in srgb,var(--mari) 9%,var(--well)); }
+  .dev.on{ background:color-mix(in srgb,var(--mari) 15%,var(--card));
+    box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--mari) 60%,transparent); }
+  .asset{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; padding:15px 16px; background:var(--well); border-radius:12px; margin-bottom:16px; }
+  .asset .k{ display:block; font-size:10.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--label); margin-bottom:4px; }
+  .asset b{ font-weight:600; font-size:13.5px; font-family:var(--mono); }
+  .status{ display:flex; align-items:center; gap:9px; font-size:13px; color:var(--prose); margin-bottom:18px; line-height:1.45; }
+  .status .dot{ flex:none; width:8px; height:8px; border-radius:50%; background:var(--mari); box-shadow:0 0 0 3px color-mix(in srgb,var(--mari) 22%,transparent); }
+  .status.no .dot{ background:#b4632a; box-shadow:0 0 0 3px color-mix(in srgb,#b4632a 22%,transparent); }
+  .acts{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .ghost{ font-family:var(--body); font-size:15px; color:var(--ink); text-decoration:none; background:var(--well); border-radius:12px; padding:12px 22px; transition:.14s; }
+  .ghost:hover{ color:var(--mari); background:color-mix(in srgb,var(--mari) 12%,var(--card)); }
+  .ghost.lead{ color:#33220a; background:color-mix(in srgb,var(--mari) 22%,var(--card)); }
+  .flashbtn.off{ background:var(--well); color:var(--label); box-shadow:none; cursor:not-allowed; pointer-events:none; }
+  .req{ font-size:12.5px; color:var(--label); margin-top:14px; line-height:1.55; }
+  .devnote{ font-size:12.5px; color:var(--label); margin-top:6px; line-height:1.55; }
+  .devnote a{ color:var(--mari); text-decoration:none; }
+  .devnote a:hover{ text-decoration:underline; }
+  .sdcard{ text-align:left; background:var(--card); border-radius:20px; padding:clamp(22px,3.4vw,30px); margin-top:14px;
+    box-shadow:0 0 0 1px var(--line),
+      0 1px 0 rgba(255,255,255,.5) inset,
+      0 -1px 0 color-mix(in srgb,var(--line) 55%, transparent) inset,
+      0 22px 50px -30px rgba(70,50,20,.5), 0 3px 8px -4px rgba(70,50,20,.13); }
+  .sdcard .txt{ font-size:14px; color:var(--prose); line-height:1.6; margin-bottom:15px; max-width:58ch; }
+  .sdsteps{ display:grid; gap:9px; margin:0 0 17px; padding:0; }
+  .sdsteps li{ list-style:none; display:flex; gap:11px; align-items:center; font-size:14px; color:var(--prose); }
+  .sdsteps .n{ flex:none; width:22px; height:22px; border-radius:50%; background:var(--well); color:var(--mari); font-size:12px; font-weight:600; display:grid; place-items:center; }
+  .dl2{ display:inline-block; font-size:14.5px; color:var(--ink); background:var(--well); border-radius:12px; padding:11px 20px; text-decoration:none; transition:.14s; }
+  .dl2:hover{ color:var(--mari); background:color-mix(in srgb,var(--mari) 12%,var(--card)); }
+  .install .rel{ margin-top:20px; font-size:13px; } .install .rel a{ color:var(--mari); text-decoration:none; }
+  @media(max-width:520px){ .asset{ grid-template-columns:1fr 1fr; } .devs{ grid-template-columns:1fr; } }
+
+  esp-web-install-button{ display:inline-flex; vertical-align:middle; }
+  .flashbtn{ cursor:pointer; }
+  .ewt-note{ font-size:13px; color:var(--label); }
 </style>
 </head>
 <body>
 
 <header>
-  <span class="eyebrow">MarigoldOS · open firmware</span>
-  <a href="https://github.com/Jon-Vii/MarigoldOS">source on GitHub</a>
+  <span class="name"><img class="mk" src="marigold.svg" alt=""> MarigoldOS</span>
+  <a href="https://github.com/Jon-Vii/marigold-os">GitHub</a>
 </header>
+
+<div class="intro">
+  <h1>MarigoldOS</h1>
+  <p class="lead">Lightweight firmware for the Xteink X3 and X4 e-readers.</p>
+</div>
 
 <div class="device" aria-label="Simulated Xteink X4 e-reader">
   <div class="body">
     <div class="sidekeys">
       <div class="slot s1"><div class="rocker">
-        <button id="k-back" title="Upper half — the screen names it" aria-label="Top rocker, upper half"></button>
-        <button id="k-ok" title="Lower half — the screen names it" aria-label="Top rocker, lower half"></button>
+        <button id="k-back" title="Upper half - the screen names it" aria-label="Top rocker, upper half"></button>
+        <button id="k-ok" title="Lower half - the screen names it" aria-label="Top rocker, lower half"></button>
       </div></div>
       <div class="slot s2"><div class="rocker">
-        <button id="k-prev" title="Upper half — the screen names it" aria-label="Bottom rocker, upper half"></button>
-        <button id="k-next" title="Lower half — the screen names it" aria-label="Bottom rocker, lower half"></button>
+        <button id="k-prev" title="Upper half - the screen names it" aria-label="Bottom rocker, upper half"></button>
+        <button id="k-next" title="Lower half - the screen names it" aria-label="Bottom rocker, lower half"></button>
       </div></div>
     </div>
     <div class="screen"><canvas id="panel" width="800" height="480"></canvas></div>
@@ -299,7 +406,7 @@
     <button id="p-next" title="Page forward" aria-label="Page forward"></button>
   </div>
   <div class="edgetab powertab">
-    <button id="k-power" title="Power — sleep and wake" aria-label="Power"></button>
+    <button id="k-power" title="Power - sleep and wake" aria-label="Power"></button>
   </div>
   <span class="led" id="led" aria-hidden="true"></span>
 </div>
@@ -312,14 +419,53 @@
 </div>
 
 <main>
-  <p>
-    The X4's firmware, the same Rust that runs on the device, compiled
-    to WebAssembly and drawing its real framebuffer one bit deep at
-    800&nbsp;×&nbsp;480. Built-in books stand in for the card, the
-    Wi-Fi session is scripted, and the canvas refreshes the way the
-    real panel does.
-  </p>
-</main>
+    <p>
+      The emulator above runs the app and rendering code of MarigoldOS,
+      compiled to WebAssembly, in a simulated e-ink panel.
+    </p>
+  </main>
+
+<section class="install">
+  <h2>Flash MarigoldOS</h2>
+  <p class="sub">Install it onto your reader over USB, right from your browser.</p>
+  <div class="flow">
+    <div class="stage">
+      <p class="stitle"><span class="no">1</span>Choose your device</p>
+      <div class="devs">
+        <button class="dev on" data-dev="x4"><b>Xteink X4</b><span>480 × 800 · USB-C</span></button>
+        <button class="dev" data-dev="x3"><b>Xteink X3</b><span>528 × 792 · pogo pins</span></button>
+      </div>
+    </div>
+    <div class="stage">
+      <p class="stitle"><span class="no">2</span>Flash over USB</p>
+      <div class="asset">
+        <div><span class="k">Version</span><b>v0.2.0</b></div>
+        <div><span class="k">Image</span><b id="img">firmware-x4.bin</b></div>
+        <div><span class="k">Size</span><b>~2.0 MB</b></div>
+      </div>
+      <div class="status" id="status"><span class="dot"></span><span id="st">Ready. You’ll choose the USB port when you flash.</span></div>
+      <div class="acts">
+        <esp-web-install-button id="flasher" manifest="manifest-x4.json"><button slot="activate" class="flashbtn" id="flash">Flash</button><span slot="unsupported" class="ewt-note"></span><span slot="not-allowed" class="ewt-note">Web flashing needs a secure (https) connection.</span></esp-web-install-button>
+        <a class="ghost" href="#" id="dl">Download .bin</a>
+      </div>
+      <p class="req">Uses WebSerial, in Chrome or Edge on the desktop. Wake the reader to its home screen and connect it; after flashing, replug USB to boot.</p>
+      <p class="devnote">Prefer the command line? Flash the downloaded .bin with esptool over USB, on any browser. See the <a href="https://github.com/Jon-Vii/marigold-os/blob/main/docs/FLASHING.md">docs</a>.</p>
+    </div>
+  </div>
+
+  <div class="sdcard">
+    <p class="stitle">Or install from an SD card</p>
+    <p class="txt">For readers with USB flashing locked at the factory. It writes only the app slot and leaves the bootloader intact.</p>
+    <ul class="sdsteps">
+      <li><span class="n">1</span> Download the SD image for your device.</li>
+      <li><span class="n">2</span> Copy it to the root of the SD card.</li>
+      <li><span class="n">3</span> Power on holding <b>Power + Up</b> to flash.</li>
+    </ul>
+    <a class="dl2" href="#" id="sd">Download SD image &#8595;</a>
+  </div>
+
+  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.2.0 release notes &#8599;</a></p>
+</section>
 
 <div class="colophon">
   <div class="row"><span>panel</span><span>GDEQ0426T82 · 800 × 480 · 1-bit</span></div>
@@ -327,6 +473,10 @@
   <div class="row"><span>firmware</span><span>Rust · esp-hal · no_std on device</span></div>
   <div class="row"><span>this page</span><span>same crates, wasm32 · no framework</span></div>
 </div>
+
+<footer class="foot">
+  MIT · <a href="https://github.com/Jon-Vii/marigold-os">GitHub</a> · <a href="#">Docs</a>
+</footer>
 
 <script>
 (async function () {
@@ -515,5 +665,31 @@
 })();
 </script>
 
+<script>
+(function(){
+  const R="https://github.com/Jon-Vii/marigold-os/releases/latest/download/";
+  const FW={x4:R+"firmware-x4.bin", x3:R+"firmware-x3.bin"};
+  const SD={x4:R+"update.bin", x3:R+"FWUPDX3.BIN"};
+  const IMG={x4:"firmware-x4.bin", x3:"firmware-x3.bin"};
+  const btns=document.querySelectorAll(".dev");
+  const img=document.getElementById("img"), dl=document.getElementById("dl"), sd=document.getElementById("sd");
+  function set(dev){ const fl=document.getElementById("flasher"); if(fl) fl.manifest=dev==="x3"?"manifest-x3.json":"manifest-x4.json"; if(img)img.textContent=IMG[dev]; if(dl)dl.href=FW[dev]; if(sd)sd.href=SD[dev]; }
+  btns.forEach(b=>b.addEventListener("click",()=>{
+    btns.forEach(x=>x.classList.remove("on")); b.classList.add("on"); set(b.dataset.dev);
+  }));
+  set("x4");
+
+  // Web Serial support gate: no serial API -> steer to Download / SD instead.
+  if(!("serial" in navigator)){
+    const flash=document.getElementById("flash"), status=document.getElementById("status"),
+          st=document.getElementById("st"), dl=document.getElementById("dl");
+    if(flash) flash.classList.add("off");
+    if(status) status.classList.add("no");
+    if(st) st.textContent="Web flashing needs Chrome or Edge on desktop. Otherwise download the .bin and flash it with esptool, or use the SD card below.";
+    if(dl) dl.classList.add("lead");
+  }
+})();
+</script>
+<script type="module" src="vendor/esp-web-tools/web/install-button.js"></script>
 </body>
 </html>
