@@ -483,7 +483,7 @@
 
 <div class="colophon">
   <div class="row"><span>panel</span><span id="panel-spec">GDEQ0426T82 · 800 × 480 · 1-bit</span></div>
-  <div class="row"><span>page turn</span><span>~473 ms measured, 421 ms panel busy</span></div>
+  <div class="row"><span>page turn</span><span id="page-turn">~473 ms measured, 421 ms panel busy</span></div>
   <div class="row"><span>firmware</span><span>Rust · esp-hal · no_std on device</span></div>
   <div class="row"><span>this page</span><span>same crates, wasm32 · no framework</span></div>
 </div>
@@ -500,9 +500,11 @@
   // x3_web_emulator.wasm).
   const BOARDS = {
     x4: { name: "Xteink X4", short: "X4", w: 800, h: 480,
-          wasm: "x4_web_emulator.wasm", panel: "GDEQ0426T82 · 800 × 480 · 1-bit", res: "800 × 480" },
+          wasm: "x4_web_emulator.wasm", panel: "GDEQ0426T82 · 800 × 480 · 1-bit", res: "800 × 480",
+          pageTurn: "~473 ms measured, 421 ms panel busy" },
     x3: { name: "Xteink X3", short: "X3", w: 792, h: 528,
-          wasm: "x3_web_emulator.wasm", panel: "UC8253 · 792 × 528 · 1-bit", res: "792 × 528" },
+          wasm: "x3_web_emulator.wasm", panel: "UC8253 · 792 × 528 · 1-bit", res: "792 × 528",
+          pageTurn: "hardware timing not yet published" },
   };
   const boardParam = new URLSearchParams(location.search).get("board");
   const board = BOARDS[boardParam] ? boardParam : "x4";
@@ -521,6 +523,7 @@
   document.getElementById("p-board").textContent = cfg.short;
   document.getElementById("p-res").textContent = cfg.res;
   document.getElementById("panel-spec").textContent = cfg.panel;
+  document.getElementById("page-turn").textContent = cfg.pageTurn;
   document.getElementById("device").setAttribute("aria-label", "Simulated " + cfg.name + " e-reader");
   document.getElementById("sw-" + board).classList.add("active");
 
@@ -604,7 +607,8 @@
   let queued = null;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // mode: 1 full (~3.5 s real; abridged here), 2 fast (421 ms), 3 fast-clean.
+  // Refresh choreography is intentionally abridged for presentation; these
+  // delays are not hardware timing measurements for the selected board.
   async function refresh(mode) {
     const pixels = frame();
     busy = true;
@@ -615,7 +619,7 @@
     } else if (mode === 2) {
       // A fast update does not flash: changed pixels just redraw, and a
       // faint imprint of the outgoing page stays behind until a cleaning
-      // refresh. The panel is still busy for the rated 421 ms.
+      // refresh. Keep the interaction briefly busy to coalesce queued input.
       workCtx.drawImage(page, 0, 0);
       ghostCtx.drawImage(work, 0, 0);
       ghosting = true;
