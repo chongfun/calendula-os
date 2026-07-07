@@ -242,6 +242,11 @@ const CLEAN_POWER_ON_STEPS: &[FlushStep] = &[
 /// A differential Fast request cannot run with the charge pump off because
 /// DTM1 is no longer a trustworthy copy of the displayed frame; the proven
 /// driver promotes that case to the absolute FastClean waveform.
+/// `screen_powered` must reflect whether the charge pump is on *right now*
+/// (mirrored by the caller's own `power_on`/`power_off`), not a cached or
+/// derived guess: `FAST_STAGED_STEPS`/`FAST_UNSTAGED_STEPS` contain no
+/// `PowerOn` step, so a stale `true` here would run `DisplayRefresh` into an
+/// unpowered panel instead of being promoted to `FastClean`.
 pub const fn flush_plan(
     requested_mode: RefreshMode,
     screen_powered: bool,
