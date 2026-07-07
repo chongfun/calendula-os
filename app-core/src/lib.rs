@@ -4,7 +4,7 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
-pub const SETTINGS_ITEMS: u8 = 6;
+pub const SETTINGS_ITEMS: u8 = 5;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -1184,7 +1184,7 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
 
 /// Settings rows, top to bottom: the type block first (typeface, then its
 /// size, weight, and spacing — broadest choice to finest adjustment), then
-/// the set-and-forget device rows.
+/// the set-and-forget display row.
 fn apply_setting(mut state: ReaderState) -> ReaderState {
     match state.selection {
         0 => {
@@ -1214,24 +1214,13 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
             };
         }
         4 => {
-            state.orientation = match state.orientation {
-                DisplayOrientation::LandscapeButtonsBottom => {
-                    DisplayOrientation::LandscapeButtonsTop
-                }
-                DisplayOrientation::LandscapeButtonsTop => DisplayOrientation::PortraitButtonsLeft,
-                DisplayOrientation::PortraitButtonsLeft => DisplayOrientation::PortraitButtonsRight,
-                DisplayOrientation::PortraitButtonsRight => {
-                    DisplayOrientation::LandscapeButtonsBottom
-                }
-            };
-        }
-        _ => {
             state.refresh_policy = match state.refresh_policy {
                 RefreshPolicy::FastOnly => RefreshPolicy::FullOnWake,
                 RefreshPolicy::FullOnWake => RefreshPolicy::FullEveryTen,
                 RefreshPolicy::FullEveryTen => RefreshPolicy::FastOnly,
             };
         }
+        _ => {}
     }
     state
 }
@@ -1605,13 +1594,9 @@ mod tests {
     }
 
     #[test]
-    fn settings_change_key_cycles_orientation_and_refresh_policy() {
+    fn settings_change_key_cycles_refresh_policy() {
         let mut state = press(ReaderState::boot(), Button::Next);
         state.selection = 4;
-        let state = press(state, Button::Confirm);
-        assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
-        let state = press(state, Button::Next);
-        assert_eq!(state.selection, 5);
         let state = press(state, Button::Confirm);
         assert_eq!(state.refresh_policy, RefreshPolicy::FullEveryTen);
         let state = press(state, Button::Back);
@@ -1646,8 +1631,8 @@ mod tests {
         let state = press(state, Button::Confirm);
         assert_eq!(state.line_spacing, LineSpacing::Relaxed);
 
-        let state = press(press(state, Button::Next), Button::Next);
-        assert_eq!(state.selection, 5);
+        let state = press(state, Button::Next);
+        assert_eq!(state.selection, 4);
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
     }

@@ -1,12 +1,6 @@
-# Walk every Settings row with the change key: typeface, type size, type
-# weight, line spacing, orientation, and refresh policy each advance one
-# step, then Back returns home.
-
-[[steps]]
-button = "Next"
-
-[[steps]]
-button = "Confirm"
+# Walk every visible Settings row with the change key: typeface, type size,
+# type weight, line spacing, and refresh policy each advance one step, then
+# Back returns home.
 
 [[steps]]
 button = "Next"
@@ -48,6 +42,5 @@ font_family = "Merriweather"
 font_size = "Large"
 font_weight = "Heavy"
 line_spacing = "Relaxed"
-orientation = "LandscapeButtonsTop"
 refresh_policy = "FullEveryTen"
 last_refresh = "FastClean"

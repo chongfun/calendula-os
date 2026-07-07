@@ -8,8 +8,7 @@
 //! only — the device does not tell time.
 
 use crate::{
-    qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
-    UiTocItem, UiView,
+    qr_generated, UiLibraryStatus, UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem, UiView,
 };
 use display::fb::Framebuffer;
 use display::font::{
@@ -426,17 +425,10 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     );
     index_row(
         fb,
-        "Orientation",
-        orientation_label(shell.orientation),
-        FIRST_ROW_Y + 256,
-        shell.selection == 4,
-    );
-    index_row(
-        fb,
         "Refresh",
         refresh_policy_label(shell.refresh_policy),
-        FIRST_ROW_Y + 320,
-        shell.selection == 5,
+        FIRST_ROW_Y + 256,
+        shell.selection == 4,
     );
 
     finish_working_screen(fb, shell);
@@ -912,15 +904,6 @@ fn push_usize(buf: &mut [u8], cursor: &mut usize, value: usize) {
         }
         buf[*cursor] = digits[index];
         *cursor += 1;
-    }
-}
-
-fn orientation_label(orientation: UiOrientation) -> &'static str {
-    match orientation {
-        UiOrientation::LandscapeButtonsBottom => "buttons bottom",
-        UiOrientation::LandscapeButtonsTop => "buttons top",
-        UiOrientation::PortraitButtonsLeft => "buttons left",
-        UiOrientation::PortraitButtonsRight => "buttons right",
     }
 }
 

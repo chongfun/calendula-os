@@ -490,7 +490,9 @@ The firmware now has the e-reader surfaces as explicit app state:
 - `Library`: selects a book or opens settings.
 - `Reading`: owns the active book/page position.
 - `Chapters`: selects a chapter within the current book.
-- `Settings`: cycles orientation, refresh policy, font size, and line spacing.
+- `Settings`: cycles refresh policy, font size, line spacing, typeface, and
+  type weight. `DisplayOrientation` is persisted for future reading-layout
+  work, but it is not currently exposed as a user-facing setting.
 
 Every surface renders in landscape: the X4 is held that way for its side page
 buttons, so `Home`, `Library`, and `Settings` share the reading posture rather
