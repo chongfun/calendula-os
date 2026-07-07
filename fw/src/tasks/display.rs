@@ -10,7 +10,9 @@ use crate::{
     DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
-use app_core::{AppView, ReaderSource, RefreshPlanner, RenderRequest, SyncSession};
+use app_core::{
+    AppView, ReaderSource, ReaderState, RefreshPlanner, RenderKind, RenderRequest, SyncSession,
+};
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
@@ -229,23 +231,33 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut pending_progress,
                     &mut last_progress_write,
                 );
-                if let Some(request) = refresh_planner.last_request() {
-                    crate::views::render_sleep(fb, request, sd_library);
-                    let _ = display_flush::flush(
-                        &mut epd,
-                        fb,
-                        prev_fb,
-                        tx_band,
-                        refresh_planner.screen_on(),
-                        RefreshMode::Full,
-                        prev_prestaged,
-                    )
-                    .await;
+                let request = refresh_planner
+                    .last_request()
+                    .unwrap_or_else(|| ReaderState::boot().render_request(RenderKind::Page));
+                crate::views::render_sleep(fb, request, sd_library);
+                let sleep_frame_settled = if display_flush::flush(
+                    &mut epd,
+                    fb,
+                    prev_fb,
+                    tx_band,
+                    refresh_planner.screen_on(),
+                    RefreshMode::Full,
+                    prev_prestaged,
+                )
+                .await
+                .is_ok()
+                {
                     prev_fb.copy_from(fb);
-                }
+                    true
+                } else {
+                    esp_println::println!("display: sleep framebuffer flush failed");
+                    false
+                };
                 prev_prestaged = false;
                 if display_flush::sleep_panel(&mut epd).await.is_ok() {
-                    refresh_planner.record_sleep();
+                    if sleep_frame_settled {
+                        refresh_planner.record_sleep();
+                    }
                     send_required_display_event(&DisplayEvent::Asleep);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
                 } else {
