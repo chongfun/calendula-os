@@ -159,9 +159,7 @@ fn scenario_paths(path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
 fn output_path(base: &Path, scenario: &Path) -> Result<PathBuf, String> {
     let suffix = if cfg!(feature = "device-x3") { "-x3" } else { "" };
     if base.extension().is_some_and(|ext| ext == "png") {
-        let parent = base.parent().unwrap_or(Path::new(""));
-        let stem = base.file_stem().and_then(|s| s.to_str()).ok_or("invalid stem")?;
-        return Ok(parent.join(format!("{stem}{suffix}.png")));
+        return Ok(base.to_owned());
     }
     let name = scenario
         .file_stem()
@@ -537,6 +535,25 @@ impl eframe::App for EmulatorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_png_output_path_is_preserved() {
+        let base = Path::new("fixtures/golden/home-x3.png");
+        let scenario = Path::new("fixtures/scenarios/home.toml");
+        assert_eq!(output_path(base, scenario).unwrap(), base);
+    }
+
+    #[test]
+    fn directory_output_path_uses_the_selected_panel_suffix() {
+        let base = Path::new("fixtures/golden");
+        let scenario = Path::new("fixtures/scenarios/home.toml");
+        let expected = if cfg!(feature = "device-x3") {
+            Path::new("fixtures/golden/home-x3.png")
+        } else {
+            Path::new("fixtures/golden/home.png")
+        };
+        assert_eq!(output_path(base, scenario).unwrap(), expected);
+    }
 
     #[test]
     fn all_scenario_contracts_pass_for_selected_panel() {
