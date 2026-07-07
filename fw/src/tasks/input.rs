@@ -23,6 +23,10 @@ const REPEAT_COOLDOWN_TICKS: u8 = 32;
 const NAV_BACK_MIN_MV: u16 = 2400;
 const NAV_BACK_MAX_MV: u16 = 2700;
 const RAW_LOG_TICKS: u8 = 67;
+// A dead gauge fails on every 15 ms poll; log the first error (with its
+// kind) and then one line per ~10 s instead of ~66 lines/s.
+#[cfg(feature = "device-x3")]
+const GAUGE_ERR_LOG_TICKS: u32 = 667;
 
 #[derive(Clone, Copy)]
 struct Band {
@@ -134,11 +138,13 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
     let mut raw_log_ticks = 0u8;
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
+    let mut gauge_failures: u32 = 0;
 
     loop {
         Timer::after_millis(POLL_MS).await;
 
-        let (battery_mv, raw_percent, aux) = read_power(&mut adc, &mut pins).await;
+        let (battery_mv, raw_percent, aux) =
+            read_power(&mut adc, &mut pins, &mut gauge_failures).await;
         let sample = RawSample {
             aux,
             nav: read_adc(&mut adc, &mut pins.nav_pin).await,
@@ -171,6 +177,7 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
         if !battery_seeded {
             emit(None, sample, battery_mv, percent);
             battery_seeded = true;
+            esp_println::println!("input: battery seeded ({} mV, {}%)", battery_mv, percent);
         }
 
         let power_pressed = debounce_active_low(pins.power.is_low(), &mut power_ticks);
@@ -203,17 +210,41 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
 /// the X4, the gauge voltage on the X3 (which has no aux ADC). On an I2C
 /// error the X3 reports a flat full battery rather than a spurious 0%.
 #[cfg(not(feature = "device-x3"))]
-async fn read_power(adc: &mut Adc<'static, ADC1>, pins: &mut InputPins) -> (u16, u8, u16) {
+async fn read_power(
+    adc: &mut Adc<'static, ADC1>,
+    pins: &mut InputPins,
+    _gauge_failures: &mut u32,
+) -> (u16, u8, u16) {
     let aux = read_adc(adc, &mut pins.aux_pin).await;
     (battery_mv(aux), battery_percent(aux), aux)
 }
 
 #[cfg(feature = "device-x3")]
-async fn read_power(_adc: &mut Adc<'static, ADC1>, pins: &mut InputPins) -> (u16, u8, u16) {
+async fn read_power(
+    _adc: &mut Adc<'static, ADC1>,
+    pins: &mut InputPins,
+    gauge_failures: &mut u32,
+) -> (u16, u8, u16) {
     match pins.gauge.read().await {
-        Ok((mv, percent)) => (mv, percent, mv),
-        Err(_) => {
-            esp_println::println!("input: bq27220 read failed");
+        Ok((mv, percent)) => {
+            if *gauge_failures > 0 {
+                esp_println::println!(
+                    "input: bq27220 recovered after {} failed reads",
+                    *gauge_failures
+                );
+                *gauge_failures = 0;
+            }
+            (mv, percent, mv)
+        }
+        Err(err) => {
+            *gauge_failures = gauge_failures.saturating_add(1);
+            if *gauge_failures == 1 || *gauge_failures % GAUGE_ERR_LOG_TICKS == 0 {
+                esp_println::println!(
+                    "input: bq27220 read failed ({:?}, {} consecutive)",
+                    err,
+                    *gauge_failures
+                );
+            }
             (0, 100, 0)
         }
     }
