@@ -766,8 +766,14 @@ enum LandscapeHomeVariant {
 pub(crate) fn fit_design_to_board(fb: &mut Framebuffer) {
     const DESIGN_W: i16 = 800;
     const DESIGN_H: i16 = 480;
-    let dx = (WIDTH as i16 - DESIGN_W) / 2;
-    let dy = (HEIGHT as i16 - DESIGN_H) / 2;
+    // The design is drawn straight into `fb` at 800x480 coordinates, so on a
+    // board narrower/shorter than the design, Framebuffer::set_pixel already
+    // silently dropped the excess before this function ever runs — there's
+    // nothing left on that axis to center. Only shift on axes where the
+    // board has *extra* room to distribute; shifting on a clipped axis would
+    // just crop a second time.
+    let dx = (WIDTH as i16 - DESIGN_W).max(0) / 2;
+    let dy = (HEIGHT as i16 - DESIGN_H).max(0) / 2;
     if dx == 0 && dy == 0 {
         return;
     }
