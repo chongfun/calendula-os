@@ -4,8 +4,11 @@
 //! 1 = dark module).
 
 /// `WIFI:T:nopass;S:XTEINK-X4;;`
+#[rustfmt::skip]
 pub const QR_JOIN_SIZE: usize = 29;
+#[rustfmt::skip]
 pub const QR_JOIN_STRIDE: usize = 4;
+#[rustfmt::skip]
 pub const QR_JOIN_BITS: [u8; 116] = [
     0xfe, 0xce, 0xeb, 0xf8,
     0x82, 0x67, 0x12, 0x08,
@@ -39,8 +42,11 @@ pub const QR_JOIN_BITS: [u8; 116] = [
 ];
 
 /// `http://192.168.4.1/`
+#[rustfmt::skip]
 pub const QR_PORTAL_SIZE: usize = 25;
+#[rustfmt::skip]
 pub const QR_PORTAL_STRIDE: usize = 4;
+#[rustfmt::skip]
 pub const QR_PORTAL_BITS: [u8; 100] = [
     0xfe, 0xec, 0xbf, 0x80,
     0x82, 0xe6, 0x20, 0x80,

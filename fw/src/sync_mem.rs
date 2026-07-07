@@ -19,7 +19,7 @@ use portable_atomic::{AtomicBool, Ordering};
 
 /// Bytes claimed from `dram2_seg` for the radio heap. The segment is
 /// ~64.8 KB and also hosts the previous-frame framebuffer (below), which
-/// was moved here so esp-wifi's static demand fits in main DRAM without
+/// was moved here so the radio stack's static demand fits in main DRAM without
 /// eating the stack region.
 ///
 /// The X3's 792x528 framebuffer is 4.3 KB larger than the X4's, so its

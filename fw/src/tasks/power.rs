@@ -1,15 +1,14 @@
 use crate::{DisplayCommand, PowerEvent, DISPLAY_COMMANDS, POWER_EVENTS};
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
-use esp_hal::gpio::{Flex, GpioPin};
-use esp_hal::peripherals::LPWR;
+use esp_hal::peripherals::{GPIO3, LPWR};
 use esp_hal::rtc_cntl::Rtc;
 
 /// Idle time with no input before the device puts itself into deep sleep.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[embassy_executor::task]
-pub async fn run(lpwr: LPWR) {
+pub async fn run(lpwr: LPWR<'static>) {
     esp_println::println!("power: started");
     let mut rtc = Rtc::new(lpwr);
     let mut deadline = Instant::now() + IDLE_TIMEOUT;
@@ -69,6 +68,6 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
 /// `Input<'static>` handle on GPIO3 is about to be torn down by the chip reset
 /// that ends deep sleep, so this second handle never coexists with a live one.
 #[allow(unsafe_code)]
-fn steal_wake_button() -> Flex<'static> {
-    Flex::new(unsafe { GpioPin::<3>::steal() })
+fn steal_wake_button() -> GPIO3<'static> {
+    unsafe { GPIO3::steal() }
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-heapless = "0.8.0"
+heapless = "0.9.0"
 miniz_oxide = { version = "0.9.1", default-features = false }
 # SHA-256 for OTA image validation (no_std, no heap). asm is off so it builds
 # for both the riscv32 target and host tests.

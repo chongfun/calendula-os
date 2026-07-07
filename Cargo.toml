@@ -26,5 +26,5 @@ opt-level = 3
 
 # The radio driver's timing-sensitive code wants speed (its build script
 # warns below opt-level 2); the rest of the sync session is network-bound.
-[profile.release.package.esp-wifi]
+[profile.release.package.esp-radio]
 opt-level = 3

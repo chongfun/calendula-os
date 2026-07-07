@@ -349,8 +349,8 @@ def kerning_entries(font_path: Path, cps, px: int):
 
 def write_kerning(out, name, entries, count_name=None):
     count = count_name or f"{name}_KERNING_COUNT"
-    out.append(f"pub const {count}: usize = {len(entries)};\n")
-    out.append(f"pub static {name}_KERNING: [KerningEntry; {count}] = [\n")
+    out.append(f"#[rustfmt::skip]\npub const {count}: usize = {len(entries)};\n")
+    out.append(f"#[rustfmt::skip]\npub static {name}_KERNING: [KerningEntry; {count}] = [\n")
     for left, right, adjust_fp in entries:
         out.append(
             "    KerningEntry { "

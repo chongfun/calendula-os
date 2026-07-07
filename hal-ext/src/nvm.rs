@@ -297,8 +297,8 @@ mod tests {
         let checksum = checksum(&encoded[..28]);
         write_u32(&mut encoded, 28, checksum);
 
-        let decoded = AppStateRecord::decode(&encoded[..AppStateRecord::V3_ENCODED_LEN])
-            .expect("v3 decodes");
+        let decoded =
+            AppStateRecord::decode(&encoded[..AppStateRecord::V3_ENCODED_LEN]).expect("v3 decodes");
         assert_eq!(decoded.font_size, 2);
         assert_eq!(decoded.line_spacing, 0);
         assert_eq!(decoded.font_weight, AppStateRecord::DEFAULT_FONT_WEIGHT);

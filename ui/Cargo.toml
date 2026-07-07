@@ -9,4 +9,4 @@ display = { path = "../display" }
 proto = { path = "../proto" }
 
 [dev-dependencies]
-heapless = "0.8.0"
+heapless = "0.9.0"

@@ -1,5 +1,7 @@
 use crate::display_flush::Epd;
-use crate::reader_store::{derive_catalog_label, source_hash, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
+use crate::reader_store::{
+    derive_catalog_label, source_hash, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW,
+};
 use crate::sd_session;
 use embedded_sdmmc::{Directory, File, LfnBuffer, Mode, TimeSource};
 use esp_hal::gpio::Output;
@@ -164,7 +166,13 @@ where
         {
             let mut collect = |path: &str, open_name: &str, in_books_dir: bool, byte_size: u32| {
                 if seen >= cursor && batch_len < SCAN_BATCH {
-                    encode_record(&mut batch[batch_len], path, open_name, in_books_dir, byte_size);
+                    encode_record(
+                        &mut batch[batch_len],
+                        path,
+                        open_name,
+                        in_books_dir,
+                        byte_size,
+                    );
                     batch_len += 1;
                 }
                 seen += 1;
@@ -291,13 +299,7 @@ where
 /// Find the catalog index of the book with the given (path-hash, byte-size).
 /// Tries `hint` (last-known index) first so an unchanged catalog resolves in
 /// one read; only a miss streams the whole file.
-fn find_in_catalog<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
+fn find_in_catalog<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     source_hash: u32,
     byte_size: u32,
@@ -336,13 +338,7 @@ where
     .flatten()
 }
 
-fn record_identity<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
+fn record_identity<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     index: usize,
 ) -> Result<(u32, u32), ()>
@@ -716,7 +712,14 @@ fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
         };
 
         if is_epub_name(file_name) {
-            visit_prefixed(prefix, file_name, &open_name, in_books_dir, entry.size, visit);
+            visit_prefixed(
+                prefix,
+                file_name,
+                &open_name,
+                in_books_dir,
+                entry.size,
+                visit,
+            );
         }
     });
 }

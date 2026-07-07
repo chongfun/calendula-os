@@ -14,12 +14,12 @@
 //! clock are all first-boot iteration points.
 
 use super::{Epd, SpiError};
+use display::epd::uc8253::fill_transformed_band;
 use display::epd::uc8253::{
     bank_for, LutBank, CDI_INTERVAL, CMD_DATA_STOP, CMD_DEEP_SLEEP, CMD_DISPLAY_REFRESH, CMD_DTM1,
     CMD_DTM2, CMD_LUT_BB, CMD_LUT_BW, CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_POWER_OFF,
     CMD_POWER_ON, CMD_VCOM_DATA_INTERVAL, DEEP_SLEEP_CHECK, INIT_SEQUENCE,
 };
-use display::epd::uc8253::fill_transformed_band;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::{BAND_BYTES, BAND_ROWS, HEIGHT, ROW_BYTES};

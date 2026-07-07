@@ -1,15 +1,15 @@
 use crate::display_flush::Epd;
 use crate::upload::{UploadBegin, UploadChunk};
 use crate::{UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS};
+use core::sync::atomic::{AtomicU8, Ordering};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
-use core::sync::atomic::{AtomicU8, Ordering};
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
 use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::{Directory, Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use esp_hal::gpio::Output;
 use esp_hal::spi::master::{Config as SpiConfig, SpiDmaBus};
-use esp_hal::time::RateExtU32;
+use esp_hal::time::Rate;
 use esp_hal::Async;
 
 /// SD SPI-mode identification must run at 100-400 kHz; data transfer is
@@ -239,7 +239,7 @@ pub(crate) fn with_root<R>(
     sd_cs.set_high();
     let _ = epd
         .spi_mut()
-        .apply_config(&SpiConfig::default().with_frequency(DISPLAY_FREQ_HZ.Hz()));
+        .apply_config(&SpiConfig::default().with_frequency(Rate::from_hz(DISPLAY_FREQ_HZ)));
     result
 }
 
@@ -264,7 +264,8 @@ where
     // deselected), so the warm path runs it too rather than special-casing.
     {
         let spi = epd.spi_mut();
-        let _ = spi.apply_config(&SpiConfig::default().with_frequency(SD_IDENT_FREQ_KHZ.kHz()));
+        let _ = spi
+            .apply_config(&SpiConfig::default().with_frequency(Rate::from_khz(SD_IDENT_FREQ_KHZ)));
         let mut wake = [0xFFu8; 10];
         let _ = BlockingSpiBus::transfer_in_place(spi, &mut wake);
         let _ = BlockingSpiBus::flush(spi);
@@ -302,7 +303,7 @@ where
     card.spi(|device| {
         let _ = device
             .spi
-            .apply_config(&SpiConfig::default().with_frequency(SD_DATA_FREQ_MHZ.MHz()));
+            .apply_config(&SpiConfig::default().with_frequency(Rate::from_mhz(SD_DATA_FREQ_MHZ)));
     });
     let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
         VolumeManager::new_with_limits(card, StaticTime, 5000);
@@ -343,7 +344,8 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
 
     {
         let spi = epd.spi_mut();
-        let _ = spi.apply_config(&SpiConfig::default().with_frequency(SD_IDENT_FREQ_KHZ.kHz()));
+        let _ = spi
+            .apply_config(&SpiConfig::default().with_frequency(Rate::from_khz(SD_IDENT_FREQ_KHZ)));
         let mut wake = [0xFFu8; 10];
         let _ = BlockingSpiBus::transfer_in_place(spi, &mut wake);
         let _ = BlockingSpiBus::flush(spi);
@@ -362,7 +364,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
     card.spi(|device| {
         let _ = device
             .spi
-            .apply_config(&SpiConfig::default().with_frequency(SD_DATA_FREQ_MHZ.MHz()));
+            .apply_config(&SpiConfig::default().with_frequency(Rate::from_mhz(SD_DATA_FREQ_MHZ)));
     });
     let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
         VolumeManager::new_with_limits(card, StaticTime, 5000);

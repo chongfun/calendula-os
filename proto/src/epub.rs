@@ -1686,7 +1686,9 @@ fn collect_spine_idrefs(opf_xml: &str) -> Vec<&str, MAX_SPINE_ITEMS> {
 
 fn manifest_item_is_reading_candidate(href: &str, media_type: &str, properties: &str) -> bool {
     if href.is_empty()
-        || properties.split_ascii_whitespace().any(|prop| prop == "nav")
+        || properties
+            .split_ascii_whitespace()
+            .any(|prop| prop == "nav")
         || media_type.eq_ignore_ascii_case("application/x-dtbncx+xml")
         || href.ends_with(".ncx")
         || href.ends_with(".css")
@@ -2091,12 +2093,11 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                         || tag_name_is(tag, "style")
                         || tag_name_is(tag, "script")
                         || tag_name_is(tag, "svg")
-                        || tag_is_hidden(tag)) =>
+                        || tag_is_hidden(tag))
+                    && !tag_is_void(tag) =>
             {
-                if !tag_is_void(tag) {
-                    skip_tag = tag_local_name(tag);
-                    skip_depth = skip_depth.saturating_add(1);
-                }
+                skip_tag = tag_local_name(tag);
+                skip_depth = skip_depth.saturating_add(1);
             }
             Token::End(tag) if skip_tag.map(|name| tag_name_is(tag, name)).unwrap_or(false) => {
                 skip_depth = skip_depth.saturating_sub(1);

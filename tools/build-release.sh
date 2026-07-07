@@ -48,7 +48,11 @@ FW="$OUT/firmware$SUFFIX.bin"
 FULL="$OUT/full-flash$SUFFIX.bin"
 
 echo "==> building fw ($DEVICE, release)"
-cargo build -p fw --release "${FEATURES[@]}"
+if ((${#FEATURES[@]})); then
+  cargo build -p fw --release "${FEATURES[@]}"
+else
+  cargo build -p fw --release
+fi
 
 mkdir -p "$OUT"
 

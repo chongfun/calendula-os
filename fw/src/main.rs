@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![feature(impl_trait_in_assoc_type)]
 #![deny(unsafe_code)]
 #![allow(clippy::manual_div_ceil)] // False positive inside esp_hal::dma_buffers!.
 #![deny(clippy::large_stack_arrays)]
@@ -65,14 +64,17 @@ use esp_backtrace as _;
 use esp_hal::analog::adc::{
     Adc, AdcCalCurve, AdcCalScheme, AdcChannel, AdcConfig, AdcPin, Attenuation,
 };
-use esp_hal::gpio::{Input, Level, Output, Pull};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
+#[cfg(not(feature = "device-x3"))]
 use esp_hal::interrupt::Priority;
 use esp_hal::peripherals::ADC1;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::time::RateExtU32;
-use esp_hal::timer::{timg::TimerGroup, AnyTimer};
-use esp_hal_embassy::{Executor, InterruptExecutor};
+use esp_hal::time::Rate;
+use esp_hal::timer::timg::TimerGroup;
+use esp_rtos::embassy::Executor;
+#[cfg(not(feature = "device-x3"))]
+use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
 use tasks::input::InputPins;
 
@@ -107,21 +109,19 @@ pub static UPLOAD_CHUNKS: Channel<CriticalSectionRawMutex, upload::UploadChunk, 
 pub static UPLOAD_RETURNS: Channel<CriticalSectionRawMutex, &'static mut [u8], 2> = Channel::new();
 pub static UPLOAD_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
 
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    esp_println::println!("{}", info);
-    loop {}
-}
-
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-static INPUT_EXECUTOR: StaticCell<InterruptExecutor<0>> = StaticCell::new();
+#[cfg(not(feature = "device-x3"))]
+static INPUT_EXECUTOR: StaticCell<InterruptExecutor<1>> = StaticCell::new();
+
+type BoardAdc = ADC1<'static>;
+type BoardAdcDriver = Adc<'static, BoardAdc, esp_hal::Blocking>;
 
 /// Blocking median-of-three ADC read for the boot-time recovery combo check,
 /// before the async input task exists. Median rejects a single noisy sample.
-fn median3_adc<P, CS>(adc: &mut Adc<'static, ADC1>, pin: &mut AdcPin<P, ADC1, CS>) -> u16
+fn median3_adc<P, CS>(adc: &mut BoardAdcDriver, pin: &mut AdcPin<P, BoardAdc, CS>) -> u16
 where
     P: AdcChannel,
-    CS: AdcCalScheme<ADC1>,
+    CS: AdcCalScheme<BoardAdc>,
 {
     let mut v = [0u16; 3];
     for slot in v.iter_mut() {
@@ -146,26 +146,29 @@ fn main() -> ! {
     esp_println::println!("xteink-x4-os: boot");
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let timg1 = TimerGroup::new(peripherals.TIMG1);
-    esp_hal_embassy::init([AnyTimer::from(timg0.timer0), AnyTimer::from(timg1.timer0)]);
+    let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
 
-    let epd_cs = Output::new(peripherals.GPIO21, Level::High);
-    let epd_dc = Output::new(peripherals.GPIO4, Level::High);
-    let epd_rst = Output::new(peripherals.GPIO5, Level::High);
-    let epd_busy = Input::new(peripherals.GPIO6, Pull::None);
-    let sd_cs = Output::new(peripherals.GPIO12, Level::High);
-    let power_button = Input::new(peripherals.GPIO3, Pull::Up);
+    let epd_cs = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
+    let epd_dc = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
+    let epd_rst = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
+    let epd_busy = Input::new(peripherals.GPIO6, InputConfig::default());
+    let sd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
+    let power_button = Input::new(
+        peripherals.GPIO3,
+        InputConfig::default().with_pull(Pull::Up),
+    );
 
     let mut adc_config = AdcConfig::new();
     // GPIO0 is the battery ADC divider on the X4; on the X3 it is I2C SCL
     // (paired with GPIO20 SDA) for the fuel gauge, so it is not an ADC pin.
     #[cfg(not(feature = "device-x3"))]
     let aux_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO0, Attenuation::_11dB);
+        .enable_pin_with_cal::<_, AdcCalCurve<BoardAdc>>(peripherals.GPIO0, Attenuation::_11dB);
     let mut nav_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO1, Attenuation::_11dB);
+        .enable_pin_with_cal::<_, AdcCalCurve<BoardAdc>>(peripherals.GPIO1, Attenuation::_11dB);
     let mut page_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO2, Attenuation::_11dB);
+        .enable_pin_with_cal::<_, AdcCalCurve<BoardAdc>>(peripherals.GPIO2, Attenuation::_11dB);
     let mut adc1 = Adc::new(peripherals.ADC1, adc_config);
 
     // X3 fuel gauge on I2C0: SCL=GPIO0, SDA=GPIO20, 400 kHz.
@@ -174,7 +177,7 @@ fn main() -> ! {
         let i2c = esp_hal::i2c::master::I2c::new(
             peripherals.I2C0,
             esp_hal::i2c::master::Config::default()
-                .with_frequency(400_u32.kHz())
+                .with_frequency(Rate::from_khz(400))
                 // The BQ27220 clock-stretches for milliseconds while it
                 // processes a command; esp-hal's default SCL timeout of 10
                 // bus cycles (25 us) aborts every read with Timeout. Allow
@@ -201,7 +204,7 @@ fn main() -> ! {
         if ota_update::recovery_combo_held(nav_mv, page_mv) {
             esp_println::println!("recovery: Back+Up held (nav={} page={})", nav_mv, page_mv);
             if ota_update::recover_to_slot0() {
-                esp_hal::reset::software_reset();
+                esp_hal::system::software_reset();
             }
         }
     }
@@ -215,7 +218,7 @@ fn main() -> ! {
     let epd_spi = Spi::new(
         peripherals.SPI2,
         SpiConfig::default()
-            .with_frequency(display::epd::SPI_HZ.Hz())
+            .with_frequency(Rate::from_hz(display::epd::SPI_HZ))
             .with_mode(esp_hal::spi::Mode::_0),
     )
     .expect("SPI2 config")
@@ -231,42 +234,51 @@ fn main() -> ! {
     // keeps running while the thread executor blocks on SD/EPUB work; a
     // cold cache build no longer deafens the buttons. Channels between the
     // tasks already use CriticalSectionRawMutex, so handoff is unchanged.
-    let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    let input_executor = INPUT_EXECUTOR.init(InterruptExecutor::new(sw_ints.software_interrupt0));
-    let input_spawner = input_executor.start(Priority::Priority1);
-    esp_println::println!("main: spawn input");
-    input_spawner
-        .spawn(tasks::input::run(
-            adc1,
-            InputPins {
-                power: power_button,
-                #[cfg(not(feature = "device-x3"))]
-                aux_pin: aux_adc,
-                nav_pin: nav_adc,
-                page_pin: page_adc,
-                #[cfg(feature = "device-x3")]
-                gauge: battery_gauge,
-            },
-        ))
-        .unwrap();
+    #[cfg(not(feature = "device-x3"))]
+    {
+        let input_executor =
+            INPUT_EXECUTOR.init(InterruptExecutor::new(sw_ints.software_interrupt1));
+        let input_spawner = input_executor.start(Priority::Priority1);
+        esp_println::println!("main: spawn input");
+        input_spawner.spawn(
+            tasks::input::run(
+                adc1,
+                InputPins {
+                    power: power_button,
+                    aux_pin: aux_adc,
+                    nav_pin: nav_adc,
+                    page_pin: page_adc,
+                },
+            )
+            .unwrap(),
+        );
+    }
 
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner: Spawner| {
+        #[cfg(feature = "device-x3")]
+        {
+            esp_println::println!("main: spawn input");
+            spawner.spawn(
+                tasks::input::run(
+                    adc1,
+                    InputPins {
+                        power: power_button,
+                        nav_pin: nav_adc,
+                        page_pin: page_adc,
+                        gauge: battery_gauge,
+                    },
+                )
+                .unwrap(),
+            );
+        }
         esp_println::println!("main: spawn display");
-        spawner.spawn(tasks::display::run(epd_bus, sd_cs)).unwrap();
+        spawner.spawn(tasks::display::run(epd_bus, sd_cs).unwrap());
         esp_println::println!("main: spawn power");
-        spawner.spawn(tasks::power::run(peripherals.LPWR)).unwrap();
+        spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
         esp_println::println!("main: spawn app");
-        spawner.spawn(tasks::app::run()).unwrap();
+        spawner.spawn(tasks::app::run().unwrap());
         esp_println::println!("main: spawn wifi");
-        spawner
-            .spawn(tasks::wifi::run(
-                spawner,
-                peripherals.WIFI,
-                peripherals.SYSTIMER,
-                peripherals.RNG,
-                peripherals.RADIO_CLK,
-            ))
-            .unwrap();
+        spawner.spawn(tasks::wifi::run(spawner, peripherals.WIFI).unwrap());
     })
 }

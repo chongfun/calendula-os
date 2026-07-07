@@ -94,7 +94,10 @@ pub fn readable_filename(client_name: &[u8]) -> UploadLabel {
     let mut at = 0;
     while at < client_name.len() && len < bytes.len() {
         let byte = if client_name[at] == b'%' && at + 2 < client_name.len() {
-            match (hex_nibble(client_name[at + 1]), hex_nibble(client_name[at + 2])) {
+            match (
+                hex_nibble(client_name[at + 1]),
+                hex_nibble(client_name[at + 2]),
+            ) {
                 (Some(high), Some(low)) => {
                     at += 2;
                     (high << 4) | low

@@ -1,3 +1,4 @@
+use super::{Epd, SpiError};
 use display::epd::{
     fill_transformed_band, ram_x_counter, ram_x_range, ram_y_counter, ram_y_range,
     update_control_1, update_control_2, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
@@ -6,7 +7,6 @@ use display::epd::{
     CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE, FAST_CLEAN_TEMPERATURE,
     INIT_SEQUENCE, UPDATE_SEQUENCE_LOAD_TEMP,
 };
-use super::{Epd, SpiError};
 use display::fb::Framebuffer;
 use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
 use embassy_time::Instant;

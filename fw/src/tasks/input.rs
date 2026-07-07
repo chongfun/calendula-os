@@ -1,8 +1,13 @@
 use crate::{Button, InputEvent, INPUT_EVENTS};
 use embassy_time::{Instant, Timer};
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
-use esp_hal::gpio::{GpioPin, Input};
-use esp_hal::peripherals::ADC1;
+use esp_hal::gpio::Input;
+#[cfg(not(feature = "device-x3"))]
+use esp_hal::peripherals::GPIO0;
+use esp_hal::peripherals::{ADC1, GPIO1, GPIO2};
+
+type BoardAdc = ADC1<'static>;
+type BoardAdcDriver = Adc<'static, BoardAdc, esp_hal::Blocking>;
 
 /// The X3's fuel gauge on the shared I2C bus (GPIO0/GPIO20). The X4 has no
 /// gauge; its battery comes from the aux ADC below.
@@ -40,9 +45,9 @@ pub struct InputPins {
     /// X4 only: battery voltage on the GPIO0 ADC divider. On the X3 GPIO0 is
     /// I2C SCL, so the aux channel does not exist and the gauge replaces it.
     #[cfg(not(feature = "device-x3"))]
-    pub aux_pin: AdcPin<GpioPin<0>, ADC1, AdcCalCurve<ADC1>>,
-    pub nav_pin: AdcPin<GpioPin<1>, ADC1, AdcCalCurve<ADC1>>,
-    pub page_pin: AdcPin<GpioPin<2>, ADC1, AdcCalCurve<ADC1>>,
+    pub aux_pin: AdcPin<GPIO0<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
+    pub nav_pin: AdcPin<GPIO1<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
+    pub page_pin: AdcPin<GPIO2<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
     #[cfg(feature = "device-x3")]
     pub gauge: BatteryGauge,
 }
@@ -128,7 +133,7 @@ const PAGE: &[Band] = &[
 ];
 
 #[embassy_executor::task]
-pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
+pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     esp_println::println!("input: started");
 
     let mut last_power = false;
@@ -211,7 +216,7 @@ pub async fn run(mut adc: Adc<'static, ADC1>, mut pins: InputPins) {
 /// error the X3 reports a flat full battery rather than a spurious 0%.
 #[cfg(not(feature = "device-x3"))]
 async fn read_power(
-    adc: &mut Adc<'static, ADC1>,
+    adc: &mut BoardAdcDriver,
     pins: &mut InputPins,
     _gauge_failures: &mut u32,
 ) -> (u16, u8, u16) {
@@ -221,7 +226,7 @@ async fn read_power(
 
 #[cfg(feature = "device-x3")]
 async fn read_power(
-    _adc: &mut Adc<'static, ADC1>,
+    _adc: &mut BoardAdcDriver,
     pins: &mut InputPins,
     gauge_failures: &mut u32,
 ) -> (u16, u8, u16) {
@@ -399,10 +404,10 @@ fn map_hardware(button: HardwareButton) -> Button {
     }
 }
 
-async fn read_adc<P, CS>(adc: &mut Adc<'static, ADC1>, pin: &mut AdcPin<P, ADC1, CS>) -> u16
+async fn read_adc<P, CS>(adc: &mut BoardAdcDriver, pin: &mut AdcPin<P, BoardAdc, CS>) -> u16
 where
     P: esp_hal::analog::adc::AdcChannel,
-    CS: AdcCalScheme<ADC1>,
+    CS: AdcCalScheme<BoardAdc>,
 {
     loop {
         match adc.read_oneshot(pin) {

@@ -1,7 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-pub mod merriweather_generated;
 pub mod epd;
 pub mod fb;
 pub mod font;
@@ -9,6 +8,7 @@ pub mod literata_extra_generated;
 pub mod literata_generated;
 pub mod literata_semibold_generated;
 pub mod literata_sizes_generated;
+pub mod merriweather_generated;
 pub mod render;
 
 /// Xteink X4: GDEQ0426T82 4.26" panel, SSD1677 controller.

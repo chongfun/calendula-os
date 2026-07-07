@@ -30,5 +30,4 @@ pub(crate) type Epd = hal_ext::spi_dma::EpdBus<
     Output<'static>,
 >;
 
-pub(crate) type SpiError =
-    <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error;
+pub(crate) type SpiError = <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error;

@@ -23,12 +23,7 @@ use display::{Rect, HEIGHT, WIDTH};
 /// of panel height (the X4's 480 gives the historical 120/200/280/360), so
 /// the same button arrangement stays aligned on the X3's differently sized
 /// panel rather than bunching toward the top.
-const KEY_YS: [i16; 4] = [
-    key_y(120),
-    key_y(200),
-    key_y(280),
-    key_y(360),
-];
+const KEY_YS: [i16; 4] = [key_y(120), key_y(200), key_y(280), key_y(360)];
 
 const fn key_y(x4_y: i16) -> i16 {
     (x4_y as i32 * HEIGHT as i32 / 480) as i16

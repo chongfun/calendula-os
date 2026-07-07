@@ -4,7 +4,7 @@
 #![allow(clippy::manual_div_ceil)] // False positive inside esp_hal::dma_buffers!.
 
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::time::RateExtU32;
+use esp_hal::time::Rate;
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -22,7 +22,7 @@ fn main() -> ! {
     let _spi = Spi::new(
         peripherals.SPI2,
         SpiConfig::default()
-            .with_frequency(10_u32.MHz())
+            .with_frequency(Rate::from_mhz(10))
             .with_mode(esp_hal::spi::Mode::_0),
     )
     .expect("SPI2 config")

@@ -96,12 +96,14 @@ pub fn validate_image<S: ImageSource>(
             return Err(ImageError::BadSegments);
         }
         let mut seg_header = [0u8; SEG_HEADER_LEN];
-        src.read_exact(&mut seg_header).map_err(|_| ImageError::Read)?;
+        src.read_exact(&mut seg_header)
+            .map_err(|_| ImageError::Read)?;
         sha.update(seg_header);
         pos += SEG_HEADER_LEN;
 
         let data_len =
-            u32::from_le_bytes([seg_header[4], seg_header[5], seg_header[6], seg_header[7]]) as usize;
+            u32::from_le_bytes([seg_header[4], seg_header[5], seg_header[6], seg_header[7]])
+                as usize;
         if pos + data_len > image_len {
             return Err(ImageError::BadSegments);
         }
@@ -402,7 +404,10 @@ mod tests {
     fn accepts_hash_appended_image() {
         let img = valid_image(true);
         let len = img.len();
-        assert_eq!(validate_image(&mut cursor(img), len, Some(0x640000)), Ok(()));
+        assert_eq!(
+            validate_image(&mut cursor(img), len, Some(0x640000)),
+            Ok(())
+        );
     }
 
     #[test]
@@ -533,7 +538,10 @@ mod tests {
         assert!(back.is_valid());
         // seq_label region is 0xFF, CRC sits in the last 4 bytes.
         assert_eq!(&bytes[4..24], &[0xFF; 20]);
-        assert_eq!(u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]), seq_crc(5));
+        assert_eq!(
+            u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+            seq_crc(5)
+        );
     }
 
     #[test]

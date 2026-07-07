@@ -73,7 +73,13 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
     }
 }
 
-fn read_file_exact<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
+fn read_file_exact<
+    D: BlockDevice,
+    T: TimeSource,
+    const MD: usize,
+    const MF: usize,
+    const MV: usize,
+>(
     file: &File<'_, D, T, MD, MF, MV>,
     buf: &mut [u8],
 ) -> Result<(), ()> {
@@ -120,7 +126,7 @@ fn try_apply(root: &SdRoot) -> Result<(), UpdateError> {
         .map_err(UpdateError::Invalid)?;
     file.seek_from_start(0).map_err(|_| UpdateError::ReadFile)?;
 
-    let mut flash = FlashStorage::new();
+    let mut flash = flash_storage();
 
     // Destination is the slot we are *not* running from.
     let (s0, s1) = read_otadata(&mut flash)?;
@@ -161,7 +167,7 @@ pub fn run_selftest() -> bool {
     // trailing bytes), so an over-copy is harmless.
     const COPY_LEN: u32 = 0x0030_0000;
 
-    let mut flash = FlashStorage::new();
+    let mut flash = flash_storage();
     let (s0, s1) = match read_otadata(&mut flash) {
         Ok(v) => v,
         Err(_) => return false,
@@ -229,7 +235,7 @@ pub fn recovery_combo_held(nav_mv: u16, page_mv: u16) -> bool {
 /// The stock bootloader can't read buttons, so this is the earliest point a
 /// held combo can be honoured — it must run before the main app takes over.
 pub fn recover_to_slot0() -> bool {
-    let mut flash = FlashStorage::new();
+    let mut flash = flash_storage();
     let (s0, s1) = match read_otadata(&mut flash) {
         Ok(v) => v,
         Err(_) => return false,
@@ -256,6 +262,14 @@ pub fn recover_to_slot0() -> bool {
         switch.entry.ota_seq
     );
     true
+}
+
+#[allow(unsafe_code)]
+fn flash_storage() -> FlashStorage<'static> {
+    // SAFETY: OTA update/recovery runs at boot before application tasks use
+    // flash directly. This preserves the old `FlashStorage::new()` singleton
+    // behavior under esp-storage's explicit peripheral ownership API.
+    FlashStorage::new(unsafe { esp_hal::peripherals::FLASH::steal() })
 }
 
 fn read_otadata(

@@ -2,9 +2,12 @@
 #![allow(dead_code)]
 use display::font::{BitmapFont, GlyphMetric, KerningEntry};
 
+#[rustfmt::skip]
 pub static MOCKUP_EMPTY_KERNING: [KerningEntry; 0] = [];
 
+#[rustfmt::skip]
 pub const MOCKUP_COUNT: usize = 266;
+#[rustfmt::skip]
 pub static MOCKUP_CODEPOINTS: [u16; MOCKUP_COUNT] = [
     0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027, 0x0028, 0x0029, 0x002A, 0x002B,
     0x002C, 0x002D, 0x002E, 0x002F, 0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
@@ -31,6 +34,7 @@ pub static MOCKUP_CODEPOINTS: [u16; MOCKUP_COUNT] = [
     0x25CE, 0x25CF,
 ];
 
+#[rustfmt::skip]
 pub static SMALL_REGULAR_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 0, len: 0, width: 0, height: 0, x_offset: 0, y_offset: 0, advance_fp: 48 },
     GlyphMetric { offset: 0, len: 11, width: 5, height: 11, x_offset: 0, y_offset: -11, advance_fp: 80 },
@@ -300,6 +304,7 @@ pub static SMALL_REGULAR_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 4475, len: 11, width: 8, height: 11, x_offset: 0, y_offset: -11, advance_fp: 128 },
 ];
 
+#[rustfmt::skip]
 pub static SMALL_REGULAR_BITMAP: [u8; 4486] = [
     0x20, 0x30, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x30, 0x20, 0x68, 0x68, 0x48, 0x48, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x7F, 0xC0, 0x11, 0x00, 0x11,
@@ -584,6 +589,7 @@ pub static SMALL_REGULAR_BITMAP: [u8; 4486] = [
     0x42, 0x42, 0x42, 0x42, 0x42, 0x7E,
 ];
 
+#[rustfmt::skip]
 pub static SMALL_REGULAR: BitmapFont = BitmapFont {
     codepoints: &MOCKUP_CODEPOINTS,
     line_height: 22,
@@ -593,6 +599,7 @@ pub static SMALL_REGULAR: BitmapFont = BitmapFont {
     kerning: &MOCKUP_EMPTY_KERNING,
 };
 
+#[rustfmt::skip]
 pub static SMALL_BOLD_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 0, len: 0, width: 0, height: 0, x_offset: 0, y_offset: 0, advance_fp: 48 },
     GlyphMetric { offset: 0, len: 12, width: 5, height: 12, x_offset: 0, y_offset: -12, advance_fp: 80 },
@@ -862,6 +869,7 @@ pub static SMALL_BOLD_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 5207, len: 11, width: 8, height: 11, x_offset: 0, y_offset: -11, advance_fp: 128 },
 ];
 
+#[rustfmt::skip]
 pub static SMALL_BOLD_BITMAP: [u8; 5218] = [
     0x30, 0x70, 0x70, 0x30, 0x30, 0x30, 0x20, 0x20, 0x00, 0x30, 0x70, 0x30, 0x6C, 0x6C, 0x6C, 0x68,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x19, 0x80, 0x3F, 0xC0, 0x7F,
@@ -1192,6 +1200,7 @@ pub static SMALL_BOLD_BITMAP: [u8; 5218] = [
     0x42, 0x7E,
 ];
 
+#[rustfmt::skip]
 pub static SMALL_BOLD: BitmapFont = BitmapFont {
     codepoints: &MOCKUP_CODEPOINTS,
     line_height: 22,
@@ -1201,6 +1210,7 @@ pub static SMALL_BOLD: BitmapFont = BitmapFont {
     kerning: &MOCKUP_EMPTY_KERNING,
 };
 
+#[rustfmt::skip]
 pub static SMALL_ITALIC_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 0, len: 0, width: 0, height: 0, x_offset: 0, y_offset: 0, advance_fp: 48 },
     GlyphMetric { offset: 0, len: 11, width: 5, height: 11, x_offset: 0, y_offset: -11, advance_fp: 80 },
@@ -1470,6 +1480,7 @@ pub static SMALL_ITALIC_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 4474, len: 11, width: 8, height: 11, x_offset: 0, y_offset: -11, advance_fp: 128 },
 ];
 
+#[rustfmt::skip]
 pub static SMALL_ITALIC_BITMAP: [u8; 4485] = [
     0x10, 0x30, 0x30, 0x30, 0x20, 0x20, 0x20, 0x20, 0x00, 0x30, 0x30, 0x28, 0x28, 0x28, 0x28, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x3F, 0xC0, 0x11, 0x00, 0x11,
@@ -1754,6 +1765,7 @@ pub static SMALL_ITALIC_BITMAP: [u8; 4485] = [
     0x42, 0x42, 0x42, 0x42, 0x7E,
 ];
 
+#[rustfmt::skip]
 pub static SMALL_ITALIC: BitmapFont = BitmapFont {
     codepoints: &MOCKUP_CODEPOINTS,
     line_height: 22,
@@ -1763,6 +1775,7 @@ pub static SMALL_ITALIC: BitmapFont = BitmapFont {
     kerning: &MOCKUP_EMPTY_KERNING,
 };
 
+#[rustfmt::skip]
 pub static TITLE_REGULAR_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 0, len: 0, width: 0, height: 0, x_offset: 0, y_offset: 0, advance_fp: 96 },
     GlyphMetric { offset: 0, len: 44, width: 10, height: 22, x_offset: 0, y_offset: -22, advance_fp: 160 },
@@ -2032,6 +2045,7 @@ pub static TITLE_REGULAR_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 14668, len: 42, width: 15, height: 21, x_offset: 0, y_offset: -21, advance_fp: 240 },
 ];
 
+#[rustfmt::skip]
 pub static TITLE_REGULAR_BITMAP: [u8; 14710] = [
     0x0C, 0x00, 0x1E, 0x00, 0x1E, 0x00, 0x1E, 0x00, 0x1E, 0x00, 0x1C, 0x00, 0x1C, 0x00, 0x1C, 0x00,
     0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00,
@@ -2955,6 +2969,7 @@ pub static TITLE_REGULAR_BITMAP: [u8; 14710] = [
     0x60, 0x0C, 0x7F, 0xFC, 0x7F, 0xFC,
 ];
 
+#[rustfmt::skip]
 pub static TITLE_REGULAR: BitmapFont = BitmapFont {
     codepoints: &MOCKUP_CODEPOINTS,
     line_height: 41,
@@ -2964,6 +2979,7 @@ pub static TITLE_REGULAR: BitmapFont = BitmapFont {
     kerning: &MOCKUP_EMPTY_KERNING,
 };
 
+#[rustfmt::skip]
 pub static TITLE_BOLD_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 0, len: 0, width: 0, height: 0, x_offset: 0, y_offset: 0, advance_fp: 96 },
     GlyphMetric { offset: 0, len: 42, width: 10, height: 21, x_offset: 0, y_offset: -21, advance_fp: 160 },
@@ -3233,6 +3249,7 @@ pub static TITLE_BOLD_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 14896, len: 42, width: 15, height: 21, x_offset: 0, y_offset: -21, advance_fp: 240 },
 ];
 
+#[rustfmt::skip]
 pub static TITLE_BOLD_BITMAP: [u8; 14938] = [
     0x1E, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x1F, 0x00, 0x1E, 0x00, 0x1E, 0x00,
     0x1E, 0x00, 0x1E, 0x00, 0x0E, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x00, 0x00,
@@ -4170,6 +4187,7 @@ pub static TITLE_BOLD_BITMAP: [u8; 14938] = [
     0x60, 0x0C, 0x60, 0x0C, 0x60, 0x0C, 0x7F, 0xFC, 0x7F, 0xFC,
 ];
 
+#[rustfmt::skip]
 pub static TITLE_BOLD: BitmapFont = BitmapFont {
     codepoints: &MOCKUP_CODEPOINTS,
     line_height: 41,
@@ -4179,6 +4197,7 @@ pub static TITLE_BOLD: BitmapFont = BitmapFont {
     kerning: &MOCKUP_EMPTY_KERNING,
 };
 
+#[rustfmt::skip]
 pub static TITLE_ITALIC_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 0, len: 0, width: 0, height: 0, x_offset: 0, y_offset: 0, advance_fp: 96 },
     GlyphMetric { offset: 0, len: 44, width: 10, height: 22, x_offset: 0, y_offset: -22, advance_fp: 160 },
@@ -4448,6 +4467,7 @@ pub static TITLE_ITALIC_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 14168, len: 42, width: 15, height: 21, x_offset: 0, y_offset: -21, advance_fp: 240 },
 ];
 
+#[rustfmt::skip]
 pub static TITLE_ITALIC_BITMAP: [u8; 14210] = [
     0x07, 0x00, 0x0F, 0x00, 0x0F, 0x00, 0x0E, 0x00, 0x0E, 0x00, 0x0E, 0x00, 0x0E, 0x00, 0x0E, 0x00,
     0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00,
@@ -5340,6 +5360,7 @@ pub static TITLE_ITALIC_BITMAP: [u8; 14210] = [
     0x7F, 0xF8,
 ];
 
+#[rustfmt::skip]
 pub static TITLE_ITALIC: BitmapFont = BitmapFont {
     codepoints: &MOCKUP_CODEPOINTS,
     line_height: 41,
@@ -5349,6 +5370,7 @@ pub static TITLE_ITALIC: BitmapFont = BitmapFont {
     kerning: &MOCKUP_EMPTY_KERNING,
 };
 
+#[rustfmt::skip]
 pub static DISPLAY_REGULAR_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 0, len: 0, width: 0, height: 0, x_offset: 0, y_offset: 0, advance_fp: 144 },
     GlyphMetric { offset: 0, len: 68, width: 15, height: 34, x_offset: 0, y_offset: -33, advance_fp: 240 },
@@ -5618,6 +5640,7 @@ pub static DISPLAY_REGULAR_METRICS: [GlyphMetric; MOCKUP_COUNT] = [
     GlyphMetric { offset: 31949, len: 96, width: 23, height: 32, x_offset: 0, y_offset: -32, advance_fp: 368 },
 ];
 
+#[rustfmt::skip]
 pub static DISPLAY_REGULAR_BITMAP: [u8; 32045] = [
     0x00, 0x00, 0x07, 0xC0, 0x07, 0xC0, 0x0F, 0xE0, 0x0F, 0xC0, 0x0F, 0xC0, 0x07, 0xC0, 0x07, 0xC0,
     0x07, 0xC0, 0x07, 0xC0, 0x07, 0xC0, 0x07, 0x80, 0x07, 0x80, 0x03, 0x80, 0x03, 0x80, 0x03, 0x80,
@@ -7624,6 +7647,7 @@ pub static DISPLAY_REGULAR_BITMAP: [u8; 32045] = [
     0x38, 0x38, 0x00, 0x38, 0x3F, 0xFF, 0xF8, 0x3F, 0xFF, 0xF8, 0x3F, 0xFF, 0xF8,
 ];
 
+#[rustfmt::skip]
 pub static DISPLAY_REGULAR: BitmapFont = BitmapFont {
     codepoints: &MOCKUP_CODEPOINTS,
     line_height: 62,
@@ -7632,4 +7656,3 @@ pub static DISPLAY_REGULAR: BitmapFont = BitmapFont {
     bitmap: &DISPLAY_REGULAR_BITMAP,
     kerning: &MOCKUP_EMPTY_KERNING,
 };
-

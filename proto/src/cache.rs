@@ -46,10 +46,10 @@ pub const COVER_BYTES: usize = COVER_STRIDE * COVER_HEIGHT;
 /// `TOC_FILE_HEADER_BYTES + i * TOC_CHAPTER_RECORD_BYTES`.
 pub const CACHE_TOC_FILE: &str = "TOC.BIN";
 pub const TOC_FILE_MAGIC: u32 = 0x5834_5443; // X4TC
-// v2: chapter title budget grew 44->60 bytes (record 48->64). 64-byte records
-// keep MAX_OVERVIEW_CHAPTERS (256) fitting the 16KB overview text buffer exactly
-// (256*64 == 16384). A v1 TOC.BIN is rejected here and rebuilt (chapter-list
-// re-parse only, no re-pagination).
+                                             // v2: chapter title budget grew 44->60 bytes (record 48->64). 64-byte records
+                                             // keep MAX_OVERVIEW_CHAPTERS (256) fitting the 16KB overview text buffer exactly
+                                             // (256*64 == 16384). A v1 TOC.BIN is rejected here and rebuilt (chapter-list
+                                             // re-parse only, no re-pagination).
 pub const TOC_FILE_VERSION: u16 = 2;
 pub const TOC_FILE_HEADER_BYTES: usize = 16;
 pub const TOC_CHAPTER_TITLE_BYTES: usize = 60;

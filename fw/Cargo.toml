@@ -20,12 +20,12 @@ ui = { path = "../ui" }
 proto = { path = "../proto" }
 hal-ext = { path = "../hal-ext" }
 
-embassy-executor  = { version = "0.7.0", features = ["nightly"] }
-embassy-time      = "0.4.0"
-embassy-sync      = "0.6.0"
+embassy-executor  = "0.10.0"
+embassy-time      = "0.5.1"
+embassy-sync      = "0.8.0"
 embassy-futures   = "0.1.1"
-esp-hal           = { version = "0.23.1", features = ["esp32c3"] }
-esp-hal-embassy   = { version = "0.6.0", features = ["esp32c3", "executors"] }
+esp-hal           = { version = "1.1.1", features = ["esp32c3", "unstable"] }
+esp-rtos          = { version = "0.3.0", features = ["esp32c3", "embassy", "esp-radio", "esp-alloc"] }
 embedded-hal-async = "1.0.0"
 embedded-hal       = "1.0.0"
 # Pinned to unreleased develop for empty-directory deletion (PR #210, merged
@@ -37,13 +37,13 @@ embedded-sdmmc     = { git = "https://github.com/rust-embedded-community/embedde
 nb                = "1.1.0"
 portable-atomic   = { version = "1.10.0", features = ["unsafe-assume-single-core"] }
 static_cell       = "2.1.0"
-heapless          = "0.8.0"
-esp-println       = { version = "0.13.0", features = ["esp32c3"] }
-esp-wifi          = { version = "0.12.0", features = ["esp32c3", "wifi"] }
-esp-alloc         = "0.6.0"
-embassy-net       = { version = "0.6.0", features = ["proto-ipv4", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
+heapless          = "0.9.0"
+esp-println       = { version = "0.17.0", features = ["esp32c3"] }
+esp-radio         = { version = "1.0.0-beta.0", features = ["esp32c3", "wifi", "unstable"] }
+esp-alloc         = "0.10.0"
+embassy-net       = { version = "0.9.1", features = ["proto-ipv4", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
 # Prints registers + backtrace over USB on CPU exceptions, then halts in
 # place instead of silently resetting. Keep: crash evidence beats reboots.
-esp-backtrace     = { version = "0.15.0", features = ["esp32c3", "println", "exception-handler"] }
-esp-storage = { version = "0.3.1", features = ["esp32c3", "nor-flash"] }
+esp-backtrace     = { version = "0.19.0", features = ["esp32c3", "println", "panic-handler"] }
+esp-storage = { version = "0.9.0", features = ["esp32c3"] }
 embedded-storage = "0.3.1"

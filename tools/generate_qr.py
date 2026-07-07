@@ -43,8 +43,11 @@ def emit(name: str, content: str) -> str:
     bits = ",\n    ".join(rows)
     return (
         f"/// `{content}`\n"
+        "#[rustfmt::skip]\n"
         f"pub const {name}_SIZE: usize = {size};\n"
+        "#[rustfmt::skip]\n"
         f"pub const {name}_STRIDE: usize = {stride};\n"
+        "#[rustfmt::skip]\n"
         f"pub const {name}_BITS: [u8; {size * stride}] = [\n    {bits},\n];\n"
     )
 

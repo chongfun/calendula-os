@@ -91,7 +91,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
         Ok(true) => {
             esp_println::println!("display: firmware update staged; resetting");
             embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
-            esp_hal::reset::software_reset();
+            esp_hal::system::software_reset();
         }
         Ok(false) => {}
         Err(e) => esp_println::println!("display: update check skipped: {:?}", e),
@@ -104,7 +104,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     if crate::ota_update::run_selftest() {
         esp_println::println!("selftest: staged; resetting");
         embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
-        esp_hal::reset::software_reset();
+        esp_hal::system::software_reset();
     }
 
     loop {

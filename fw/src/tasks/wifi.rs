@@ -25,14 +25,12 @@ use embassy_net::{
     StaticConfigV4,
 };
 use embassy_time::{with_timeout, Duration, Timer};
-use esp_hal::peripherals::{RADIO_CLK, RNG, SYSTIMER, WIFI};
+use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
-use esp_hal::timer::systimer::SystemTimer;
-use esp_wifi::wifi::{
-    new_with_mode, AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
-    WifiApDevice, WifiController, WifiDevice, WifiStaDevice,
+use esp_radio::wifi::{
+    ap::AccessPointConfig, sta::StationConfig, AuthenticationMethod, Config as WifiConfig,
+    ControllerConfig, Interface, WifiController,
 };
-use esp_wifi::EspWifiController;
 use proto::captive;
 
 // Measured first-association joins ran ~21 s; give them headroom.
@@ -51,17 +49,17 @@ pub fn credentials() -> Option<(&'static str, &'static str)> {
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDevice>>) -> ! {
+async fn net_task(mut runner: Runner<'static, Interface>) -> ! {
     runner.run().await
 }
 
 #[embassy_executor::task]
-async fn ap_net_task(mut runner: Runner<'static, WifiDevice<'static, WifiApDevice>>) -> ! {
+async fn ap_net_task(mut runner: Runner<'static, Interface>) -> ! {
     runner.run().await
 }
 
 #[embassy_executor::task]
-pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, radio_clk: RADIO_CLK) {
+pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
     // Idle until the first Start; Exit before any radio work is a no-op
     // because nothing has been loaned yet.
     loop {
@@ -92,33 +90,30 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         credentials().and_then(|(ssid, password)| WifiCredentials::from_strs(ssid, password))
     });
 
-    let mut rng = Rng::new(rng);
+    let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
-    let timer = SystemTimer::new(systimer);
-    let inited = match esp_wifi::init(timer.alarm0, rng, radio_clk) {
-        Ok(inited) => inited,
+    let mut controller = match WifiController::new(wifi, ControllerConfig::default()) {
+        Ok(controller) => controller,
         Err(err) => {
             esp_println::println!("wifi: init failed: {:?}", err);
             send_event(SyncEvent::Failed(SyncError::RadioInit));
             park_until_exit().await;
         }
     };
-    // Everything radio-shaped lives in the loaned heap; Box::leak is
-    // honest here because the session never ends except by reset.
-    let inited: &'static EspWifiController<'static> =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(inited));
     let Some(creds) = resolved else {
-        run_portal(spawner, inited, wifi, seed, tcp_rx, tcp_tx, http_a, http_b).await;
+        run_portal(
+            spawner,
+            &mut controller,
+            seed,
+            tcp_rx,
+            tcp_tx,
+            http_a,
+            http_b,
+        )
+        .await;
     };
 
-    let (device, controller) = match new_with_mode(inited, wifi, WifiStaDevice) {
-        Ok(parts) => parts,
-        Err(err) => {
-            esp_println::println!("wifi: sta mode failed: {:?}", err);
-            send_event(SyncEvent::Failed(SyncError::RadioInit));
-            park_until_exit().await;
-        }
-    };
+    let device = Interface::station();
 
     let resources: &'static mut StackResources<4> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(StackResources::new()));
@@ -128,10 +123,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         resources,
         seed,
     );
-    if spawner.spawn(net_task(runner)).is_err() {
-        send_event(SyncEvent::Failed(SyncError::RadioInit));
-        park_until_exit().await;
-    }
+    spawner.spawn(net_task(runner).unwrap());
 
     let mut session = Session {
         controller,
@@ -533,35 +525,23 @@ const SAVED_PAGE: &str = concat!(
 #[allow(clippy::too_many_arguments)]
 async fn run_portal(
     spawner: Spawner,
-    inited: &'static EspWifiController<'static>,
-    wifi: WIFI,
+    controller: &mut WifiController<'static>,
     seed: u64,
     tcp_rx: &'static mut [u8],
     tcp_tx: &'static mut [u8],
     http_a: &'static mut [u8],
     http_b: &'static mut [u8],
 ) -> ! {
-    let (device, mut controller) = match new_with_mode(inited, wifi, WifiApDevice) {
-        Ok(parts) => parts,
-        Err(err) => {
-            esp_println::println!("portal: ap mode failed: {:?}", err);
-            send_event(SyncEvent::Failed(SyncError::RadioInit));
-            park_until_exit().await;
-        }
-    };
-    let config = Configuration::AccessPoint(AccessPointConfiguration {
-        ssid: PORTAL_SSID.try_into().unwrap_or_default(),
-        auth_method: AuthMethod::None,
-        ..Default::default()
-    });
-    if controller.set_configuration(&config).is_err() || controller.start_async().await.is_err() {
+    let device = Interface::access_point();
+    let config = WifiConfig::AccessPoint(AccessPointConfig::default().with_ssid(PORTAL_SSID));
+    if controller.set_config(&config).is_err() {
         esp_println::println!("portal: ap start failed");
         send_event(SyncEvent::Failed(SyncError::RadioInit));
         park_until_exit().await;
     }
 
     let portal = Ipv4Address::new(PORTAL_IP[0], PORTAL_IP[1], PORTAL_IP[2], PORTAL_IP[3]);
-    let mut dns_servers = heapless::Vec::new();
+    let mut dns_servers: heapless::Vec<Ipv4Address, 3> = heapless::Vec::new();
     let _ = dns_servers.push(portal);
     let resources: &'static mut StackResources<6> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(StackResources::new()));
@@ -575,10 +555,7 @@ async fn run_portal(
         resources,
         seed,
     );
-    if spawner.spawn(ap_net_task(runner)).is_err() {
-        send_event(SyncEvent::Failed(SyncError::RadioInit));
-        park_until_exit().await;
-    }
+    spawner.spawn(ap_net_task(runner).unwrap());
 
     esp_println::println!("portal: up at 192.168.4.1 as {}", PORTAL_SSID);
     send_event(SyncEvent::PortalUp);
@@ -792,9 +769,7 @@ async fn park_until_exit() -> ! {
 fn reset_now() -> ! {
     esp_println::println!("wifi: sync session over, resetting");
     // Let the message drain the UART before the reset takes the port.
-    esp_hal::reset::software_reset();
-    #[allow(clippy::empty_loop)]
-    loop {}
+    esp_hal::system::software_reset()
 }
 
 fn send_event(event: SyncEvent) {
@@ -838,28 +813,25 @@ impl Session {
 
     async fn join(&mut self, ssid: &str, password: &str) -> Result<(), SyncError> {
         if !self.started {
-            let config = Configuration::Client(ClientConfiguration {
-                ssid: ssid.try_into().map_err(|_| SyncError::Join)?,
-                password: password.try_into().map_err(|_| SyncError::Join)?,
-                auth_method: if password.is_empty() {
-                    AuthMethod::None
-                } else {
-                    AuthMethod::WPA2Personal
-                },
-                ..Default::default()
-            });
+            let config = WifiConfig::Station(
+                StationConfig::default()
+                    .with_ssid(ssid)
+                    .with_password(password.into())
+                    .with_auth_method(if password.is_empty() {
+                        AuthenticationMethod::None
+                    } else {
+                        AuthenticationMethod::Wpa2Personal
+                    }),
+            );
             self.controller
-                .set_configuration(&config)
-                .map_err(|_| SyncError::Join)?;
-            self.controller
-                .start_async()
-                .await
+                .set_config(&config)
                 .map_err(|_| SyncError::Join)?;
             self.started = true;
         }
         with_timeout(JOIN_TIMEOUT, self.controller.connect_async())
             .await
             .map_err(|_| SyncError::Join)?
+            .map(|_| ())
             .map_err(|err| {
                 esp_println::println!("wifi: join failed: {:?}", err);
                 SyncError::Join

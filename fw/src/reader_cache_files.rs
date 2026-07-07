@@ -75,8 +75,7 @@ const POSITION_BYTES: usize = 15;
 /// rather than a stale page. The chapter would survive, but there is no
 /// separate progress source to reconcile it against, so full reset is the
 /// honest fallback.
-const POSITION_GEOMETRY_SALT: u32 =
-    (display::WIDTH as u32 ^ display::HEIGHT as u32) ^ (800 ^ 480);
+const POSITION_GEOMETRY_SALT: u32 = (display::WIDTH as u32 ^ display::HEIGHT as u32) ^ (800 ^ 480);
 
 // The salt must vanish on the X4 or an upgrade would reject every existing
 // POS.BIN; guard the backward-compat guarantee at compile time.
