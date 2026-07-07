@@ -13,7 +13,7 @@ use app_core::{
 use books::{BookStore, SHELF};
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
-use display::font::{draw_text, literata, literata_small, measure_text, FontStyle, TypeSettings};
+use display::font::{draw_text, literata, measure_text, FontStyle, TypeSettings};
 use display::{HEIGHT, WIDTH};
 use ui::app_render::{render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel};
 use ui::reading::ReadingBlocks;
@@ -368,18 +368,7 @@ impl WebEmulator {
 
         let (current, total) = store.chapter_page_position(request.page);
         let label = format!("{}/{}", current, total);
-        let font = literata_small(FontStyle::Regular);
-        let width = measure_text(font, &label) as i16;
-        // Shared with fw::views via ui::reading::READER_FOOTER_BASELINE_Y;
-        // hardcoding the X4's 477 dropped the counter into the X3's body text.
-        draw_text(
-            &mut self.fb,
-            font,
-            &label,
-            ui::reading::READER_RIGHT_X - width - 16,
-            ui::reading::READER_FOOTER_BASELINE_Y,
-            false,
-        );
+        ui::reading::draw_reading_page_counter(&mut self.fb, &label);
     }
 
     /// Convert the panel-mounted framebuffer (rows mirrored for the X4's

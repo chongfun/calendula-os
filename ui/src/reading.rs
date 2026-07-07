@@ -272,6 +272,22 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
     });
 }
 
+/// Draw the page-in-chapter counter that completes the reading surface.
+/// Callers own the chapter-position calculation and formatting; this shared
+/// seam owns the exact font, right inset, and panel-relative baseline.
+pub fn draw_reading_page_counter(fb: &mut Framebuffer, label: &str) {
+    let font = display::font::literata_small(FontStyle::Regular);
+    let width = measure_text(font, label) as i16;
+    draw_text(
+        fb,
+        font,
+        label,
+        READER_RIGHT_X - width - 16,
+        READER_FOOTER_BASELINE_Y,
+        false,
+    );
+}
+
 pub const READER_PAGE_TOP: i16 = 6;
 /// Footer band top: 14 rows up from the panel's bottom edge. Panel-relative
 /// so the X3's taller page pushes the footer to its own bottom edge; on the

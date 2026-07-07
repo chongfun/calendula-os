@@ -17,7 +17,7 @@ use display::font::{
 };
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
-use ui::reading::{draw_reading_page_body, page_record_at};
+use ui::reading::{draw_reading_page_body, draw_reading_page_counter, page_record_at};
 use ui::reading::{paginate_block_pages, ReadingBlocks, READER_PAGE_BOTTOM, READER_PAGE_TOP};
 
 struct FixtureBlock {
@@ -234,6 +234,37 @@ fn reading_page_bodies_match_goldens() {
     for page_index in 0..2 {
         assert_page_matches_golden(&source, page_index, &format!("reading-page-{page_index}"));
     }
+}
+
+/// Pin the complete reading surface, including the page-in-chapter counter.
+/// The body-only goldens above isolate pagination and typography; this frame
+/// catches footer font, inset, and panel-relative baseline regressions.
+#[test]
+fn full_reading_surface_matches_golden() {
+    let source = fixture(TypeSettings::DEFAULT);
+    let page = page_record_at(&source, 0, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+    let mut fb = Framebuffer::new();
+    draw_reading_page_body(&mut fb, &source, page);
+    draw_reading_page_counter(&mut fb, "1/2");
+
+    let actual = encode_png(&fb);
+    let path = golden_path("reading-surface-0");
+    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
+        std::fs::write(&path, &actual).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read(&path).unwrap_or_else(|err| {
+        panic!(
+            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
+            path.display()
+        )
+    });
+    assert_eq!(
+        actual,
+        expected,
+        "reading surface diverged from {}",
+        path.display()
+    );
 }
 
 /// The same blocks at the large size with relaxed leading: fewer lines fit
