@@ -62,8 +62,8 @@ covers the paths: web flasher, SD card, and the in-app update from the card.
 ## Credits
 
 - [Literata](https://github.com/googlefonts/literata) and [Merriweather](https://github.com/SorkinType/Merriweather) (both OFL) for the reading typefaces
-- [esp-hal](https://github.com/esp-rs/esp-hal) and [Embassy](https://embassy.dev) underneath everything
-- The OpenX4 community SDK for the panel's addressing behavior
+- [The OpenX4 community SDK](https://github.com/open-x4-epaper/community-sdk) for panel addressing behavior
+- [Crosspoint Reader](https://github.com/crosspoint-reader/crosspoint-reader) for the community reverse-engineering behind X3 device support
 
 ## License
 
