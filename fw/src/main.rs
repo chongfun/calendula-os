@@ -174,7 +174,14 @@ fn main() -> ! {
         let i2c = esp_hal::i2c::master::I2c::new(
             peripherals.I2C0,
             esp_hal::i2c::master::Config::default()
-                .with_frequency(400_u32.kHz()),
+                .with_frequency(400_u32.kHz())
+                // The BQ27220 clock-stretches for milliseconds while it
+                // processes a command; esp-hal's default SCL timeout of 10
+                // bus cycles (25 us) aborts every read with Timeout. Allow
+                // 2000 cycles (~5 ms at 400 kHz, rounded up to a power of
+                // two by the hardware), matching the 4 ms Wire timeout the
+                // stock firmware uses.
+                .with_timeout(esp_hal::i2c::master::BusTimeout::BusCycles(2000)),
         )
         .expect("I2C0 config")
         .with_scl(peripherals.GPIO0)
