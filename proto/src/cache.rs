@@ -10,16 +10,16 @@ pub const CACHE_VERSION: u16 = 1;
 // lazy, per-book re-paginate; surviving chapters lay out identically, so
 // chapter-keyed positions carry over.
 //
-// Bumped 23 -> 24 with the EPUB 3 nav page-list fix. The old TOC parser read
-// every `<nav>` in the navigation document, so a book's `page-list` (page
-// markers `i`, `ii`, `1`, `2`) and `landmarks` navs leaked in as phantom
-// chapters, inflating the chapter count. A book already indexed on the buggy
-// firmware loads via the fast book-cache path, which never re-parses the nav
-// or rewrites TOC.BIN, so the bogus chapter list would persist. Rejecting v23
-// forces the one-time rebuild that re-runs the corrected nav parser; the
-// re-paginate is incidental and chapter-keyed positions carry over.
-pub const CACHE_V2_VERSION: u16 = 24;
-const CACHE_V2_COMPAT_VERSION: u16 = 24;
+// Bumped 23 -> 24 with the EPUB 3 nav page-list fix. Bumped 24 -> 25 when the
+// nav classifier widened beyond `epub:type` to also reject page lists,
+// landmarks, lists of illustrations/tables, and back-matter index navs marked
+// by role/label/id/class. A book already indexed on buggy firmware loads via
+// the fast book-cache path, which never re-parses the nav or rewrites TOC.BIN,
+// so the bogus chapter list would persist. Rejecting v24 forces the one-time
+// rebuild that re-runs the corrected nav parser; the re-paginate is incidental
+// and chapter-keyed positions carry over.
+pub const CACHE_V2_VERSION: u16 = 25;
+const CACHE_V2_COMPAT_VERSION: u16 = 25;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
 pub const CACHE_DIR: &str = "CACHE";
 pub const CACHE_V2_DIR: &str = "CACHE2";

@@ -2791,21 +2791,127 @@ fn tag_local_name(tag: &str) -> Option<&str> {
 
 /// Whether this `<nav>` start tag is the reading table of contents.
 ///
-/// An EPUB 3 navigation document usually holds several `<nav>` elements
-/// distinguished by `epub:type`: the `toc`, plus a `page-list` (whose entries
-/// are page-break markers like `i`, `ii`, `1`, `2`) and `landmarks` (`Cover`,
-/// `Start Reading`). Only the `toc` lists chapters, so treating every `<nav>`
-/// as the contents injected those page markers and landmarks as phantom
-/// chapters, inflating the book's size and chapter count. Accept a nav when it
-/// is `epub:type="toc"`, or when it carries no `epub:type` at all (older
-/// single-nav documents that omit the attribute).
+/// An EPUB 3 navigation document usually holds several `<nav>` elements:
+/// `toc`, `page-list` (page markers like `i`, `ii`, `1`, `2`), landmarks, and
+/// sometimes back-matter indices. Only the reading TOC lists chapters. EPUBs
+/// are not consistent about where they put that meaning: some use `epub:type`,
+/// others use ARIA/doc roles, labels, ids, or classes, so keep both the
+/// positive and negative checks here.
 fn nav_start_is_toc(tag: &str) -> bool {
-    match attr_value(tag, "epub:type") {
-        Some(value) => value
+    if let Some(value) = attr_value(tag, "epub:type") {
+        return value
             .split_ascii_whitespace()
-            .any(|word| word.eq_ignore_ascii_case("toc")),
-        None => true,
+            .any(|word| word.eq_ignore_ascii_case("toc"));
     }
+
+    if nav_attr_has_any(tag, "role", &["doc-toc", "toc"])
+        || nav_attr_has_any(tag, "aria-label", &["toc", "contents", "tableofcontents"])
+        || nav_attr_has_any(tag, "id", &["toc", "contents", "tableofcontents"])
+        || nav_attr_has_any(tag, "class", &["toc", "contents", "tableofcontents"])
+    {
+        return true;
+    }
+
+    !nav_attr_has_any(
+        tag,
+        "role",
+        &[
+            "doc-pagelist",
+            "pagelist",
+            "page-list",
+            "doc-index",
+            "index",
+            "doc-landmarks",
+            "landmarks",
+            "doc-loi",
+            "loi",
+            "doc-lot",
+            "lot",
+        ],
+    ) && !nav_attr_has_any(
+        tag,
+        "aria-label",
+        &[
+            "pagelist",
+            "page-list",
+            "pages",
+            "index",
+            "landmarks",
+            "listofillustrations",
+            "listoftables",
+        ],
+    ) && !nav_attr_has_any(
+        tag,
+        "id",
+        &[
+            "pagelist",
+            "page-list",
+            "page_list",
+            "pages",
+            "index",
+            "landmarks",
+            "loi",
+            "lot",
+        ],
+    ) && !nav_attr_has_any(
+        tag,
+        "class",
+        &[
+            "pagelist",
+            "page-list",
+            "page_list",
+            "pages",
+            "index",
+            "landmarks",
+            "loi",
+            "lot",
+        ],
+    )
+}
+
+fn nav_attr_has_any(tag: &str, attr: &str, markers: &[&str]) -> bool {
+    let Some(value) = attr_value(tag, attr) else {
+        return false;
+    };
+    markers
+        .iter()
+        .any(|marker| ascii_contains_normalized(value, marker))
+}
+
+fn ascii_contains_normalized(value: &str, marker: &str) -> bool {
+    let marker_len = marker
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .count();
+    if marker_len == 0 {
+        return false;
+    }
+    let mut matched = 0usize;
+    for byte in value.bytes() {
+        if !byte.is_ascii_alphanumeric() {
+            continue;
+        }
+        let Some(expected) = normalized_marker_byte(marker, matched) else {
+            return true;
+        };
+        if byte.eq_ignore_ascii_case(&expected) {
+            matched += 1;
+            if matched == marker_len {
+                return true;
+            }
+        } else {
+            let first = normalized_marker_byte(marker, 0).unwrap_or(expected);
+            matched = usize::from(byte.eq_ignore_ascii_case(&first));
+        }
+    }
+    false
+}
+
+fn normalized_marker_byte(marker: &str, index: usize) -> Option<u8> {
+    marker
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .nth(index)
 }
 
 fn tag_is_hidden(tag: &str) -> bool {
@@ -4030,6 +4136,23 @@ mod tests {
               <nav epub:type="landmarks"><ol>
                 <li><a epub:type="cover" href="cover.xhtml">Cover</a></li>
                 <li><a epub:type="bodymatter" href="chapter1.xhtml">Start Reading</a></li>
+              </ol></nav>
+              <nav role="doc-pagelist"><ol>
+                <li><a href="back.xhtml#pix">ix</a></li>
+                <li><a href="back.xhtml#px">x</a></li>
+              </ol></nav>
+              <nav aria-label="Index"><ol>
+                <li><a href="back.xhtml#index-a">A</a></li>
+                <li><a href="back.xhtml#index-b">B</a></li>
+              </ol></nav>
+              <nav id="loi"><ol>
+                <li><a href="figures.xhtml#f1">Figure 1</a></li>
+              </ol></nav>
+              <nav class="page_list"><ol>
+                <li><a href="back.xhtml#pxi">xi</a></li>
+              </ol></nav>
+              <nav epub:type="lot"><ol>
+                <li><a href="tables.xhtml#t1">Table 1</a></li>
               </ol></nav>
             </body></html>
         "#;
