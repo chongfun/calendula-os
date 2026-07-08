@@ -759,6 +759,42 @@ enum LandscapeHomeVariant {
     BookFirst,
 }
 
+/// Centers an 800x480-authored design (the X4 panel) on the actual
+/// framebuffer, clipping the outermost margins; a no-op on the X4. Used by the
+/// `--design-mockups` studies, which are absolute-positioned. The landscape
+/// home mockups instead reflow to fill the panel (see `ls_x`/`ls_y`).
+pub(crate) fn fit_design_to_board(fb: &mut Framebuffer) {
+    const DESIGN_W: i16 = 800;
+    const DESIGN_H: i16 = 480;
+    // The design is drawn straight into `fb` at 800x480 coordinates, so on a
+    // board narrower/shorter than the design, Framebuffer::set_pixel already
+    // silently dropped the excess before this function ever runs — there's
+    // nothing left on that axis to center. Only shift on axes where the
+    // board has *extra* room to distribute; shifting on a clipped axis would
+    // just crop a second time.
+    let dx = (WIDTH as i16 - DESIGN_W).max(0) / 2;
+    let dy = (HEIGHT as i16 - DESIGN_H).max(0) / 2;
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let mut src = vec![true; WIDTH * HEIGHT];
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            src[y * WIDTH + x] = fb.pixel(x, y);
+        }
+    }
+    fb.clear(true);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let tx = x as i16 + dx;
+            let ty = y as i16 + dy;
+            if tx >= 0 && ty >= 0 && (tx as usize) < WIDTH && (ty as usize) < HEIGHT {
+                fb.set_pixel(tx as usize, ty as usize, src[y * WIDTH + x]);
+            }
+        }
+    }
+}
+
 fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
     fb.clear(true);
     match variant {

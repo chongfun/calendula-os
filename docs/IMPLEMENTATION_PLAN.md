@@ -173,10 +173,11 @@ Current code status:
   egui frontend behind `--features gui`. Headless mode accepts one TOML scenario
   or a scenario directory, applies scripted button/library events, validates app
   and panel state, writes PNG frame dumps, and compares against golden PNGs.
-- The emulator includes an SSD1677-oriented panel model that tracks BW/RED RAM,
-  address ranges/counters, refresh controls, refresh mode history, and deep
-  sleep validation. It is a protocol model, not an analog e-paper or ESP32-C3
-  timing emulator.
+- The emulator includes per-controller protocol models. The SSD1677 model tracks
+  BW/RED RAM and update controls; the UC8253 model validates complete DTM1/DTM2
+  writes, LUT/CDI readiness, prestaging, power, and sleep. UC8253 refresh order
+  comes from the same allocation-free `display::epd::uc8253::FlushPlan` that
+  firmware executes, so the host model cannot drift into a second driver.
 - Scenarios live under `fixtures/scenarios`; matching golden frames live under
   `fixtures/golden`. Add or update both before/alongside UI/navigation changes
   so agents can verify behavior before flashing hardware.

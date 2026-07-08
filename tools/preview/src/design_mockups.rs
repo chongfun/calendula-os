@@ -72,6 +72,7 @@ pub fn write_design_mockups(out: &Path) -> std::io::Result<()> {
         let mut fb = Framebuffer::new();
         fb.clear(true);
         draw(&mut fb);
+        crate::fit_design_to_board(&mut fb);
         crate::write_png(&dir.join(format!("{name}.png")), &fb)?;
     }
     write_gallery_html(&dir, screens)?;

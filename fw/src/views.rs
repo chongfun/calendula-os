@@ -230,8 +230,6 @@ fn draw_reader_footer(
     sd_library: &ReaderStore,
     page_count: u32,
 ) {
-    let label_font = display::font::literata_small(FontStyle::Regular);
-
     // Page within the chapter (spine item), aggregated across its cache
     // sections. Falls back to the current section, then the whole book, when
     // no book index is loaded to aggregate from.
@@ -258,15 +256,7 @@ fn draw_reader_footer(
 
     let mut label = String::<32>::new();
     let _ = write!(label, "{}/{}", chapter_current, chapter_total);
-    let label_width = measure_text(label_font, label.as_str()) as i16;
-    // The slash inks 2 rows below its baseline, so the counter sits 3 rows
-    // up from the panel's bottom edge — as low as it goes without clipping.
-    // READER_PAGE_BOTTOM is derived from this baseline; they move together
-    // (both panel-relative, so the X3's taller page carries them down).
-    let footer_y = display::HEIGHT as i16 - 3;
-    let footer_pad = 16;
-    let label_x = READER_RIGHT_X - label_width - footer_pad;
-    draw_text(fb, label_font, label.as_str(), label_x, footer_y, false);
+    ui::reading::draw_reading_page_counter(fb, label.as_str());
 }
 
 fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
@@ -276,8 +266,9 @@ fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_libra
     let (title, author) =
         sd_library.active_book_labels(request.book_id, fallback.title, fallback.author);
 
-    // Vertically center title + author block within the reader page region.
-    let title_y = 232i16;
+    // Vertically center title + author block within the reader page region
+    // (panel-relative, so the X3's taller page carries the plate down).
+    let title_y = display::HEIGHT as i16 / 2 - 8;
     let author_y = title_y + 36;
     draw_text_centered_truncated_local(
         fb,

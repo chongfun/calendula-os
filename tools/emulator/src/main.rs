@@ -1,4 +1,9 @@
+#[cfg(not(feature = "device-x3"))]
 mod panel;
+#[cfg(feature = "device-x3")]
+#[path = "panel_uc8253.rs"]
+mod panel;
+mod panel_common;
 mod render;
 mod scenario;
 
@@ -152,6 +157,7 @@ fn scenario_paths(path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
 }
 
 fn output_path(base: &Path, scenario: &Path) -> Result<PathBuf, String> {
+    let suffix = if cfg!(feature = "device-x3") { "-x3" } else { "" };
     if base.extension().is_some_and(|ext| ext == "png") {
         return Ok(base.to_owned());
     }
@@ -159,7 +165,7 @@ fn output_path(base: &Path, scenario: &Path) -> Result<PathBuf, String> {
         .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("scenario has no valid file stem: {}", scenario.display()))?;
-    Ok(base.join(format!("{name}.png")))
+    Ok(base.join(format!("{name}{suffix}.png")))
 }
 
 fn compare_png(path: &Path, fb: &display::fb::Framebuffer) -> Result<(), String> {
@@ -203,6 +209,8 @@ pub struct Emulator {
     refresh_planner: RefreshPlanner,
     panel: PanelModel,
     fb: display::fb::Framebuffer,
+    prev_fb: display::fb::Framebuffer,
+    prev_prestaged: bool,
     sleeping: bool,
     _sd_root: Option<PathBuf>,
     library_entries: Vec<String>,
@@ -225,6 +233,8 @@ impl Emulator {
             refresh_planner: RefreshPlanner::new(),
             panel: PanelModel::new(),
             fb: display::fb::Framebuffer::new(),
+            prev_fb: display::fb::Framebuffer::new(),
+            prev_prestaged: false,
             sleeping: false,
             _sd_root: sd_root,
             library_entries: Vec::new(),
@@ -250,6 +260,7 @@ impl Emulator {
             if self.sleeping {
                 self.sleeping = false;
                 self.panel.init_sequence().expect("panel wake init");
+                self.prev_prestaged = false;
                 self.state.view = app_core::AppView::Home;
                 self.render(app_core::RenderKind::Page);
             } else {
@@ -344,11 +355,16 @@ impl Emulator {
             crate::render::render_request(&mut self.fb, request, &self.library_entries);
         }
         let mode = self.refresh_planner.mode_for(request);
-        self.panel
-            .write_framebuffer_bw(&self.fb)
-            .expect("panel framebuffer write");
-        self.panel.refresh(mode).expect("panel refresh");
+        let effective_mode = self
+            .panel
+            .flush(&self.fb, &self.prev_fb, mode, self.prev_prestaged)
+            .expect("panel flush");
         self.refresh_planner.record_render(request, mode);
+        self.prev_fb.copy_from(&self.fb);
+        // A Full flush already writes the old/RED plane with the current
+        // frame, so staging it again here would just repeat that write.
+        self.prev_prestaged = effective_mode == display::epd::RefreshMode::Full
+            || self.panel.prestage_previous(&self.fb).is_ok();
     }
 
     fn sleep_panel(&mut self) {
@@ -358,11 +374,15 @@ impl Emulator {
             &self.library_entries,
         );
         self.panel
-            .write_framebuffer_bw(&self.fb)
-            .expect("panel sleep framebuffer write");
-        self.panel
-            .refresh(display::epd::RefreshMode::Full)
-            .expect("panel sleep refresh");
+            .flush(
+                &self.fb,
+                &self.prev_fb,
+                display::epd::RefreshMode::Full,
+                self.prev_prestaged,
+            )
+            .expect("panel sleep flush");
+        self.prev_fb.copy_from(&self.fb);
+        self.prev_prestaged = false;
         self.panel.deep_sleep().expect("panel deep sleep");
         self.refresh_planner.record_sleep();
     }
@@ -372,9 +392,7 @@ fn storage_command_for_transition(
     previous: app_core::ReaderState,
     next: app_core::ReaderState,
 ) -> Option<StorageCommand> {
-    let Some(index) = ReaderSource::from_book_id(next.book_id).sd_index() else {
-        return None;
-    };
+    let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
     if next.view != AppView::Reading {
         return None;
     }
@@ -511,5 +529,44 @@ impl eframe::App for EmulatorApp {
                 ui.image((texture.id(), size));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_png_output_path_is_preserved() {
+        let base = Path::new("fixtures/golden/home-x3.png");
+        let scenario = Path::new("fixtures/scenarios/home.toml");
+        assert_eq!(output_path(base, scenario).unwrap(), base);
+    }
+
+    #[test]
+    fn directory_output_path_uses_the_selected_panel_suffix() {
+        let base = Path::new("fixtures/golden");
+        let scenario = Path::new("fixtures/scenarios/home.toml");
+        let expected = if cfg!(feature = "device-x3") {
+            Path::new("fixtures/golden/home-x3.png")
+        } else {
+            Path::new("fixtures/golden/home.png")
+        };
+        assert_eq!(output_path(base, scenario).unwrap(), expected);
+    }
+
+    #[test]
+    fn all_scenario_contracts_pass_for_selected_panel() {
+        let scenarios = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/scenarios");
+        for path in scenario_paths(Some(&scenarios)).expect("list scenarios") {
+            let mut emulator = Emulator::boot(None);
+            let scenario = Scenario::load(&path).expect("load scenario");
+            scenario
+                .run(&mut emulator)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            scenario
+                .assert(&emulator)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        }
     }
 }
