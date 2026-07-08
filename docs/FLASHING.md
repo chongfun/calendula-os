@@ -74,14 +74,17 @@ Produces local images in `target/release-images/`:
 - **`update.bin`** — byte-identical to `firmware.bin`, under the filename the
   stock OEM SD-card updater looks for. The OEM updater writes it to the app
   slot at `0x10000`, so it is an **app image, not a full-flash image**.
+- **`FWUPDATE.BIN`** — byte-identical to `firmware.bin`, under the filename
+  MarigoldOS itself looks for on the card root at boot.
 - **`FWUPDX3.BIN`** — the X3 SD-card trigger filename.
 - **`full-flash*.bin`** — merged 16 MB images (bootloader + partition table +
   app) for local bench recovery on unlocked units only.
 
-Tagged GitHub releases publish only the four public app/SD assets:
-`firmware-x4.bin`, `firmware-x3.bin`, `update.bin`, and `FWUPDX3.BIN`.
-`firmware-x4.bin` is the release-time name for the default X4
-`target/release-images/firmware.bin`.
+Tagged GitHub releases publish only the public app/SD assets:
+`firmware-x4.bin`, `firmware-x3.bin`, `update.bin`, `FWUPDATE.BIN`, and
+`FWUPDX3.BIN`. `firmware-x4.bin` is the release-time name for the default X4
+`target/release-images/firmware.bin`; `FWUPDATE.BIN` is the same X4 app image
+under Marigold's in-app updater trigger name.
 
 > [!CAUTION]
 > Never put `full-flash*.bin` on an SD card and never write it to `0x10000`. The
@@ -166,8 +169,8 @@ Two mechanisms exist, both pioneered by CrossPoint:
 Once *any* build of this firmware is running, it can update itself from the card
 with no computer — this is what keeps a locked unit from being a one-way trip:
 
-1. Copy a new app image to the card root as **`FWUPDATE.BIN`** (the `firmware.bin`
-   / `update.bin` an `tools/build-release.sh` produces; the `FWUPDATE.BIN` name
+1. Copy a new app image to the card root as **`FWUPDATE.BIN`** (the file
+   `tools/build-release.sh` produces for X4; the `FWUPDATE.BIN` name
    is the one-shot trigger, kept distinct from a permanent `update.bin` you may
    also keep on the card). On the **X3** the trigger is **`FWUPDX3.BIN`**
    instead — each build only picks up an image named for its own panel, so a
@@ -204,7 +207,7 @@ Implemented and verified on host tooling:
 - [x] App descriptor with the open eFuse range at offset `0x20` (bootloader-gate
       workaround), verified present in the built image.
 - [x] Reproducible app/SD images (`firmware.bin`, `firmware-x3.bin`,
-      `update.bin`, `FWUPDX3.BIN`) plus local-only `full-flash*.bin` bench
+      `update.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`) plus local-only `full-flash*.bin` bench
       images (`tools/build-release.sh`). The SD images are app images written to
       `0x10000`, matching the OEM updater.
 - [x] `cargo run` flashes the stock-compatible layout.

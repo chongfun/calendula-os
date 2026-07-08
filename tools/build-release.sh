@@ -8,8 +8,9 @@
 #   firmware.bin    app image for OTA slot app0/ota_0. Flash to 0x10000. This is
 #                   what the web flasher, `esptool write_flash 0x10000`, and the
 #                   in-app SD/OTA updater consume. Leaves the bootloader intact.
-#   FWUPDATE.BIN    byte-identical to firmware.bin, under the filename the
-#   (FWUPDX3.BIN)   in-app SD updater looks for on the card root. The name is
+#   update.bin      X4 stock/OEM SD updater filename.
+#   FWUPDATE.BIN    X4 in-app SD updater filename.
+#   FWUPDX3.BIN     X3 in-app SD updater filename. The name is
 #                   device-specific so a card can't cross-flash the wrong panel.
 #   full-flash.bin  merged 16 MB image (bootloader + partition table + app) for
 #                   programming a whole *unlocked* unit from scratch with
@@ -18,7 +19,7 @@
 #                   app slot and brick the device.
 #
 # GitHub releases publish only app/SD images: firmware-x4.bin, firmware-x3.bin,
-# update.bin, and FWUPDX3.BIN. full-flash*.bin remains local-only.
+# update.bin, FWUPDATE.BIN, and FWUPDX3.BIN. full-flash*.bin remains local-only.
 #
 # The app images carry our app descriptor (magic 0xABCD5432 at image offset
 # 0x20) with the wide-open eFuse-revision range, which is what lets the stock
@@ -27,14 +28,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# SD_IMAGE is the card-root filename the SD updater consumes: on the X4 the
-# `update.bin` the stock OEM updater reads (also what our in-app updater takes
-# once renamed to FWUPDATE.BIN); on the X3 our in-app updater's own trigger,
-# FWUPDX3.BIN (device-specific so a card can't cross-flash the wrong panel).
+# STOCK_SD_IMAGE is the card-root filename the stock/OEM updater consumes.
+# IN_APP_SD_IMAGE is the trigger filename Marigold itself consumes on boot.
 DEVICE="${1:-x4}"
 case "$DEVICE" in
-  x4) FEATURES=(); SUFFIX=""; SD_IMAGE=update.bin ;;
-  x3) FEATURES=(--features device-x3); SUFFIX="-x3"; SD_IMAGE=FWUPDX3.BIN ;;
+  x4) FEATURES=(); SUFFIX=""; STOCK_SD_IMAGE=update.bin; IN_APP_SD_IMAGE=FWUPDATE.BIN ;;
+  x3) FEATURES=(--features device-x3); SUFFIX="-x3"; STOCK_SD_IMAGE=FWUPDX3.BIN; IN_APP_SD_IMAGE=FWUPDX3.BIN ;;
   *)  echo "usage: $0 [x4|x3]" >&2; exit 2 ;;
 esac
 
@@ -66,18 +65,27 @@ common=(--chip "$CHIP" --flash-size "$FLASH_SIZE"
 echo "==> firmware$SUFFIX.bin (app image, app0/ota_0 @ 0x10000)"
 espflash save-image "${common[@]}" "$ELF" "$FW"
 
-echo "==> $SD_IMAGE (same app image, name the SD updater reads)"
-cp "$FW" "$OUT/$SD_IMAGE"
+echo "==> $STOCK_SD_IMAGE (same app image, stock/OEM SD updater name)"
+cp "$FW" "$OUT/$STOCK_SD_IMAGE"
+if [[ "$IN_APP_SD_IMAGE" != "$STOCK_SD_IMAGE" ]]; then
+  echo "==> $IN_APP_SD_IMAGE (same app image, Marigold in-app SD updater name)"
+  cp "$FW" "$OUT/$IN_APP_SD_IMAGE"
+fi
 
 echo "==> full-flash$SUFFIX.bin (merged 16 MB, unlocked-only, write to 0x0)"
 espflash save-image "${common[@]}" --merge "$ELF" "$FULL"
 
 echo
 echo "Artifacts in $OUT:"
-ls -la "$FW" "$OUT/$SD_IMAGE" "$FULL"
+artifacts=("$FW" "$OUT/$STOCK_SD_IMAGE" "$FULL")
+if [[ "$IN_APP_SD_IMAGE" != "$STOCK_SD_IMAGE" ]]; then
+  artifacts+=("$OUT/$IN_APP_SD_IMAGE")
+fi
+ls -la "${artifacts[@]}"
 echo
 echo "Flash paths (see docs/FLASHING.md):"
-echo "  In-app SD updater : copy $SD_IMAGE to the SD card root, then power"
+echo "  Marigold SD update: copy $IN_APP_SD_IMAGE to the SD card root, then reboot."
+echo "  Stock/OEM updater : copy $STOCK_SD_IMAGE to the SD card root, then power"
 echo "                      on holding Power + Up on USB power."
 echo "  Unlocked, app only: esptool.py --chip $CHIP write_flash 0x10000 $FW"
 echo "  Unlocked, whole   : esptool.py --chip $CHIP write_flash 0x0 $FULL"
