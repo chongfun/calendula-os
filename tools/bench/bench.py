@@ -218,8 +218,12 @@ def run_capture(args: argparse.Namespace) -> int:
                     "counts": counts,
                 },
             )
-    budget_warnings = summarize_paths([args.out], DEFAULT_BUDGETS)
-    return 1 if args.strict and budget_warnings else 0
+    report_warnings = summarize_paths(
+        [args.out],
+        DEFAULT_BUDGETS,
+        validate_suites=args.strict,
+    )
+    return 1 if args.strict and report_warnings else 0
 
 
 def reset_device(espflash: str, port: str) -> None:
@@ -412,11 +416,16 @@ def write_event(out: Any, event: dict[str, Any]) -> None:
 
 
 def run_report(args: argparse.Namespace) -> int:
-    budget_warnings = summarize_paths(args.paths, args.budgets)
-    return 1 if args.strict and budget_warnings else 0
+    report_warnings = summarize_paths(args.paths, args.budgets, validate_suites=args.strict)
+    return 1 if args.strict and report_warnings else 0
 
 
-def summarize_paths(paths: list[Path], budgets_path: Path | None = None) -> list[str]:
+def summarize_paths(
+    paths: list[Path],
+    budgets_path: Path | None = None,
+    *,
+    validate_suites: bool = False,
+) -> list[str]:
     events: list[dict[str, Any]] = []
     for path in paths:
         events.extend(read_events(path))
@@ -491,11 +500,16 @@ def summarize_paths(paths: list[Path], budgets_path: Path | None = None) -> list
         for event in warnings[:10]:
             print(f"  {event.get('line', event)}")
     budget_warnings = evaluate_budgets(events, load_budgets(budgets_path))
+    suite_warnings = evaluate_suite_signals(events) if validate_suites else []
     if budget_warnings:
         print("budget warnings:")
         for warning in budget_warnings:
             print(f"  {warning}")
-    return budget_warnings
+    if suite_warnings:
+        print("suite warnings:")
+        for warning in suite_warnings:
+            print(f"  {warning}")
+    return budget_warnings + suite_warnings
 
 
 def read_events(path: Path) -> list[dict[str, Any]]:
@@ -650,6 +664,45 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             percentile(catalog_load, 95) if catalog_load else None,
             storage_cache.get("catalog_load_warn_ms"),
         )
+    return warnings
+
+
+def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    by_suite: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        suite = str(event.get("suite", "unknown"))
+        by_suite.setdefault(suite, []).append(event)
+
+    for suite, suite_events in sorted(by_suite.items()):
+        signal_events = [
+            event
+            for event in suite_events
+            if event.get("event") not in {"run_start", "run_end"}
+        ]
+        if not signal_events:
+            warnings.append(f"{suite}: no parsed bench telemetry")
+            continue
+        event_names = {str(event.get("event")) for event in signal_events}
+        if "warning" in event_names:
+            warnings.append(f"{suite}: warning events present")
+        if suite == "page-turn":
+            if not page_turn_durations(suite_events):
+                warnings.append("page-turn: no input-to-Reading-render duration captured")
+        elif suite == "storage-cache":
+            if not any(name.startswith("storage") for name in event_names):
+                warnings.append("storage-cache: no storage telemetry captured")
+        elif suite == "sleep-sync":
+            if not any(event.get("event") == "sleep" for event in signal_events):
+                warnings.append("sleep-sync: no sleep telemetry captured")
+            if any(event.get("event") == "sleep" and event.get("ok") is False for event in signal_events):
+                warnings.append("sleep-sync: failed sleep phase captured")
+        elif suite == "reader-soak":
+            if not {"render", "input"}.issubset(event_names):
+                warnings.append("reader-soak: expected both input and render telemetry")
+        elif suite == "thermal-run":
+            if "refresh" not in event_names:
+                warnings.append("thermal-run: no refresh timing telemetry captured")
     return warnings
 
 

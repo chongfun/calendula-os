@@ -40,9 +40,11 @@ the repo.
 This is useful for boot, catalog-cache, and sleep/wake smoke runs because it
 does not rely on catching a manual button press at the right moment.
 
-`report --strict` exits non-zero when checked-in warning budgets are exceeded.
-Capture commands also accept `--strict`, applying the same budget gate to the
-log they just wrote.
+`report --strict` exits non-zero when checked-in warning budgets are exceeded or
+when the selected suite did not capture its expected signal, such as storage
+telemetry for `storage-cache` or input-to-Reading-render timing for
+`page-turn`. Capture commands also accept `--strict`, applying the same gate to
+the log they just wrote.
 
 ## When to use
 

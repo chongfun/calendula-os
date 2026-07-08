@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import bench
+
+
+class BenchParserTests(unittest.TestCase):
+    def test_parse_structured_render(self) -> None:
+        event = bench.parse_line(
+            "bench: render view=Reading mode=Fast page=12 chapter=5 layout_ms=22 flush_ms=438 prestage_ms=15 t_ms=96260",
+            "page-turn",
+        )[0]
+        self.assertEqual(event["event"], "render")
+        self.assertEqual(event["view"], "Reading")
+        self.assertEqual(event["mode"], "Fast")
+        self.assertEqual(event["flush_ms"], 438)
+
+    def test_parse_legacy_render(self) -> None:
+        event = bench.parse_line(
+            "bench: render Reading Fast page=12 ch=5 layout=24ms flush=438ms prestage=16ms t=93958",
+            "page-turn",
+        )[0]
+        self.assertEqual(event["event"], "render")
+        self.assertEqual(event["view"], "Reading")
+        self.assertEqual(event["mode"], "Fast")
+        self.assertTrue(event["legacy"])
+
+    def test_button_normalization(self) -> None:
+        event = bench.parse_line(
+            "bench: input button=Some(Next) aux=2061 nav=5 page_raw=2937 t_ms=10524",
+            "page-turn",
+        )[0]
+        self.assertEqual(event["button"], "Next")
+
+
+class BenchReportTests(unittest.TestCase):
+    def test_page_turn_duration_pairs_input_with_next_reading_render(self) -> None:
+        events = [
+            {"suite": "page-turn", "event": "input", "button": "Next", "t_ms": 100},
+            {
+                "suite": "page-turn",
+                "event": "render",
+                "view": "Reading",
+                "mode": "Fast",
+                "t_ms": 560,
+            },
+        ]
+        self.assertEqual(bench.page_turn_durations(events), [460])
+
+    def test_budget_warning_for_slow_page_turn(self) -> None:
+        events = [
+            {"suite": "page-turn", "event": "input", "button": "Next", "t_ms": 100},
+            {
+                "suite": "page-turn",
+                "event": "render",
+                "view": "Reading",
+                "mode": "Fast",
+                "t_ms": 800,
+            },
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"median_press_to_settled_ms": 550}},
+        )
+        self.assertTrue(any("page-turn median" in warning for warning in warnings))
+
+    def test_suite_signal_warning_for_empty_capture(self) -> None:
+        warnings = bench.evaluate_suite_signals(
+            [
+                {"suite": "storage-cache", "event": "run_start"},
+                {"suite": "storage-cache", "event": "run_end"},
+            ]
+        )
+        self.assertEqual(warnings, ["storage-cache: no parsed bench telemetry"])
+
+    def test_strict_report_uses_suite_signal_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"suite": "storage-cache", "event": "run_start"}),
+                        json.dumps({"suite": "storage-cache", "event": "run_end"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            warnings = bench.summarize_paths([path], None, validate_suites=True)
+        self.assertEqual(warnings, ["storage-cache: no parsed bench telemetry"])
+
+
+if __name__ == "__main__":
+    unittest.main()
