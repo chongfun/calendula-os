@@ -367,6 +367,12 @@
   .sdsteps .n{ flex:none; width:22px; height:22px; border-radius:50%; background:var(--well); color:var(--mari); font-size:12px; font-weight:600; display:grid; place-items:center; }
   .dl2{ display:inline-block; font-size:14.5px; color:var(--ink); background:var(--well); border-radius:12px; padding:11px 20px; text-decoration:none; transition:.14s; }
   .dl2:hover{ color:var(--mari); background:color-mix(in srgb,var(--mari) 12%,var(--card)); }
+  @media (prefers-color-scheme: dark) {
+    .ghost,
+    .dl2 {
+      color: var(--prose);
+    }
+  }
   .install .rel{ margin-top:20px; font-size:13px; } .install .rel a{ color:var(--mari); text-decoration:none; }
   @media(max-width:520px){ .asset{ grid-template-columns:1fr 1fr; } .devs{ grid-template-columns:1fr; } }
 
