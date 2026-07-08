@@ -81,6 +81,7 @@ python3 tools/font_pack_to_rust.py \
 tools/cargo.sh build --release --features builtin-custom-font
 ```
 
-`display/src/custom_generated.rs` is generated and intentionally absent from
-normal builds. When `builtin-custom-font` is enabled, the compiled-in custom
+`display/src/custom_generated.rs` is a tracked placeholder in normal builds so
+workspace tooling can resolve the optional module. Replace it with the generated
+file before enabling `builtin-custom-font`. When enabled, the compiled-in custom
 font takes precedence over the SD card `CUSTOM.FNT`.

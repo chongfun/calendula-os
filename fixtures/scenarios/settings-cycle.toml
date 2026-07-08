@@ -1,6 +1,6 @@
 # Walk every visible Settings row with the change key: typeface, type size,
-# type weight, line spacing, and refresh policy each advance one step, then
-# Back returns home.
+# type weight, line spacing, refresh policy, and orientation each advance one
+# step, then Back returns home.
 
 [[steps]]
 button = "Next"
@@ -33,7 +33,13 @@ button = "Next"
 button = "Confirm"
 
 [[steps]]
-button = "Back"
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Next"
 
 [expect]
 view = "Home"
@@ -43,4 +49,5 @@ font_size = "Large"
 font_weight = "Heavy"
 line_spacing = "Relaxed"
 refresh_policy = "FullEveryTen"
+orientation = "landscape-top"
 last_refresh = "FastClean"

@@ -8,7 +8,8 @@
 //! only — the device does not tell time.
 
 use crate::{
-    qr_generated, UiLibraryStatus, UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem, UiView,
+    qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
+    UiTocItem, UiView,
 };
 use display::fb::Framebuffer;
 use display::font::{
@@ -56,6 +57,48 @@ const FOOTER_Y: i16 = HEIGHT as i16 - 24;
 /// conventionally are.
 const TITLE_LEADING: i16 = 54;
 
+#[derive(Clone, Copy)]
+struct ShellLayout {
+    mirrored: bool,
+    content_x: i16,
+    content_right: i16,
+    colophon_right: i16,
+    heading_cx: i16,
+}
+
+impl ShellLayout {
+    const fn for_orientation(orientation: UiOrientation) -> Self {
+        match orientation {
+            UiOrientation::LandscapeButtonsTop => Self {
+                mirrored: true,
+                content_x: WIDTH as i16 - CONTENT_RIGHT,
+                content_right: WIDTH as i16 - CONTENT_X,
+                colophon_right: WIDTH as i16 - (COLOPHON_RIGHT - CONTENT_RIGHT),
+                heading_cx: WIDTH as i16 - HEADING_CX,
+            },
+            _ => Self {
+                mirrored: false,
+                content_x: CONTENT_X,
+                content_right: CONTENT_RIGHT,
+                colophon_right: COLOPHON_RIGHT,
+                heading_cx: HEADING_CX,
+            },
+        }
+    }
+
+    const fn content_width(self) -> i16 {
+        self.content_right - self.content_x
+    }
+
+    const fn selection_x(self) -> i16 {
+        if self.mirrored {
+            self.content_right + 22
+        } else {
+            self.content_x - 32
+        }
+    }
+}
+
 pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     match shell.view {
@@ -75,10 +118,11 @@ pub fn render_shell_overlay(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 /// the progress rule, and a colophon in chapter-and-pages terms.
 fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    dash_key(fb, 0, "library", false);
-    dash_key(fb, 1, "continue", true);
-    dash_key(fb, 2, "wireless", false);
-    dash_key(fb, 3, "settings", false);
+    let layout = ShellLayout::for_orientation(shell.orientation);
+    dash_key(fb, layout, 0, "library", false);
+    dash_key(fb, layout, 1, "continue", true);
+    dash_key(fb, layout, 2, "wireless", false);
+    dash_key(fb, layout, 3, "settings", false);
 
     // Long titles wrap to a second line that grows upward, keeping the
     // author/rule/colophon furniture (and one-line titles) fixed.
@@ -86,20 +130,27 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     let (first, second) = wrap_title(
         title_font,
         shell.active_book.title,
-        (CONTENT_RIGHT - CONTENT_X) as u16,
+        layout.content_width() as u16,
     );
     if second.is_empty() {
-        draw_text(fb, title_font, first, CONTENT_X, 180, false);
+        draw_text(fb, title_font, first, layout.content_x, 180, false);
     } else {
-        draw_text(fb, title_font, first, CONTENT_X, 180 - TITLE_LEADING, false);
-        draw_text(fb, title_font, second, CONTENT_X, 180, false);
+        draw_text(
+            fb,
+            title_font,
+            first,
+            layout.content_x,
+            180 - TITLE_LEADING,
+            false,
+        );
+        draw_text(fb, title_font, second, layout.content_x, 180, false);
     }
     if !shell.active_book.author.is_empty() {
         ls_caps(
             fb,
             literata_small(FontStyle::Regular),
             shell.active_book.author,
-            CONTENT_X,
+            layout.content_x,
             222,
             3,
         );
@@ -110,7 +161,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     } else {
         shell.active_book.progress_permille
     };
-    progress_rule(fb, CONTENT_X, 280, 240, permille);
+    progress_rule(fb, layout.content_x, 280, 240, permille);
 
     // Colophon: the chapter name alone, in the book's italic voice —
     // the progress rule already answers "how far". Roman numeral
@@ -120,12 +171,12 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         shell.chapters,
         shell.chapter,
         shell.chapter_title,
-        CONTENT_X,
+        layout.content_x,
         312,
-        COLOPHON_RIGHT - CONTENT_X,
+        layout.colophon_right - layout.content_x,
     );
 
-    draw_battery_percent(fb, shell.battery_percent);
+    draw_battery_percent(fb, layout, shell.battery_percent);
     mirror_framebuffer_long_axis(fb);
 }
 
@@ -230,34 +281,35 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
 
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    dash_key(fb, 0, "home", false);
-    dash_key(fb, 1, "open", true);
-    dash_key(fb, 2, "previous", false);
-    dash_key(fb, 3, "next", false);
-    heading(fb, "Library");
+    let layout = ShellLayout::for_orientation(shell.orientation);
+    dash_key(fb, layout, 0, "home", false);
+    dash_key(fb, layout, 1, "open", true);
+    dash_key(fb, layout, 2, "previous", false);
+    dash_key(fb, layout, 3, "next", false);
+    heading(fb, layout, "Library");
 
     match shell.library_status {
         UiLibraryStatus::NotScanned | UiLibraryStatus::Scanning => {
-            centered_note(fb, "reading the card\u{2026}");
-            finish_working_screen(fb, shell);
+            centered_note(fb, layout, "reading the card\u{2026}");
+            finish_working_screen(fb, shell, layout);
             return;
         }
         UiLibraryStatus::Error => {
-            centered_note(fb, "the library is unavailable");
-            finish_working_screen(fb, shell);
+            centered_note(fb, layout, "the library is unavailable");
+            finish_working_screen(fb, shell, layout);
             return;
         }
         UiLibraryStatus::Empty => {
-            centered_note(fb, "no books \u{2014} add EPUB files to /books");
-            finish_working_screen(fb, shell);
+            centered_note(fb, layout, "no books \u{2014} add EPUB files to /books");
+            finish_working_screen(fb, shell, layout);
             return;
         }
         UiLibraryStatus::Ready => {}
     }
     let total = shell.library_total as usize;
     if total == 0 || shell.library_entries.is_empty() {
-        centered_note(fb, "no books \u{2014} add EPUB files to /books");
-        finish_working_screen(fb, shell);
+        centered_note(fb, layout, "no books \u{2014} add EPUB files to /books");
+        finish_working_screen(fb, shell, layout);
         return;
     }
 
@@ -283,22 +335,22 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             continue;
         };
         if abs == selected_index {
-            selection_arrow(fb, y);
+            selection_arrow(fb, layout, y);
         }
         draw_text_truncated(
             fb,
             body,
             entry,
-            CONTENT_X,
+            layout.content_x,
             y,
-            (CONTENT_RIGHT - CONTENT_X) as usize,
+            layout.content_width() as usize,
             false,
         );
         y += ROW_STEP;
     }
 
-    position_footer(fb, selected_index + 1, total);
-    finish_working_screen(fb, shell);
+    position_footer(fb, layout, selected_index + 1, total);
+    finish_working_screen(fb, shell, layout);
 }
 
 /// Absolute catalog index of the first visible Library row that keeps
@@ -332,16 +384,17 @@ pub fn toc_scroll_start(selection: usize, total: usize) -> usize {
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    dash_key(fb, 0, "close", false);
-    dash_key(fb, 1, "open", true);
-    dash_key(fb, 2, "previous", false);
-    dash_key(fb, 3, "next", false);
-    heading(fb, "Contents");
+    let layout = ShellLayout::for_orientation(shell.orientation);
+    dash_key(fb, layout, 0, "close", false);
+    dash_key(fb, layout, 1, "open", true);
+    dash_key(fb, layout, 2, "previous", false);
+    dash_key(fb, layout, 3, "next", false);
+    heading(fb, layout, "Contents");
 
     let total = shell.chapters_total as usize;
     if total == 0 || shell.chapters.is_empty() {
-        centered_note(fb, "no chapters found");
-        finish_working_screen(fb, shell);
+        centered_note(fb, layout, "no chapters found");
+        finish_working_screen(fb, shell, layout);
         return;
     }
 
@@ -351,8 +404,8 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // a wrong chapter that "jumps" forward on the first key. Hold a note until
     // the real list arrives and the selection is in range.
     if shell.selection as usize >= total {
-        centered_note(fb, "loading contents\u{2026}");
-        finish_working_screen(fb, shell);
+        centered_note(fb, layout, "loading contents\u{2026}");
+        finish_working_screen(fb, shell, layout);
         return;
     }
 
@@ -377,26 +430,28 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             continue;
         };
         if abs == selected {
-            selection_arrow(fb, y);
+            selection_arrow(fb, layout, y);
         }
-        draw_toc_row(fb, item, abs, y);
+        draw_toc_row(fb, layout, item, abs, y);
         y += TOC_ROW_STEP;
     }
 
-    position_footer(fb, selected + 1, total);
-    finish_working_screen(fb, shell);
+    position_footer(fb, layout, selected + 1, total);
+    finish_working_screen(fb, shell, layout);
 }
 
 fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    dash_key(fb, 0, "home", false);
-    dash_key(fb, 1, "change", true);
-    dash_key(fb, 2, "previous", false);
-    dash_key(fb, 3, "next", false);
-    heading(fb, "Settings");
+    let layout = ShellLayout::for_orientation(shell.orientation);
+    dash_key(fb, layout, 0, "home", false);
+    dash_key(fb, layout, 1, "change", true);
+    dash_key(fb, layout, 2, "previous", false);
+    dash_key(fb, layout, 3, "next", false);
+    heading(fb, layout, "Settings");
 
     index_row(
         fb,
+        layout,
         "Typeface",
         font_family_label(shell.font_family, shell.custom_font_name),
         FIRST_ROW_Y,
@@ -404,6 +459,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     );
     index_row(
         fb,
+        layout,
         "Type size",
         font_size_label(shell.font_size),
         FIRST_ROW_Y + 64,
@@ -411,6 +467,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     );
     index_row(
         fb,
+        layout,
         "Type weight",
         font_weight_label(shell.font_weight),
         FIRST_ROW_Y + 128,
@@ -418,6 +475,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     );
     index_row(
         fb,
+        layout,
         "Line spacing",
         line_spacing_label(shell.line_spacing),
         FIRST_ROW_Y + 192,
@@ -425,45 +483,57 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     );
     index_row(
         fb,
+        layout,
         "Refresh",
         refresh_policy_label(shell.refresh_policy),
         FIRST_ROW_Y + 256,
         shell.selection == 4,
     );
+    index_row(
+        fb,
+        layout,
+        "Orientation",
+        orientation_label(shell.orientation),
+        FIRST_ROW_Y + 320,
+        shell.selection == 5,
+    );
 
-    finish_working_screen(fb, shell);
+    finish_working_screen(fb, shell, layout);
 }
 
 fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
+    let layout = ShellLayout::for_orientation(shell.orientation);
     match shell.sync_status {
-        UiSyncStatus::ForgetPending => dash_key(fb, 0, "cancel", false),
-        _ => dash_key(fb, 0, "home", false),
+        UiSyncStatus::ForgetPending => dash_key(fb, layout, 0, "cancel", false),
+        _ => dash_key(fb, layout, 0, "home", false),
     }
     match shell.sync_status {
-        UiSyncStatus::Idle => dash_key(fb, 1, "connect", true),
-        UiSyncStatus::NotConfigured => dash_key(fb, 1, "set up", true),
-        UiSyncStatus::ForgetPending => dash_key(fb, 1, "forget", true),
-        UiSyncStatus::Error(_) => dash_key(fb, 1, "again", true),
-        UiSyncStatus::CredentialsSaved | UiSyncStatus::Serving(_) => dash_key(fb, 1, "done", true),
-        _ => dash_unused(fb, 1),
+        UiSyncStatus::Idle => dash_key(fb, layout, 1, "connect", true),
+        UiSyncStatus::NotConfigured => dash_key(fb, layout, 1, "set up", true),
+        UiSyncStatus::ForgetPending => dash_key(fb, layout, 1, "forget", true),
+        UiSyncStatus::Error(_) => dash_key(fb, layout, 1, "again", true),
+        UiSyncStatus::CredentialsSaved | UiSyncStatus::Serving(_) => {
+            dash_key(fb, layout, 1, "done", true)
+        }
+        _ => dash_unused(fb, layout, 1),
     }
     match shell.sync_status {
-        UiSyncStatus::Idle => dash_key(fb, 2, "forget", false),
-        _ => dash_unused(fb, 2),
+        UiSyncStatus::Idle => dash_key(fb, layout, 2, "forget", false),
+        _ => dash_unused(fb, layout, 2),
     }
-    dash_unused(fb, 3);
-    heading(fb, "Wireless");
+    dash_unused(fb, layout, 3);
+    heading(fb, layout, "Wireless");
 
     let hint_y = 280;
     match shell.sync_status {
         UiSyncStatus::NotConfigured => {
-            centered_note(fb, "no wi-fi network saved yet");
+            centered_note(fb, layout, "no wi-fi network saved yet");
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "set up opens a hotspot your phone can configure",
-                HEADING_CX,
+                layout.heading_cx,
                 hint_y,
             );
         }
@@ -473,12 +543,12 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             push_str(&mut buf, &mut cursor, "network \u{201C}");
             push_str(&mut buf, &mut cursor, shell.wifi_ssid);
             push_str(&mut buf, &mut cursor, "\u{201D}");
-            centered_note(fb, text_in(&buf, cursor));
+            centered_note(fb, layout, text_in(&buf, cursor));
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "connect to add and manage books from your browser",
-                HEADING_CX,
+                layout.heading_cx,
                 hint_y,
             );
         }
@@ -488,24 +558,24 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             push_str(&mut buf, &mut cursor, "forget \u{201C}");
             push_str(&mut buf, &mut cursor, shell.wifi_ssid);
             push_str(&mut buf, &mut cursor, "\u{201D}?");
-            centered_note(fb, text_in(&buf, cursor));
+            centered_note(fb, layout, text_in(&buf, cursor));
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "removes the saved wi-fi network \u{00b7} set up runs again next time",
-                HEADING_CX,
+                layout.heading_cx,
                 hint_y,
             );
         }
         UiSyncStatus::Starting | UiSyncStatus::Connecting => {
-            centered_note(fb, "joining wi-fi \u{2026}");
+            centered_note(fb, layout, "joining wi-fi \u{2026}");
         }
         UiSyncStatus::Connected(ip) => {
             let mut buf = [0u8; 40];
             let mut cursor = 0;
             push_str(&mut buf, &mut cursor, "connected at ");
             push_ipv4(&mut buf, &mut cursor, ip);
-            centered_note(fb, text_in(&buf, cursor));
+            centered_note(fb, layout, text_in(&buf, cursor));
         }
         UiSyncStatus::PortalUp => {
             // The QR joins the open hotspot; the captive DNS then raises
@@ -515,7 +585,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 &qr_generated::QR_JOIN_BITS,
                 qr_generated::QR_JOIN_SIZE,
                 qr_generated::QR_JOIN_STRIDE,
-                HEADING_CX,
+                layout.heading_cx,
                 160,
                 5,
             );
@@ -523,14 +593,14 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 fb,
                 literata_small(FontStyle::Regular),
                 "scan to join \u{201c}XTEINK-X4\u{201d}",
-                HEADING_CX,
+                layout.heading_cx,
                 348,
             );
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "then enter your wi-fi in the page that opens \u{00b7} http://192.168.4.1",
-                HEADING_CX,
+                layout.heading_cx,
                 382,
             );
         }
@@ -540,15 +610,15 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             push_str(&mut buf, &mut cursor, "visit ");
             push_ipv4(&mut buf, &mut cursor, ip);
             push_str(&mut buf, &mut cursor, " to add and remove books");
-            centered_note(fb, text_in(&buf, cursor));
+            centered_note(fb, layout, text_in(&buf, cursor));
         }
         UiSyncStatus::CredentialsSaved => {
-            centered_note(fb, "wi-fi saved");
+            centered_note(fb, layout, "wi-fi saved");
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "press done to restart, then connect from this screen",
-                HEADING_CX,
+                layout.heading_cx,
                 hint_y,
             );
         }
@@ -557,11 +627,11 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             let mut cursor = 0;
             push_str(&mut buf, &mut cursor, "could not connect \u{00B7} ");
             push_str(&mut buf, &mut cursor, reason);
-            centered_note(fb, text_in(&buf, cursor));
+            centered_note(fb, layout, text_in(&buf, cursor));
         }
     }
 
-    finish_working_screen(fb, shell);
+    finish_working_screen(fb, shell, layout);
 }
 
 /// Blits a packed QR matrix centered on `cx`, `scale` pixels per module,
@@ -627,41 +697,47 @@ fn text_in(buf: &[u8], len: usize) -> &str {
 
 /// An em-dash faces the physical button; the label is letterspaced
 /// small caps, bold for the screen's one primary action.
-fn dash_key(fb: &mut Framebuffer, slot: usize, label: &str, primary: bool) {
+fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str, primary: bool) {
     let y = KEY_YS[slot];
-    draw_text(
-        fb,
-        literata(FontStyle::Regular),
-        "\u{2014}",
-        KEY_DASH_X,
-        y + 8,
-        false,
-    );
+    let dash_font = literata(FontStyle::Regular);
+    let dash = "\u{2014}";
+    let dash_x = if layout.mirrored {
+        WIDTH as i16 - KEY_DASH_X - measure_text(dash_font, dash) as i16
+    } else {
+        KEY_DASH_X
+    };
+    draw_text(fb, dash_font, dash, dash_x, y + 8, false);
     let style = if primary {
         FontStyle::Bold
     } else {
         FontStyle::Regular
     };
-    ls_caps(fb, literata_small(style), label, KEY_LABEL_X, y + 6, 2);
+    let label_font = literata_small(style);
+    if layout.mirrored {
+        let width = ls_width(label_font, label, 2);
+        ls_caps(fb, label_font, label, dash_x - 24 - width, y + 6, 2);
+    } else {
+        ls_caps(fb, label_font, label, KEY_LABEL_X, y + 6, 2);
+    }
 }
 
 /// An unused key keeps its bare dash: the mark stays, the word goes.
-fn dash_unused(fb: &mut Framebuffer, slot: usize) {
-    draw_text(
-        fb,
-        literata(FontStyle::Regular),
-        "\u{2014}",
-        KEY_DASH_X,
-        KEY_YS[slot] + 8,
-        false,
-    );
+fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
+    let dash_font = literata(FontStyle::Regular);
+    let dash = "\u{2014}";
+    let dash_x = if layout.mirrored {
+        WIDTH as i16 - KEY_DASH_X - measure_text(dash_font, dash) as i16
+    } else {
+        KEY_DASH_X
+    };
+    draw_text(fb, dash_font, dash, dash_x, KEY_YS[slot] + 8, false);
 }
 
-fn heading(fb: &mut Framebuffer, text: &str) {
+fn heading(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
     let small = literata_small(FontStyle::Regular);
     let width = ls_width(small, text, 5);
-    ls_caps(fb, small, text, HEADING_CX - width / 2, 42, 5);
-    hline(fb, HEADING_CX - 160, 56, 320);
+    ls_caps(fb, small, text, layout.heading_cx - width / 2, 42, 5);
+    hline(fb, layout.heading_cx - 160, 56, 320);
 }
 
 /// Letterspaced all-caps, the small-caps stand-in for this bitmap set.
@@ -697,25 +773,45 @@ pub(crate) fn ls_width(font: &BitmapFont, text: &str, extra: i16) -> i16 {
 
 /// Name, dot leaders, italic value right-aligned: the index pattern
 /// shared by every list screen.
-fn index_row(fb: &mut Framebuffer, name: &str, value: &str, y: i16, selected: bool) {
+fn index_row(
+    fb: &mut Framebuffer,
+    layout: ShellLayout,
+    name: &str,
+    value: &str,
+    y: i16,
+    selected: bool,
+) {
     if selected {
-        selection_arrow(fb, y);
+        selection_arrow(fb, layout, y);
     }
     let body = literata(FontStyle::Regular);
-    let end_x = draw_text(fb, body, name, CONTENT_X, y, false);
+    let end_x = draw_text(fb, body, name, layout.content_x, y, false);
     let value_font = literata(FontStyle::Italic);
     let value_w = measure_text(value_font, value) as i16;
     let mut dx = end_x + 16;
-    while dx < CONTENT_RIGHT - value_w - 14 {
+    while dx < layout.content_right - value_w - 14 {
         fill_rect(fb, Rect::new(dx as u16, (y - 2) as u16, 1, 1), false);
         dx += 8;
     }
-    draw_text(fb, value_font, value, CONTENT_RIGHT - value_w, y, false);
+    draw_text(
+        fb,
+        value_font,
+        value,
+        layout.content_right - value_w,
+        y,
+        false,
+    );
 }
 
-fn draw_toc_row(fb: &mut Framebuffer, item: &UiTocItem<'_>, index: usize, y: i16) {
+fn draw_toc_row(
+    fb: &mut Framebuffer,
+    layout: ShellLayout,
+    item: &UiTocItem<'_>,
+    index: usize,
+    y: i16,
+) {
     let body = literata(FontStyle::Regular);
-    let indent = CONTENT_X + (item.level.saturating_sub(1) as i16 * 18);
+    let indent = layout.content_x + (item.level.saturating_sub(1) as i16 * 18);
     let mut numbered = [0u8; 32];
     let title = if item.title.is_empty() {
         fmt_numbered_chapter(index + 1, &mut numbered)
@@ -730,7 +826,7 @@ fn draw_toc_row(fb: &mut Framebuffer, item: &UiTocItem<'_>, index: usize, y: i16
             title,
             indent,
             y,
-            (CONTENT_RIGHT - indent).max(0) as usize,
+            (layout.content_right - indent).max(0) as usize,
             false,
         );
         return;
@@ -742,27 +838,45 @@ fn draw_toc_row(fb: &mut Framebuffer, item: &UiTocItem<'_>, index: usize, y: i16
     let page = core::str::from_utf8(&page_buf[..cursor]).unwrap_or("");
     let page_w = measure_text(body, page) as i16;
 
-    let title_max = (CONTENT_RIGHT - indent - page_w - 40).max(40) as usize;
+    let title_max = (layout.content_right - indent - page_w - 40).max(40) as usize;
     let shown = fit_text(body, title, title_max as u16);
     let end_x = draw_text(fb, body, shown, indent, y, false);
     let mut dx = end_x + 16;
-    while dx < CONTENT_RIGHT - page_w - 14 {
+    while dx < layout.content_right - page_w - 14 {
         fill_rect(fb, Rect::new(dx as u16, (y - 2) as u16, 1, 1), false);
         dx += 8;
     }
-    draw_text(fb, body, page, CONTENT_RIGHT - page_w, y, false);
+    draw_text(fb, body, page, layout.content_right - page_w, y, false);
 }
 
-fn selection_arrow(fb: &mut Framebuffer, y: i16) {
-    draw_text(fb, literata(FontStyle::Regular), "\u{2192}", 178, y, false);
+fn selection_arrow(fb: &mut Framebuffer, layout: ShellLayout, y: i16) {
+    let arrow = if layout.mirrored {
+        "\u{2190}"
+    } else {
+        "\u{2192}"
+    };
+    draw_text(
+        fb,
+        literata(FontStyle::Regular),
+        arrow,
+        layout.selection_x(),
+        y,
+        false,
+    );
 }
 
-fn centered_note(fb: &mut Framebuffer, text: &str) {
-    draw_text_centered(fb, literata(FontStyle::Italic), text, HEADING_CX, 230);
+fn centered_note(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
+    draw_text_centered(
+        fb,
+        literata(FontStyle::Italic),
+        text,
+        layout.heading_cx,
+        230,
+    );
 }
 
 /// "– n of m –" centered on the content column.
-fn position_footer(fb: &mut Framebuffer, current: usize, total: usize) {
+fn position_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, total: usize) {
     let mut buf = [0u8; 32];
     let mut cursor = 0;
     push_str(&mut buf, &mut cursor, "\u{2013} ");
@@ -775,24 +889,35 @@ fn position_footer(fb: &mut Framebuffer, current: usize, total: usize) {
         fb,
         literata_small(FontStyle::Regular),
         label,
-        HEADING_CX,
+        layout.heading_cx,
         FOOTER_Y,
     );
 }
 
-fn draw_battery_percent(fb: &mut Framebuffer, percent: u8) {
+fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) {
     let mut buf = [0u8; 8];
     let mut cursor = 0;
     push_usize(&mut buf, &mut cursor, percent.min(100) as usize);
     push_str(&mut buf, &mut cursor, "%");
     let label = core::str::from_utf8(&buf[..cursor]).unwrap_or("");
     let small = literata_small(FontStyle::Regular);
-    let width = measure_text(small, label) as i16;
-    draw_text(fb, small, label, FOOTER_RIGHT - width, FOOTER_Y, false);
+    if layout.mirrored {
+        draw_text(
+            fb,
+            small,
+            label,
+            WIDTH as i16 - FOOTER_RIGHT,
+            FOOTER_Y,
+            false,
+        );
+    } else {
+        let width = measure_text(small, label) as i16;
+        draw_text(fb, small, label, FOOTER_RIGHT - width, FOOTER_Y, false);
+    }
 }
 
-fn finish_working_screen(fb: &mut Framebuffer, shell: &UiShell<'_>) {
-    draw_battery_percent(fb, shell.battery_percent);
+fn finish_working_screen(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: ShellLayout) {
+    draw_battery_percent(fb, layout, shell.battery_percent);
     mirror_framebuffer_long_axis(fb);
 }
 
@@ -912,6 +1037,14 @@ fn refresh_policy_label(policy: UiRefreshPolicy) -> &'static str {
         UiRefreshPolicy::FastOnly => "fast only",
         UiRefreshPolicy::FullOnWake => "full on wake",
         UiRefreshPolicy::FullEveryTen => "full every ten",
+    }
+}
+
+fn orientation_label(orientation: UiOrientation) -> &'static str {
+    match orientation {
+        UiOrientation::LandscapeButtonsBottom => "buttons down",
+        UiOrientation::LandscapeButtonsTop => "buttons up",
+        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => "buttons down",
     }
 }
 

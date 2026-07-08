@@ -46,6 +46,7 @@ pub fn render_request(
     let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
     let model = demo_model(request, &borrowed_entries);
     render_shared_request(fb, request, &model);
+    apply_orientation(fb, request.orientation);
 }
 
 pub fn render_sleep(
@@ -56,6 +57,13 @@ pub fn render_sleep(
     let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
     let model = demo_model(request, &borrowed_entries);
     render_shared_sleep(fb, request, &model);
+    apply_orientation(fb, request.orientation);
+}
+
+fn apply_orientation(fb: &mut Framebuffer, orientation: app_core::DisplayOrientation) {
+    if orientation == app_core::DisplayOrientation::LandscapeButtonsTop {
+        fb.rotate_180();
+    }
 }
 
 #[cfg(feature = "gui")]

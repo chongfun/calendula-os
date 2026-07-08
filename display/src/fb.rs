@@ -67,6 +67,39 @@ impl Framebuffer {
             top_row.swap_with_slice(bottom_row);
         }
     }
+
+    /// Rotate the row-major 1 bpp buffer 180 degrees in place.
+    pub fn rotate_180(&mut self) {
+        for y in 0..HEIGHT / 2 {
+            let top_start = y * ROW_BYTES;
+            let bottom_start = (HEIGHT - 1 - y) * ROW_BYTES;
+            let (head, tail) = self.data.split_at_mut(bottom_start);
+            let top_row = &mut head[top_start..top_start + ROW_BYTES];
+            let bottom_row = &mut tail[..ROW_BYTES];
+
+            for index in 0..ROW_BYTES {
+                let mirror = ROW_BYTES - 1 - index;
+                let top = top_row[index];
+                top_row[index] = bottom_row[mirror].reverse_bits();
+                bottom_row[mirror] = top.reverse_bits();
+            }
+        }
+
+        if HEIGHT % 2 == 1 {
+            let start = (HEIGHT / 2) * ROW_BYTES;
+            let row = &mut self.data[start..start + ROW_BYTES];
+            for index in 0..ROW_BYTES / 2 {
+                let mirror = ROW_BYTES - 1 - index;
+                let left = row[index];
+                row[index] = row[mirror].reverse_bits();
+                row[mirror] = left.reverse_bits();
+            }
+            if ROW_BYTES % 2 == 1 {
+                let middle = ROW_BYTES / 2;
+                row[middle] = row[middle].reverse_bits();
+            }
+        }
+    }
 }
 
 impl Default for Framebuffer {
@@ -108,6 +141,38 @@ mod tests {
         let original = *fb.bytes();
         fb.flip_vertical();
         fb.flip_vertical();
+        assert_eq!(fb.bytes()[..], original[..]);
+    }
+
+    #[test]
+    fn rotate_180_maps_corners_and_points() {
+        let mut fb = Framebuffer::new();
+        fb.set_pixel(0, 0, false);
+        fb.set_pixel(WIDTH - 1, 0, false);
+        fb.set_pixel(13, 7, false);
+        fb.set_pixel(400, 239, false);
+        fb.set_pixel(401, 240, false);
+
+        let mut expected = Framebuffer::new();
+        expected.set_pixel(WIDTH - 1, HEIGHT - 1, false);
+        expected.set_pixel(0, HEIGHT - 1, false);
+        expected.set_pixel(WIDTH - 1 - 13, HEIGHT - 1 - 7, false);
+        expected.set_pixel(WIDTH - 1 - 400, HEIGHT - 1 - 239, false);
+        expected.set_pixel(WIDTH - 1 - 401, HEIGHT - 1 - 240, false);
+
+        fb.rotate_180();
+        assert_eq!(fb.bytes()[..], expected.bytes()[..]);
+    }
+
+    #[test]
+    fn rotate_180_twice_is_identity() {
+        let mut fb = Framebuffer::new();
+        for (i, x) in [3usize, 99, 200, WIDTH - 2].iter().enumerate() {
+            fb.set_pixel(*x, i * 123 % HEIGHT, false);
+        }
+        let original = *fb.bytes();
+        fb.rotate_180();
+        fb.rotate_180();
         assert_eq!(fb.bytes()[..], original[..]);
     }
 }

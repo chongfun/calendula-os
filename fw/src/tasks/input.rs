@@ -394,12 +394,12 @@ fn map_hardware(button: HardwareButton) -> Button {
             FrontLayout::BackConfirmRightLeft => Button::Previous,
         },
         HardwareButton::Up => match SIDE_LAYOUT {
-            SideLayout::PrevNext => Button::Previous,
-            SideLayout::NextPrev => Button::Next,
+            SideLayout::PrevNext => Button::PagePrevious,
+            SideLayout::NextPrev => Button::PageNext,
         },
         HardwareButton::Down => match SIDE_LAYOUT {
-            SideLayout::PrevNext => Button::Next,
-            SideLayout::NextPrev => Button::Previous,
+            SideLayout::PrevNext => Button::PageNext,
+            SideLayout::NextPrev => Button::PagePrevious,
         },
     }
 }

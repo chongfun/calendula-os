@@ -4,7 +4,7 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
-pub const SETTINGS_ITEMS: u8 = 5;
+pub const SETTINGS_ITEMS: u8 = 6;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -57,6 +57,8 @@ pub enum Button {
     Confirm,
     Previous,
     Next,
+    PagePrevious,
+    PageNext,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +190,7 @@ impl RefreshPlanner {
         if last.kind == RenderKind::Boot
             || request.view != last.view
             || request.book_id != last.book_id
+            || request.orientation != last.orientation
             // A type-settings change redraws whole text columns; the clean
             // pass avoids fast-diff ghosting across the page.
             || request.font_size != last.font_size
@@ -677,13 +680,14 @@ impl ReaderState {
 
     pub fn apply_input(self, ctx: ReducerContext, event: InputEvent) -> Self {
         let InputEvent::Sample {
-            button,
+            button: raw_button,
             aux_raw,
             nav_raw,
             page_raw,
             battery_mv,
             battery_percent,
         } = event;
+        let button = orient_button(self.orientation, raw_button);
         let mut next = self;
         next.last_button = button;
         next.aux_raw = aux_raw;
@@ -699,10 +703,10 @@ impl ReaderState {
             (AppView::Home, Some(button)) => {
                 next = apply_home_action(next, home_action_for_button(button));
             }
-            (AppView::Library, Some(Button::Next)) => {
+            (AppView::Library, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.library_item_count(ctx));
             }
-            (AppView::Library, Some(Button::Previous)) => {
+            (AppView::Library, Some(Button::Previous | Button::PagePrevious)) => {
                 next.selection = wrap_prev(self.selection, self.library_item_count(ctx));
             }
             // Imprint key grammar: Back always zooms out one level,
@@ -725,7 +729,7 @@ impl ReaderState {
                 next.selection = 0;
                 next.read_request_pending = false;
             }
-            (AppView::Reading, Some(Button::Next)) => {
+            (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page + 1 < self.sd_page_count {
                         next.page = self.page + 1;
@@ -743,7 +747,7 @@ impl ReaderState {
                     next.page = 0;
                 }
             }
-            (AppView::Reading, Some(Button::Previous)) => {
+            (AppView::Reading, Some(Button::Previous | Button::PagePrevious)) => {
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page > 0 {
                         next.page = self.page - 1;
@@ -770,10 +774,10 @@ impl ReaderState {
                 next.view = AppView::Home;
                 next.selection = 0;
             }
-            (AppView::Chapters, Some(Button::Next)) => {
+            (AppView::Chapters, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.chapter_item_count(ctx) as u16);
             }
-            (AppView::Chapters, Some(Button::Previous)) => {
+            (AppView::Chapters, Some(Button::Previous | Button::PagePrevious)) => {
                 next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx) as u16);
             }
             (AppView::Chapters, Some(Button::Confirm)) => {
@@ -831,18 +835,18 @@ impl ReaderState {
                     next.sync_status = next.wireless_entry_status();
                 }
             }
-            (AppView::Wireless, Some(Button::Previous)) => {
+            (AppView::Wireless, Some(Button::Previous | Button::PagePrevious)) => {
                 // The browse key doubles as "forget" while idle; the
                 // destructive step still needs its Confirm.
                 if self.sync_status == SyncStatus::Idle {
                     next.sync_status = SyncStatus::ForgetPending;
                 }
             }
-            (AppView::Wireless, Some(Button::Next)) => {}
-            (AppView::Settings, Some(Button::Next)) => {
+            (AppView::Wireless, Some(Button::Next | Button::PageNext)) => {}
+            (AppView::Settings, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, SETTINGS_ITEMS as u16);
             }
-            (AppView::Settings, Some(Button::Previous)) => {
+            (AppView::Settings, Some(Button::Previous | Button::PagePrevious)) => {
                 next.selection = wrap_prev(self.selection, SETTINGS_ITEMS as u16);
             }
             (AppView::Settings, Some(Button::Confirm)) => {
@@ -1165,8 +1169,8 @@ fn home_action_for_button(button: Button) -> HomeAction {
         // onto the shelf; Confirm affirms continuing to read.
         Button::Back => HomeAction::Files,
         Button::Confirm => HomeAction::Read,
-        Button::Previous => HomeAction::Wireless,
-        Button::Next | Button::Power => HomeAction::Settings,
+        Button::Previous | Button::PagePrevious => HomeAction::Wireless,
+        Button::Next | Button::PageNext | Button::Power => HomeAction::Settings,
     }
 }
 
@@ -1199,9 +1203,25 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
     state
 }
 
+fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Option<Button> {
+    let button = button?;
+    if orientation != DisplayOrientation::LandscapeButtonsTop {
+        return Some(button);
+    }
+    Some(match button {
+        Button::Power => Button::Power,
+        Button::Back => Button::Next,
+        Button::Confirm => Button::Previous,
+        Button::Previous => Button::Confirm,
+        Button::Next => Button::Back,
+        Button::PagePrevious => Button::PageNext,
+        Button::PageNext => Button::PagePrevious,
+    })
+}
+
 /// Settings rows, top to bottom: the type block first (typeface, then its
 /// size, weight, and spacing — broadest choice to finest adjustment), then
-/// the set-and-forget display row.
+/// the set-and-forget display rows.
 fn apply_setting(mut state: ReaderState) -> ReaderState {
     match state.selection {
         0 => {
@@ -1232,6 +1252,14 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 RefreshPolicy::FastOnly => RefreshPolicy::FullOnWake,
                 RefreshPolicy::FullOnWake => RefreshPolicy::FullEveryTen,
                 RefreshPolicy::FullEveryTen => RefreshPolicy::FastOnly,
+            };
+        }
+        5 => {
+            state.orientation = match state.orientation {
+                DisplayOrientation::LandscapeButtonsBottom => {
+                    DisplayOrientation::LandscapeButtonsTop
+                }
+                _ => DisplayOrientation::LandscapeButtonsBottom,
             };
         }
         _ => {}
@@ -1657,7 +1685,48 @@ mod tests {
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 4);
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, 5);
+        let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
+    }
+
+    #[test]
+    fn settings_change_key_toggles_landscape_orientation() {
+        let mut state = press(ReaderState::boot(), Button::Next);
+        state.selection = 5;
+
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
+
+        let state = press(state, Button::Previous);
+        assert_eq!(
+            state.orientation,
+            DisplayOrientation::LandscapeButtonsBottom
+        );
+    }
+
+    #[test]
+    fn landscape_top_rotates_front_button_mapping() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::LandscapeButtonsTop;
+
+        assert_eq!(press(state, Button::Back).view, AppView::Settings);
+        assert_eq!(press(state, Button::Confirm).view, AppView::Wireless);
+        assert_eq!(press(state, Button::Previous).view, AppView::Reading);
+        assert_eq!(press(state, Button::Next).view, AppView::Library);
+    }
+
+    #[test]
+    fn landscape_top_swaps_page_buttons() {
+        let mut state = press(ReaderState::boot(), Button::Back);
+        state.library_count = 3;
+        state.orientation = DisplayOrientation::LandscapeButtonsTop;
+
+        let next = press(state, Button::PagePrevious);
+        assert_eq!(next.selection, 1);
+
+        let previous = press(next, Button::PageNext);
+        assert_eq!(previous.selection, 0);
     }
 
     #[test]
@@ -1718,6 +1787,21 @@ mod tests {
         planner.record_render(request, RefreshMode::Full);
 
         state.font_size = FontSize::Large;
+        assert_eq!(
+            planner.mode_for(state.render_request(RenderKind::Page)),
+            RefreshMode::FastClean
+        );
+    }
+
+    #[test]
+    fn refresh_plan_cleans_after_orientation_change() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = ReaderState::boot();
+        state.view = AppView::Settings;
+        let request = state.render_request(RenderKind::Page);
+        planner.record_render(request, RefreshMode::Full);
+
+        state.orientation = DisplayOrientation::LandscapeButtonsTop;
         assert_eq!(
             planner.mode_for(state.render_request(RenderKind::Page)),
             RefreshMode::FastClean

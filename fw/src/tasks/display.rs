@@ -11,7 +11,8 @@ use crate::{
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::{
-    AppView, ReaderSource, ReaderState, RefreshPlanner, RenderKind, RenderRequest, SyncSession,
+    display_orientation_from_u8, refresh_policy_from_u8, AppView, DisplayOrientation, ReaderSource,
+    RefreshPlanner, RenderKind, RenderRequest, SyncSession, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
@@ -239,10 +240,19 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut pending_progress,
                     &mut last_progress_write,
                 );
-                let request = refresh_planner
-                    .last_request()
-                    .unwrap_or_else(|| ReaderState::boot().render_request(RenderKind::Page));
-                crate::views::render_sleep(fb, request, sd_library);
+                let request = refresh_planner.last_request().or_else(|| {
+                    sleep_request_from_saved_state(
+                        &mut epd,
+                        &mut sd_cs,
+                        sd_library,
+                        &pending_progress,
+                    )
+                });
+                if let Some(request) = request {
+                    crate::views::render_sleep(fb, request, sd_library);
+                } else {
+                    crate::views::render_sleep_blank(fb);
+                }
                 let sleep_frame_settled = if display_flush::flush(
                     &mut epd,
                     fb,
@@ -987,6 +997,61 @@ fn restore_saved_state(
         font_weight: record.font_weight,
         font_family: record.font_family,
     });
+}
+
+fn sleep_request_from_saved_state(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    pending_progress: &Option<AppStateRecord>,
+) -> Option<RenderRequest> {
+    let record = match *pending_progress {
+        Some(record) => record,
+        None => reader_cache::load_app_state(epd, sd_cs)?,
+    };
+    let hint = ReaderSource::from_book_id(record.book_id).sd_index();
+    let index = crate::library_sd::find_index_by_identity(
+        epd,
+        sd_cs,
+        record.source_hash,
+        record.source_size,
+        hint,
+    )?;
+    crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
+    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
+    let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
+    Some(RenderRequest {
+        kind: RenderKind::Page,
+        view: AppView::Home,
+        page: record.screen,
+        page_count,
+        chapter: record.chapter.min(u8::MAX as u16) as u8,
+        selection: 0,
+        book_id: ReaderSource::sd(index).book_id(),
+        orientation: display_orientation_from_u8(record.reading_orientation)
+            .unwrap_or(DisplayOrientation::LandscapeButtonsBottom),
+        refresh_policy: refresh_policy_from_u8(record.refresh_policy)
+            .unwrap_or(app_core::RefreshPolicy::FullOnWake),
+        font_size: display::font::FontSize::from_u8(record.font_size)
+            .unwrap_or(display::font::FontSize::Medium),
+        line_spacing: display::font::LineSpacing::from_u8(record.line_spacing)
+            .unwrap_or(display::font::LineSpacing::Normal),
+        font_weight: display::font::FontWeight::from_u8(record.font_weight)
+            .unwrap_or(display::font::FontWeight::Normal),
+        font_family: display::font::FontFamily::from_u8(record.font_family)
+            .unwrap_or(display::font::FontFamily::Literata),
+        last_button: None,
+        aux_raw: 0,
+        nav_raw: 0,
+        page_raw: 0,
+        battery_mv: 0,
+        battery_percent: 100,
+        library_count: library.catalog_count_u16(),
+        sync_status: SyncStatus::NotConfigured,
+        wifi_ssid: [0; 32],
+        wifi_ssid_len: 0,
+        dirty: display::Rect::FULL,
+    })
 }
 
 fn flush_pending_progress(

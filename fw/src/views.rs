@@ -1,6 +1,6 @@
 use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
 use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
-use crate::{catalog, AppView, ReaderSource, RenderRequest};
+use crate::{catalog, AppView, DisplayOrientation, ReaderSource, RenderRequest};
 use core::fmt::Write;
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata, measure_text, FontFamily, FontStyle};
@@ -36,6 +36,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     if SHOW_INPUT_DEBUG {
         draw_input_sample(fb, request);
     }
+    apply_orientation(fb, request.orientation);
 }
 
 pub(crate) fn render_custom_reader_from_root(
@@ -55,6 +56,7 @@ pub(crate) fn render_custom_reader_from_root(
     fb.clear(true);
     draw_sd_reader_page_with_custom_font(fb, request, sd_library, root);
     fb.flip_vertical();
+    apply_orientation(fb, request.orientation);
     true
 }
 
@@ -67,6 +69,25 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_sleep(fb, request, &model);
+    apply_orientation(fb, request.orientation);
+}
+
+pub(crate) fn render_sleep_blank(fb: &mut Framebuffer) {
+    fb.clear(true);
+    draw_text_centered_truncated_local(
+        fb,
+        literata(FontStyle::Regular),
+        "\u{00B7} asleep \u{00B7}",
+        0,
+        display::WIDTH as i16,
+        display::HEIGHT as i16 / 2,
+    );
+}
+
+fn apply_orientation(fb: &mut Framebuffer, orientation: DisplayOrientation) {
+    if orientation == DisplayOrientation::LandscapeButtonsTop {
+        fb.rotate_180();
+    }
 }
 
 fn ui_model<'a>(
@@ -311,7 +332,11 @@ fn draw_reader_footer(
 
     let mut label = String::<32>::new();
     let _ = write!(label, "{}/{}", chapter_current, chapter_total);
-    ui::reading::draw_reading_page_counter(fb, label.as_str());
+    ui::reading::draw_reading_page_counter_aligned(
+        fb,
+        label.as_str(),
+        request.orientation == DisplayOrientation::LandscapeButtonsTop,
+    );
 }
 
 fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
@@ -427,6 +452,8 @@ fn button_label(button: Option<crate::Button>) -> &'static str {
         Some(crate::Button::Confirm) => "OK",
         Some(crate::Button::Previous) => "PREV",
         Some(crate::Button::Next) => "NEXT",
+        Some(crate::Button::PagePrevious) => "PAGE-",
+        Some(crate::Button::PageNext) => "PAGE+",
         None => "NONE",
     }
 }

@@ -234,8 +234,11 @@ pub async fn run() {
                             opening_book = None;
                         }
                     }
-                    let should_render =
-                        boot_render_pending || library_event_affects_view(&state, &event);
+                    let should_render = if boot_render_pending {
+                        library_event_allows_first_render(&event)
+                    } else {
+                        library_event_affects_view(&state, &event)
+                    };
                     state = state.apply_library_event(ctx, event);
                     if !should_render {
                         continue;
@@ -255,8 +258,11 @@ pub async fn run() {
                         opening_book = None;
                     }
                 }
-                let should_render =
-                    boot_render_pending || library_event_affects_view(&state, &event);
+                let should_render = if boot_render_pending {
+                    library_event_allows_first_render(&event)
+                } else {
+                    library_event_affects_view(&state, &event)
+                };
                 state = state.apply_library_event(ctx, event);
                 if !should_render {
                     continue;
@@ -327,6 +333,13 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
         crate::LibraryEvent::CustomFont { .. } => state.view == AppView::Settings,
         crate::LibraryEvent::Restored { .. } => true,
     }
+}
+
+fn library_event_allows_first_render(event: &crate::LibraryEvent) -> bool {
+    matches!(
+        event,
+        crate::LibraryEvent::Restored { .. } | crate::LibraryEvent::Scanned { .. }
+    )
 }
 
 fn should_send_storage_immediately(command: StorageCommand) -> bool {

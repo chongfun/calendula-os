@@ -282,6 +282,8 @@ fn parse_button(value: &str) -> Result<Button, String> {
         "Confirm" | "confirm" | "Ok" | "ok" => Ok(Button::Confirm),
         "Previous" | "previous" | "prev" => Ok(Button::Previous),
         "Next" | "next" => Ok(Button::Next),
+        "PagePrevious" | "page-previous" | "page-prev" => Ok(Button::PagePrevious),
+        "PageNext" | "page-next" => Ok(Button::PageNext),
         _ => Err(format!("unknown button: {value}")),
     }
 }

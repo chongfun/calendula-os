@@ -7,13 +7,13 @@
 mod books;
 
 use app_core::{
-    AppView, Button, InputEvent, LibraryEvent, ReaderSource, RefreshPlanner, RenderKind,
-    StorageCommand, SyncEvent, SyncStatus, WifiSsid, MAX_SD_CHAPTERS,
+    AppView, Button, DisplayOrientation, InputEvent, LibraryEvent, ReaderSource, RefreshPlanner,
+    RenderKind, StorageCommand, SyncEvent, SyncStatus, WifiSsid, MAX_SD_CHAPTERS,
 };
 use books::{BookStore, SHELF};
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
-use display::font::{draw_text, literata, literata_small, measure_text, FontStyle, TypeSettings};
+use display::font::{draw_text, literata, measure_text, FontStyle, TypeSettings};
 use display::{HEIGHT, WIDTH};
 use ui::app_render::{render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel};
 use ui::reading::ReadingBlocks;
@@ -301,16 +301,24 @@ impl WebEmulator {
         } else {
             self.draw_shell(request, false);
         }
+        self.apply_orientation(request.orientation);
         self.finish_frame(request);
     }
 
     fn render_sleep(&mut self) {
         let request = self.state.render_request(RenderKind::Page);
         self.draw_shell(request, true);
+        self.apply_orientation(request.orientation);
         self.blit();
         self.planner.record_sleep();
         self.last_refresh = RefreshMode::Full as u32 + 1;
         self.frame_seq = self.frame_seq.wrapping_add(1);
+    }
+
+    fn apply_orientation(&mut self, orientation: DisplayOrientation) {
+        if orientation == DisplayOrientation::LandscapeButtonsTop {
+            self.fb.rotate_180();
+        }
     }
 
     fn finish_frame(&mut self, request: app_core::RenderRequest) {
@@ -399,15 +407,10 @@ impl WebEmulator {
 
         let (current, total) = store.chapter_page_position(request.page);
         let label = format!("{}/{}", current, total);
-        let font = literata_small(FontStyle::Regular);
-        let width = measure_text(font, &label) as i16;
-        draw_text(
+        ui::reading::draw_reading_page_counter_aligned(
             &mut self.fb,
-            font,
             &label,
-            ui::reading::READER_RIGHT_X - width - 16,
-            477,
-            false,
+            request.orientation == DisplayOrientation::LandscapeButtonsTop,
         );
     }
 
@@ -505,7 +508,9 @@ pub extern "C" fn x4_key(button: u32, now_ms: f64) {
         1 => Button::Back,
         2 => Button::Confirm,
         3 => Button::Previous,
-        _ => Button::Next,
+        4 => Button::Next,
+        5 => Button::PagePrevious,
+        _ => Button::PageNext,
     };
     emulator().input(button, now_ms);
 }

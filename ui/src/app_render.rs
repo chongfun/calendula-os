@@ -238,6 +238,8 @@ fn button_label(button: Button) -> &'static str {
         Button::Confirm => "OK",
         Button::Previous => "PREV",
         Button::Next => "NEXT",
+        Button::PagePrevious => "PAGE-",
+        Button::PageNext => "PAGE+",
     }
 }
 

@@ -449,8 +449,8 @@ impl EmulatorApp {
             (egui::Key::Q, Button::Power),
             (egui::Key::Escape, Button::Back),
             (egui::Key::Enter, Button::Confirm),
-            (egui::Key::ArrowLeft, Button::Previous),
-            (egui::Key::ArrowRight, Button::Next),
+            (egui::Key::ArrowLeft, Button::PagePrevious),
+            (egui::Key::ArrowRight, Button::PageNext),
         ];
         for (key, button) in bindings {
             if ctx.input(|input| input.key_pressed(key)) {
@@ -491,8 +491,8 @@ impl eframe::App for EmulatorApp {
             ui.label("Q Power");
             ui.label("Esc Back");
             ui.label("Enter Confirm");
-            ui.label("Left Previous");
-            ui.label("Right Next");
+            ui.label("Left Page Previous");
+            ui.label("Right Page Next");
             ui.horizontal(|ui| {
                 if ui.button("Back").clicked() {
                     self.emulator.input(Button::Back);

@@ -102,6 +102,12 @@
       0 2px 6px rgba(50,46,38,.28),
       0 26px 60px -16px rgba(40,36,28,.55);
     margin-bottom: 14px;
+    transform-origin: center;
+    transition: transform 420ms cubic-bezier(.2,.8,.2,1);
+  }
+  .device.buttons-up { transform: rotate(180deg); }
+  @media (prefers-reduced-motion: reduce) {
+    .device { transition: none; }
   }
   .edgetab {
     position: absolute;
@@ -487,9 +493,11 @@
 <script>
 (async function () {
   const WIDTH = 800, HEIGHT = 480;
-  const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4 };
+  const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
   const SAVE_KEY = "x4-progress-v1";
+  const ORIENTATION_BUTTONS_TOP = 1;
 
+  const device = document.querySelector(".device");
   const canvas = document.getElementById("panel");
   const screenCtx = canvas.getContext("2d");
 
@@ -526,6 +534,10 @@
   const wasm = instance.exports;
   wasm.x4_boot();
 
+  function syncDeviceOrientation(orientation) {
+    device.classList.toggle("buttons-up", orientation === ORIENTATION_BUTTONS_TOP);
+  }
+
   // Restore the shelf position saved by a previous visit.
   try {
     const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
@@ -534,6 +546,7 @@
       wasm.x4_restore(...saved, ...(saved.length === 8 ? [0] : []));
     }
   } catch (_) { /* fresh start */ }
+  syncDeviceOrientation(new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 9)[3]);
 
   const frame = () =>
     new Uint8ClampedArray(wasm.memory.buffer, wasm.x4_frame_ptr(), WIDTH * HEIGHT * 4);
@@ -643,20 +656,21 @@
 
   function save() {
     const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 9);
+    syncDeviceOrientation(snap[3]);
     localStorage.setItem(SAVE_KEY, JSON.stringify([...snap]));
   }
 
   for (const [id, code] of [
     ["k-power", BTN.power], ["k-back", BTN.back], ["k-ok", BTN.ok],
     ["k-prev", BTN.prev], ["k-next", BTN.next],
-    ["p-prev", BTN.prev], ["p-next", BTN.next],
+    ["p-prev", BTN.pagePrev], ["p-next", BTN.pageNext],
   ]) {
     document.getElementById(id).addEventListener("click", () => press(code));
   }
   addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     const map = {
-      ArrowLeft: BTN.prev, ArrowRight: BTN.next, Enter: BTN.ok,
+      ArrowLeft: BTN.pagePrev, ArrowRight: BTN.pageNext, Enter: BTN.ok,
       Escape: BTN.back, q: BTN.power, Q: BTN.power,
     };
     if (map[event.key] !== undefined) {

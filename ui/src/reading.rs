@@ -276,16 +276,18 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
 /// Callers own the chapter-position calculation and formatting; this shared
 /// seam owns the exact font, right inset, and panel-relative baseline.
 pub fn draw_reading_page_counter(fb: &mut Framebuffer, label: &str) {
+    draw_reading_page_counter_aligned(fb, label, false);
+}
+
+pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left: bool) {
     let font = display::font::literata_small(FontStyle::Regular);
-    let width = measure_text(font, label) as i16;
-    draw_text(
-        fb,
-        font,
-        label,
-        READER_RIGHT_X - width - 16,
-        READER_FOOTER_BASELINE_Y,
-        false,
-    );
+    let x = if left {
+        READER_LEFT_X + 16
+    } else {
+        let width = measure_text(font, label) as i16;
+        READER_RIGHT_X - width - 16
+    };
+    draw_text(fb, font, label, x, READER_FOOTER_BASELINE_Y, false);
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
