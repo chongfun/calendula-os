@@ -264,6 +264,28 @@ pub fn recover_to_slot0() -> bool {
     true
 }
 
+/// Acknowledge a freshly OTA-booted app before the next deep-sleep reset can
+/// make rollback-enabled bootloaders return to the previous firmware.
+pub fn mark_running_slot_valid() {
+    let mut flash = flash_storage();
+    let (s0, s1) = match read_otadata(&mut flash) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(valid) = ota::plan_mark_app_valid(&s0, &s1) else {
+        return;
+    };
+    if write_select_entry(&mut flash, valid.target_sector, &valid.entry).is_err() {
+        esp_println::println!("ota: mark-valid failed");
+        return;
+    }
+    esp_println::println!(
+        "ota: marked slot {} valid (seq {})",
+        (valid.entry.ota_seq - 1) % OTA_COUNT,
+        valid.entry.ota_seq
+    );
+}
+
 #[allow(unsafe_code)]
 fn flash_storage() -> FlashStorage<'static> {
     // SAFETY: OTA update/recovery runs at boot before application tasks use

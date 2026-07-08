@@ -171,6 +171,10 @@ with no computer — this is what keeps a locked unit from being a one-way trip:
    (`proto::ota::validate_image`), writes it into the **inactive** OTA slot,
    flips `otadata` to select it (`proto::ota::plan_switch`), deletes
    `FWUPDATE.BIN` so it runs only once, and resets into the new firmware.
+   On the first boot after any OTA-slot install (including CrossInk's
+   Settings -> SD firmware update flow), Marigold marks the selected `otadata`
+   entry valid before the reader starts, so rollback-enabled bootloaders do not
+   return to the previous firmware on the next deep-sleep reset.
 
 Only the inactive slot and inactive `otadata` sector are written, so a bad or
 half-copied image never harms the running firmware — the bootloader keeps
@@ -210,6 +214,11 @@ Implemented and verified on host tooling:
       validated, written to the inactive OTA slot with `esp-storage`, selected
       via `otadata`, deleted, and the device resets into it. Only the inactive
       slot/sector are touched.
+- [x] **OTA rollback acknowledgement** (`fw::ota_update::mark_running_slot_valid`)
+      — early boot rewrites an active `NEW`/`PENDING_VERIFY` select entry as
+      `VALID`. This covers installs launched from CrossInk/CrossPoint's
+      Settings -> SD firmware update path, where a rollback-enabled bootloader
+      may otherwise boot Marigold once and then return to CrossInk after sleep.
 - [x] **Flash + otadata path validated on hardware** (2026-07-05, unlocked X4).
       A one-shot self-test (`fw::ota_update::run_selftest`, `ota-selftest`
       feature) copied the running image into the inactive slot with `esp-storage`
@@ -217,7 +226,8 @@ Implemented and verified on host tooling:
       loaded the app **from the far slot** (`Loaded app from partition at offset
       0x650000`) — proving the erase/write, the seq CRC (a wrong CRC would be
       ignored), and the switch. It settled on the new slot with **no rollback
-      loop**, so `otadata` state NEW is fine here; no `UNDEFINED` change needed.
+      loop** on that bootloader; rollback-enabled installs are covered by the
+      boot-time mark-valid step above.
       The SD read path is separately confirmed from normal boot logs, and
       `validate_image` is host-tested — so every constituent of the SD updater
       is now exercised even though a full `FWUPDATE.BIN` run awaits a card

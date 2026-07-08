@@ -209,6 +209,8 @@ fn main() -> ! {
         }
     }
 
+    ota_update::mark_running_slot_valid();
+
     // One display band must fit a single TX DMA buffer (X4 fills it
     // exactly; the X3's 99-byte rows leave 80 bytes slack). The RX side
     // only ever carries the SD session's bounce chunk - the EPD is

@@ -181,6 +181,10 @@ pub const UNINITIALIZED_SEQ: u32 = 0xFFFF_FFFF;
 /// Freshly written, not yet marked valid. What we write on a new flash — this
 /// is the state the FreeInk SDK / CrossPoint switch uses and it boots on the X4.
 pub const OTA_IMG_NEW: u32 = 0x0;
+/// Bootloader rollback-enabled state: the new app has booted once and must
+/// mark itself valid before the next reset, or the bootloader may roll back.
+pub const OTA_IMG_PENDING_VERIFY: u32 = 0x1;
+pub const OTA_IMG_VALID: u32 = 0x2;
 pub const OTA_IMG_INVALID: u32 = 0x3;
 pub const OTA_IMG_ABORTED: u32 = 0x4;
 
@@ -270,6 +274,41 @@ pub fn active_app_slot(
         (Some(a), Some(b)) => a.max(b),
     };
     Some((active_seq - 1) % ota_count.max(1))
+}
+
+/// The active otadata entry and its sector, using the same "highest valid seq"
+/// rule as the bootloader. `None` means both entries are erased or bad.
+pub fn active_select_entry(
+    sector0: &[u8; SELECT_ENTRY_LEN],
+    sector1: &[u8; SELECT_ENTRY_LEN],
+) -> Option<(usize, SelectEntry)> {
+    let e0 = SelectEntry::from_bytes(sector0);
+    let e1 = SelectEntry::from_bytes(sector1);
+    let s0 = e0.is_valid().then_some(e0.ota_seq);
+    let s1 = e1.is_valid().then_some(e1.ota_seq);
+    match (s0, s1) {
+        (None, None) => None,
+        (Some(_), None) => Some((0, e0)),
+        (None, Some(_)) => Some((1, e1)),
+        (Some(a), Some(b)) if a >= b => Some((0, e0)),
+        (Some(_), Some(_)) => Some((1, e1)),
+    }
+}
+
+/// If the selected app is in a rollback trial state, return the otadata write
+/// needed to acknowledge it as booted successfully.
+pub fn plan_mark_app_valid(
+    sector0: &[u8; SELECT_ENTRY_LEN],
+    sector1: &[u8; SELECT_ENTRY_LEN],
+) -> Option<OtaSwitch> {
+    let (target_sector, active) = active_select_entry(sector0, sector1)?;
+    if active.ota_state != OTA_IMG_NEW && active.ota_state != OTA_IMG_PENDING_VERIFY {
+        return None;
+    }
+    Some(OtaSwitch {
+        target_sector,
+        entry: SelectEntry::new(active.ota_seq, OTA_IMG_VALID),
+    })
 }
 
 /// The single otadata write that makes `dest_slot` the next boot target.
@@ -601,6 +640,30 @@ mod tests {
         // an aborted higher seq is ignored -> falls back to seq 3
         let s9_aborted = SelectEntry::new(9, OTA_IMG_ABORTED).to_bytes();
         assert_eq!(active_app_slot(&s3, &s9_aborted, 2), Some(0));
+    }
+
+    #[test]
+    fn mark_app_valid_only_rewrites_trial_state() {
+        let old = SelectEntry::new(3, OTA_IMG_VALID).to_bytes();
+        let new = SelectEntry::new(4, OTA_IMG_PENDING_VERIFY).to_bytes();
+        let sw = plan_mark_app_valid(&old, &new).expect("pending app should be acknowledged");
+        assert_eq!(sw.target_sector, 1);
+        assert_eq!(sw.entry.ota_seq, 4);
+        assert_eq!(sw.entry.ota_state, OTA_IMG_VALID);
+        assert_eq!(sw.entry.crc, seq_crc(4));
+
+        let valid = sw.entry.to_bytes();
+        assert_eq!(plan_mark_app_valid(&old, &valid), None);
+    }
+
+    #[test]
+    fn mark_app_valid_accepts_new_state() {
+        let erased = [0xFFu8; SELECT_ENTRY_LEN];
+        let new = SelectEntry::new(2, OTA_IMG_NEW).to_bytes();
+        let sw = plan_mark_app_valid(&erased, &new).expect("new app should be acknowledged");
+        assert_eq!(sw.target_sector, 1);
+        assert_eq!(sw.entry.ota_seq, 2);
+        assert_eq!(sw.entry.ota_state, OTA_IMG_VALID);
     }
 
     #[test]
