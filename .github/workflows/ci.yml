@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Host target for crates that build/test on a plain host (see README's
+  # "Development" section). The firmware target (fw, hal-ext) comes from
+  # .cargo/config.toml's [build] default and rust-toolchain.toml.
+  HOST_TARGET: x86_64-unknown-linux-gnu
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable, rustfmt)
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable, firmware target, clippy)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup target add riscv32imc-unknown-none-elf --toolchain stable
+      - name: cargo clippy (firmware target, whole workspace)
+        run: cargo clippy --workspace -- -D warnings
+
+  clippy-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable, clippy)
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: cargo clippy (host target, host-testable crates)
+        run: >
+          cargo clippy --workspace --exclude hal-ext --exclude fw
+          --target "$HOST_TARGET" --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal
+      - name: cargo test (host-testable crates)
+        run: cargo test --workspace --exclude hal-ext --exclude fw --target "$HOST_TARGET"
+
+  golden-frames:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal
+      - name: Check X4 emulator golden frames
+        run: cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
+      - name: Check X3 emulator golden frames
+        run: cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden
+
+  build-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable, firmware target)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add riscv32imc-unknown-none-elf --toolchain stable
+      - name: Build X4 firmware (release)
+        run: tools/cargo.sh build -p fw --release
+      - name: Build X3 firmware (release)
+        run: tools/cargo.sh build -p fw --release --features device-x3
