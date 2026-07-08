@@ -549,7 +549,8 @@
   document.getElementById("sw-" + board).classList.add("active");
 
   // All frame compositing happens on an offscreen canvas at the panel's
-  // native 800x480; present() then scales it onto the visible canvas whose
+  // native resolution (WIDTH x HEIGHT); present() then scales it onto the
+  // visible canvas whose
   // backing store matches the displayed size times devicePixelRatio. CSS
   // used to nearest-neighbor-scale the native canvas instead, and at
   // fractional scales that dropped single pixel rows -- visibly clipping
