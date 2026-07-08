@@ -177,7 +177,6 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     );
 
     draw_battery_percent(fb, layout, shell.battery_percent);
-    mirror_framebuffer_long_axis(fb);
 }
 
 pub(crate) fn draw_chapter_colophon(
@@ -918,7 +917,6 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
 
 fn finish_working_screen(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: ShellLayout) {
     draw_battery_percent(fb, layout, shell.battery_percent);
-    mirror_framebuffer_long_axis(fb);
 }
 
 fn hline(fb: &mut Framebuffer, x: i16, y: i16, w: i16) {
@@ -935,18 +933,6 @@ fn fmt_numbered_chapter(number: usize, buf: &mut [u8; 32]) -> &str {
     push_str(buf, &mut cursor, "Chapter ");
     push_usize(buf, &mut cursor, number);
     core::str::from_utf8(&buf[..cursor]).unwrap_or("Chapter")
-}
-
-fn mirror_framebuffer_long_axis(fb: &mut Framebuffer) {
-    for y in 0..HEIGHT / 2 {
-        let other_y = HEIGHT - 1 - y;
-        for x in 0..WIDTH {
-            let top = fb.pixel(x, y);
-            let bottom = fb.pixel(x, other_y);
-            fb.set_pixel(x, y, bottom);
-            fb.set_pixel(x, other_y, top);
-        }
-    }
 }
 
 fn draw_text_truncated(

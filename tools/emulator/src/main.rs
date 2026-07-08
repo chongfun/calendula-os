@@ -349,6 +349,10 @@ impl Emulator {
             && ReaderSource::from_book_id(request.book_id).is_sd()
             && self.sd_reader_status != EmulatedReaderStatus::Ready
         {
+            // This stand-in plate has always been drawn in raw buffer
+            // coordinates (the old pipeline never flipped this branch), and
+            // the framebuffer now remembers the previous render's frame.
+            self.fb.set_frame(display::fb::FbFrame::Native);
             self.fb.clear(true);
             display::render::draw_ascii(&mut self.fb, "OPENING EPUB", 20, 72, false);
         } else {

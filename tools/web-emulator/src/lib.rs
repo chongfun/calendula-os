@@ -295,30 +295,23 @@ impl WebEmulator {
         let sd_reading = request.view == AppView::Reading
             && ReaderSource::from_book_id(request.book_id).is_sd();
         if sd_reading {
+            self.fb
+                .set_frame(ui::app_render::fb_frame(request.orientation));
             self.fb.clear(true);
             self.draw_reader_page(request);
-            self.fb.flip_vertical();
         } else {
             self.draw_shell(request, false);
         }
-        self.apply_orientation(request.orientation);
         self.finish_frame(request);
     }
 
     fn render_sleep(&mut self) {
         let request = self.state.render_request(RenderKind::Page);
         self.draw_shell(request, true);
-        self.apply_orientation(request.orientation);
         self.blit();
         self.planner.record_sleep();
         self.last_refresh = RefreshMode::Full as u32 + 1;
         self.frame_seq = self.frame_seq.wrapping_add(1);
-    }
-
-    fn apply_orientation(&mut self, orientation: DisplayOrientation) {
-        if orientation == DisplayOrientation::LandscapeButtonsTop {
-            self.fb.rotate_180();
-        }
     }
 
     fn finish_frame(&mut self, request: app_core::RenderRequest) {
@@ -419,7 +412,7 @@ impl WebEmulator {
     fn blit(&mut self) {
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let color = if self.fb.pixel(x, HEIGHT - 1 - y) { PAPER } else { INK };
+                let color = if self.fb.native_pixel(x, HEIGHT - 1 - y) { PAPER } else { INK };
                 let offset = (y * WIDTH + x) * 4;
                 self.rgba[offset] = color[0];
                 self.rgba[offset + 1] = color[1];

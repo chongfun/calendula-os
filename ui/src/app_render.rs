@@ -5,10 +5,9 @@ use crate::{
 use app_core::{
     AppView, Button, DisplayOrientation, RefreshPolicy, RenderRequest, SyncError, SyncStatus,
 };
-use display::fb::Framebuffer;
+use display::fb::{FbFrame, Framebuffer};
 use display::font::{draw_text, literata_display, literata_small, measure_text, FontStyle};
 use display::render::draw_ascii;
-use display::{HEIGHT, WIDTH};
 
 #[derive(Clone, Copy, Debug)]
 pub struct UiRenderModel<'a> {
@@ -29,7 +28,21 @@ pub struct UiRenderModel<'a> {
     pub custom_font_name: &'a str,
 }
 
+/// The drawing frame for an orientation: where `set_pixel` coordinates put
+/// ink on the panel as held. Every renderer sets this before drawing; the
+/// framebuffer is a long-lived static that remembers the previous frame.
+pub fn fb_frame(orientation: DisplayOrientation) -> FbFrame {
+    match orientation {
+        DisplayOrientation::LandscapeButtonsBottom => FbFrame::Landscape,
+        DisplayOrientation::LandscapeButtonsTop => FbFrame::LandscapeFlipped,
+        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight => {
+            FbFrame::Portrait
+        }
+    }
+}
+
 pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
+    fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {
         render_builtin_reading(fb, request, model);
         return;
@@ -95,6 +108,7 @@ fn sync_error_label(error: SyncError) -> &'static str {
 /// (caps author, progress rule, italic chapter name), centered. No
 /// battery; a days-old panel image must not show stale numbers.
 pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
+    fb.set_frame(fb_frame(request.orientation));
     fb.clear(true);
     let title_font = literata_display();
     let (first, second) = crate::render::wrap_title(title_font, model.active_book.title, 720);
@@ -139,8 +153,6 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
         340,
         SLEEP_COLOPHON_MAX_W,
     );
-
-    mirror_framebuffer_long_axis(fb);
 }
 
 fn draw_font_centered_fit(
@@ -180,7 +192,6 @@ fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &
     if let Some(button) = request.last_button {
         draw_ascii(fb, button_label(button), 64, 280, false);
     }
-    mirror_framebuffer_long_axis(fb);
 }
 
 fn ui_view(view: AppView) -> UiView {
@@ -208,18 +219,6 @@ fn ui_refresh_policy(policy: RefreshPolicy) -> UiRefreshPolicy {
         RefreshPolicy::FastOnly => UiRefreshPolicy::FastOnly,
         RefreshPolicy::FullOnWake => UiRefreshPolicy::FullOnWake,
         RefreshPolicy::FullEveryTen => UiRefreshPolicy::FullEveryTen,
-    }
-}
-
-fn mirror_framebuffer_long_axis(fb: &mut Framebuffer) {
-    for y in 0..HEIGHT / 2 {
-        let other_y = HEIGHT - 1 - y;
-        for x in 0..WIDTH {
-            let top = fb.pixel(x, y);
-            let bottom = fb.pixel(x, other_y);
-            fb.set_pixel(x, y, bottom);
-            fb.set_pixel(x, other_y, top);
-        }
     }
 }
 

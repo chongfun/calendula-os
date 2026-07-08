@@ -18,10 +18,10 @@ const SHOW_INPUT_DEBUG: bool = false;
 const MAX_UI_CHAPTERS: usize = 256;
 
 pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
+    fb.set_frame(app_render::fb_frame(request.orientation));
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
         fb.clear(true);
         draw_sd_reader_page(fb, request, sd_library);
-        fb.flip_vertical();
     } else {
         let mut library_entries = [""; LIBRARY_WINDOW];
         let mut chapters = [UiTocItem {
@@ -36,7 +36,6 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     if SHOW_INPUT_DEBUG {
         draw_input_sample(fb, request);
     }
-    apply_orientation(fb, request.orientation);
 }
 
 pub(crate) fn render_custom_reader_from_root(
@@ -53,10 +52,9 @@ pub(crate) fn render_custom_reader_from_root(
         return false;
     }
 
+    fb.set_frame(app_render::fb_frame(request.orientation));
     fb.clear(true);
     draw_sd_reader_page_with_custom_font(fb, request, sd_library, root);
-    fb.flip_vertical();
-    apply_orientation(fb, request.orientation);
     true
 }
 
@@ -69,10 +67,10 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_sleep(fb, request, &model);
-    apply_orientation(fb, request.orientation);
 }
 
 pub(crate) fn render_sleep_blank(fb: &mut Framebuffer) {
+    fb.set_frame(display::fb::FbFrame::Native);
     fb.clear(true);
     draw_text_centered_truncated_local(
         fb,
@@ -82,12 +80,6 @@ pub(crate) fn render_sleep_blank(fb: &mut Framebuffer) {
         display::WIDTH as i16,
         display::HEIGHT as i16 / 2,
     );
-}
-
-fn apply_orientation(fb: &mut Framebuffer, orientation: DisplayOrientation) {
-    if orientation == DisplayOrientation::LandscapeButtonsTop {
-        fb.rotate_180();
-    }
 }
 
 fn ui_model<'a>(
