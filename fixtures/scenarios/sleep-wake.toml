@@ -9,4 +9,4 @@ view = "Home"
 sleeping = false
 panel_sleeping = false
 last_refresh = "FastClean"
-history_contains = "cmd 0x10"
+history_contains = "deep_sleep"

@@ -423,10 +423,12 @@ The emulator intentionally models the behavior that is useful during ordinary
 development:
 
 - app reducer state transitions from button and library events
-- 800x480, 1 bpp framebuffer rendering
+- selected-panel 1 bpp framebuffer rendering (X4 800x480 or X3 792x528)
 - shared panel byte/bit transform from `display::epd`
 - SSD1677-style BW/RED RAM, address counters/ranges, refresh mode history, and
   deep-sleep command validation
+- UC8253 DTM1/DTM2, LUT/CDI, prestage, power, and sleep validation driven by
+  the same allocation-free refresh-operation plan as firmware
 - scripted scenarios that can assert final view/book/page/selection/panel state,
   dump PNG frames, and compare against golden frames
 
@@ -439,6 +441,7 @@ Typical development loop:
 ```sh
 cargo test -p app-core -p proto --target aarch64-apple-darwin
 cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
+cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features --features device-x3
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --dump target/emulator
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --present-dump target/emulator-presented
@@ -531,7 +534,7 @@ The deeper modules keep implementation complexity behind narrow data-oriented
 interfaces:
 
 ```text
-fw::display_flush       SSD1677 init, RAM streaming, sleep, and byte transforms
+fw::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sleep
 fw::library_sd          FAT scan, SD chip-select handling, and file discovery
 fw::sd_session          SD session open/close and the upload write pump
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records

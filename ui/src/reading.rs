@@ -272,14 +272,35 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
     });
 }
 
+/// Draw the page-in-chapter counter that completes the reading surface.
+/// Callers own the chapter-position calculation and formatting; this shared
+/// seam owns the exact font, right inset, and panel-relative baseline.
+pub fn draw_reading_page_counter(fb: &mut Framebuffer, label: &str) {
+    let font = display::font::literata_small(FontStyle::Regular);
+    let width = measure_text(font, label) as i16;
+    draw_text(
+        fb,
+        font,
+        label,
+        READER_RIGHT_X - width - 16,
+        READER_FOOTER_BASELINE_Y,
+        false,
+    );
+}
+
 pub const READER_PAGE_TOP: i16 = 6;
 /// Footer band top: 14 rows up from the panel's bottom edge. Panel-relative
 /// so the X3's taller page pushes the footer to its own bottom edge; on the
 /// X4 this is the historical 466.
 pub const READER_FOOTER_TOP: i16 = display::HEIGHT as i16 - 14;
+/// Page-counter text baseline: as low as it goes without clipping (the
+/// slash inks 2 rows below its baseline). Used by `fw::views` so the
+/// footer's exact panel-relative position lives in one place instead of
+/// being kept in sync by hand across crates.
+pub const READER_FOOTER_BASELINE_Y: i16 = display::HEIGHT as i16 - 3;
 /// Last permissible baseline row for body ink. Derived, not tuned: the
-/// page counter's '/' ink starts 12 rows up from its baseline (the panel
-/// bottom minus 3, `fw::views`), and the deepest body glyph reaches 7 rows
+/// page counter's '/' ink starts 12 rows up from its baseline
+/// (`READER_FOOTER_BASELINE_Y`), and the deepest body glyph reaches 7 rows
 /// below its baseline (comma-below diacritics), so bottom - 3 - 12 - 7 - 1
 /// keeps every possible descender a clear row away from the counter. On the
 /// X4 this is the historical 457.

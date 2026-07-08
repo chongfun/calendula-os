@@ -5,4 +5,4 @@ button = "Power"
 view = "Home"
 sleeping = true
 panel_sleeping = true
-history_contains = "cmd 0x10"
+history_contains = "deep_sleep"
