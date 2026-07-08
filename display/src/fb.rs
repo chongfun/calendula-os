@@ -77,11 +77,10 @@ impl Framebuffer {
             let top_row = &mut head[top_start..top_start + ROW_BYTES];
             let bottom_row = &mut tail[..ROW_BYTES];
 
-            for index in 0..ROW_BYTES {
-                let mirror = ROW_BYTES - 1 - index;
-                let top = top_row[index];
-                top_row[index] = bottom_row[mirror].reverse_bits();
-                bottom_row[mirror] = top.reverse_bits();
+            for (top, bottom) in top_row.iter_mut().zip(bottom_row.iter_mut().rev()) {
+                let saved_top = *top;
+                *top = bottom.reverse_bits();
+                *bottom = saved_top.reverse_bits();
             }
         }
 

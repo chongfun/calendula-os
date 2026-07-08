@@ -137,6 +137,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    #[allow(clippy::too_many_arguments)]
     fn draw_styled_line(
         &mut self,
         fb: &mut Framebuffer,
@@ -217,6 +218,7 @@ where
         ink.width()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &mut self,
         fb: &mut Framebuffer,
@@ -263,9 +265,8 @@ where
                 .checked_add(metric.offset as u32)?
                 .checked_add((y * row_bytes) as u32)?;
             self.file.seek_from_start(offset).ok()?;
-            read_full(&self.file, &mut row[..row_bytes])?;
-            for x_byte in 0..row_bytes {
-                let byte = row[x_byte];
+            read_full(self.file, &mut row[..row_bytes])?;
+            for (x_byte, &byte) in row.iter().enumerate().take(row_bytes) {
                 if byte == 0 {
                     continue;
                 }

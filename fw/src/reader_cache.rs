@@ -1325,7 +1325,9 @@ where
         }
         let requested = out.len();
         let remaining_budget = EPUB_OPEN_READ_BYTE_LIMIT.saturating_sub(self.read_bytes) as usize;
-        let read_len = requested.min(EPUB_READ_AT_CHUNK_BYTES).min(remaining_budget);
+        let read_len = requested
+            .min(EPUB_READ_AT_CHUNK_BYTES)
+            .min(remaining_budget);
         if read_len == 0 {
             return Err(());
         }
