@@ -3,6 +3,7 @@
 MarigoldOS is a lightweight, open-source firmware for the Xteink X4 and X3 e-readers.
 
 [![Flashing](https://img.shields.io/badge/Flashing-2b2b2b?style=flat)](docs/FLASHING.md)
+[![Custom fonts](https://img.shields.io/badge/Custom_fonts-2b2b2b?style=flat)](docs/CUSTOM_FONTS.md)
 [![Architecture](https://img.shields.io/badge/Architecture-2b2b2b?style=flat)](docs/ARCHITECTURE.md)
 
 ![The MarigoldOS site showing the browser emulator home menu with Alice's Adventures in Wonderland selected](docs/home.png)
@@ -16,7 +17,7 @@ e-ink display and a selection of public-domain books.
 
 ### Reading
 - **EPUB 2 & 3** — native table of contents for each (EPUB 3 nav, NCX fallback)
-- **Two typefaces** — Literata and Merriweather, with adjustable size, weight, and line spacing
+- **Reader typefaces** — Literata and Merriweather, plus an optional custom typeface slot from the SD card
 - **Whole-book pagination cache** — a book parses once and reopens in tens of milliseconds
 - **Fast page turns** — 473 ms end-to-end, within ~50 ms of the panel's rated floor
 
