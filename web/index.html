@@ -265,6 +265,19 @@
     padding: 1px 6px;
     font-size: 10.5px;
   }
+  .boardswitch a {
+    color: var(--label);
+    text-decoration: none;
+    border: 1px solid color-mix(in srgb, var(--label) 40%, transparent);
+    border-radius: 4px;
+    padding: 1px 6px;
+    margin-left: 2px;
+  }
+  .boardswitch a.active {
+    font-weight: 600;
+    border-color: var(--label);
+    background: color-mix(in srgb, var(--label) 12%, transparent);
+  }
   main {
     max-width: 620px;
     margin-top: clamp(32px, 6vw, 56px);
@@ -411,7 +424,7 @@
   <p class="lead">Lightweight firmware for the Xteink X3 and X4 e-readers.</p>
 </div>
 
-<div class="device" aria-label="Simulated Xteink X4 e-reader">
+<div class="device" id="device" aria-label="Simulated Xteink X4 e-reader">
   <div class="body">
     <div class="sidekeys">
       <div class="slot s1"><div class="rocker">
@@ -436,6 +449,7 @@
 </div>
 
 <div class="hints">
+  <span class="boardswitch">board: <a id="sw-x4" href="?board=x4">X4</a> <a id="sw-x3" href="?board=x3">X3</a></span>
   <span class="kbonly"><kbd>←</kbd> <kbd>→</kbd> turn pages</span>
   <span class="kbonly"><kbd>Enter</kbd> confirm</span>
   <span class="kbonly"><kbd>Esc</kbd> back</span>
@@ -493,7 +507,7 @@
 </section>
 
 <div class="colophon">
-  <div class="row"><span>panel</span><span>GDEQ0426T82 · 800 × 480 · 1-bit</span></div>
+  <div class="row"><span>panel</span><span id="panel-spec">GDEQ0426T82 · 800 × 480 · 1-bit</span></div>
   <div class="row"><span>page turn</span><span>~473 ms measured, 421 ms panel busy</span></div>
   <div class="row"><span>firmware</span><span>Rust · esp-hal · no_std on device</span></div>
   <div class="row"><span>this page</span><span>same crates, wasm32 · no framework</span></div>
@@ -505,14 +519,34 @@
 
 <script>
 (async function () {
-  const WIDTH = 800, HEIGHT = 480;
+  // Board is selected at page load via ?board=x3 (default x4); the geometry
+  // is compile-time in the firmware, so each board is a separate wasm build
+  // (build the X3 wasm with `--features device-x3` and serve it as
+  // x3_web_emulator.wasm).
+  const BOARDS = {
+    x4: { name: "Xteink X4", short: "X4", w: 800, h: 480,
+          wasm: "x4_web_emulator.wasm", panel: "GDEQ0426T82 · 800 × 480 · 1-bit", res: "800 × 480" },
+    x3: { name: "Xteink X3", short: "X3", w: 792, h: 528,
+          wasm: "x3_web_emulator.wasm", panel: "UC8253 · 792 × 528 · 1-bit", res: "792 × 528" },
+  };
+  const boardParam = new URLSearchParams(location.search).get("board");
+  const board = BOARDS[boardParam] ? boardParam : "x4";
+  const cfg = BOARDS[board];
+  const WIDTH = cfg.w, HEIGHT = cfg.h;
   const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
-  const SAVE_KEY = "x4-progress-v1";
+  const SAVE_KEY = board + "-progress-v1";
   const ORIENTATION_BUTTONS_TOP = 1;
 
   const device = document.querySelector(".device");
   const canvas = document.getElementById("panel");
+  canvas.width = WIDTH;
+  canvas.height = HEIGHT;
   const screenCtx = canvas.getContext("2d");
+
+  // Reflect the selected board in the page chrome.
+  document.getElementById("panel-spec").textContent = cfg.panel;
+  document.getElementById("device").setAttribute("aria-label", "Simulated " + cfg.name + " e-reader");
+  document.getElementById("sw-" + board).classList.add("active");
 
   // All frame compositing happens on an offscreen canvas at the panel's
   // native 800x480; present() then scales it onto the visible canvas whose
@@ -542,7 +576,7 @@
   const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   const { instance } = await WebAssembly.instantiateStreaming(
-    fetch("x4_web_emulator.wasm")
+    fetch(cfg.wasm)
   );
   const wasm = instance.exports;
   wasm.x4_boot();

@@ -56,6 +56,18 @@ Hardware-facing bench runs live in `tools/bench`. Use short `page-turn` and
 reader rendering, SD/cache, or progress-write changes; use longer soak/storage
 runs before risky merges or releases.
 
+The board is a compile-time feature (X4 by default, or `device-x3`); pass
+`--features device-x3` to run the firmware, native emulator, or preview for
+the X3. The browser emulator builds one wasm per board:
+
+```sh
+tools/build-web.sh _site                # X4 + X3 wasm + index.html into _site/
+python3 -m http.server -d _site 8000    # then open http://localhost:8000/?board=x3
+```
+
+`.github/workflows/pages.yml` runs this on push to `main`; the hosted page's
+`?board=` switch picks which wasm to load (default X4).
+
 ## Flashing
 
 `cargo run` flashes over USB for development. To install without a toolchain —
