@@ -8,8 +8,8 @@
 //! only — the device does not tell time.
 
 use crate::{
-    qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
-    UiTocItem, UiView,
+    qr_generated, reading::PORTRAIT_READING_SHEET_HEIGHT, UiLibraryStatus, UiOrientation,
+    UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem, UiView,
 };
 use display::fb::Framebuffer;
 use display::font::{
@@ -75,8 +75,6 @@ const KEY_XS: [i16; 4] = KEY_YS;
 /// Portrait key strip: icons sit on a single baseline centered above the
 /// physical buttons.
 const KEY_STRIP_ICON_Y: i16 = PORTRAIT_H - 24;
-/// Rows the summoned reading sheet covers: the icon row plus symmetric padding.
-const READING_SHEET_HEIGHT: i16 = 48;
 
 /// The orientation-varying layout values. Landscape entries are the
 /// historical constants (buttons-top mirrors the x axis); portrait
@@ -860,23 +858,23 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
     draw_text(fb, dash_font, dash, dash_x, KEY_YS[slot] + 8, false);
 }
 
-/// The summoned reading key sheet: portrait reading is full-bleed, and a
-/// named-key press slides this white band up over the page bottom, above
-/// the physical buttons. A hairline closes its top edge; the four staggered
-/// strip keys name what the buttons do while it is up. Paging dismisses it
-/// (the reducer owns that).
+/// The summoned reading key sheet: portrait reading stays chrome-free, and a
+/// named-key press slides this white band up from the reserved bottom zone
+/// above the physical buttons. A hairline closes its top edge; the four
+/// staggered strip keys name what the buttons do while it is up. Paging
+/// dismisses it (the reducer owns that).
 pub fn render_reading_sheet(fb: &mut Framebuffer) {
     if !fb.is_portrait() {
         return;
     }
-    let top = PORTRAIT_H - READING_SHEET_HEIGHT;
+    let top = PORTRAIT_H - PORTRAIT_READING_SHEET_HEIGHT;
     fill_rect(
         fb,
         Rect::new(
             0,
             top as u16,
             PORTRAIT_W as u16,
-            READING_SHEET_HEIGHT as u16,
+            PORTRAIT_READING_SHEET_HEIGHT as u16,
         ),
         true,
     );

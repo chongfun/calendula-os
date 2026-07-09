@@ -8,15 +8,15 @@ X3 portrait panel (open question below) remain the only bench items.
 
 ## Summary
 
-Let the reader hold the device upright. **Portrait** becomes an opt-in
-orientation, chosen from a new Settings row and persisted; **landscape stays
-the default** and nothing about it changes. In portrait the device is rotated
-so the front four-key ladder sits along the **bottom edge** — the natural
-paperback grip — and the existing Previous/Next pair of that row pages with
-the left key going back and the right key going forward. Every view (Home,
-Library, Chapters, Settings, Wireless, Sleep, and the reader itself) renders
-a true portrait layout in the same Imprint design language: nothing is
-squeezed, mirrored, or letterboxed.
+Let the reader hold the device upright. **Portrait** becomes one posture in a
+persisted three-posture Settings cycle; **landscape-buttons-down stays the
+default** and its reading behavior is unchanged. In portrait the device is
+rotated so the front four-key ladder sits along the **bottom edge** — the
+natural paperback grip — and the existing Previous/Next pair of that row pages
+with the left key going back and the right key going forward. Every view (Home,
+Library, Chapters, Settings, Wireless, Sleep, and the reader itself) renders a
+true portrait layout in the same Imprint design language: nothing is squeezed,
+mirrored, or letterboxed.
 
 Much of the state plumbing already exists and is being *lit up*, not built:
 
@@ -143,30 +143,30 @@ untouched — portrait is the same book, held upright.
 ## Reading in portrait
 
 The reader's page box gets portrait constants beside the landscape ones
-(`ui/src/reading.rs:291-313`): full-bleed margins on the narrower measure,
-footer band above the bottom edge. Portrait wrap points differ from
-landscape, so **`PANEL_LAYOUT_SALT` (`reading.rs:347`) gains disjoint values
-per panel × orientation** (landscape X4 keeps 0 so every existing cache stays
-valid; X3 keeps 256; portrait claims fresh bands). Toggling orientation
-therefore re-paginates the book — the same cost and UX as changing type size,
-and it must be just as unceremonious: the reader lands on the equivalent
-position, with the rebuild delay on first open after a switch. An SD card
-carries caches for each geometry it has been read under; they coexist by
-salt.
+(`ui/src/reading.rs`): margins on the narrower measure, with the body baseline
+limit and footer band kept above the summoned-sheet zone. Portrait wrap points
+differ from landscape, so **the panel salt and orientation salt claim disjoint
+cache bands**: landscape X4 keeps 0..127 so every existing cache stays valid,
+portrait X4 uses 128..255, landscape X3 uses 256..383, and portrait X3 uses
+384..511. Toggling orientation therefore re-paginates the book — the same cost
+and UX as changing type size, and it must be just as unceremonious: the reader
+lands on the equivalent position, with the rebuild delay on first open after a
+switch. An SD card carries caches for each geometry it has been read under;
+they coexist by salt.
 
-The folio ("– 142 –" style counter) keeps its bottom corner, above the zone
+The folio ("– 142 –" style counter) keeps its page-box corner above the zone
 the summoned sheet occupies.
 
 ## The summoned menu
 
-Reading stays full-bleed — the bezel is the margin. In portrait, pressing any
+Reading stays chrome-free — the bezel is the margin. In portrait, pressing any
 front-ladder key while reading first **summons the key strip as a bottom
 sheet** directly above the physical buttons: the margin appears when called
 for, exactly the "summoning creates the margin" behavior the design-language
 brainstorm specified for landscape
 (`docs/brainstorms/2026-06-11-ui-design-language-brainstorm.md`), rotated.
 The sheet is a white band carrying the four key icons on a single row (with a
-reduced footprint of `READING_SHEET_HEIGHT = 48`); while it is up, keys
+reduced footprint of `PORTRAIT_READING_SHEET_HEIGHT = 48`); while it is up, keys
 act on their icons — Back dismisses to the page, Confirm opens Chapters, the
 browse pair pages (paging auto-dismisses the sheet, since turning the page is
 the answer, not a menu errand).
@@ -183,18 +183,18 @@ deferred (below).
 ## Settings and persistence
 
 A new **Orientation** row joins Settings as row 5 — after the type block and
-the display row, set-and-forget territory — cycling **Landscape ↔ Portrait**
-in `apply_setting` (`app-core/src/lib.rs:1188`), rendered as a standard
-`index_row` with the italic value. The two values map to
-`LandscapeButtonsBottom` and `PortraitButtonsRight`; the other two enum
-variants stay unexposed.
+the display row, set-and-forget territory — cycling three exposed postures in
+`apply_setting`: `LandscapeButtonsBottom` (buttons down) →
+`LandscapeButtonsTop` (buttons up, the 180° flip) →
+`PortraitButtonsRight` (portrait, ladder along the bottom edge) → back to
+`LandscapeButtonsBottom`. The row renders as a standard `index_row` with the
+italic value. `PortraitButtonsLeft` stays unexposed in v1.
 
 Persistence unifies to the one user-facing setting. Today the record carries
 two bytes and the save path writes a vestigial constant into
-`shell_orientation` (`app-core/src/lib.rs:1063`); both bytes now carry the
-single chosen orientation, restored on boot through the existing
-`display_orientation_from_u8` path (`app-core/src/lib.rs:962, 1109`). The
-record format already has the bytes — **no NVM version bump**.
+`shell_orientation`; both bytes now carry the chosen posture, restored on boot
+through the existing `display_orientation_from_u8` path. The record format
+already has the bytes — **no NVM version bump**.
 
 ## Emulators, previews, CI
 

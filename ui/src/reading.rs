@@ -327,6 +327,10 @@ pub const READER_LEFT_X: i16 = 8;
 /// same inset rather than letting body ink touch the edge.
 pub const READER_RIGHT_X: i16 = display::WIDTH as i16 - 8;
 pub const READER_WRAP_SAFETY: i16 = 4;
+/// Rows reserved for the portrait reading sheet. The portrait reader keeps
+/// its folio and body baseline limit above this band so summoning the sheet
+/// never erases the page counter.
+pub const PORTRAIT_READING_SHEET_HEIGHT: i16 = 48;
 
 // The portrait page box: the same margins on the upright page (width =
 // panel HEIGHT, height = panel WIDTH). Left margin and page top match
@@ -346,7 +350,7 @@ pub const fn reader_right_x(portrait: bool) -> i16 {
 /// Last permissible body-ink baseline of the frame the settings select.
 pub const fn reader_page_bottom(portrait: bool) -> i16 {
     if portrait {
-        display::WIDTH as i16 - 23
+        display::WIDTH as i16 - PORTRAIT_READING_SHEET_HEIGHT - 23
     } else {
         READER_PAGE_BOTTOM
     }
@@ -355,7 +359,7 @@ pub const fn reader_page_bottom(portrait: bool) -> i16 {
 /// Footer band top of the frame the settings select.
 pub const fn reader_footer_top(portrait: bool) -> i16 {
     if portrait {
-        display::WIDTH as i16 - 14
+        display::WIDTH as i16 - PORTRAIT_READING_SHEET_HEIGHT - 14
     } else {
         READER_FOOTER_TOP
     }
@@ -364,7 +368,7 @@ pub const fn reader_footer_top(portrait: bool) -> i16 {
 /// Page-counter baseline of the frame the settings select.
 pub const fn reader_footer_baseline_y(portrait: bool) -> i16 {
     if portrait {
-        display::WIDTH as i16 - 3
+        display::WIDTH as i16 - PORTRAIT_READING_SHEET_HEIGHT - 3
     } else {
         READER_FOOTER_BASELINE_Y
     }
@@ -419,6 +423,14 @@ const PANEL_LAYOUT_SALT: u16 = if display::WIDTH == 800 && display::HEIGHT == 48
     256
 };
 
+/// Orientation salt, stacked on the panel salt in the 9 version bits:
+/// landscape X4 keeps band 0..127, portrait X4 claims 128..255, landscape
+/// X3 claims 256..383, and portrait X3 claims 384..511. The value must stay
+/// below 512 after panel + orientation + routine version bumps because the
+/// layout config stores those bits above the 7 low type-setting bits.
+const ORIENTATION_LAYOUT_SALT: u16 = 128;
+const _: () = assert!(READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT + ORIENTATION_LAYOUT_SALT < 512);
+
 /// Orientation salt, stacked on the panel salt in the version bits: the
 /// portrait page box wraps at a different measure and paginates a
 /// different height, so portrait caches claim their own version band and
@@ -426,7 +438,7 @@ const PANEL_LAYOUT_SALT: u16 = if display::WIDTH == 800 && display::HEIGHT == 48
 /// bands per panel stay disjoint from every other panel's.
 const fn orientation_layout_salt(portrait: bool) -> u16 {
     if portrait {
-        512
+        ORIENTATION_LAYOUT_SALT
     } else {
         0
     }
@@ -1126,7 +1138,7 @@ mod tests {
         FontStyle::BoldItalic,
     ];
 
-    const ALL_SETTINGS: [TypeSettings; 54] = {
+    const ALL_SETTINGS: [TypeSettings; 108] = {
         let sizes = [FontSize::Small, FontSize::Medium, FontSize::Large];
         let spacings = [
             LineSpacing::Compact,
@@ -1139,7 +1151,8 @@ mod tests {
             FontFamily::Merriweather,
             FontFamily::Custom,
         ];
-        let mut out = [TypeSettings::DEFAULT; 54];
+        let portraits = [false, true];
+        let mut out = [TypeSettings::DEFAULT; 108];
         let mut i = 0;
         while i < 3 {
             let mut j = 0;
@@ -1148,13 +1161,17 @@ mod tests {
                 while k < 2 {
                     let mut l = 0;
                     while l < 3 {
-                        out[((i * 3 + j) * 2 + k) * 3 + l] = TypeSettings {
-                            size: sizes[i],
-                            spacing: spacings[j],
-                            weight: weights[k],
-                            family: families[l],
-                            portrait: false,
-                        };
+                        let mut m = 0;
+                        while m < 2 {
+                            out[(((i * 3 + j) * 2 + k) * 3 + l) * 2 + m] = TypeSettings {
+                                size: sizes[i],
+                                spacing: spacings[j],
+                                weight: weights[k],
+                                family: families[l],
+                                portrait: portraits[m],
+                            };
+                            m += 1;
+                        }
                         l += 1;
                     }
                     k += 1;
@@ -1235,6 +1252,14 @@ mod tests {
             );
             seen[index] = config;
         }
+    }
+
+    #[test]
+    fn portrait_footer_stays_above_summoned_sheet() {
+        let sheet_top = display::WIDTH as i16 - PORTRAIT_READING_SHEET_HEIGHT;
+        assert!(reader_footer_top(true) < sheet_top);
+        assert!(reader_footer_baseline_y(true) < sheet_top);
+        assert!(reader_page_bottom(true) < reader_footer_top(true));
     }
 
     #[test]
