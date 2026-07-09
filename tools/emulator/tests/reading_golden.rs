@@ -425,14 +425,49 @@ fn portrait_reading_surface_matches_goldens() {
     let portrait_bottom = ui::reading::reader_page_bottom(true);
     let pages = paginate_block_pages(&source, READER_PAGE_TOP, portrait_bottom);
     assert!(pages >= 1, "portrait fixture paginates");
-    let landscape_pages = paginate_block_pages(
-        &fixture(TypeSettings::DEFAULT),
-        READER_PAGE_TOP,
-        READER_PAGE_BOTTOM,
-    );
+    // Assert that orientation affects pagination using a custom test fixture
+    // designed to trigger different page boundaries due to different dimensions.
+    let create_test_blocks = || {
+        let mut blocks = Vec::new();
+        for _ in 0..21 {
+            blocks.push(FixtureBlock {
+                record: record(TextRole::Body, TextAlign::Justify, 3),
+                text: "A standard test paragraph of medium length that will wrap differently \
+                       in portrait and landscape orientation because of the width change."
+                    .into(),
+                style: FontStyle::Regular,
+                page_break_before: false,
+                paragraph_end: true,
+            });
+        }
+        blocks
+    };
+    let portrait_test = {
+        let mut f = FixtureBlocks {
+            blocks: create_test_blocks(),
+            settings: TypeSettings {
+                portrait: true,
+                ..TypeSettings::DEFAULT
+            },
+        };
+        finish_line_counts(&mut f);
+        f
+    };
+    let landscape_test = {
+        let mut f = FixtureBlocks {
+            blocks: create_test_blocks(),
+            settings: TypeSettings::DEFAULT,
+        };
+        finish_line_counts(&mut f);
+        f
+    };
+
+    let p_pages = paginate_block_pages(&portrait_test, READER_PAGE_TOP, portrait_bottom);
+    let l_pages = paginate_block_pages(&landscape_test, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+
     assert_ne!(
-        pages, landscape_pages,
-        "orientation participates in pagination: portrait={pages} landscape={landscape_pages}"
+        p_pages, l_pages,
+        "orientation participates in pagination: portrait={p_pages} landscape={l_pages}"
     );
 
     let page = page_record_at(&source, 0, READER_PAGE_TOP, portrait_bottom);
