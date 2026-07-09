@@ -812,35 +812,16 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
         FontStyle::Regular
     };
     if layout.portrait {
-        let cx = KEY_XS[slot];
-        let point = embedded_graphics_core::geometry::Point::new(
-            (cx - 12) as i32,
-            (KEY_STRIP_ICON_Y - 12) as i32,
+        // Portrait keys are named by a 1bpp icon centered over the button,
+        // not by a letterspaced label; `primary` carries no weight here.
+        let glyph = crate::icons::icon_for_label(label);
+        let left = KEY_XS[slot] - crate::icons::ICON_SIZE / 2;
+        crate::icons::draw_icon(
+            fb,
+            glyph,
+            left,
+            KEY_STRIP_ICON_Y - crate::icons::ICON_SIZE / 2,
         );
-        let color = embedded_graphics_core::pixelcolor::BinaryColor::Off;
-
-        use embedded_graphics::image::Image;
-        use embedded_graphics::prelude::*;
-        use embedded_icon::mdi::size24px::*;
-        use embedded_icon::NewIcon;
-
-        match label {
-            "home" => Image::new(&Home::new(color), point).draw(fb),
-            "library" | "contents" => Image::new(&FormatListBulleted::new(color), point).draw(fb),
-            "continue" | "open" => Image::new(&BookOpenOutline::new(color), point).draw(fb),
-            "wireless" => Image::new(&Wifi::new(color), point).draw(fb),
-            "settings" => Image::new(&Cog::new(color), point).draw(fb),
-            "previous" => Image::new(&ChevronLeft::new(color), point).draw(fb),
-            "next" => Image::new(&ChevronRight::new(color), point).draw(fb),
-            "close" | "cancel" => Image::new(&Close::new(color), point).draw(fb),
-            "change" | "edit" => Image::new(&Pencil::new(color), point).draw(fb),
-            "connect" | "done" => Image::new(&Check::new(color), point).draw(fb),
-            "forget" | "trash" => Image::new(&Delete::new(color), point).draw(fb),
-            "set up" => Image::new(&Plus::new(color), point).draw(fb),
-            "again" => Image::new(&Refresh::new(color), point).draw(fb),
-            _ => Image::new(&HelpCircleOutline::new(color), point).draw(fb),
-        }
-        .ok();
         return;
     }
     let y = KEY_YS[slot];
