@@ -112,9 +112,9 @@ structure; they draw from metrics instead of consts.
 Portrait metrics, in the same Imprint vocabulary:
 
 - **The key strip** is the left margin rail rotated onto the bottom edge:
-  `KEY_XS` positions match `KEY_YS`, which are explicitly mapped to the physical
-  locations of the two front rocker switches on the panel (rather than early 
-  assumptions of evenly spaced buttons). Instead of staggered
+  `KEY_XS` positions match `KEY_YS`, which are evenly spaced across the physical 
+  outer bounds of the device's two front rocker switches (e.g. `[99, 209, 319, 429]`).
+  Instead of staggered
   text labels and em-dashes, it uses a single baseline of icons centered
   over the buttons. The icons are hand-rolled 1bpp bitmaps authored in
   ASCII art and packed at compile time (`ui/src/icons.rs`) — a monochrome

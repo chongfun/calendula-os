@@ -21,12 +21,12 @@ use display::{Rect, HEIGHT, WIDTH};
 /// Vertical centers of the four left-bezel buttons on screen,
 /// top to bottom: Back, Confirm, Previous, Next.
 #[cfg(not(feature = "device-x3"))]
-const KEY_YS: [i16; 4] = [90, 182, 298, 390];
+const KEY_YS: [i16; 4] = [90, 190, 290, 390];
 
-/// On the X3 device, the physical buttons are two distinct rockers rather than
-/// evenly-spaced buttons. The layout matches their physical positions on the panel.
+/// On the X3 device, the physical buttons are two distinct rockers. This layout
+/// matches the outer bounds of the rockers but distributes the icons evenly.
 #[cfg(feature = "device-x3")]
-const KEY_YS: [i16; 4] = [99, 200, 328, 429];
+const KEY_YS: [i16; 4] = [99, 209, 319, 429];
 
 const KEY_DASH_X: i16 = 10;
 const KEY_LABEL_X: i16 = 40;
