@@ -54,6 +54,13 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// Raw physical dimensions of the display panel.
+    ///
+    /// # Warning
+    ///
+    /// Do not use this directly for application rendering, layout, or dirty tracking,
+    /// as it does not account for the current screen orientation. For orientation-aware
+    /// full-screen rects, use [`Rect::full_for_orientation`] instead.
     pub const FULL: Self = Self {
         x: 0,
         y: 0,
@@ -62,6 +69,9 @@ impl Rect {
     };
 
     /// Returns the full rect bounds matching the active orientation.
+    ///
+    /// Callers should use this instead of [`Rect::FULL`] to ensure orientation-aware sizing
+    /// is correctly applied for rendering, layouts, and screen redraw bounds.
     pub fn full_for_orientation(portrait: bool) -> Self {
         if portrait {
             Self {
