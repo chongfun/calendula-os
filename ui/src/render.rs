@@ -1007,14 +1007,7 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
         // above the heading area to avoid overlapping.
         let width = measure_text(small, label) as i16;
         let frame_width = FbFrame::Portrait.width() as i16;
-        draw_text(
-            fb,
-            small,
-            label,
-            frame_width - 16 - width,
-            24,
-            false,
-        );
+        draw_text(fb, small, label, frame_width - 16 - width, 24, false);
     } else if layout.mirrored {
         draw_text(
             fb,
