@@ -735,6 +735,31 @@ pub fn wrapped_line_count(
     lines
 }
 
+/// Compute the wrapped line count for a block in the given reading context.
+/// This is the shared logic cache builders and test fixtures use to compute
+/// line counts for blocks whose text might wrap across multiple lines.
+pub fn compute_block_line_count(
+    source: &impl ReadingBlocks,
+    index: usize,
+    text: &str,
+) -> u8 {
+    let Some(record) = source.block(index) else {
+        return 1;
+    };
+    let settings = source.type_settings();
+    let right_x = reader_right_x(settings.portrait);
+    let indent = block_first_line_indent(source, index);
+    let font = body_font(settings, source.block_style(index));
+    let max_width = right_x
+        - if record.align == TextAlign::Center {
+            READER_LEFT_X
+        } else {
+            reader_x_for(record.role)
+        };
+    let lines = wrapped_line_count(font, text, max_width, indent).max(1);
+    lines.min(u8::MAX as u16) as u8
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn wrapped_block_height(
     font: &'static BitmapFont,

@@ -197,21 +197,10 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
 /// Recompute the wrap-dependent line counts for the fixture's settings the
 /// way the cache builders do.
 fn finish_line_counts(fixture: &mut FixtureBlocks) {
-    let right_x = ui::reading::reader_right_x(fixture.settings.portrait);
     for index in 0..fixture.blocks.len() {
-        let record = fixture.blocks[index].record;
-        let indent = ui::reading::block_first_line_indent(fixture, index);
-        let font = ui::reading::body_font(fixture.settings, fixture.blocks[index].style);
-        let max_width = right_x
-            - if record.align == TextAlign::Center {
-                ui::reading::READER_LEFT_X
-            } else {
-                ui::reading::reader_x_for(record.role)
-            };
-        let lines =
-            ui::reading::wrapped_line_count(font, &fixture.blocks[index].text, max_width, indent)
-                .max(1);
-        fixture.blocks[index].record.line_count = lines.min(u8::MAX as u16) as u8;
+        let text = &fixture.blocks[index].text;
+        fixture.blocks[index].record.line_count =
+            ui::reading::compute_block_line_count(fixture, index, text);
     }
 }
 
@@ -442,9 +431,8 @@ fn portrait_reading_surface_matches_goldens() {
         READER_PAGE_BOTTOM,
     );
     assert_ne!(
-        (pages, true),
-        (landscape_pages, false),
-        "orientation participates in pagination"
+        pages, landscape_pages,
+        "orientation participates in pagination: portrait={pages} landscape={landscape_pages}"
     );
 
     let page = page_record_at(&source, 0, READER_PAGE_TOP, portrait_bottom);

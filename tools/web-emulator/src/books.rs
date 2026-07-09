@@ -159,20 +159,10 @@ impl BookStore {
 
     /// Compute the wrap-dependent line counts the parser could not know yet.
     fn finish_line_counts(&mut self) {
-        let right_x = ui::reading::reader_right_x(self.settings.portrait);
         for index in 0..self.blocks.len() {
-            let record = self.blocks[index].record;
-            let indent = block_first_line_indent(self, index);
-            let font = body_font(self.settings, self.blocks[index].style);
-            let max_width = right_x
-                - if record.align == TextAlign::Center {
-                    READER_LEFT_X
-                } else {
-                    reader_x_for(record.role)
-                };
-            let lines =
-                wrapped_line_count(font, &self.blocks[index].text, max_width, indent).max(1);
-            self.blocks[index].record.line_count = lines.min(u8::MAX as u16) as u8;
+            let text = self.blocks[index].text.clone();
+            self.blocks[index].record.line_count =
+                ui::reading::compute_block_line_count(self, index, &text);
         }
     }
 
