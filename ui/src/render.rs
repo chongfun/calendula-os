@@ -124,7 +124,10 @@ impl ShellLayout {
                 heading_cx: PORTRAIT_W / 2,
                 footer_right: PORTRAIT_W - 24,
                 footer_y: PORTRAIT_H - 72,
-                battery_y: 60,
+                // Phone-style status corner: the readout sits in the very
+                // top-right, above the centered heading (baseline 42) so it
+                // reads as its own marker rather than hanging off the rule.
+                battery_y: 30,
                 note_y: 320,
                 hint_y: 370,
                 qr_top: 210,
