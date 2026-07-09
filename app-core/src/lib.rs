@@ -197,7 +197,6 @@ impl RefreshPlanner {
         if last.kind == RenderKind::Boot
             || request.view != last.view
             || request.book_id != last.book_id
-            || request.orientation != last.orientation
             // A type-settings change redraws whole text columns; the clean
             // pass avoids fast-diff ghosting across the page.
             || request.font_size != last.font_size
