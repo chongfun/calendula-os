@@ -827,6 +827,43 @@ fn portrait_key_dash(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) -> 
     cx
 }
 
+/// The summoned reading key sheet: portrait reading stays chrome-free, and
+/// a named-key press raises this white band over the page's bottom edge —
+/// footer and all, the page reserves nothing for it. A hairline closes its
+/// top edge; inside, four 1bpp icons sit on one baseline, each centered
+/// over the physical button it names (following the front-pair swap), so
+/// the band stays shallow. Paging dismisses it (the reducer owns that).
+pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pages_left: bool) {
+    let mut layout = ShellLayout::for_orientation(orientation);
+    layout.pages_left = pages_left;
+    if !layout.portrait {
+        return;
+    }
+    let top = layout.frame_height - crate::reading::PORTRAIT_READING_SHEET_HEIGHT;
+    let width = fb.frame_width() as u16;
+    fill_rect(
+        fb,
+        Rect::new(
+            0,
+            top as u16,
+            width,
+            crate::reading::PORTRAIT_READING_SHEET_HEIGHT as u16,
+        ),
+        true,
+    );
+    hline(fb, 0, top, width as i16);
+    let icon_cy = layout.frame_height - 24;
+    for (slot, label) in ["home", "contents", "previous", "next"].iter().enumerate() {
+        let glyph = crate::icons::icon_for_label(label);
+        crate::icons::draw_icon(
+            fb,
+            glyph,
+            layout.key_pos(slot) - crate::icons::ICON_SIZE / 2,
+            icon_cy - crate::icons::ICON_SIZE / 2,
+        );
+    }
+}
+
 /// The four slots sit 80px apart — too tight for letterspaced caps side
 /// by side — so labels stagger across two baselines: outer slots (Back,
 /// Previous) high, inner slots (Confirm, Next) low, each centered over

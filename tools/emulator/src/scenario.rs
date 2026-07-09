@@ -46,6 +46,7 @@ struct Expect {
     font_weight: Option<String>,
     font_family: Option<String>,
     sleeping: Option<bool>,
+    reading_sheet: Option<bool>,
     library_count: Option<u16>,
     last_button: Option<String>,
     last_refresh: Option<String>,
@@ -103,6 +104,14 @@ impl Scenario {
                 return Err(format!(
                     "expected orientation {expected:?}, got {:?}",
                     state.orientation
+                ));
+            }
+        }
+        if let Some(reading_sheet) = self.expect.reading_sheet {
+            if state.reading_sheet != reading_sheet {
+                return Err(format!(
+                    "expected reading_sheet {reading_sheet}, got {}",
+                    state.reading_sheet
                 ));
             }
         }

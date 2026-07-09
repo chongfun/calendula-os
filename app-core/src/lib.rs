@@ -256,6 +256,9 @@ pub struct RenderRequest {
     pub book_id: u32,
     pub orientation: DisplayOrientation,
     pub front_buttons: FrontButtons,
+    /// Portrait reading's summoned key sheet is up; renderers draw it
+    /// over the page's bottom band.
+    pub reading_sheet: bool,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -646,6 +649,9 @@ pub struct ReaderState {
     pub sd_chapter_count: u8,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     pub read_request_pending: bool,
+    /// Portrait reading's summoned key sheet is up: the next named-key
+    /// press acts on the label it revealed instead of summoning again.
+    pub reading_sheet: bool,
     pub sync_status: SyncStatus,
     /// The saved Wi-Fi network's name; len 0 means none is saved. Fed by
     /// `SyncEvent::NetworkSaved` at boot and `CredentialsSaved` from the
@@ -682,6 +688,7 @@ impl ReaderState {
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             read_request_pending: false,
+            reading_sheet: false,
             sync_status: SyncStatus::NotConfigured,
             wifi_ssid: [0; 32],
             wifi_ssid_len: 0,
@@ -763,6 +770,9 @@ impl ReaderState {
                 next.read_request_pending = false;
             }
             (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
+                // Page turns never wait on the key sheet: reading momentum
+                // would make a turn a second press. A turn dismisses the sheet.
+                next.reading_sheet = false;
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page + 1 < self.sd_page_count {
                         next.page = self.page + 1;
@@ -781,6 +791,7 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Previous | Button::PagePrevious)) => {
+                next.reading_sheet = false;
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page > 0 {
                         next.page = self.page - 1;
@@ -797,15 +808,30 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Confirm)) => {
-                next.view = AppView::Chapters;
-                // `chapter` already tracks the reading position (kept current
-                // by the firmware's Loaded event, un-capped); opening the list
-                // lands the cursor there rather than on the saturated guess.
-                next.selection = self.chapter as u16;
+                // Portrait reading is full-bleed: the first named-key press
+                // summons the key sheet above the buttons (the margin
+                // appears when called for); the second press acts on the
+                // label it revealed. Landscape keeps its direct mapping.
+                if is_portrait(self.orientation) && !self.reading_sheet {
+                    next.reading_sheet = true;
+                } else {
+                    next.reading_sheet = false;
+                    next.view = AppView::Chapters;
+                    // `chapter` already tracks the reading position (kept
+                    // current by the firmware's Loaded event, un-capped);
+                    // opening the list lands the cursor there rather than
+                    // on the saturated guess.
+                    next.selection = self.chapter as u16;
+                }
             }
             (AppView::Reading, Some(Button::Back)) => {
-                next.view = AppView::Home;
-                next.selection = 0;
+                if is_portrait(self.orientation) && !self.reading_sheet {
+                    next.reading_sheet = true;
+                } else {
+                    next.reading_sheet = false;
+                    next.view = AppView::Home;
+                    next.selection = 0;
+                }
             }
             (AppView::Chapters, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.chapter_item_count(ctx) as u16);
@@ -889,6 +915,12 @@ impl ReaderState {
                 next.view = AppView::Home;
                 next.selection = 0;
             }
+        }
+
+        // The sheet is a reading-surface state; leaving the page (or the
+        // posture that summons it) always drops it.
+        if next.view != AppView::Reading || !is_portrait(next.orientation) {
+            next.reading_sheet = false;
         }
 
         next
@@ -1095,6 +1127,7 @@ impl ReaderState {
             book_id: self.book_id,
             orientation: self.orientation,
             front_buttons: self.front_buttons,
+            reading_sheet: self.reading_sheet,
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -1874,6 +1907,62 @@ mod tests {
         assert_eq!(next.selection, 1);
         let previous = press(next, Button::PagePrevious);
         assert_eq!(previous.selection, 0);
+    }
+
+    #[test]
+    fn portrait_reading_summons_the_sheet_before_acting() {
+        let mut state = press(ReaderState::boot(), Button::Confirm);
+        assert_eq!(state.view, AppView::Reading);
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+
+        // First named-key press summons; the second acts on its label.
+        let state = press(state, Button::Confirm);
+        assert!(state.reading_sheet);
+        assert_eq!(state.view, AppView::Reading, "summoning is not an action");
+        let state = press(state, Button::Confirm);
+        assert!(!state.reading_sheet);
+        assert_eq!(state.view, AppView::Chapters);
+
+        // Back out of Chapters returns to a sheetless page; Back then
+        // summons, and a second Back leaves for Home.
+        let state = press(state, Button::Back);
+        assert_eq!(state.view, AppView::Reading);
+        assert!(!state.reading_sheet);
+        let state = press(state, Button::Back);
+        assert!(state.reading_sheet);
+        let state = press(state, Button::Back);
+        assert_eq!(state.view, AppView::Home);
+        assert!(!state.reading_sheet);
+    }
+
+    #[test]
+    fn portrait_page_turns_never_wait_on_the_sheet() {
+        let mut state = press(ReaderState::boot(), Button::Confirm);
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+
+        // The browse pair pages immediately — no summon toll.
+        let chapter_before = state.chapter;
+        let state = press(state, Button::Next);
+        assert!(!state.reading_sheet);
+        assert_ne!(state.chapter, chapter_before, "next paged immediately");
+
+        // And a page turn dismisses an up sheet.
+        let state = press(state, Button::Confirm);
+        assert!(state.reading_sheet);
+        let state = press(state, Button::Next);
+        assert!(!state.reading_sheet);
+        assert_eq!(state.view, AppView::Reading);
+    }
+
+    #[test]
+    fn landscape_reading_keeps_direct_key_mappings() {
+        let state = press(ReaderState::boot(), Button::Confirm);
+        assert_eq!(state.view, AppView::Reading);
+
+        // No sheet in landscape: Confirm opens Chapters on the first press.
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.view, AppView::Chapters, "no sheet in landscape");
+        assert!(!state.reading_sheet);
     }
 
     #[test]
