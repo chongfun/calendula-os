@@ -1039,6 +1039,7 @@ where
             target_pages: visible_page_capacity,
             generate_toc_from_headings,
             generated_toc_for_spine: false,
+            pages_dirty: true,
         };
         // Stream the whole member through the resumable block parser in
         // bounded windows: spine XHTML of any size decodes completely, with
@@ -1462,6 +1463,12 @@ struct LibraryBlockSink<
     target_pages: usize,
     generate_toc_from_headings: bool,
     generated_toc_for_spine: bool,
+    /// The section arena changed since the last `rebuild_page_index`. Every
+    /// pushed XHTML run used to trigger a full re-walk of the accumulated
+    /// blocks (twice, via `flush_if_full`) — O(blocks²) per section. The
+    /// flag limits the rebuild to arena mutations, including paragraph-end
+    /// marks, which change heights without changing counts.
+    pages_dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1570,15 +1577,23 @@ where
         self.line_ink.width()
     }
 
+    fn rebuild_pages_if_dirty(&mut self) {
+        if self.pages_dirty {
+            reader_layout::rebuild_page_index(self.library);
+            self.pages_dirty = false;
+        }
+    }
+
     fn finish_spine(&mut self, partial: bool) {
         flush_styled_preview_line(self, true);
         self.flush_section(partial || self.stopped, false);
     }
 
     fn flush_section(&mut self, partial: bool, carry_incomplete: bool) -> bool {
-        reader_layout::rebuild_page_index(self.library);
+        self.rebuild_pages_if_dirty();
         if self.library.block_count() == 0 || self.library.page_count == 0 {
             self.library.clear_lines();
+            self.pages_dirty = true;
             return true;
         }
         if *self.section_count >= self.sections.len() {
@@ -1641,14 +1656,18 @@ where
                 self.library.text_len = full_text;
                 self.library.carry_last_page(cut);
                 reader_layout::rebuild_page_index(self.library);
+                self.pages_dirty = false;
             }
-            None => self.library.clear_lines(),
+            None => {
+                self.library.clear_lines();
+                self.pages_dirty = true;
+            }
         }
         true
     }
 
     fn flush_if_full(&mut self) {
-        reader_layout::rebuild_page_index(self.library);
+        self.rebuild_pages_if_dirty();
         if self.library.page_count >= self.target_pages
             || self.library.block_count() >= self.library.block_capacity().saturating_sub(4)
             || self.library.text_capacity_reached()
@@ -1899,6 +1918,9 @@ fn flush_styled_preview_line<
     if sink.line.is_empty() {
         if paragraph_end {
             sink.library.mark_last_block_paragraph_end();
+            // Height-only change: the trailing paragraph gap moved without
+            // block_count moving, so the page index is stale all the same.
+            sink.pages_dirty = true;
         }
         return;
     }
@@ -1951,6 +1973,7 @@ fn flush_styled_preview_line<
             sink.spine_index,
         );
     }
+    sink.pages_dirty = true;
     sink.line.clear();
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
