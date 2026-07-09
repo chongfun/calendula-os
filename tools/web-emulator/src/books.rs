@@ -6,11 +6,7 @@
 use display::font::{FontStyle, TypeSettings};
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
-use ui::reading::{
-    block_first_line_indent, block_height, block_ink_height, body_font, wrapped_line_count,
-    ReadingBlocks, READER_LEFT_X, READER_PAGE_TOP,
-    reader_x_for,
-};
+use ui::reading::{block_height, block_ink_height, ReadingBlocks, READER_PAGE_TOP};
 
 pub struct BookSource {
     pub title: &'static str,
