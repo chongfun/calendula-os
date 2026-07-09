@@ -11,7 +11,7 @@ use crate::{
     qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
     UiTocItem, UiView,
 };
-use display::fb::Framebuffer;
+use display::fb::{FbFrame, Framebuffer};
 use display::font::{
     draw_text, literata, literata_display, literata_small, measure_text, BitmapFont, FontStyle,
 };
@@ -44,10 +44,17 @@ const HEADING_CX: i16 = 480;
 const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
-/// Rows the Library list shows at once. Public so the firmware sizes the
-/// resident catalog window to cover the visible range it must stream in.
-pub const LIBRARY_VISIBLE_ROWS: usize = 6;
-const VISIBLE_ROWS: usize = LIBRARY_VISIBLE_ROWS;
+/// Rows the Library list shows at once. Public so the firmware slides the
+/// resident catalog window over the visible range it must stream in. The
+/// portrait page runs the long axis upright, so it seats more rows above
+/// its bottom key rail than landscape does above its footer line.
+pub const fn library_visible_rows(portrait: bool) -> usize {
+    if portrait {
+        10
+    } else {
+        6
+    }
+}
 /// Footer baseline: 24px up from the panel's bottom edge (the X4's
 /// historical 456). Panel-relative so the taller X3 keeps its apparatus in
 /// the corner rather than floating it mid-page.
@@ -60,6 +67,15 @@ const TITLE_LEADING: i16 = 54;
 #[derive(Clone, Copy)]
 struct ShellLayout {
     mirrored: bool,
+    portrait: bool,
+    /// Front buttons run pages-first: the key rail's slot labels must sit
+    /// beside the buttons that now carry them, so slot lookups rotate the
+    /// two pairs.
+    pages_left: bool,
+    /// Drawing-frame height: the panel's long axis stands upright in
+    /// portrait, so vertical furniture (footer, key rail) hangs off this
+    /// rather than the panel HEIGHT constant.
+    frame_height: i16,
     content_x: i16,
     content_right: i16,
     colophon_right: i16,
@@ -71,18 +87,50 @@ impl ShellLayout {
         match orientation {
             UiOrientation::LandscapeButtonsTop => Self {
                 mirrored: true,
+                portrait: false,
+                pages_left: false,
+                frame_height: HEIGHT as i16,
                 content_x: WIDTH as i16 - CONTENT_RIGHT,
                 content_right: WIDTH as i16 - CONTENT_X,
                 colophon_right: WIDTH as i16 - (COLOPHON_RIGHT - CONTENT_RIGHT),
                 heading_cx: WIDTH as i16 - HEADING_CX,
             },
+            UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => {
+                // The margin rail moves to the bottom edge beside the front
+                // buttons, so content spans the frame's full (short) width.
+                let width = FbFrame::Portrait.width() as i16;
+                Self {
+                    mirrored: false,
+                    portrait: true,
+                    pages_left: false,
+                    frame_height: FbFrame::Portrait.height() as i16,
+                    content_x: 44,
+                    content_right: width - 36,
+                    colophon_right: width - 24,
+                    heading_cx: width / 2,
+                }
+            }
             _ => Self {
                 mirrored: false,
+                portrait: false,
+                pages_left: false,
+                frame_height: HEIGHT as i16,
                 content_x: CONTENT_X,
                 content_right: CONTENT_RIGHT,
                 colophon_right: COLOPHON_RIGHT,
                 heading_cx: HEADING_CX,
             },
+        }
+    }
+
+    /// Physical key position for a semantic slot. With pages-left front
+    /// buttons the two pairs trade places whole, so semantic slots 0-1
+    /// (back, primary) draw beside physical positions 2-3 and vice versa.
+    const fn key_pos(self, slot: usize) -> i16 {
+        if self.pages_left {
+            KEY_YS[(slot + 2) % 4]
+        } else {
+            KEY_YS[slot]
         }
     }
 
@@ -97,6 +145,22 @@ impl ShellLayout {
             self.content_x - 32
         }
     }
+
+    /// Footer baseline: the panel-bottom corner line in landscape; lifted
+    /// above the bottom key rail in portrait.
+    const fn footer_y(self) -> i16 {
+        if self.portrait {
+            self.frame_height - 100
+        } else {
+            FOOTER_Y
+        }
+    }
+}
+
+fn shell_layout(shell: &UiShell<'_>) -> ShellLayout {
+    let mut layout = ShellLayout::for_orientation(shell.orientation);
+    layout.pages_left = shell.front_pages_left;
+    layout
 }
 
 pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -118,32 +182,40 @@ pub fn render_shell_overlay(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 /// the progress rule, and a colophon in chapter-and-pages terms.
 fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let mut layout = shell_layout(shell);
+    // Home direct-maps the physical key column and the reducer ignores the
+    // front-pair swap there (see apply_input), so its labels stay put too.
+    layout.pages_left = false;
     dash_key(fb, layout, 0, "library", false);
     dash_key(fb, layout, 1, "continue", true);
     dash_key(fb, layout, 2, "wireless", false);
     dash_key(fb, layout, 3, "settings", false);
 
-    // Long titles wrap to a second line that grows upward, keeping the
-    // author/rule/colophon furniture (and one-line titles) fixed.
+    // Long titles wrap to further lines that grow upward, keeping the
+    // author/rule/colophon furniture (and one-line titles) fixed. The
+    // portrait title page drops its block deeper into the taller leaf
+    // (the same three-eighths position), keeping the block's own leading —
+    // and its narrower measure gets a third line, since titles that fill
+    // two landscape lines need three upright ones.
+    let title_y = if layout.portrait {
+        layout.frame_height * 3 / 8
+    } else {
+        180
+    };
+    let max_lines = if layout.portrait { 3 } else { 2 };
     let title_font = literata_display();
-    let (first, second) = wrap_title(
+    let (lines, count, overflow) = wrap_title_lines(
         title_font,
         shell.active_book.title,
         layout.content_width() as u16,
+        max_lines,
     );
-    if second.is_empty() {
-        draw_text(fb, title_font, first, layout.content_x, 180, false);
-    } else {
-        draw_text(
-            fb,
-            title_font,
-            first,
-            layout.content_x,
-            180 - TITLE_LEADING,
-            false,
-        );
-        draw_text(fb, title_font, second, layout.content_x, 180, false);
+    for (index, line) in lines[..count].iter().enumerate() {
+        let y = title_y - TITLE_LEADING * (count - 1 - index) as i16;
+        let end = draw_text(fb, title_font, line, layout.content_x, y, false);
+        if overflow && index == count - 1 {
+            draw_text(fb, title_font, "...", end, y, false);
+        }
     }
     if !shell.active_book.author.is_empty() {
         ls_caps(
@@ -151,7 +223,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             literata_small(FontStyle::Regular),
             shell.active_book.author,
             layout.content_x,
-            222,
+            title_y + 42,
             3,
         );
     }
@@ -161,7 +233,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     } else {
         shell.active_book.progress_permille
     };
-    progress_rule(fb, layout.content_x, 280, 240, permille);
+    progress_rule(fb, layout.content_x, title_y + 100, 240, permille);
 
     // Colophon: the chapter name alone, in the book's italic voice —
     // the progress rule already answers "how far". Roman numeral
@@ -172,12 +244,11 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         shell.chapter,
         shell.chapter_title,
         layout.content_x,
-        312,
+        title_y + 132,
         layout.colophon_right - layout.content_x,
     );
 
     draw_battery_percent(fb, layout, shell.battery_percent);
-    mirror_framebuffer_long_axis(fb);
 }
 
 pub(crate) fn draw_chapter_colophon(
@@ -281,7 +352,7 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
 
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     dash_key(fb, layout, 0, "home", false);
     dash_key(fb, layout, 1, "open", true);
     dash_key(fb, layout, 2, "previous", false);
@@ -318,11 +389,11 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // range. A miss (stale window mid-refill) leaves that row blank rather than
     // drawing the wrong book.
     let selected_index = (shell.selection as usize).min(total.saturating_sub(1));
-    let start = library_scroll_start(selected_index, total);
+    let start = library_scroll_start(selected_index, total, layout.portrait);
     let window_start = shell.library_window_start as usize;
     let body = literata(FontStyle::Regular);
     let mut y = FIRST_ROW_Y;
-    for row in 0..VISIBLE_ROWS {
+    for row in 0..library_visible_rows(layout.portrait) {
         let abs = start + row;
         if abs >= total {
             break;
@@ -356,35 +427,44 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 /// Absolute catalog index of the first visible Library row that keeps
 /// `selection` on screen. Shared by the renderer and the firmware's window
 /// loader so both agree on which slice of the catalog is resident.
-pub fn library_scroll_start(selection: usize, total: usize) -> usize {
-    let start = if selection >= VISIBLE_ROWS {
-        selection + 1 - VISIBLE_ROWS
+pub fn library_scroll_start(selection: usize, total: usize, portrait: bool) -> usize {
+    let rows = library_visible_rows(portrait);
+    let start = if selection >= rows {
+        selection + 1 - rows
     } else {
         0
     };
-    start.min(total.saturating_sub(VISIBLE_ROWS))
+    start.min(total.saturating_sub(rows))
 }
 
 // The contents page uses tight index rows — a real table of contents,
 // not a menu: title, dot leaders, the chapter's book page right-aligned.
 const TOC_ROW_STEP: i16 = 36;
-pub const TOC_VISIBLE_ROWS: usize = 9;
+
+pub const fn toc_visible_rows(portrait: bool) -> usize {
+    if portrait {
+        15
+    } else {
+        9
+    }
+}
 
 /// Absolute TOC index of the first visible Contents row that keeps
 /// `selection` on screen. Shared by the renderer and the firmware's TOC
 /// window loader so both agree on which slice must be resident.
-pub fn toc_scroll_start(selection: usize, total: usize) -> usize {
-    let start = if selection >= TOC_VISIBLE_ROWS {
-        selection + 1 - TOC_VISIBLE_ROWS
+pub fn toc_scroll_start(selection: usize, total: usize, portrait: bool) -> usize {
+    let rows = toc_visible_rows(portrait);
+    let start = if selection >= rows {
+        selection + 1 - rows
     } else {
         0
     };
-    start.min(total.saturating_sub(TOC_VISIBLE_ROWS))
+    start.min(total.saturating_sub(rows))
 }
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     dash_key(fb, layout, 0, "close", false);
     dash_key(fb, layout, 1, "open", true);
     dash_key(fb, layout, 2, "previous", false);
@@ -414,10 +494,10 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // before each render. A miss (stale window mid-refill) leaves that row
     // blank rather than drawing the wrong chapter.
     let selected = (shell.selection as usize).min(total - 1);
-    let start = toc_scroll_start(selected, total);
+    let start = toc_scroll_start(selected, total, layout.portrait);
     let window_start = shell.chapters_window_start as usize;
     let mut y = FIRST_ROW_Y;
-    for row in 0..TOC_VISIBLE_ROWS {
+    for row in 0..toc_visible_rows(layout.portrait) {
         let abs = start + row;
         if abs >= total {
             break;
@@ -442,68 +522,45 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 
 fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     dash_key(fb, layout, 0, "home", false);
     dash_key(fb, layout, 1, "change", true);
     dash_key(fb, layout, 2, "previous", false);
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    index_row(
-        fb,
-        layout,
-        "Typeface",
-        font_family_label(shell.font_family, shell.custom_font_name),
-        FIRST_ROW_Y,
-        shell.selection == 0,
-    );
-    index_row(
-        fb,
-        layout,
-        "Type size",
-        font_size_label(shell.font_size),
-        FIRST_ROW_Y + 64,
-        shell.selection == 1,
-    );
-    index_row(
-        fb,
-        layout,
-        "Type weight",
-        font_weight_label(shell.font_weight),
-        FIRST_ROW_Y + 128,
-        shell.selection == 2,
-    );
-    index_row(
-        fb,
-        layout,
-        "Line spacing",
-        line_spacing_label(shell.line_spacing),
-        FIRST_ROW_Y + 192,
-        shell.selection == 3,
-    );
-    index_row(
-        fb,
-        layout,
-        "Refresh",
-        refresh_policy_label(shell.refresh_policy),
-        FIRST_ROW_Y + 256,
-        shell.selection == 4,
-    );
-    index_row(
-        fb,
-        layout,
-        "Orientation",
-        orientation_label(shell.orientation),
-        FIRST_ROW_Y + 320,
-        shell.selection == 5,
-    );
+    // Seven rows must clear the landscape footer line, so the settings
+    // index runs tighter than the Library's ROW_STEP.
+    const SETTINGS_ROW_STEP: i16 = 52;
+    let rows: [(&str, &str); 7] = [
+        (
+            "Typeface",
+            font_family_label(shell.font_family, shell.custom_font_name),
+        ),
+        ("Type size", font_size_label(shell.font_size)),
+        ("Type weight", font_weight_label(shell.font_weight)),
+        ("Line spacing", line_spacing_label(shell.line_spacing)),
+        ("Refresh", refresh_policy_label(shell.refresh_policy)),
+        ("Orientation", orientation_label(shell.orientation)),
+        ("Front buttons", front_buttons_label(shell.front_pages_left)),
+    ];
+    for (index, (name, value)) in rows.into_iter().enumerate() {
+        index_row(
+            fb,
+            layout,
+            name,
+            value,
+            FIRST_ROW_Y + index as i16 * SETTINGS_ROW_STEP,
+            shell.selection == index as u16,
+        );
+    }
 
     finish_working_screen(fb, shell, layout);
 }
 
 fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     match shell.sync_status {
         UiSyncStatus::ForgetPending => dash_key(fb, layout, 0, "cancel", false),
         _ => dash_key(fb, layout, 0, "home", false),
@@ -525,7 +582,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_unused(fb, layout, 3);
     heading(fb, layout, "Wireless");
 
-    let hint_y = 280;
+    let hint_y = if layout.portrait { 330 } else { 280 };
     match shell.sync_status {
         UiSyncStatus::NotConfigured => {
             centered_note(fb, layout, "no wi-fi network saved yet");
@@ -698,7 +755,26 @@ fn text_in(buf: &[u8], len: usize) -> &str {
 /// An em-dash faces the physical button; the label is letterspaced
 /// small caps, bold for the screen's one primary action.
 fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str, primary: bool) {
-    let y = KEY_YS[slot];
+    let style = if primary {
+        FontStyle::Bold
+    } else {
+        FontStyle::Regular
+    };
+    let label_font = literata_small(style);
+    if layout.portrait {
+        let cx = portrait_key_dash(fb, layout, slot);
+        let width = ls_width(label_font, label, 2);
+        ls_caps(
+            fb,
+            label_font,
+            label,
+            cx - width / 2,
+            portrait_key_label_y(layout, slot),
+            2,
+        );
+        return;
+    }
+    let y = layout.key_pos(slot);
     let dash_font = literata(FontStyle::Regular);
     let dash = "\u{2014}";
     let dash_x = if layout.mirrored {
@@ -707,12 +783,6 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
         KEY_DASH_X
     };
     draw_text(fb, dash_font, dash, dash_x, y + 8, false);
-    let style = if primary {
-        FontStyle::Bold
-    } else {
-        FontStyle::Regular
-    };
-    let label_font = literata_small(style);
     if layout.mirrored {
         let width = ls_width(label_font, label, 2);
         ls_caps(fb, label_font, label, dash_x - 24 - width, y + 6, 2);
@@ -723,6 +793,10 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
 
 /// An unused key keeps its bare dash: the mark stays, the word goes.
 fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
+    if layout.portrait {
+        portrait_key_dash(fb, layout, slot);
+        return;
+    }
     let dash_font = literata(FontStyle::Regular);
     let dash = "\u{2014}";
     let dash_x = if layout.mirrored {
@@ -730,7 +804,39 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
     } else {
         KEY_DASH_X
     };
-    draw_text(fb, dash_font, dash, dash_x, KEY_YS[slot] + 8, false);
+    draw_text(fb, dash_font, dash, dash_x, layout.key_pos(slot) + 8, false);
+}
+
+/// Portrait margin keys: the front-button column lies along the bottom
+/// bezel, so each slot's em-dash sits on one line hugging that edge,
+/// centered on its physical button (the same panel positions KEY_YS marks
+/// in landscape). Returns the slot's center x for the label.
+fn portrait_key_dash(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) -> i16 {
+    let cx = layout.key_pos(slot);
+    let dash_font = literata(FontStyle::Regular);
+    let dash = "\u{2014}";
+    let dash_w = measure_text(dash_font, dash) as i16;
+    draw_text(
+        fb,
+        dash_font,
+        dash,
+        cx - dash_w / 2,
+        layout.frame_height - 10,
+        false,
+    );
+    cx
+}
+
+/// The four slots sit 80px apart — too tight for letterspaced caps side
+/// by side — so labels stagger across two baselines: outer slots (Back,
+/// Previous) high, inner slots (Confirm, Next) low, each centered over
+/// its own dash.
+fn portrait_key_label_y(layout: ShellLayout, slot: usize) -> i16 {
+    if slot.is_multiple_of(2) {
+        layout.frame_height - 56
+    } else {
+        layout.frame_height - 28
+    }
 }
 
 fn heading(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
@@ -866,13 +972,10 @@ fn selection_arrow(fb: &mut Framebuffer, layout: ShellLayout, y: i16) {
 }
 
 fn centered_note(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
-    draw_text_centered(
-        fb,
-        literata(FontStyle::Italic),
-        text,
-        layout.heading_cx,
-        230,
-    );
+    // The taller portrait page carries its note a little further down to
+    // keep it in the same optical position under the heading rule.
+    let y = if layout.portrait { 280 } else { 230 };
+    draw_text_centered(fb, literata(FontStyle::Italic), text, layout.heading_cx, y);
 }
 
 /// "– n of m –" centered on the content column.
@@ -890,7 +993,7 @@ fn position_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, to
         literata_small(FontStyle::Regular),
         label,
         layout.heading_cx,
-        FOOTER_Y,
+        layout.footer_y(),
     );
 }
 
@@ -901,7 +1004,19 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
     push_str(&mut buf, &mut cursor, "%");
     let label = core::str::from_utf8(&buf[..cursor]).unwrap_or("");
     let small = literata_small(FontStyle::Regular);
-    if layout.mirrored {
+    if layout.portrait {
+        // The bottom corners belong to the key rail; the readout tucks
+        // into the content column's right edge on the footer line.
+        let width = measure_text(small, label) as i16;
+        draw_text(
+            fb,
+            small,
+            label,
+            layout.content_right - width,
+            layout.footer_y(),
+            false,
+        );
+    } else if layout.mirrored {
         draw_text(
             fb,
             small,
@@ -918,7 +1033,6 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
 
 fn finish_working_screen(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: ShellLayout) {
     draw_battery_percent(fb, layout, shell.battery_percent);
-    mirror_framebuffer_long_axis(fb);
 }
 
 fn hline(fb: &mut Framebuffer, x: i16, y: i16, w: i16) {
@@ -935,18 +1049,6 @@ fn fmt_numbered_chapter(number: usize, buf: &mut [u8; 32]) -> &str {
     push_str(buf, &mut cursor, "Chapter ");
     push_usize(buf, &mut cursor, number);
     core::str::from_utf8(&buf[..cursor]).unwrap_or("Chapter")
-}
-
-fn mirror_framebuffer_long_axis(fb: &mut Framebuffer) {
-    for y in 0..HEIGHT / 2 {
-        let other_y = HEIGHT - 1 - y;
-        for x in 0..WIDTH {
-            let top = fb.pixel(x, y);
-            let bottom = fb.pixel(x, other_y);
-            fb.set_pixel(x, y, bottom);
-            fb.set_pixel(x, other_y, top);
-        }
-    }
 }
 
 fn draw_text_truncated(
@@ -967,9 +1069,48 @@ fn draw_text_truncated(
 /// second line is glyph-truncated if the remainder still overflows,
 /// and a single unbreakable overlong word truncates on line one.
 pub(crate) fn wrap_title<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
-    if measure_text(font, text) <= max_w {
-        return (text, "");
+    let (lines, _, _) = wrap_title_lines(font, text, max_w, 2);
+    (lines[0], lines[1])
+}
+
+/// Break a title into up to `max_lines` lines at word boundaries, each
+/// within the measure. The final line is cut to the measure when the title
+/// still overflows, with room reserved for the caller's `...`; the returned
+/// flag says whether that happened.
+pub(crate) fn wrap_title_lines<'a>(
+    font: &BitmapFont,
+    text: &'a str,
+    max_w: u16,
+    max_lines: usize,
+) -> ([&'a str; 3], usize, bool) {
+    let max_lines = max_lines.clamp(1, 3);
+    let mut lines = [""; 3];
+    let mut count = 0;
+    let mut rest = text;
+    while count < max_lines - 1 && measure_text(font, rest) > max_w {
+        let (line, tail) = split_title_line(font, rest, max_w);
+        if tail.is_empty() {
+            // An unbreakable over-wide word: the cut line is final.
+            lines[count] = line;
+            return (lines, count + 1, true);
+        }
+        lines[count] = line;
+        count += 1;
+        rest = tail;
     }
+    if measure_text(font, rest) <= max_w {
+        lines[count] = rest;
+        return (lines, count + 1, false);
+    }
+    let dots = measure_text(font, "...");
+    lines[count] = fit_text(font, rest, max_w.saturating_sub(dots));
+    (lines, count + 1, true)
+}
+
+/// One title line at the widest word boundary within the measure, plus the
+/// untrimmed remainder. An over-wide first word cannot break: it comes back
+/// cut to the measure with an empty remainder.
+fn split_title_line<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
     let mut split = 0usize;
     for (index, _) in text.match_indices(' ') {
         if measure_text(font, &text[..index]) <= max_w {
@@ -981,8 +1122,7 @@ pub(crate) fn wrap_title<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&
     if split == 0 {
         return (fit_text(font, text, max_w), "");
     }
-    let rest = text[split + 1..].trim_start();
-    (&text[..split], fit_text(font, rest, max_w))
+    (&text[..split], text[split + 1..].trim_start())
 }
 
 pub(crate) fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
@@ -1044,7 +1184,15 @@ fn orientation_label(orientation: UiOrientation) -> &'static str {
     match orientation {
         UiOrientation::LandscapeButtonsBottom => "buttons down",
         UiOrientation::LandscapeButtonsTop => "buttons up",
-        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => "buttons down",
+        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => "portrait",
+    }
+}
+
+fn front_buttons_label(pages_left: bool) -> &'static str {
+    if pages_left {
+        "pages left"
+    } else {
+        "pages right"
     }
 }
 
@@ -1088,6 +1236,31 @@ fn font_family_label(family: display::font::FontFamily, custom_name: &str) -> &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_title_lines_fits_alice_on_three_portrait_lines() {
+        // The portrait content measure (444 - 44). Two lines cut this title
+        // mid-word; the third line lets it render whole.
+        let font = literata_display();
+        let title = "Alice's Adventures in Wonderland";
+        let (lines, count, overflow) = wrap_title_lines(font, title, 400, 3);
+        assert_eq!(&lines[..count], &["Alice's", "Adventures in", "Wonderland"]);
+        assert!(!overflow);
+        for line in &lines[..count] {
+            assert!(measure_text(font, line) <= 400);
+        }
+    }
+
+    #[test]
+    fn wrap_title_lines_flags_overflow_and_reserves_ellipsis_room() {
+        let font = literata_display();
+        let title = "The Collected Correspondence of an Unhurried Victorian Naturalist";
+        let (lines, count, overflow) = wrap_title_lines(font, title, 400, 3);
+        assert_eq!(count, 3);
+        assert!(overflow);
+        let dots = measure_text(font, "...");
+        assert!(measure_text(font, lines[2]) + dots <= 400);
+    }
 
     #[test]
     fn wrap_title_keeps_short_titles_on_one_line() {

@@ -115,9 +115,16 @@
       0 26px 60px -16px rgba(40,36,28,.55);
     margin-bottom: 14px;
     transform-origin: center;
-    transition: transform 420ms cubic-bezier(.2,.8,.2,1);
+    transition:
+      transform 420ms cubic-bezier(.2,.8,.2,1),
+      margin 420ms cubic-bezier(.2,.8,.2,1);
   }
   .device.buttons-up { transform: rotate(180deg); }
+  /* The portrait hold: a quarter turn counter-clockwise at full size —
+     the panel keeps its landscape resolution. Transforms leave layout
+     alone, so syncDeviceOrientation adds compensating margins that push
+     the sections below out of the taller visual box. */
+  .device.portrait { transform: rotate(-90deg); }
   @media (prefers-reduced-motion: reduce) {
     .device { transition: none; }
   }
@@ -468,6 +475,11 @@
   esp-web-install-button{ display:inline-flex; vertical-align:middle; }
   .flashbtn{ cursor:pointer; }
   .ewt-note{ font-size:13px; color:var(--label); }
+
+  /* The inline FWUPDATE.BIN link fell back to the browser's default blue,
+     which clashed with the warm palette; match the other prose links. */
+  .sdcard .txt a{ color:var(--mari); text-decoration:none; }
+  .sdcard .txt a:hover{ text-decoration:underline; }
 </style>
 </head>
 <body>
@@ -539,7 +551,7 @@
     <div class="stage">
       <p class="stitle"><span class="no">2</span>Flash over USB</p>
       <div class="asset">
-        <div><span class="k">Version</span><b>v0.2.1</b></div>
+        <div><span class="k">Version</span><b>v0.3.1</b></div>
         <div><span class="k">Image</span><b id="img">firmware-x4.bin</b></div>
         <div><span class="k">Size</span><b>~2.0 MB</b></div>
       </div>
@@ -565,7 +577,7 @@
     <p class="txt">Already running Marigold on an X4? Use <a href="https://github.com/Jon-Vii/marigold-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> instead and reboot normally.</p>
   </div>
 
-  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.2.1 release notes &#8599;</a></p>
+  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.3.1 release notes &#8599;</a></p>
 </section>
 
 <div class="colophon">
@@ -598,6 +610,8 @@
   const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
   const SAVE_KEY = board + "-progress-v1";
   const ORIENTATION_BUTTONS_TOP = 1;
+  const ORIENTATION_PORTRAIT_LEFT = 2;
+  const ORIENTATION_PORTRAIT_RIGHT = 3;
 
   const device = document.querySelector(".device");
   const canvas = document.getElementById("panel");
@@ -624,7 +638,13 @@
 
   function present() {
     const dpr = window.devicePixelRatio || 1;
-    const cssWidth = canvas.getBoundingClientRect().width || WIDTH;
+    // Layout width, not getBoundingClientRect(): the portrait hold rotates
+    // and scales the device chrome with a CSS transform, and the rect of a
+    // transformed canvas is its visual box — sizing the backing store from
+    // that undersamples the panel (fuzzy) at the wrong aspect. clientWidth
+    // ignores transforms; the browser then resamples the full-resolution
+    // canvas through the transform at device-pixel quality.
+    const cssWidth = canvas.clientWidth || WIDTH;
     const width = Math.max(1, Math.round(cssWidth * dpr));
     const height = Math.max(1, Math.round((width * HEIGHT) / WIDTH));
     if (canvas.width !== width || canvas.height !== height) {
@@ -647,17 +667,39 @@
 
   function syncDeviceOrientation(orientation) {
     device.classList.toggle("buttons-up", orientation === ORIENTATION_BUTTONS_TOP);
+    device.classList.toggle(
+      "portrait",
+      orientation === ORIENTATION_PORTRAIT_LEFT || orientation === ORIENTATION_PORTRAIT_RIGHT,
+    );
+    updatePortraitSpacing();
   }
+
+  // The quarter turn is a pure transform, so the device's layout box stays
+  // landscape-shaped; grow the vertical margins by the visual overhang
+  // (rotation about the center hangs (width - height) / 2 past each edge)
+  // so the page content below moves down instead of being covered.
+  function updatePortraitSpacing() {
+    if (device.classList.contains("portrait")) {
+      const overhang = Math.max(0, (device.offsetWidth - device.offsetHeight) / 2);
+      device.style.marginTop = `${Math.round(overhang)}px`;
+      device.style.marginBottom = `${Math.round(overhang) + 14}px`;
+    } else {
+      device.style.marginTop = "";
+      device.style.marginBottom = "";
+    }
+  }
+  addEventListener("resize", updatePortraitSpacing);
 
   // Restore the shelf position saved by a previous visit.
   try {
     const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
-    if (Array.isArray(saved) && (saved.length === 8 || saved.length === 9)) {
-      // Length-8 saves predate the Font setting; default it to Literata.
-      wasm.x4_restore(...saved, ...(saved.length === 8 ? [0] : []));
+    if (Array.isArray(saved) && saved.length >= 8 && saved.length <= 10) {
+      // Shorter saves predate the Font (length 8) and Front buttons
+      // (length 9) settings; default the missing trailing words to zero.
+      wasm.x4_restore(...saved, ...Array(10 - saved.length).fill(0));
     }
   } catch (_) { /* fresh start */ }
-  syncDeviceOrientation(new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 9)[3]);
+  syncDeviceOrientation(new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 10)[3]);
 
   const frame = () =>
     new Uint8ClampedArray(wasm.memory.buffer, wasm.x4_frame_ptr(), WIDTH * HEIGHT * 4);
@@ -766,7 +808,7 @@
   }
 
   function save() {
-    const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 9);
+    const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 10);
     syncDeviceOrientation(snap[3]);
     localStorage.setItem(SAVE_KEY, JSON.stringify([...snap]));
   }

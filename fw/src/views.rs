@@ -1,4 +1,4 @@
-use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
+use crate::reader_layout;
 use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 use crate::{catalog, AppView, DisplayOrientation, ReaderSource, RenderRequest};
 use core::fmt::Write;
@@ -18,10 +18,10 @@ const SHOW_INPUT_DEBUG: bool = false;
 const MAX_UI_CHAPTERS: usize = 256;
 
 pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
+    fb.set_frame(app_render::fb_frame(request.orientation));
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
         fb.clear(true);
         draw_sd_reader_page(fb, request, sd_library);
-        fb.flip_vertical();
     } else {
         let mut library_entries = [""; LIBRARY_WINDOW];
         let mut chapters = [UiTocItem {
@@ -36,13 +36,13 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     if SHOW_INPUT_DEBUG {
         draw_input_sample(fb, request);
     }
-    apply_orientation(fb, request.orientation);
 }
 
 pub(crate) fn render_custom_reader_from_root(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
     root: &crate::sd_session::SdRoot<'_>,
 ) -> bool {
     if request.view != AppView::Reading
@@ -53,10 +53,9 @@ pub(crate) fn render_custom_reader_from_root(
         return false;
     }
 
+    fb.set_frame(app_render::fb_frame(request.orientation));
     fb.clear(true);
-    draw_sd_reader_page_with_custom_font(fb, request, sd_library, root);
-    fb.flip_vertical();
-    apply_orientation(fb, request.orientation);
+    draw_sd_reader_page_with_custom_font(fb, request, sd_library, font_metrics, root);
     true
 }
 
@@ -69,10 +68,10 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_sleep(fb, request, &model);
-    apply_orientation(fb, request.orientation);
 }
 
 pub(crate) fn render_sleep_blank(fb: &mut Framebuffer) {
+    fb.set_frame(display::fb::FbFrame::Native);
     fb.clear(true);
     draw_text_centered_truncated_local(
         fb,
@@ -82,12 +81,6 @@ pub(crate) fn render_sleep_blank(fb: &mut Framebuffer) {
         display::WIDTH as i16,
         display::HEIGHT as i16 / 2,
     );
-}
-
-fn apply_orientation(fb: &mut Framebuffer, orientation: DisplayOrientation) {
-    if orientation == DisplayOrientation::LandscapeButtonsTop {
-        fb.rotate_180();
-    }
 }
 
 fn ui_model<'a>(
@@ -245,7 +238,11 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
     // on-disk TOC, page/block records still point at the old section but the
     // bytes underneath are TOC records -- drawing the body now paints garbage
     // glyphs. Hold the bookplate until the reading section reloads on exit.
+    // The page box is part of the layout: blocks wrapped for the portrait
+    // column must not paint into a landscape frame (they cover half the
+    // panel); hold the bookplate until the rebuild lands.
     let reading_buffer_ready = layout_current
+        && sd_library.portrait() == app_core::is_portrait(request.orientation)
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
         && !sd_library.text_holds_toc();
     match (sd_library.reader_status(), reading_buffer_ready) {
@@ -268,6 +265,7 @@ fn draw_sd_reader_page_with_custom_font(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
     root: &crate::sd_session::SdRoot<'_>,
 ) {
     let layout_current = sd_library.type_settings()
@@ -277,7 +275,11 @@ fn draw_sd_reader_page_with_custom_font(
             weight: request.font_weight,
             family: request.font_family,
         };
+    // The page box is part of the layout: blocks wrapped for the portrait
+    // column must not paint into a landscape frame (they cover half the
+    // panel); hold the bookplate until the rebuild lands.
     let reading_buffer_ready = layout_current
+        && sd_library.portrait() == app_core::is_portrait(request.orientation)
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
         && !sd_library.text_holds_toc();
     match (sd_library.reader_status(), reading_buffer_ready) {
@@ -290,7 +292,13 @@ fn draw_sd_reader_page_with_custom_font(
         (BookLoadStatus::Ready, _) => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            if !crate::custom_font::draw_reading_page_body(root, fb, sd_library, plan.page()) {
+            if !crate::custom_font::draw_reading_page_body(
+                root,
+                fb,
+                sd_library,
+                font_metrics,
+                plan.page(),
+            ) {
                 ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
             }
             draw_reader_footer(fb, request, sd_library, page_count);
@@ -347,26 +355,15 @@ fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_libra
         sd_library.active_book_labels(request.book_id, fallback.title, fallback.author);
 
     // Vertically center title + author block within the reader page region
-    // (panel-relative, so the X3's taller page carries the plate down).
-    let title_y = display::HEIGHT as i16 / 2 - 8;
+    // (frame-relative, so the X3's taller page and the portrait hold both
+    // carry the plate to their own middle).
+    let left = 8;
+    let right = fb.frame_width() as i16 - 8;
+    let title_y = fb.frame_height() as i16 / 2 - 8;
     let author_y = title_y + 36;
-    draw_text_centered_truncated_local(
-        fb,
-        title_font,
-        title,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        title_y,
-    );
+    draw_text_centered_truncated_local(fb, title_font, title, left, right, title_y);
     if !author.is_empty() {
-        draw_text_centered_truncated_local(
-            fb,
-            author_font,
-            author,
-            READER_LEFT_X,
-            READER_RIGHT_X,
-            author_y,
-        );
+        draw_text_centered_truncated_local(fb, author_font, author, left, right, author_y);
     }
 }
 
@@ -376,30 +373,18 @@ fn draw_sd_reader_error(fb: &mut Framebuffer, request: RenderRequest, sd_library
     let fallback = catalog::active_book(request.book_id);
     let (title, _) = sd_library.active_book_labels(request.book_id, fallback.title, "");
 
-    let title_y = 224i16;
+    let left = 8;
+    let right = fb.frame_width() as i16 - 8;
+    let title_y = fb.frame_height() as i16 / 2 - 16;
     let message_y = title_y + 40;
-    draw_text_centered_truncated_local(
-        fb,
-        title_font,
-        title,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        title_y,
-    );
+    draw_text_centered_truncated_local(fb, title_font, title, left, right, title_y);
     let error = sd_library.reader_error();
     let message: &str = if error.is_empty() {
         "Could not open this book."
     } else {
         error
     };
-    draw_text_centered_truncated_local(
-        fb,
-        body_font,
-        message,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        message_y,
-    );
+    draw_text_centered_truncated_local(fb, body_font, message, left, right, message_y);
 }
 
 fn draw_text_centered_truncated_local(

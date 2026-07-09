@@ -16,6 +16,7 @@ pub struct AppStateRecord {
     pub line_spacing: u8,
     pub font_weight: u8,
     pub font_family: u8,
+    pub front_buttons: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -48,6 +49,7 @@ impl AppStateRecord {
             line_spacing: Self::DEFAULT_LINE_SPACING,
             font_weight: Self::DEFAULT_FONT_WEIGHT,
             font_family: Self::DEFAULT_FONT_FAMILY,
+            front_buttons: 0,
             source_hash: 0,
             source_size: 0,
         }
@@ -68,11 +70,13 @@ impl AppStateRecord {
         out[26] = self.font_size;
         out[27] = self.line_spacing;
         // V4 adds the type weight at byte 28; the checksum span covers the
-        // reserved tail. The font family later took reserved byte 29: records
-        // written before it carry zero there, which is the Literata default,
-        // so no version bump was needed. Bytes 30-31 stay reserved zero.
+        // reserved tail. The font family later took reserved byte 29 and the
+        // front-button layout byte 30: records written before either carry
+        // zero there, which is the respective default (Literata, pages
+        // right), so no version bump was needed. Byte 31 stays reserved zero.
         out[28] = self.font_weight;
         out[29] = self.font_family;
+        out[30] = self.front_buttons;
         let checksum = checksum(&out[..32]);
         write_u32(&mut out, 32, checksum);
         out
@@ -105,6 +109,7 @@ impl AppStateRecord {
                     line_spacing: bytes[27],
                     font_weight: bytes[28],
                     font_family: bytes[29],
+                    front_buttons: bytes[30],
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                 })
@@ -133,6 +138,7 @@ impl AppStateRecord {
                     line_spacing,
                     font_weight: Self::DEFAULT_FONT_WEIGHT,
                     font_family: Self::DEFAULT_FONT_FAMILY,
+                    front_buttons: 0,
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                 })
@@ -153,6 +159,7 @@ impl AppStateRecord {
                     line_spacing: Self::DEFAULT_LINE_SPACING,
                     font_weight: Self::DEFAULT_FONT_WEIGHT,
                     font_family: Self::DEFAULT_FONT_FAMILY,
+                    front_buttons: 0,
                     source_hash: 0,
                     source_size: 0,
                 })
@@ -276,6 +283,7 @@ mod tests {
             line_spacing: 0,
             font_weight: 1,
             font_family: 1,
+            front_buttons: 1,
             source_hash: 0xDEAD_BEEF,
             source_size: 123_456,
         }
@@ -337,6 +345,21 @@ mod tests {
         let decoded = AppStateRecord::decode(&encoded).expect("pre-family v4 decodes");
         assert_eq!(decoded.font_family, AppStateRecord::DEFAULT_FONT_FAMILY);
         assert_eq!(decoded.font_weight, 1);
+    }
+
+    #[test]
+    fn pre_front_buttons_v4_records_decode_as_pages_right() {
+        // V4 records written before the Front buttons setting carry the
+        // reserved zero at byte 30; that must decode as the default
+        // (pages right) layout.
+        let mut encoded = record().encode();
+        encoded[30] = 0;
+        let checksum = checksum(&encoded[..32]);
+        write_u32(&mut encoded, 32, checksum);
+
+        let decoded = AppStateRecord::decode(&encoded).expect("pre-front-buttons v4 decodes");
+        assert_eq!(decoded.front_buttons, 0);
+        assert_eq!(decoded.font_family, 1);
     }
 
     #[test]

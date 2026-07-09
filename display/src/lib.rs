@@ -60,10 +60,17 @@ impl Rect {
     }
 
     pub fn clipped(self) -> Option<Self> {
-        let x0 = self.x.min(WIDTH as u16);
-        let y0 = self.y.min(HEIGHT as u16);
-        let x1 = self.x.saturating_add(self.w).min(WIDTH as u16);
-        let y1 = self.y.saturating_add(self.h).min(HEIGHT as u16);
+        self.clipped_to(WIDTH, HEIGHT)
+    }
+
+    /// Clip to a drawing frame's dimensions — the framebuffer's logical
+    /// frame is taller than the native buffer in portrait, so rect clipping
+    /// must follow the frame rather than the panel constants.
+    pub fn clipped_to(self, width: usize, height: usize) -> Option<Self> {
+        let x0 = self.x.min(width as u16);
+        let y0 = self.y.min(height as u16);
+        let x1 = self.x.saturating_add(self.w).min(width as u16);
+        let y1 = self.y.saturating_add(self.h).min(height as u16);
 
         if x1 <= x0 || y1 <= y0 {
             return None;

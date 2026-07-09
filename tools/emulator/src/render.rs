@@ -46,7 +46,6 @@ pub fn render_request(
     let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
     let model = demo_model(request, &borrowed_entries);
     render_shared_request(fb, request, &model);
-    apply_orientation(fb, request.orientation);
 }
 
 pub fn render_sleep(
@@ -57,13 +56,6 @@ pub fn render_sleep(
     let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
     let model = demo_model(request, &borrowed_entries);
     render_shared_sleep(fb, request, &model);
-    apply_orientation(fb, request.orientation);
-}
-
-fn apply_orientation(fb: &mut Framebuffer, orientation: app_core::DisplayOrientation) {
-    if orientation == app_core::DisplayOrientation::LandscapeButtonsTop {
-        fb.rotate_180();
-    }
 }
 
 #[cfg(feature = "gui")]
@@ -71,7 +63,7 @@ pub fn framebuffer_to_color_image(fb: &Framebuffer) -> ColorImage {
     let mut pixels = Vec::with_capacity(WIDTH * HEIGHT);
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
-            pixels.push(if fb.pixel(x, y) {
+            pixels.push(if fb.native_pixel(x, y) {
                 Color32::from_rgb(238, 236, 226)
             } else {
                 Color32::from_rgb(22, 22, 20)
@@ -115,7 +107,7 @@ pub fn encode_png<W: Write>(writer: W, fb: &Framebuffer) -> Result<(), png::Enco
     let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
     for y in 0..display::HEIGHT {
         for x in 0..display::WIDTH {
-            data.push(if fb.pixel(x, y) { 0xEE } else { 0x18 });
+            data.push(if fb.native_pixel(x, y) { 0xEE } else { 0x18 });
         }
     }
     writer.write_image_data(&data)
@@ -132,7 +124,7 @@ pub fn encode_presented_png<W: Write>(
     let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT * 4);
     for y in 0..display::HEIGHT {
         for x in 0..display::WIDTH {
-            if fb.pixel(x, y) {
+            if fb.native_pixel(x, y) {
                 data.extend_from_slice(&[238, 236, 226, 255]);
             } else {
                 data.extend_from_slice(&[22, 22, 20, 255]);

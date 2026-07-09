@@ -1,7 +1,7 @@
 use crate::Emulator;
 use app_core::{
-    AppView, Button, DisplayOrientation, LibraryEvent, RefreshPolicy, SyncError, SyncEvent,
-    SyncStatus,
+    AppView, Button, DisplayOrientation, FrontButtons, LibraryEvent, RefreshPolicy, SyncError,
+    SyncEvent, SyncStatus,
 };
 use display::epd::RefreshMode;
 use serde::Deserialize;
@@ -39,6 +39,7 @@ struct Expect {
     page: Option<u32>,
     selection: Option<u16>,
     orientation: Option<String>,
+    front_buttons: Option<String>,
     refresh_policy: Option<String>,
     font_size: Option<String>,
     line_spacing: Option<String>,
@@ -102,6 +103,15 @@ impl Scenario {
                 return Err(format!(
                     "expected orientation {expected:?}, got {:?}",
                     state.orientation
+                ));
+            }
+        }
+        if let Some(front_buttons) = &self.expect.front_buttons {
+            let expected = parse_front_buttons(front_buttons)?;
+            if state.front_buttons != expected {
+                return Err(format!(
+                    "expected front buttons {expected:?}, got {:?}",
+                    state.front_buttons
                 ));
             }
         }
@@ -309,6 +319,14 @@ fn parse_orientation(value: &str) -> Result<DisplayOrientation, String> {
         "PortraitButtonsLeft" | "portrait-left" => Ok(DisplayOrientation::PortraitButtonsLeft),
         "PortraitButtonsRight" | "portrait-right" => Ok(DisplayOrientation::PortraitButtonsRight),
         _ => Err(format!("unknown orientation: {value}")),
+    }
+}
+
+fn parse_front_buttons(value: &str) -> Result<FrontButtons, String> {
+    match value {
+        "PagesRight" | "pages-right" => Ok(FrontButtons::PagesRight),
+        "PagesLeft" | "pages-left" => Ok(FrontButtons::PagesLeft),
+        _ => Err(format!("unknown front buttons: {value}")),
     }
 }
 

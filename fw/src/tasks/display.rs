@@ -75,6 +75,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let mut prev_prestaged = false;
     static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
     let sd_library = SD_LIBRARY.take();
+    // ASCII glyph metrics for the custom font pack; shared by the build's
+    // line measurement and the reading-page draw so both stay off the card.
+    static FONT_METRICS: ConstStaticCell<crate::custom_font::MetricCache> =
+        ConstStaticCell::new(crate::custom_font::MetricCache::new());
+    let font_metrics = FONT_METRICS.take();
 
     esp_println::println!("display: init start");
     display_flush::init_panel(&mut epd).await;
@@ -127,6 +132,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             &mut sd_cs,
                             sd_library,
                             request.selection,
+                            app_core::is_portrait(request.orientation),
                         );
                     } else if ReaderSource::from_book_id(request.book_id).is_sd() {
                         if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
@@ -144,13 +150,21 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                                     sd_library,
                                     index,
                                     request.selection as usize,
+                                    app_core::is_portrait(request.orientation),
                                 );
                             }
                         }
                     }
                 }
                 let layout_start = Instant::now();
-                if !render_custom_reader(&mut epd, &mut sd_cs, fb, request, sd_library) {
+                if !render_custom_reader(
+                    &mut epd,
+                    &mut sd_cs,
+                    fb,
+                    request,
+                    sd_library,
+                    font_metrics,
+                ) {
                     crate::views::render(fb, request, sd_library);
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
@@ -351,6 +365,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut epd,
                     &mut sd_cs,
                     sd_library,
+                    font_metrics,
                     &mut epub_scratch,
                     &mut sync_session,
                     &mut pending_progress,
@@ -375,6 +390,7 @@ fn render_custom_reader(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
 ) -> bool {
     if request.view != AppView::Reading
         || !ReaderSource::from_book_id(request.book_id).is_sd()
@@ -385,7 +401,7 @@ fn render_custom_reader(
         return false;
     }
     crate::sd_session::with_root(epd, sd_cs, |root| {
-        crate::views::render_custom_reader_from_root(fb, request, sd_library, root)
+        crate::views::render_custom_reader_from_root(fb, request, sd_library, font_metrics, root)
     })
     .unwrap_or(false)
 }
@@ -400,21 +416,23 @@ fn open_loading_plate_request(
     sd_library: &ReaderStore,
     last_request: Option<RenderRequest>,
 ) -> Option<RenderRequest> {
-    let (book_id, index, target_pages, type_settings) = match *command {
+    let (book_id, index, target_pages, type_settings, portrait) = match *command {
         StorageCommand::OpenBook {
             book_id,
             index,
             target_pages,
             type_settings,
+            portrait,
             ..
-        } => (book_id, index, target_pages, type_settings),
+        } => (book_id, index, target_pages, type_settings, portrait),
         StorageCommand::ExtendSection {
             book_id,
             index,
             target_pages,
             type_settings,
+            portrait,
             ..
-        } => (book_id, index, target_pages, type_settings),
+        } => (book_id, index, target_pages, type_settings, portrait),
         _ => return None,
     };
     // Only SD books re-paginate and route to the reader loading plate; the
@@ -423,6 +441,7 @@ fn open_loading_plate_request(
         return None;
     }
     if sd_library.type_settings() == type_settings
+        && sd_library.portrait() == portrait
         && sd_library.covers_global_page(index as usize, target_pages as u32)
     {
         return None;
@@ -447,6 +466,7 @@ fn handle_storage_command(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     sd_library: &mut ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     sync_session: &mut SyncSession,
     pending_progress: &mut Option<AppStateRecord>,
@@ -541,6 +561,7 @@ fn handle_storage_command(
             chapter,
             target_pages,
             type_settings,
+            portrait,
         }
         | StorageCommand::ExtendSection {
             request_id,
@@ -549,6 +570,7 @@ fn handle_storage_command(
             chapter,
             target_pages,
             type_settings,
+            portrait,
         } => {
             let storage_start = Instant::now();
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
@@ -569,7 +591,7 @@ fn handle_storage_command(
             // Adopt the command's type settings before the RAM fast path:
             // a settings change drops the loaded page coverage, so the
             // request falls through to the cache load/rebuild below.
-            sd_library.set_type_settings(type_settings);
+            sd_library.set_layout(type_settings, portrait);
             // A fresh selection (chapter 0, page 0) resumes from the
             // book's own saved position; explicit page requests pass
             // through untouched. Extends never resume.
@@ -642,6 +664,7 @@ fn handle_storage_command(
                 chapter,
                 target_pages as usize,
                 scratch,
+                font_metrics,
             );
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
@@ -710,12 +733,13 @@ fn handle_storage_command(
             index,
             chapter,
             type_settings,
+            portrait,
         } => {
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
             }
             crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
-            sd_library.set_type_settings(type_settings);
+            sd_library.set_layout(type_settings, portrait);
             // The TOC is still in the buffer; resolve the chapter's start page
             // before loading the section overwrites it. Re-ensure the window
             // covers the selection in case it slid since the overview render.
@@ -725,6 +749,7 @@ fn handle_storage_command(
                 sd_library,
                 index as usize,
                 chapter as usize,
+                portrait,
             );
             let target_page = sd_library.overview_page_at(chapter as usize);
             let scratch = ensure_epub_scratch(epub_scratch);
@@ -736,6 +761,7 @@ fn handle_storage_command(
                 chapter,
                 target_page as usize,
                 scratch,
+                font_metrics,
             );
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
@@ -792,6 +818,7 @@ fn handle_storage_command(
                 line_spacing: record.line_spacing,
                 font_weight: record.font_weight,
                 font_family: record.font_family,
+                front_buttons: record.front_buttons,
                 source_hash,
                 source_size,
             };
@@ -909,6 +936,7 @@ fn send_resumed_position(
         line_spacing: request.line_spacing as u8,
         font_weight: request.font_weight as u8,
         font_family: request.font_family as u8,
+        front_buttons: request.front_buttons as u8,
     });
 }
 
@@ -1001,6 +1029,7 @@ fn restore_saved_state(
         line_spacing: record.line_spacing,
         font_weight: record.font_weight,
         font_family: record.font_family,
+        front_buttons: record.front_buttons,
     });
 }
 
@@ -1035,6 +1064,8 @@ fn sleep_request_from_saved_state(
         book_id: ReaderSource::sd(index).book_id(),
         orientation: display_orientation_from_u8(record.reading_orientation)
             .unwrap_or(DisplayOrientation::LandscapeButtonsBottom),
+        front_buttons: app_core::front_buttons_from_u8(record.front_buttons)
+            .unwrap_or(app_core::FrontButtons::PagesRight),
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

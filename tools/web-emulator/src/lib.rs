@@ -51,7 +51,7 @@ struct WebEmulator {
     ops: Vec<(f64, Op)>,
     frame_seq: u32,
     last_refresh: u32,
-    snapshot: [u32; 9],
+    snapshot: [u32; 10],
 }
 
 impl WebEmulator {
@@ -69,7 +69,7 @@ impl WebEmulator {
             ops: Vec::new(),
             frame_seq: 0,
             last_refresh: 0,
-            snapshot: [0; 9],
+            snapshot: [0; 10],
         };
         emu.state = emu.state.apply_library_event(
             emu.ctx,
@@ -195,12 +195,14 @@ impl WebEmulator {
     }
 
     fn store_ready_for(&self, book_index: u16) -> bool {
-        self.store_book == Some(book_index)
-            && self
-                .store
-                .as_ref()
-                .is_some_and(|store| store.type_settings() == self.state.type_settings())
-            && self.load_status == LoadStatus::Ready
+        let layout_current = self.store.as_ref().is_some_and(|store| {
+            store.type_settings() == self.state.type_settings()
+                && ReadingBlocks::page_box(store)
+                    == ui::reading::PageBox::for_portrait(app_core::is_portrait(
+                        self.state.orientation,
+                    ))
+        });
+        self.store_book == Some(book_index) && layout_current && self.load_status == LoadStatus::Ready
     }
 
     fn finish_open(&mut self, book_index: u16) {
@@ -214,7 +216,11 @@ impl WebEmulator {
             return;
         }
         let source = &SHELF[book_index as usize % SHELF.len()];
-        self.store = Some(BookStore::build(source, self.state.type_settings()));
+        self.store = Some(BookStore::build(
+            source,
+            self.state.type_settings(),
+            app_core::is_portrait(self.state.orientation),
+        ));
         self.store_book = Some(book_index);
         self.load_status = LoadStatus::Ready;
     }
@@ -249,11 +255,12 @@ impl WebEmulator {
                 line_spacing: self.state.line_spacing as u8,
                 font_weight: self.state.font_weight as u8,
                 font_family: self.state.font_family as u8,
+                front_buttons: self.state.front_buttons as u8,
             },
         );
     }
 
-    fn restore(&mut self, snapshot: [u32; 9]) {
+    fn restore(&mut self, snapshot: [u32; 10]) {
         self.state = self.state.apply_library_event(
             self.ctx,
             LibraryEvent::Restored {
@@ -267,6 +274,7 @@ impl WebEmulator {
                 line_spacing: snapshot[6] as u8,
                 font_weight: snapshot[7] as u8,
                 font_family: snapshot[8] as u8,
+                front_buttons: snapshot[9] as u8,
             },
         );
         let book_index = ReaderSource::from_book_id(snapshot[0]).sd_index().unwrap_or(0);
@@ -287,6 +295,7 @@ impl WebEmulator {
             u32::from(persisted.line_spacing),
             u32::from(persisted.font_weight),
             u32::from(persisted.font_family),
+            u32::from(persisted.front_buttons),
         ];
     }
 
@@ -295,30 +304,23 @@ impl WebEmulator {
         let sd_reading = request.view == AppView::Reading
             && ReaderSource::from_book_id(request.book_id).is_sd();
         if sd_reading {
+            self.fb
+                .set_frame(ui::app_render::fb_frame(request.orientation));
             self.fb.clear(true);
             self.draw_reader_page(request);
-            self.fb.flip_vertical();
         } else {
             self.draw_shell(request, false);
         }
-        self.apply_orientation(request.orientation);
         self.finish_frame(request);
     }
 
     fn render_sleep(&mut self) {
         let request = self.state.render_request(RenderKind::Page);
         self.draw_shell(request, true);
-        self.apply_orientation(request.orientation);
         self.blit();
         self.planner.record_sleep();
         self.last_refresh = RefreshMode::Full as u32 + 1;
         self.frame_seq = self.frame_seq.wrapping_add(1);
-    }
-
-    fn apply_orientation(&mut self, orientation: DisplayOrientation) {
-        if orientation == DisplayOrientation::LandscapeButtonsTop {
-            self.fb.rotate_180();
-        }
     }
 
     fn finish_frame(&mut self, request: app_core::RenderRequest) {
@@ -422,7 +424,7 @@ impl WebEmulator {
     fn blit(&mut self) {
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let color = if self.fb.pixel(x, HEIGHT - 1 - y) { PAPER } else { INK };
+                let color = if self.fb.native_pixel(x, HEIGHT - 1 - y) { PAPER } else { INK };
                 let offset = (y * WIDTH + x) * 4;
                 self.rgba[offset] = color[0];
                 self.rgba[offset + 1] = color[1];
@@ -465,6 +467,7 @@ fn storage_command_for_transition(
             chapter: next.chapter,
             target_pages: 5,
             type_settings: next.type_settings(),
+            portrait: app_core::is_portrait(next.orientation),
         });
     }
 
@@ -476,6 +479,7 @@ fn storage_command_for_transition(
             chapter: next.chapter,
             target_pages: next.page.saturating_add(5).min(u16::MAX as u32) as u16,
             type_settings: next.type_settings(),
+            portrait: app_core::is_portrait(next.orientation),
         });
     }
 
@@ -563,9 +567,19 @@ pub extern "C" fn x4_restore(
     spacing: u32,
     weight: u32,
     family: u32,
+    front_buttons: u32,
 ) {
     emulator().restore([
-        book_id, chapter, page, orientation, policy, size, spacing, weight, family,
+        book_id,
+        chapter,
+        page,
+        orientation,
+        policy,
+        size,
+        spacing,
+        weight,
+        family,
+        front_buttons,
     ]);
 }
 

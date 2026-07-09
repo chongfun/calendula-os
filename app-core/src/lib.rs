@@ -4,7 +4,7 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
-pub const SETTINGS_ITEMS: u8 = 6;
+pub const SETTINGS_ITEMS: u8 = 7;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -117,6 +117,16 @@ enum HomeAction {
     Files,
     Wireless,
     Settings,
+}
+
+/// Where the front page-turn pair sits. The front row is two pairs —
+/// back/confirm and previous/next. `PagesLeft` exchanges the pairs whole,
+/// keeping each pair's internal order, for readers whose thumb rests on
+/// the other end of the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontButtons {
+    PagesRight,
+    PagesLeft,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +255,7 @@ pub struct RenderRequest {
     pub selection: u16,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
+    pub front_buttons: FrontButtons,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -281,6 +292,9 @@ pub enum StorageCommand {
         chapter: u8,
         target_pages: u16,
         type_settings: TypeSettings,
+        /// Paginate into the portrait page box. Rides beside the type
+        /// settings because it changes wrap points the same way.
+        portrait: bool,
     },
     ExtendSection {
         request_id: u32,
@@ -289,6 +303,7 @@ pub enum StorageCommand {
         chapter: u8,
         target_pages: u16,
         type_settings: TypeSettings,
+        portrait: bool,
     },
     /// Load the full chapter list (TOC.BIN) into the reader's section buffer
     /// for the Chapters overview. The reading section reloads on exit.
@@ -306,6 +321,7 @@ pub enum StorageCommand {
         index: u16,
         chapter: u8,
         type_settings: TypeSettings,
+        portrait: bool,
     },
     StoreProgress(PersistedAppState),
     /// Hand the EPUB scratch to the wifi task as sync-session heap. One
@@ -498,6 +514,7 @@ pub enum LibraryEvent {
         line_spacing: u8,
         font_weight: u8,
         font_family: u8,
+        front_buttons: u8,
     },
 }
 
@@ -583,6 +600,7 @@ pub struct PersistedAppState {
     pub line_spacing: u8,
     pub font_weight: u8,
     pub font_family: u8,
+    pub front_buttons: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -610,6 +628,7 @@ pub struct ReaderState {
     pub chapter: u8,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
+    pub front_buttons: FrontButtons,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -645,6 +664,7 @@ impl ReaderState {
             chapter: 0,
             book_id: 1,
             orientation: DisplayOrientation::LandscapeButtonsBottom,
+            front_buttons: FrontButtons::PagesRight,
             refresh_policy: RefreshPolicy::FullOnWake,
             font_size: FontSize::Medium,
             line_spacing: LineSpacing::Normal,
@@ -687,7 +707,18 @@ impl ReaderState {
             battery_mv,
             battery_percent,
         } = event;
-        let button = orient_button(self.orientation, raw_button);
+        let button = orient_button(
+            self.orientation,
+            swap_front_pairs(self.front_buttons, raw_button),
+        );
+        // Home is positional, not grammatical: its four actions direct-map
+        // the physical key column, with the ordering itself ranked (continue
+        // second from the top). The front-pair swap moves roles to the
+        // resting thumb, but Home has no roles to move -- riding the swap
+        // would demote continue to the far end and put wireless and settings
+        // on the comfortable pair. So Home maps from the un-swapped keys and
+        // reads the same for every user.
+        let home_button = orient_button(self.orientation, raw_button);
         let mut next = self;
         next.last_button = button;
         next.aux_raw = aux_raw;
@@ -700,8 +731,10 @@ impl ReaderState {
         match (self.view, button) {
             (_, None) => {}
             (_, Some(Button::Power)) => {}
-            (AppView::Home, Some(button)) => {
-                next = apply_home_action(next, home_action_for_button(button));
+            (AppView::Home, Some(_)) => {
+                if let Some(home_button) = home_button {
+                    next = apply_home_action(next, home_action_for_button(home_button));
+                }
             }
             (AppView::Library, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.library_item_count(ctx));
@@ -953,6 +986,7 @@ impl ReaderState {
                 line_spacing,
                 font_weight,
                 font_family,
+                front_buttons,
             } => {
                 self.book_id = book_id;
                 self.chapter = chapter;
@@ -997,6 +1031,9 @@ impl ReaderState {
                         } else {
                             family
                         };
+                }
+                if let Some(front) = front_buttons_from_u8(front_buttons) {
+                    self.front_buttons = front;
                 }
                 self.dirty = Rect::FULL;
             }
@@ -1057,6 +1094,7 @@ impl ReaderState {
             selection: self.selection,
             book_id: self.book_id,
             orientation: self.orientation,
+            front_buttons: self.front_buttons,
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -1088,6 +1126,7 @@ impl ReaderState {
             line_spacing: self.line_spacing as u8,
             font_weight: self.font_weight as u8,
             font_family: self.font_family as u8,
+            front_buttons: self.front_buttons as u8,
             source_hash: 0,
             source_size: 0,
         }
@@ -1127,12 +1166,30 @@ impl ReaderState {
     }
 }
 
+/// Whether an orientation stands the panel's long axis upright. The two
+/// portrait variants share one page geometry, so reading layout keys off
+/// this rather than the exact variant.
+pub fn is_portrait(orientation: DisplayOrientation) -> bool {
+    matches!(
+        orientation,
+        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight
+    )
+}
+
 pub fn display_orientation_from_u8(value: u8) -> Option<DisplayOrientation> {
     match value {
         0 => Some(DisplayOrientation::LandscapeButtonsBottom),
         1 => Some(DisplayOrientation::LandscapeButtonsTop),
         2 => Some(DisplayOrientation::PortraitButtonsLeft),
         3 => Some(DisplayOrientation::PortraitButtonsRight),
+        _ => None,
+    }
+}
+
+pub fn front_buttons_from_u8(value: u8) -> Option<FrontButtons> {
+    match value {
+        0 => Some(FrontButtons::PagesRight),
+        1 => Some(FrontButtons::PagesLeft),
         _ => None,
     }
 }
@@ -1203,19 +1260,43 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
     state
 }
 
+/// Positional button semantics: after the device rotates, the button
+/// sitting where Back used to be still acts as Back. The 180-degree flip
+/// reverses both the front column and the side pair. The quarter turn to
+/// portrait keeps everything: the front column reads left-to-right along
+/// the bottom bezel in its natural order, and the side pair stands on end
+/// with the forward key already at its natural end (hardware-walked
+/// July 9 2026 — a swap here came out inverted on the device).
+/// `PagesLeft` exchanges the two front pairs whole (back/confirm with
+/// previous/next) before the orientation map, so the swap is a fact about
+/// the physical buttons rather than the current hold. The side page rail
+/// is untouched.
+fn swap_front_pairs(front_buttons: FrontButtons, button: Option<Button>) -> Option<Button> {
+    if front_buttons == FrontButtons::PagesRight {
+        return button;
+    }
+    Some(match button? {
+        Button::Back => Button::Previous,
+        Button::Confirm => Button::Next,
+        Button::Previous => Button::Back,
+        Button::Next => Button::Confirm,
+        other => other,
+    })
+}
+
 fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Option<Button> {
     let button = button?;
-    if orientation != DisplayOrientation::LandscapeButtonsTop {
-        return Some(button);
-    }
-    Some(match button {
-        Button::Power => Button::Power,
-        Button::Back => Button::Next,
-        Button::Confirm => Button::Previous,
-        Button::Previous => Button::Confirm,
-        Button::Next => Button::Back,
-        Button::PagePrevious => Button::PageNext,
-        Button::PageNext => Button::PagePrevious,
+    Some(match orientation {
+        DisplayOrientation::LandscapeButtonsTop => match button {
+            Button::Power => Button::Power,
+            Button::Back => Button::Next,
+            Button::Confirm => Button::Previous,
+            Button::Previous => Button::Confirm,
+            Button::Next => Button::Back,
+            Button::PagePrevious => Button::PageNext,
+            Button::PageNext => Button::PagePrevious,
+        },
+        _ => button,
     })
 }
 
@@ -1255,11 +1336,22 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
             };
         }
         5 => {
+            // Three holds are offered: the two landscapes and the one
+            // portrait (front buttons below the screen). The buttons-above
+            // portrait variant stays in the enum for the persistence format
+            // but has no use case, so the cycle skips it.
             state.orientation = match state.orientation {
                 DisplayOrientation::LandscapeButtonsBottom => {
                     DisplayOrientation::LandscapeButtonsTop
                 }
+                DisplayOrientation::LandscapeButtonsTop => DisplayOrientation::PortraitButtonsLeft,
                 _ => DisplayOrientation::LandscapeButtonsBottom,
+            };
+        }
+        6 => {
+            state.front_buttons = match state.front_buttons {
+                FrontButtons::PagesRight => FrontButtons::PagesLeft,
+                FrontButtons::PagesLeft => FrontButtons::PagesRight,
             };
         }
         _ => {}
@@ -1591,6 +1683,7 @@ mod tests {
                 line_spacing: LineSpacing::Normal as u8,
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
+                front_buttons: FrontButtons::PagesRight as u8,
             },
         );
         assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
@@ -1625,6 +1718,7 @@ mod tests {
                 line_spacing: LineSpacing::Normal as u8,
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
+                front_buttons: FrontButtons::PagesRight as u8,
             },
         );
         assert_eq!(state.selection, home_selection);
@@ -1687,22 +1781,99 @@ mod tests {
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 5);
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, 6);
+        let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
     }
 
     #[test]
-    fn settings_change_key_toggles_landscape_orientation() {
+    fn settings_change_key_toggles_front_buttons() {
+        let mut state = press(ReaderState::boot(), Button::Next);
+        state.selection = 6;
+
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.front_buttons, FrontButtons::PagesLeft);
+
+        // With the pairs swapped, the physical Next key (second key of the
+        // pair now holding back/confirm) carries Confirm's change action,
+        // and toggles the setting back.
+        let state = press(state, Button::Next);
+        assert_eq!(state.front_buttons, FrontButtons::PagesRight);
+    }
+
+    #[test]
+    fn pages_left_swaps_the_front_pairs_whole() {
+        let mut state = ReaderState::boot();
+        state.front_buttons = FrontButtons::PagesLeft;
+        state.view = AppView::Reading;
+
+        // Reading: the physical back/confirm pair now turns pages (order
+        // kept within the pair), and the old page pair carries back/confirm.
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_page_count = 10;
+        state.page = 5;
+        assert_eq!(press(state, Button::Back).page, 4);
+        assert_eq!(press(state, Button::Confirm).page, 6);
+        assert_eq!(press(state, Button::Previous).view, AppView::Home);
+        assert_eq!(press(state, Button::Next).view, AppView::Chapters);
+
+        // The side page rail is untouched.
+        assert_eq!(press(state, Button::PageNext).page, 6);
+    }
+
+    #[test]
+    fn home_ignores_the_front_pair_swap() {
+        // Home is positional: the same physical key opens the same view
+        // whether or not the pairs are swapped, so the title page reads
+        // identically for every user.
+        let mut state = ReaderState::boot();
+        state.front_buttons = FrontButtons::PagesLeft;
+
+        assert_eq!(press(state, Button::Back).view, AppView::Library);
+        assert_eq!(press(state, Button::Confirm).view, AppView::Reading);
+        assert_eq!(press(state, Button::Previous).view, AppView::Wireless);
+        assert_eq!(press(state, Button::Next).view, AppView::Settings);
+    }
+
+    #[test]
+    fn settings_change_key_cycles_the_three_offered_orientations() {
         let mut state = press(ReaderState::boot(), Button::Next);
         state.selection = 5;
 
         let state = press(state, Button::Confirm);
         assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
 
+        // Rotated 180 degrees, the physical Previous key sits where Confirm
+        // was, so it carries the change action.
         let state = press(state, Button::Previous);
+        assert_eq!(state.orientation, DisplayOrientation::PortraitButtonsLeft);
+
+        // Portrait keeps the front column's order: Confirm stays Confirm,
+        // and the cycle wraps back to the default hold (skipping the
+        // unoffered buttons-above portrait).
+        let state = press(state, Button::Confirm);
         assert_eq!(
             state.orientation,
             DisplayOrientation::LandscapeButtonsBottom
         );
+    }
+
+    #[test]
+    fn portrait_keeps_all_physical_buttons() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+
+        assert_eq!(press(state, Button::Back).view, AppView::Library);
+        assert_eq!(press(state, Button::Confirm).view, AppView::Reading);
+
+        // The side pair keeps its physical sense: the hardware walk showed
+        // the forward key already lands at its natural end in portrait.
+        let mut library = press(state, Button::Back);
+        library.library_count = 3;
+        let next = press(library, Button::PageNext);
+        assert_eq!(next.selection, 1);
+        let previous = press(next, Button::PagePrevious);
+        assert_eq!(previous.selection, 0);
     }
 
     #[test]
@@ -1767,6 +1938,7 @@ mod tests {
                 line_spacing: LineSpacing::Compact as u8,
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
+                front_buttons: FrontButtons::PagesRight as u8,
             },
         );
         assert_eq!(state.book_id, 2);
@@ -1920,6 +2092,7 @@ mod tests {
             line_spacing: 0,
             font_weight: 0,
             font_family: 0,
+            front_buttons: 0,
             source_hash: 0,
             source_size: 0,
         };
@@ -1934,6 +2107,7 @@ mod tests {
                 chapter: 0,
                 target_pages: 0,
                 type_settings: TypeSettings::DEFAULT,
+                portrait: false,
             },
             StorageCommand::ExtendSection {
                 request_id: 1,
@@ -1942,6 +2116,7 @@ mod tests {
                 chapter: 0,
                 target_pages: 0,
                 type_settings: TypeSettings::DEFAULT,
+                portrait: false,
             },
             StorageCommand::LoadChapters {
                 request_id: 1,
@@ -1954,6 +2129,7 @@ mod tests {
                 index: 0,
                 chapter: 0,
                 type_settings: TypeSettings::DEFAULT,
+                portrait: false,
             },
             StorageCommand::StoreProgress(persisted),
             StorageCommand::LoanSyncMemory,
