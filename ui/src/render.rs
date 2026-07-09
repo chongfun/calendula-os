@@ -164,33 +164,31 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 2, "wireless", false);
     dash_key(fb, layout, 3, "settings", false);
 
-    // Long titles wrap to a second line that grows upward, keeping the
+    // Long titles wrap to further lines that grow upward, keeping the
     // author/rule/colophon furniture (and one-line titles) fixed. The
     // portrait title page drops its block deeper into the taller leaf
-    // (the same three-eighths position), keeping the block's own leading.
+    // (the same three-eighths position), keeping the block's own leading —
+    // and its narrower measure gets a third line, since titles that fill
+    // two landscape lines need three upright ones.
     let title_y = if layout.portrait {
         layout.frame_height * 3 / 8
     } else {
         180
     };
+    let max_lines = if layout.portrait { 3 } else { 2 };
     let title_font = literata_display();
-    let (first, second) = wrap_title(
+    let (lines, count, overflow) = wrap_title_lines(
         title_font,
         shell.active_book.title,
         layout.content_width() as u16,
+        max_lines,
     );
-    if second.is_empty() {
-        draw_text(fb, title_font, first, layout.content_x, title_y, false);
-    } else {
-        draw_text(
-            fb,
-            title_font,
-            first,
-            layout.content_x,
-            title_y - TITLE_LEADING,
-            false,
-        );
-        draw_text(fb, title_font, second, layout.content_x, title_y, false);
+    for (index, line) in lines[..count].iter().enumerate() {
+        let y = title_y - TITLE_LEADING * (count - 1 - index) as i16;
+        let end = draw_text(fb, title_font, line, layout.content_x, y, false);
+        if overflow && index == count - 1 {
+            draw_text(fb, title_font, "...", end, y, false);
+        }
     }
     if !shell.active_book.author.is_empty() {
         ls_caps(
@@ -1067,9 +1065,48 @@ fn draw_text_truncated(
 /// second line is glyph-truncated if the remainder still overflows,
 /// and a single unbreakable overlong word truncates on line one.
 pub(crate) fn wrap_title<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
-    if measure_text(font, text) <= max_w {
-        return (text, "");
+    let (lines, _, _) = wrap_title_lines(font, text, max_w, 2);
+    (lines[0], lines[1])
+}
+
+/// Break a title into up to `max_lines` lines at word boundaries, each
+/// within the measure. The final line is cut to the measure when the title
+/// still overflows, with room reserved for the caller's `...`; the returned
+/// flag says whether that happened.
+pub(crate) fn wrap_title_lines<'a>(
+    font: &BitmapFont,
+    text: &'a str,
+    max_w: u16,
+    max_lines: usize,
+) -> ([&'a str; 3], usize, bool) {
+    let max_lines = max_lines.clamp(1, 3);
+    let mut lines = [""; 3];
+    let mut count = 0;
+    let mut rest = text;
+    while count < max_lines - 1 && measure_text(font, rest) > max_w {
+        let (line, tail) = split_title_line(font, rest, max_w);
+        if tail.is_empty() {
+            // An unbreakable over-wide word: the cut line is final.
+            lines[count] = line;
+            return (lines, count + 1, true);
+        }
+        lines[count] = line;
+        count += 1;
+        rest = tail;
     }
+    if measure_text(font, rest) <= max_w {
+        lines[count] = rest;
+        return (lines, count + 1, false);
+    }
+    let dots = measure_text(font, "...");
+    lines[count] = fit_text(font, rest, max_w.saturating_sub(dots));
+    (lines, count + 1, true)
+}
+
+/// One title line at the widest word boundary within the measure, plus the
+/// untrimmed remainder. An over-wide first word cannot break: it comes back
+/// cut to the measure with an empty remainder.
+fn split_title_line<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
     let mut split = 0usize;
     for (index, _) in text.match_indices(' ') {
         if measure_text(font, &text[..index]) <= max_w {
@@ -1081,8 +1118,7 @@ pub(crate) fn wrap_title<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&
     if split == 0 {
         return (fit_text(font, text, max_w), "");
     }
-    let rest = text[split + 1..].trim_start();
-    (&text[..split], fit_text(font, rest, max_w))
+    (&text[..split], text[split + 1..].trim_start())
 }
 
 pub(crate) fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
@@ -1188,6 +1224,31 @@ fn font_family_label<'a>(family: display::font::FontFamily, custom_name: &'a str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_title_lines_fits_alice_on_three_portrait_lines() {
+        // The portrait content measure (444 - 44). Two lines cut this title
+        // mid-word; the third line lets it render whole.
+        let font = literata_display();
+        let title = "Alice's Adventures in Wonderland";
+        let (lines, count, overflow) = wrap_title_lines(font, title, 400, 3);
+        assert_eq!(&lines[..count], &["Alice's", "Adventures in", "Wonderland"]);
+        assert!(!overflow);
+        for line in &lines[..count] {
+            assert!(measure_text(font, line) <= 400);
+        }
+    }
+
+    #[test]
+    fn wrap_title_lines_flags_overflow_and_reserves_ellipsis_room() {
+        let font = literata_display();
+        let title = "The Collected Correspondence of an Unhurried Victorian Naturalist";
+        let (lines, count, overflow) = wrap_title_lines(font, title, 400, 3);
+        assert_eq!(count, 3);
+        assert!(overflow);
+        let dots = measure_text(font, "...");
+        assert!(measure_text(font, lines[2]) + dots <= 400);
+    }
 
     #[test]
     fn wrap_title_keeps_short_titles_on_one_line() {
