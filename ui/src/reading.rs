@@ -738,11 +738,7 @@ pub fn wrapped_line_count(
 /// Compute the wrapped line count for a block in the given reading context.
 /// This is the shared logic cache builders and test fixtures use to compute
 /// line counts for blocks whose text might wrap across multiple lines.
-pub fn compute_block_line_count(
-    source: &impl ReadingBlocks,
-    index: usize,
-    text: &str,
-) -> u8 {
+pub fn compute_block_line_count(source: &impl ReadingBlocks, index: usize, text: &str) -> u8 {
     let Some(record) = source.block(index) else {
         return 1;
     };
