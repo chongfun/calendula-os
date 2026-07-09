@@ -1783,6 +1783,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
     let shell = UiShell {
         view,
         orientation: UiOrientation::LandscapeButtonsBottom,
+        front_pages_left: false,
         refresh_policy: UiRefreshPolicy::FullOnWake,
         font_size: display::font::FontSize::Medium,
         line_spacing: display::font::LineSpacing::Normal,

@@ -818,6 +818,7 @@ fn handle_storage_command(
                 line_spacing: record.line_spacing,
                 font_weight: record.font_weight,
                 font_family: record.font_family,
+                front_buttons: record.front_buttons,
                 source_hash,
                 source_size,
             };
@@ -935,6 +936,7 @@ fn send_resumed_position(
         line_spacing: request.line_spacing as u8,
         font_weight: request.font_weight as u8,
         font_family: request.font_family as u8,
+        front_buttons: request.front_buttons as u8,
     });
 }
 
@@ -1027,6 +1029,7 @@ fn restore_saved_state(
         line_spacing: record.line_spacing,
         font_weight: record.font_weight,
         font_family: record.font_family,
+        front_buttons: record.front_buttons,
     });
 }
 
@@ -1061,6 +1064,8 @@ fn sleep_request_from_saved_state(
         book_id: ReaderSource::sd(index).book_id(),
         orientation: display_orientation_from_u8(record.reading_orientation)
             .unwrap_or(DisplayOrientation::LandscapeButtonsBottom),
+        front_buttons: app_core::front_buttons_from_u8(record.front_buttons)
+            .unwrap_or(app_core::FrontButtons::PagesRight),
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

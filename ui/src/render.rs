@@ -68,6 +68,10 @@ const TITLE_LEADING: i16 = 54;
 struct ShellLayout {
     mirrored: bool,
     portrait: bool,
+    /// Front buttons run pages-first: the key rail's slot labels must sit
+    /// beside the buttons that now carry them, so slot lookups rotate the
+    /// two pairs.
+    pages_left: bool,
     /// Drawing-frame height: the panel's long axis stands upright in
     /// portrait, so vertical furniture (footer, key rail) hangs off this
     /// rather than the panel HEIGHT constant.
@@ -84,6 +88,7 @@ impl ShellLayout {
             UiOrientation::LandscapeButtonsTop => Self {
                 mirrored: true,
                 portrait: false,
+                pages_left: false,
                 frame_height: HEIGHT as i16,
                 content_x: WIDTH as i16 - CONTENT_RIGHT,
                 content_right: WIDTH as i16 - CONTENT_X,
@@ -97,6 +102,7 @@ impl ShellLayout {
                 Self {
                     mirrored: false,
                     portrait: true,
+                    pages_left: false,
                     frame_height: FbFrame::Portrait.height() as i16,
                     content_x: 44,
                     content_right: width - 36,
@@ -107,12 +113,24 @@ impl ShellLayout {
             _ => Self {
                 mirrored: false,
                 portrait: false,
+                pages_left: false,
                 frame_height: HEIGHT as i16,
                 content_x: CONTENT_X,
                 content_right: CONTENT_RIGHT,
                 colophon_right: COLOPHON_RIGHT,
                 heading_cx: HEADING_CX,
             },
+        }
+    }
+
+    /// Physical key position for a semantic slot. With pages-left front
+    /// buttons the two pairs trade places whole, so semantic slots 0-1
+    /// (back, primary) draw beside physical positions 2-3 and vice versa.
+    const fn key_pos(self, slot: usize) -> i16 {
+        if self.pages_left {
+            KEY_YS[(slot + 2) % 4]
+        } else {
+            KEY_YS[slot]
         }
     }
 
@@ -139,6 +157,12 @@ impl ShellLayout {
     }
 }
 
+fn shell_layout(shell: &UiShell<'_>) -> ShellLayout {
+    let mut layout = ShellLayout::for_orientation(shell.orientation);
+    layout.pages_left = shell.front_pages_left;
+    layout
+}
+
 pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     match shell.view {
@@ -158,7 +182,7 @@ pub fn render_shell_overlay(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 /// the progress rule, and a colophon in chapter-and-pages terms.
 fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     dash_key(fb, layout, 0, "library", false);
     dash_key(fb, layout, 1, "continue", true);
     dash_key(fb, layout, 2, "wireless", false);
@@ -325,7 +349,7 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
 
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     dash_key(fb, layout, 0, "home", false);
     dash_key(fb, layout, 1, "open", true);
     dash_key(fb, layout, 2, "previous", false);
@@ -437,7 +461,7 @@ pub fn toc_scroll_start(selection: usize, total: usize, portrait: bool) -> usize
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     dash_key(fb, layout, 0, "close", false);
     dash_key(fb, layout, 1, "open", true);
     dash_key(fb, layout, 2, "previous", false);
@@ -495,68 +519,45 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 
 fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     dash_key(fb, layout, 0, "home", false);
     dash_key(fb, layout, 1, "change", true);
     dash_key(fb, layout, 2, "previous", false);
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    index_row(
-        fb,
-        layout,
-        "Typeface",
-        font_family_label(shell.font_family, shell.custom_font_name),
-        FIRST_ROW_Y,
-        shell.selection == 0,
-    );
-    index_row(
-        fb,
-        layout,
-        "Type size",
-        font_size_label(shell.font_size),
-        FIRST_ROW_Y + 64,
-        shell.selection == 1,
-    );
-    index_row(
-        fb,
-        layout,
-        "Type weight",
-        font_weight_label(shell.font_weight),
-        FIRST_ROW_Y + 128,
-        shell.selection == 2,
-    );
-    index_row(
-        fb,
-        layout,
-        "Line spacing",
-        line_spacing_label(shell.line_spacing),
-        FIRST_ROW_Y + 192,
-        shell.selection == 3,
-    );
-    index_row(
-        fb,
-        layout,
-        "Refresh",
-        refresh_policy_label(shell.refresh_policy),
-        FIRST_ROW_Y + 256,
-        shell.selection == 4,
-    );
-    index_row(
-        fb,
-        layout,
-        "Orientation",
-        orientation_label(shell.orientation),
-        FIRST_ROW_Y + 320,
-        shell.selection == 5,
-    );
+    // Seven rows must clear the landscape footer line, so the settings
+    // index runs tighter than the Library's ROW_STEP.
+    const SETTINGS_ROW_STEP: i16 = 52;
+    let rows: [(&str, &str); 7] = [
+        (
+            "Typeface",
+            font_family_label(shell.font_family, shell.custom_font_name),
+        ),
+        ("Type size", font_size_label(shell.font_size)),
+        ("Type weight", font_weight_label(shell.font_weight)),
+        ("Line spacing", line_spacing_label(shell.line_spacing)),
+        ("Refresh", refresh_policy_label(shell.refresh_policy)),
+        ("Orientation", orientation_label(shell.orientation)),
+        ("Front buttons", front_buttons_label(shell.front_pages_left)),
+    ];
+    for (index, (name, value)) in rows.into_iter().enumerate() {
+        index_row(
+            fb,
+            layout,
+            name,
+            value,
+            FIRST_ROW_Y + index as i16 * SETTINGS_ROW_STEP,
+            shell.selection == index as u16,
+        );
+    }
 
     finish_working_screen(fb, shell, layout);
 }
 
 fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = ShellLayout::for_orientation(shell.orientation);
+    let layout = shell_layout(shell);
     match shell.sync_status {
         UiSyncStatus::ForgetPending => dash_key(fb, layout, 0, "cancel", false),
         _ => dash_key(fb, layout, 0, "home", false),
@@ -770,7 +771,7 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
         );
         return;
     }
-    let y = KEY_YS[slot];
+    let y = layout.key_pos(slot);
     let dash_font = literata(FontStyle::Regular);
     let dash = "\u{2014}";
     let dash_x = if layout.mirrored {
@@ -800,7 +801,7 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
     } else {
         KEY_DASH_X
     };
-    draw_text(fb, dash_font, dash, dash_x, KEY_YS[slot] + 8, false);
+    draw_text(fb, dash_font, dash, dash_x, layout.key_pos(slot) + 8, false);
 }
 
 /// Portrait margin keys: the front-button column lies along the bottom
@@ -808,7 +809,7 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
 /// centered on its physical button (the same panel positions KEY_YS marks
 /// in landscape). Returns the slot's center x for the label.
 fn portrait_key_dash(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) -> i16 {
-    let cx = KEY_YS[slot];
+    let cx = layout.key_pos(slot);
     let dash_font = literata(FontStyle::Regular);
     let dash = "\u{2014}";
     let dash_w = measure_text(dash_font, dash) as i16;
@@ -1181,6 +1182,14 @@ fn orientation_label(orientation: UiOrientation) -> &'static str {
         UiOrientation::LandscapeButtonsBottom => "buttons down",
         UiOrientation::LandscapeButtonsTop => "buttons up",
         UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => "portrait",
+    }
+}
+
+fn front_buttons_label(pages_left: bool) -> &'static str {
+    if pages_left {
+        "pages left"
+    } else {
+        "pages right"
     }
 }
 

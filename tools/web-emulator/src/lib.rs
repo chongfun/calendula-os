@@ -51,7 +51,7 @@ struct WebEmulator {
     ops: Vec<(f64, Op)>,
     frame_seq: u32,
     last_refresh: u32,
-    snapshot: [u32; 9],
+    snapshot: [u32; 10],
 }
 
 impl WebEmulator {
@@ -69,7 +69,7 @@ impl WebEmulator {
             ops: Vec::new(),
             frame_seq: 0,
             last_refresh: 0,
-            snapshot: [0; 9],
+            snapshot: [0; 10],
         };
         emu.state = emu.state.apply_library_event(
             emu.ctx,
@@ -255,11 +255,12 @@ impl WebEmulator {
                 line_spacing: self.state.line_spacing as u8,
                 font_weight: self.state.font_weight as u8,
                 font_family: self.state.font_family as u8,
+                front_buttons: self.state.front_buttons as u8,
             },
         );
     }
 
-    fn restore(&mut self, snapshot: [u32; 9]) {
+    fn restore(&mut self, snapshot: [u32; 10]) {
         self.state = self.state.apply_library_event(
             self.ctx,
             LibraryEvent::Restored {
@@ -273,6 +274,7 @@ impl WebEmulator {
                 line_spacing: snapshot[6] as u8,
                 font_weight: snapshot[7] as u8,
                 font_family: snapshot[8] as u8,
+                front_buttons: snapshot[9] as u8,
             },
         );
         let book_index = ReaderSource::from_book_id(snapshot[0]).sd_index().unwrap_or(0);
@@ -293,6 +295,7 @@ impl WebEmulator {
             u32::from(persisted.line_spacing),
             u32::from(persisted.font_weight),
             u32::from(persisted.font_family),
+            u32::from(persisted.front_buttons),
         ];
     }
 
@@ -561,9 +564,19 @@ pub extern "C" fn x4_restore(
     spacing: u32,
     weight: u32,
     family: u32,
+    front_buttons: u32,
 ) {
     emulator().restore([
-        book_id, chapter, page, orientation, policy, size, spacing, weight, family,
+        book_id,
+        chapter,
+        page,
+        orientation,
+        policy,
+        size,
+        spacing,
+        weight,
+        family,
+        front_buttons,
     ]);
 }
 

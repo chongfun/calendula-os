@@ -104,9 +104,7 @@ impl Framebuffer {
             FbFrame::Native => (x < WIDTH && y < HEIGHT).then_some((x, y)),
             FbFrame::Landscape => (x < WIDTH && y < HEIGHT).then(|| (x, HEIGHT - 1 - y)),
             FbFrame::LandscapeFlipped => (x < WIDTH && y < HEIGHT).then(|| (WIDTH - 1 - x, y)),
-            FbFrame::Portrait => {
-                (x < HEIGHT && y < WIDTH).then(|| (WIDTH - 1 - y, HEIGHT - 1 - x))
-            }
+            FbFrame::Portrait => (x < HEIGHT && y < WIDTH).then(|| (WIDTH - 1 - y, HEIGHT - 1 - x)),
         }
     }
 

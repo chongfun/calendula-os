@@ -4,7 +4,7 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
-pub const SETTINGS_ITEMS: u8 = 6;
+pub const SETTINGS_ITEMS: u8 = 7;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -117,6 +117,16 @@ enum HomeAction {
     Files,
     Wireless,
     Settings,
+}
+
+/// Where the front page-turn pair sits. The front row is two pairs —
+/// back/confirm and previous/next. `PagesLeft` exchanges the pairs whole,
+/// keeping each pair's internal order, for readers whose thumb rests on
+/// the other end of the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontButtons {
+    PagesRight,
+    PagesLeft,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +255,7 @@ pub struct RenderRequest {
     pub selection: u16,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
+    pub front_buttons: FrontButtons,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -503,6 +514,7 @@ pub enum LibraryEvent {
         line_spacing: u8,
         font_weight: u8,
         font_family: u8,
+        front_buttons: u8,
     },
 }
 
@@ -588,6 +600,7 @@ pub struct PersistedAppState {
     pub line_spacing: u8,
     pub font_weight: u8,
     pub font_family: u8,
+    pub front_buttons: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -615,6 +628,7 @@ pub struct ReaderState {
     pub chapter: u8,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
+    pub front_buttons: FrontButtons,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -650,6 +664,7 @@ impl ReaderState {
             chapter: 0,
             book_id: 1,
             orientation: DisplayOrientation::LandscapeButtonsBottom,
+            front_buttons: FrontButtons::PagesRight,
             refresh_policy: RefreshPolicy::FullOnWake,
             font_size: FontSize::Medium,
             line_spacing: LineSpacing::Normal,
@@ -692,7 +707,10 @@ impl ReaderState {
             battery_mv,
             battery_percent,
         } = event;
-        let button = orient_button(self.orientation, raw_button);
+        let button = orient_button(
+            self.orientation,
+            swap_front_pairs(self.front_buttons, raw_button),
+        );
         let mut next = self;
         next.last_button = button;
         next.aux_raw = aux_raw;
@@ -958,6 +976,7 @@ impl ReaderState {
                 line_spacing,
                 font_weight,
                 font_family,
+                front_buttons,
             } => {
                 self.book_id = book_id;
                 self.chapter = chapter;
@@ -1002,6 +1021,9 @@ impl ReaderState {
                         } else {
                             family
                         };
+                }
+                if let Some(front) = front_buttons_from_u8(front_buttons) {
+                    self.front_buttons = front;
                 }
                 self.dirty = Rect::FULL;
             }
@@ -1062,6 +1084,7 @@ impl ReaderState {
             selection: self.selection,
             book_id: self.book_id,
             orientation: self.orientation,
+            front_buttons: self.front_buttons,
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -1093,6 +1116,7 @@ impl ReaderState {
             line_spacing: self.line_spacing as u8,
             font_weight: self.font_weight as u8,
             font_family: self.font_family as u8,
+            front_buttons: self.front_buttons as u8,
             source_hash: 0,
             source_size: 0,
         }
@@ -1148,6 +1172,14 @@ pub fn display_orientation_from_u8(value: u8) -> Option<DisplayOrientation> {
         1 => Some(DisplayOrientation::LandscapeButtonsTop),
         2 => Some(DisplayOrientation::PortraitButtonsLeft),
         3 => Some(DisplayOrientation::PortraitButtonsRight),
+        _ => None,
+    }
+}
+
+pub fn front_buttons_from_u8(value: u8) -> Option<FrontButtons> {
+    match value {
+        0 => Some(FrontButtons::PagesRight),
+        1 => Some(FrontButtons::PagesLeft),
         _ => None,
     }
 }
@@ -1225,6 +1257,23 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
 /// the bottom bezel in its natural order, and the side pair stands on end
 /// with the forward key already at its natural end (hardware-walked
 /// July 9 2026 — a swap here came out inverted on the device).
+/// `PagesLeft` exchanges the two front pairs whole (back/confirm with
+/// previous/next) before the orientation map, so the swap is a fact about
+/// the physical buttons rather than the current hold. The side page rail
+/// is untouched.
+fn swap_front_pairs(front_buttons: FrontButtons, button: Option<Button>) -> Option<Button> {
+    if front_buttons == FrontButtons::PagesRight {
+        return button;
+    }
+    Some(match button? {
+        Button::Back => Button::Previous,
+        Button::Confirm => Button::Next,
+        Button::Previous => Button::Back,
+        Button::Next => Button::Confirm,
+        other => other,
+    })
+}
+
 fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Option<Button> {
     let button = button?;
     Some(match orientation {
@@ -1285,10 +1334,14 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 DisplayOrientation::LandscapeButtonsBottom => {
                     DisplayOrientation::LandscapeButtonsTop
                 }
-                DisplayOrientation::LandscapeButtonsTop => {
-                    DisplayOrientation::PortraitButtonsLeft
-                }
+                DisplayOrientation::LandscapeButtonsTop => DisplayOrientation::PortraitButtonsLeft,
                 _ => DisplayOrientation::LandscapeButtonsBottom,
+            };
+        }
+        6 => {
+            state.front_buttons = match state.front_buttons {
+                FrontButtons::PagesRight => FrontButtons::PagesLeft,
+                FrontButtons::PagesLeft => FrontButtons::PagesRight,
             };
         }
         _ => {}
@@ -1620,6 +1673,7 @@ mod tests {
                 line_spacing: LineSpacing::Normal as u8,
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
+                front_buttons: FrontButtons::PagesRight as u8,
             },
         );
         assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
@@ -1654,6 +1708,7 @@ mod tests {
                 line_spacing: LineSpacing::Normal as u8,
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
+                front_buttons: FrontButtons::PagesRight as u8,
             },
         );
         assert_eq!(state.selection, home_selection);
@@ -1716,7 +1771,43 @@ mod tests {
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 5);
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, 6);
+        let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
+    }
+
+    #[test]
+    fn settings_change_key_toggles_front_buttons() {
+        let mut state = press(ReaderState::boot(), Button::Next);
+        state.selection = 6;
+
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.front_buttons, FrontButtons::PagesLeft);
+
+        // With the pairs swapped, the physical Next key (second key of the
+        // pair now holding back/confirm) carries Confirm's change action,
+        // and toggles the setting back.
+        let state = press(state, Button::Next);
+        assert_eq!(state.front_buttons, FrontButtons::PagesRight);
+    }
+
+    #[test]
+    fn pages_left_swaps_the_front_pairs_whole() {
+        let mut state = ReaderState::boot();
+        state.front_buttons = FrontButtons::PagesLeft;
+
+        // Home maps the semantic keys; the physical back/confirm pair now
+        // carries previous/next and vice versa, order kept within pairs.
+        assert_eq!(press(state, Button::Back).view, AppView::Wireless);
+        assert_eq!(press(state, Button::Confirm).view, AppView::Settings);
+        assert_eq!(press(state, Button::Previous).view, AppView::Library);
+        assert_eq!(press(state, Button::Next).view, AppView::Reading);
+
+        // The side page rail is untouched.
+        let mut library = press(state, Button::Previous);
+        library.library_count = 3;
+        let next = press(library, Button::PageNext);
+        assert_eq!(next.selection, 1);
     }
 
     #[test]
@@ -1822,6 +1913,7 @@ mod tests {
                 line_spacing: LineSpacing::Compact as u8,
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
+                front_buttons: FrontButtons::PagesRight as u8,
             },
         );
         assert_eq!(state.book_id, 2);
@@ -1975,6 +2067,7 @@ mod tests {
             line_spacing: 0,
             font_weight: 0,
             font_family: 0,
+            front_buttons: 0,
             source_hash: 0,
             source_size: 0,
         };

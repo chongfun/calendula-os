@@ -3,7 +3,8 @@ use crate::{
     UiSyncStatus, UiTocItem, UiView,
 };
 use app_core::{
-    AppView, Button, DisplayOrientation, RefreshPolicy, RenderRequest, SyncError, SyncStatus,
+    AppView, Button, DisplayOrientation, FrontButtons, RefreshPolicy, RenderRequest, SyncError,
+    SyncStatus,
 };
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{draw_text, literata_display, literata_small, measure_text, FontStyle};
@@ -51,6 +52,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
     let shell = UiShell {
         view: ui_view(request.view),
         orientation: ui_orientation(request.orientation),
+        front_pages_left: request.front_buttons == FrontButtons::PagesLeft,
         refresh_policy: ui_refresh_policy(request.refresh_policy),
         font_size: request.font_size,
         line_spacing: request.line_spacing,

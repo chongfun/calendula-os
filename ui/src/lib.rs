@@ -84,6 +84,9 @@ pub struct UiTocItem<'a> {
 pub struct UiShell<'a> {
     pub view: UiView,
     pub orientation: UiOrientation,
+    /// The front page-turn pair sits left of back/confirm instead of right
+    /// of it; the key rail's labels follow the buttons.
+    pub front_pages_left: bool,
     pub refresh_policy: UiRefreshPolicy,
     pub font_size: display::font::FontSize,
     pub line_spacing: display::font::LineSpacing,
