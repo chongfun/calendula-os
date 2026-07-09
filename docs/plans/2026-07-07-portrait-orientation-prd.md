@@ -114,18 +114,25 @@ Portrait metrics, in the same Imprint vocabulary:
 - **The key strip** is the left margin rail rotated onto the bottom edge:
   `KEY_XS` positions computed as fractions of the portrait width (the same
   panel-relative pattern `KEY_YS` uses for height). Instead of staggered
-  text labels and em-dashes, it uses a single baseline of crisp MDI icons
-  (from the `embedded-icon` crate) mapped to the keys. Unused keys simply show no icon.
+  text labels and em-dashes, it uses a single baseline of icons centered
+  over the buttons. The icons are hand-rolled 1bpp bitmaps authored in
+  ASCII art and packed at compile time (`ui/src/icons.rs`) — a monochrome
+  mask is exactly what the 1bpp panel draws, so this costs ~2 KB of rodata
+  against the ~18 KB the `embedded-icon`/`embedded-graphics` crates added
+  for richer-than-1bpp data the panel would only threshold away. Settings
+  uses a sliders/"tune" glyph (a gear reads as a burst at 24px); unused
+  keys simply show no icon.
 - **Content** runs full-width between comfortable margins — no 210px rail
   offset to honor, so portrait trades column width for page height. The
   heading centers at width/2 with its hairline underline; list screens keep
   `ROW_STEP`, dot leaders, italic right-aligned values, and the `→` selection
-  arrow, and may show more rows than landscape's six where the taller page
-  allows.
-- **Apparatus** — the battery percent tucks into the top-right corner (`battery_y = 60`),
-  aligning nicely on the same baseline as the view's heading; the icon strip owns the bottom.
-  Sleep stays the centered ceremonial
-  plate, unchanged in spirit, re-centered for the portrait canvas.
+  arrow, and show more rows than landscape's six (library 10, contents 16)
+  where the taller page allows.
+- **Apparatus** — the battery percent sits in a phone-style top-right status
+  corner (`battery_y = 30`), lifted above the centered heading and its rule
+  so it reads as its own marker rather than hanging off the rule; the icon
+  strip owns the bottom. Sleep stays the centered ceremonial plate,
+  unchanged in spirit, re-centered for the portrait canvas.
 
 All five shell views (`render_home`, `render_library`, `render_chapters`,
 `render_settings`, `render_wireless`) plus the sleep plate
@@ -158,7 +165,7 @@ sheet** directly above the physical buttons: the margin appears when called
 for, exactly the "summoning creates the margin" behavior the design-language
 brainstorm specified for landscape
 (`docs/brainstorms/2026-06-11-ui-design-language-brainstorm.md`), rotated.
-The sheet is a white band carrying the four MDI icons on a single row (with a
+The sheet is a white band carrying the four key icons on a single row (with a
 reduced footprint of `READING_SHEET_HEIGHT = 48`); while it is up, keys
 act on their icons — Back dismisses to the page, Confirm opens Chapters, the
 browse pair pages (paging auto-dismisses the sheet, since turning the page is
