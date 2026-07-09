@@ -755,25 +755,24 @@ fn text_in(buf: &[u8], len: usize) -> &str {
 /// An em-dash faces the physical button; the label is letterspaced
 /// small caps, bold for the screen's one primary action.
 fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str, primary: bool) {
+    if layout.portrait {
+        // Portrait keys are named by a 1bpp icon centered over the button,
+        // not by a letterspaced label; `primary` carries no weight here.
+        let glyph = crate::icons::icon_for_label(label);
+        crate::icons::draw_icon(
+            fb,
+            glyph,
+            layout.key_pos(slot) - crate::icons::ICON_SIZE / 2,
+            layout.frame_height - 24 - crate::icons::ICON_SIZE / 2,
+        );
+        return;
+    }
     let style = if primary {
         FontStyle::Bold
     } else {
         FontStyle::Regular
     };
     let label_font = literata_small(style);
-    if layout.portrait {
-        let cx = portrait_key_dash(fb, layout, slot);
-        let width = ls_width(label_font, label, 2);
-        ls_caps(
-            fb,
-            label_font,
-            label,
-            cx - width / 2,
-            portrait_key_label_y(layout, slot),
-            2,
-        );
-        return;
-    }
     let y = layout.key_pos(slot);
     let dash_font = literata(FontStyle::Regular);
     let dash = "\u{2014}";
@@ -792,9 +791,9 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
 }
 
 /// An unused key keeps its bare dash: the mark stays, the word goes.
+/// Portrait names keys with icons only, so an unused key shows nothing.
 fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
     if layout.portrait {
-        portrait_key_dash(fb, layout, slot);
         return;
     }
     let dash_font = literata(FontStyle::Regular);
@@ -805,26 +804,6 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
         KEY_DASH_X
     };
     draw_text(fb, dash_font, dash, dash_x, layout.key_pos(slot) + 8, false);
-}
-
-/// Portrait margin keys: the front-button column lies along the bottom
-/// bezel, so each slot's em-dash sits on one line hugging that edge,
-/// centered on its physical button (the same panel positions KEY_YS marks
-/// in landscape). Returns the slot's center x for the label.
-fn portrait_key_dash(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) -> i16 {
-    let cx = layout.key_pos(slot);
-    let dash_font = literata(FontStyle::Regular);
-    let dash = "\u{2014}";
-    let dash_w = measure_text(dash_font, dash) as i16;
-    draw_text(
-        fb,
-        dash_font,
-        dash,
-        cx - dash_w / 2,
-        layout.frame_height - 10,
-        false,
-    );
-    cx
 }
 
 /// The summoned reading key sheet: portrait reading stays chrome-free, and
@@ -852,28 +831,10 @@ pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pa
         true,
     );
     hline(fb, 0, top, width as i16);
-    let icon_cy = layout.frame_height - 24;
-    for (slot, label) in ["home", "contents", "previous", "next"].iter().enumerate() {
-        let glyph = crate::icons::icon_for_label(label);
-        crate::icons::draw_icon(
-            fb,
-            glyph,
-            layout.key_pos(slot) - crate::icons::ICON_SIZE / 2,
-            icon_cy - crate::icons::ICON_SIZE / 2,
-        );
-    }
-}
-
-/// The four slots sit 80px apart — too tight for letterspaced caps side
-/// by side — so labels stagger across two baselines: outer slots (Back,
-/// Previous) high, inner slots (Confirm, Next) low, each centered over
-/// its own dash.
-fn portrait_key_label_y(layout: ShellLayout, slot: usize) -> i16 {
-    if slot.is_multiple_of(2) {
-        layout.frame_height - 56
-    } else {
-        layout.frame_height - 28
-    }
+    dash_key(fb, layout, 0, "home", false);
+    dash_key(fb, layout, 1, "contents", true);
+    dash_key(fb, layout, 2, "previous", false);
+    dash_key(fb, layout, 3, "next", false);
 }
 
 fn heading(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {

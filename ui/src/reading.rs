@@ -378,8 +378,8 @@ pub const READER_PAGE_BOTTOM: i16 = display::HEIGHT as i16 - 23;
 /// Rows the portrait reading sheet covers when summoned. The portrait
 /// reader reserves no space for it: the page and its footer use the full
 /// frame height, and the sheet draws on top of the footer and bottom text
-/// lines while it is up. Shallow because the band names keys with single
-/// 24px icons centered 24 rows up, not the staggered two-baseline rail.
+/// lines while it is up. Shallow because the portrait key strip names keys
+/// with single 24px icons centered 24 rows up.
 pub const PORTRAIT_READING_SHEET_HEIGHT: i16 = 48;
 pub const READER_LEFT_X: i16 = 8;
 /// Right text margin: 8 rows in from the panel's right edge (the X4's
