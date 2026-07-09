@@ -606,6 +606,8 @@
   const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
   const SAVE_KEY = board + "-progress-v1";
   const ORIENTATION_BUTTONS_TOP = 1;
+  const ORIENTATION_PORTRAIT_LEFT = 2;
+  const ORIENTATION_PORTRAIT_RIGHT = 3;
 
   const device = document.querySelector(".device");
   const canvas = document.getElementById("panel");
@@ -689,6 +691,10 @@
   const scratch = document.createElement("canvas");
   const scratchCtx = scratch.getContext("2d");
   const framePortrait = () => wasm.x4_frame_width() < wasm.x4_frame_height();
+  const statePortrait = () => {
+    const o = wasm.x4_orientation();
+    return o === ORIENTATION_PORTRAIT_LEFT || o === ORIENTATION_PORTRAIT_RIGHT;
+  };
 
   function paintFrame(pixels) {
     const w = wasm.x4_frame_width(), h = wasm.x4_frame_height();
@@ -712,7 +718,7 @@
   // silhouette (a transform keeps the original layout box).
   let chromePortrait = false;
   function applyOrientationChrome() {
-    const portrait = framePortrait();
+    const portrait = statePortrait();
     device.classList.toggle("portrait", portrait);
     if (portrait) {
       const pad = Math.max(0, (device.offsetWidth - device.offsetHeight) / 2);
@@ -752,7 +758,7 @@
   async function refresh(mode) {
     const pixels = frame();
     busy = true;
-    if (framePortrait() !== chromePortrait) {
+    if (statePortrait() !== chromePortrait) {
       applyOrientationChrome();
     }
     led.classList.add("on");

@@ -559,6 +559,11 @@ pub extern "C" fn x4_frame_height() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn x4_orientation() -> u32 {
+    emulator().state.orientation as u32
+}
+
+#[no_mangle]
 pub extern "C" fn x4_frame_seq() -> u32 {
     emulator().frame_seq
 }
