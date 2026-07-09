@@ -397,8 +397,11 @@ impl WebEmulator {
             || (self.store_book == Some(book_index) && self.load_status == LoadStatus::Ready);
         if !ready {
             let source = &SHELF[book_index as usize % SHELF.len()];
-            draw_centered(&mut self.fb, literata(FontStyle::Bold), source.title, 232);
-            draw_centered(&mut self.fb, literata(FontStyle::Italic), source.author, 268);
+            // Straddle the panel's vertical center (X4: 232/268) so the plate
+            // stays centered on the taller X3 instead of riding high.
+            let mid = HEIGHT as i16 / 2;
+            draw_centered(&mut self.fb, literata(FontStyle::Bold), source.title, mid - 8);
+            draw_centered(&mut self.fb, literata(FontStyle::Italic), source.author, mid + 28);
             return;
         }
         let store = self.store.as_ref().unwrap();

@@ -10,3 +10,5 @@ __pycache__/
 /tools/fonts/
 .venv-font/
 /web/x4_web_emulator.wasm
+/web/x3_web_emulator.wasm
+/_site/

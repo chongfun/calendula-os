@@ -6,6 +6,7 @@ on:
     paths:
       - "web/**"
       - "tools/web-emulator/**"
+      - "tools/build-web.sh"
       - "app-core/**"
       - "display/**"
       - "ui/**"
@@ -33,18 +34,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add wasm32-unknown-unknown --toolchain stable
-      - name: Build wasm emulator
-        working-directory: tools/web-emulator
-        run: cargo build --target wasm32-unknown-unknown --release
+      - name: Build wasm emulators (all boards) and assemble site
+        run: ./tools/build-web.sh _site
       - name: Check emulator golden frames
         run: cargo run --manifest-path tools/emulator/Cargo.toml --target x86_64-unknown-linux-gnu --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
       - name: Check X3 emulator golden frames
         run: cargo run --manifest-path tools/emulator/Cargo.toml --target x86_64-unknown-linux-gnu --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden
-      - name: Assemble site
-        run: |
-          mkdir -p _site
-          cp -R web/. _site/
-          cp tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emulator.wasm _site/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
