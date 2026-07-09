@@ -711,6 +711,14 @@ impl ReaderState {
             self.orientation,
             swap_front_pairs(self.front_buttons, raw_button),
         );
+        // Home is positional, not grammatical: its four actions direct-map
+        // the physical key column, with the ordering itself ranked (continue
+        // second from the top). The front-pair swap moves roles to the
+        // resting thumb, but Home has no roles to move -- riding the swap
+        // would demote continue to the far end and put wireless and settings
+        // on the comfortable pair. So Home maps from the un-swapped keys and
+        // reads the same for every user.
+        let home_button = orient_button(self.orientation, raw_button);
         let mut next = self;
         next.last_button = button;
         next.aux_raw = aux_raw;
@@ -723,8 +731,10 @@ impl ReaderState {
         match (self.view, button) {
             (_, None) => {}
             (_, Some(Button::Power)) => {}
-            (AppView::Home, Some(button)) => {
-                next = apply_home_action(next, home_action_for_button(button));
+            (AppView::Home, Some(_)) => {
+                if let Some(home_button) = home_button {
+                    next = apply_home_action(next, home_action_for_button(home_button));
+                }
             }
             (AppView::Library, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.library_item_count(ctx));
@@ -1795,19 +1805,34 @@ mod tests {
     fn pages_left_swaps_the_front_pairs_whole() {
         let mut state = ReaderState::boot();
         state.front_buttons = FrontButtons::PagesLeft;
+        state.view = AppView::Reading;
 
-        // Home maps the semantic keys; the physical back/confirm pair now
-        // carries previous/next and vice versa, order kept within pairs.
-        assert_eq!(press(state, Button::Back).view, AppView::Wireless);
-        assert_eq!(press(state, Button::Confirm).view, AppView::Settings);
-        assert_eq!(press(state, Button::Previous).view, AppView::Library);
-        assert_eq!(press(state, Button::Next).view, AppView::Reading);
+        // Reading: the physical back/confirm pair now turns pages (order
+        // kept within the pair), and the old page pair carries back/confirm.
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_page_count = 10;
+        state.page = 5;
+        assert_eq!(press(state, Button::Back).page, 4);
+        assert_eq!(press(state, Button::Confirm).page, 6);
+        assert_eq!(press(state, Button::Previous).view, AppView::Home);
+        assert_eq!(press(state, Button::Next).view, AppView::Chapters);
 
         // The side page rail is untouched.
-        let mut library = press(state, Button::Previous);
-        library.library_count = 3;
-        let next = press(library, Button::PageNext);
-        assert_eq!(next.selection, 1);
+        assert_eq!(press(state, Button::PageNext).page, 6);
+    }
+
+    #[test]
+    fn home_ignores_the_front_pair_swap() {
+        // Home is positional: the same physical key opens the same view
+        // whether or not the pairs are swapped, so the title page reads
+        // identically for every user.
+        let mut state = ReaderState::boot();
+        state.front_buttons = FrontButtons::PagesLeft;
+
+        assert_eq!(press(state, Button::Back).view, AppView::Library);
+        assert_eq!(press(state, Button::Confirm).view, AppView::Reading);
+        assert_eq!(press(state, Button::Previous).view, AppView::Wireless);
+        assert_eq!(press(state, Button::Next).view, AppView::Settings);
     }
 
     #[test]

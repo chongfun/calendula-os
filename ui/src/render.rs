@@ -182,7 +182,10 @@ pub fn render_shell_overlay(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 /// the progress rule, and a colophon in chapter-and-pages terms.
 fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let layout = shell_layout(shell);
+    let mut layout = shell_layout(shell);
+    // Home direct-maps the physical key column and the reducer ignores the
+    // front-pair swap there (see apply_input), so its labels stay put too.
+    layout.pages_left = false;
     dash_key(fb, layout, 0, "library", false);
     dash_key(fb, layout, 1, "continue", true);
     dash_key(fb, layout, 2, "wireless", false);
