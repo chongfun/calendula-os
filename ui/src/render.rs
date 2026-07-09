@@ -1003,15 +1003,16 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
     let label = core::str::from_utf8(&buf[..cursor]).unwrap_or("");
     let small = literata_small(FontStyle::Regular);
     if layout.portrait {
-        // The bottom corners belong to the key rail; the readout tucks
-        // into the content column's right edge on the footer line.
+        // The battery percentage sits tucked in the top-right corner,
+        // above the heading area to avoid overlapping.
         let width = measure_text(small, label) as i16;
+        let frame_width = FbFrame::Portrait.width() as i16;
         draw_text(
             fb,
             small,
             label,
-            layout.content_right - width,
-            layout.footer_y(),
+            frame_width - 16 - width,
+            24,
             false,
         );
     } else if layout.mirrored {
