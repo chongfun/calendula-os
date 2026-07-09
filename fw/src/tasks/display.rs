@@ -437,6 +437,14 @@ fn open_loading_plate_request(
     request.line_spacing = type_settings.spacing;
     request.font_weight = type_settings.weight;
     request.font_family = type_settings.family;
+    // The command carries only a portrait bool, so preserve the request's
+    // existing variant when it already agrees and reconcile only a mismatch
+    // (a stale landscape template on a portrait open, or vice versa).
+    request.orientation = match (type_settings.portrait, request.orientation.is_portrait()) {
+        (true, false) => DisplayOrientation::PortraitButtonsRight,
+        (false, true) => DisplayOrientation::LandscapeButtonsBottom,
+        _ => request.orientation,
+    };
     Some(request)
 }
 
