@@ -47,7 +47,11 @@ const FIRST_ROW_Y: i16 = 118;
 /// Rows the Library list shows at once. Public so the firmware sizes the
 /// resident catalog window to cover the visible range it must stream in.
 pub fn library_visible_rows(portrait: bool) -> usize {
-    if portrait { 10 } else { 6 }
+    if portrait {
+        10
+    } else {
+        6
+    }
 }
 /// Footer baseline: 24px up from the panel's bottom edge (the X4's
 /// historical 456). Panel-relative so the taller X3 keeps its apparatus in
@@ -68,18 +72,11 @@ const PORTRAIT_H: i16 = WIDTH as i16;
 /// quarter-turn maps the ladder's top-to-bottom order onto the bottom
 /// edge left-to-right with no re-derivation.
 const KEY_XS: [i16; 4] = KEY_YS;
-/// Portrait key strip: the em-dash mark faces its button at the panel
-/// edge; the letterspaced label sits above it. The key pitch (80 on the
-/// X4) is narrower than a full word like CONTINUE, so labels stagger
-/// across two baselines — even slots low, odd slots high — for a
-/// two-pitch lane without abbreviating the vocabulary.
-const KEY_STRIP_DASH_Y: i16 = PORTRAIT_H - 12;
-const KEY_STRIP_LABEL_LOW_Y: i16 = PORTRAIT_H - 38;
-const KEY_STRIP_LABEL_HIGH_Y: i16 = PORTRAIT_H - 64;
-const KEY_STRIP_LABEL_MAX_W: i16 = 2 * (KEY_YS[1] - KEY_YS[0]) - 12;
-/// Rows the summoned reading sheet covers: both staggered label baselines
-/// plus the dash row, with a breath above the high labels.
-const READING_SHEET_HEIGHT: i16 = 84;
+/// Portrait key strip: icons sit on a single baseline centered above the
+/// physical buttons.
+const KEY_STRIP_ICON_Y: i16 = PORTRAIT_H - 24;
+/// Rows the summoned reading sheet covers: the icon row plus symmetric padding.
+const READING_SHEET_HEIGHT: i16 = 48;
 
 /// The orientation-varying layout values. Landscape entries are the
 /// historical constants (buttons-top mirrors the x axis); portrait
@@ -95,6 +92,7 @@ struct ShellLayout {
     heading_cx: i16,
     footer_right: i16,
     footer_y: i16,
+    battery_y: i16,
     note_y: i16,
     hint_y: i16,
     qr_top: i16,
@@ -125,7 +123,8 @@ impl ShellLayout {
                 colophon_right: PORTRAIT_W - 24,
                 heading_cx: PORTRAIT_W / 2,
                 footer_right: PORTRAIT_W - 24,
-                footer_y: PORTRAIT_H - 96,
+                footer_y: PORTRAIT_H - 72,
+                battery_y: 60,
                 note_y: 320,
                 hint_y: 370,
                 qr_top: 210,
@@ -151,6 +150,7 @@ impl ShellLayout {
         heading_cx: HEADING_CX,
         footer_right: FOOTER_RIGHT,
         footer_y: FOOTER_Y,
+        battery_y: FOOTER_Y,
         note_y: 230,
         hint_y: 280,
         qr_top: 160,
@@ -466,7 +466,11 @@ pub fn library_scroll_start(portrait: bool, selection: usize, total: usize) -> u
 // not a menu: title, dot leaders, the chapter's book page right-aligned.
 const TOC_ROW_STEP: i16 = 36;
 pub fn toc_visible_rows(portrait: bool) -> usize {
-    if portrait { 16 } else { 9 }
+    if portrait {
+        16
+    } else {
+        9
+    }
 }
 
 /// Absolute TOC index of the first visible Contents row that keeps
@@ -809,16 +813,34 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
     };
     if layout.portrait {
         let cx = KEY_XS[slot];
-        strip_dash(fb, cx);
-        let baseline = if slot.is_multiple_of(2) {
-            KEY_STRIP_LABEL_LOW_Y
-        } else {
-            KEY_STRIP_LABEL_HIGH_Y
-        };
-        let font = literata_small(style);
-        let shown = fit_ls_caps(font, label, KEY_STRIP_LABEL_MAX_W, 2);
-        let width = ls_width(font, shown, 2);
-        ls_caps(fb, font, shown, cx - width / 2, baseline, 2);
+        let point = embedded_graphics_core::geometry::Point::new(
+            (cx - 12) as i32,
+            (KEY_STRIP_ICON_Y - 12) as i32,
+        );
+        let color = embedded_graphics_core::pixelcolor::BinaryColor::Off;
+
+        use embedded_graphics::image::Image;
+        use embedded_graphics::prelude::*;
+        use embedded_icon::mdi::size24px::*;
+        use embedded_icon::NewIcon;
+
+        match label {
+            "home" => Image::new(&Home::new(color), point).draw(fb),
+            "library" | "contents" => Image::new(&FormatListBulleted::new(color), point).draw(fb),
+            "continue" | "open" => Image::new(&BookOpenOutline::new(color), point).draw(fb),
+            "wireless" => Image::new(&Wifi::new(color), point).draw(fb),
+            "settings" => Image::new(&Cog::new(color), point).draw(fb),
+            "previous" => Image::new(&ChevronLeft::new(color), point).draw(fb),
+            "next" => Image::new(&ChevronRight::new(color), point).draw(fb),
+            "close" | "cancel" => Image::new(&Close::new(color), point).draw(fb),
+            "change" | "edit" => Image::new(&Pencil::new(color), point).draw(fb),
+            "connect" | "done" => Image::new(&Check::new(color), point).draw(fb),
+            "forget" | "trash" => Image::new(&Delete::new(color), point).draw(fb),
+            "set up" => Image::new(&Plus::new(color), point).draw(fb),
+            "again" => Image::new(&Refresh::new(color), point).draw(fb),
+            _ => Image::new(&HelpCircleOutline::new(color), point).draw(fb),
+        }
+        .ok();
         return;
     }
     let y = KEY_YS[slot];
@@ -842,7 +864,6 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
 /// An unused key keeps its bare dash: the mark stays, the word goes.
 fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
     if layout.portrait {
-        strip_dash(fb, KEY_XS[slot]);
         return;
     }
     let dash_font = literata(FontStyle::Regular);
@@ -853,34 +874,6 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
         KEY_DASH_X
     };
     draw_text(fb, dash_font, dash, dash_x, KEY_YS[slot] + 8, false);
-}
-
-/// The strip key's em-dash mark, centered over its physical button.
-fn strip_dash(fb: &mut Framebuffer, cx: i16) {
-    let dash_font = literata(FontStyle::Regular);
-    let dash_w = measure_text(dash_font, "\u{2014}") as i16;
-    draw_text(
-        fb,
-        dash_font,
-        "\u{2014}",
-        cx - dash_w / 2,
-        KEY_STRIP_DASH_Y,
-        false,
-    );
-}
-
-/// The longest head of `label` whose letterspaced caps fit `max_w` — strip
-/// labels live on a fixed key pitch and must never lean on a neighbor.
-fn fit_ls_caps<'a>(font: &BitmapFont, label: &'a str, max_w: i16, extra: i16) -> &'a str {
-    let mut shown = label;
-    while !shown.is_empty() && ls_width(font, shown, extra) > max_w {
-        let mut end = shown.len() - 1;
-        while end > 0 && !shown.is_char_boundary(end) {
-            end -= 1;
-        }
-        shown = shown[..end].trim_end();
-    }
-    shown
 }
 
 /// The summoned reading key sheet: portrait reading is full-bleed, and a
@@ -1086,7 +1079,7 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
             small,
             label,
             WIDTH as i16 - FOOTER_RIGHT,
-            layout.footer_y,
+            layout.battery_y,
             false,
         );
     } else {
@@ -1096,7 +1089,7 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
             small,
             label,
             layout.footer_right - width,
-            layout.footer_y,
+            layout.battery_y,
             false,
         );
     }

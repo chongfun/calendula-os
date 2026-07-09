@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 app-core = { path = "../app-core" }
 display = { path = "../display" }
+embedded-graphics = "0.8.2"
+embedded-graphics-core = "0.4"
+embedded-icon = "0.0.1"
 proto = { path = "../proto" }
 
 [dev-dependencies]
