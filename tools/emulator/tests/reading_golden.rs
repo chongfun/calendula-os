@@ -169,22 +169,66 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
         page_break_before: false,
         paragraph_end: true,
     });
-    FixtureBlocks { blocks, settings }
+    let mut fixture = FixtureBlocks { blocks, settings };
+    if settings.portrait {
+        // Style-marked text only ever reaches the page as single-line
+        // blocks (the cache builder flushes styled runs line by line), so
+        // the styled sampler must fit the narrower portrait measure on one
+        // line; the landscape-width sampler above would clip.
+        fixture.blocks[2].text = styled(&[
+            (FontStyle::Regular, "Runs:"),
+            (FontStyle::Italic, "slanted"),
+            (FontStyle::Bold, "heavy"),
+            (FontStyle::Regular, "plain."),
+        ]);
+        // The hand-written line counts above are the landscape ones (and
+        // what the existing landscape goldens pin); the portrait measure
+        // wraps differently, so recompute them the way the cache builders
+        // do at build time. Styled blocks stay single-line by contract.
+        finish_line_counts(&mut fixture);
+        assert_eq!(
+            fixture.blocks[2].record.line_count, 1,
+            "styled sampler must stay a single line in portrait"
+        );
+    }
+    fixture
+}
+
+/// Recompute the wrap-dependent line counts for the fixture's settings the
+/// way the cache builders do.
+fn finish_line_counts(fixture: &mut FixtureBlocks) {
+    let right_x = ui::reading::reader_right_x(fixture.settings.portrait);
+    for index in 0..fixture.blocks.len() {
+        let record = fixture.blocks[index].record;
+        let indent = ui::reading::block_first_line_indent(fixture, index);
+        let font = ui::reading::body_font(fixture.settings, fixture.blocks[index].style);
+        let max_width = right_x
+            - if record.align == TextAlign::Center {
+                ui::reading::READER_LEFT_X
+            } else {
+                ui::reading::reader_x_for(record.role)
+            };
+        let lines =
+            ui::reading::wrapped_line_count(font, &fixture.blocks[index].text, max_width, indent)
+                .max(1);
+        fixture.blocks[index].record.line_count = lines.min(u8::MAX as u16) as u8;
+    }
 }
 
 fn encode_png(fb: &Framebuffer) -> Vec<u8> {
     // Same mapping as the emulator's render::encode_png so frames are
-    // directly comparable with the scenario goldens.
+    // directly comparable with the scenario goldens. Dimensions follow the
+    // frame's logical orientation, so a portrait frame pins upright.
+    let (width, height) = (fb.width(), fb.height());
     let mut bytes = Vec::new();
     {
-        let mut encoder =
-            png::Encoder::new(&mut bytes, display::WIDTH as u32, display::HEIGHT as u32);
+        let mut encoder = png::Encoder::new(&mut bytes, width as u32, height as u32);
         encoder.set_color(png::ColorType::Grayscale);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().expect("png header");
-        let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
-        for y in 0..display::HEIGHT {
-            for x in 0..display::WIDTH {
+        let mut data = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
                 data.push(if fb.pixel(x, y) { 0xEE } else { 0x18 });
             }
         }
@@ -277,6 +321,7 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
         spacing: LineSpacing::Relaxed,
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
+        portrait: false,
     });
     let default_pages =
         paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);
@@ -300,6 +345,7 @@ fn reading_page_bodies_match_goldens_heavy() {
         spacing: LineSpacing::Normal,
         weight: FontWeight::Heavy,
         family: FontFamily::Literata,
+        portrait: false,
     });
     assert_page_matches_golden(&source, 0, "reading-page-heavy-0");
 }
@@ -314,6 +360,7 @@ fn reading_page_bodies_match_goldens_merriweather() {
         spacing: LineSpacing::Normal,
         weight: FontWeight::Normal,
         family: FontFamily::Merriweather,
+        portrait: false,
     });
     assert_page_matches_golden(&source, 0, "reading-page-merriweather-0");
 }
@@ -366,6 +413,7 @@ fn small_compact_paginates_no_worse_than_default() {
         spacing: LineSpacing::Compact,
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
+        portrait: false,
     });
     let default_pages =
         paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);
@@ -374,4 +422,54 @@ fn small_compact_paginates_no_worse_than_default() {
         pages <= default_pages,
         "small/compact must not need more pages ({pages}) than default ({default_pages})"
     );
+}
+
+/// The portrait page box: the same blocks wrap to the narrower upright
+/// measure and paginate against the taller page. The full surface — body,
+/// page counter, and the summoned key sheet — is pinned per board.
+#[test]
+fn portrait_reading_surface_matches_goldens() {
+    let source = fixture(TypeSettings {
+        portrait: true,
+        ..TypeSettings::DEFAULT
+    });
+    let portrait_bottom = ui::reading::reader_page_bottom(true);
+    let pages = paginate_block_pages(&source, READER_PAGE_TOP, portrait_bottom);
+    assert!(pages >= 1, "portrait fixture paginates");
+    let landscape_pages = paginate_block_pages(
+        &fixture(TypeSettings::DEFAULT),
+        READER_PAGE_TOP,
+        READER_PAGE_BOTTOM,
+    );
+    assert_ne!(
+        (pages, true),
+        (landscape_pages, false),
+        "orientation participates in pagination"
+    );
+
+    let page = page_record_at(&source, 0, READER_PAGE_TOP, portrait_bottom);
+    let mut fb = Framebuffer::new();
+    fb.set_portrait(true);
+    draw_reading_page_body(&mut fb, &source, page);
+    draw_reading_page_counter(&mut fb, &format!("1/{pages}"));
+    assert_golden_frame(&fb, "reading-portrait-surface-0");
+
+    ui::render::render_reading_sheet(&mut fb);
+    assert_golden_frame(&fb, "reading-portrait-sheet-0");
+}
+
+fn assert_golden_frame(fb: &Framebuffer, name: &str) {
+    let actual = encode_png(fb);
+    let path = golden_path(name);
+    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
+        std::fs::write(&path, &actual).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read(&path).unwrap_or_else(|err| {
+        panic!(
+            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
+            path.display()
+        )
+    });
+    assert_eq!(actual, expected, "frame diverged from {}", path.display());
 }

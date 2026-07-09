@@ -303,6 +303,14 @@
     background: var(--led);
     box-shadow: 0 0 6px 1px color-mix(in srgb, var(--led) 70%, transparent);
   }
+  /* Portrait posture: the firmware reports an upright frame, so the whole
+     slab turns a quarter counter-clockwise - the front-key ladder lands on
+     the bottom edge and the page rocker on the right, as in the hand. The
+     panel canvas keeps its native landscape store; the script paints
+     portrait frames rotated a quarter clockwise into it, and the two
+     turns cancel. JS sets the vertical margins that reserve the rotated
+     silhouette's room. */
+  .device.portrait { transform: rotate(-90deg); }
 
   /* ------------------------------------------------ page matter */
   .hints {
@@ -674,16 +682,60 @@
   const ghostCtx = ghost.getContext("2d");
   let ghosting = false;
 
+  // Portrait frames arrive viewer-upright at HEIGHT x WIDTH; they paint
+  // into the panel-native page canvas rotated a quarter clockwise (the
+  // same turn the firmware's flush transform makes), and the CSS device
+  // rotation turns them back upright. Landscape frames paint straight.
+  const scratch = document.createElement("canvas");
+  const scratchCtx = scratch.getContext("2d");
+  const framePortrait = () => wasm.x4_frame_width() < wasm.x4_frame_height();
+
+  function paintFrame(pixels) {
+    const w = wasm.x4_frame_width(), h = wasm.x4_frame_height();
+    if (!framePortrait()) {
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
+      return;
+    }
+    if (scratch.width !== w || scratch.height !== h) {
+      scratch.width = w; scratch.height = h;
+    }
+    scratchCtx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.translate(WIDTH, 0);
+    ctx.rotate(Math.PI / 2);
+    ctx.drawImage(scratch, 0, 0);
+    ctx.restore();
+  }
+
+  // Turn the slab to match the frame and reserve room for the rotated
+  // silhouette (a transform keeps the original layout box).
+  let chromePortrait = false;
+  function applyOrientationChrome() {
+    const portrait = framePortrait();
+    device.classList.toggle("portrait", portrait);
+    if (portrait) {
+      const pad = Math.max(0, (device.offsetWidth - device.offsetHeight) / 2);
+      device.style.marginTop = Math.round(pad + 8) + "px";
+      device.style.marginBottom = Math.round(pad + 22) + "px";
+    } else {
+      device.style.marginTop = "";
+      device.style.marginBottom = "";
+    }
+    chromePortrait = portrait;
+  }
+  addEventListener("resize", () => { if (chromePortrait) applyOrientationChrome(); });
+
   function putInverted(pixels) {
     const inv = new Uint8ClampedArray(pixels);
     for (let i = 0; i < inv.length; i += 4) {
       inv[i] = 255 - inv[i]; inv[i + 1] = 255 - inv[i + 1]; inv[i + 2] = 255 - inv[i + 2];
     }
-    ctx.putImageData(new ImageData(inv, WIDTH, HEIGHT), 0, 0);
+    paintFrame(inv);
     present();
   }
   function putFinal(pixels) {
-    ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), WIDTH, HEIGHT), 0, 0);
+    paintFrame(pixels);
     if (ghosting) {
       ctx.globalAlpha = 0.035;
       ctx.drawImage(ghost, 0, 0);
@@ -700,6 +752,9 @@
   async function refresh(mode) {
     const pixels = frame();
     busy = true;
+    if (framePortrait() !== chromePortrait) {
+      applyOrientationChrome();
+    }
     led.classList.add("on");
     if (reduceMotion) {
       ghosting = false;

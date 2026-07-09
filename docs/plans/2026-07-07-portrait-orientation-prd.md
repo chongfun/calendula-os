@@ -1,7 +1,10 @@
 # Portrait Orientation — PRD
 
-Status: **planning.** Scope agreed 2026-07-07. No code written yet. This
-document is the shared understanding to build against.
+Status: **implemented (2026-07-08).** All six build-sequence phases landed;
+landscape goldens byte-identical, portrait goldens and scenarios added, both
+boards build and flush portrait frames through the panel-model protocol.
+On-hardware verification of the portrait rocker direction (phase 4) and the
+X3 portrait panel (open question below) remain the only bench items.
 
 ## Summary
 
