@@ -19,15 +19,15 @@ use display::render::fill_rect;
 use display::{Rect, HEIGHT, WIDTH};
 
 /// Vertical centers of the four left-bezel buttons on screen,
-/// top to bottom: Back, Confirm, Previous, Next. Positioned as a fraction
-/// of panel height (the X4's 480 gives the historical 120/200/280/360), so
-/// the same button arrangement stays aligned on the X3's differently sized
-/// panel rather than bunching toward the top.
-const KEY_YS: [i16; 4] = [key_y(120), key_y(200), key_y(280), key_y(360)];
+/// top to bottom: Back, Confirm, Previous, Next.
+#[cfg(not(feature = "device-x3"))]
+const KEY_YS: [i16; 4] = [90, 182, 298, 390];
 
-const fn key_y(x4_y: i16) -> i16 {
-    (x4_y as i32 * HEIGHT as i32 / 480) as i16
-}
+/// On the X3 device, the physical buttons are two distinct rockers rather than
+/// evenly-spaced buttons. The layout matches their physical positions on the panel.
+#[cfg(feature = "device-x3")]
+const KEY_YS: [i16; 4] = [99, 200, 328, 429];
+
 const KEY_DASH_X: i16 = 10;
 const KEY_LABEL_X: i16 = 40;
 const CONTENT_X: i16 = 210;
