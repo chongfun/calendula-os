@@ -1220,14 +1220,14 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
 
 /// Positional button semantics: after the device rotates, the button
 /// sitting where Back used to be still acts as Back. The 180-degree flip
-/// reverses both the front column and the side pair; the quarter turn to
-/// portrait keeps the front column's order (it reads left-to-right along
-/// the bottom bezel) but stands the side pair on end, so only that pair
-/// swaps to keep "upper button pages back".
+/// reverses both the front column and the side pair. The quarter turn to
+/// portrait keeps everything: the front column reads left-to-right along
+/// the bottom bezel in its natural order, and the side pair stands on end
+/// with the forward key already at its natural end (hardware-walked
+/// July 9 2026 — a swap here came out inverted on the device).
 fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Option<Button> {
     let button = button?;
     Some(match orientation {
-        DisplayOrientation::LandscapeButtonsBottom => button,
         DisplayOrientation::LandscapeButtonsTop => match button {
             Button::Power => Button::Power,
             Button::Back => Button::Next,
@@ -1237,13 +1237,7 @@ fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Opt
             Button::PagePrevious => Button::PageNext,
             Button::PageNext => Button::PagePrevious,
         },
-        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight => {
-            match button {
-                Button::PagePrevious => Button::PageNext,
-                Button::PageNext => Button::PagePrevious,
-                other => other,
-            }
-        }
+        _ => button,
     })
 }
 
@@ -1749,18 +1743,20 @@ mod tests {
     }
 
     #[test]
-    fn portrait_keeps_front_buttons_and_swaps_page_buttons() {
+    fn portrait_keeps_all_physical_buttons() {
         let mut state = ReaderState::boot();
         state.orientation = DisplayOrientation::PortraitButtonsLeft;
 
         assert_eq!(press(state, Button::Back).view, AppView::Library);
         assert_eq!(press(state, Button::Confirm).view, AppView::Reading);
 
+        // The side pair keeps its physical sense: the hardware walk showed
+        // the forward key already lands at its natural end in portrait.
         let mut library = press(state, Button::Back);
         library.library_count = 3;
-        let next = press(library, Button::PagePrevious);
-        assert_eq!(next.selection, 1, "side pair stands on end and swaps");
-        let previous = press(next, Button::PageNext);
+        let next = press(library, Button::PageNext);
+        assert_eq!(next.selection, 1);
+        let previous = press(next, Button::PagePrevious);
         assert_eq!(previous.selection, 0);
     }
 

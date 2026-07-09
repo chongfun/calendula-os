@@ -71,11 +71,10 @@ Wrap width and page height change in portrait, so pagination is orientation-depe
 Positional semantics, as `LandscapeButtonsTop` already established (the button in the
 "back position" is Back):
 
-- `PortraitButtonsLeft`: front row keeps natural order; side pair swaps
-  (PagePrevious↔PageNext) so the upper button pages back.
-
-Physical wiring direction is asserted from the emulator model; the hardware walk
-confirms it and may flip the swap.
+- `PortraitButtonsLeft`: no remap at all. The front row reads naturally along the
+  bottom bezel, and the hardware walk (July 9) showed the side pair's forward key
+  already lands at its natural end — the initially guessed swap was inverted on
+  the device and removed.
 
 ## 5. Settings
 

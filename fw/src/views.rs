@@ -237,7 +237,11 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
     // on-disk TOC, page/block records still point at the old section but the
     // bytes underneath are TOC records -- drawing the body now paints garbage
     // glyphs. Hold the bookplate until the reading section reloads on exit.
+    // The page box is part of the layout: blocks wrapped for the portrait
+    // column must not paint into a landscape frame (they cover half the
+    // panel); hold the bookplate until the rebuild lands.
     let reading_buffer_ready = layout_current
+        && sd_library.portrait() == app_core::is_portrait(request.orientation)
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
         && !sd_library.text_holds_toc();
     match (sd_library.reader_status(), reading_buffer_ready) {
@@ -269,7 +273,11 @@ fn draw_sd_reader_page_with_custom_font(
             weight: request.font_weight,
             family: request.font_family,
         };
+    // The page box is part of the layout: blocks wrapped for the portrait
+    // column must not paint into a landscape frame (they cover half the
+    // panel); hold the bookplate until the rebuild lands.
     let reading_buffer_ready = layout_current
+        && sd_library.portrait() == app_core::is_portrait(request.orientation)
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
         && !sd_library.text_holds_toc();
     match (sd_library.reader_status(), reading_buffer_ready) {
