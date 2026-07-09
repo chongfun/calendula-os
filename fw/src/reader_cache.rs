@@ -994,106 +994,113 @@ where
         })
         .unwrap_or_else(|| inferred_start_spine_index(&package));
 
-    for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
-        *index >= start_spine_index
-            && !item.href.is_empty()
-            && !spine_item_is_navigation(item, &package)
-    }) {
-        if section_count >= sections.len() {
-            book_partial = true;
-            break;
-        }
-        saw_spine = true;
-        library.clear_lines();
-        resolve_epub_href(opf_path, spine.href.of(package.opf_text), &mut xhtml_path)?;
-        esp_println::println!("epub: find spine {}", xhtml_path.as_str());
-        let Ok(xhtml_entry) = zip.find_entry(&xhtml_path, scratch.header, scratch.name) else {
-            continue;
-        };
-        esp_println::println!(
-            "epub: spine {} compressed={} uncompressed={}",
-            xhtml_path.as_str(),
-            xhtml_entry.compressed_size,
-            xhtml_entry.uncompressed_size
-        );
-        let type_settings = library.type_settings();
-        let mut sink = LibraryBlockSink {
-            library,
-            root,
-            cache_key,
-            source_identity,
-            sections: &mut *sections,
-            section_count: &mut section_count,
-            total_pages: &mut total_pages,
-            book_partial: &mut book_partial,
-            write_micros: &mut section_write_micros,
-            spine_index: spine_index.min(u16::MAX as usize) as u16,
-            line: String::new(),
-            line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
-            line_role: TextRole::Body,
-            line_align: TextAlign::Justify,
-            line_style: FontStyle::Regular,
-            pending_space: false,
-            dropping_paragraph: false,
-            stopped: false,
-            target_pages: visible_page_capacity,
-            generate_toc_from_headings,
-            generated_toc_for_spine: false,
-            pages_dirty: true,
-        };
-        // Stream the whole member through the resumable block parser in
-        // bounded windows: spine XHTML of any size decodes completely, with
-        // no 24 KB prefix truncation. The parser's in-body assumption is
-        // sniffed from the first decoded window, mirroring the
-        // whole-document contains() check.
-        let mut tokenizer = StreamingXmlTokenizer::new();
-        let mut parser: Option<XhtmlBlockStreamParser> = None;
-        let mut parse_error: Option<XhtmlError> = None;
-        let read_result = zip.read_entry_to_sink(
-            xhtml_entry,
-            scratch.compressed,
-            scratch.xhtml,
-            &mut *scratch.zip_inflate,
-            &mut |chunk| {
-                let parser = parser.get_or_insert_with(|| {
-                    let has_body = bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
-                    XhtmlBlockStreamParser::new(!has_body)
-                });
-                tokenizer
-                    .feed_xhtml_blocks(chunk, parser, Some(&css_rules), &mut sink)
-                    .map_err(|err| {
-                        parse_error = Some(err);
-                        proto::epub::ZipError::Inflate
-                    })
-            },
-        );
-        match read_result {
-            Ok(()) => {
-                if let Some(parser) = parser.as_mut() {
-                    if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut sink) {
-                        if !sink.stopped {
-                            return Err(err.into());
+    // The SECTIONS directory stays open for the whole spine walk; every
+    // section flush is one file open instead of a four-level dir walk.
+    reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
+        for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
+            *index >= start_spine_index
+                && !item.href.is_empty()
+                && !spine_item_is_navigation(item, &package)
+        }) {
+            if section_count >= sections.len() {
+                book_partial = true;
+                break;
+            }
+            saw_spine = true;
+            library.clear_lines();
+            resolve_epub_href(opf_path, spine.href.of(package.opf_text), &mut xhtml_path)?;
+            esp_println::println!("epub: find spine {}", xhtml_path.as_str());
+            let Ok(xhtml_entry) = zip.find_entry(&xhtml_path, scratch.header, scratch.name) else {
+                continue;
+            };
+            esp_println::println!(
+                "epub: spine {} compressed={} uncompressed={}",
+                xhtml_path.as_str(),
+                xhtml_entry.compressed_size,
+                xhtml_entry.uncompressed_size
+            );
+            let type_settings = library.type_settings();
+            let mut sink = LibraryBlockSink {
+                library,
+                root,
+                sections_dir,
+                cache_key,
+                source_identity,
+                sections: &mut *sections,
+                section_count: &mut section_count,
+                total_pages: &mut total_pages,
+                book_partial: &mut book_partial,
+                write_micros: &mut section_write_micros,
+                spine_index: spine_index.min(u16::MAX as usize) as u16,
+                line: String::new(),
+                line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
+                line_role: TextRole::Body,
+                line_align: TextAlign::Justify,
+                line_style: FontStyle::Regular,
+                pending_space: false,
+                dropping_paragraph: false,
+                stopped: false,
+                target_pages: visible_page_capacity,
+                generate_toc_from_headings,
+                generated_toc_for_spine: false,
+                pages_dirty: true,
+            };
+            // Stream the whole member through the resumable block parser in
+            // bounded windows: spine XHTML of any size decodes completely, with
+            // no 24 KB prefix truncation. The parser's in-body assumption is
+            // sniffed from the first decoded window, mirroring the
+            // whole-document contains() check.
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser: Option<XhtmlBlockStreamParser> = None;
+            let mut parse_error: Option<XhtmlError> = None;
+            let read_result = zip.read_entry_to_sink(
+                xhtml_entry,
+                scratch.compressed,
+                scratch.xhtml,
+                &mut *scratch.zip_inflate,
+                &mut |chunk| {
+                    let parser = parser.get_or_insert_with(|| {
+                        let has_body =
+                            bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
+                        XhtmlBlockStreamParser::new(!has_body)
+                    });
+                    tokenizer
+                        .feed_xhtml_blocks(chunk, parser, Some(&css_rules), &mut sink)
+                        .map_err(|err| {
+                            parse_error = Some(err);
+                            proto::epub::ZipError::Inflate
+                        })
+                },
+            );
+            match read_result {
+                Ok(()) => {
+                    if let Some(parser) = parser.as_mut() {
+                        if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut sink) {
+                            if !sink.stopped {
+                                return Err(err.into());
+                            }
                         }
                     }
                 }
-            }
-            Err(_) if parse_error.is_some() => {
-                let err = parse_error.take().expect("parse error recorded");
-                if sink.stopped {
-                    esp_println::println!(
-                        "epub: bounded open stopped at spine {} after {} section(s): {:?}",
-                        spine_index,
-                        *sink.section_count,
-                        err
-                    );
-                } else {
-                    return Err(err.into());
+                Err(_) if parse_error.is_some() => {
+                    let err = parse_error.take().expect("parse error recorded");
+                    if sink.stopped {
+                        esp_println::println!(
+                            "epub: bounded open stopped at spine {} after {} section(s): {:?}",
+                            spine_index,
+                            *sink.section_count,
+                            err
+                        );
+                    } else {
+                        return Err(err.into());
+                    }
                 }
+                Err(err) => return Err(err.into()),
             }
-            Err(err) => return Err(err.into()),
+            sink.finish_spine(false);
         }
-        sink.finish_spine(false);
-    }
+        Ok::<(), ReaderCacheError>(())
+    })?;
 
     if section_count > 0 && total_pages > 0 {
         let sections_slice = &sections[..section_count];
@@ -1346,7 +1353,9 @@ where
         }
         let requested = out.len();
         let remaining_budget = EPUB_OPEN_READ_BYTE_LIMIT.saturating_sub(self.read_bytes) as usize;
-        let read_len = requested.min(EPUB_READ_AT_CHUNK_BYTES).min(remaining_budget);
+        let read_len = requested
+            .min(EPUB_READ_AT_CHUNK_BYTES)
+            .min(remaining_budget);
         if read_len == 0 {
             return Err(());
         }
@@ -1439,6 +1448,10 @@ struct LibraryBlockSink<
 {
     library: &'a mut ReaderStore,
     root: &'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    /// The book's SECTIONS directory, opened once for the whole build.
+    /// `None` when the cache directories could not be created — section
+    /// writes then fail per section and the book publishes as partial.
+    sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
     cache_key: &'r str,
     source_identity: (u32, u32),
     sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
@@ -1629,13 +1642,15 @@ where
         self.library.set_section_partial(partial);
         let section_id = (*self.section_count).min(u16::MAX as usize) as u16;
         let write_started = Instant::now();
-        let wrote = reader_cache_files::write_v2_section_cache(
-            self.root,
-            self.cache_key,
-            self.source_identity,
-            section_id,
-            self.library,
-        );
+        let wrote = match self.sections_dir {
+            Some(sections) => reader_cache_files::write_v2_section_cache_in(
+                sections,
+                self.source_identity,
+                section_id,
+                self.library,
+            ),
+            None => false,
+        };
         *self.write_micros += write_started.elapsed().as_micros();
         if !wrote {
             *self.book_partial = true;

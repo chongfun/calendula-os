@@ -448,7 +448,8 @@ where
         };
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
-            || header.font_config != reader_layout::reader_layout_config(library.type_settings(), library.portrait())
+            || header.font_config
+                != reader_layout::reader_layout_config(library.type_settings(), library.portrait())
             || header.custom_font_identity != library.custom_font_identity()
             || header.section_count as usize > MAX_BOOK_SECTIONS
             || header.toc_count as usize > MAX_SD_TOC_ITEMS
@@ -857,7 +858,10 @@ where
             author_text_bytes,
             viewport_width: 800,
             viewport_height: 480,
-            font_config: reader_layout::reader_layout_config(library.type_settings(), library.portrait()),
+            font_config: reader_layout::reader_layout_config(
+                library.type_settings(),
+                library.portrait(),
+            ),
             custom_font_identity: library.custom_font_identity(),
             partial,
         };
@@ -1020,7 +1024,8 @@ where
         {
             return CacheLoadResult::Invalid;
         }
-        let expected_config = reader_layout::reader_layout_config(library.type_settings(), library.portrait());
+        let expected_config =
+            reader_layout::reader_layout_config(library.type_settings(), library.portrait());
         if header.custom_font_identity != library.custom_font_identity() {
             return CacheLoadResult::Invalid;
         }
@@ -1086,6 +1091,75 @@ where
         );
         false
     })
+}
+
+/// Open the book's SECTIONS directory once and run `f` with it, so a whole
+/// build writes tens of section files without re-walking the four-level
+/// cache chain per section. Directory creation failure passes `None`: the
+/// build still runs, every section write reports failure, and the book is
+/// marked partial — the same degraded path as before.
+pub(crate) fn with_v2_sections_dir<
+    R,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    f: impl for<'a> FnOnce(Option<&Directory<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>) -> R,
+) -> R
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if ensure_v2_cache_dirs(root, key).is_err() {
+        esp_println::println!("cache: v2 ensure dirs failed key={}", key);
+        return f(None);
+    }
+    // One handle walks the chain via change_dir, so the whole build holds a
+    // single directory slot instead of the four-level ladder.
+    let Ok(mut dir) = root.open_dir(CACHE_ROOT_DIR) else {
+        return f(None);
+    };
+    if dir.change_dir(CACHE_V2_DIR).is_err()
+        || dir.change_dir(key).is_err()
+        || dir.change_dir(CACHE_SECTIONS_DIR).is_err()
+    {
+        return f(None);
+    }
+    f(Some(&dir))
+}
+
+/// Write one section file into an already-open SECTIONS directory — the
+/// per-section body of `write_v2_section_cache` without the per-call
+/// directory walk.
+pub(crate) fn write_v2_section_cache_in<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    source_identity: (u32, u32),
+    section: u16,
+    library: &ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+    section_file_name(section, &mut name);
+    match sections.open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate) {
+        Ok(file) => write_v2_section_body(&file, source_identity, library.cached_spine, library),
+        Err(_) => {
+            esp_println::println!("cache: v2 open section failed section={}", section);
+            false
+        }
+    }
 }
 
 fn with_v2_section_file<
@@ -1486,7 +1560,10 @@ where
         text_bytes: library.text_len.min(u32::MAX as usize) as u32,
         viewport_width: 800,
         viewport_height: 480,
-        font_config: reader_layout::reader_layout_config(library.type_settings(), library.portrait()),
+        font_config: reader_layout::reader_layout_config(
+            library.type_settings(),
+            library.portrait(),
+        ),
         custom_font_identity: library.custom_font_identity(),
         bytes_consumed: 0,
         total_bytes: 0,
