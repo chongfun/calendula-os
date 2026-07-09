@@ -108,12 +108,7 @@ impl Scenario {
             }
         }
         if let Some(reading_sheet) = self.expect.reading_sheet {
-            if state.reading_sheet != reading_sheet {
-                return Err(format!(
-                    "expected reading_sheet {reading_sheet}, got {}",
-                    state.reading_sheet
-                ));
-            }
+            expect_eq("reading_sheet", reading_sheet, state.reading_sheet)?;
         }
         if let Some(front_buttons) = &self.expect.front_buttons {
             let expected = parse_front_buttons(front_buttons)?;
