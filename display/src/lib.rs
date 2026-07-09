@@ -61,12 +61,27 @@ impl Rect {
         h: HEIGHT as u16,
     };
 
+    /// Returns the full rect bounds matching the active orientation.
+    pub fn full_for_orientation(portrait: bool) -> Self {
+        if portrait {
+            Self {
+                x: 0,
+                y: 0,
+                w: HEIGHT as u16,
+                h: WIDTH as u16,
+            }
+        } else {
+            Self::FULL
+        }
+    }
+
     pub const fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
         Self { x, y, w, h }
     }
 
-    pub fn clipped(self) -> Option<Self> {
-        self.clipped_to(WIDTH as u16, HEIGHT as u16)
+    pub fn clipped(self, portrait: bool) -> Option<Self> {
+        let bounds = Self::full_for_orientation(portrait);
+        self.clipped_to(bounds.w, bounds.h)
     }
 
     /// Clip against an explicit frame size — the logical dimensions of the

@@ -1036,6 +1036,8 @@ fn sleep_request_from_saved_state(
     crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
     reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
     let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
+    let orientation = display_orientation_from_u8(record.reading_orientation)
+        .unwrap_or(DisplayOrientation::LandscapeButtonsBottom);
     Some(RenderRequest {
         kind: RenderKind::Page,
         view: AppView::Home,
@@ -1044,8 +1046,7 @@ fn sleep_request_from_saved_state(
         chapter: record.chapter.min(u8::MAX as u16) as u8,
         selection: 0,
         book_id: ReaderSource::sd(index).book_id(),
-        orientation: display_orientation_from_u8(record.reading_orientation)
-            .unwrap_or(DisplayOrientation::LandscapeButtonsBottom),
+        orientation,
         reading_sheet: false,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
@@ -1067,7 +1068,7 @@ fn sleep_request_from_saved_state(
         sync_status: SyncStatus::NotConfigured,
         wifi_ssid: [0; 32],
         wifi_ssid_len: 0,
-        dirty: display::Rect::FULL,
+        dirty: display::Rect::full_for_orientation(orientation.is_portrait()),
     })
 }
 

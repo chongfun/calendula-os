@@ -713,7 +713,7 @@ impl ReaderState {
         next.page_raw = page_raw;
         next.battery_mv = battery_mv;
         next.battery_percent = battery_percent;
-        next.dirty = Rect::FULL;
+        next.dirty = Rect::full_for_orientation(next.orientation.is_portrait());
 
         match (self.view, button) {
             (_, None) => {}
@@ -921,7 +921,7 @@ impl ReaderState {
                     self.book_id = ReaderSource::sd(0).book_id();
                     self.chapter = 0;
                     self.page = 0;
-                    self.dirty = Rect::FULL;
+                    self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
                 }
                 if self.view == AppView::Library {
                     if count == 0 {
@@ -929,7 +929,7 @@ impl ReaderState {
                     } else if self.selection >= count {
                         self.selection = count - 1;
                     }
-                    self.dirty = Rect::FULL;
+                    self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
                     if self.read_request_pending {
                         self.read_request_pending = false;
                     }
@@ -951,7 +951,7 @@ impl ReaderState {
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
                     self.chapter = current_chapter.min(u8::MAX as u16) as u8;
-                    self.dirty = Rect::FULL;
+                    self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
                 }
             }
             LibraryEvent::ChapterPage {
@@ -963,7 +963,7 @@ impl ReaderState {
                     if let Some(slot) = self.sd_chapter_pages.get_mut(chapter as usize) {
                         *slot = page.min(u16::MAX as u32) as u16;
                     }
-                    self.dirty = Rect::FULL;
+                    self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
                 }
             }
             LibraryEvent::ChapterCursor {
@@ -983,7 +983,7 @@ impl ReaderState {
                 if !available && self.font_family == FontFamily::Custom {
                     self.font_family = FontFamily::Literata;
                 }
-                self.dirty = Rect::FULL;
+                self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
             }
             LibraryEvent::Restored {
                 book_id,
@@ -1041,14 +1041,14 @@ impl ReaderState {
                             family
                         };
                 }
-                self.dirty = Rect::FULL;
+                self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
             }
         }
         if self.view == AppView::Library {
             self.selection = self
                 .selection
                 .min(self.library_item_count(ctx).saturating_sub(1));
-            self.dirty = Rect::FULL;
+            self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
         }
         self
     }
@@ -1076,7 +1076,7 @@ impl ReaderState {
             }
             SyncEvent::Failed(error) => SyncStatus::Error(error),
         };
-        self.dirty = Rect::FULL;
+        self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
         self
     }
 
