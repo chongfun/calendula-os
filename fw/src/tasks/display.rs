@@ -224,6 +224,14 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     let flush_ms = flush_start.elapsed().as_millis();
                     refresh_planner.record_render(request, mode);
                     prev_fb.copy_from(fb);
+                    // Settle first: the panel is visually done, so unblock the
+                    // input/power pipeline before the ~23 ms RED prestage and
+                    // any chapter-crossing SD read. Both still run on this task
+                    // before the next command is dequeued, so `prev_prestaged`
+                    // is always current by the next flush, and a Sleep queued
+                    // by power_task after DisplaySettled waits behind them.
+                    send_required_display_event(&DisplayEvent::Settled);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
                     let prestage_start = Instant::now();
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
                         .await
@@ -256,8 +264,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                             });
                         }
                     }
-                    send_required_display_event(&DisplayEvent::Settled);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
                 } else {
                     esp_println::println!("display: SPI transfer failed");
                     prev_prestaged = false;
