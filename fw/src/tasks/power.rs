@@ -42,8 +42,9 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 // Power button: sleep on demand.
                 PowerEvent::SleepNow => {
-                    enter_sleep(&mut rtc).await;
-                    // Only reached if a late button press aborted the handshake.
+                    // Only reached if a late button press aborted the
+                    // handshake; resume on that press's idle tier.
+                    idle = enter_sleep(&mut rtc).await;
                     deadline = Instant::now() + idle;
                 }
                 PowerEvent::DisplaySettled | PowerEvent::DisplayAsleep => {}
@@ -51,7 +52,7 @@ pub async fn run(lpwr: LPWR<'static>) {
             // Idle timeout elapsed with no activity.
             Either::Second(_) => {
                 esp_println::println!("power: idle timeout");
-                enter_sleep(&mut rtc).await;
+                idle = enter_sleep(&mut rtc).await;
                 deadline = Instant::now() + idle;
             }
         }
@@ -64,10 +65,11 @@ pub async fn run(lpwr: LPWR<'static>) {
 ///
 /// Deep sleep is terminal — the chip reboots on wake — so this only returns if
 /// a button press arrives during the display handshake and aborts the
-/// transition. Waiting for `DisplayAsleep` before cutting power guarantees the
-/// e-ink panel has settled on its sleep image and progress is safely on the SD
-/// card.
-async fn enter_sleep(rtc: &mut Rtc<'_>) {
+/// transition, and the returned value is the idle tier of the view that press
+/// landed in, so the resumed idle clock ticks at the cancelling view's leash.
+/// Waiting for `DisplayAsleep` before cutting power guarantees the e-ink panel
+/// has settled on its sleep image and progress is safely on the SD card.
+async fn enter_sleep(rtc: &mut Rtc<'_>) -> Duration {
     esp_println::println!("power: display sleep");
     DISPLAY_COMMANDS.send(DisplayCommand::Sleep).await;
 
@@ -78,7 +80,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
                 let mut button = steal_wake_button();
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
-            PowerEvent::Activity(_) => return,
+            PowerEvent::Activity(view) => return idle_timeout(view),
             PowerEvent::DisplaySettled | PowerEvent::SleepNow => {}
         }
     }
