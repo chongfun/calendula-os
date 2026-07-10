@@ -812,26 +812,20 @@ impl ReaderState {
                 // summons the key sheet above the buttons (the margin
                 // appears when called for); the second press acts on the
                 // label it revealed. Landscape keeps its direct mapping.
-                if is_portrait(self.orientation) && !self.reading_sheet {
-                    next.reading_sheet = true;
-                } else {
-                    next.reading_sheet = false;
-                    next.view = AppView::Chapters;
+                next = self.portrait_summon_or(|s| {
+                    s.view = AppView::Chapters;
                     // `chapter` already tracks the reading position (kept
                     // current by the firmware's Loaded event, un-capped);
                     // opening the list lands the cursor there rather than
                     // on the saturated guess.
-                    next.selection = self.chapter as u16;
-                }
+                    s.selection = s.chapter as u16;
+                });
             }
             (AppView::Reading, Some(Button::Back)) => {
-                if is_portrait(self.orientation) && !self.reading_sheet {
-                    next.reading_sheet = true;
-                } else {
-                    next.reading_sheet = false;
-                    next.view = AppView::Home;
-                    next.selection = 0;
-                }
+                next = self.portrait_summon_or(|s| {
+                    s.view = AppView::Home;
+                    s.selection = 0;
+                });
             }
             (AppView::Chapters, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.chapter_item_count(ctx) as u16);
@@ -1196,6 +1190,19 @@ impl ReaderState {
             }
         }
         selected
+    }
+
+    fn portrait_summon_or<F>(mut self, action: F) -> Self
+    where
+        F: FnOnce(&mut Self),
+    {
+        if is_portrait(self.orientation) && !self.reading_sheet {
+            self.reading_sheet = true;
+        } else {
+            self.reading_sheet = false;
+            action(&mut self);
+        }
+        self
     }
 }
 
