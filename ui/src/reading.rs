@@ -222,6 +222,166 @@ pub fn page_record_at(source: &impl ReadingBlocks, page_index: usize) -> PageRec
     }
 }
 
+/// Where an appended block lands in the page index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockPlacement {
+    /// The block joins the page in progress (or opens the very first page).
+    SamePage,
+    /// The block opens a new page.
+    NewPage,
+}
+
+/// Incremental page-index cursor: the running `(y, last block height)` of
+/// the firmware's `rebuild_page_index` walk, advanced one block at a time
+/// as the cache build appends lines — O(1) per line instead of a full
+/// re-walk of every accumulated block.
+///
+/// Invariant: driving [`Self::place_next_block`] over blocks `0..n` and
+/// mirroring each placement with [`apply_block_placement`] yields page
+/// records bit-identical to the full rebuild walk. Page records persist
+/// into section files, so any divergence is silent cache corruption; the
+/// host tests below check the cursor against a naive full walk on every
+/// step, including retroactive paragraph-end growth and capacity overflow.
+#[derive(Clone, Copy, Debug)]
+pub struct PageIndexCursor {
+    y: i16,
+    /// Height charged for the most recently placed block, kept so a
+    /// retroactive height change can re-derive the pre-placement `y`.
+    last_block_height: i16,
+}
+
+impl PageIndexCursor {
+    /// A cursor over an empty block set laid into `page_box`.
+    pub const fn start(page_box: PageBox) -> Self {
+        Self {
+            y: page_box.top,
+            last_block_height: 0,
+        }
+    }
+
+    /// Place the block just appended at `index` (which must be the last
+    /// block, placed exactly once, in order). Uses the same decision as the
+    /// full rebuild walk: a block starts a new page when its gapped height
+    /// overflows the page or it demands a break, and the page already has
+    /// content.
+    pub fn place_next_block(
+        &mut self,
+        source: &impl ReadingBlocks,
+        index: usize,
+    ) -> BlockPlacement {
+        let PageBox { top, bottom, .. } = source.page_box();
+        let height = block_height(source, index);
+        let new_page =
+            (self.y + height > bottom || source.page_break_before(index)) && self.y > top;
+        if new_page {
+            self.y = top;
+        }
+        self.y += height;
+        self.last_block_height = height;
+        if new_page {
+            BlockPlacement::NewPage
+        } else {
+            BlockPlacement::SamePage
+        }
+    }
+
+    /// Re-place the most recently placed block after a retroactive height
+    /// change — a trailing paragraph-end mark adds the paragraph gap after
+    /// the block has already been placed. Returns `NewPage` when the grown
+    /// block no longer fits the page it joined and a full walk would move it
+    /// to a fresh page (the caller then mirrors the move with
+    /// [`apply_last_block_move`]); a block that already opened its page can
+    /// only grow in place. Heights never shrink here (the gap is
+    /// non-negative), so a placed `NewPage` decision never reverts.
+    pub fn replace_last_block(
+        &mut self,
+        source: &impl ReadingBlocks,
+        index: usize,
+    ) -> BlockPlacement {
+        let PageBox { top, bottom, .. } = source.page_box();
+        let y_before = self.y - self.last_block_height;
+        let height = block_height(source, index);
+        let new_page =
+            (y_before + height > bottom || source.page_break_before(index)) && y_before > top;
+        self.y = if new_page {
+            top + height
+        } else {
+            y_before + height
+        };
+        self.last_block_height = height;
+        if new_page {
+            BlockPlacement::NewPage
+        } else {
+            BlockPlacement::SamePage
+        }
+    }
+}
+
+/// Mirror one [`PageIndexCursor`] placement into bounded page-record
+/// arrays, replicating the full rebuild's behavior exactly — including the
+/// silent drop of page records past `pages.len()` (`overflowed` then latches
+/// so later same-page blocks don't grow an unrelated record).
+pub fn apply_block_placement(
+    placement: BlockPlacement,
+    index: usize,
+    spine: u16,
+    pages: &mut [PageRecord],
+    page_spine: &mut [u16],
+    page_count: &mut usize,
+    overflowed: &mut bool,
+) {
+    let open_first = *page_count == 0 && matches!(placement, BlockPlacement::SamePage);
+    match placement {
+        BlockPlacement::SamePage if !open_first => {
+            if !*overflowed {
+                pages[*page_count - 1].block_count += 1;
+            }
+        }
+        _ => {
+            if *overflowed || *page_count >= pages.len() {
+                *overflowed = true;
+                return;
+            }
+            pages[*page_count] = PageRecord {
+                first_block: index as u16,
+                block_count: 1,
+            };
+            page_spine[*page_count] = spine;
+            *page_count += 1;
+        }
+    }
+}
+
+/// Mirror a [`PageIndexCursor::replace_last_block`] move: the grown block
+/// leaves the tail of the page in progress and opens a new page. Follows
+/// the same capacity rule as [`apply_block_placement`].
+pub fn apply_last_block_move(
+    index: usize,
+    spine: u16,
+    pages: &mut [PageRecord],
+    page_spine: &mut [u16],
+    page_count: &mut usize,
+    overflowed: &mut bool,
+) {
+    if *overflowed || *page_count == 0 {
+        // The block lives past the recorded pages (or nothing is recorded);
+        // a full rebuild would not record its page either.
+        return;
+    }
+    let last = *page_count - 1;
+    pages[last].block_count = pages[last].block_count.saturating_sub(1);
+    if *page_count >= pages.len() {
+        *overflowed = true;
+        return;
+    }
+    pages[*page_count] = PageRecord {
+        first_block: index as u16,
+        block_count: 1,
+    };
+    page_spine[*page_count] = spine;
+    *page_count += 1;
+}
+
 pub fn for_each_drawable_block(
     source: &impl ReadingBlocks,
     page: PageRecord,
@@ -1348,6 +1508,418 @@ mod tests {
                 if consumed >= text.len() {
                     break;
                 }
+            }
+        }
+    }
+
+    /// Growable fixture for the incremental page-index cursor: single-line
+    /// blocks (the shape the streaming cache build produces) with per-block
+    /// role, paragraph-end, and page-break flags, exposing only the first
+    /// `len` blocks so one allocation serves an append-one-at-a-time walk.
+    struct PageBlocks {
+        roles: Vec<TextRole>,
+        ends: Vec<bool>,
+        breaks: Vec<bool>,
+        settings: TypeSettings,
+        page_box: PageBox,
+        len: usize,
+    }
+
+    impl ReadingBlocks for PageBlocks {
+        fn block_count(&self) -> usize {
+            self.len
+        }
+        fn block(&self, index: usize) -> Option<BlockRecord> {
+            (index < self.len).then(|| BlockRecord {
+                text_offset: 0,
+                text_len: 0,
+                line_count: 1,
+                role: self.roles[index],
+                style: proto::text::FontStyle::Regular,
+                align: TextAlign::Justify,
+            })
+        }
+        fn block_text(&self, _index: usize) -> &str {
+            ""
+        }
+        fn block_style(&self, _index: usize) -> FontStyle {
+            FontStyle::Regular
+        }
+        fn page_break_before(&self, index: usize) -> bool {
+            self.breaks[index]
+        }
+        fn paragraph_end(&self, index: usize) -> bool {
+            self.ends[index]
+        }
+        fn type_settings(&self) -> TypeSettings {
+            self.settings
+        }
+        fn page_box(&self) -> PageBox {
+            self.page_box
+        }
+    }
+
+    /// Reference implementation: the pre-incremental firmware
+    /// `rebuild_page_index` walk, verbatim — full gapped height against the
+    /// page edge, completed pages pushed at each boundary plus the trailing
+    /// page, records silently dropped past `capacity`.
+    fn naive_page_index(
+        source: &impl ReadingBlocks,
+        capacity: usize,
+    ) -> (Vec<PageRecord>, Vec<u16>, usize) {
+        let mut pages = vec![
+            PageRecord {
+                first_block: 0,
+                block_count: 0
+            };
+            capacity
+        ];
+        let mut page_spine = vec![0u16; capacity];
+        let mut page_count = 0usize;
+        let push = |pages: &mut Vec<PageRecord>,
+                    page_spine: &mut Vec<u16>,
+                    page_count: &mut usize,
+                    first_block: usize,
+                    block_count: usize| {
+            if block_count == 0 || *page_count >= capacity {
+                return;
+            }
+            pages[*page_count] = PageRecord {
+                first_block: first_block as u16,
+                block_count: block_count as u16,
+            };
+            page_spine[*page_count] = spine_for(first_block);
+            *page_count += 1;
+        };
+        if source.block_count() == 0 {
+            return (pages, page_spine, 0);
+        }
+        let PageBox {
+            top: page_top,
+            bottom: page_bottom,
+            ..
+        } = source.page_box();
+        let mut first_block = 0usize;
+        let mut block_count = 0usize;
+        let mut y = page_top;
+        for index in 0..source.block_count() {
+            let height = block_height(source, index);
+            let new_page =
+                (y + height > page_bottom || source.page_break_before(index)) && y > page_top;
+            if new_page {
+                push(
+                    &mut pages,
+                    &mut page_spine,
+                    &mut page_count,
+                    first_block,
+                    block_count,
+                );
+                first_block = index;
+                block_count = 0;
+                y = page_top;
+            }
+            block_count += 1;
+            y += height;
+        }
+        push(
+            &mut pages,
+            &mut page_spine,
+            &mut page_count,
+            first_block,
+            block_count,
+        );
+        (pages, page_spine, page_count)
+    }
+
+    /// Deterministic per-block spine, so spine propagation into the page
+    /// records is checked too.
+    fn spine_for(index: usize) -> u16 {
+        (index / 5) as u16
+    }
+
+    /// The incremental side under test: the shared cursor plus the shared
+    /// array-application helpers, driven exactly as the firmware's
+    /// `LibraryBlockSink` drives them.
+    struct IncrementalIndex {
+        cursor: PageIndexCursor,
+        pages: Vec<PageRecord>,
+        page_spine: Vec<u16>,
+        page_count: usize,
+        overflowed: bool,
+    }
+
+    impl IncrementalIndex {
+        fn new(page_box: PageBox, capacity: usize) -> Self {
+            Self {
+                cursor: PageIndexCursor::start(page_box),
+                pages: vec![
+                    PageRecord {
+                        first_block: 0,
+                        block_count: 0
+                    };
+                    capacity
+                ],
+                page_spine: vec![0u16; capacity],
+                page_count: 0,
+                overflowed: false,
+            }
+        }
+
+        fn append(&mut self, source: &impl ReadingBlocks, index: usize) {
+            let placement = self.cursor.place_next_block(source, index);
+            apply_block_placement(
+                placement,
+                index,
+                spine_for(index),
+                &mut self.pages,
+                &mut self.page_spine,
+                &mut self.page_count,
+                &mut self.overflowed,
+            );
+        }
+
+        fn mark_last_grew(&mut self, source: &impl ReadingBlocks, index: usize) {
+            if self.cursor.replace_last_block(source, index) == BlockPlacement::NewPage {
+                apply_last_block_move(
+                    index,
+                    spine_for(index),
+                    &mut self.pages,
+                    &mut self.page_spine,
+                    &mut self.page_count,
+                    &mut self.overflowed,
+                );
+            }
+        }
+
+        /// The firmware's carry-path fallback: full rebuild, adopting the
+        /// walk's cursor for the appends that follow.
+        fn rebuild(&mut self, source: &impl ReadingBlocks) {
+            self.cursor = PageIndexCursor::start(source.page_box());
+            self.page_count = 0;
+            self.overflowed = false;
+            for index in 0..source.block_count() {
+                self.append(source, index);
+            }
+        }
+
+        fn assert_matches(&self, source: &impl ReadingBlocks, context: &str) {
+            let (pages, page_spine, page_count) = naive_page_index(source, self.pages.len());
+            assert_eq!(self.page_count, page_count, "page_count: {context}");
+            assert_eq!(
+                &self.pages[..page_count],
+                &pages[..page_count],
+                "page records: {context}"
+            );
+            assert_eq!(
+                &self.page_spine[..page_count],
+                &page_spine[..page_count],
+                "page spines: {context}"
+            );
+        }
+    }
+
+    /// Deterministic pseudo-random block sequences: varied roles (varied
+    /// heights and paragraph gaps), paragraph ends, and page breaks.
+    fn synth_blocks(
+        seed: u32,
+        count: usize,
+        settings: TypeSettings,
+        page_box: PageBox,
+    ) -> PageBlocks {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 16
+        };
+        let roles = [
+            TextRole::Body,
+            TextRole::Body,
+            TextRole::Body,
+            TextRole::BlockQuote,
+            TextRole::Heading3,
+            TextRole::Heading2,
+            TextRole::Heading1,
+        ];
+        let mut fixture = PageBlocks {
+            roles: Vec::new(),
+            ends: Vec::new(),
+            breaks: Vec::new(),
+            settings,
+            page_box,
+            len: 0,
+        };
+        for _ in 0..count {
+            fixture.roles.push(roles[next() as usize % roles.len()]);
+            fixture.ends.push(next() % 3 != 0);
+            fixture.breaks.push(next() % 11 == 0);
+            fixture.len += 1;
+        }
+        fixture
+    }
+
+    #[test]
+    fn incremental_page_cursor_matches_full_rebuild_at_every_append() {
+        let boxes = [
+            PageBox::LANDSCAPE,
+            PageBox::PORTRAIT,
+            // A short page forces frequent page turns and, with the small
+            // capacities below, exercises the past-capacity drop path.
+            PageBox {
+                left: 8,
+                right: 200,
+                top: 6,
+                bottom: 96,
+            },
+        ];
+        let settings = [
+            TypeSettings::DEFAULT,
+            TypeSettings {
+                size: FontSize::Small,
+                spacing: LineSpacing::Compact,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Large,
+                spacing: LineSpacing::Relaxed,
+                ..TypeSettings::DEFAULT
+            },
+        ];
+        let mut overflow_hit = false;
+        for page_box in boxes {
+            for settings in settings {
+                for (seed, capacity) in [(1u32, 96usize), (2, 96), (3, 4), (4, 2)] {
+                    let mut fixture = synth_blocks(seed, 80, settings, page_box);
+                    let total = fixture.len;
+                    fixture.len = 0;
+                    let mut incremental = IncrementalIndex::new(page_box, capacity);
+                    for index in 0..total {
+                        fixture.len = index + 1;
+                        incremental.append(&fixture, index);
+                        incremental.assert_matches(
+                            &fixture,
+                            &format!("seed {seed} capacity {capacity} block {index}"),
+                        );
+                    }
+                    overflow_hit |= incremental.overflowed;
+                }
+            }
+        }
+        assert!(
+            overflow_hit,
+            "the grid must exercise the capacity-drop path"
+        );
+    }
+
+    #[test]
+    fn retroactive_paragraph_end_marks_match_full_rebuild() {
+        // Mirror the build's mark_last_block_paragraph_end: blocks arrive
+        // with paragraph_end=false, then an empty paragraph-end fragment
+        // flips the flag on the last block only — a height-only change that
+        // the cursor must absorb as a bounded one-block fix-up.
+        let mut moved_hit = false;
+        for page_box in [PageBox::LANDSCAPE, PageBox::PORTRAIT] {
+            for seed in 5u32..9 {
+                let mut fixture = synth_blocks(seed, 60, TypeSettings::DEFAULT, page_box);
+                // Roles with a real trailing gap make the flip change height.
+                let total = fixture.len;
+                for flag in fixture.ends.iter_mut() {
+                    *flag = false;
+                }
+                fixture.len = 0;
+                let mut incremental = IncrementalIndex::new(page_box, 96);
+                let mut state = seed;
+                for index in 0..total {
+                    fixture.len = index + 1;
+                    incremental.append(&fixture, index);
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    if (state >> 16) % 2 == 0 {
+                        let before = incremental.page_count;
+                        fixture.ends[index] = true;
+                        incremental.mark_last_grew(&fixture, index);
+                        moved_hit |= incremental.page_count > before;
+                    }
+                    incremental.assert_matches(&fixture, &format!("seed {seed} block {index}"));
+                }
+            }
+        }
+        assert!(
+            moved_hit,
+            "the sweep must include a mark that moves the block to a new page"
+        );
+    }
+
+    #[test]
+    fn paragraph_end_growth_moves_an_exactly_full_block_to_the_next_page() {
+        // Constructed move: Medium/Normal body advance is 26; a page box of
+        // 6..58 fits exactly two lines ungapped. Marking the second block
+        // (BlockQuote, trailing gap 6) paragraph-end grows it past the edge,
+        // so a full rebuild moves it to a new page — the cursor must agree.
+        let advance = line_advance(TypeSettings::DEFAULT, TextRole::Body);
+        let page_box = PageBox {
+            left: 8,
+            right: 200,
+            top: 6,
+            bottom: 6 + 2 * advance,
+        };
+        let mut fixture = PageBlocks {
+            roles: vec![TextRole::Body, TextRole::BlockQuote],
+            ends: vec![true, false],
+            breaks: vec![false, false],
+            settings: TypeSettings::DEFAULT,
+            page_box,
+            len: 0,
+        };
+        let mut incremental = IncrementalIndex::new(page_box, 96);
+        fixture.len = 1;
+        incremental.append(&fixture, 0);
+        fixture.len = 2;
+        incremental.append(&fixture, 1);
+        assert_eq!(incremental.page_count, 1, "both blocks share the page");
+
+        fixture.ends[1] = true;
+        incremental.mark_last_grew(&fixture, 1);
+        assert_eq!(incremental.page_count, 2, "the grown block moved");
+        incremental.assert_matches(&fixture, "constructed move");
+    }
+
+    #[test]
+    fn cursor_adopted_from_a_carry_rebuild_stays_in_agreement() {
+        // The carry path drops the flushed whole pages, rebases the
+        // half-finished page's blocks to the front, and full-rebuilds; the
+        // appends that follow continue incrementally from the walk's cursor.
+        for seed in 10u32..14 {
+            let full = synth_blocks(seed, 70, TypeSettings::DEFAULT, PageBox::LANDSCAPE);
+            let (pages, _, page_count) = naive_page_index(&full, 96);
+            if page_count < 2 {
+                continue;
+            }
+            // Simulate carrying the last (half-finished) page: keep only its
+            // blocks, as carry_last_page rebases them to index 0.
+            let cut = pages[page_count - 1].first_block as usize;
+            let mut carried = PageBlocks {
+                roles: full.roles[cut..].to_vec(),
+                ends: full.ends[cut..].to_vec(),
+                breaks: full.breaks[cut..].to_vec(),
+                settings: full.settings,
+                page_box: full.page_box,
+                len: full.len - cut,
+            };
+            let mut incremental = IncrementalIndex::new(carried.page_box, 96);
+            incremental.rebuild(&carried);
+            incremental.assert_matches(&carried, &format!("seed {seed} post-carry rebuild"));
+
+            // Keep appending after the rebuild.
+            let more = synth_blocks(seed ^ 0xa5a5, 30, full.settings, full.page_box);
+            for index in 0..more.len {
+                carried.roles.push(more.roles[index]);
+                carried.ends.push(more.ends[index]);
+                carried.breaks.push(more.breaks[index]);
+                carried.len += 1;
+                incremental.append(&carried, carried.len - 1);
+                incremental.assert_matches(
+                    &carried,
+                    &format!("seed {seed} appended block {index} after carry"),
+                );
             }
         }
     }

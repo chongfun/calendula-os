@@ -10,33 +10,12 @@ use heapless::String;
 
 const CATALOG_ROOT_DIR: &str = "XTEINK";
 const CATALOG_FILE: &str = "CATALOG.BIN";
-const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
-/// v3 widened the on-disk book count from a single byte to a `u16` at
-/// `header[5..7]`, so the catalog (and the streamed Library list) is bounded by
-/// the card, not 255. v4 rebuilds stale records written before long filenames
-/// were safely bounded: those records could contain only `/`. An older catalog
-/// fails the version check and is rebuilt by a fresh scan -- no migration code
-/// needed.
-const CATALOG_VERSION: u8 = 4;
-const CATALOG_HEADER_BYTES: usize = 8;
-const CATALOG_RECORD_BYTES: usize = 92;
-/// Books staged in RAM per pass of the multi-pass scan write. embedded-sdmmc
-/// forbids writing to a file while a directory iteration holds its lock, so the
-/// catalog cannot be streamed out during the walk; instead each pass collects
-/// this many records into a stack batch and appends them after the walk
-/// returns. A library larger than one batch costs extra read-only directory
-/// walks, all behind the scan spinner.
-const SCAN_BATCH: usize = 48;
-
-/// One catalog record decoded into owned fields, so it outlives the file handle
-/// it was read through.
-struct CatalogRecord {
-    display_name: String<64>,
-    open_name: String<16>,
-    in_books_dir: bool,
-    byte_size: u32,
-    source_hash: u32,
-}
+use proto::catalog::{
+    catalog_identity_staged, catalog_record_identity, decode_catalog_record, encode_catalog_header,
+    encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
+    CatalogRecord, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
+    CATALOG_RECORD_TITLE_OFFSET, CATALOG_TITLE_BYTES,
+};
 
 #[inline(never)]
 pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &mut ReaderStore) {
@@ -49,14 +28,28 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         esp_println::println!("sd: open root");
         library.clear_catalog();
         library.status = LibraryScanStatus::Scanning;
-        match write_catalog_streaming(root) {
-            Ok(0) => LibraryScanStatus::Empty,
-            Ok(count) => {
+        // The 16 KB section text arena doubles as the scan's staging and
+        // identity scratch: a scan runs from the storage dispatcher (boot or
+        // an explicit refresh), never while a page render is reading the
+        // arena, and the section window is invalidated below so a stale page
+        // can't be served from clobbered text afterwards.
+        let scanned = write_catalog_streaming(root, &mut library.text);
+        if let Ok(count) = scanned {
+            if count > 0 {
                 esp_println::println!("sd: catalog written, {} epub(s)", count);
                 // Drop the cached data of books no longer on the card before
                 // reloading the window: this is the one moment the full book
                 // set is known and the catalog is fresh.
-                sweep_orphan_caches(root);
+                sweep_orphan_caches(root, &mut library.text);
+            }
+        }
+        // The arena held scan scratch, not section text: drop the resident
+        // section (and any Chapters TOC window) so nothing renders from it.
+        library.clear_lines();
+        library.text_holds_toc = false;
+        match scanned {
+            Ok(0) => LibraryScanStatus::Empty,
+            Ok(_) => {
                 // Reload the header count + the first list window from the file
                 // we just wrote, so the streaming readers and the store agree.
                 let _ = read_catalog_window(root, library, 0);
@@ -142,8 +135,12 @@ fn walk_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOL
 /// Write CATALOG.BIN from the card without ever holding the whole library in
 /// RAM. embedded-sdmmc locks the volume across a directory walk, so records
 /// cannot be written mid-iteration; instead one walk counts the books (for the
-/// header), then each later walk stages the next `SCAN_BATCH` records into a
-/// stack buffer and appends them once the walk has returned. Returns the book
+/// header), then each later walk stages the next batch of records into the
+/// caller's scratch region (the idle 16 KB section arena -- ~105 records per
+/// pass, so ordinary libraries take two walks total) and appends them once the
+/// walk has returned. Each staged record also gets its display title (the EPUB
+/// title cached at last open, or the upload label) resolved once here, so
+/// Library window reads never probe per-book files again. Returns the book
 /// count actually written.
 fn write_catalog_streaming<
     D,
@@ -153,11 +150,16 @@ fn write_catalog_streaming<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    scratch: &mut [u8],
 ) -> Result<u16, ()>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let batch_capacity = scratch.len() / CATALOG_RECORD_BYTES;
+    if batch_capacity == 0 {
+        return Err(());
+    }
     let xteink = open_or_make_dir(root, CATALOG_ROOT_DIR)?;
     let file = xteink
         .open_file_in_dir(CATALOG_FILE, Mode::ReadWriteCreateOrTruncate)
@@ -171,26 +173,30 @@ where
     let count = counted.min(u16::MAX as usize) as u16;
 
     let mut header = [0u8; CATALOG_HEADER_BYTES];
-    header[..4].copy_from_slice(CATALOG_MAGIC);
-    header[4] = CATALOG_VERSION;
-    header[5..7].copy_from_slice(&count.to_le_bytes());
+    encode_catalog_header(count, &mut header);
     file.write(&header).map_err(|_| ())?;
 
     let total = count as usize;
     let mut cursor = 0usize;
     while cursor < total {
-        let mut batch = [[0u8; CATALOG_RECORD_BYTES]; SCAN_BATCH];
         let mut batch_len = 0usize;
         let mut seen = 0usize;
         {
             let mut collect = |path: &str, open_name: &str, in_books_dir: bool, byte_size: u32| {
-                if seen >= cursor && batch_len < SCAN_BATCH {
-                    encode_record(
-                        &mut batch[batch_len],
+                if seen >= cursor && batch_len < batch_capacity {
+                    let at = batch_len * CATALOG_RECORD_BYTES;
+                    let record: &mut [u8; CATALOG_RECORD_BYTES] = (&mut scratch
+                        [at..at + CATALOG_RECORD_BYTES])
+                        .try_into()
+                        .expect("record slice is exactly one record");
+                    encode_catalog_record(
+                        record,
                         path,
                         open_name,
+                        "",
                         in_books_dir,
                         byte_size,
+                        source_hash(path, byte_size),
                     );
                     batch_len += 1;
                 }
@@ -198,12 +204,29 @@ where
             };
             walk_epubs(root, &mut collect);
         }
-        for record in &batch[..batch_len] {
-            file.write(record).map_err(|_| ())?;
-        }
         if batch_len == 0 {
             break;
         }
+        // The walk has returned, so file opens are legal again: resolve each
+        // staged record's title (cheap for the common case -- a dir open that
+        // fails before any file read) and patch it in before the append.
+        for index in 0..batch_len {
+            let at = index * CATALOG_RECORD_BYTES;
+            let record: &[u8; CATALOG_RECORD_BYTES] = (&scratch[at..at + CATALOG_RECORD_BYTES])
+                .try_into()
+                .expect("record slice is exactly one record");
+            let decoded = decode_catalog_record(record);
+            let mut title = String::<64>::new();
+            if cached_title_label(root, &decoded, &mut title).is_some() {
+                let mut field = [0u8; CATALOG_TITLE_BYTES];
+                encode_catalog_title(title.as_str(), &mut field);
+                scratch[at + CATALOG_RECORD_TITLE_OFFSET
+                    ..at + CATALOG_RECORD_TITLE_OFFSET + CATALOG_TITLE_BYTES]
+                    .copy_from_slice(&field);
+            }
+        }
+        file.write(&scratch[..batch_len * CATALOG_RECORD_BYTES])
+            .map_err(|_| ())?;
         cursor += batch_len;
     }
     Ok(count)
@@ -233,10 +256,7 @@ where
         .map_err(|_| ())?;
     let mut header = [0u8; CATALOG_HEADER_BYTES];
     read_exact_file(&file, &mut header)?;
-    if &header[..4] != CATALOG_MAGIC || header[4] != CATALOG_VERSION {
-        return Err(());
-    }
-    let count = u16::from_le_bytes([header[5], header[6]]);
+    let count = proto::catalog::decode_catalog_header(&header).ok_or(())?;
     f(&file, count)
 }
 
@@ -269,12 +289,13 @@ where
         let mut record = [0u8; CATALOG_RECORD_BYTES];
         for _ in 0..take {
             read_exact_file(file, &mut record)?;
-            let decoded = decode_record(&record);
-            // Prefer the title saved when the book was last opened over the
-            // file-stem label, so uploaded books (8.3 names) read as their
-            // real titles. A miss (never opened) falls back to the stem.
-            let mut title = String::<64>::new();
-            let label = cached_title_label(root, &decoded, &mut title);
+            let decoded = decode_catalog_record(&record);
+            // Prefer the title persisted in the record (resolved at scan,
+            // refreshed at book open) over the file-stem label, so uploaded
+            // books (8.3 names) read as their real titles. An empty title
+            // falls back to the stem. No per-row file probes: window
+            // crossings cost exactly the record reads.
+            let label = (!decoded.title.is_empty()).then_some(decoded.title.as_str());
             library.push_window_entry(
                 decoded.display_name.as_str(),
                 decoded.open_name.as_str(),
@@ -310,7 +331,7 @@ where
         seek_to_record(file, index)?;
         let mut record = [0u8; CATALOG_RECORD_BYTES];
         read_exact_file(file, &mut record)?;
-        Ok(decode_record(&record))
+        Ok(decode_catalog_record(&record))
     })
     .ok()
 }
@@ -345,8 +366,7 @@ where
         let mut record = [0u8; CATALOG_RECORD_BYTES];
         for index in 0..count as usize {
             read_exact_file(file, &mut record)?;
-            let rh = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-            let rs = u32::from_le_bytes([record[4], record[5], record[6], record[7]]);
+            let (rh, rs) = catalog_record_identity(&record);
             if rh == source_hash && rs == byte_size {
                 return Ok(Some(index as u16));
             }
@@ -368,10 +388,7 @@ where
     seek_to_record(file, index)?;
     let mut record = [0u8; CATALOG_RECORD_BYTES];
     read_exact_file(file, &mut record)?;
-    Ok((
-        u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
-        u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
-    ))
+    Ok(catalog_record_identity(&record))
 }
 
 fn seek_to_record<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
@@ -386,41 +403,14 @@ where
     file.seek_from_start(offset).map_err(|_| ())
 }
 
-fn encode_record(
-    record: &mut [u8; CATALOG_RECORD_BYTES],
-    display_name: &str,
-    open_name: &str,
-    in_books_dir: bool,
-    byte_size: u32,
-) {
-    record.fill(0);
-    record[0] = in_books_dir as u8;
-    record[4..8].copy_from_slice(&byte_size.to_le_bytes());
-    record[8..12].copy_from_slice(&source_hash(display_name, byte_size).to_le_bytes());
-    copy_fixed(display_name.as_bytes(), &mut record[12..76]);
-    copy_fixed(open_name.as_bytes(), &mut record[76..92]);
-}
-
-fn decode_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogRecord {
-    let mut display_name = String::<64>::new();
-    let _ = display_name.push_str(fixed_str(&record[12..76]));
-    let mut open_name = String::<16>::new();
-    let _ = open_name.push_str(fixed_str(&record[76..92]));
-    CatalogRecord {
-        display_name,
-        open_name,
-        in_books_dir: record[0] != 0,
-        byte_size: u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
-        source_hash: u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
-    }
-}
-
 /// The list label override for a catalog record, read into `title` in place,
 /// in order of authority: the EPUB title saved in the book's cache when it was
 /// last opened, then the readable filename stashed at upload (for uploads not
 /// yet opened, whose 8.3 name is unreadable). Returns `None` (file-stem
-/// fallback) when neither exists. Cheap for the common case -- each lookup is a
-/// dir open that fails before any file read.
+/// fallback) when neither exists. Resolved once per book at scan time -- the
+/// result persists in the record's title field, so window reads never call
+/// this. Cheap for the common case -- each lookup is a dir open that fails
+/// before any file read.
 fn cached_title_label<
     'a,
     D,
@@ -489,19 +479,14 @@ pub(crate) fn load_active_entry(
     if library.active_index() == Some(index) {
         return true;
     }
-    // Read the record and, in the same session, the title saved when the book
-    // was last opened, so the active book's fallback label (Home colophon
-    // before a reopen) matches what the list shows.
-    let resolved = sd_session::with_root(epd, sd_cs, |root| {
-        let record = read_catalog_record_at(root, index)?;
-        let mut title = String::<64>::new();
-        let has_title = cached_title_label(root, &record, &mut title).is_some();
-        Some((record, if has_title { Some(title) } else { None }))
-    })
-    .ok()
-    .flatten();
+    // The record carries the title persisted at scan/open, so the active
+    // book's fallback label (Home colophon before a reopen) matches what the
+    // list shows without any per-book cache probe.
+    let resolved = sd_session::with_root(epd, sd_cs, |root| read_catalog_record_at(root, index))
+        .ok()
+        .flatten();
     match resolved {
-        Some((record, title)) => {
+        Some(record) => {
             library.set_active_entry(
                 index,
                 record.display_name.as_str(),
@@ -509,12 +494,97 @@ pub(crate) fn load_active_entry(
                 record.in_books_dir,
                 record.byte_size,
                 record.source_hash,
-                title.as_deref(),
+                (!record.title.is_empty()).then_some(record.title.as_str()),
             );
             true
         }
         None => false,
     }
+}
+
+/// Persist a book's just-learned title into its catalog record, so the next
+/// window read (and the next boot's catalog cache) label it without probing
+/// the book's cache. Runs inside the open's existing SD session. The record
+/// at `index` is patched only when its identity still matches (the catalog
+/// may have been rewritten under a stale index -- then the identity resolves
+/// the true index) and only when the stored title actually differs, so the
+/// common reopen costs one record read and no write.
+pub(crate) fn update_catalog_title<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    index: usize,
+    source_identity: (u32, u32),
+    title: &str,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if title.is_empty() {
+        return false;
+    }
+    let Ok(xteink) = root.open_dir(CATALOG_ROOT_DIR) else {
+        return false;
+    };
+    let Ok(file) = xteink.open_file_in_dir(CATALOG_FILE, Mode::ReadWriteAppend) else {
+        return false;
+    };
+    if file.seek_from_start(0).is_err() {
+        return false;
+    }
+    let mut header = [0u8; CATALOG_HEADER_BYTES];
+    if read_exact_file(&file, &mut header).is_err() {
+        return false;
+    }
+    let Some(count) = proto::catalog::decode_catalog_header(&header) else {
+        return false;
+    };
+    // Trust the caller's index only if the record identity still matches;
+    // otherwise resolve by identity on the already-open file (one streamed
+    // pass, rare -- the catalog was rewritten under a stale index).
+    let hinted = index < count as usize
+        && record_identity(&file, index)
+            .map(|identity| identity == source_identity)
+            .unwrap_or(false);
+    let target = if hinted {
+        index
+    } else {
+        let mut found = None;
+        if seek_to_record(&file, 0).is_err() {
+            return false;
+        }
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        for candidate in 0..count as usize {
+            if read_exact_file(&file, &mut record).is_err() {
+                return false;
+            }
+            if catalog_record_identity(&record) == source_identity {
+                found = Some(candidate);
+                break;
+            }
+        }
+        let Some(found) = found else {
+            return false;
+        };
+        found
+    };
+    let mut field = [0u8; CATALOG_TITLE_BYTES];
+    encode_catalog_title(title, &mut field);
+    let title_offset =
+        (CATALOG_HEADER_BYTES + target * CATALOG_RECORD_BYTES + CATALOG_RECORD_TITLE_OFFSET) as u32;
+    let mut stored = [0u8; CATALOG_TITLE_BYTES];
+    if file.seek_from_start(title_offset).is_err() || read_exact_file(&file, &mut stored).is_err() {
+        return false;
+    }
+    if stored == field {
+        return true;
+    }
+    file.seek_from_start(title_offset).is_ok() && file.write(&field).is_ok()
 }
 
 /// Resolve a saved (path-hash, byte-size) back to its catalog index, the
@@ -541,6 +611,13 @@ pub(crate) fn find_index_by_identity(
 /// not its key name, so a live book's cache is never swept. Reading position
 /// lives in the global STATE.BIN and is untouched. Bounded per pass; any excess
 /// is handled by the next scan.
+///
+/// The catalog's identities (8 B each) load into `scratch` once, sorted, so
+/// each cache dir checks membership with an in-RAM binary search --
+/// O((N + C) log N) rather than streaming the whole catalog off the card per
+/// cache dir. Should the catalog outgrow the scratch (2,048 books against
+/// the 16 KB arena), the overflow falls back to the streamed per-cache
+/// lookup, keeping the sweep exact.
 fn sweep_orphan_caches<
     D,
     T,
@@ -549,12 +626,14 @@ fn sweep_orphan_caches<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    scratch: &mut [u8],
 ) where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     use core::fmt::Write;
     const SWEEP_MAX_PER_PASS: usize = 48;
+    let (staged, truncated) = stage_catalog_identities(root, scratch);
     // Collect cache-dir names up front: embedded-sdmmc forbids opening files
     // while a directory iteration holds the lock.
     let mut keys: heapless::Vec<String<8>, SWEEP_MAX_PER_PASS> = heapless::Vec::new();
@@ -581,7 +660,11 @@ fn sweep_orphan_caches<
         // else -- no book, or an unreadable BOOK.BIN -- is reclaimed.
         let live = header
             .as_ref()
-            .map(|h| find_in_catalog(root, h.source_hash, h.source_size, None).is_some())
+            .map(|h| {
+                catalog_identity_staged(scratch, staged, h.source_hash, h.source_size)
+                    || (truncated
+                        && find_in_catalog(root, h.source_hash, h.source_size, None).is_some())
+            })
             .unwrap_or(false);
         if live {
             continue;
@@ -593,6 +676,44 @@ fn sweep_orphan_caches<
     if swept > 0 {
         esp_println::println!("cache: swept {} orphan cache(s)", swept);
     }
+}
+
+/// Load every catalog record's `(source_hash, byte_size)` into `scratch` in
+/// one streamed pass, then sort them for `catalog_identity_staged`'s binary
+/// search. Returns `(staged_count, truncated)`; `truncated` also covers an
+/// unreadable catalog, so callers keep the streamed fallback and a broken
+/// catalog behaves exactly as before.
+fn stage_catalog_identities<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    scratch: &mut [u8],
+) -> (usize, bool)
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let capacity = scratch.len() / CATALOG_IDENTITY_BYTES;
+    let (staged, truncated) = with_catalog_file(root, |file, count| {
+        seek_to_record(file, 0)?;
+        let take = (count as usize).min(capacity);
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        for index in 0..take {
+            read_exact_file(file, &mut record)?;
+            let (hash, size) = catalog_record_identity(&record);
+            if !stage_catalog_identity(scratch, index, hash, size) {
+                return Ok((index, true));
+            }
+        }
+        Ok((take, count as usize > take))
+    })
+    .unwrap_or((0, true));
+    sort_catalog_identities(scratch, staged);
+    (staged, truncated)
 }
 
 /// Stream the whole catalog into the browser shelf buffer as
@@ -613,13 +734,19 @@ pub(crate) fn write_catalog_listing(
                 if read_exact_file(file, &mut record).is_err() {
                     break;
                 }
-                let decoded = decode_record(&record);
+                let decoded = decode_catalog_record(&record);
+                // The shelf shows the same label as the Library list: the
+                // persisted title when the book has one, else the stem label.
                 let mut label = String::<64>::new();
-                derive_catalog_label(
-                    decoded.display_name.as_str(),
-                    decoded.open_name.as_str(),
-                    &mut label,
-                );
+                if decoded.title.is_empty() {
+                    derive_catalog_label(
+                        decoded.display_name.as_str(),
+                        decoded.open_name.as_str(),
+                        &mut label,
+                    );
+                } else {
+                    let _ = label.push_str(decoded.title.as_str());
+                }
                 let open_name = decoded.open_name.as_bytes();
                 let line_len = 1 + 1 + open_name.len() + 1 + label.len() + 1;
                 if at + line_len > out.len() {
@@ -687,19 +814,6 @@ where
         out = &mut tmp[read..];
     }
     Ok(())
-}
-
-fn copy_fixed(src: &[u8], dst: &mut [u8]) {
-    let len = src.len().min(dst.len());
-    dst[..len].copy_from_slice(&src[..len]);
-}
-
-fn fixed_str(bytes: &[u8]) -> &str {
-    let len = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    core::str::from_utf8(&bytes[..len]).unwrap_or("")
 }
 
 fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
