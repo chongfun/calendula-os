@@ -18,6 +18,11 @@ WASM="$ROOT/tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emul
 mkdir -p "$OUT_DIR"
 cp -R "$ROOT/web/." "$OUT_DIR/"
 
+# Book bodies are runtime-fetched static assets, not compiled into the wasm;
+# index.html's BOOK_FILES list matches books.rs's SHELF order.
+mkdir -p "$OUT_DIR/books"
+cp "$ROOT/tools/web-emulator/books/"*.txt "$OUT_DIR/books/"
+
 build() {
   local board="$1"; shift
   cargo build --manifest-path "$MANIFEST" \
