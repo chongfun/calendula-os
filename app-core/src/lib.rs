@@ -178,7 +178,9 @@ impl RefreshPlanner {
     /// so on a deep-sleep wake the panel contents are known by construction
     /// and the first render can take the one-flicker clean instead of the
     /// multi-flash full waveform. Callers must gate the seed strictly on the
-    /// deep-sleep wake cause: any other cold boot (battery pull, crash,
+    /// deep-sleep wake cause *and* on a persisted record that the sleep
+    /// frame actually settled: the sleep path still powers down when its
+    /// final flush fails, and any other cold boot (battery pull, crash,
     /// software reset) leaves unknown pixels that only `Full` clears.
     pub const fn with_panel_shows_sleep_screen(mut self, shows_sleep_screen: bool) -> Self {
         self.panel_shows_sleep_screen = shows_sleep_screen;

@@ -64,11 +64,13 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     // transition and refusal rules live in app-core with the contracts.
     let mut sync_session = SyncSession::default();
     // On a deep-sleep (Power button) wake the panel still shows the sleep
-    // screen — the only deep-sleep entry path draws it and waits for the
-    // panel to settle before cutting power — so the seeded planner picks the
-    // ~1.5 s one-flicker FastClean for the wake render instead of the ~3.5 s
-    // multi-flash Full. Any other cold boot leaves the seed false and keeps
-    // the full waveform for unknown panel contents.
+    // screen: deep_sleep_wake is true only when the RTC wake cause is the
+    // armed GPIO *and* the pre-sleep handshake recorded that the sleep frame
+    // settled on the panel (see sleep_marker). The seeded planner then picks
+    // the ~1.5 s one-flicker FastClean for the wake render instead of the
+    // ~3.5 s multi-flash Full. Any other boot — battery pull, crash, software
+    // reset, or a sleep whose final flush failed — leaves the seed false and
+    // keeps the full waveform for unknown panel contents.
     let mut refresh_planner = RefreshPlanner::new().with_panel_shows_sleep_screen(deep_sleep_wake);
     let mut pending_progress: Option<AppStateRecord> = None;
     let mut last_progress_write: Option<Instant> = None;
@@ -100,26 +102,24 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     // One-shot firmware self-update: if the card holds a pending image, flash it
     // into the inactive OTA slot and reboot into it before the reader starts.
     // Runs here because SD access lives behind this task's shared SPI bus, and
-    // the radio is still idle so the flash writes are safe. Skipped on a
-    // deep-sleep wake: updates stage during a wifi sync session, which always
-    // exits by software reset — never through deep sleep — so no pending
-    // image can be waiting, and skipping the SD probe shaves the wake path.
-    if deep_sleep_wake {
-        esp_println::println!("display: update check skipped: deep-sleep wake");
-    } else {
-        match crate::sd_session::with_root(
-            &mut epd,
-            &mut sd_cs,
-            crate::ota_update::apply_pending_update,
-        ) {
-            Ok(true) => {
-                esp_println::println!("display: firmware update staged; resetting");
-                embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
-                esp_hal::system::software_reset();
-            }
-            Ok(false) => {}
-            Err(e) => esp_println::println!("display: update check skipped: {:?}", e),
+    // the radio is still idle so the flash writes are safe. Runs on every boot,
+    // deep-sleep wakes included: the card is user-removable, so an update can
+    // be staged offline while the device sleeps and arrive through a Power-
+    // button wake — wifi-staged updates are not the only source. The no-
+    // trigger probe costs one failed open on the mounted root, and the cold
+    // card init it pays is one the first render's SD reads would pay anyway.
+    match crate::sd_session::with_root(
+        &mut epd,
+        &mut sd_cs,
+        crate::ota_update::apply_pending_update,
+    ) {
+        Ok(true) => {
+            esp_println::println!("display: firmware update staged; resetting");
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
+            esp_hal::system::software_reset();
         }
+        Ok(false) => {}
+        Err(e) => esp_println::println!("display: update check skipped: {:?}", e),
     }
 
     // Flash-path self-test (feature `ota-selftest` only, off in release): copy
@@ -320,27 +320,27 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     false
                 };
                 prev_prestaged = false;
-                if display_flush::sleep_panel(&mut epd).await.is_ok() {
-                    if sleep_frame_settled {
-                        refresh_planner.record_sleep();
-                    }
-                    send_required_display_event(&DisplayEvent::Asleep);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
-                    esp_println::println!(
-                        "bench: sleep phase=complete ok=true elapsed_ms={} t_ms={}",
-                        sleep_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
-                    );
-                } else {
+                let panel_slept = display_flush::sleep_panel(&mut epd).await.is_ok();
+                if !panel_slept {
                     esp_println::println!("display: sleep command failed");
-                    send_required_display_event(&DisplayEvent::Asleep);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
-                    esp_println::println!(
-                        "bench: sleep phase=complete ok=false elapsed_ms={} t_ms={}",
-                        sleep_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
-                    );
                 }
+                if panel_slept && sleep_frame_settled {
+                    refresh_planner.record_sleep();
+                }
+                // Persist whether the panel really holds the sleep frame
+                // before DisplayAsleep releases the power task to cut power:
+                // the next boot's GPIO wake seeds its fast-wake planner from
+                // this marker, and a flush or panel-sleep failure must leave
+                // it false so that boot falls back to the full waveform.
+                crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
+                send_required_display_event(&DisplayEvent::Asleep);
+                let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                esp_println::println!(
+                    "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",
+                    panel_slept,
+                    sleep_start.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
             }
             Either::Second(StorageCommand::ReceiveUpload) => {
                 if sync_session.admits(&StorageCommand::ReceiveUpload) {
