@@ -812,7 +812,7 @@ impl ReaderState {
                 // summons the key sheet above the buttons (the margin
                 // appears when called for); the second press acts on the
                 // label it revealed. Landscape keeps its direct mapping.
-                next = self.portrait_summon_or(|s| {
+                next = next.portrait_summon_or(|s| {
                     s.view = AppView::Chapters;
                     // `chapter` already tracks the reading position (kept
                     // current by the firmware's Loaded event, un-capped);
@@ -822,7 +822,7 @@ impl ReaderState {
                 });
             }
             (AppView::Reading, Some(Button::Back)) => {
-                next = self.portrait_summon_or(|s| {
+                next = next.portrait_summon_or(|s| {
                     s.view = AppView::Home;
                     s.selection = 0;
                 });
