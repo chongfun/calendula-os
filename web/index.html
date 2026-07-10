@@ -690,7 +690,7 @@
     const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
     if (Array.isArray(saved) && saved[0] >= 2) bootBook = (saved[0] - 2) % BOOK_FILES.length;
   } catch (_) { /* fresh start */ }
-  fetchBook(bootBook);
+  fetchBook(bootBook).catch(() => {});
 
   const { instance } = await WebAssembly.instantiateStreaming(
     fetch(cfg.wasm)
