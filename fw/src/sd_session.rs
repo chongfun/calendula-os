@@ -564,6 +564,13 @@ where
         let chunk = UPLOAD_CHUNKS.receive().await;
         if !failed && !chunk.abort {
             if let Some(buffer) = &chunk.buffer {
+                // One blocking whole-chunk write, on purpose. Pacing this
+                // as 512-B slices with a yield between them (to keep
+                // net_task fed under the theory that the 10-30 ms write
+                // starves TCP) was tried and measured on hardware
+                // 2026-07-11: it cost ~1 s per 3.2 MB upload and bought
+                // nothing — TCP rides out the stall via buffering. Don't
+                // reintroduce pacing without a timed upload A/B.
                 if pending
                     .write(&buffer[..chunk.len.min(buffer.len())])
                     .is_err()
