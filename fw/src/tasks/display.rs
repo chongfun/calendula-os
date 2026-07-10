@@ -224,12 +224,32 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     let flush_ms = flush_start.elapsed().as_millis();
                     refresh_planner.record_render(request, mode);
                     prev_fb.copy_from(fb);
-                    // Settle first: the panel is visually done, so unblock the
-                    // input/power pipeline before the ~23 ms RED prestage and
-                    // any chapter-crossing SD read. Both still run on this task
-                    // before the next command is dequeued, so `prev_prestaged`
-                    // is always current by the next flush, and a Sleep queued
-                    // by power_task after DisplaySettled waits behind them.
+                    // Keep the current chapter tracking the page just shown, past
+                    // the reducer's 128-chapter cap. Cheap in-RAM check; only the
+                    // loaded SD reader has an uncapped page map, so this no-ops on
+                    // other views and reads SD only when the chapter changes. Must
+                    // run before Settled: the app clears its render lock on Settled
+                    // and may immediately render or navigate, so the ChapterCursor
+                    // correction has to be queued ahead of it or that next action
+                    // uses the stale chapter.
+                    if request.view == AppView::Reading {
+                        if let Some(current) = reader_cache::track_reading_chapter(
+                            &mut epd,
+                            &mut sd_cs,
+                            request.page,
+                            sd_library,
+                        ) {
+                            send_loaded_library_event(&LibraryEvent::ChapterCursor {
+                                book_id: request.book_id,
+                                current_chapter: current,
+                            });
+                        }
+                    }
+                    // Settle before the ~23 ms RED prestage: the panel is visually
+                    // done, so unblock the input/power pipeline. The prestage still
+                    // runs on this task before the next command is dequeued, so
+                    // `prev_prestaged` is always current by the next flush, and a
+                    // Sleep queued by power_task after DisplaySettled waits behind it.
                     send_required_display_event(&DisplayEvent::Settled);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
                     let prestage_start = Instant::now();
@@ -247,23 +267,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         prestage_start.elapsed().as_millis(),
                         Instant::now().as_millis(),
                     );
-                    // Keep the current chapter tracking the page just shown, past
-                    // the reducer's 128-chapter cap. Cheap in-RAM check; only the
-                    // loaded SD reader has an uncapped page map, so this no-ops on
-                    // other views and reads SD only when the chapter changes.
-                    if request.view == AppView::Reading {
-                        if let Some(current) = reader_cache::track_reading_chapter(
-                            &mut epd,
-                            &mut sd_cs,
-                            request.page,
-                            sd_library,
-                        ) {
-                            send_loaded_library_event(&LibraryEvent::ChapterCursor {
-                                book_id: request.book_id,
-                                current_chapter: current,
-                            });
-                        }
-                    }
                 } else {
                     esp_println::println!("display: SPI transfer failed");
                     prev_prestaged = false;
