@@ -66,5 +66,18 @@ ASSERT(_stack_start - _stack_end >= {min_stack},
 
     fs::write(out_dir.join("ram-layout.x"), script).unwrap();
     println!("cargo:rustc-link-search={}", out_dir.display());
+
+    // linkall.x is emitted here instead of .cargo/config.toml rustflags: cargo
+    // merges that file with any ancestor checkout's copy (a worktree nested
+    // inside the repo), and a doubled linker script fails the link with
+    // "region 'ICACHE' already defined". A build script runs once per package,
+    // so this cannot double. Skip it only when some config still supplies the
+    // flag (a checkout from before this change acting as the ancestor). It
+    // must precede ram-layout.x, which references linkall.x's dram2_seg.
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    let rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    if !rustflags.contains("-Tlinkall.x") {
+        println!("cargo:rustc-link-arg-bins=-Tlinkall.x");
+    }
     println!("cargo:rustc-link-arg-bins=-Tram-layout.x");
 }
