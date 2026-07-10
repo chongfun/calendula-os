@@ -12,8 +12,8 @@ const CATALOG_ROOT_DIR: &str = "XTEINK";
 const CATALOG_FILE: &str = "CATALOG.BIN";
 use proto::catalog::{
     catalog_identity_staged, catalog_record_identity, decode_catalog_record, encode_catalog_header,
-    encode_catalog_record, encode_catalog_title, stage_catalog_identity, CatalogRecord,
-    CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
+    encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
+    CatalogRecord, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
     CATALOG_RECORD_TITLE_OFFSET, CATALOG_TITLE_BYTES,
 };
 
@@ -612,11 +612,12 @@ pub(crate) fn find_index_by_identity(
 /// lives in the global STATE.BIN and is untouched. Bounded per pass; any excess
 /// is handled by the next scan.
 ///
-/// The catalog's identities (8 B each) load into `scratch` once, so each
-/// cache dir checks membership in RAM -- O(C + N) rather than streaming the
-/// whole catalog per cache dir (O(C x N)). Should the catalog outgrow the
-/// scratch (2,048 books against the 16 KB arena), the overflow falls back to
-/// the streamed per-cache lookup, keeping the sweep exact.
+/// The catalog's identities (8 B each) load into `scratch` once, sorted, so
+/// each cache dir checks membership with an in-RAM binary search --
+/// O((N + C) log N) rather than streaming the whole catalog off the card per
+/// cache dir. Should the catalog outgrow the scratch (2,048 books against
+/// the 16 KB arena), the overflow falls back to the streamed per-cache
+/// lookup, keeping the sweep exact.
 fn sweep_orphan_caches<
     D,
     T,
@@ -678,9 +679,10 @@ fn sweep_orphan_caches<
 }
 
 /// Load every catalog record's `(source_hash, byte_size)` into `scratch` in
-/// one streamed pass. Returns `(staged_count, truncated)`; `truncated` also
-/// covers an unreadable catalog, so callers keep the streamed fallback and a
-/// broken catalog behaves exactly as before.
+/// one streamed pass, then sort them for `catalog_identity_staged`'s binary
+/// search. Returns `(staged_count, truncated)`; `truncated` also covers an
+/// unreadable catalog, so callers keep the streamed fallback and a broken
+/// catalog behaves exactly as before.
 fn stage_catalog_identities<
     D,
     T,
@@ -696,7 +698,7 @@ where
     T: TimeSource,
 {
     let capacity = scratch.len() / CATALOG_IDENTITY_BYTES;
-    with_catalog_file(root, |file, count| {
+    let (staged, truncated) = with_catalog_file(root, |file, count| {
         seek_to_record(file, 0)?;
         let take = (count as usize).min(capacity);
         let mut record = [0u8; CATALOG_RECORD_BYTES];
@@ -709,7 +711,9 @@ where
         }
         Ok((take, count as usize > take))
     })
-    .unwrap_or((0, true))
+    .unwrap_or((0, true));
+    sort_catalog_identities(scratch, staged);
+    (staged, truncated)
 }
 
 /// Stream the whole catalog into the browser shelf buffer as

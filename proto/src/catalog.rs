@@ -124,25 +124,84 @@ pub fn stage_catalog_identity(scratch: &mut [u8], index: usize, hash: u32, size:
     true
 }
 
-/// Whether `(hash, size)` is among the first `count` staged identities. A
+/// Sort the first `count` staged identities so `catalog_identity_staged`
+/// can binary-search them. Heapsort over the 8-byte entries: in place, no
+/// allocation, no recursion -- O(N log N) with N bounded by the scratch
+/// capacity (~2,048 identities in the 16 KB arena).
+pub fn sort_catalog_identities(scratch: &mut [u8], count: usize) {
+    let count = count.min(scratch.len() / CATALOG_IDENTITY_BYTES);
+    for parent in (0..count / 2).rev() {
+        sift_down_identity(scratch, parent, count);
+    }
+    for end in (1..count).rev() {
+        swap_identities(scratch, 0, end);
+        sift_down_identity(scratch, 0, end);
+    }
+}
+
+/// Whether `(hash, size)` is among the first `count` staged identities,
+/// which must already be ordered by `sort_catalog_identities` -- the check
+/// is a binary search, O(log N) per cache dir instead of a linear scan. A
 /// zero identity never matches, mirroring the streamed catalog lookup that
 /// refuses to resolve `(0, 0)`.
 pub fn catalog_identity_staged(scratch: &[u8], count: usize, hash: u32, size: u32) -> bool {
     if hash == 0 && size == 0 {
         return false;
     }
-    for index in 0..count {
-        let at = index * CATALOG_IDENTITY_BYTES;
-        let Some(slot) = scratch.get(at..at + CATALOG_IDENTITY_BYTES) else {
-            return false;
-        };
-        let staged_hash = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
-        let staged_size = u32::from_le_bytes([slot[4], slot[5], slot[6], slot[7]]);
-        if staged_hash == hash && staged_size == size {
-            return true;
+    if count > scratch.len() / CATALOG_IDENTITY_BYTES {
+        return false;
+    }
+    let key = identity_key(hash, size);
+    let (mut lo, mut hi) = (0usize, count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match staged_key(scratch, mid).cmp(&key) {
+            core::cmp::Ordering::Less => lo = mid + 1,
+            core::cmp::Ordering::Greater => hi = mid,
+            core::cmp::Ordering::Equal => return true,
         }
     }
     false
+}
+
+/// The sort/search key for one identity: the staged slot's little-endian
+/// bytes as a `u64`, so `identity_key(hash, size)` and `staged_key` agree
+/// byte for byte with what `stage_catalog_identity` wrote.
+fn identity_key(hash: u32, size: u32) -> u64 {
+    u64::from(hash) | (u64::from(size) << 32)
+}
+
+fn staged_key(scratch: &[u8], index: usize) -> u64 {
+    let at = index * CATALOG_IDENTITY_BYTES;
+    let mut bytes = [0u8; CATALOG_IDENTITY_BYTES];
+    bytes.copy_from_slice(&scratch[at..at + CATALOG_IDENTITY_BYTES]);
+    u64::from_le_bytes(bytes)
+}
+
+fn swap_identities(scratch: &mut [u8], a: usize, b: usize) {
+    for offset in 0..CATALOG_IDENTITY_BYTES {
+        scratch.swap(
+            a * CATALOG_IDENTITY_BYTES + offset,
+            b * CATALOG_IDENTITY_BYTES + offset,
+        );
+    }
+}
+
+fn sift_down_identity(scratch: &mut [u8], mut parent: usize, end: usize) {
+    loop {
+        let mut child = parent * 2 + 1;
+        if child >= end {
+            return;
+        }
+        if child + 1 < end && staged_key(scratch, child) < staged_key(scratch, child + 1) {
+            child += 1;
+        }
+        if staged_key(scratch, parent) >= staged_key(scratch, child) {
+            return;
+        }
+        swap_identities(scratch, parent, child);
+        parent = child;
+    }
 }
 
 fn copy_fixed(src: &[u8], dst: &mut [u8]) {
@@ -253,10 +312,13 @@ mod tests {
 
     #[test]
     fn staged_identities_answer_membership_like_a_catalog_walk() {
+        // Staged deliberately out of key order: membership must come from
+        // the sort, not the staging order.
         let mut scratch = [0u8; 64];
-        assert!(stage_catalog_identity(&mut scratch, 0, 0xaaaa, 100));
-        assert!(stage_catalog_identity(&mut scratch, 1, 0xbbbb, 200));
-        assert!(stage_catalog_identity(&mut scratch, 2, 0xcccc, 300));
+        assert!(stage_catalog_identity(&mut scratch, 0, 0xcccc, 300));
+        assert!(stage_catalog_identity(&mut scratch, 1, 0xaaaa, 100));
+        assert!(stage_catalog_identity(&mut scratch, 2, 0xbbbb, 200));
+        sort_catalog_identities(&mut scratch, 3);
 
         assert!(catalog_identity_staged(&scratch, 3, 0xbbbb, 200));
         assert!(!catalog_identity_staged(&scratch, 3, 0xbbbb, 201));
@@ -267,7 +329,38 @@ mod tests {
         // The zero identity never matches: an unreadable cache header must
         // not accidentally resolve to a zeroed record.
         assert!(stage_catalog_identity(&mut scratch, 3, 0, 0));
+        sort_catalog_identities(&mut scratch, 4);
         assert!(!catalog_identity_staged(&scratch, 4, 0, 0));
+    }
+
+    #[test]
+    fn sorted_lookup_matches_a_linear_scan_over_many_identities() {
+        // Enough entries (descending, with duplicates) that the binary
+        // search crosses several pivot levels on both hit and miss paths.
+        const N: usize = 33;
+        // Adjacent staged indices share one key, so every key appears twice
+        // (bar one) and the search must still find it.
+        fn identity_for(index: usize) -> (u32, u32) {
+            let v = (N as u32 - index as u32).div_ceil(2);
+            (v * 3, v % 5)
+        }
+        let mut scratch = [0u8; N * CATALOG_IDENTITY_BYTES];
+        for index in 0..N {
+            let (hash, size) = identity_for(index);
+            assert!(stage_catalog_identity(&mut scratch, index, hash, size));
+        }
+        sort_catalog_identities(&mut scratch, N);
+
+        for index in 0..N {
+            let (hash, size) = identity_for(index);
+            assert!(
+                catalog_identity_staged(&scratch, N, hash, size),
+                "staged identity {index} must be found after sorting"
+            );
+            // Same hash, different size: the full 8-byte key must match.
+            assert!(!catalog_identity_staged(&scratch, N, hash, size + 7));
+        }
+        assert!(!catalog_identity_staged(&scratch, N, 1, 1));
     }
 
     #[test]
