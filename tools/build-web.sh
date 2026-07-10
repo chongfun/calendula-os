@@ -22,7 +22,15 @@ build() {
   local board="$1"; shift
   cargo build --manifest-path "$MANIFEST" \
     --target wasm32-unknown-unknown --release "$@"
-  cp "$WASM" "$OUT_DIR/${board}_web_emulator.wasm"
+  local out="$OUT_DIR/${board}_web_emulator.wasm"
+  cp "$WASM" "$out"
+  # Best-effort size pass: CI installs binaryen (pages.yml), locally it is
+  # optional — the un-optimized wasm is fully functional, just heavier.
+  if command -v wasm-opt >/dev/null 2>&1; then
+    wasm-opt -Oz --strip-debug --strip-producers "$out" -o "$out"
+  else
+    echo "wasm-opt not found; skipping size pass for ${board} (install binaryen to enable)" >&2
+  fi
 }
 
 build x4

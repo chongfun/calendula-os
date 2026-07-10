@@ -41,6 +41,8 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add wasm32-unknown-unknown --toolchain stable
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build wasm emulators (all boards) and assemble site
         run: ./tools/build-web.sh _site
       - name: Download release firmware
