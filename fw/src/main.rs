@@ -164,6 +164,15 @@ fn main() -> ! {
     let peripherals = esp_hal::init(config);
     esp_println::println!("calendula-os: boot");
 
+    // Deep sleep is terminal, so waking is this cold boot; the RTC wake
+    // cause is the only trace of it. A Power-button (GPIO) wake means the
+    // panel still shows the sleep screen the firmware drew before powering
+    // down, which lets the display task seed its refresh planner for the
+    // fast wake waveform and skip the boot OTA probe. Battery pulls,
+    // crashes, and software resets all read false here.
+    let deep_sleep_wake = hal_ext::rtc::woke_from_deep_sleep_gpio();
+    esp_println::println!("main: deep_sleep_wake={}", deep_sleep_wake);
+
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
@@ -298,7 +307,7 @@ fn main() -> ! {
             );
         }
         esp_println::println!("main: spawn display");
-        spawner.spawn(tasks::display::run(epd_bus, sd_cs).unwrap());
+        spawner.spawn(tasks::display::run(epd_bus, sd_cs, deep_sleep_wake).unwrap());
         esp_println::println!("main: spawn power");
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
         esp_println::println!("main: spawn app");

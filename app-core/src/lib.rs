@@ -171,6 +171,20 @@ impl RefreshPlanner {
         self
     }
 
+    /// Seeds a fresh planner with the knowledge that the panel already shows
+    /// the sleep screen. Deep sleep is terminal — waking reboots the chip and
+    /// builds a new planner — but the only deep-sleep entry path draws the
+    /// sleep screen and waits for the panel to settle before cutting power,
+    /// so on a deep-sleep wake the panel contents are known by construction
+    /// and the first render can take the one-flicker clean instead of the
+    /// multi-flash full waveform. Callers must gate the seed strictly on the
+    /// deep-sleep wake cause: any other cold boot (battery pull, crash,
+    /// software reset) leaves unknown pixels that only `Full` clears.
+    pub const fn with_panel_shows_sleep_screen(mut self, shows_sleep_screen: bool) -> Self {
+        self.panel_shows_sleep_screen = shows_sleep_screen;
+        self
+    }
+
     pub const fn screen_on(&self) -> bool {
         self.screen_on
     }
@@ -2161,6 +2175,44 @@ mod tests {
 
         // Disabling fast refresh falls back to the deep full everywhere.
         let conservative = RefreshPlanner::new().with_fast_refresh_enabled(false);
+        assert_eq!(conservative.mode_for(request), RefreshMode::Full);
+    }
+
+    #[test]
+    fn refresh_plan_seeded_deep_sleep_wake_uses_fast_clean() {
+        let request = ReaderState::boot().render_request(RenderKind::Boot);
+
+        // A deep-sleep wake is a cold boot with a fresh planner, but the
+        // panel still shows the sleep screen the firmware drew before
+        // powering down; the seed lets the wake render take the one-flicker
+        // clean instead of the multi-flash full waveform.
+        let mut planner = RefreshPlanner::new().with_panel_shows_sleep_screen(true);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+
+        // The seed is consumed by the first render: from here the planner
+        // behaves exactly like an in-session one — the post-boot cleanup
+        // pass, then fast differentials for same-context turns.
+        planner.record_render(request, RefreshMode::FastClean);
+        let mut page = request;
+        page.kind = RenderKind::Page;
+        assert_eq!(planner.mode_for(page), RefreshMode::FastClean);
+        planner.record_render(page, RefreshMode::FastClean);
+        page.selection = 1;
+        assert_eq!(planner.mode_for(page), RefreshMode::Fast);
+
+        // An unseeded cold boot (battery pull, crash, software reset) still
+        // pays the deep full waveform — panel contents are unknown.
+        assert_eq!(
+            RefreshPlanner::new()
+                .with_panel_shows_sleep_screen(false)
+                .mode_for(request),
+            RefreshMode::Full
+        );
+
+        // With fast refresh disabled the seed is ignored.
+        let conservative = RefreshPlanner::new()
+            .with_panel_shows_sleep_screen(true)
+            .with_fast_refresh_enabled(false);
         assert_eq!(conservative.mode_for(request), RefreshMode::Full);
     }
 
