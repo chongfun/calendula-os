@@ -18,7 +18,7 @@ use esp_hal::Async;
 /// clock, which on the X4 (SSD1677, 40 MHz) is out of SD spec entirely and
 /// what the read-retry machinery in the EPUB path was quietly absorbing.
 const SD_IDENT_FREQ_KHZ: u32 = 400;
-const SD_DATA_FREQ_MHZ: u32 = 20;
+const SD_DATA_FREQ_MHZ: u32 = 25;
 /// Restore frequency after SD access: the active panel's SPI clock. This
 /// MUST be per-panel — the UC8253 (X3) can't decode above ~20 MHz, so
 /// restoring the X4's 40 MHz leaves the panel deaf to every subsequent
@@ -128,11 +128,38 @@ pub(crate) struct SdSpiDevice<'a, SPI, CS> {
 
 /// Also sizes the shared bus's RX DMA buffer in main.rs: SD traffic is the
 /// only read path on SPI2 (the EPD is write-only), and every SD operation
-/// bounces through one of these chunks.
-pub(crate) const SD_SPI_CHUNK_BYTES: usize = 64;
+/// bounces through one of these chunks. Sized to one SD block so a 512-B
+/// data read/write is a single DMA transaction instead of eight; the
+/// extra ~448 B of DRAM comes out of the stack headroom build.rs asserts.
+pub(crate) const SD_SPI_CHUNK_BYTES: usize = 512;
 
 #[repr(align(4))]
 struct AlignedSdChunk([u8; SD_SPI_CHUNK_BYTES]);
+
+/// The one bounce chunk all SD SPI operations share. Static rather than a
+/// local so the 512-B block never lands on the reader's deep-call stack
+/// (the 27 KB link-time budget in build.rs is nearly spent); as .bss it is
+/// instead counted against the stack-headroom ASSERT. Sound for the same
+/// reason `sd_stats` uses plain load/store: every SD transaction runs on
+/// the storage/display task, and the borrows below never overlap.
+struct SdBounce(core::cell::UnsafeCell<AlignedSdChunk>);
+// Safety: only the single SD-owning task touches the chunk (see above).
+#[allow(unsafe_code)]
+unsafe impl Sync for SdBounce {}
+static SD_BOUNCE: SdBounce = SdBounce(core::cell::UnsafeCell::new(AlignedSdChunk(
+    [0xFF; SD_SPI_CHUNK_BYTES],
+)));
+
+/// Exclusive access to the shared bounce chunk, refilled with the 0xFF
+/// idle pattern SD cards expect on MOSI during reads.
+#[allow(unsafe_code)]
+fn sd_bounce() -> &'static mut AlignedSdChunk {
+    // Safety: single-task SD ownership (see SdBounce); callers drop the
+    // reference before the next call re-borrows.
+    let chunk = unsafe { &mut *SD_BOUNCE.0.get() };
+    chunk.0.fill(0xFF);
+    chunk
+}
 
 fn sd_spi_pace(iterations: u32) {
     for _ in 0..iterations {
@@ -185,7 +212,7 @@ where
 {
     fn read_with_sd_clocks(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
+            let bounce = sd_bounce();
             self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
             chunk.copy_from_slice(&bounce.0[..chunk.len()]);
         }
@@ -194,7 +221,7 @@ where
 
     fn write_chunked(&mut self, buffer: &[u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
+            let bounce = sd_bounce();
             bounce.0[..chunk.len()].copy_from_slice(chunk);
             self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
         }
@@ -210,7 +237,7 @@ where
             .chunks_mut(SD_SPI_CHUNK_BYTES)
             .zip(write_common.chunks(SD_SPI_CHUNK_BYTES))
         {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
+            let bounce = sd_bounce();
             bounce.0[..write_chunk.len()].copy_from_slice(write_chunk);
             self.spi
                 .transfer_in_place(&mut bounce.0[..write_chunk.len()])?;
@@ -227,7 +254,7 @@ where
 
     fn transfer_in_place_chunked(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
+            let bounce = sd_bounce();
             bounce.0[..chunk.len()].copy_from_slice(chunk);
             self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
             chunk.copy_from_slice(&bounce.0[..chunk.len()]);

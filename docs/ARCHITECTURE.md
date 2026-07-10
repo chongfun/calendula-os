@@ -217,7 +217,7 @@ the single SPI owner, so display refresh and SD transactions cannot overlap, but
 the user-facing view is always drawn from the latest already-owned snapshot.
 SD/FAT access goes through an SD session: the board I/O task deselects the
 display, clocks the bus down for the card (400 kHz identification with wake
-clocks, then 20 MHz data), opens the FAT root, performs one storage action, and
+clocks, then 25 MHz data), opens the FAT root, performs one storage action, and
 restores 40 MHz display SPI before returning to EPD work. The card stays powered
 between sessions while the device is awake, so only the first session runs the
 full CMD0/ACMD41 init; later ones reuse the remembered card type and skip the
