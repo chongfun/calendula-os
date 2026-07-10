@@ -735,6 +735,23 @@ impl ReaderState {
         next.battery_percent = battery_percent;
         next.dirty = Rect::FULL;
 
+        // Portrait reading is full-bleed: the first named-key press summons
+        // the key sheet above the buttons (the margin appears when called
+        // for); the second press acts on the label it revealed. Page turns
+        // never wait on the sheet -- reading momentum would make a turn a
+        // second press -- so the browse pair acts at once, dismissing it.
+        // Landscape keeps its direct mapping.
+        if self.view == AppView::Reading && is_portrait(self.orientation) {
+            match button {
+                Some(Button::Confirm | Button::Back) if !self.reading_sheet => {
+                    next.reading_sheet = true;
+                    return next;
+                }
+                Some(Button::Power) | None => {}
+                Some(_) => next.reading_sheet = false,
+            }
+        }
+
         match (self.view, button) {
             (_, None) => {}
             (_, Some(Button::Power)) => {}
@@ -770,9 +787,6 @@ impl ReaderState {
                 next.read_request_pending = false;
             }
             (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
-                // Page turns never wait on the key sheet: reading momentum
-                // would make a turn a second press. A turn dismisses the sheet.
-                next.reading_sheet = false;
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page + 1 < self.sd_page_count {
                         next.page = self.page + 1;
@@ -791,7 +805,6 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Previous | Button::PagePrevious)) => {
-                next.reading_sheet = false;
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page > 0 {
                         next.page = self.page - 1;
@@ -808,24 +821,15 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Confirm)) => {
-                // Portrait reading is full-bleed: the first named-key press
-                // summons the key sheet above the buttons (the margin
-                // appears when called for); the second press acts on the
-                // label it revealed. Landscape keeps its direct mapping.
-                next = next.portrait_summon_or(|s| {
-                    s.view = AppView::Chapters;
-                    // `chapter` already tracks the reading position (kept
-                    // current by the firmware's Loaded event, un-capped);
-                    // opening the list lands the cursor there rather than
-                    // on the saturated guess.
-                    s.selection = s.chapter as u16;
-                });
+                next.view = AppView::Chapters;
+                // `chapter` already tracks the reading position (kept current
+                // by the firmware's Loaded event, un-capped); opening the list
+                // lands the cursor there rather than on the saturated guess.
+                next.selection = self.chapter as u16;
             }
             (AppView::Reading, Some(Button::Back)) => {
-                next = next.portrait_summon_or(|s| {
-                    s.view = AppView::Home;
-                    s.selection = 0;
-                });
+                next.view = AppView::Home;
+                next.selection = 0;
             }
             (AppView::Chapters, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.chapter_item_count(ctx) as u16);
@@ -1190,19 +1194,6 @@ impl ReaderState {
             }
         }
         selected
-    }
-
-    fn portrait_summon_or<F>(mut self, action: F) -> Self
-    where
-        F: FnOnce(&mut Self),
-    {
-        if is_portrait(self.orientation) && !self.reading_sheet {
-            self.reading_sheet = true;
-        } else {
-            self.reading_sheet = false;
-            action(&mut self);
-        }
-        self
     }
 }
 

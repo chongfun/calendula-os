@@ -3,9 +3,10 @@
 //! Each glyph is authored as 24 rows of ASCII art (`#` = ink, space =
 //! paper) and packed at compile time into a `[u32; 24]` bitmap — one bit
 //! per column, MSB = leftmost. The panel is 1bpp and the strip draws in
-//! pure ink, so a monochrome mask is exactly what reaches the glass; this
-//! replaces the `embedded-icon`/`embedded-graphics` crates (~18 KB of
-//! flash) with ~1.3 KB of bitmap rodata and a two-loop blit.
+//! pure ink, so a monochrome mask is exactly what reaches the glass;
+//! ~1.3 KB of bitmap rodata and a two-loop blit cover the whole strip
+//! without pulling in an icon crate (`embedded-icon` plus the
+//! `embedded-graphics` drawing stack would cost ~18 KB of flash).
 
 use display::fb::Framebuffer;
 
@@ -37,9 +38,6 @@ const fn icon(rows: [&str; 24]) -> Icon {
 /// per-pixel to the framebuffer's logical bounds.
 pub fn draw_icon(fb: &mut Framebuffer, glyph: &Icon, x: i16, y: i16) {
     for (row, bits) in glyph.iter().enumerate() {
-        if *bits == 0 {
-            continue;
-        }
         for col in 0..24u32 {
             if (bits >> (23 - col)) & 1 != 0 {
                 let px = x + col as i16;
@@ -64,9 +62,9 @@ pub fn icon_for_label(label: &str) -> &'static Icon {
         "previous" => &CHEVRON_LEFT,
         "next" => &CHEVRON_RIGHT,
         "close" | "cancel" => &CROSS,
-        "change" | "edit" => &PENCIL,
+        "change" => &PENCIL,
         "connect" | "done" => &CHECK,
-        "forget" | "trash" => &TRASH,
+        "forget" => &TRASH,
         "set up" => &PLUS,
         "again" => &REFRESH,
         _ => &HELP,

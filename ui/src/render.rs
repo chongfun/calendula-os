@@ -815,9 +815,9 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
 pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pages_left: bool) {
     let mut layout = ShellLayout::for_orientation(orientation);
     layout.pages_left = pages_left;
-    if !layout.portrait {
-        return;
-    }
+    // The reducer only holds the sheet up in portrait; landscape callers
+    // never reach here.
+    debug_assert!(layout.portrait);
     let top = layout.frame_height - crate::reading::PORTRAIT_READING_SHEET_HEIGHT;
     let width = fb.frame_width() as u16;
     fill_rect(
@@ -1006,7 +1006,7 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
         // The battery percentage sits tucked in the top-right corner,
         // above the heading area to avoid overlapping.
         let width = measure_text(small, label) as i16;
-        let frame_width = FbFrame::Portrait.width() as i16;
+        let frame_width = fb.frame_width() as i16;
         draw_text(fb, small, label, frame_width - 16 - width, 24, false);
     } else if layout.mirrored {
         draw_text(
