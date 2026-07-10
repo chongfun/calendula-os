@@ -75,6 +75,10 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let mut prev_prestaged = false;
     static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
     let sd_library = SD_LIBRARY.take();
+    // ReaderStore::new() is all-zero bytes so the 47 KB static lives in
+    // .bss (not a flashed .data image); fill in the non-zero defaults once,
+    // in place, before anything reads the store.
+    sd_library.init_runtime_defaults();
     // ASCII glyph metrics for the custom font pack; shared by the build's
     // line measurement and the reading-page draw so both stay off the card.
     static FONT_METRICS: ConstStaticCell<crate::custom_font::MetricCache> =

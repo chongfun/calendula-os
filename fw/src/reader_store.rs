@@ -1,5 +1,5 @@
 use app_core::{ReaderSource, MAX_SD_CHAPTERS};
-use display::font::{FontStyle, TypeSettings};
+use display::font::{FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings};
 use heapless::String;
 use proto::cache::{
     BlockRecord, BookV2SectionRecord, PageRecord, TocRecord, CACHE_KEY_BYTES, COVER_BYTES,
@@ -71,6 +71,37 @@ pub(crate) const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionR
     start_page: 0,
     page_count: 0,
     partial: false,
+};
+
+/// All-zero-byte stand-ins for the non-zero defaults, used only by
+/// [`ReaderStore::new`]: the const value behind the 47 KB `SD_LIBRARY`
+/// static must be all zeroes so the linker places it in .bss instead of a
+/// flashed-and-copied .data image. The zeroed slots are never read --
+/// [`ReaderStore::init_runtime_defaults`] rewrites them to the real
+/// defaults once at boot, before any use.
+const ZERO_TOC_RECORD: TocRecord = TocRecord {
+    title_offset: 0,
+    title_len: 0,
+    href_offset: 0,
+    href_len: 0,
+    anchor_offset: 0,
+    anchor_len: 0,
+    level: 0,
+    spine_index: 0, // EMPTY_TOC_RECORD carries the real -1 sentinel.
+};
+const ZERO_BLOCK_RECORD: BlockRecord = BlockRecord {
+    text_offset: 0,
+    text_len: 0,
+    line_count: 0,
+    role: TextRole::Body,
+    style: proto::text::FontStyle::Regular,
+    align: TextAlign::Left, // EMPTY_BLOCK_RECORD's Justify has discriminant 2.
+};
+const ZERO_TYPE_SETTINGS: TypeSettings = TypeSettings {
+    size: FontSize::Small,
+    spacing: LineSpacing::Compact,
+    weight: FontWeight::Normal,
+    family: FontFamily::Literata,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +260,13 @@ pub(crate) struct ReaderStore {
 }
 
 impl ReaderStore {
+    /// The boot value of the `SD_LIBRARY` static. Every byte of this const
+    /// must be zero (enums by zero-discriminant variants, records by the
+    /// `ZERO_*` stand-ins) so the linker keeps the 47 KB static in .bss:
+    /// one non-zero byte anywhere moves the whole struct into .data, which
+    /// costs a flash image copy of the full size plus a boot-time memcpy.
+    /// [`Self::init_runtime_defaults`] restores the handful of non-zero
+    /// defaults in place, immediately after the cell is taken.
     pub(crate) const fn new() -> Self {
         Self {
             status: LibraryScanStatus::NotScanned,
@@ -247,8 +285,8 @@ impl ReaderStore {
             error: String::new(),
             cache_key: String::new(),
             cover_ready: false,
-            cover_width: COVER_WIDTH as u16,
-            cover_height: COVER_HEIGHT as u16,
+            cover_width: 0,
+            cover_height: 0,
             cover_bits: [0; COVER_BYTES],
             cached_spine: 0,
             section_partial: false,
@@ -261,7 +299,7 @@ impl ReaderStore {
             book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
             toc_text_len: 0,
-            toc: [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS],
+            toc: [ZERO_TOC_RECORD; MAX_SD_TOC_ITEMS],
             toc_page: [0; MAX_SD_TOC_ITEMS],
             toc_count: 0,
             toc_total: 0,
@@ -276,23 +314,45 @@ impl ReaderStore {
             current_chapter_source: (0, 0),
             text: [0; MAX_READER_TEXT_BYTES],
             text_len: 0,
-            blocks: [EMPTY_BLOCK_RECORD; MAX_READER_BLOCKS],
+            blocks: [ZERO_BLOCK_RECORD; MAX_READER_BLOCKS],
             block_styles: [FontStyle::Regular; MAX_READER_BLOCKS],
             block_spine: [0; MAX_READER_BLOCKS],
             block_page_break_before: [false; MAX_READER_BLOCKS],
-            block_paragraph_end: [true; MAX_READER_BLOCKS],
+            block_paragraph_end: [false; MAX_READER_BLOCKS],
             block_paragraph_start: [false; MAX_READER_BLOCKS],
             block_count: 0,
             pages: [EMPTY_PAGE_RECORD; MAX_READER_PAGES],
             page_spine: [0; MAX_READER_PAGES],
             page_count: 0,
-            type_settings: TypeSettings::DEFAULT,
+            type_settings: ZERO_TYPE_SETTINGS,
             portrait: false,
             custom_font_available: false,
             custom_font_identity: 0,
             custom_font_name: String::new(),
             custom_font_faces: [proto::font_pack::FontPackFaceRecord::EMPTY; MAX_CUSTOM_FONT_FACES],
             custom_font_face_count: 0,
+        }
+    }
+
+    /// Restore the non-zero defaults the all-zero [`Self::new`] const cannot
+    /// carry, mutating the static in place (never a stack copy of the 47 KB
+    /// store). Called exactly once, right after `SD_LIBRARY.take()`, so no
+    /// reader ever observes the `ZERO_*` stand-ins: cover dimensions, the
+    /// default type settings, the -1 spine sentinel in unused TOC slots, the
+    /// Justify align of unused blocks, and the paragraph-end default that
+    /// `clear_lines` also maintains.
+    pub(crate) fn init_runtime_defaults(&mut self) {
+        self.cover_width = COVER_WIDTH as u16;
+        self.cover_height = COVER_HEIGHT as u16;
+        self.type_settings = TypeSettings::DEFAULT;
+        for record in self.toc.iter_mut() {
+            *record = EMPTY_TOC_RECORD;
+        }
+        for record in self.blocks.iter_mut() {
+            *record = EMPTY_BLOCK_RECORD;
+        }
+        for end in self.block_paragraph_end.iter_mut() {
+            *end = true;
         }
     }
 
