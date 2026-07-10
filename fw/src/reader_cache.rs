@@ -1045,6 +1045,7 @@ where
                 xhtml_entry.uncompressed_size
             );
             let type_settings = library.type_settings();
+            let page_box = library.page_box();
             let mut sink = LibraryBlockSink {
                 library,
                 root,
@@ -1068,7 +1069,8 @@ where
                 target_pages: visible_page_capacity,
                 generate_toc_from_headings,
                 generated_toc_for_spine: false,
-                pages_dirty: true,
+                page_cursor: ui::reading::PageIndexCursor::start(page_box),
+                page_overflowed: false,
             };
             // Stream the whole member through the resumable block parser in
             // bounded windows: spine XHTML of any size decodes completely, with
@@ -1501,12 +1503,17 @@ struct LibraryBlockSink<
     target_pages: usize,
     generate_toc_from_headings: bool,
     generated_toc_for_spine: bool,
-    /// The section arena changed since the last `rebuild_page_index`. Every
-    /// pushed XHTML run used to trigger a full re-walk of the accumulated
-    /// blocks (twice, via `flush_if_full`) — O(blocks²) per section. The
-    /// flag limits the rebuild to arena mutations, including paragraph-end
-    /// marks, which change heights without changing counts.
-    pages_dirty: bool,
+    /// Incremental page-index cursor: each appended line advances the page
+    /// records in O(1) instead of triggering a full `rebuild_page_index`
+    /// re-walk of every accumulated block — O(blocks²) per section before.
+    /// Hard invariant: the records must stay bit-identical to a full
+    /// rebuild (they persist into section files), which the shared cursor's
+    /// host tests check step-by-step against the naive walk. The carry path
+    /// falls back to a full rebuild and re-adopts its cursor.
+    page_cursor: ui::reading::PageIndexCursor,
+    /// Latched when a page record was dropped past the `pages` capacity,
+    /// mirroring the full rebuild's silent drop.
+    page_overflowed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1616,11 +1623,45 @@ where
         self.line_ink.width()
     }
 
-    fn rebuild_pages_if_dirty(&mut self) {
-        if self.pages_dirty {
-            reader_layout::rebuild_page_index(self.library);
-            self.pages_dirty = false;
+    /// Mirror the block just appended (at `block_count - 1`) into the page
+    /// index through the shared incremental cursor — O(1) per line.
+    fn note_block_appended(&mut self) {
+        let index = self.library.block_count - 1;
+        let placement = self.page_cursor.place_next_block(self.library, index);
+        let spine = self.library.block_spine.get(index).copied().unwrap_or(0);
+        ui::reading::apply_block_placement(
+            placement,
+            index,
+            spine,
+            &mut self.library.pages,
+            &mut self.library.page_spine,
+            &mut self.library.page_count,
+            &mut self.page_overflowed,
+        );
+    }
+
+    /// Bounded fix-up for `mark_last_block_paragraph_end`: the mark grows
+    /// the last block by its trailing paragraph gap after placement, so
+    /// re-place just that block; when it no longer fits its page, move it
+    /// to a fresh one, exactly as a full rebuild would.
+    fn note_last_block_grew(&mut self, index: usize) {
+        let placement = self.page_cursor.replace_last_block(self.library, index);
+        if placement == ui::reading::BlockPlacement::NewPage {
+            let spine = self.library.block_spine.get(index).copied().unwrap_or(0);
+            ui::reading::apply_last_block_move(
+                index,
+                spine,
+                &mut self.library.pages,
+                &mut self.library.page_spine,
+                &mut self.library.page_count,
+                &mut self.page_overflowed,
+            );
         }
+    }
+
+    fn reset_page_cursor(&mut self) {
+        self.page_cursor = ui::reading::PageIndexCursor::start(self.library.page_box());
+        self.page_overflowed = false;
     }
 
     fn finish_spine(&mut self, partial: bool) {
@@ -1629,10 +1670,9 @@ where
     }
 
     fn flush_section(&mut self, partial: bool, carry_incomplete: bool) -> bool {
-        self.rebuild_pages_if_dirty();
         if self.library.block_count() == 0 || self.library.page_count == 0 {
             self.library.clear_lines();
-            self.pages_dirty = true;
+            self.reset_page_cursor();
             return true;
         }
         if *self.section_count >= self.sections.len() {
@@ -1696,19 +1736,22 @@ where
                 self.library.block_count = full_blocks;
                 self.library.text_len = full_text;
                 self.library.carry_last_page(cut);
-                reader_layout::rebuild_page_index(self.library);
-                self.pages_dirty = false;
+                // Full rebuild on the carry path: the carried blocks were
+                // rebased, so re-derive the page records and adopt the
+                // walk's cursor for the appends that follow.
+                let (cursor, overflowed) = reader_layout::rebuild_page_index(self.library);
+                self.page_cursor = cursor;
+                self.page_overflowed = overflowed;
             }
             None => {
                 self.library.clear_lines();
-                self.pages_dirty = true;
+                self.reset_page_cursor();
             }
         }
         true
     }
 
     fn flush_if_full(&mut self) {
-        self.rebuild_pages_if_dirty();
         if self.library.page_count >= self.target_pages
             || self.library.block_count() >= self.library.block_capacity().saturating_sub(4)
             || self.library.text_capacity_reached()
@@ -1958,10 +2001,15 @@ fn flush_styled_preview_line<
 {
     if sink.line.is_empty() {
         if paragraph_end {
+            let count = sink.library.block_count;
+            let changed = count > 0 && !sink.library.block_paragraph_end[count - 1];
             sink.library.mark_last_block_paragraph_end();
-            // Height-only change: the trailing paragraph gap moved without
-            // block_count moving, so the page index is stale all the same.
-            sink.pages_dirty = true;
+            if changed {
+                // Height-only change: the trailing paragraph gap grew the
+                // last block after it was placed, so re-place just that
+                // block instead of rebuilding the whole page index.
+                sink.note_last_block_grew(count - 1);
+            }
         }
         return;
     }
@@ -1990,6 +2038,7 @@ fn flush_styled_preview_line<
             sink.generated_toc_for_spine = true;
         }
     }
+    let mut appended_from = sink.library.block_count;
     if !sink.library.push_line_block(
         line.as_str(),
         style,
@@ -2005,6 +2054,7 @@ fn flush_styled_preview_line<
         // refuses and sets book_partial; the line is then genuinely
         // dropped, which is the separate whole-book limit.)
         sink.flush_section(false, true);
+        appended_from = sink.library.block_count;
         let _ = sink.library.push_line_block(
             line.as_str(),
             style,
@@ -2014,7 +2064,11 @@ fn flush_styled_preview_line<
             sink.spine_index,
         );
     }
-    sink.pages_dirty = true;
+    if sink.library.block_count > appended_from {
+        // push_line_block can also no-op (empty trim, full block table), so
+        // only an actual append advances the page cursor.
+        sink.note_block_appended();
+    }
     sink.line.clear();
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
