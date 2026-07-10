@@ -29,9 +29,21 @@ pub struct UiRenderModel<'a> {
     pub custom_font_name: &'a str,
 }
 
-/// The drawing frame for an orientation: where `set_pixel` coordinates put
-/// ink on the panel as held. Every renderer sets this before drawing; the
-/// framebuffer is a long-lived static that remembers the previous frame.
+/// Maps a display orientation to the corresponding framebuffer drawing frame.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(
+///     fb_frame(DisplayOrientation::LandscapeButtonsBottom),
+///     FbFrame::Landscape
+/// );
+/// assert_eq!(
+///     fb_frame(DisplayOrientation::PortraitButtonsLeft),
+///     FbFrame::Portrait
+/// );
+/// ```
+pub fn fb_frame(orientation: DisplayOrientation) -> FbFrame
 pub fn fb_frame(orientation: DisplayOrientation) -> FbFrame {
     match orientation {
         DisplayOrientation::LandscapeButtonsBottom => FbFrame::Landscape,
@@ -42,10 +54,17 @@ pub fn fb_frame(orientation: DisplayOrientation) -> FbFrame {
     }
 }
 
-/// Draw the summoned portrait key sheet over a finished reading page.
-/// Shared by every reading compositor (built-in books here, the firmware's
-/// SD reader paths, the web emulator), so the band and its labels cannot
-/// drift between them. A no-op unless the request holds the sheet up.
+/// Draws the reading-sheet overlay when requested.
+///
+/// The overlay uses the display orientation and front-button layout from the
+/// render request. If no reading sheet is requested, the framebuffer is left
+/// unchanged.
+///
+/// # Examples
+///
+/// ```no_run
+/// render_reading_sheet_overlay(&mut framebuffer, request);
+/// ```
 pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest) {
     if !request.reading_sheet {
         return;
@@ -57,6 +76,16 @@ pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest
     );
 }
 
+/// Renders the requested application view into the framebuffer.
+///
+/// Reading views include the built-in reading page and optional reading-sheet overlay;
+/// other views are rendered using the supplied UI model.
+///
+/// # Examples
+///
+/// ```no_run
+/// render_request(&mut framebuffer, request, &model);
+/// ```
 pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
     fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {

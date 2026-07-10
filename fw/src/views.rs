@@ -17,6 +17,13 @@ const SHOW_INPUT_DEBUG: bool = false;
 // full chapter list from the card, so the render window must hold it.
 const MAX_UI_CHAPTERS: usize = 256;
 
+/// Renders the requested application view, including SD-backed reading pages and optional input diagnostics.
+///
+/// # Examples
+///
+/// ```
+/// render(&mut framebuffer, request, &reader_store);
+/// ```
 pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
     fb.set_frame(app_render::fb_frame(request.orientation));
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
@@ -39,6 +46,26 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     }
 }
 
+/// Renders an SD-backed reading view using the custom font when the request supports it.
+///
+/// # Examples
+///
+/// ```no_run
+/// let rendered = render_custom_reader_from_root(
+///     fb,
+///     request,
+///     sd_library,
+///     &mut font_metrics,
+///     &root,
+/// );
+/// assert!(rendered);
+/// ```
+///
+/// `false` indicates that the request was not eligible for custom-font rendering.
+///
+/// # Returns
+///
+/// `true` if the custom-font reader was rendered, `false` otherwise.
 pub(crate) fn render_custom_reader_from_root(
     fb: &mut Framebuffer,
     request: RenderRequest,

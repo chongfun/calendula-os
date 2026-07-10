@@ -662,6 +662,16 @@ pub struct ReaderState {
 }
 
 impl ReaderState {
+    /// Creates the initial reader state for application startup.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let state = ReaderState::boot();
+    /// assert_eq!(state.view, AppView::Home);
+    /// assert_eq!(state.book_id, 1);
+    /// assert_eq!(state.library_count, 0);
+    /// ```
     pub const fn boot() -> Self {
         Self {
             view: AppView::Home,
@@ -705,6 +715,30 @@ impl ReaderState {
         self.wifi_ssid_len > 0
     }
 
+    /// Applies an input sample to the reader state, updating device readings and navigating the current view.
+    ///
+    /// In portrait reading mode, the first `Confirm` or `Back` press displays the reading key sheet;
+    /// a subsequent press performs the selected action. Page navigation dismisses the sheet immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let state = ReaderState::boot().apply_input(
+    ///     ReducerContext::new(1, 1),
+    ///     InputEvent::button(Button::Next),
+    /// );
+    ///
+    /// assert_eq!(state.view, AppView::Settings);
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - Context containing built-in book and chapter counts.
+    /// * `event` - Sampled input and battery data to apply.
+    ///
+    /// # Returns
+    ///
+    /// The updated reader state.
     pub fn apply_input(self, ctx: ReducerContext, event: InputEvent) -> Self {
         let InputEvent::Sample {
             button: raw_button,
@@ -1114,6 +1148,17 @@ impl ReaderState {
         }
     }
 
+    /// Creates a render request from the current reader state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let state = ReaderState::boot();
+    /// let request = state.render_request(RenderKind::Page);
+    ///
+    /// assert_eq!(request.kind, RenderKind::Page);
+    /// assert_eq!(request.view, AppView::Home);
+    /// ```
     pub fn render_request(self, kind: RenderKind) -> RenderRequest {
         RenderRequest {
             kind,

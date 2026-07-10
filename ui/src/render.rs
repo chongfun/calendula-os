@@ -752,8 +752,20 @@ fn text_in(buf: &[u8], len: usize) -> &str {
 // Imprint furniture
 // ------------------------------------------------------------------
 
-/// An em-dash faces the physical button; the label is letterspaced
-/// small caps, bold for the screen's one primary action.
+/// Draws a labeled bezel key according to the current orientation.
+///
+/// Landscape layouts render an em dash and letterspaced label, with the primary
+/// action emphasized in bold. Portrait layouts render a centered icon for the
+/// label.
+///
+/// # Examples
+///
+/// ```no_run
+/// dash_key(&mut framebuffer, layout, 0, "home", false);
+/// ```
+///
+/// `slot` identifies the semantic key position, and `primary` controls the
+/// landscape label emphasis.
 fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str, primary: bool) {
     if layout.portrait {
         // Portrait keys are named by a 1bpp icon centered over the button,
@@ -790,8 +802,18 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
     }
 }
 
-/// An unused key keeps its bare dash: the mark stays, the word goes.
-/// Portrait names keys with icons only, so an unused key shows nothing.
+/// Draws the unused key marker in landscape layouts.
+///
+/// Portrait layouts leave unused keys blank because key labels are represented by icons.
+///
+/// # Examples
+///
+/// ```
+/// # fn example(fb: &mut Framebuffer, layout: ShellLayout) {
+/// dash_unused(fb, layout, 0);
+/// # }
+/// ```
+fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
 fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
     if layout.portrait {
         return;
@@ -806,12 +828,17 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
     draw_text(fb, dash_font, dash, dash_x, layout.key_pos(slot) + 8, false);
 }
 
-/// The summoned reading key sheet: portrait reading stays chrome-free, and
-/// a named-key press raises this white band over the page's bottom edge —
-/// footer and all, the page reserves nothing for it. A hairline closes its
-/// top edge; inside, four 1bpp icons sit on one baseline, each centered
-/// over the physical button it names (following the front-pair swap), so
-/// the band stays shallow. Paging dismisses it (the reducer owns that).
+/// Renders the portrait reading key sheet over the bottom of the framebuffer.
+///
+/// The sheet displays the Home, Contents, Previous, and Next key icons, positioning
+/// them according to the orientation and front-button arrangement.
+///
+/// # Examples
+///
+/// ```ignore
+/// render_reading_sheet(&mut framebuffer, UiOrientation::PortraitButtonsLeft, false);
+/// ```
+pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pages_left: bool) {
 pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pages_left: bool) {
     let mut layout = ShellLayout::for_orientation(orientation);
     layout.pages_left = pages_left;
@@ -837,6 +864,13 @@ pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pa
     dash_key(fb, layout, 3, "next", false);
 }
 
+/// Draws a letterspaced, centered heading with a horizontal rule beneath it.
+///
+/// # Examples
+///
+/// ```ignore
+/// heading(&mut framebuffer, layout, "Library");
+/// ```
 fn heading(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
     let small = literata_small(FontStyle::Regular);
     let width = ls_width(small, text, 5);
@@ -995,6 +1029,15 @@ fn position_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, to
     );
 }
 
+/// Draws the battery percentage in the appropriate position for the current layout.
+///
+/// Values greater than 100 are displayed as `100%`.
+///
+/// # Examples
+///
+/// ```ignore
+/// draw_battery_percent(&mut framebuffer, layout, 85);
+/// ```
 fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) {
     let mut buf = [0u8; 8];
     let mut cursor = 0;

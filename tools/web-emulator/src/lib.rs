@@ -299,6 +299,14 @@ impl WebEmulator {
         ];
     }
 
+    /// Renders the requested emulator view and updates the current frame.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut emulator = WebEmulator::boot();
+    /// emulator.render(RenderKind::Page);
+    /// ```
     fn render(&mut self, kind: RenderKind) {
         let request = self.state.render_request(kind);
         let sd_reading = request.view == AppView::Reading

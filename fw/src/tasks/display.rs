@@ -1033,6 +1033,32 @@ fn restore_saved_state(
     });
 }
 
+/// Builds the Home-page render request used when restoring the sleep screen from saved reading state.
+///
+/// Pending progress takes precedence over persisted state. The saved source identity is resolved
+/// against the catalog before the corresponding book metadata is loaded.
+///
+/// # Arguments
+///
+/// * `pending_progress` - Coalesced progress to use instead of loading state from storage.
+///
+/// # Returns
+///
+/// A render request containing the restored reading state, or `None` when no saved state exists or
+/// its source cannot be found in the catalog.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let request = sleep_request_from_saved_state(
+///     &mut epd,
+///     &mut sd_cs,
+///     &mut library,
+///     &pending_progress,
+/// );
+///
+/// assert_eq!(request.map(|request| request.view), Some(AppView::Home));
+/// ```
 fn sleep_request_from_saved_state(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,

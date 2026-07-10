@@ -15,8 +15,18 @@ pub const ICON_SIZE: i16 = 24;
 /// One 24x24 monochrome glyph, row-major, column `x` in bit `23 - x`.
 type Icon = [u32; 24];
 
-/// Pack 24 rows of ASCII art into a bitmap. Any non-space character inks
-/// the pixel; rows may be short (the tail stays paper).
+/// Packs 24 rows of ASCII art into a 24-row bitmap, treating each non-space character as an ink pixel.
+///
+/// Rows shorter than 24 characters leave their remaining pixels clear. The leftmost pixel
+/// occupies the most significant bit of each row.
+///
+/// # Examples
+///
+/// ```
+/// const glyph: Icon = icon(["#"; 24]);
+/// assert_eq!(glyph[0], 1 << 23);
+/// ```
+const fn icon(rows: [&str; 24]) -> Icon {
 const fn icon(rows: [&str; 24]) -> Icon {
     let mut out = [0u32; 24];
     let mut y = 0;
@@ -34,8 +44,17 @@ const fn icon(rows: [&str; 24]) -> Icon {
     out
 }
 
-/// Blit an icon in ink with its top-left corner at `(x, y)`, clipped
-/// per-pixel to the framebuffer's logical bounds.
+/// Draws the ink pixels of a glyph with its top-left corner at `(x, y)`.
+///
+/// Pixels whose destination coordinates are negative are skipped.
+///
+/// # Examples
+///
+/// ```
+/// let mut framebuffer: Framebuffer = unimplemented!();
+/// let glyph = icon_for_label("home");
+/// draw_icon(&mut framebuffer, glyph, 0, 0);
+/// ```
 pub fn draw_icon(fb: &mut Framebuffer, glyph: &Icon, x: i16, y: i16) {
     for (row, bits) in glyph.iter().enumerate() {
         for col in 0..24u32 {
@@ -50,8 +69,24 @@ pub fn draw_icon(fb: &mut Framebuffer, glyph: &Icon, x: i16, y: i16) {
     }
 }
 
-/// The strip icon for a key label; the fallback question mark covers any
-/// label without a dedicated glyph.
+/// Selects the glyph associated with a key label.
+///
+/// Unknown labels use the question-mark glyph.
+///
+/// # Examples
+///
+/// ```
+/// let icon = icon_for_label("home");
+/// assert!(std::ptr::eq(icon, icon_for_label("home")));
+/// ```
+///
+/// # Arguments
+///
+/// * `label` - The key label to map to a glyph.
+///
+/// # Returns
+///
+/// A reference to the matching static glyph, or the question-mark glyph for unknown labels.
 pub fn icon_for_label(label: &str) -> &'static Icon {
     match label {
         "home" => &HOME,

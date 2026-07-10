@@ -78,6 +78,23 @@ impl Scenario {
         Ok(())
     }
 
+    /// Validates the emulator state against the configured expectations.
+    ///
+    /// Checks each configured expectation and stops at the first mismatch or invalid
+    /// expected value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing the first expectation that does not match or
+    /// cannot be parsed.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Set up the emulator and scenario as needed.
+    /// scenario.assert(&emu).unwrap();
+    /// ```
+    pub fn assert(&self, emu: &Emulator) -> Result<(), String> {
     pub fn assert(&self, emu: &Emulator) -> Result<(), String> {
         let state = emu.state();
         if let Some(view) = &self.expect.view {

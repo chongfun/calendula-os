@@ -970,6 +970,19 @@ mod tests {
         fn page_break_before(&self, _index: usize) -> bool {
             false
         }
+        /// Reports whether the block at `index` ends a paragraph.
+        ///
+        /// Missing entries are treated as paragraph endings.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// let paragraph_ends = [false, true];
+        ///
+        /// assert!(!paragraph_ends.get(0).copied().unwrap_or(true));
+        /// assert!(paragraph_ends.get(1).copied().unwrap_or(true));
+        /// assert!(paragraph_ends.get(2).copied().unwrap_or(true));
+        /// ```
         fn paragraph_end(&self, index: usize) -> bool {
             self.ends.get(index).copied().unwrap_or(true)
         }
