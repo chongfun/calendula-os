@@ -247,11 +247,18 @@ impl RefreshPlanner {
         }
     }
 
-    pub fn record_sleep(&mut self) {
+    /// Records the panel powering down at the end of the sleep handshake.
+    /// Clearing `last_request` is what makes the next render re-init the
+    /// panel, so this must run whenever the panel actually slept — even if
+    /// the sleep-frame flush failed. `panel_shows_sleep_screen` carries that
+    /// flush outcome: `true` lets the wake render take the one-flicker
+    /// clean, `false` (stale pixels under a failed flush) keeps the deep
+    /// full waveform that unknown panel contents require.
+    pub fn record_sleep(&mut self, panel_shows_sleep_screen: bool) {
         self.screen_on = false;
         self.fast_refreshes = 0;
         self.last_request = None;
-        self.panel_shows_sleep_screen = true;
+        self.panel_shows_sleep_screen = panel_shows_sleep_screen;
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
@@ -2159,7 +2166,7 @@ mod tests {
 
         // After a display sleep the panel shows the sleep screen the
         // firmware drew, so wake also needs only the one-flicker clean.
-        planner.record_sleep();
+        planner.record_sleep(true);
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
     }
 
@@ -2173,10 +2180,21 @@ mod tests {
         planner.record_render(request, RefreshMode::Full);
 
         // Wake after sleep: known sleep-screen contents, one-flicker clean.
-        planner.record_sleep();
+        planner.record_sleep(true);
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
         planner.record_render(request, RefreshMode::FastClean);
-        planner.record_sleep();
+        planner.record_sleep(true);
+
+        // A sleep whose final flush failed still powers the panel down, so
+        // the screen is off and the next render re-inits — but the pixels
+        // underneath are stale, and the wake render must pay the deep full
+        // waveform instead of fast-cleaning over them.
+        let mut failed_flush = RefreshPlanner::new();
+        failed_flush.record_render(request, RefreshMode::Full);
+        failed_flush.record_sleep(false);
+        assert!(!failed_flush.screen_on());
+        assert_eq!(failed_flush.last_request(), None);
+        assert_eq!(failed_flush.mode_for(request), RefreshMode::Full);
 
         // Disabling fast refresh falls back to the deep full everywhere.
         let conservative = RefreshPlanner::new().with_fast_refresh_enabled(false);

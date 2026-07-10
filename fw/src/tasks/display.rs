@@ -324,8 +324,14 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 if !panel_slept {
                     esp_println::println!("display: sleep command failed");
                 }
-                if panel_slept && sleep_frame_settled {
-                    refresh_planner.record_sleep();
+                // Whenever the panel actually slept the planner must know the
+                // screen is off — an aborted handshake (a late button press
+                // beating DisplayAsleep) otherwise renders to a powered-down
+                // panel without re-init. The settled flag rides along so a
+                // failed flush wakes with the deep full waveform, not a fast
+                // clean over stale pixels.
+                if panel_slept {
+                    refresh_planner.record_sleep(sleep_frame_settled);
                 }
                 // Persist whether the panel really holds the sleep frame
                 // before DisplayAsleep releases the power task to cut power:
