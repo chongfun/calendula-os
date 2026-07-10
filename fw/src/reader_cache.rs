@@ -265,7 +265,7 @@ where
         "epub: stage TryV2BookIndexFast page={}",
         target_pages as u32
     );
-    if try_load_v2_book_cache(
+    let status = if try_load_v2_book_cache(
         root,
         cache_key.as_str(),
         source_identity,
@@ -274,10 +274,8 @@ where
         Instant::now(),
         "fast",
     ) {
-        return BookLoadStatus::Ready;
-    }
-
-    if in_books_dir {
+        BookLoadStatus::Ready
+    } else if in_books_dir {
         let load_result = match root.open_dir("BOOKS") {
             Ok(books) => match books.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
                 Ok(file) => Some(build_or_load_epub_cache_from_file(
@@ -322,7 +320,20 @@ where
             }
         };
         status_for_load_result(load_result, library)
+    };
+    if matches!(status, BookLoadStatus::Ready) && !library.title.is_empty() {
+        // Persist the just-learned EPUB title into the catalog record, in
+        // this same session, so future Library windows and boots label the
+        // book without probing its cache. Read-compare first; a reopen with
+        // an unchanged title writes nothing.
+        let _ = crate::library_sd::update_catalog_title(
+            root,
+            index,
+            source_identity,
+            library.title.as_str(),
+        );
     }
+    status
 }
 
 #[inline(never)]

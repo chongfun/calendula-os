@@ -4,6 +4,7 @@
 pub mod book;
 pub mod cache;
 pub mod captive;
+pub mod catalog;
 pub mod epub;
 pub mod font_pack;
 pub mod ota;
