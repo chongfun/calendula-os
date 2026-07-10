@@ -91,9 +91,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
         ConstStaticCell::new(crate::custom_font::MetricCache::new());
     let font_metrics = FONT_METRICS.take();
 
-    esp_println::println!("display: init start");
-    display_flush::init_panel(&mut epd).await;
-    esp_println::println!("display: init complete");
+    // No panel init here: the first-render guard in the loop below (fresh
+    // planner — screen off, no last request) owns the boot init, exactly as
+    // it already owned re-init after a display sleep. Initializing at task
+    // start too made every boot's first render pay reset + init twice (on
+    // the X3 that second pass re-whitens both ~52 KB DTM planes).
 
     // One-shot firmware self-update: if the card holds a pending image, flash it
     // into the inactive OTA slot and reboot into it before the reader starts.
@@ -186,6 +188,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
 
+                // Sole panel-init site: true for a boot's first render (fresh
+                // planner) and again after any display sleep — record_sleep
+                // clears last_request, which also covers the aborted-sleep
+                // path where a late button press interrupts the handshake
+                // after the panel already powered down.
                 if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
                     esp_println::println!("display: wake init start");
                     display_flush::init_panel(&mut epd).await;
