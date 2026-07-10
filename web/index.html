@@ -18,9 +18,29 @@
 <meta name="twitter:title" content="CalendulaOS · lightweight firmware for the Xteink X3 and X4">
 <meta name="twitter:description" content="Lightweight open firmware for the Xteink X3 and X4 e-readers. Try it in your browser, then flash it to your reader over USB or from an SD card.">
 <meta name="twitter:image" content="https://chongfun.github.io/calendula-os/home.png">
+<script>
+// The board wasm is picked by ?board= at runtime, so a static preload can't
+// name it. Kick the multi-megabyte download off during HTML parse instead of
+// waiting for the module script at the bottom of the page. `crossorigin`
+// makes the preload's request mode match the fetch() the module script
+// issues, so the browser reuses this download instead of starting a second.
+(function () {
+  var board = new URLSearchParams(location.search).get("board") === "x3" ? "x3" : "x4";
+  var link = document.createElement("link");
+  link.rel = "preload";
+  link.as = "fetch";
+  link.type = "application/wasm";
+  link.crossOrigin = "anonymous";
+  link.href = board + "_web_emulator.wasm";
+  document.head.appendChild(link);
+})();
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap" rel="stylesheet">
+<!-- Non-blocking font load: media="print" keeps the stylesheet off the
+     critical path; onload swaps it live. Georgia stands in until then. -->
+<link href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap" rel="stylesheet"></noscript>
 <style>
   :root {
     --paper: #eeece2;
