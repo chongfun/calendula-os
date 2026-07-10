@@ -36,8 +36,38 @@ use proto::captive;
 // Measured first-association joins ran ~21 s; give them headroom.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
-const PORTAL_SSID: &str = "XTEINK-X4";
+/// The hotspot beacons the SSID the join QR names; `ui::join_qr` is the
+/// single source, so the QR a phone scans cannot drift from the AP.
+const PORTAL_SSID: &str = ui::join_qr::PORTAL_SSID;
 const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
+
+/// Alphabet for the per-session portal PSK: ASCII alphanumerics minus
+/// the hand-typing-ambiguous 0/O/1/l/I (phones that cannot scan type it
+/// from the screen) and nothing the `WIFI:` QR payload needs escaped
+/// (`\ ; , : "`). 56 characters.
+const PSK_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
+
+/// Mints the onboarding hotspot's WPA2 PSK for this portal session from
+/// the hardware RNG. Home credentials POST to /save over the hotspot
+/// link, so it must not be open; and a PSK fixed at build time would be
+/// public — committed to the repo or extractable from the released
+/// firmware.bin — so it is drawn fresh here and travels only on the
+/// screen's QR. Six-bit rejection sampling keeps the draw uniform over
+/// the 56-character alphabet.
+fn mint_portal_psk(rng: Rng) -> app_core::PortalPsk {
+    let mut bytes = [0u8; app_core::PortalPsk::LEN];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        for byte in rng.random().to_le_bytes() {
+            let draw = (byte & 0x3F) as usize;
+            if draw < PSK_ALPHABET.len() && filled < bytes.len() {
+                bytes[filled] = PSK_ALPHABET[draw];
+                filled += 1;
+            }
+        }
+    }
+    app_core::PortalPsk::new(bytes)
+}
 
 /// Compile-time station credentials for the dev phase:
 /// `XTEINK_WIFI_SSID=... XTEINK_WIFI_PASS=... cargo build ...`
@@ -535,9 +565,10 @@ const SAVED_PAGE: &str = concat!(
     "connect to your network.</p></body></html>",
 );
 
-/// The onboarding hotspot: open AP, captive DHCP + DNS, and the
-/// credential form on port 80. Never returns; the session ends with the
-/// reset that `SyncCommand::Exit` triggers.
+/// The onboarding hotspot: WPA2 AP under a PSK minted for this session
+/// (joined via the QR the Wireless screen renders from it), captive
+/// DHCP + DNS, and the credential form on port 80. Never returns; the
+/// session ends with the reset that `SyncCommand::Exit` triggers.
 #[allow(clippy::too_many_arguments)]
 async fn run_portal(
     spawner: Spawner,
@@ -548,8 +579,14 @@ async fn run_portal(
     http_a: &'static mut [u8],
     http_b: &'static mut [u8],
 ) -> ! {
+    let psk = mint_portal_psk(Rng::new());
     let device = Interface::access_point();
-    let config = WifiConfig::AccessPoint(AccessPointConfig::default().with_ssid(PORTAL_SSID));
+    let config = WifiConfig::AccessPoint(
+        AccessPointConfig::default()
+            .with_ssid(PORTAL_SSID)
+            .with_auth_method(AuthenticationMethod::Wpa2Personal)
+            .with_password(psk.as_str().into()),
+    );
     if controller.set_config(&config).is_err() {
         esp_println::println!("portal: ap start failed");
         send_event(SyncEvent::Failed(SyncError::RadioInit));
@@ -573,8 +610,10 @@ async fn run_portal(
     );
     spawner.spawn(ap_net_task(runner).unwrap());
 
+    // The PSK itself stays off the serial log; the screen is its only
+    // channel.
     esp_println::println!("portal: up at 192.168.4.1 as {}", PORTAL_SSID);
-    send_event(SyncEvent::PortalUp);
+    send_event(SyncEvent::PortalUp(psk));
 
     // Three servers share the task; Exit interrupts them with the reset.
     select(

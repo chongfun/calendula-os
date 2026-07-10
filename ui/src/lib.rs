@@ -3,6 +3,7 @@
 
 pub mod app_render;
 pub mod icons;
+pub mod join_qr;
 pub mod layout;
 pub mod qr_generated;
 pub mod reading;
@@ -42,7 +43,9 @@ pub enum UiSyncStatus {
     Starting,
     Connecting,
     Connected([u8; 4]),
-    PortalUp,
+    /// The onboarding hotspot is up; carries the session's WPA2 PSK
+    /// bytes (always ASCII) for the join QR and manual-join text.
+    PortalUp([u8; 16]),
     Serving([u8; 4]),
     CredentialsSaved,
     Error(&'static str),

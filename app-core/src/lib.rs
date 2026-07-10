@@ -483,6 +483,43 @@ impl WifiSsid {
     }
 }
 
+/// The onboarding hotspot's WPA2 PSK, minted fresh from the hardware RNG
+/// each time the portal starts. It rides `SyncEvent::PortalUp` into
+/// `SyncStatus` so the Wireless screen can render the join QR and the
+/// manual-join password text — the on-screen QR is the only channel that
+/// carries it, so nothing secret lives in the repo or the release binary.
+/// Always exactly [`PortalPsk::LEN`] ASCII characters from an alphabet
+/// that avoids hand-typing-ambiguous glyphs (0/O/1/l/I) and everything
+/// the `WIFI:` QR payload would need escaped (`\ ; , : "`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortalPsk {
+    bytes: [u8; PortalPsk::LEN],
+}
+
+impl PortalPsk {
+    pub const LEN: usize = 16;
+
+    /// Fixed value for the emulators' synthetic portal flow, so golden
+    /// frames render deterministically. Sixteen characters from the same
+    /// unambiguous alphabet the firmware mints from; never used on
+    /// hardware.
+    pub const EMULATOR_DEMO: Self = Self {
+        bytes: *b"emudemopsk234567",
+    };
+
+    pub const fn new(bytes: [u8; Self::LEN]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes).unwrap_or("")
+    }
+
+    pub const fn bytes(&self) -> [u8; Self::LEN] {
+        self.bytes
+    }
+}
+
 // Bounded Copy messages by design: chapter_pages rides inside the event
 // because firmware has no heap to box large variants into.
 #[allow(clippy::large_enum_variant)]
@@ -562,8 +599,9 @@ pub enum SyncStatus {
     Connecting,
     /// Joined and DHCP-configured with this IPv4 address.
     Connected([u8; 4]),
-    /// The onboarding hotspot is up; the screen shows the join QR.
-    PortalUp,
+    /// The onboarding hotspot is up; the screen renders the join QR and
+    /// manual-join password from this session's PSK.
+    PortalUp(PortalPsk),
     /// Connected and the book server answers at this address until the
     /// session ends.
     Serving([u8; 4]),
@@ -591,7 +629,8 @@ pub enum SyncEvent {
     NetworkSaved(WifiSsid),
     Connecting,
     Connected([u8; 4]),
-    PortalUp,
+    /// The onboarding hotspot is up, secured with this session's PSK.
+    PortalUp(PortalPsk),
     Serving([u8; 4]),
     CredentialsSaved(WifiSsid),
     Failed(SyncError),
@@ -1117,7 +1156,7 @@ impl ReaderState {
             }
             SyncEvent::Connecting => SyncStatus::Connecting,
             SyncEvent::Connected(ip) => SyncStatus::Connected(ip),
-            SyncEvent::PortalUp => SyncStatus::PortalUp,
+            SyncEvent::PortalUp(psk) => SyncStatus::PortalUp(psk),
             SyncEvent::Serving(ip) => SyncStatus::Serving(ip),
             SyncEvent::CredentialsSaved(ssid) => {
                 self.wifi_ssid = ssid.bytes;
@@ -1468,11 +1507,17 @@ mod tests {
         assert_eq!(state.sync_status, SyncStatus::NotConfigured);
         let state = press(state, Button::Confirm);
         assert_eq!(state.sync_status, SyncStatus::Starting);
-        let state = state.apply_sync_event(SyncEvent::PortalUp);
-        assert_eq!(state.sync_status, SyncStatus::PortalUp);
+        let state = state.apply_sync_event(SyncEvent::PortalUp(PortalPsk::EMULATOR_DEMO));
+        assert_eq!(
+            state.sync_status,
+            SyncStatus::PortalUp(PortalPsk::EMULATOR_DEMO)
+        );
         // Confirm is inert while the portal serves.
         let state = press(state, Button::Confirm);
-        assert_eq!(state.sync_status, SyncStatus::PortalUp);
+        assert_eq!(
+            state.sync_status,
+            SyncStatus::PortalUp(PortalPsk::EMULATOR_DEMO)
+        );
         let state = state.apply_sync_event(SyncEvent::CredentialsSaved(
             WifiSsid::new("latent.space").unwrap(),
         ));
