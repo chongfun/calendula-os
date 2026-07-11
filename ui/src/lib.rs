@@ -1,6 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+use app_core::PortalPsk;
+
 pub mod app_render;
 pub mod icons;
 pub mod join_qr;
@@ -44,8 +46,10 @@ pub enum UiSyncStatus {
     Connecting,
     Connected([u8; 4]),
     /// The onboarding hotspot is up; carries the session's WPA2 PSK
-    /// bytes (always ASCII) for the join QR and manual-join text.
-    PortalUp([u8; 16]),
+    /// for the join QR and manual-join text. Carried as [`PortalPsk`]
+    /// rather than raw bytes so its redacted `Debug` keeps the live
+    /// password out of any formatted UI state.
+    PortalUp(PortalPsk),
     Serving([u8; 4]),
     CredentialsSaved,
     Error(&'static str),
@@ -128,4 +132,53 @@ pub struct UiShell<'a> {
     /// The saved Wi-Fi network's name; empty when none is saved. Names
     /// the network on the Wireless screen's idle and forget states.
     pub wifi_ssid: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_psk_stays_redacted_in_ui_debug_output() {
+        let psk = PortalPsk::EMULATOR_DEMO;
+        let status = UiSyncStatus::PortalUp(psk);
+        let shell = UiShell {
+            view: UiView::Wireless,
+            orientation: UiOrientation::PortraitButtonsRight,
+            front_pages_left: false,
+            refresh_policy: UiRefreshPolicy::FullEveryTen,
+            font_size: Default::default(),
+            line_spacing: Default::default(),
+            font_weight: Default::default(),
+            font_family: Default::default(),
+            custom_font_name: "",
+            selection: 0,
+            chapter: 0,
+            chapter_title: "",
+            page: 1,
+            page_count: 1,
+            battery_percent: 100,
+            active_book: UiBook {
+                title: "",
+                author: "",
+                progress_permille: 0,
+                cover: None,
+            },
+            library_status: UiLibraryStatus::NotScanned,
+            library_entries: &[],
+            library_window_start: 0,
+            library_total: 0,
+            chapters: &[],
+            chapters_window_start: 0,
+            chapters_total: 0,
+            sync_status: status,
+            wifi_ssid: "",
+        };
+        for rendered in [format!("{status:?}"), format!("{shell:?}")] {
+            assert!(
+                !rendered.contains(psk.as_str()),
+                "debug output leaks the live PSK: {rendered}"
+            );
+        }
+    }
 }

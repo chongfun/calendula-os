@@ -46,6 +46,10 @@ const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
 /// it.
 const PSK_ALPHABET: &[u8] = app_core::PSK_ALPHABET;
 
+// mint_portal_psk's 6-bit draws can only reach indexes 0..64; a longer
+// alphabet would silently leave its tail characters unmintable.
+const _: () = assert!(PSK_ALPHABET.len() <= 64);
+
 /// Mints the onboarding hotspot's WPA2 PSK for this portal session from
 /// the hardware RNG. Home credentials POST to /save over the hotspot
 /// link, so it must not be open; and a PSK fixed at build time would be

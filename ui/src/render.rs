@@ -641,7 +641,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             // render time — the PSK exists nowhere at build time — and
             // the password is printed under it for phones that cannot
             // scan.
-            let psk_text = text_in(&psk, psk.len());
+            let psk_text = psk.as_str();
             let mut temp = [0u8; join_qr::BUFFER_LEN];
             let mut out = [0u8; join_qr::BUFFER_LEN];
             // 140 + 33 modules * 5 px + the 20 px quiet zone ends at
