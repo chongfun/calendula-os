@@ -534,6 +534,7 @@ fn close_fault_during_commit_discards_target_and_keeps_old() {
 
     let pending = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
         .expect("begin re-upload");
+    let target_name = pending.target().clone();
     pending.write(b"new body").expect("stream");
     // Fail commit's internal close: the new copy's metadata never lands,
     // so commit must discard the target and leave the old copy alone.
@@ -551,6 +552,17 @@ fn close_fault_during_commit_discards_target_and_keeps_old() {
     assert_eq!(book_names(&books), vec!["BOOK0000.EPU"]);
     assert_eq!(read_book(&books, "BOOK0000.EPU"), b"old body");
     assert_eq!(identity_of(&root, "BOOK0000.EPU"), Some(0xAAAA));
+    // The discarded target's sidecars must also be gone.
+    assert_eq!(
+        identity_of(&root, target_name.as_str()),
+        None,
+        "discarded target's identity sidecar must be absent"
+    );
+    let mut label = heapless::String::<64>::new();
+    assert!(
+        !upload_store::read_upload_label(&root, target_name.as_str(), &mut label),
+        "discarded target's label sidecar must be absent"
+    );
 }
 
 #[test]
@@ -570,10 +582,19 @@ fn invalid_upload_names_are_rejected_without_touching_the_card() {
         "BOOK00x0.EPU",
         "BOOK0000.TXT",
     ] {
+        // Arm a read fault: if begin touches the device at all, the fault
+        // fires and is consumed. An unconsumed fault proves rejection was
+        // purely syntactic.
+        disk.fault.fail_read_in.set(Some(0));
         assert!(
             PendingUpload::begin(&root, &books, &name(bad), 0xAAAA, "label.epub").is_err(),
             "{bad:?} must be rejected"
         );
+        assert!(
+            disk.fault.fail_read_in.get().is_some(),
+            "{bad:?} must be rejected without performing any device read"
+        );
+        disk.fault.fail_read_in.set(None);
     }
     assert_eq!(*disk.data.borrow(), before, "no block was written");
 }
