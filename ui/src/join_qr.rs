@@ -13,8 +13,14 @@ use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
 
 /// The onboarding hotspot's SSID: the `S:` field of the QR payload and
 /// the network the Wireless screen's caption names. The firmware's AP
-/// config must beacon exactly this.
-pub const PORTAL_SSID: &str = "XTEINK-X4";
+/// config must beacon exactly this. Board-named so an X3 doesn't
+/// advertise itself as an X4; both spellings are nine bytes, so the QR
+/// payload shape is identical.
+pub const PORTAL_SSID: &str = if display::DEVICE_IS_X3 {
+    "XTEINK-X3"
+} else {
+    "XTEINK-X4"
+};
 
 /// Highest QR version the scratch buffers accommodate. The payload has a
 /// fixed shape — 18 bytes of `WIFI:` scaffolding around the 9-byte SSID

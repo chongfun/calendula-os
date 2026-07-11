@@ -174,7 +174,8 @@ recovery path for a wrong password or a changed router that used to
 require editing the card on a computer.
 
 With no credentials anywhere, starting a session raises the onboarding portal
-instead: a WPA2 `XTEINK-X4` hotspot at 192.168.4.1 with a captive DHCP
+instead: a WPA2 hotspot (`XTEINK-X4` or `XTEINK-X3`, named for the board)
+at 192.168.4.1 with a captive DHCP
 server, a DNS catch-all (every name resolves to the portal, which makes
 phones raise their sign-in sheet unprompted), and a credential form on
 port 80. The hotspot's WPA2 PSK is minted per session from the hardware
