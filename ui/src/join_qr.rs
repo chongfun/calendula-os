@@ -66,7 +66,7 @@ pub fn encode<'a>(
 mod tests {
     use super::*;
 
-    const DEMO_PSK: &str = "emudemopsk234567";
+    const DEMO_PSK: &str = "emudemqpsk234567";
 
     fn demo_qr(out: &mut [u8; BUFFER_LEN]) -> QrCode<'_> {
         let mut temp = [0u8; BUFFER_LEN];

@@ -488,13 +488,20 @@ impl WifiSsid {
 /// `SyncStatus` so the Wireless screen can render the join QR and the
 /// manual-join password text — the on-screen QR is the only channel that
 /// carries it, so nothing secret lives in the repo or the release binary.
-/// Always exactly [`PortalPsk::LEN`] ASCII characters from an alphabet
-/// that avoids hand-typing-ambiguous glyphs (0/O/1/l/I) and everything
-/// the `WIFI:` QR payload would need escaped (`\ ; , : "`).
+/// Always exactly [`PortalPsk::LEN`] ASCII characters from
+/// [`PSK_ALPHABET`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortalPsk {
     bytes: [u8; PortalPsk::LEN],
 }
+
+/// Alphabet for the per-session portal PSK: ASCII alphanumerics minus
+/// the hand-typing-ambiguous 0/O/1/I/l/i/o (phones that cannot scan
+/// type it from the screen) and nothing the `WIFI:` QR payload needs
+/// escaped (`\ ; , : "`). 55 characters. Lives here rather than in the
+/// firmware's minting code so [`PortalPsk::EMULATOR_DEMO`] is
+/// host-testable against it.
+pub const PSK_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
 
 impl PortalPsk {
     pub const LEN: usize = 16;
@@ -504,7 +511,7 @@ impl PortalPsk {
     /// unambiguous alphabet the firmware mints from; never used on
     /// hardware.
     pub const EMULATOR_DEMO: Self = Self {
-        bytes: *b"emudemopsk234567",
+        bytes: *b"emudemqpsk234567",
     };
 
     pub const fn new(bytes: [u8; Self::LEN]) -> Self {
@@ -1469,6 +1476,19 @@ mod tests {
     use super::*;
 
     const CTX: ReducerContext = ReducerContext::new(1, 3);
+
+    #[test]
+    fn emulator_demo_psk_stays_within_the_mintable_alphabet() {
+        let bytes = PortalPsk::EMULATOR_DEMO.bytes();
+        assert_eq!(bytes.len(), PortalPsk::LEN);
+        for b in bytes {
+            assert!(
+                PSK_ALPHABET.contains(&b),
+                "EMULATOR_DEMO byte {:?} is outside PSK_ALPHABET",
+                b as char
+            );
+        }
+    }
 
     fn press(state: ReaderState, button: Button) -> ReaderState {
         state.apply_input(CTX, InputEvent::button(button))

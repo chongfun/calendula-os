@@ -41,11 +41,10 @@ const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
 const PORTAL_SSID: &str = ui::join_qr::PORTAL_SSID;
 const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
 
-/// Alphabet for the per-session portal PSK: ASCII alphanumerics minus
-/// the hand-typing-ambiguous 0/O/1/l/I (phones that cannot scan type it
-/// from the screen) and nothing the `WIFI:` QR payload needs escaped
-/// (`\ ; , : "`). 56 characters.
-const PSK_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
+/// Alphabet for the per-session portal PSK; lives in app-core next to
+/// `PortalPsk` so the emulators' fixed demo value is host-tested against
+/// it.
+const PSK_ALPHABET: &[u8] = app_core::PSK_ALPHABET;
 
 /// Mints the onboarding hotspot's WPA2 PSK for this portal session from
 /// the hardware RNG. Home credentials POST to /save over the hotspot
@@ -53,7 +52,7 @@ const PSK_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstu
 /// public — committed to the repo or extractable from the released
 /// firmware.bin — so it is drawn fresh here and travels only on the
 /// screen's QR. Six-bit rejection sampling keeps the draw uniform over
-/// the 56-character alphabet.
+/// the 55-character alphabet.
 fn mint_portal_psk(rng: Rng) -> app_core::PortalPsk {
     let mut bytes = [0u8; app_core::PortalPsk::LEN];
     let mut filled = 0;
