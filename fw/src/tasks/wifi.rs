@@ -340,13 +340,15 @@ async fn upload_server(
                 core::str::from_utf8(&catalog[..catalog_len.min(catalog.len())]).unwrap_or("");
             let _ = write_http_response(&mut socket, "200 OK", listing).await;
         } else if is_delete {
-            let path_bytes = request_buf.get(path_at..path_at + path_len);
-            let name = path_bytes
-                .and_then(raw_query_name)
-                .and_then(valid_short_name);
+            let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
             let in_books = path_bytes
-                .map(|p| !window_contains(p, b"root=1"))
+                .as_ref()
+                .map(|p| !proto::upload::has_query_param(p, b"root=1"))
                 .unwrap_or(true);
+            let name = path_bytes
+                .as_mut()
+                .and_then(|p| proto::upload::raw_query_name(p))
+                .and_then(|decoded| valid_short_name(decoded));
             let ok = match name {
                 Some(name) => {
                     if !session_started {
@@ -359,6 +361,7 @@ async fn upload_server(
                             delete: true,
                             in_books,
                             label: crate::upload::UploadLabel::new(),
+                            identity_hash: 0,
                         })
                         .await;
                     UPLOAD_RESULTS.receive().await
@@ -373,11 +376,21 @@ async fn upload_server(
             .await;
         } else if is_upload_post {
             let client_name = request_buf
-                .get(path_at..path_at + path_len)
-                .and_then(raw_query_name)
+                .get_mut(path_at..path_at + path_len)
+                .and_then(proto::upload::raw_query_name)
+                .map(|s| &*s)
                 .unwrap_or(b"book");
             let name = sanitized_name(client_name);
             let label = crate::upload::readable_filename(client_name);
+            let identity_hash = crate::upload::hash_identity(client_name);
+
+            let begin = UploadBegin {
+                name,
+                delete: false,
+                in_books: true,
+                label,
+                identity_hash,
+            };
 
             if !session_started {
                 STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
@@ -389,8 +402,7 @@ async fn upload_server(
                 request_buf,
                 leftover_range,
                 content_length,
-                name,
-                label,
+                begin,
                 &mut pool,
             )
             .await;
@@ -419,20 +431,12 @@ async fn stream_book(
     request_buf: &[u8],
     leftover: core::ops::Range<usize>,
     content_length: usize,
-    name: crate::upload::UploadName,
-    label: crate::upload::UploadLabel,
+    begin: UploadBegin,
     pool: &mut heapless::Vec<&'static mut [u8], 2>,
 ) -> bool {
-    esp_println::println!("upload: '{}' {} bytes", name, content_length);
+    esp_println::println!("upload: '{}' {} bytes", begin.name, content_length);
     crate::upload::UPLOAD_IN_FLIGHT.store(true, portable_atomic::Ordering::SeqCst);
-    UPLOAD_BEGINS
-        .send(UploadBegin {
-            name,
-            delete: false,
-            in_books: true,
-            label,
-        })
-        .await;
+    UPLOAD_BEGINS.send(begin).await;
 
     let mut leftover = &request_buf[leftover];
     if leftover.len() > content_length {
@@ -691,18 +695,6 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
         .await;
     send_event(SyncEvent::CredentialsSaved(ssid));
     true
-}
-
-fn window_contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Raw (undecoded) `name=` value from a path's query string.
-fn raw_query_name(path: &[u8]) -> Option<&[u8]> {
-    let query_at = path.iter().position(|byte| *byte == b'?')? + 1;
-    path[query_at..]
-        .split(|byte| *byte == b'&')
-        .find_map(|pair| pair.strip_prefix(b"name="))
 }
 
 /// Accepts an existing 8.3 catalog open-name verbatim: short, printable
