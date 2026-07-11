@@ -15,24 +15,23 @@ thousands of "cannot find `Some` in this scope" errors.
 HOST="$(rustc -vV | sed -n 's/^host: //p')"   # aarch64-apple-darwin on an Apple-silicon Mac
 ```
 
-CI passes the same thing as `$HOST_TARGET` (`x86_64-unknown-linux-gnu`).
+CI passes the same thing as `$HOST_TARGET` (`x86_64-unknown-linux-gnu`). Alternatively,
+use the `tools/check.sh` script which automatically determines your host target.
 
 ## Format and lint
 
 ```sh
-cargo fmt --all
-cargo clippy -p app-core -p display -p ui -p proto --all-targets --target "$HOST" -- -D warnings
-tools/cargo.sh clippy -p fw -- -D warnings
-tools/cargo.sh clippy -p fw --features device-x3 -- -D warnings
+tools/check.sh fmt
+tools/check.sh clippy-host
+tools/check.sh clippy-firmware
 ```
 
 The host clippy set is exactly CI's `--workspace --exclude hal-ext --exclude fw`.
-The firmware runs lint `hal-ext` and the shared crates on the RISC-V target as a
-side effect of `-p fw`, and the `device-x3` run is what catches breakage in
-board-gated panel and geometry code — always run both boards.
+The firmware clippy runs lint on `hal-ext` and the shared crates on the RISC-V target as a
+side effect of compiling the firmware.
 
-`cargo fmt --all` and `cargo clippy --workspace` only reach the six root-workspace
-crates. `tools/emulator`, `tools/preview`, and `tools/web-emulator` each declare
+`cargo fmt --all` and `cargo clippy --workspace` only reach the seven root-workspace
+crates (including `upload-store`). `tools/emulator`, `tools/preview`, and `tools/web-emulator` each declare
 their own `[workspace]`, sit outside CI's fmt and clippy jobs, and are not
 fmt-clean today. Match local style when editing them; do not run `cargo fmt`
 across those trees or you will bury the real change in reformatting noise.
@@ -43,17 +42,13 @@ X4 and X3 frames share `fixtures/golden/`; X3 files carry an `-x3` suffix. Check
 both boards:
 
 ```sh
-cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST" \
-  --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
-cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST" \
-  --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden
+tools/check.sh golden-frames
 ```
 
 When a frame changes on purpose, point `--dump` straight at the golden directory
 for each board — it names every file from the scenario stem plus the board
 suffix, and rewrites unchanged frames byte-for-byte, so `git diff` shows exactly
-the frames the change touched. Review those images, then re-run the two `--check`
-commands above.
+the frames the change touched. Review those images, then re-run `tools/check.sh golden-frames`.
 
 ```sh
 cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST" \
@@ -67,25 +62,14 @@ from `--dump`. Never hand-edit one or round-trip it through an image editor.
 `--present-dump` writes the panel-presented image instead of the framebuffer —
 useful when debugging refresh and ghosting, never a golden.
 
+Agents must not update goldens merely to make a test green; they must inspect the pixel changes and explain why they are intentional.
+
 ### Per-board target dirs when alternating boards
 
 Both boards share `tools/emulator/target`, and the `device-x3` feature flip
 recompiles `display` → `ui` → emulator (~2–6 s each way), so alternating X4/X3
-checks pay that rebuild on every switch. Give each board its own artifact
-cache with `--target-dir` and both directions stay warm:
-
-```sh
-alias golden-x4='cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST" \
-  --target-dir tools/emulator/target/x4 \
-  --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden'
-alias golden-x3='cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST" \
-  --target-dir tools/emulator/target/x3 \
-  --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden'
-```
-
-The same `--target-dir` split works for the `cargo test` reading-golden runs
-below. The per-board directories live under the emulator's own `target/`, so
-`cargo clean --manifest-path tools/emulator/Cargo.toml` still clears them.
+checks pay that rebuild on every switch. `tools/check.sh` already gives each board
+its own artifact cache with `--target-dir` so both directions stay warm.
 
 To eyeball a single scenario, pass a `.toml` file to `--scenario` and a `.png` to
 `--dump`; `--gui` needs `--features gui`.
@@ -93,18 +77,20 @@ To eyeball a single scenario, pass a `.toml` file to `--scenario` and a `.png` t
 ## Reading-page goldens
 
 Typography and reading-layout changes also need the reading-page goldens, which
-`--scenario` does not cover. **No CI job runs these** — the root `cargo test
---workspace` never reaches `tools/emulator`, and the golden-frames job only runs
-scenarios — so this check exists only if you run it.
+`--scenario` does not cover. These checks run in the CI `golden-frames` job alongside emulator unit tests. Check them locally:
 
 ```sh
-cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST" --test reading_golden
-cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST" --test reading_golden \
-  --no-default-features --features device-x3
+tools/check.sh test-emulator
 ```
 
-Regenerate after an intentional typography change by prefixing each with
-`REGEN_READING_GOLDEN=1`, then re-run both without it to confirm they pass.
+Regenerate after an intentional typography change by running:
+
+```sh
+REGEN_READING_GOLDEN=1 ./tools/check.sh test-emulator
+./tools/check.sh test-emulator
+```
+
+The second invocation verifies that the regenerated fixtures pass without regeneration enabled.
 
 ## Browser emulator
 

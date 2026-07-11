@@ -34,9 +34,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ inputs.release_tag || github.sha }}
+          persist-credentials: false
       - name: Install Rust (stable, wasm target)
         run: |
           rustup toolchain install stable --profile minimal
@@ -59,7 +60,7 @@ jobs:
               --pattern update.bin --pattern FWUPDX3.BIN --dir _site
           fi
           tools/verify_web_flasher.sh _site
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: _site
 
@@ -71,4 +72,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
