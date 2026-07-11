@@ -495,6 +495,16 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
     }
 }
 
+/// Collision-probe window: how many consecutive hash-tail slots an upload
+/// examines. Uploads always land inside this window (at its first empty
+/// slot), so scanning the whole window finds every surviving same-identity
+/// copy — the invariant that makes replacement sound. It holds for any size,
+/// but only if the window never shrinks once a release has placed books with
+/// it; widening is always safe. 16 tolerates a 15-book tail-collision
+/// cluster, far beyond what 4 base-36 hash digits make plausible, while
+/// keeping the per-upload probe cost and the obsolete-tail buffer small.
+const UPLOAD_PROBE_WINDOW: usize = 16;
+
 async fn write_one_book<
     D,
     T,
@@ -521,10 +531,15 @@ where
             };
     }
 
-    let mut obsolete_tails = heapless::Vec::<u32, 100>::new();
+    let mut obsolete_tails = heapless::Vec::<u32, UPLOAD_PROBE_WINDOW>::new();
     let mut first_empty_name = None;
 
-    for _ in 0..100 {
+    // Scan the whole window with no early exit: a deletion can open an empty
+    // slot in front of a surviving copy, so the first empty slot proves
+    // nothing about later ones. Cost per upload is UPLOAD_PROBE_WINDOW
+    // existence probes plus one identity read per occupied slot — noise next
+    // to streaming the book body.
+    for _ in 0..UPLOAD_PROBE_WINDOW {
         match books.open_file_in_dir(candidate_name.as_str(), Mode::ReadOnly) {
             Ok(existing_file) => {
                 drop(existing_file);
