@@ -12,6 +12,9 @@ env:
   # .cargo/config.toml's [build] default and rust-toolchain.toml.
   HOST_TARGET: x86_64-unknown-linux-gnu
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,72 +23,76 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Install Rust (stable, rustfmt)
         run: rustup toolchain install stable --profile minimal --component rustfmt
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+      - name: Check fmt
+        run: tools/check.sh fmt
 
   clippy-firmware:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Install Rust (stable, firmware target, clippy)
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup target add riscv32imc-unknown-none-elf --toolchain stable
-      - name: cargo clippy (firmware target, whole workspace)
-        run: cargo clippy --workspace -- -D warnings
+      - name: Check firmware clippy
+        run: tools/check.sh clippy-firmware
 
   clippy-host:
+    name: Lint Host Code
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Install Rust (stable, clippy)
         run: rustup toolchain install stable --profile minimal --component clippy
-      - name: cargo clippy (host target, host-testable crates)
-        run: >
-          cargo clippy --workspace --exclude hal-ext --exclude fw
-          --target "$HOST_TARGET" --all-targets -- -D warnings
+      - name: Check host clippy
+        run: tools/check.sh clippy-host
 
   test:
+    name: Test Host Code
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Install Rust (stable)
         run: rustup toolchain install stable --profile minimal
-      - name: cargo test (host-testable crates)
-        run: cargo test --workspace --exclude hal-ext --exclude fw --target "$HOST_TARGET"
+      - name: Test host
+        run: tools/check.sh test-host
 
   golden-frames:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Install Rust (stable)
         run: rustup toolchain install stable --profile minimal
-      - name: Check X4 emulator golden frames
-        run: cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
-      - name: Check X3 emulator golden frames
-        run: cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden
+      - name: Check golden frames
+        run: tools/check.sh golden-frames
       # tools/emulator is its own cargo workspace, so the root `cargo test
       # --workspace` never reaches it; without these the reading-page goldens
       # and the emulator unit tests run in no workflow at all.
-      - name: Test X4 emulator (reading goldens, unit tests)
-        run: cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features
-      - name: Test X3 emulator (reading goldens, unit tests)
-        run: cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features --features device-x3
+      - name: Test emulator (reading goldens, unit tests)
+        run: tools/check.sh test-emulator
 
   build-firmware:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Install Rust (stable, firmware target)
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add riscv32imc-unknown-none-elf --toolchain stable
-      - name: Build X4 firmware (release)
-        run: tools/cargo.sh build -p fw --release
-      - name: Build X3 firmware (release)
-        run: tools/cargo.sh build -p fw --release --features device-x3
+      - name: Build firmware (release)
+        run: tools/check.sh build-firmware

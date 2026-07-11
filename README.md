@@ -41,13 +41,13 @@ release-image tool:
 ```sh
 rustup target add riscv32imc-unknown-none-elf
 cargo install espflash
+./tools/install-hooks.sh                                        # optional: git hooks for local feedback
 ```
 
 ```sh
 tools/cargo.sh run -p fw --release                              # build, flash, serial monitor
-tools/cargo.sh test -p app-core -p proto --target aarch64-apple-darwin
-cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin \
-  --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
+tools/check.sh test-host                                        # host tests
+tools/check.sh golden-frames                                    # X4/X3 emulator goldens
 tools/bench/bench.py channel-stress --host                       # host bench
 ```
 
