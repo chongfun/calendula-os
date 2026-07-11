@@ -644,8 +644,11 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             let psk_text = text_in(&psk, psk.len());
             let mut temp = [0u8; join_qr::BUFFER_LEN];
             let mut out = [0u8; join_qr::BUFFER_LEN];
+            // 140 + 33 modules * 5 px + the 20 px quiet zone ends at
+            // y 325; the first caption baseline at 352 keeps its
+            // ascenders out of the cleared band.
             if let Some(qr) = join_qr::encode(psk_text, &mut temp, &mut out) {
-                draw_qr(fb, &qr, layout.heading_cx, 150, 5);
+                draw_qr(fb, &qr, layout.heading_cx, 140, 5);
             }
             let mut buf = [0u8; 48];
             let mut cursor = 0;
@@ -657,7 +660,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 literata_small(FontStyle::Regular),
                 text_in(&buf, cursor),
                 layout.heading_cx,
-                344,
+                352,
             );
             let mut buf = [0u8; 32];
             let mut cursor = 0;
@@ -668,14 +671,14 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 literata_small(FontStyle::Regular),
                 text_in(&buf, cursor),
                 layout.heading_cx,
-                376,
+                384,
             );
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "then enter your wi-fi in the page that opens \u{00b7} http://192.168.4.1",
                 layout.heading_cx,
-                408,
+                416,
             );
         }
         UiSyncStatus::Serving(ip) => {
@@ -709,7 +712,10 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 }
 
 /// Blits a QR symbol centered on `cx`, `scale` pixels per module, with
-/// the quiet zone cleared around it.
+/// the spec's four-module quiet zone cleared around it — regular QR
+/// needs the full four on every side (two is a Micro QR allowance), and
+/// marginal phone cameras punish anything less. Keep neighbors out of
+/// the cleared band.
 fn draw_qr(
     fb: &mut Framebuffer,
     qr: &qrcodegen_no_heap::QrCode<'_>,
@@ -721,7 +727,7 @@ fn draw_qr(
     let edge = size as i16 * scale;
     let left = (cx - edge / 2).max(0) as u16;
     let top = top.max(0) as u16;
-    let quiet = (scale * 2) as u16;
+    let quiet = (scale * 4) as u16;
     fill_rect(
         fb,
         Rect {
