@@ -617,7 +617,7 @@ async fn run_portal(
     // The PSK itself stays off the serial log; the screen is its only
     // channel.
     esp_println::println!("portal: up at 192.168.4.1 as {}", PORTAL_SSID);
-    send_event(SyncEvent::PortalUp(psk));
+    SYNC_EVENTS.send(SyncEvent::PortalUp(psk)).await;
 
     // Three servers share the task; Exit interrupts them with the reset.
     select(
