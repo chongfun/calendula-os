@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import bench
 
@@ -91,6 +92,63 @@ class BenchReportTests(unittest.TestCase):
             )
             warnings = bench.summarize_paths([path], None, validate_suites=True)
         self.assertEqual(warnings, ["storage-cache: no parsed bench telemetry"])
+
+
+class CaptureLinesTests(unittest.TestCase):
+    @patch("bench.serial_lines")
+    def test_initial_oserror_propagates(self, mock_serial) -> None:
+        import errno
+        def gen():
+            raise OSError(errno.ENOENT, "Not found")
+            yield
+        mock_serial.return_value = gen()
+        with self.assertRaises(OSError):
+            list(bench.capture_lines("/dev/port"))
+
+    @patch("bench.print")
+    @patch("bench.time.sleep")
+    @patch("bench.os.path.exists")
+    @patch("bench.serial_lines")
+    def test_reconnects_after_oserror(self, mock_serial, mock_exists, mock_sleep, mock_print) -> None:
+        import errno
+        from unittest.mock import call
+        def gen1():
+            yield ""
+            yield "data\n"
+            raise OSError(errno.ENODEV, "Vanished")
+        def gen2():
+            yield ""
+            yield "more data\n"
+        mock_serial.side_effect = [gen1(), gen2()]
+        mock_exists.side_effect = [False, True]
+        
+        lines = list(bench.capture_lines("/dev/port"))
+        
+        self.assertEqual(lines, ["data\n", "more data\n"])
+        mock_sleep.assert_has_calls([call(0.5), call(0.5)])
+        mock_print.assert_any_call("port: /dev/port vanished (device asleep?); wake it to resume capture", flush=True)
+        mock_print.assert_any_call("port: back; resuming capture", flush=True)
+
+    @patch("bench.print")
+    @patch("bench.time.sleep")
+    @patch("bench.time.monotonic")
+    @patch("bench.os.path.exists")
+    @patch("bench.serial_lines")
+    def test_stop_at_expiration_while_absent(self, mock_serial, mock_exists, mock_monotonic, mock_sleep, mock_print) -> None:
+        import errno
+        def gen():
+            yield ""
+            yield "data\n"
+            raise OSError(errno.ENODEV, "Vanished")
+        mock_serial.return_value = gen()
+        mock_exists.return_value = False
+        mock_monotonic.return_value = 100.0
+        
+        lines = list(bench.capture_lines("/dev/port", stop_at=50.0))
+        
+        self.assertEqual(lines, ["data\n"])
+        mock_print.assert_any_call("port: capture window ended while the device was away", flush=True)
+        mock_sleep.assert_not_called()
 
 
 if __name__ == "__main__":
