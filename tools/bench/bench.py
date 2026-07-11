@@ -292,19 +292,20 @@ def capture_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
             for line in serial_lines(port, stop_at=stop_at):
                 connected = True
                 yield line
-            return
         except OSError as err:
             if not connected or err.errno not in PORT_LOST_ERRNOS:
                 raise
-        print(f"port: {port} vanished (device asleep?); wake it to resume capture")
+        else:
+            return
+        print(f"port: {port} vanished (device asleep?); wake it to resume capture", flush=True)
         while not os.path.exists(port):
             if stop_at is not None and time.monotonic() >= stop_at:
-                print("port: capture window ended while the device was away")
+                print("port: capture window ended while the device was away", flush=True)
                 return
             time.sleep(0.5)
         # Let enumeration settle before reopening the fresh device node.
         time.sleep(0.5)
-        print("port: back; resuming capture")
+        print("port: back; resuming capture", flush=True)
 
 
 def serial_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
