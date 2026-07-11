@@ -199,6 +199,16 @@ pub fn percent_decode_in_place(bytes: &mut [u8]) -> usize {
     write
 }
 
+/// Returns true if the exact query parameter is present in the path's query string.
+pub fn has_query_param(path: &[u8], param: &[u8]) -> bool {
+    let Some(query_at) = path.iter().position(|byte| *byte == b'?') else {
+        return false;
+    };
+    path[query_at + 1..]
+        .split(|byte| *byte == b'&')
+        .any(|pair| pair == param)
+}
+
 /// Percent-decoded `name=` value from a path's query string.
 pub fn raw_query_name(path: &mut [u8]) -> Option<&mut [u8]> {
     let query_at = path.iter().position(|byte| *byte == b'?')? + 1;
@@ -347,5 +357,18 @@ mod tests {
 
         let mut buf4 = b"?name=&other=1".to_vec();
         assert!(raw_query_name(&mut buf4).is_none());
+    }
+
+    #[test]
+    fn test_has_query_param() {
+        assert!(has_query_param(b"?root=1", b"root=1"));
+        assert!(has_query_param(b"?name=book.epu&root=1", b"root=1"));
+        assert!(has_query_param(b"?root=1&name=book.epu", b"root=1"));
+
+        // Encoded or embedded strings must not trigger the param
+        assert!(!has_query_param(b"?name=root%3D1.epu", b"root=1"));
+        assert!(!has_query_param(b"?name=root=1.epu", b"root=1"));
+        assert!(!has_query_param(b"?root=2", b"root=1"));
+        assert!(!has_query_param(b"/delete", b"root=1"));
     }
 }

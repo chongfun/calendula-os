@@ -341,14 +341,14 @@ async fn upload_server(
             let _ = write_http_response(&mut socket, "200 OK", listing).await;
         } else if is_delete {
             let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
+            let in_books = path_bytes
+                .as_ref()
+                .map(|p| !proto::upload::has_query_param(p, b"root=1"))
+                .unwrap_or(true);
             let name = path_bytes
                 .as_mut()
                 .and_then(|p| proto::upload::raw_query_name(p))
                 .and_then(|decoded| valid_short_name(decoded));
-            let in_books = path_bytes
-                .as_ref()
-                .map(|p| !window_contains(p, b"root=1"))
-                .unwrap_or(true);
             let ok = match name {
                 Some(name) => {
                     if !session_started {
@@ -695,10 +695,6 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
         .await;
     send_event(SyncEvent::CredentialsSaved(ssid));
     true
-}
-
-fn window_contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Accepts an existing 8.3 catalog open-name verbatim: short, printable
