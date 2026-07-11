@@ -46,7 +46,7 @@ const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
 /// it.
 const PSK_ALPHABET: &[u8] = app_core::PSK_ALPHABET;
 
-// mint_portal_psk's 6-bit draws can only reach indexes 0..64; a longer
+// mint_portal_psk's 6-bit draws can only reach indexes 0..=63; a longer
 // alphabet would silently leave its tail characters unmintable.
 const _: () = assert!(PSK_ALPHABET.len() <= 64);
 
