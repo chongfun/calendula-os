@@ -287,25 +287,35 @@ def capture_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
     still fails fast, so a mistyped --port errors immediately.
     """
     connected = False
+    reconnecting = False
     while True:
+        if reconnecting:
+            if stop_at is not None and time.monotonic() >= stop_at:
+                print("port: capture window ended while the device was away", flush=True)
+                return
+            if not os.path.exists(port):
+                time.sleep(0.5)
+                continue
+            # Let enumeration settle before reopening the fresh device node.
+            time.sleep(0.5)
+
         try:
             for line in serial_lines(port, stop_at=stop_at):
+                if line == "":
+                    if reconnecting:
+                        print("port: back; resuming capture", flush=True)
+                        reconnecting = False
+                    continue
                 connected = True
                 yield line
         except OSError as err:
             if not connected or err.errno not in PORT_LOST_ERRNOS:
                 raise
+            if not reconnecting:
+                print(f"port: {port} vanished (device asleep?); wake it to resume capture", flush=True)
+                reconnecting = True
         else:
             return
-        print(f"port: {port} vanished (device asleep?); wake it to resume capture", flush=True)
-        while not os.path.exists(port):
-            if stop_at is not None and time.monotonic() >= stop_at:
-                print("port: capture window ended while the device was away", flush=True)
-                return
-            time.sleep(0.5)
-        # Let enumeration settle before reopening the fresh device node.
-        time.sleep(0.5)
-        print("port: back; resuming capture", flush=True)
 
 
 def serial_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
@@ -321,6 +331,7 @@ def serial_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
         fcntl.ioctl(fd, termios.TIOCMBIS, struct.pack("i", termios.TIOCM_DTR))
         fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack("i", termios.TIOCM_RTS))
+        yield ""
         buf = b""
         while True:
             timeout = 0.2
@@ -334,7 +345,7 @@ def serial_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
                 continue
             chunk = os.read(fd, 4096)
             if not chunk:
-                continue
+                raise OSError(errno.EIO, "EOF on serial port")
             buf += chunk
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
