@@ -185,8 +185,9 @@ RAM, nothing secret lives in the repo or is extractable from a release
 binary. It rides `SyncEvent::PortalUp` to the Wireless screen, which
 encodes the join QR at render time (`ui/src/join_qr.rs`, Nayuki's
 no-heap qrcodegen) and prints the password beside it for phones that
-cannot scan; the on-screen QR is the PSK's only channel, so QR and
-beacon cannot drift. Submitted credentials travel to the display
+cannot scan; the display is the PSK's only channel (supporting both
+QR scanning and manual password entry), so the on-screen credentials
+and beacon cannot drift. Submitted credentials travel to the display
 task as a `StoreWifiCredentials` Copy message, land in WIFI.BIN, and the
 next session joins as a station. `proto::captive` holds the sans-IO
 DHCP/DNS/HTTP codecs under host tests; the wifi task only owns sockets.

@@ -490,9 +490,17 @@ impl WifiSsid {
 /// carries it, so nothing secret lives in the repo or the release binary.
 /// Always exactly [`PortalPsk::LEN`] ASCII characters from
 /// [`PSK_ALPHABET`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PortalPsk {
     bytes: [u8; PortalPsk::LEN],
+}
+
+impl core::fmt::Debug for PortalPsk {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PortalPsk")
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Alphabet for the per-session portal PSK: ASCII alphanumerics minus
@@ -502,6 +510,15 @@ pub struct PortalPsk {
 /// firmware's minting code so [`PortalPsk::EMULATOR_DEMO`] is
 /// host-testable against it.
 pub const PSK_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
+
+/// Error returned when constructing a [`PortalPsk`] from invalid bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PskError {
+    /// One or more bytes are not in [`PSK_ALPHABET`].
+    InvalidCharacter,
+    /// The bytes are not valid UTF-8.
+    InvalidUtf8,
+}
 
 impl PortalPsk {
     pub const LEN: usize = 16;
@@ -514,12 +531,27 @@ impl PortalPsk {
         bytes: *b"emudemqpsk234567",
     };
 
-    pub const fn new(bytes: [u8; Self::LEN]) -> Self {
-        Self { bytes }
+    /// Constructs a PSK after validating every byte against [`PSK_ALPHABET`]
+    /// and ensuring valid UTF-8. Returns [`PskError`] if any byte is invalid.
+    pub fn new(bytes: [u8; Self::LEN]) -> Result<Self, PskError> {
+        // Validate UTF-8
+        if core::str::from_utf8(&bytes).is_err() {
+            return Err(PskError::InvalidUtf8);
+        }
+        // Validate every byte is in PSK_ALPHABET
+        for &byte in &bytes {
+            if !PSK_ALPHABET.contains(&byte) {
+                return Err(PskError::InvalidCharacter);
+            }
+        }
+        Ok(Self { bytes })
     }
 
+    /// Returns the PSK as a string slice. This is infallible because
+    /// construction validates UTF-8.
     pub fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.bytes).unwrap_or("")
+        // SAFETY: `new` validates UTF-8, so this cannot fail.
+        unsafe { core::str::from_utf8_unchecked(&self.bytes) }
     }
 
     pub const fn bytes(&self) -> [u8; Self::LEN] {

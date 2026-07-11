@@ -65,7 +65,9 @@ fn mint_portal_psk(rng: Rng) -> app_core::PortalPsk {
             }
         }
     }
-    app_core::PortalPsk::new(bytes)
+    // SAFETY: Every byte is drawn from PSK_ALPHABET, which contains only
+    // valid ASCII characters, so validation cannot fail.
+    app_core::PortalPsk::new(bytes).expect("minted PSK must be valid")
 }
 
 /// Compile-time station credentials for the dev phase:
