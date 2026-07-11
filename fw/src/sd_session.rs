@@ -513,18 +513,18 @@ where
     // The probe/sidecar/replace state machine lives in upload-store (where
     // the host fault-injection tests exercise it); this shell owns only the
     // chunk streaming between begin and commit/abort.
-    let begun = upload_store::Transaction::begin(
+    let begun = upload_store::PendingUpload::begin(
         root,
         books,
         &begin.name,
         begin.identity_hash,
         begin.label.as_str(),
     );
-    let Ok((transaction, file)) = begun else {
+    let Ok(pending) = begun else {
         drain_until_end().await;
         return None;
     };
-    let malformed = transaction.skipped_malformed_sidecars();
+    let malformed = pending.skipped_malformed_sidecars();
     if malformed > 0 {
         esp_println::println!(
             "upload: {} malformed identity sidecar(s) treated as absent",
@@ -537,7 +537,10 @@ where
         let chunk = UPLOAD_CHUNKS.receive().await;
         if !failed && !chunk.abort {
             if let Some(buffer) = &chunk.buffer {
-                if file.write(&buffer[..chunk.len.min(buffer.len())]).is_err() {
+                if pending
+                    .write(&buffer[..chunk.len.min(buffer.len())])
+                    .is_err()
+                {
                     failed = true;
                 }
             }
@@ -550,12 +553,12 @@ where
         }
     }
     if failed || aborted {
-        transaction.abort(file, root, books);
+        pending.abort(root, books);
         return None;
     }
     // commit closes the file and retires the replaced copies only if the
     // close succeeded; a failed close discards the target and returns None.
-    transaction.commit(file, root, books)
+    pending.commit(root, books)
 }
 
 /// Consumes one file's worth of chunks without a file to write into.

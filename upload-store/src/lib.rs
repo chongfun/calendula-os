@@ -8,12 +8,13 @@
 //! dependencies, so the host test suite can drive it against an in-memory
 //! FAT card with injected faults (see `tests/transaction.rs`).
 //!
-//! The invariant the [`Transaction`] shape enforces: incoming data always
+//! The invariant the [`PendingUpload`] shape enforces: incoming data always
 //! streams into an *empty* slot, never over the existing book.
 //! embedded-sdmmc has no rename, so replacing in place would truncate the old
 //! copy before the new one is known good; instead the old copy is deleted
-//! only in [`Transaction::commit`], and any failure path ([`Transaction::abort`],
-//! or an error inside [`Transaction::begin`]) removes only the new slot's
+//! only in [`PendingUpload::commit`] — after the target's close proves it
+//! durable — and any failure path ([`PendingUpload::abort`], a failed close,
+//! or an error inside [`PendingUpload::begin`]) removes only the new slot's
 //! artifacts.
 
 #![no_std]
@@ -344,50 +345,60 @@ pub fn delete_upload_sidecars<
     let _ = labels.delete_file_in_dir(file_name.as_str());
 }
 
-/// One in-flight book write. Created by [`Transaction::begin`], which hands
-/// back the open target [`File`]; the caller streams the body into it and
-/// then hands it back to exactly one of [`Transaction::commit`] (data landed
-/// whole) or [`Transaction::abort`] (write error or client abort). Both
-/// consume the file, so the target can neither be committed while still open
-/// nor left open to make abort's deletion fail; `commit` closes it first and
-/// retires prior copies only after the close succeeds.
+/// One in-flight book write. Created by [`PendingUpload::begin`]; the caller
+/// streams the body with [`PendingUpload::write`] and then calls exactly one
+/// of [`PendingUpload::commit`] (data landed whole) or
+/// [`PendingUpload::abort`] (write error or client abort). The staged target
+/// [`File`] is owned privately, so it can neither be committed while still
+/// open, substituted for another handle, nor left open to make abort's
+/// deletion fail; `commit` closes it first and retires prior copies only
+/// after the close succeeds.
 ///
 /// Until a successful `commit` close, every prior copy of the book — and its
 /// sidecars — is left untouched, so no failure between `begin` and `commit`
-/// can cost the previously valid copy.
-pub struct Transaction {
+/// can cost the previously valid copy. Dropping a `PendingUpload` without
+/// committing closes the target via the [`File`] drop but leaves it staged;
+/// its valid identity sidecar means the next re-upload of the same book
+/// retires it like any other surviving copy.
+pub struct PendingUpload<
+    'b,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+> where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     prefix: String<4>,
     target: UploadName,
     obsolete_tails: heapless::Vec<u32, UPLOAD_PROBE_WINDOW>,
     skipped_malformed_sidecars: usize,
+    file: File<'b, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
 }
 
-impl Transaction {
+impl<'b, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    PendingUpload<'b, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     /// Probe the slot chain for `name`, stage the sidecars for a free slot,
     /// and open that slot's file for writing.
     ///
     /// `Err` means nothing usable was staged (any partially staged sidecars
-    /// are removed) and no existing book was touched: I/O error while
-    /// probing, no free slot in the window, or a sidecar/open failure.
+    /// are removed) and no existing book was touched: a malformed `name`,
+    /// I/O error while probing, no free slot in the window, or a
+    /// sidecar/open failure.
     #[allow(clippy::result_unit_err)]
-    pub fn begin<
-        'b,
-        D,
-        T,
-        const MAX_DIRS: usize,
-        const MAX_FILES: usize,
-        const MAX_VOLUMES: usize,
-    >(
+    pub fn begin(
         root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         books: &'b Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         name: &UploadName,
         identity_hash: u64,
         label: &str,
-    ) -> Result<(Self, File<'b, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>), ()>
-    where
-        D: embedded_sdmmc::BlockDevice,
-        T: TimeSource,
-    {
+    ) -> Result<Self, ()> {
         let Some((prefix, mut tail)) = parse_upload_name(name) else {
             return Err(());
         };
@@ -475,18 +486,21 @@ impl Transaction {
             return Err(());
         };
 
-        Ok((
-            Transaction {
-                prefix,
-                target,
-                obsolete_tails,
-                skipped_malformed_sidecars,
-            },
+        Ok(PendingUpload {
+            prefix,
+            target,
+            obsolete_tails,
+            skipped_malformed_sidecars,
             file,
-        ))
+        })
     }
 
-    /// The slot this transaction streams into.
+    /// Append body bytes to the staged target file.
+    pub fn write(&self, data: &[u8]) -> Result<(), embedded_sdmmc::Error<D::Error>> {
+        self.file.write(data)
+    }
+
+    /// The slot this upload streams into.
     pub fn target(&self) -> &UploadName {
         &self.target
     }
@@ -503,38 +517,29 @@ impl Transaction {
     /// with its sidecars. Prior copies were never touched. Sidecars go only
     /// if the file itself went, so a failed delete stays identity-matched
     /// and gets retried by the next re-upload.
-    pub fn abort<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    pub fn abort(
         self,
-        file: File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    ) where
-        D: embedded_sdmmc::BlockDevice,
-        T: TimeSource,
-    {
-        let _ = file.close();
+    ) {
+        let _ = self.file.close();
         discard_target(root, books, self.target.as_str());
     }
 
     /// The body streamed without error: close the target file, and only if
     /// the close succeeds — the new copy's metadata is durably on the card —
     /// retire the replaced copies and return the target name. A failed close
-    /// discards the target like [`Transaction::abort`] and returns `None`,
+    /// discards the target like [`PendingUpload::abort`] and returns `None`,
     /// leaving every prior copy intact. Sidecars go only if the file itself
     /// went, so a failed delete stays identity-matched and gets retried by
     /// the next re-upload.
     #[must_use = "a None commit means the upload failed and the target was discarded"]
-    pub fn commit<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    pub fn commit(
         self,
-        file: File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    ) -> Option<UploadName>
-    where
-        D: embedded_sdmmc::BlockDevice,
-        T: TimeSource,
-    {
-        if file.close().is_err() {
+    ) -> Option<UploadName> {
+        if self.file.close().is_err() {
             discard_target(root, books, self.target.as_str());
             return None;
         }

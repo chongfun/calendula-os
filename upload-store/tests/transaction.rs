@@ -14,7 +14,7 @@ use embedded_sdmmc::{
     VolumeManager,
 };
 use proto::upload::UploadName;
-use upload_store::Transaction;
+use upload_store::PendingUpload;
 
 const BLOCK_BYTES: usize = 512;
 /// 16 MiB card: big enough that fatfs picks FAT16 and small enough to stay fast.
@@ -201,13 +201,10 @@ fn upload(
     identity: u64,
     body: &[u8],
 ) -> UploadName {
-    let (transaction, file) =
-        Transaction::begin(root, books, &name(begin_name), identity, "label.epub")
-            .expect("begin upload");
-    file.write(body).expect("write body");
-    transaction
-        .commit(file, root, books)
-        .expect("commit upload")
+    let pending = PendingUpload::begin(root, books, &name(begin_name), identity, "label.epub")
+        .expect("begin upload");
+    pending.write(body).expect("write body");
+    pending.commit(root, books).expect("commit upload")
 }
 
 fn read_book(books: &Dir<'_>, book_name: &str) -> Vec<u8> {
@@ -250,12 +247,13 @@ fn close_write_cost() -> u32 {
     let mgr = open_mgr(&disk);
     let (root, books) = open_dirs(&mgr);
     upload(&root, &books, "BOOK0000.EPU", 0xAAAA, b"old body");
-    let (_transaction, file) =
-        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
-            .expect("begin");
-    file.write(b"new body").expect("stream");
+    // A different identity, so the probe finds nothing to retire and
+    // commit's writes are exactly the internal close's writes.
+    let pending = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xBBBB, "label.epub")
+        .expect("begin");
+    pending.write(b"new body").expect("stream");
     let before = disk.writes.get();
-    file.close().expect("close");
+    assert!(pending.commit(&root, &books).is_some());
     disk.writes.get() - before
 }
 
@@ -291,15 +289,16 @@ fn reupload_replaces_only_after_success_and_old_survives_mid_stream() {
     let (root, books) = open_dirs(&mgr);
     upload(&root, &books, "BOOK0000.EPU", 0xAAAA, b"old body");
 
-    let (transaction, file) =
-        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
-            .expect("begin re-upload");
+    let pending = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
+        .expect("begin re-upload");
     // Mid-stream: the new data goes to a different slot and the old copy is
     // still whole on the card.
-    assert_ne!(transaction.target().as_str(), "BOOK0000.EPU");
-    file.write(b"new body, longer than before").expect("stream");
+    assert_ne!(pending.target().as_str(), "BOOK0000.EPU");
+    pending
+        .write(b"new body, longer than before")
+        .expect("stream");
     assert_eq!(read_book(&books, "BOOK0000.EPU"), b"old body");
-    let landed = transaction.commit(file, &root, &books).expect("commit");
+    let landed = pending.commit(&root, &books).expect("commit");
 
     // Committed: exactly one copy, the new one, identity intact.
     assert_eq!(book_names(&books), vec![landed.as_str().to_string()]);
@@ -318,11 +317,10 @@ fn client_abort_preserves_the_old_copy_and_leaves_no_debris() {
     let (root, books) = open_dirs(&mgr);
     upload(&root, &books, "BOOK0000.EPU", 0xAAAA, b"old body");
 
-    let (transaction, file) =
-        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
-            .expect("begin re-upload");
-    file.write(b"partial ne").expect("partial stream");
-    transaction.abort(file, &root, &books);
+    let pending = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
+        .expect("begin re-upload");
+    pending.write(b"partial ne").expect("partial stream");
+    pending.abort(&root, &books);
 
     assert_eq!(book_names(&books), vec!["BOOK0000.EPU"]);
     assert_eq!(read_book(&books, "BOOK0000.EPU"), b"old body");
@@ -338,16 +336,18 @@ fn sd_write_fault_mid_stream_preserves_the_old_copy() {
     let (root, books) = open_dirs(&mgr);
     upload(&root, &books, "BOOK0000.EPU", 0xAAAA, b"old body");
 
-    let (transaction, file) =
-        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
-            .expect("begin re-upload");
+    let pending = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
+        .expect("begin re-upload");
     // Stream enough that writes hit the device, then fail the next one —
     // the same shape as an SD card dropping out mid-body.
     let big = vec![0x5A_u8; 4096];
-    file.write(&big).expect("first chunk");
+    pending.write(&big).expect("first chunk");
     disk.fault.fail_write_in.set(Some(0));
-    assert!(file.write(&big).is_err(), "the injected fault must surface");
-    transaction.abort(file, &root, &books);
+    assert!(
+        pending.write(&big).is_err(),
+        "the injected fault must surface"
+    );
+    pending.abort(&root, &books);
 
     // Reopen fresh (as after a power cycle): only the old copy remains.
     drop((root, books));
@@ -368,7 +368,7 @@ fn sidecar_write_fault_during_begin_stages_nothing() {
 
     // Fail the very next device write: the identity sidecar staging.
     disk.fault.fail_write_in.set(Some(0));
-    let begun = Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub");
+    let begun = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub");
     assert!(begun.is_err(), "begin must refuse after a sidecar fault");
 
     assert_eq!(book_names(&books), vec!["BOOK0000.EPU"]);
@@ -387,7 +387,7 @@ fn probe_read_fault_aborts_before_touching_anything() {
     let before = disk.data.borrow().clone();
 
     disk.fault.fail_read_in.set(Some(0));
-    let begun = Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub");
+    let begun = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub");
     assert!(begun.is_err(), "begin must refuse after a probe fault");
     assert_eq!(*disk.data.borrow(), before, "no block was written");
 }
@@ -399,15 +399,14 @@ fn retire_fault_during_commit_keeps_the_old_copy_identity_matched() {
     let (root, books) = open_dirs(&mgr);
     upload(&root, &books, "BOOK0000.EPU", 0xAAAA, b"old body");
 
-    let (transaction, file) =
-        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
-            .expect("begin re-upload");
-    file.write(b"new body").expect("stream");
+    let pending = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
+        .expect("begin re-upload");
+    pending.write(b"new body").expect("stream");
     // Fail the delete of the replaced copy inside commit, skipping the
     // write that commit's internal close performs first (measured by
     // close_write_cost below).
     disk.fault.fail_write_in.set(Some(close_write_cost()));
-    let landed = transaction.commit(file, &root, &books).expect("commit");
+    let landed = pending.commit(&root, &books).expect("commit");
     let landed = landed.as_str().to_string();
 
     // Assert against the device, not this session: embedded-sdmmc's block
@@ -508,12 +507,11 @@ fn malformed_identity_sidecar_is_skipped_not_fatal() {
     sidecar.close().expect("close sidecar");
     assert_eq!(identity_of(&root, "BOOK0000.EPU"), None);
 
-    let (transaction, file) =
-        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
-            .expect("begin must proceed past the malformed sidecar");
-    assert_eq!(transaction.skipped_malformed_sidecars(), 1);
-    file.write(b"new body").expect("stream");
-    let landed = transaction.commit(file, &root, &books).expect("commit");
+    let pending = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
+        .expect("begin must proceed past the malformed sidecar");
+    assert_eq!(pending.skipped_malformed_sidecars(), 1);
+    pending.write(b"new body").expect("stream");
+    let landed = pending.commit(&root, &books).expect("commit");
 
     // The unmatched old copy survives as a visible duplicate — the accepted
     // worst case — and the new copy carries a valid identity.
@@ -534,15 +532,14 @@ fn close_fault_during_commit_discards_target_and_keeps_old() {
     let (root, books) = open_dirs(&mgr);
     upload(&root, &books, "BOOK0000.EPU", 0xAAAA, b"old body");
 
-    let (transaction, file) =
-        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
-            .expect("begin re-upload");
-    file.write(b"new body").expect("stream");
+    let pending = PendingUpload::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
+        .expect("begin re-upload");
+    pending.write(b"new body").expect("stream");
     // Fail commit's internal close: the new copy's metadata never lands,
     // so commit must discard the target and leave the old copy alone.
     disk.fault.fail_write_in.set(Some(0));
     assert!(
-        transaction.commit(file, &root, &books).is_none(),
+        pending.commit(&root, &books).is_none(),
         "commit must report failure when the close fails"
     );
 
@@ -574,7 +571,7 @@ fn invalid_upload_names_are_rejected_without_touching_the_card() {
         "BOOK0000.TXT",
     ] {
         assert!(
-            Transaction::begin(&root, &books, &name(bad), 0xAAAA, "label.epub").is_err(),
+            PendingUpload::begin(&root, &books, &name(bad), 0xAAAA, "label.epub").is_err(),
             "{bad:?} must be rejected"
         );
     }
