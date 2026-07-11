@@ -1,5 +1,5 @@
 use crate::display_flush::Epd;
-use crate::upload::{UploadBegin, UploadChunk};
+use crate::upload::{UploadBegin, UploadChunk, UploadName};
 use crate::{UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS};
 use core::sync::atomic::{AtomicU8, Ordering};
 use embedded_hal::delay::DelayNs;
@@ -478,22 +478,12 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
             } else {
                 root.delete_file_in_dir(begin.name.as_str()).is_ok()
             };
-            if removed {
-                crate::reader_cache_files::delete_upload_label(&root, begin.name.as_str());
+            if removed && begin.in_books {
+                crate::reader_cache_files::delete_upload_sidecars(&root, begin.name.as_str());
             }
             removed
         } else {
-            let written = write_one_book(&books, &begin).await;
-            // Stash the readable filename so the Library can label the book
-            // before it is ever opened; the 8.3 name on the card can't carry it.
-            if written && !begin.label.is_empty() {
-                crate::reader_cache_files::write_upload_label(
-                    &root,
-                    begin.name.as_str(),
-                    begin.label.as_str(),
-                );
-            }
-            written
+            write_one_book(&root, &books, &begin).await.is_some()
         };
         esp_println::println!(
             "upload: '{}' {} ok={}",
@@ -512,17 +502,114 @@ async fn write_one_book<
     const MAX_FILES: usize,
     const MAX_VOLUMES: usize,
 >(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     begin: &UploadBegin,
-) -> bool
+) -> Option<UploadName>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(file) = books.open_file_in_dir(begin.name.as_str(), Mode::ReadWriteCreateOrTruncate)
-    else {
+    let mut candidate_name = begin.name.clone();
+    let mut tail = 0u32;
+    for c in candidate_name.as_str()[4..8].chars() {
+        tail = tail * 36
+            + match c {
+                '0'..='9' => (c as u8 - b'0') as u32,
+                'A'..='Z' => (c as u8 - b'A' + 10) as u32,
+                _ => 0,
+            };
+    }
+
+    let mut obsolete_tails = heapless::Vec::<u32, 100>::new();
+    let mut first_empty_name = None;
+
+    for _ in 0..100 {
+        match books.open_file_in_dir(candidate_name.as_str(), Mode::ReadOnly) {
+            Ok(existing_file) => {
+                drop(existing_file);
+
+                // Read the existing stashed identity to compare exact logical filename
+                match crate::reader_cache_files::read_upload_identity(root, candidate_name.as_str())
+                {
+                    Ok(Some(existing_identity)) => {
+                        if existing_identity == begin.identity_hash {
+                            // Same logical filename; the old copy is replaced
+                            // only after the new data lands whole in an empty
+                            // slot, so a failed transfer never costs it.
+                            let _ = obsolete_tails.push(tail);
+                        }
+                    }
+                    Ok(None) => {
+                        // Valid read, but no identity found. It's a different file.
+                    }
+                    Err(_) => {
+                        // I/O error reading the identity sidecar. Abort.
+                        drain_until_end().await;
+                        return None;
+                    }
+                }
+            }
+            Err(embedded_sdmmc::Error::NotFound) => {
+                // No existing file. Remember the first empty slot we find.
+                if first_empty_name.is_none() {
+                    first_empty_name = Some(candidate_name.clone());
+                }
+            }
+            Err(_) => {
+                // I/O error checking if the file exists. Abort.
+                drain_until_end().await;
+                return None;
+            }
+        }
+
+        // Genuinely different filename (or manually-copied file).
+        // Increment the suffix and try the next candidate.
+        tail = (tail + 1) % 36u32.pow(4);
+        let digits = crate::upload::base36_tail(tail);
+        let mut new_name = UploadName::new();
+        let _ = new_name.push_str(&begin.name.as_str()[0..4]);
+        for digit in digits {
+            let _ = new_name.push(digit as char);
+        }
+        let _ = new_name.push_str(".EPU");
+        candidate_name = new_name;
+    }
+
+    // The data always streams into an empty slot, never over the existing
+    // book: embedded-sdmmc has no rename, so replacing in place would
+    // truncate the old copy before the new one is known good. The old book
+    // (if any) is deleted only after the write completes.
+    let target_name = first_empty_name;
+    let mut file_to_write = None;
+
+    if let Some(name) = target_name.as_ref() {
+        // Write sidecars before creating the book data
+        let sidecars_ok = crate::reader_cache_files::write_upload_label(
+            root,
+            name.as_str(),
+            begin.label.as_str(),
+        ) && crate::reader_cache_files::write_upload_identity(
+            root,
+            name.as_str(),
+            begin.identity_hash,
+        );
+
+        if sidecars_ok {
+            if let Ok(file) = books.open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
+            {
+                file_to_write = Some(file);
+            }
+        }
+        if file_to_write.is_none() {
+            // Don't leave sidecars for a slot that never got its book.
+            crate::reader_cache_files::delete_upload_sidecars(root, name.as_str());
+        }
+    }
+
+    let Some(file) = file_to_write else {
         drain_until_end().await;
-        return false;
+        return None;
     };
     let mut failed = false;
     let mut aborted = false;
@@ -542,12 +629,35 @@ where
             break;
         }
     }
-    drop(file);
-    if failed || aborted {
-        let _ = books.delete_file_in_dir(begin.name.as_str());
-        return false;
+    if file.close().is_err() {
+        failed = true;
     }
-    true
+    if failed || aborted {
+        if let Some(name) = target_name.as_ref() {
+            if books.delete_file_in_dir(name.as_str()).is_ok() {
+                crate::reader_cache_files::delete_upload_sidecars(root, name.as_str());
+            }
+        }
+        return None;
+    }
+    // The new copy is whole; retire the replaced books. Sidecars go only if
+    // the file itself went, so a failed delete stays identity-matched and
+    // gets retried by the next re-upload.
+    for obsolete_tail in obsolete_tails {
+        let digits = crate::upload::base36_tail(obsolete_tail);
+        let mut old = UploadName::new();
+        let _ = old.push_str(&begin.name.as_str()[0..4]);
+        for digit in digits {
+            let _ = old.push(digit as char);
+        }
+        let _ = old.push_str(".EPU");
+
+        if books.delete_file_in_dir(old.as_str()).is_ok() {
+            crate::reader_cache_files::delete_upload_sidecars(root, old.as_str());
+        }
+    }
+
+    target_name
 }
 
 /// Consumes one file's worth of chunks without a file to write into.

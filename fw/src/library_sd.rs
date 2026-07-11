@@ -428,13 +428,24 @@ where
     T: TimeSource,
 {
     let key = proto::cache::cache_key_for(decoded.display_name.as_str(), decoded.byte_size);
+    let mut raw_name = String::<64>::new();
     if crate::reader_cache_files::read_cached_book_title(
         root,
         key.as_str(),
         (decoded.source_hash, decoded.byte_size),
         title,
-    ) || crate::reader_cache_files::read_upload_label(root, decoded.open_name.as_str(), title)
-    {
+    ) {
+        Some(title.as_str())
+    } else if crate::reader_cache_files::read_upload_label(
+        root,
+        decoded.open_name.as_str(),
+        &mut raw_name,
+    ) {
+        crate::reader_store::derive_catalog_label(
+            raw_name.as_str(),
+            decoded.open_name.as_str(),
+            title,
+        );
         Some(title.as_str())
     } else {
         None
