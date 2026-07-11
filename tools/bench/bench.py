@@ -10,6 +10,7 @@ the host tells the operator what workflow to perform, captures structured
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -194,7 +195,7 @@ def run_capture(args: argparse.Namespace) -> int:
         try:
             if args.reset_before:
                 reset_device(args.espflash, args.port)
-            for line in serial_lines(args.port, stop_at=stop_at):
+            for line in capture_lines(args.port, stop_at=stop_at):
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 for event in parse_line(line, suite.name):
@@ -265,6 +266,45 @@ def stop_target_for(args: argparse.Namespace, suite: Suite) -> tuple[str, int] |
     if suite.stop_event is None or suite.stop_count_arg is None:
         return None
     return suite.stop_event, int(getattr(args, suite.stop_count_arg))
+
+
+# Errno values a vanishing USB-serial device raises: the ESP32-C3's
+# USB-JTAG port drops off the bus when the firmware enters deep sleep
+# (idle timeout, the sleep-cycle suites). macOS reports ENXIO ("Device
+# not configured"), Linux EIO or ENODEV; ENOENT covers a reopen racing
+# re-enumeration.
+PORT_LOST_ERRNOS = {errno.ENXIO, errno.EIO, errno.ENODEV, errno.ENOENT}
+
+
+def capture_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
+    """`serial_lines`, surviving the device dropping off the bus.
+
+    Deep sleep mid-capture is expected — an idle timeout or a
+    sleep-cycle suite kills the USB-JTAG port — so rather than dying
+    with a traceback, announce the loss, wait for the port to
+    re-enumerate (waking the device is the operator's job), and resume
+    until the capture window closes. A port that never produced a line
+    still fails fast, so a mistyped --port errors immediately.
+    """
+    connected = False
+    while True:
+        try:
+            for line in serial_lines(port, stop_at=stop_at):
+                connected = True
+                yield line
+            return
+        except OSError as err:
+            if not connected or err.errno not in PORT_LOST_ERRNOS:
+                raise
+        print(f"port: {port} vanished (device asleep?); wake it to resume capture")
+        while not os.path.exists(port):
+            if stop_at is not None and time.monotonic() >= stop_at:
+                print("port: capture window ended while the device was away")
+                return
+            time.sleep(0.5)
+        # Let enumeration settle before reopening the fresh device node.
+        time.sleep(0.5)
+        print("port: back; resuming capture")
 
 
 def serial_lines(port: str, stop_at: float | None = None) -> Iterable[str]:

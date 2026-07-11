@@ -29,6 +29,12 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
 
 - Run `thermal-run` only for targeted refresh, ghosting, sleep-screen,
   enclosure, power, SD-card, or ambient-temperature investigations.
+- `reader-soak` is a passive capture: the operator runs the described
+  reading workflow on the device by hand while bench.py records. Menus
+  idle-sleep after 3 minutes (Reading after 10), so keep interacting.
+- Deep sleep drops the USB-JTAG serial port mid-capture; bench.py
+  announces the loss and waits for the port to re-enumerate — wake the
+  device to resume. The capture window keeps counting while it is away.
 
 ## Logs
 
