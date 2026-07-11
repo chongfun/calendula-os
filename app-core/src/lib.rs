@@ -486,7 +486,7 @@ impl WifiSsid {
 /// The onboarding hotspot's WPA2 PSK, minted fresh from the hardware RNG
 /// each time the portal starts. It rides `SyncEvent::PortalUp` into
 /// `SyncStatus` so the Wireless screen can render the join QR and the
-/// manual-join password text — the on-screen QR is the only channel that
+/// manual-join password text — the display is the only channel that
 /// carries it, so nothing secret lives in the repo or the release binary.
 /// Always exactly [`PortalPsk::LEN`] ASCII characters from
 /// [`PSK_ALPHABET`].
@@ -511,15 +511,6 @@ impl core::fmt::Debug for PortalPsk {
 /// host-testable against it.
 pub const PSK_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
 
-/// Error returned when constructing a [`PortalPsk`] from invalid bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PskError {
-    /// One or more bytes are not in [`PSK_ALPHABET`].
-    InvalidCharacter,
-    /// The bytes are not valid UTF-8.
-    InvalidUtf8,
-}
-
 impl PortalPsk {
     pub const LEN: usize = 16;
 
@@ -531,27 +522,20 @@ impl PortalPsk {
         bytes: *b"emudemqpsk234567",
     };
 
-    /// Constructs a PSK after validating every byte against [`PSK_ALPHABET`]
-    /// and ensuring valid UTF-8. Returns [`PskError`] if any byte is invalid.
-    pub fn new(bytes: [u8; Self::LEN]) -> Result<Self, PskError> {
-        // Validate UTF-8
-        if core::str::from_utf8(&bytes).is_err() {
-            return Err(PskError::InvalidUtf8);
+    /// Constructs a PSK, refusing any byte outside [`PSK_ALPHABET`] —
+    /// which also rules out non-ASCII bytes and the characters the
+    /// `WIFI:` QR payload would need escaped.
+    pub fn new(bytes: [u8; Self::LEN]) -> Option<Self> {
+        if bytes.iter().all(|b| PSK_ALPHABET.contains(b)) {
+            Some(Self { bytes })
+        } else {
+            None
         }
-        // Validate every byte is in PSK_ALPHABET
-        for &byte in &bytes {
-            if !PSK_ALPHABET.contains(&byte) {
-                return Err(PskError::InvalidCharacter);
-            }
-        }
-        Ok(Self { bytes })
     }
 
-    /// Returns the PSK as a string slice. This is infallible because
-    /// construction validates UTF-8.
     pub fn as_str(&self) -> &str {
-        // SAFETY: `new` validates UTF-8, so this cannot fail.
-        unsafe { core::str::from_utf8_unchecked(&self.bytes) }
+        // PSK_ALPHABET is pure ASCII, so validated bytes are always UTF-8.
+        core::str::from_utf8(&self.bytes).unwrap_or("")
     }
 
     pub const fn bytes(&self) -> [u8; Self::LEN] {
@@ -1518,6 +1502,21 @@ mod tests {
                 PSK_ALPHABET.contains(&b),
                 "EMULATOR_DEMO byte {:?} is outside PSK_ALPHABET",
                 b as char
+            );
+        }
+    }
+
+    #[test]
+    fn portal_psk_construction_refuses_bytes_outside_the_alphabet() {
+        let valid = PortalPsk::EMULATOR_DEMO.bytes();
+        assert_eq!(PortalPsk::new(valid), Some(PortalPsk::EMULATOR_DEMO));
+        for bad in [b'0', b';', 0xFF] {
+            let mut bytes = valid;
+            bytes[0] = bad;
+            assert_eq!(
+                PortalPsk::new(bytes),
+                None,
+                "byte {bad:#04x} must be refused"
             );
         }
     }
