@@ -143,12 +143,12 @@ impl WebEmulator {
                     let warm = self.store_ready_for(book_index);
                     if !warm {
                         self.load_status = LoadStatus::Loading;
-                        if book_text(book_index).is_none() {
-                            // Start the page's fetch now, in parallel with
-                            // the simulated card latency.
-                            self.wanted_book = Some(book_index);
-                        }
                     }
+                    // Start the page's fetch now, in parallel with the
+                    // simulated card latency — or, when the body is already
+                    // cached, drop any want left over from a superseded open
+                    // so the page stops retrying a book nobody is waiting on.
+                    self.wanted_book = book_text(book_index).is_none().then_some(book_index);
                     let delay = if warm { REOPEN_BOOK_MS } else { OPEN_BOOK_MS };
                     // A new open supersedes any earlier one still waiting
                     // on its body.
@@ -341,6 +341,12 @@ impl WebEmulator {
     }
 
     fn render(&mut self, kind: RenderKind) {
+        // Async work keeps completing while asleep (a book body arriving for
+        // a pending FinishOpen, sync ops); state may hydrate, but nothing
+        // may paint over the sleep screen. Waking re-renders explicitly.
+        if self.sleeping {
+            return;
+        }
         let request = self.state.render_request(kind);
         let sd_reading = request.view == AppView::Reading
             && ReaderSource::from_book_id(request.book_id).is_sd();
