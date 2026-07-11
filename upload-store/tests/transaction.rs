@@ -57,6 +57,9 @@ impl FaultPlan {
 struct FaultyDisk {
     data: RefCell<Vec<u8>>,
     fault: FaultPlan,
+    /// Total write calls, for measuring how many writes an operation costs
+    /// so a fault can be aimed past it (see `close_write_cost`).
+    writes: Cell<u32>,
 }
 
 /// The tests hold one `Rc` handle for arming faults and inspecting raw bytes
@@ -88,6 +91,7 @@ impl BlockDevice for SharedDisk {
     }
 
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
+        self.writes.set(self.writes.get() + 1);
         if FaultPlan::take_fault(&self.fault.fail_write_in) {
             return Err(DiskError);
         }
@@ -158,6 +162,7 @@ fn new_card() -> SharedDisk {
     SharedDisk(Rc::new(FaultyDisk {
         data: RefCell::new(format_disk()),
         fault: FaultPlan::default(),
+        writes: Cell::new(0),
     }))
 }
 
@@ -200,8 +205,9 @@ fn upload(
         Transaction::begin(root, books, &name(begin_name), identity, "label.epub")
             .expect("begin upload");
     file.write(body).expect("write body");
-    file.close().expect("close body");
-    transaction.commit(root, books)
+    transaction
+        .commit(file, root, books)
+        .expect("commit upload")
 }
 
 fn read_book(books: &Dir<'_>, book_name: &str) -> Vec<u8> {
@@ -234,6 +240,23 @@ fn book_names(books: &Dir<'_>) -> Vec<String> {
 
 fn identity_of(root: &Dir<'_>, book_name: &str) -> Option<u64> {
     upload_store::read_upload_identity(root, book_name).expect("readable identity")
+}
+
+/// How many device write calls a File::close costs in the re-upload
+/// scenario, measured on a scratch card so retire-time faults can be aimed
+/// past commit's internal close instead of hardcoding a block count.
+fn close_write_cost() -> u32 {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    upload(&root, &books, "BOOK0000.EPU", 0xAAAA, b"old body");
+    let (_transaction, file) =
+        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
+            .expect("begin");
+    file.write(b"new body").expect("stream");
+    let before = disk.writes.get();
+    file.close().expect("close");
+    disk.writes.get() - before
 }
 
 // ---------------------------------------------------------------------------
@@ -276,8 +299,7 @@ fn reupload_replaces_only_after_success_and_old_survives_mid_stream() {
     assert_ne!(transaction.target().as_str(), "BOOK0000.EPU");
     file.write(b"new body, longer than before").expect("stream");
     assert_eq!(read_book(&books, "BOOK0000.EPU"), b"old body");
-    file.close().expect("close");
-    let landed = transaction.commit(&root, &books);
+    let landed = transaction.commit(file, &root, &books).expect("commit");
 
     // Committed: exactly one copy, the new one, identity intact.
     assert_eq!(book_names(&books), vec![landed.as_str().to_string()]);
@@ -300,8 +322,7 @@ fn client_abort_preserves_the_old_copy_and_leaves_no_debris() {
         Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
             .expect("begin re-upload");
     file.write(b"partial ne").expect("partial stream");
-    let _ = file.close();
-    transaction.abort(&root, &books);
+    transaction.abort(file, &root, &books);
 
     assert_eq!(book_names(&books), vec!["BOOK0000.EPU"]);
     assert_eq!(read_book(&books, "BOOK0000.EPU"), b"old body");
@@ -325,10 +346,8 @@ fn sd_write_fault_mid_stream_preserves_the_old_copy() {
     let big = vec![0x5A_u8; 4096];
     file.write(&big).expect("first chunk");
     disk.fault.fail_write_in.set(Some(0));
-    let mut write_failed = file.write(&big).is_err();
-    write_failed |= file.close().is_err();
-    assert!(write_failed, "the injected fault must surface");
-    transaction.abort(&root, &books);
+    assert!(file.write(&big).is_err(), "the injected fault must surface");
+    transaction.abort(file, &root, &books);
 
     // Reopen fresh (as after a power cycle): only the old copy remains.
     drop((root, books));
@@ -384,10 +403,11 @@ fn retire_fault_during_commit_keeps_the_old_copy_identity_matched() {
         Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
             .expect("begin re-upload");
     file.write(b"new body").expect("stream");
-    file.close().expect("close");
-    // Fail the delete of the replaced copy inside commit.
-    disk.fault.fail_write_in.set(Some(0));
-    let landed = transaction.commit(&root, &books);
+    // Fail the delete of the replaced copy inside commit, skipping the
+    // write that commit's internal close performs first (measured by
+    // close_write_cost below).
+    disk.fault.fail_write_in.set(Some(close_write_cost()));
+    let landed = transaction.commit(file, &root, &books).expect("commit");
     let landed = landed.as_str().to_string();
 
     // Assert against the device, not this session: embedded-sdmmc's block
@@ -493,8 +513,7 @@ fn malformed_identity_sidecar_is_skipped_not_fatal() {
             .expect("begin must proceed past the malformed sidecar");
     assert_eq!(transaction.skipped_malformed_sidecars(), 1);
     file.write(b"new body").expect("stream");
-    file.close().expect("close");
-    let landed = transaction.commit(&root, &books);
+    let landed = transaction.commit(file, &root, &books).expect("commit");
 
     // The unmatched old copy survives as a visible duplicate — the accepted
     // worst case — and the new copy carries a valid identity.
@@ -506,6 +525,60 @@ fn malformed_identity_sidecar_is_skipped_not_fatal() {
     assert_eq!(read_book(&books, "BOOK0000.EPU"), b"old body");
     assert_eq!(read_book(&books, "BOOK0001.EPU"), b"new body");
     assert_eq!(identity_of(&root, "BOOK0001.EPU"), Some(0xAAAA));
+}
+
+#[test]
+fn close_fault_during_commit_discards_target_and_keeps_old() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    upload(&root, &books, "BOOK0000.EPU", 0xAAAA, b"old body");
+
+    let (transaction, file) =
+        Transaction::begin(&root, &books, &name("BOOK0000.EPU"), 0xAAAA, "label.epub")
+            .expect("begin re-upload");
+    file.write(b"new body").expect("stream");
+    // Fail commit's internal close: the new copy's metadata never lands,
+    // so commit must discard the target and leave the old copy alone.
+    disk.fault.fail_write_in.set(Some(0));
+    assert!(
+        transaction.commit(file, &root, &books).is_none(),
+        "commit must report failure when the close fails"
+    );
+
+    // Reopen fresh (as after a power cycle): only the old copy remains.
+    drop((root, books));
+    drop(mgr);
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    assert_eq!(book_names(&books), vec!["BOOK0000.EPU"]);
+    assert_eq!(read_book(&books, "BOOK0000.EPU"), b"old body");
+    assert_eq!(identity_of(&root, "BOOK0000.EPU"), Some(0xAAAA));
+}
+
+#[test]
+fn invalid_upload_names_are_rejected_without_touching_the_card() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let before = disk.data.borrow().clone();
+
+    // "ABC\u{e9}000.EPU" is 12 valid UTF-8 bytes with a character straddling
+    // byte offset 4: slicing by byte would panic without validation. The
+    // rest cover a lowercase prefix, a non-base-36 tail, and a wrong
+    // extension, each of which would probe an unrelated slot chain.
+    for bad in [
+        "ABC\u{e9}000.EPU",
+        "book0000.EPU",
+        "BOOK00x0.EPU",
+        "BOOK0000.TXT",
+    ] {
+        assert!(
+            Transaction::begin(&root, &books, &name(bad), 0xAAAA, "label.epub").is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    assert_eq!(*disk.data.borrow(), before, "no block was written");
 }
 
 #[test]

@@ -549,14 +549,13 @@ where
             break;
         }
     }
-    if file.close().is_err() {
-        failed = true;
-    }
     if failed || aborted {
-        transaction.abort(root, books);
+        transaction.abort(file, root, books);
         return None;
     }
-    Some(transaction.commit(root, books))
+    // commit closes the file and retires the replaced copies only if the
+    // close succeeded; a failed close discards the target and returns None.
+    transaction.commit(file, root, books)
 }
 
 /// Consumes one file's worth of chunks without a file to write into.

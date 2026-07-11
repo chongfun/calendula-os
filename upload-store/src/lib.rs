@@ -65,6 +65,36 @@ fn suffixed_name(prefix4: &str, tail: u32) -> UploadName {
     name
 }
 
+/// Validates the full `PPPPTTTT.EPU` shape (uppercase-alphanumeric prefix,
+/// base-36 tail, exact extension — see `proto::upload::sanitized_name`) and
+/// splits it into the probe chain's prefix and starting tail. `UploadName`
+/// is only a capacity bound, so every byte is checked before any slicing:
+/// a multi-byte character straddling an offset would otherwise panic, and a
+/// non-base-36 tail byte would silently probe an unrelated slot chain.
+fn parse_upload_name(name: &UploadName) -> Option<(String<4>, u32)> {
+    let bytes = name.as_bytes();
+    if bytes.len() != 12 || &bytes[8..12] != b".EPU" {
+        return None;
+    }
+    if !bytes[0..8]
+        .iter()
+        .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut prefix = String::<4>::new();
+    let _ = prefix.push_str(&name.as_str()[0..4]);
+    let mut tail = 0u32;
+    for &b in &bytes[4..8] {
+        tail = tail * 36
+            + match b {
+                b'0'..=b'9' => (b - b'0') as u32,
+                _ => (b - b'A' + 10) as u32,
+            };
+    }
+    Some((prefix, tail))
+}
+
 fn open_or_make_dir<
     'a,
     D,
@@ -315,13 +345,16 @@ pub fn delete_upload_sidecars<
 }
 
 /// One in-flight book write. Created by [`Transaction::begin`], which hands
-/// back the open target [`File`]; the caller streams the body into it, closes
-/// it, and then calls exactly one of [`Transaction::commit`] (data landed
-/// whole) or [`Transaction::abort`] (write error or client abort).
+/// back the open target [`File`]; the caller streams the body into it and
+/// then hands it back to exactly one of [`Transaction::commit`] (data landed
+/// whole) or [`Transaction::abort`] (write error or client abort). Both
+/// consume the file, so the target can neither be committed while still open
+/// nor left open to make abort's deletion fail; `commit` closes it first and
+/// retires prior copies only after the close succeeds.
 ///
-/// Until `commit`, every prior copy of the book — and its sidecars — is left
-/// untouched, so no failure between `begin` and `commit` can cost the
-/// previously valid copy.
+/// Until a successful `commit` close, every prior copy of the book — and its
+/// sidecars — is left untouched, so no failure between `begin` and `commit`
+/// can cost the previously valid copy.
 pub struct Transaction {
     prefix: String<4>,
     target: UploadName,
@@ -355,21 +388,9 @@ impl Transaction {
         D: embedded_sdmmc::BlockDevice,
         T: TimeSource,
     {
-        // Upload names are always PPPPTTTT.EPU (see proto::upload::sanitized_name).
-        if name.len() != 12 {
+        let Some((prefix, mut tail)) = parse_upload_name(name) else {
             return Err(());
-        }
-        let mut prefix = String::<4>::new();
-        let _ = prefix.push_str(&name.as_str()[0..4]);
-        let mut tail = 0u32;
-        for c in name.as_str()[4..8].chars() {
-            tail = tail * 36
-                + match c {
-                    '0'..='9' => (c as u8 - b'0') as u32,
-                    'A'..='Z' => (c as u8 - b'A' + 10) as u32,
-                    _ => 0,
-                };
-        }
+        };
 
         let mut obsolete_tails = heapless::Vec::<u32, UPLOAD_PROBE_WINDOW>::new();
         let mut skipped_malformed_sidecars = 0usize;
@@ -477,42 +498,67 @@ impl Transaction {
         self.skipped_malformed_sidecars
     }
 
-    /// The transfer failed or was aborted (after the target file was closed
-    /// or dropped): remove the target and its sidecars. Prior copies were
-    /// never touched. Sidecars go only if the file itself went, so a failed
-    /// delete stays identity-matched and gets retried by the next re-upload.
+    /// The transfer failed or was aborted: close the target file
+    /// (best-effort — the slot is being discarded either way) and remove it
+    /// with its sidecars. Prior copies were never touched. Sidecars go only
+    /// if the file itself went, so a failed delete stays identity-matched
+    /// and gets retried by the next re-upload.
     pub fn abort<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
         self,
+        file: File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     ) where
         D: embedded_sdmmc::BlockDevice,
         T: TimeSource,
     {
-        if books.delete_file_in_dir(self.target.as_str()).is_ok() {
-            delete_upload_sidecars(root, self.target.as_str());
-        }
+        let _ = file.close();
+        discard_target(root, books, self.target.as_str());
     }
 
-    /// The new copy is whole (written and closed): retire the replaced
-    /// copies and return the target name. Sidecars go only if the file
-    /// itself went, so a failed delete stays identity-matched and gets
-    /// retried by the next re-upload.
+    /// The body streamed without error: close the target file, and only if
+    /// the close succeeds — the new copy's metadata is durably on the card —
+    /// retire the replaced copies and return the target name. A failed close
+    /// discards the target like [`Transaction::abort`] and returns `None`,
+    /// leaving every prior copy intact. Sidecars go only if the file itself
+    /// went, so a failed delete stays identity-matched and gets retried by
+    /// the next re-upload.
+    #[must_use = "a None commit means the upload failed and the target was discarded"]
     pub fn commit<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
         self,
+        file: File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
         books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    ) -> UploadName
+    ) -> Option<UploadName>
     where
         D: embedded_sdmmc::BlockDevice,
         T: TimeSource,
     {
+        if file.close().is_err() {
+            discard_target(root, books, self.target.as_str());
+            return None;
+        }
         for obsolete_tail in &self.obsolete_tails {
             let old = suffixed_name(self.prefix.as_str(), *obsolete_tail);
             if books.delete_file_in_dir(old.as_str()).is_ok() {
                 delete_upload_sidecars(root, old.as_str());
             }
         }
-        self.target
+        Some(self.target)
+    }
+}
+
+/// Remove a discarded target slot's book file and, only if that deletion
+/// succeeded, its sidecars (see the abort/commit notes on retry).
+fn discard_target<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    target: &str,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if books.delete_file_in_dir(target).is_ok() {
+        delete_upload_sidecars(root, target);
     }
 }
