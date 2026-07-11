@@ -93,7 +93,7 @@ class BenchReportTests(unittest.TestCase):
             warnings = bench.summarize_paths([path], None, validate_suites=True)
         self.assertEqual(warnings, ["storage-cache: no parsed bench telemetry"])
 
-    @patch("bench.print")
+    @patch("builtins.print")
     def test_summarize_paths_default_reports_latest_run(self, mock_print) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "log.jsonl"
@@ -116,7 +116,7 @@ class BenchReportTests(unittest.TestCase):
             mock_print.assert_any_call("renders:       0")
             mock_print.assert_any_call("bench report: latest run only (run2; 1 earlier run(s) in the log — pass --all to pool)")
 
-    @patch("bench.print")
+    @patch("builtins.print")
     def test_summarize_paths_all_reports_every_run(self, mock_print) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "log.jsonl"
@@ -185,7 +185,7 @@ class CaptureLinesTests(unittest.TestCase):
         with self.assertRaises(OSError):
             list(bench.capture_lines("/dev/port"))
 
-    @patch("bench.print")
+    @patch("builtins.print")
     @patch("bench.time.sleep")
     @patch("bench.os.path.exists")
     @patch("bench.serial_lines")
@@ -209,7 +209,7 @@ class CaptureLinesTests(unittest.TestCase):
         mock_print.assert_any_call("port: /dev/port vanished (device asleep?); wake it to resume capture", flush=True)
         mock_print.assert_any_call("port: back; resuming capture", flush=True)
 
-    @patch("bench.print")
+    @patch("builtins.print")
     @patch("bench.time.sleep")
     @patch("bench.time.monotonic")
     @patch("bench.os.path.exists")
