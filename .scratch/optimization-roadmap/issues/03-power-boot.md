@@ -1,6 +1,6 @@
 # WS-C: Power & boot — standby current, wake latency, battery
 
-Status: ready-for-agent (items C1, C3, C4, C5 are code-verifiable; C2 and C6 need a device + meter for sign-off)
+Status: C1+C3+C4+C5 DONE (#11; wake-cause gating logs 'main: deep_sleep_wake=', idle timeout tiered Reading 10 min / menus 3 min / Wireless 10 min). Next: C2 (device + µA meter). C6 still blocked on X3 display-path hardware verification. See PRD status for a once-observed X3 PON quirk. (items C1, C3, C4, C5 are code-verifiable; C2 and C6 need a device + meter for sign-off)
 
 Owns: `fw/src/tasks/power.rs`, `fw/src/tasks/input.rs`, `hal-ext/src/rtc.rs`, `hal-ext/src/bq27220.rs`, planner-seed surface of `app-core/src/lib.rs`, boot-init region of `fw/src/tasks/display.rs`.
 Do not touch: flush/prestage region of the display task (WS-A), wifi task (WS-D).

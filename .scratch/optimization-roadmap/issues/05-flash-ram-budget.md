@@ -1,6 +1,6 @@
 # WS-E: Flash & RAM budget — image size, stack headroom
 
-Status: ready-for-agent
+Status: E1+E2+E3 DONE (measured: ~246 KB flash freed, ~7 KB stack headroom both boards, .data 52→5 KB). E4 deferred until flash headroom is wanted.
 
 Owns: `.cargo/config.toml`, `display/src/font.rs` (GlyphMetric struct + accessor), `fw/src/reader_store.rs`, `fw/src/custom_font.rs` (decode side), generated font tables, DISPLAY_EVENTS declaration.
 Coordination: `font.rs`/`custom_font.rs` overlap WS-A item A2 and WS-B item B1 — land E2 (metric packing) **first**, then those proceed independently.

@@ -1,6 +1,6 @@
 # WS-F: Web emulator & CI — page weight, load time, golden coverage
 
-Status: ready-for-agent
+Status: F1–F4+F6 DONE (#13 — initial transfer −49% gz, reading goldens now in CI). F5 deferred; only worth it if board-switching matters.
 
 Owns: `web/`, `tools/web-emulator/`, `tools/build-web.sh`, `.github/workflows/`, `tools/emulator` (test harness fixes only). Fully disjoint from the firmware workstreams — safe to run in parallel with everything.
 

@@ -1,6 +1,6 @@
 # WS-A: Display render path — shave the ~50 ms of software around the 421 ms panel BUSY
 
-Status: ready-for-agent
+Status: A1 DONE (#12, incl. the wait_ready micro-fix). Next: A2 (unblocked by E2; gate on Landscape frames — portrait is active work). A3 open (coordinate with portrait first). A4/A5 hardware experiments, unscheduled.
 
 Owns: `display/` crate, `fw/src/display_flush/`, flush/prestage region of `fw/src/tasks/display.rs`, `hal-ext/src/spi_dma.rs`.
 Do not touch: `fw/src/sd_session.rs` (WS-D), boot-init region of display task (WS-C item 2 owns the double-`init_panel` fix).

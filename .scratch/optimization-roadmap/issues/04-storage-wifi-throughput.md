@@ -1,6 +1,6 @@
 # WS-D: Storage & Wi-Fi throughput — SD bandwidth, upload speed, session setup, onboarding
 
-Status: ready-for-agent
+Status: D1 DONE (#14 — measured: cold build −5.4%, write_ms −9.5%, progress write −35%; NOT the hoped 2×). D2 REJECTED on measurement — see below. D3 DONE as per-session runtime PSK (#19). Next: D4, then D5. D6: read the evidence file below first. NEW: upload-ceiling investigation below.
 
 Owns: `fw/src/sd_session.rs`, `fw/src/tasks/wifi.rs`, `fw/src/upload.rs`, `fw/src/sync_mem.rs`, vendored/pinned `embedded-sdmmc`.
 Note: `sd_session.rs` changes speed up WS-B's reader path too — this workstream owns the file; WS-B must not modify it.
@@ -22,6 +22,33 @@ Radio is trimmed to 4 static RX / 8 dyn RX / 8 dyn TX, AMPDU off (`fw/src/tasks/
 Also: `write_one_book` (`fw/src/sd_session.rs:508-551`) calls fully blocking `file.write` on 4 KB (10–30 ms, no await) on the shared thread-mode executor, starving `net_task` → RX drops → TCP stalls. Slice writes 512 B at a time with `embassy_futures::yield_now().await` between slices. Optionally grow ping-pong buffers 4→8–16 KB from the loaned heap (`wifi.rs:281-283`) once yielding makes large chunks harmless.
 
 - Impact: 2–4× radio RX throughput; +20–50% from yielding on top of D1 — combined plausibly 3–5× end-to-end upload.
+
+**POST-MORTEM (2026-07-11): implemented, measured, rejected.** Timed upload
+A/B (X3, 3.2 MB EPUB, same card/network): main 19.3 s median → D1+D2 21.1 s
+→ D1+buffers-only ~20.2 s. The 512-B slice + yield pacing cost ~1 s per
+upload (~6,300 yield/reschedule cycles); the buffers and AMPDU-RX bought
+nothing while spending ~6.6 KB of loaned heap at join (free 27,300 → 20,700).
+Throughput sits near 160 KB/s under every configuration, so neither radio RX
+nor SD write stalls is the limiter — main's blocking 4 KB writes do not stall
+TCP in practice. Only the per-upload heap log shipped (#14). Do not re-try
+either half without new evidence from the investigation below.
+
+## D-NEW (investigation, S–M): find the ~160 KB/s upload ceiling
+
+Everything ruled out so far: radio RX buffers, AMPDU-RX, SD write stalls, SPI
+chunking (all measured 2026-07-11/12). Remaining candidates, roughly in order
+of suspicion: (a) the 4 KB two-buffer ping-pong handshake between the wifi
+and storage tasks — each chunk's channel round-trip serializes against the SD
+write it triggers; (b) esp-radio power-save mode during the session (check
+whether PS is disabled while serving); (c) single-stream TCP dynamics — small
+congestion window against a receiver that reads in 4 KB bites; (d) the HTTP
+server's read pattern in the upload handler. Tools already in place: the
+timed-curl protocol (PRD status section), `upload: heap used/free` per
+upload, `sd_stats` counters. Instrument first — e.g. timestamp the ping-pong
+(fill-time vs write-time per chunk) to see which side starves — then fix only
+what the numbers indict. A believable outcome is 2–5× upload throughput;
+another believable outcome is that the radio/RF layer is the ceiling and
+uploads are already as fast as this hardware goes.
 - Risk: heap exhaustion inside the radio blob crashes the loaned-buffer session (only recovery is the reset) and AMPDU reorder buffers allocate under load — soak with 10+ book uploads while watching heap high-water.
 - Verify: timed curl A/B, heap logs, `bench channel-stress --host` (its charter is exactly this ping-pong), serial for TCP timeouts.
 
@@ -49,6 +76,16 @@ Today: portal captures credentials → SAVED page says "press done, then run syn
 - Verify: phone onboarding end-to-end on hardware (also covers the DNS sign-in-sheet path, itself flagged untested); emulator scenario + goldens; reset still restores reading position.
 
 ## D6 (Tier 3, L): Multi-block CMD18/CMD25 in the pinned embedded-sdmmc
+
+**Evidence file (2026-07-12, X3, 11.7 MB EPUB cold build):** `sd_stats`
+showed `write_calls == write_blocks` (1,944 each) and per-block write cost
+2.23 ms against ~0.16 ms of wire time at 25 MHz — i.e. ~2 ms/block is CMD24
+command/response/CRC overhead plus card programming latency, and only
+multi-block batching can amortize it. The build's total write time was
+4.34 s, so CMD25 could plausibly recover 2–3 s of every large cold build.
+Note #18 moved the upload write path into the `upload-store` crate; reader
+cache writes still go through fw's SD session. Weigh the fork-maintenance
+cost of patching the pinned embedded-sdmmc against those seconds.
 
 Above the SPI layer, `embedded-sdmmc` `File::write` write-backs one 512-B block per call → every block is its own CMD24 with command/response/CRC + 1–3 ms card programming; reads are per-block CMD17. Its CMD25 path exists but is unreachable. Patch the pinned crate (`fw/Cargo.toml:39`) to batch cluster-contiguous whole-block runs, or write payload blocks directly using FAT only for allocation/metadata. Same for CMD18 on sequential reads (`SdFileReadAt::read_at` 8 KB chunks, `reader_cache.rs:1356`); IMPLEMENTATION_PLAN already names CMD18 as one of two "material wins". Do this only if post-D1/D2 profiling still shows SD-bound transfer (`write_calls == write_blocks` in bench counters answers it immediately).
 
