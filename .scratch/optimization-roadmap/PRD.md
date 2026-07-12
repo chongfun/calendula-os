@@ -18,30 +18,60 @@ roadmap, but they own the upload write path now), bench harness fixes (#16,
 entirety, and D1's "~2× SD bandwidth" framing (real win is 5–10% of cold
 builds; the measured evidence now lives in D1's commit message and issue 04).
 
-**Next queue (priority order, rationale in the issue files):**
+**Next queue (re-ranked 2026-07-12: reading-common-path items first, then
+whole-device ROI; custom-font items demoted — the owner reads with built-in
+fonts only):**
 
-1. **B1** — custom-font metric cache (issue 02). Unblocked: E2 landed, metrics
-   are the 12-byte layout; the cache should store encoded 12-B records (the
-   in-flash `FONT_METRICS` cache already does exactly that — copy its shape).
-2. **A2** — byte-run rasterizer fast paths (issue 01). Unblocked by E2. New
-   constraint since 2026-07-09: portrait is under active development (portrait
-   reading sheet + icons merged; a portrait-default PR is open) — gate the fast
-   paths on Landscape frames and keep per-pixel portrait, exactly as the issue
-   already says. Goldens must pass unchanged, both boards.
-3. **D4** — directed Wi-Fi join (issue 04). Software-implementable; needs a
+1. **A2** — byte-run rasterizer fast paths (issue 01). Reading path: every
+   page turn and menu frame. Unblocked by E2. New constraint since
+   2026-07-09: portrait is under active development (portrait reading sheet +
+   icons merged; a portrait-default PR is open) — gate the fast paths on
+   Landscape frames and keep per-pixel portrait, exactly as the issue already
+   says. Goldens must pass unchanged, both boards.
+2. **NEW: B6** — settings-independent content cache, CONTENT.BIN (issue 02).
+   Reading path: a Type Size/Weight/Family change still invalidates every
+   section (`font_config & !0b11`, `fw/src/reader_cache_files.rs:914`) and
+   pays a full cold build — 14.1 s on the measured 11.7 MB EPUB. The full
+   design is inlined in issue 02 (audited against main 2026-07-12; capture
+   at the `push_block` boundary, replay through the same sink).
+3. **B4** — progressive first open (issue 02). Its prerequisites (B3, D1)
+   landed. Sequence after B6: both restructure the reader_cache open flow,
+   and B6 shrinks the background phase B4 hides. Large; interleaves with
+   display-task storage dispatch.
+4. **A3** — panel-native framebuffer byte order (issue 01). Reading path
+   (~10–13 ms per turn and prestage) and frees 8 KB; heavy golden re-bless;
+   coordinate with the portrait work before starting.
+5. **C2** — deep-sleep GPIO hold + first-ever sleep-current measurement
+   (issue 03). Top non-reading item: the largest standby unknown. Needs a
+   device and a µA meter.
+6. **D4** — directed Wi-Fi join (issue 04). Software-implementable; needs a
    device for join-time A/B. WIFI.BIN gains fields — keep old records readable.
-4. **C2** — deep-sleep GPIO hold + first-ever sleep-current measurement
-   (issue 03). Needs a device and a µA meter; the largest standby unknown.
-5. **A3** — panel-native framebuffer byte order (issue 01). Frees 8 KB; heavy
-   golden re-bless; coordinate with the portrait work before starting.
-6. **B4** — progressive first open (issue 02). Its sequencing prerequisites
-   (B3, D1) have landed. Large; interleaves with display-task storage dispatch.
-7. **D5** — portal → station handoff (issue 04). Hardware-validation-heavy.
-8. **NEW: upload-ceiling investigation** (issue 04, replaces D2's slot).
+7. **Upload-ceiling investigation** (issue 04, replaces D2's slot).
    Measure-first: find what actually caps uploads at ~160 KB/s.
+8. **D5** — portal → station handoff (issue 04). Hardware-validation-heavy;
+   fires once per device onboarding.
+9. **B1** — custom-font metric cache (issue 02). Demoted from #1: it only
+   affects custom-font (SD font pack) cold builds, and the owner doesn't use
+   custom fonts. The spec stays current in issue 02 (unblocked by E2, S–M)
+   if that ever changes.
 
 Tier 3 unchanged (A4, A5, C6, E4, F5) except **D6**, which now has a complete
-evidence file in issue 04 — read it before deciding.
+evidence file in issue 04 — read it before deciding — and **NEW: B7**
+(per-config section caches, issue 02), which is conditional: implement only
+if B6's measured replay is still slow on device.
+
+**docs/OPTIMIZATION_PLAN.md audit (2026-07-12):** that document (a 2026-07-05
+brainstorm predating this roadmap) was checked against main, folded in, and
+deleted. Its items 0–3 had landed — 8 KB `read_at` chunks with the bounce
+buffer gone (`EPUB_READ_AT_CHUNK_BYTES`, `fw/src/reader_cache.rs:39`),
+incremental pagination as `PageIndexCursor` (#10), held-open SECTIONS dir
+(`with_v2_sections_dir`, `fw/src/reader_cache_files.rs:975`). Its item 6 was
+already tracked here as B4. Items 4–5 were the only live remainders, brought
+in above as B6/B7 with their full designs inlined in issue 02. One design
+note did not survive the audit: the forward-only upload-time build path
+(`ZipLocalStream`) has no firmware call site anymore — uploads just store
+files (#18) and the cache builds on first open — so B6's capture only needs
+the random-access `ZipStream` path.
 
 **Operational context for the next agent (hard-won this round):**
 

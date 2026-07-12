@@ -1,6 +1,6 @@
 # WS-B: Book pipeline — cold builds, custom fonts, catalog scan, progressive open
 
-Status: B2+B3 DONE (#10). Next: B1 (unblocked by E2 — store encoded 12-B metric records, as the in-flash FONT_METRICS cache now does). B4 open, its prerequisites (B3, D1) landed; note the upload write path now belongs to the upload-store crate (#18).
+Status: B2+B3 DONE (#10). Next: B6 (CONTENT.BIN — brought in 2026-07-12 from the retired docs/OPTIMIZATION_PLAN.md brainstorm; full design inlined below), then B4 (its prerequisites B3, D1 landed; sequence after B6 — both restructure the open flow). B1 is DEMOTED, not dropped: the owner reads with built-in fonts only, so custom-font build speed has near-zero personal ROI; the spec below stays current (unblocked by E2 — store encoded 12-B metric records, as the in-flash FONT_METRICS cache now does) if custom fonts come into use. Note the upload write path now belongs to the upload-store crate (#18).
 
 Owns: `fw/src/reader_cache*.rs`, `fw/src/custom_font.rs`, `fw/src/library_sd.rs`, `fw/src/reader_layout.rs`, `ui/src/reading.rs`, `proto/`.
 Do not touch: `fw/src/sd_session.rs` — SD chunk/clock/multi-block changes belong to WS-D (this workstream benefits automatically).
@@ -45,8 +45,31 @@ Baseline: cold V2 cache build 3.9 s for a 117-page EPUB (~70% CPU inflate+parse+
 
 Per-word `String<768>` copy to satisfy borrows (`reader_cache.rs:1860-1862`), full line re-measure on wrap (`:1883-1885`), `sanitize_preview_block`'s ~15 scans + two LowerAscii copies (`:2133-2212`). Only while already in this file for B3/B4.
 
+## B6 (Tier 2, M): Settings-independent content cache — CONTENT.BIN
+
+A Type Size/Weight/Family change flips wrap-relevant bits in `reader_layout_config`, so `load_v2_section_cache` rejects every section (`font_config & !0b11` check, `fw/src/reader_cache_files.rs:914`) and the open re-does the entire EPUB pass — zip read + inflate + XML parse + wrap + section rewrite, a full cold build (14.1 s on the measured 11.7 MB EPUB). Everything upstream of wrapping is settings-independent. Persist the `push_block` argument stream (text, role, style, align, paragraph_end, plus spine-boundary markers) to `XTEINK/CACHE2/<key>/CONTENT.BIN` during the full build; on a layout-config miss, replay it through the same `LibraryBlockSink` instead of re-parsing the EPUB.
+
+Design (folded in from the retired docs/OPTIMIZATION_PLAN.md item 4, audited against main 2026-07-12):
+
+- **Capture point:** the `XhtmlBlockSink::push_block` boundary — the exact argument stream `(text, role, style, align, paragraph_end)` per fragment, plus a spine-boundary marker between spine items (record `spine_index` and the `finish_spine` events). Capturing here (raw, pre-normalization) guarantees a replay produces byte-identical sections, because the replay literally calls the same `push_block`. `start_spine_index` and navigation-spine skipping (`spine_item_is_navigation`) run before `push_block`, so the captured stream already excludes them — replay must not re-filter.
+- **File and format:** `XTEINK/CACHE2/<key>/CONTENT.BIN`. Header: own magic + `CONTENT_VERSION` + `source_hash` + `source_size` + `complete` flag. Records: `spine_index: u16, role: u8, style: u8, align: u8, flags: u8 (paragraph_end, spine_end), text_len: u16, text bytes`. Constants and encode/decode helpers go in `proto/src/cache.rs` next to the existing section records, with unit tests there (host-buildable).
+- **Write during the full build:** wrap the sink so each `push_block` also appends one record, sequential append only, through a staging buffer loaned from `ReaderCacheScratch` — never a stack buffer (`scratch.xhtml` is busy during spine streaming; `scratch.opf`/`scratch.container` are idle after OPF parse — verify before reusing, and document the reuse where the field is declared, as `load_epub_toc` does for `xhtml`). If any write fails, delete the file and continue the build — CONTENT.BIN is purely an accelerator. Partial/stopped builds (`book_partial`, spine truncation) must record `complete = false`.
+- **Replay path:** in `build_or_load_book_cache_from_root`, when the section load misses on layout config (today that surfaces as `CacheLoadResult::Invalid` from the `font_config` check — plumb the distinction out, or simply try CONTENT.BIN before the EPUB whenever the index/section load misses): verify identity + version + `complete`, then stream the records into a `LibraryBlockSink` configured with no zip work — same `flush_if_full`/`flush_section`/`write_v2_book_index` flow, `generate_toc_from_headings = false`. Fall back to the full EPUB path on any read/decode error, after deleting the bad file. Replay only from a `complete` capture.
+- **TOC.BIN and COVER.BIN survive settings rebuilds:** their contents don't depend on type settings — only the page map does, and that is already recomputed per config (`refresh_chapter_tracking`, `chapter_page_token`). On replay, don't re-stream or rewrite TOC.BIN; populate the resident `library.toc*` fields from the old BOOK.BIN (load it before invalidating) or from TOC.BIN, so the rewritten BOOK.BIN keeps its TOC block.
+- **Invalidation:** keyed by source identity (hash + size) and `CONTENT_VERSION` only — never by layout config. Bump `CONTENT_VERSION` whenever XHTML-parser / entity-decode / sink-normalization semantics change (same bump-log discipline as `READER_LAYOUT_VERSION` in `ui/src/reading.rs`). Cache-dir eviction (`fw/src/reader_cache_files.rs:642` area) must learn to delete CONTENT.BIN too.
+- **Cost:** roughly the book's raw text on SD (typically well under a few MB) plus one extra sequential write on the first open — accepted; it buys every later settings change.
+- One simplification vs the original design: the forward-only build path (`ZipLocalStream`) has no firmware call site anymore — uploads store files (#18) and builds happen on first open — so capture only needs the `ZipStream` path; keep the sink generic but don't spend effort on forward-only capture.
+
+- Impact: settings-change reopen drops from a full cold build to sequential read + wrap + section writes — skips zip/inflate/XML, the bulk of the CPU-dominated build. First open pays one extra sequential write (~raw text size).
+- Verify: encode/decode round-trip tests in `proto` (host); on device: (1) a cold open writes CONTENT.BIN, (2) A/B a Type Size change on the 11.7 MB baseline book, (3) identical `total=` page counts from replay vs from-EPUB rebuild at the same settings, (4) hand-corrupt/truncate CONTENT.BIN → fallback still opens.
+- Coordination: same files as B4 (`reader_cache*.rs`, `reader_cache_files.rs`) — land B6 before starting B4.
+
+## B7 (conditional, S–M): Per-config section caches
+
+Keep caches per layout config instead of overwriting, so flipping back to a previously-built setting is an instant cache hit (folded in from the retired docs/OPTIMIZATION_PLAN.md item 5). The layout config is a small packed integer (`reader_layout_config`: `version<<6 | family<<5 | weight<<4 | size<<2 | spacing`); key the wrap-relevant nibble (family/weight/size, 4 bits) into the section file names (e.g. `S<cfg>_<n>` — mind the 8.3 name budget, `CACHE_SECTION_FILE_BYTES = 8`) and into per-config BOOK.BIN names. Costs: SD space multiplies per config used; eviction needs a policy (e.g. keep at most 2 configs per book, delete least recently used); `CACHE_V2_VERSION` bump if BOOK.BIN naming changes. Only worth it if B6's measured replay is still noticeably slow on device — decide from B6's verify numbers, don't schedule independently.
+
 ## Do not re-propose
 
 Already done in the July build-path work: write staging, held-open SECTIONS dir, dirty-gated rebuilds, 8 KB read_at clamp, warm SD session reuse, style-marker dedup, OPF span strings, streamed whole-spine XHTML, ZIP central-directory hash index. V1 cache migration is disabled by design. Page-turn latency and reopen path are not software targets.
 
-Suggested order: B1 → B2 → B3 → B4 (with B5 folded in).
+Suggested order: B6 → B4 (with B5 folded in). B7 only if B6's replay measures slow; B1 only if custom fonts come into use.
