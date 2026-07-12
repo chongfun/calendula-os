@@ -87,11 +87,11 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) -> Duration {
 }
 
 /// Re-materialises the Power button (GPIO3) as a deep-sleep wake source.
-///
-/// SAFETY: only reached on the terminal deep-sleep path. The input task's
-/// `Input<'static>` handle on GPIO3 is about to be torn down by the chip reset
-/// that ends deep sleep, so this second handle never coexists with a live one.
 #[allow(unsafe_code)]
 fn steal_wake_button() -> GPIO3<'static> {
+    // SAFETY: only reached on the terminal deep-sleep path. The input task's
+    // `Input<'static>` handle on GPIO3 is about to be torn down by the chip
+    // reset that ends deep sleep, so this second handle never coexists with a
+    // live one.
     unsafe { GPIO3::steal() }
 }

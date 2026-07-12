@@ -10,6 +10,20 @@ members = [
 ]
 resolver = "2"
 
+# Members opt in with `[lints] workspace = true`; Cargo does not apply this
+# table implicitly. The tools/ crates are separate workspaces and stay outside
+# it. `unsafe_code` levels stay as crate attributes because they differ per
+# crate: libraries forbid it, fw denies it with narrow per-item allows.
+[workspace.lints.rust]
+# Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an
+# inner `unsafe {}` so each operation's obligations stay visible.
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# Every unsafe block carries a `// SAFETY:` comment stating its soundness
+# argument.
+undocumented_unsafe_blocks = "deny"
+
 [profile.release]
 opt-level = "s"          # Size over speed
 lto = "fat"

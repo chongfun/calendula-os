@@ -3,6 +3,9 @@ name = "upload-store"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 # Same pin as fw's; see fw/Cargo.toml for why this exact rev.
 embedded-sdmmc = { git = "https://github.com/rust-embedded-community/embedded-sdmmc-rs.git", rev = "d26892f7405469eba95741763ab39bda2239d5ec", default-features = false }
