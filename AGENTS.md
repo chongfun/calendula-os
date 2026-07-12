@@ -47,7 +47,8 @@ Do not push, tag, publish a release, rewrite history, or discard user changes wi
 ## Rust and embedded constraints
 
 The firmware is `#![no_std]` on an ESP32-C3: 400 KB SRAM, no PSRAM, ~43 KB of
-usable stack, one framebuffer (48,000 bytes on X4, 52,272 bytes on X3),
+usable stack, one framebuffer (48,000 pixel bytes on X4, 52,272 on X3;
+`fw/build.rs` adds one byte for the drawing-frame field),
 `panic = "abort"` in release.
 `docs/ARCHITECTURE.md` (Rules, Data-oriented design) is the authority on the
 invariants; a change that compiles, passes tests, and still violates one of
