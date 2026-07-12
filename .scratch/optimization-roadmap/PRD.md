@@ -22,18 +22,19 @@ builds; the measured evidence now lives in D1's commit message and issue 04).
 whole-device ROI; custom-font items demoted — the owner reads with built-in
 fonts only):**
 
-1. **A2** — byte-run rasterizer fast paths (issue 01). Reading path: every
-   page turn and menu frame. Unblocked by E2. New constraint since
-   2026-07-09: portrait is under active development (portrait reading sheet +
-   icons merged; a portrait-default PR is open) — gate the fast paths on
-   Landscape frames and keep per-pixel portrait, exactly as the issue already
-   says. Goldens must pass unchanged, both boards.
-2. **NEW: B6** — settings-independent content cache, CONTENT.BIN (issue 02).
-   Reading path: a Type Size/Weight/Family change still invalidates every
-   section (`font_config & !0b11`, `fw/src/reader_cache_files.rs:914`) and
-   pays a full cold build — 14.1 s on the measured 11.7 MB EPUB. The full
-   design is inlined in issue 02 (audited against main 2026-07-12; capture
-   at the `push_block` boundary, replay through the same sink).
+1. **A2** — byte-run rasterizer fast paths (issue 01). **IMPLEMENTED
+   2026-07-12 on branch `opt/a2-byte-run-rasterizer`**: `fill_span`/`blit_row`
+   byte-run primitives on `Framebuffer`, landscape frames only, portrait
+   stays per-pixel; goldens unchanged on both boards plus
+   fast-vs-per-pixel-reference equivalence tests. Awaiting PR and the
+   on-device `page-turn` bench (`layout_ms` p95).
+2. **NEW: B6** — settings-independent content cache, CONT.BIN (issue 02).
+   **IMPLEMENTED 2026-07-12 on branch `opt/b6-content-cache`**: capture at
+   the `push_block` seam via a wrapping sink, strict-framed replay through
+   the same sink, relaxed BOOK.BIN labels/TOC loader; all check.sh gates
+   pass. Awaiting PR and the on-device A/B in the commit message (Type Size
+   change on the 11.7 MB baseline book: replay-vs-full timings, identical
+   `total=` counts, corrupt-CONT.BIN fallback still opens).
 3. **B4** — progressive first open (issue 02). Its prerequisites (B3, D1)
    landed. Sequence after B6: both restructure the reader_cache open flow,
    and B6 shrinks the background phase B4 hides. Large; interleaves with
