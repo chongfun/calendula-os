@@ -24,17 +24,31 @@ Use the repository verification entry points:
 - `tools/check.sh fmt` for formatting.
 - `tools/check.sh fast` for normal Rust changes.
 - `tools/check.sh emulator` for UI, layout, rendering, typography, reader-state, or golden-frame changes.
-- `tools/check.sh firmware` for firmware, HAL, board-specific, feature-gated, or release-sensitive changes.
+- `tools/check.sh firmware` for firmware, HAL, board-specific, or release-sensitive changes.
 - `tools/check.sh all` before a pull request is considered ready.
 
 Changes affecting boards, rendering, or firmware must be checked for both X4 and X3.
+
+`tools/check.sh` covers the X4 and X3 device configurations, but not every
+optional feature. When changing feature-gated code, additionally compile or
+lint every affected valid feature combination. For example:
+
+    tools/cargo.sh clippy -p fw --features ota-selftest -- -D warnings
+
+Do not use `--all-features` as a substitute for the repository's defined
+matrix. The `builtin-custom-font` case needs special handling: the checked-in
+`display/src/custom_generated.rs` emits `compile_error!` until a generated
+module replaces it, so verifying changes under that feature requires running
+`tools/font_pack_to_rust.py` first and compiling the affected X4/X3
+combination.
 
 Do not push, tag, publish a release, rewrite history, or discard user changes without explicit permission.
 
 ## Rust and embedded constraints
 
 The firmware is `#![no_std]` on an ESP32-C3: 400 KB SRAM, no PSRAM, ~43 KB of
-usable stack, one 48 KB framebuffer, `panic = "abort"` in release.
+usable stack, one framebuffer (48,000 bytes on X4, 52,272 bytes on X3),
+`panic = "abort"` in release.
 `docs/ARCHITECTURE.md` (Rules, Data-oriented design) is the authority on the
 invariants; a change that compiles, passes tests, and still violates one of
 these is wrong:
@@ -81,10 +95,11 @@ these is wrong:
   `device-x3` deliberately flips the whole workspace to X3 geometry;
   `builtin-custom-font` compiles in a generated typeface; `ota-selftest` is
   an on-device flash exerciser that must never reach a release.
-  `--all-features` builds a nonsense hybrid and verifies nothing — use the
-  `tools/check.sh` entry points, which already cover both devices. Keep new
-  features additive and document their interactions in Cargo.toml comments
-  as the existing ones do.
+  `--all-features` builds a nonsense hybrid and verifies nothing.
+  `tools/check.sh` covers both devices but does not enable
+  `builtin-custom-font` or `ota-selftest`; see the verification note above
+  for how to check those paths. Keep new features additive and document
+  their interactions in Cargo.toml comments as the existing ones do.
 - Prefer crates already in the tree. A new dependency must support the
   firmware target as `no_std`, with default features trimmed, and be weighed
   for flash and RAM cost. Pin Git dependencies to a commit and record why

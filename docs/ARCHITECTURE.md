@@ -67,7 +67,7 @@ flowchart TD
 - `#![no_std]`, no heap allocation in the reading path. The one
   exception is the Wi-Fi sync session, which donates loaned buffers to
   esp-alloc and ends in a reset (see "Wi-Fi sync session").
-- One 48 KB 1 bpp framebuffer.
+- One framebuffer: 48,000 bytes on X4 (800×480), 52,272 bytes on X3 (792×528), 1 bpp.
 - Display ownership is single-writer: only `display_task` touches the EPD bus.
 - Reader state ownership is single-writer: only `app_task` mutates page/menu state.
 - Messages are small `Copy` values. Bulk bytes stay in caller-owned buffers.
@@ -605,7 +605,7 @@ flash/NVM fallback remains separate from the record format.
 | Reopen a cached book | tens of milliseconds |
 | RAM | 400 KB SRAM, no PSRAM |
 | Usable stack | ~43 KB |
-| Framebuffer | one, 48 KB, 1 bit per pixel |
+| Framebuffer | one, 1 bit per pixel: 48,000 B (X4) or 52,272 B (X3) |
 
 ## Bring-up checklist
 
