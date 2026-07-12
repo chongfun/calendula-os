@@ -48,8 +48,10 @@ Do not push, tag, publish a release, rewrite history, or discard user changes wi
 
 The firmware is `#![no_std]` on an ESP32-C3: 400 KB SRAM, no PSRAM, ~43 KB of
 usable stack, two framebuffer allocations (active drawing buffer in main DRAM,
-previous-frame buffer in DRAM2; each is 48,000 pixel bytes on X4, 52,272 on
-X3; `fw/build.rs` adds one byte for the drawing-frame field),
+previous-frame buffer in DRAM2; each is FB_BYTES + 1 bytes: 48,001 bytes on X4,
+52,273 on X3, where the extra byte is due to the Framebuffer layout's FbFrame
+field defined in display/src/fb.rs, and fw/build.rs mirrors
+size_of::<Framebuffer>() when sizing the previous-frame linker slot),
 `panic = "abort"` in release.
 `docs/ARCHITECTURE.md` (Rules, Data-oriented design) is the authority on the
 invariants; a change that compiles, passes tests, and still violates one of
