@@ -1,8 +1,72 @@
 # PRD: CalendulaOS optimization roadmap
 
-Status: ready-for-agent
-Date: 2026-07-09
+Status: round 1 landed — see "Status after round 1" below for what's done, what's disproven, and the next queue
+Date: 2026-07-09 (status updated 2026-07-12)
 Author: research pass over six parallel code-survey agents (display, book pipeline, power/boot, flash/RAM, storage/Wi-Fi, web emulator), each scoped to a mostly-disjoint code region so implementation can proceed in parallel.
+
+## Status after round 1 (2026-07-12)
+
+**Landed on main:** A1 (#12), B2+B3 (#10), C1+C3+C4+C5 (#11), D1 (#14, measured
+results in its commit message), D3 as per-session runtime PSK (#19 — a stronger
+design than the build-time PSK this PRD proposed; see issue 04), E1+E2+E3,
+F1–F4+F6 (#13). Adjacent landings this round: upload same-prefix clobber fix +
+`upload-store` crate with host fault-injection tests (#15, #18 — not from this
+roadmap, but they own the upload write path now), bench harness fixes (#16,
+#17), nested-worktree linker fix (#8), agent-contract docs under `docs/agents/`.
+
+**Disproven on hardware — moved to the do-not-re-propose list:** D2 in its
+entirety, and D1's "~2× SD bandwidth" framing (real win is 5–10% of cold
+builds; the measured evidence now lives in D1's commit message and issue 04).
+
+**Next queue (priority order, rationale in the issue files):**
+
+1. **B1** — custom-font metric cache (issue 02). Unblocked: E2 landed, metrics
+   are the 12-byte layout; the cache should store encoded 12-B records (the
+   in-flash `FONT_METRICS` cache already does exactly that — copy its shape).
+2. **A2** — byte-run rasterizer fast paths (issue 01). Unblocked by E2. New
+   constraint since 2026-07-09: portrait is under active development (portrait
+   reading sheet + icons merged; a portrait-default PR is open) — gate the fast
+   paths on Landscape frames and keep per-pixel portrait, exactly as the issue
+   already says. Goldens must pass unchanged, both boards.
+3. **D4** — directed Wi-Fi join (issue 04). Software-implementable; needs a
+   device for join-time A/B. WIFI.BIN gains fields — keep old records readable.
+4. **C2** — deep-sleep GPIO hold + first-ever sleep-current measurement
+   (issue 03). Needs a device and a µA meter; the largest standby unknown.
+5. **A3** — panel-native framebuffer byte order (issue 01). Frees 8 KB; heavy
+   golden re-bless; coordinate with the portrait work before starting.
+6. **B4** — progressive first open (issue 02). Its sequencing prerequisites
+   (B3, D1) have landed. Large; interleaves with display-task storage dispatch.
+7. **D5** — portal → station handoff (issue 04). Hardware-validation-heavy.
+8. **NEW: upload-ceiling investigation** (issue 04, replaces D2's slot).
+   Measure-first: find what actually caps uploads at ~160 KB/s.
+
+Tier 3 unchanged (A4, A5, C6, E4, F5) except **D6**, which now has a complete
+evidence file in issue 04 — read it before deciding.
+
+**Operational context for the next agent (hard-won this round):**
+
+- Verification gates per branch: `cargo fmt --all --check`; host clippy set +
+  `tools/cargo.sh clippy -p fw` on BOTH boards (`--features device-x3`);
+  release links on both boards (the stack ASSERT is the guard); host tests
+  `--workspace --exclude hal-ext --exclude fw`; emulator golden `--check` on
+  both boards. Read `docs/agents/` — agent-contract docs were added this round.
+- Firmware in nested worktrees links fine now (#8); no RUSTFLAGS workaround.
+- Bench harness: captures survive deep-sleep port loss and `report` summarizes
+  only the latest run in the log (`--all` pools). `reader-soak` is
+  operator-driven — a human works the device while it captures — and menus
+  idle-sleep after 3 min (C4), so keep interacting or the device deep-sleeps
+  mid-capture.
+- Timed upload A/B protocol that produced the D2 verdict: same book/card/
+  network/position, `curl -sS -o /dev/null -H 'Expect:' --data-binary @book
+  "http://<ip>/upload?name=book.epub" -w '%{time_total}s %{speed_upload} B/s'`,
+  3 runs, compare medians. `upload: heap used/free` prints after each upload.
+- Measured X3 envelope (2026-07-12, post-round-1 main): Fast flush 415 ms
+  (busy 379), FastClean 691 ms (busy 456), prestage 33 ms, reading layout
+  19–22 ms, catalog load 31 ms / 15 EPUBs, cold build 14.1 s for an 11.7 MB /
+  441-page EPUB, progress write 51 ms, warm reopen (RAM hit) 13–15 ms.
+- Observed once, unexplained (2026-07-11): X3 PON busy wait hit its 1 s
+  ceiling (`PON busy_low=false 1000ms`) during sleep-entry Full refresh, then
+  behaved normally. First suspect if X3 sleep entry ever misbehaves.
 
 ## Goal
 
@@ -99,6 +163,21 @@ Each workstream is one issue file under `issues/`, owns a distinct set of files,
 - Power: bench-supervised runs with an external µA/mA meter (bench.py has no power channel today).
 
 ## Already considered / rejected — do NOT re-propose
+
+- **D2 (radio RX buffers 8/24 + AMPDU-RX + SD writes paced in 512-B slices
+  with yields) — rejected on hardware measurement 2026-07-11.** Timed upload
+  A/B, X3, 3.2 MB EPUB: main 19.3 s median; D1+D2 21.1 s; D1+buffers-only
+  ~20.2 s. The pacing cost ~1 s/upload; the buffers bought nothing and spent
+  ~6.6 KB of loaned heap at join. Upload throughput sits near 160 KB/s
+  regardless — the bottleneck is neither radio RX nor SD write stalls (main's
+  blocking 4 KB writes demonstrably don't stall TCP). Code comments at the
+  radio config and the upload write loop record the verdict; only the
+  per-upload heap log survived. Any future upload work starts with the
+  upload-ceiling investigation (issue 04), not by re-trying these.
+- **Build-time portal PSK** (this PRD's original D3 shape) — a committed PSK
+  is public in a public repo, and even a CI-minted one is extractable from
+  released firmware.bin. Shipped instead as a per-session runtime PSK with
+  on-device QR encoding (#19).
 
 - Partial-window panel refresh — deliberately shelved, twice (docs/ARCHITECTURE.md, IMPLEMENTATION_PLAN.md).
 - SPI above 40 MHz for the panel (rated ceiling); `MIRROR_Y=true` (tested, wrong).

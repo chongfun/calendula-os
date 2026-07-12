@@ -1,6 +1,6 @@
 # WS-B: Book pipeline — cold builds, custom fonts, catalog scan, progressive open
 
-Status: ready-for-agent
+Status: B2+B3 DONE (#10). Next: B1 (unblocked by E2 — store encoded 12-B metric records, as the in-flash FONT_METRICS cache now does). B4 open, its prerequisites (B3, D1) landed; note the upload write path now belongs to the upload-store crate (#18).
 
 Owns: `fw/src/reader_cache*.rs`, `fw/src/custom_font.rs`, `fw/src/library_sd.rs`, `fw/src/reader_layout.rs`, `ui/src/reading.rs`, `proto/`.
 Do not touch: `fw/src/sd_session.rs` — SD chunk/clock/multi-block changes belong to WS-D (this workstream benefits automatically).
