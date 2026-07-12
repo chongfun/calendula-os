@@ -7,15 +7,17 @@ use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::cache::{
-    decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
-    decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
-    encode_book_v2_header, encode_book_v2_section, encode_page, encode_section_v2_header,
+    decode_block, decode_book_v2_header, decode_book_v2_section, decode_content_header,
+    decode_cover_header, decode_page, decode_section_v2_header, decode_toc, decode_toc_chapter,
+    decode_toc_file_header, encode_block, encode_book_v2_header, encode_book_v2_section,
+    encode_content_header, encode_content_record_header, encode_page, encode_section_v2_header,
     encode_toc, encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord,
-    SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
-    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR,
-    CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR,
-    COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES,
-    TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
+    ContentHeader, ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES,
+    BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE,
+    CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES,
+    CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR, CONTENT_HEADER_BYTES,
+    CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES,
+    TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -678,6 +680,7 @@ pub(crate) fn empty_cache_dir<
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_BOOK_FILE);
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_TOC_FILE);
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_COVER_FILE);
+        let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_CONTENT_FILE);
     }
     // Likewise the book handle: closed by the scope above, deletable here
     // (a directory entry has no chain to reclaim).
@@ -1038,6 +1041,446 @@ where
             false
         }
     }
+}
+
+/// Open the book's `CONT.BIN` (settings-independent content cache) and run
+/// `f` with it. One directory handle walks the chain via `change_dir`, like
+/// `with_v2_sections_dir`.
+pub(crate) fn with_v2_content_file<
+    R,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    mode: Mode,
+    f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
+) -> Option<R>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut dir = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    dir.change_dir(CACHE_V2_DIR).ok()?;
+    dir.change_dir(key).ok()?;
+    let file = dir.open_file_in_dir(CACHE_CONTENT_FILE, mode).ok()?;
+    Some(f(&file))
+}
+
+/// Read `CONT.BIN`'s header, if the file exists and decodes.
+pub(crate) fn read_v2_content_header<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> Option<ContentHeader>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_content_file(root, key, Mode::ReadOnly, |file| {
+        let mut bytes = [0u8; CONTENT_HEADER_BYTES];
+        read_exact_file(file, &mut bytes).ok()?;
+        decode_content_header(&bytes).ok()
+    })
+    .flatten()
+}
+
+/// Delete the book's `CONT.BIN`. Failures are ignored — a stale or corrupt
+/// content cache is only ever an accelerator, and the next full build
+/// recreates it.
+pub(crate) fn delete_v2_content_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(mut dir) = root.open_dir(CACHE_ROOT_DIR) else {
+        return;
+    };
+    if dir.change_dir(CACHE_V2_DIR).is_err() || dir.change_dir(key).is_err() {
+        return;
+    }
+    let _ = upload_store::remove_file_reclaiming_clusters(&dir, CACHE_CONTENT_FILE);
+}
+
+/// Open (creating as needed) the book cache directory that holds CONT.BIN,
+/// one handle walked via `change_dir`. The capture's file handle borrows
+/// it, so the caller keeps it alive for the whole build. Opening a
+/// directory the SECTIONS walk also passes through is fine: this
+/// embedded-sdmmc rev allows duplicate directory opens (directories hold
+/// no cached state); only deleting an open directory errors.
+pub(crate) fn open_v2_content_dir<
+    'v,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &'v Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> Option<Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if ensure_v2_cache_dirs(root, key).is_err() {
+        return None;
+    }
+    let mut dir = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    dir.change_dir(CACHE_V2_DIR).ok()?;
+    dir.change_dir(key).ok()?;
+    Some(dir)
+}
+
+/// Captures the build's `push_block` stream into `<key>/CONT.BIN` so a later
+/// type-settings change replays it instead of re-reading and re-parsing the
+/// EPUB. Failure is one-way and silent: the capture disables itself, and
+/// `finish` deletes the partial file — CONT.BIN is purely an accelerator, so
+/// the build itself never fails on its account.
+pub(crate) struct ContentCapture<
+    'd,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+> where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    /// `None` once disabled (setup or write failure).
+    file: Option<File<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+    stage: [u8; RECORD_STAGE_BYTES],
+    len: usize,
+    source_identity: (u32, u32),
+}
+
+impl<'d, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    ContentCapture<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    /// Create `CONT.BIN` in the book's cache dir (from `open_v2_content_dir`)
+    /// and write its header with `complete = false`; the flag flips in
+    /// `finish` only after the whole spine walk captured. Any failure — or
+    /// `None` for the dir — returns a disabled capture.
+    pub(crate) fn begin(
+        dir: Option<&'d Directory<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+        source_identity: (u32, u32),
+    ) -> Self {
+        let mut capture = Self {
+            file: None,
+            stage: [0u8; RECORD_STAGE_BYTES],
+            len: 0,
+            source_identity,
+        };
+        let Some(dir) = dir else {
+            return capture;
+        };
+        let Ok(file) = dir.open_file_in_dir(CACHE_CONTENT_FILE, Mode::ReadWriteCreateOrTruncate)
+        else {
+            return capture;
+        };
+        let mut header = [0u8; CONTENT_HEADER_BYTES];
+        let encoded = encode_content_header(
+            ContentHeader {
+                source_hash: source_identity.0,
+                source_size: source_identity.1,
+                complete: false,
+            },
+            &mut header,
+        );
+        if encoded.is_ok() && file.write(&header).is_ok() {
+            capture.file = Some(file);
+        }
+        capture
+    }
+
+    /// Record one `push_block` call. The text follows the fixed record
+    /// header; see `proto::cache::ContentRecordHeader`.
+    pub(crate) fn push_block_record(
+        &mut self,
+        spine_index: u16,
+        text: &str,
+        role: proto::text::TextRole,
+        style: proto::text::FontStyle,
+        align: proto::text::TextAlign,
+        paragraph_end: bool,
+    ) {
+        if self.file.is_none() {
+            return;
+        }
+        let Ok(text_len) = u16::try_from(text.len()) else {
+            self.file = None;
+            return;
+        };
+        if text.len() > crate::reader_cache::READER_XHTML_SCRATCH {
+            self.file = None;
+            return;
+        }
+        let mut header = [0u8; CONTENT_RECORD_HEADER_BYTES];
+        if encode_content_record_header(
+            ContentRecordHeader {
+                spine_index,
+                text_len,
+                role,
+                style,
+                align,
+                paragraph_end,
+                spine_end: false,
+            },
+            &mut header,
+        )
+        .is_err()
+        {
+            self.file = None;
+            return;
+        }
+
+        // Ensure both header and text are flushed/staged together: if they don't
+        // fit in the remaining stage capacity, flush the existing buffer first.
+        let total_len = header.len() + text.len();
+        if total_len > self.stage.len() - self.len && self.len > 0 {
+            let Some(file) = self.file.as_ref() else {
+                return;
+            };
+            if file.write(&self.stage[..self.len]).is_err() {
+                self.file = None;
+                return;
+            }
+            self.len = 0;
+        }
+
+        self.stage_push(&header);
+        self.stage_push(text.as_bytes());
+    }
+
+    /// Record the end of one spine item, so replay knows where to finish
+    /// the current section run.
+    pub(crate) fn spine_end(&mut self, spine_index: u16) {
+        if self.file.is_none() {
+            return;
+        }
+        let mut header = [0u8; CONTENT_RECORD_HEADER_BYTES];
+        if encode_content_record_header(
+            ContentRecordHeader {
+                spine_index,
+                text_len: 0,
+                role: proto::text::TextRole::Body,
+                style: proto::text::FontStyle::Regular,
+                align: proto::text::TextAlign::Left,
+                paragraph_end: false,
+                spine_end: true,
+            },
+            &mut header,
+        )
+        .is_err()
+        {
+            self.file = None;
+            return;
+        }
+        self.stage_push(&header);
+    }
+
+    /// Batch small record writes through the staging buffer, the
+    /// `WriteStage` pattern; any write failure disables the capture.
+    fn stage_push(&mut self, bytes: &[u8]) {
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        if bytes.len() > self.stage.len() - self.len {
+            if self.len > 0 && file.write(&self.stage[..self.len]).is_err() {
+                self.file = None;
+                return;
+            }
+            self.len = 0;
+        }
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        if bytes.len() >= self.stage.len() {
+            if file.write(bytes).is_err() {
+                self.file = None;
+            }
+            return;
+        }
+        self.stage[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    /// Flush and mark the capture complete (`keep = true`, the whole spine
+    /// walk captured cleanly), or delete the partial file through the same
+    /// directory handle the capture was opened from. Returns whether a
+    /// complete CONT.BIN was kept.
+    pub(crate) fn finish(
+        mut self,
+        dir: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+        keep: bool,
+    ) -> bool {
+        let mut kept = false;
+        if keep {
+            if self.len > 0 {
+                let flushed = match self.file.as_ref() {
+                    Some(file) => file.write(&self.stage[..self.len]).is_ok(),
+                    None => false,
+                };
+                if !flushed {
+                    self.file = None;
+                }
+                self.len = 0;
+            }
+            if let Some(file) = self.file.as_ref() {
+                let mut header = [0u8; CONTENT_HEADER_BYTES];
+                kept = encode_content_header(
+                    ContentHeader {
+                        source_hash: self.source_identity.0,
+                        source_size: self.source_identity.1,
+                        complete: true,
+                    },
+                    &mut header,
+                )
+                .is_ok()
+                    && file.seek_from_start(0).is_ok()
+                    && file.write(&header).is_ok();
+            }
+        }
+        drop(self.file.take());
+        if !kept {
+            if let Some(dir) = dir {
+                let _ = upload_store::remove_file_reclaiming_clusters(dir, CACHE_CONTENT_FILE);
+            }
+        }
+        kept
+    }
+}
+
+/// Load only the labels (title/author) and the resident TOC copy from a
+/// book's v2 index, accepting any layout config or custom-font identity:
+/// the content replay path runs precisely when the index is layout-invalid,
+/// but its TOC and labels are settings-independent and must survive into
+/// the rewritten index. Deliberately does not touch the section index.
+pub(crate) fn load_v2_book_labels_and_toc<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return false;
+        }
+        let Ok(header) = decode_book_v2_header(&header_bytes) else {
+            return false;
+        };
+        if header.source_hash != source_identity.0
+            || header.source_size != source_identity.1
+            || header.section_count as usize > MAX_BOOK_SECTIONS
+            || header.toc_count as usize > MAX_SD_TOC_ITEMS
+            || header.toc_text_bytes as usize > MAX_SD_TOC_TEXT_BYTES
+            || header.title_text_bytes as usize > 64
+            || header.author_text_bytes as usize > 64
+        {
+            return false;
+        }
+        let toc_offset =
+            BOOK_V2_HEADER_BYTES + header.section_count as usize * BOOK_V2_SECTION_RECORD_BYTES;
+        if file.seek_from_start(toc_offset as u32).is_err() {
+            return false;
+        }
+        let mut toc = [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS];
+        if !read_records_batched(
+            file,
+            TOC_RECORD_BYTES,
+            header.toc_count as usize,
+            |index, bytes| {
+                let Ok(record) = decode_toc(bytes) else {
+                    return false;
+                };
+                if !toc_record_fits_text(record, header.toc_text_bytes) {
+                    return false;
+                }
+                toc[index] = record;
+                true
+            },
+        ) {
+            return false;
+        }
+        library.clear_toc();
+        if header.toc_text_bytes > 0 {
+            let text_len = header.toc_text_bytes as usize;
+            if read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
+                return false;
+            }
+            library.toc_text_len = text_len;
+            library.toc_count = header.toc_count as usize;
+            for (index, record) in toc
+                .iter()
+                .take(header.toc_count as usize)
+                .copied()
+                .enumerate()
+            {
+                library.toc[index] = record;
+                library.toc_page[index] = 0;
+            }
+        }
+        let mut title = [0u8; 64];
+        let mut author = [0u8; 64];
+        let mut title_str = "";
+        let mut author_str = "";
+        if header.title_text_bytes > 0 {
+            let title_len = header.title_text_bytes as usize;
+            if read_exact_file(file, &mut title[..title_len]).is_err() {
+                return false;
+            }
+            let Ok(parsed_title) = core::str::from_utf8(&title[..title_len]) else {
+                return false;
+            };
+            title_str = parsed_title;
+        }
+        if header.author_text_bytes > 0 {
+            let author_len = header.author_text_bytes as usize;
+            if read_exact_file(file, &mut author[..author_len]).is_err() {
+                return false;
+            }
+            let Ok(parsed_author) = core::str::from_utf8(&author[..author_len]) else {
+                return false;
+            };
+            author_str = parsed_author;
+        }
+        if header.title_text_bytes > 0 || header.author_text_bytes > 0 {
+            library.set_book_labels(title_str, author_str);
+        }
+        true
+    })
+    .unwrap_or(false)
 }
 
 fn with_v2_section_file<
