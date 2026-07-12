@@ -3,6 +3,9 @@ name = "display"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [features]
 # Xteink X3 panel (792x528, UC8253). Off = Xteink X4 (800x480, SSD1677),
 # the default so host tools and existing builds are untouched. Additive so
