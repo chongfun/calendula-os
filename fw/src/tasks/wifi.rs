@@ -593,7 +593,9 @@ async fn run_portal(
     );
     if controller.set_config(&config).is_err() {
         esp_println::println!("portal: ap start failed");
-        send_event(SyncEvent::Failed(SyncError::RadioInit));
+        SYNC_EVENTS
+            .send(SyncEvent::Failed(SyncError::RadioInit))
+            .await;
         park_until_exit().await;
     }
 
