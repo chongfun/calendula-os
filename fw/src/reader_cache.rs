@@ -14,7 +14,10 @@ use esp_hal::gpio::Output;
 use hal_ext::nvm::AppStateRecord;
 use heapless::String;
 use proto::book::BookId;
-use proto::cache::BookV2SectionRecord;
+use proto::cache::{
+    decode_content_record_header, BookV2SectionRecord, CONTENT_HEADER_BYTES,
+    CONTENT_RECORD_HEADER_BYTES,
+};
 use proto::epub::{
     decode_html_entity, parse_opf, strip_fragment, CssRules, Epub3NavStreamParser, EpubTocSink,
     EpubZipOps, NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
@@ -273,6 +276,14 @@ where
         library,
         Instant::now(),
         "fast",
+    ) || try_replay_content_cache(
+        root,
+        cache_key.as_str(),
+        source_identity,
+        target_pages as u32,
+        library,
+        scratch,
+        font_metrics,
     ) {
         BookLoadStatus::Ready
     } else if in_books_dir {
@@ -1019,9 +1030,18 @@ where
         })
         .unwrap_or_else(|| inferred_start_spine_index(&package));
 
+    // Capture the push_block stream into CONT.BIN alongside the build, so a
+    // type-settings change can replay it without re-parsing the EPUB. The
+    // capture is a pure accelerator: it disables itself on any failure and
+    // never fails the build. Its directory handle outlives the whole walk
+    // because the capture's file handle borrows it.
+    let content_dir = reader_cache_files::open_v2_content_dir(root, cache_key);
+    let mut content =
+        reader_cache_files::ContentCapture::begin(content_dir.as_ref(), source_identity);
+
     // The SECTIONS directory stays open for the whole spine walk; every
     // section flush is one file open instead of a four-level dir walk.
-    reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
+    let walk = reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
         for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
             *index >= start_spine_index
                 && !item.href.is_empty()
@@ -1046,6 +1066,7 @@ where
             );
             let type_settings = library.type_settings();
             let page_box = library.page_box();
+            let spine_u16 = spine_index.min(u16::MAX as usize) as u16;
             let mut sink = LibraryBlockSink {
                 library,
                 root,
@@ -1057,7 +1078,7 @@ where
                 total_pages: &mut total_pages,
                 book_partial: &mut book_partial,
                 write_micros: &mut section_write_micros,
-                spine_index: spine_index.min(u16::MAX as usize) as u16,
+                spine_index: spine_u16,
                 line: String::new(),
                 line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
                 line_role: TextRole::Body,
@@ -1077,6 +1098,11 @@ where
             // no 24 KB prefix truncation. The parser's in-body assumption is
             // sniffed from the first decoded window, mirroring the
             // whole-document contains() check.
+            let mut capture_sink = CapturingBlockSink {
+                inner: &mut sink,
+                capture: &mut content,
+                spine_index: spine_u16,
+            };
             let mut tokenizer = StreamingXmlTokenizer::new();
             let mut parser: Option<XhtmlBlockStreamParser> = None;
             let mut parse_error: Option<XhtmlError> = None;
@@ -1092,7 +1118,7 @@ where
                         XhtmlBlockStreamParser::new(!has_body)
                     });
                     tokenizer
-                        .feed_xhtml_blocks(chunk, parser, Some(&css_rules), &mut sink)
+                        .feed_xhtml_blocks(chunk, parser, Some(&css_rules), &mut capture_sink)
                         .map_err(|err| {
                             parse_error = Some(err);
                             proto::epub::ZipError::Inflate
@@ -1102,8 +1128,8 @@ where
             match read_result {
                 Ok(()) => {
                     if let Some(parser) = parser.as_mut() {
-                        if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut sink) {
-                            if !sink.stopped {
+                        if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut capture_sink) {
+                            if !capture_sink.inner.stopped {
                                 return Err(err.into());
                             }
                         }
@@ -1111,11 +1137,11 @@ where
                 }
                 Err(_) if parse_error.is_some() => {
                     let err = parse_error.take().expect("parse error recorded");
-                    if sink.stopped {
+                    if capture_sink.inner.stopped {
                         esp_println::println!(
                             "epub: bounded open stopped at spine {} after {} section(s): {:?}",
                             spine_index,
-                            *sink.section_count,
+                            *capture_sink.inner.section_count,
                             err
                         );
                     } else {
@@ -1125,73 +1151,439 @@ where
                 Err(err) => return Err(err.into()),
             }
             sink.finish_spine(false);
+            content.spine_end(spine_u16);
         }
         Ok::<(), ReaderCacheError>(())
-    })?;
+    });
+
+    // Keep CONT.BIN only when the walk captured the whole book: a partial
+    // or failed capture is deleted so replay can never resurrect a
+    // truncated stream.
+    let content_kept = content.finish(
+        content_dir.as_ref(),
+        walk.is_ok() && !book_partial && section_count > 0 && total_pages > 0,
+    );
+    esp_println::println!("epub: content capture kept={}", content_kept);
+    walk?;
 
     if section_count > 0 && total_pages > 0 {
-        let sections_slice = &sections[..section_count];
-        let wrote_index = reader_cache_files::write_v2_book_index(
+        publish_book_cache(
             root,
             cache_key,
             source_identity,
-            total_pages,
-            sections_slice,
+            requested_global_page,
+            "full",
+            open_started,
+            spine_started,
+            io_start,
+            section_write_micros,
             library,
+            &sections[..section_count],
+            total_pages,
             book_partial,
-        );
-        library.set_book_index(total_pages, book_partial || !wrote_index, sections_slice);
-        match reader_cache_files::load_v2_section_by_global_page(
-            root,
-            cache_key,
-            source_identity,
-            requested_global_page.min(total_pages.saturating_sub(1)),
-            library,
-        ) {
-            CacheLoadResult::Hit { .. } => {}
-            _ => {
-                let first = sections_slice[0];
-                library.set_current_section_range(first.start_page, first.page_count as usize);
-            }
-        }
-        reader_layout::rebuild_toc_page_targets(library);
-        refresh_chapter_tracking(
-            root,
-            cache_key,
-            source_identity,
-            requested_global_page.min(total_pages.saturating_sub(1)),
-            library,
-        );
-        let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
-        esp_println::println!("epub: stage PublishLoaded");
-        esp_println::println!(
-            "epub: full book cache ready after {} ms (total={} sections={} partial={} cover={:?} key {})",
-            open_started.elapsed().as_millis(),
-            total_pages,
-            section_count,
-            book_partial,
-            cover,
-            cache_key
-        );
-        let io = crate::sd_session::sd_stats::snapshot().since(io_start);
-        esp_println::println!(
-            "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={}",
-            open_started.elapsed().as_millis(),
-            spine_started.elapsed().as_millis(),
-            section_write_micros / 1000,
-            section_count,
-            total_pages,
-            io.read_calls,
-            io.read_blocks,
-            io.write_calls,
-            io.write_blocks,
-            cache_key
         );
         Ok(())
     } else if saw_spine {
         Err(ReaderCacheError::NoBodyText)
     } else {
         Err(ReaderCacheError::MissingSpine)
+    }
+}
+
+/// The shared publish tail of a section-cache build: write BOOK.BIN, load
+/// the requested section, refresh chapter tracking and the cover, and print
+/// the ready/bench lines. Used by the full EPUB build (`label` "full") and
+/// the CONT.BIN replay path (`label` "replay").
+#[allow(clippy::too_many_arguments)]
+fn publish_book_cache<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    cache_key: &str,
+    source_identity: (u32, u32),
+    requested_global_page: u32,
+    label: &str,
+    open_started: Instant,
+    spine_started: Instant,
+    io_start: crate::sd_session::sd_stats::Snapshot,
+    section_write_micros: u64,
+    library: &mut ReaderStore,
+    sections_slice: &[BookV2SectionRecord],
+    total_pages: u32,
+    book_partial: bool,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let wrote_index = reader_cache_files::write_v2_book_index(
+        root,
+        cache_key,
+        source_identity,
+        total_pages,
+        sections_slice,
+        library,
+        book_partial,
+    );
+    library.set_book_index(total_pages, book_partial || !wrote_index, sections_slice);
+    match reader_cache_files::load_v2_section_by_global_page(
+        root,
+        cache_key,
+        source_identity,
+        requested_global_page.min(total_pages.saturating_sub(1)),
+        library,
+    ) {
+        CacheLoadResult::Hit { .. } => {}
+        _ => {
+            let first = sections_slice[0];
+            library.set_current_section_range(first.start_page, first.page_count as usize);
+        }
+    }
+    reader_layout::rebuild_toc_page_targets(library);
+    refresh_chapter_tracking(
+        root,
+        cache_key,
+        source_identity,
+        requested_global_page.min(total_pages.saturating_sub(1)),
+        library,
+    );
+    let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
+    esp_println::println!("epub: stage PublishLoaded");
+    esp_println::println!(
+        "epub: {label} book cache ready after {} ms (total={} sections={} partial={} cover={:?} key {})",
+        open_started.elapsed().as_millis(),
+        total_pages,
+        sections_slice.len(),
+        book_partial,
+        cover,
+        cache_key
+    );
+    let io = crate::sd_session::sd_stats::snapshot().since(io_start);
+    esp_println::println!(
+        "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={}",
+        open_started.elapsed().as_millis(),
+        spine_started.elapsed().as_millis(),
+        section_write_micros / 1000,
+        sections_slice.len(),
+        total_pages,
+        io.read_calls,
+        io.read_blocks,
+        io.write_calls,
+        io.write_blocks,
+        cache_key
+    );
+}
+
+/// Forwards `push_block` to the build sink while recording the exact call
+/// into the content capture. Wrapping at the trait seam keeps the capture
+/// out of `LibraryBlockSink`'s already-wide borrow set, and guarantees the
+/// captured stream is byte-for-byte what the sink consumed.
+struct CapturingBlockSink<
+    'w,
+    'v,
+    S,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+> where
+    S: XhtmlBlockSink,
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    inner: &'w mut S,
+    capture: &'w mut reader_cache_files::ContentCapture<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    spine_index: u16,
+}
+
+impl<S, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    XhtmlBlockSink for CapturingBlockSink<'_, '_, S, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    S: XhtmlBlockSink,
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    fn push_block(
+        &mut self,
+        text: &str,
+        role: TextRole,
+        style: proto::text::FontStyle,
+        align: TextAlign,
+        paragraph_end: bool,
+    ) -> Result<(), XhtmlError> {
+        self.capture
+            .push_block_record(self.spine_index, text, role, style, align, paragraph_end);
+        self.inner
+            .push_block(text, role, style, align, paragraph_end)
+    }
+}
+
+/// Rebuild the section cache by replaying CONT.BIN — the captured
+/// `push_block` stream — through the same build sink, skipping the zip
+/// read, inflate, and XML parse entirely. Runs when the v2 index missed
+/// (typically a type-settings change); returns true when the book
+/// published Ready. Any validation or framing failure deletes the file and
+/// returns false, so the caller falls back to the full EPUB build.
+#[inline(never)]
+fn try_replay_content_cache<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    cache_key: &str,
+    source_identity: (u32, u32),
+    requested_global_page: u32,
+    library: &mut ReaderStore,
+    scratch: &mut ReaderCacheScratch<'_>,
+    font_metrics: &mut crate::custom_font::MetricCache,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let open_started = Instant::now();
+    match reader_cache_files::read_v2_content_header(root, cache_key) {
+        Some(header)
+            if header.complete
+                && header.source_hash == source_identity.0
+                && header.source_size == source_identity.1 => {}
+        Some(_) => {
+            // Incomplete or written for a different file under the same
+            // key: dead weight, delete it.
+            reader_cache_files::delete_v2_content_file(root, cache_key);
+            return false;
+        }
+        None => return false,
+    }
+    // The old BOOK.BIN is layout-invalid but its labels and TOC copy are
+    // settings-independent; carry them into the rewritten index. Bail to
+    // the full build when they can't be recovered — it re-parses them.
+    if !reader_cache_files::load_v2_book_labels_and_toc(root, cache_key, source_identity, library) {
+        return false;
+    }
+    library.clear_cover();
+    esp_println::println!("epub: stage ReplayContentCache");
+
+    let io_start = crate::sd_session::sd_stats::snapshot();
+    let spine_started = Instant::now();
+    scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
+    let sections = &mut *scratch.book_sections;
+    let mut section_count = 0usize;
+    let mut total_pages = 0u32;
+    let mut book_partial = false;
+    let mut section_write_micros: u64 = 0;
+    let visible_page_capacity = library.page_capacity().max(1);
+    let generate_toc_from_headings = library.toc_count() == 0;
+
+    let replayed = reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
+        reader_cache_files::with_v2_content_file(root, cache_key, Mode::ReadOnly, |file| {
+            replay_content_records(
+                file,
+                root,
+                sections_dir,
+                source_identity,
+                library,
+                font_metrics,
+                sections,
+                &mut section_count,
+                &mut total_pages,
+                &mut book_partial,
+                &mut section_write_micros,
+                &mut scratch.xhtml[..],
+                visible_page_capacity,
+                generate_toc_from_headings,
+            )
+        })
+        .unwrap_or(Err(()))
+    });
+
+    if replayed.is_err() || section_count == 0 || total_pages == 0 {
+        esp_println::println!("epub: content replay failed, falling back to full build");
+        reader_cache_files::delete_v2_content_file(root, cache_key);
+        return false;
+    }
+    publish_book_cache(
+        root,
+        cache_key,
+        source_identity,
+        requested_global_page,
+        "replay",
+        open_started,
+        spine_started,
+        io_start,
+        section_write_micros,
+        library,
+        &sections[..section_count],
+        total_pages,
+        book_partial,
+    );
+    true
+}
+
+/// Ensure at least `need` bytes sit at `buf[*pos..*fill]`, shifting the
+/// buffered remainder to the front and refilling from the file.
+/// `Ok(false)` is a clean end-of-file exactly on a record boundary;
+/// `Err(())` is a short file mid-record or a read failure.
+fn refill_content_buf<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    buf: &mut [u8],
+    pos: &mut usize,
+    fill: &mut usize,
+    need: usize,
+) -> Result<bool, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if *fill - *pos >= need {
+        return Ok(true);
+    }
+    buf.copy_within(*pos..*fill, 0);
+    *fill -= *pos;
+    *pos = 0;
+    while *fill < need {
+        let read = file.read(&mut buf[*fill..]).map_err(|_| ())?;
+        if read == 0 {
+            return if *fill == 0 { Ok(false) } else { Err(()) };
+        }
+        *fill += read;
+    }
+    Ok(true)
+}
+
+/// Stream CONT.BIN's records into fresh `LibraryBlockSink` runs, one per
+/// captured spine item, mirroring the full build's spine loop. The marker
+/// discipline is strict — every group ends in a spine-end record and never
+/// changes spine index mid-group — so any violation means a corrupt file.
+#[allow(clippy::too_many_arguments)]
+fn replay_content_records<
+    'r,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    root: &'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
+    sections: &mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
+    section_count: &mut usize,
+    total_pages: &mut u32,
+    book_partial: &mut bool,
+    write_micros: &mut u64,
+    buf: &mut [u8],
+    visible_page_capacity: usize,
+    generate_toc_from_headings: bool,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if file.seek_from_start(CONTENT_HEADER_BYTES as u32).is_err() {
+        return Err(());
+    }
+    let mut pos = 0usize;
+    let mut fill = 0usize;
+    'groups: loop {
+        // Peek the next group's spine index; clean EOF here ends the walk.
+        if !refill_content_buf(file, buf, &mut pos, &mut fill, CONTENT_RECORD_HEADER_BYTES)? {
+            return Ok(());
+        }
+        let group_spine =
+            decode_content_record_header(&buf[pos..pos + CONTENT_RECORD_HEADER_BYTES])
+                .map_err(|_| ())?
+                .spine_index;
+        if *section_count >= sections.len() {
+            *book_partial = true;
+            return Ok(());
+        }
+        library.clear_lines();
+        let type_settings = library.type_settings();
+        let page_box = library.page_box();
+        let mut sink = LibraryBlockSink {
+            library: &mut *library,
+            root,
+            sections_dir,
+            source_identity,
+            font_metrics: &mut *font_metrics,
+            sections: &mut *sections,
+            section_count: &mut *section_count,
+            total_pages: &mut *total_pages,
+            book_partial: &mut *book_partial,
+            write_micros: &mut *write_micros,
+            spine_index: group_spine,
+            line: String::new(),
+            line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
+            line_role: TextRole::Body,
+            line_align: TextAlign::Justify,
+            line_style: FontStyle::Regular,
+            pending_space: false,
+            dropping_paragraph: false,
+            stopped: false,
+            target_pages: visible_page_capacity,
+            generate_toc_from_headings,
+            generated_toc_for_spine: false,
+            page_cursor: ui::reading::PageIndexCursor::start(page_box),
+            page_overflowed: false,
+        };
+        loop {
+            // A complete capture never ends mid-group: EOF here is corrupt.
+            if !refill_content_buf(file, buf, &mut pos, &mut fill, CONTENT_RECORD_HEADER_BYTES)? {
+                return Err(());
+            }
+            let record = decode_content_record_header(&buf[pos..pos + CONTENT_RECORD_HEADER_BYTES])
+                .map_err(|_| ())?;
+            if record.spine_index != group_spine {
+                return Err(());
+            }
+            pos += CONTENT_RECORD_HEADER_BYTES;
+            if record.spine_end {
+                sink.finish_spine(false);
+                continue 'groups;
+            }
+            let text_len = record.text_len as usize;
+            if text_len > buf.len() {
+                return Err(());
+            }
+            if !refill_content_buf(file, buf, &mut pos, &mut fill, text_len)? {
+                return Err(());
+            }
+            let text = core::str::from_utf8(&buf[pos..pos + text_len]).map_err(|_| ())?;
+            let pushed = sink.push_block(
+                text,
+                record.role,
+                record.style,
+                record.align,
+                record.paragraph_end,
+            );
+            pos += text_len;
+            if pushed.is_err() {
+                if sink.stopped {
+                    // Section capacity exhausted at these settings — the
+                    // same stop a full build takes; publish partial.
+                    sink.finish_spine(false);
+                    return Ok(());
+                }
+                return Err(());
+            }
+        }
     }
 }
 

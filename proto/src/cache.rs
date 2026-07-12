@@ -68,6 +68,111 @@ pub const TOC_FILE_HEADER_BYTES: usize = 16;
 pub const TOC_CHAPTER_TITLE_BYTES: usize = 60;
 pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;
 
+/// Settings-independent content cache: the exact `push_block` argument
+/// stream captured during a full EPUB build (fragment text plus role,
+/// style, align, paragraph_end, and spine boundaries). A type-settings
+/// change replays this file through the same build sink instead of
+/// re-reading, re-inflating, and re-parsing the whole EPUB. Keyed by
+/// source identity and `CONTENT_VERSION` only — never by layout config.
+/// Bump `CONTENT_VERSION` whenever XHTML parsing, entity decoding, or sink
+/// normalization semantics change (the `READER_LAYOUT_VERSION` discipline).
+pub const CACHE_CONTENT_FILE: &str = "CONT.BIN";
+pub const CONTENT_MAGIC: u32 = 0x5834_434E; // X4CN
+pub const CONTENT_VERSION: u16 = 1;
+pub const CONTENT_HEADER_BYTES: usize = 16;
+pub const CONTENT_RECORD_HEADER_BYTES: usize = 8;
+const CONTENT_FLAG_COMPLETE: u8 = 1;
+const CONTENT_RECORD_FLAG_PARAGRAPH_END: u8 = 1;
+const CONTENT_RECORD_FLAG_SPINE_END: u8 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentHeader {
+    pub source_hash: u32,
+    pub source_size: u32,
+    /// False until the capture has recorded the whole spine walk; replay
+    /// only ever runs from a complete capture.
+    pub complete: bool,
+}
+
+/// One captured `push_block` call (text follows the header), or — with
+/// `spine_end` set and `text_len` 0 — the end-of-spine-item marker that
+/// tells replay to finish the current section run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentRecordHeader {
+    pub spine_index: u16,
+    pub text_len: u16,
+    pub role: TextRole,
+    pub style: FontStyle,
+    pub align: TextAlign,
+    pub paragraph_end: bool,
+    pub spine_end: bool,
+}
+
+pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, CONTENT_HEADER_BYTES)?;
+    write_u32(out, 0, CONTENT_MAGIC);
+    write_u16(out, 4, CONTENT_VERSION);
+    out[6] = if header.complete {
+        CONTENT_FLAG_COMPLETE
+    } else {
+        0
+    };
+    out[7] = 0;
+    write_u32(out, 8, header.source_hash);
+    write_u32(out, 12, header.source_size);
+    Ok(CONTENT_HEADER_BYTES)
+}
+
+pub fn decode_content_header(input: &[u8]) -> Result<ContentHeader, CacheError> {
+    require(input, CONTENT_HEADER_BYTES)?;
+    if read_u32(input, 0)? != CONTENT_MAGIC {
+        return Err(CacheError::BadMagic);
+    }
+    if read_u16(input, 4)? != CONTENT_VERSION {
+        return Err(CacheError::BadVersion);
+    }
+    Ok(ContentHeader {
+        source_hash: read_u32(input, 8)?,
+        source_size: read_u32(input, 12)?,
+        complete: input[6] & CONTENT_FLAG_COMPLETE != 0,
+    })
+}
+
+pub fn encode_content_record_header(
+    record: ContentRecordHeader,
+    out: &mut [u8],
+) -> Result<usize, CacheError> {
+    require(out, CONTENT_RECORD_HEADER_BYTES)?;
+    if record.spine_end && record.text_len != 0 {
+        return Err(CacheError::BadLength);
+    }
+    write_u16(out, 0, record.spine_index);
+    write_u16(out, 2, record.text_len);
+    out[4] = role_byte(record.role);
+    out[5] = style_byte(record.style);
+    out[6] = align_byte(record.align);
+    out[7] = (u8::from(record.paragraph_end) * CONTENT_RECORD_FLAG_PARAGRAPH_END)
+        | (u8::from(record.spine_end) * CONTENT_RECORD_FLAG_SPINE_END);
+    Ok(CONTENT_RECORD_HEADER_BYTES)
+}
+
+pub fn decode_content_record_header(input: &[u8]) -> Result<ContentRecordHeader, CacheError> {
+    require(input, CONTENT_RECORD_HEADER_BYTES)?;
+    let record = ContentRecordHeader {
+        spine_index: read_u16(input, 0)?,
+        text_len: read_u16(input, 2)?,
+        role: role_from_byte(input[4])?,
+        style: style_from_byte(input[5])?,
+        align: align_from_byte(input[6])?,
+        paragraph_end: input[7] & CONTENT_RECORD_FLAG_PARAGRAPH_END != 0,
+        spine_end: input[7] & CONTENT_RECORD_FLAG_SPINE_END != 0,
+    };
+    if record.spine_end && record.text_len != 0 {
+        return Err(CacheError::BadLength);
+    }
+    Ok(record)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheError {
     BufferTooSmall,
@@ -914,6 +1019,110 @@ fn align_from_byte(byte: u8) -> Result<TextAlign, CacheError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_header_round_trips_and_rejects_foreign_bytes() {
+        for complete in [false, true] {
+            let header = ContentHeader {
+                source_hash: 0xDEAD_BEEF,
+                source_size: 3_200_141,
+                complete,
+            };
+            let mut bytes = [0u8; CONTENT_HEADER_BYTES];
+            encode_content_header(header, &mut bytes).expect("header encodes");
+            assert_eq!(decode_content_header(&bytes), Ok(header));
+        }
+
+        let mut bytes = [0u8; CONTENT_HEADER_BYTES];
+        encode_content_header(
+            ContentHeader {
+                source_hash: 1,
+                source_size: 2,
+                complete: true,
+            },
+            &mut bytes,
+        )
+        .expect("header encodes");
+        let mut bad_magic = bytes;
+        bad_magic[0] ^= 0xFF;
+        assert_eq!(decode_content_header(&bad_magic), Err(CacheError::BadMagic));
+        let mut bad_version = bytes;
+        bad_version[4] = 0xFF;
+        assert_eq!(
+            decode_content_header(&bad_version),
+            Err(CacheError::BadVersion)
+        );
+        assert_eq!(
+            decode_content_header(&bytes[..CONTENT_HEADER_BYTES - 1]),
+            Err(CacheError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn content_record_header_round_trips() {
+        let block = ContentRecordHeader {
+            spine_index: 12,
+            text_len: 517,
+            role: TextRole::BlockQuote,
+            style: FontStyle::Italic,
+            align: TextAlign::Center,
+            paragraph_end: true,
+            spine_end: false,
+        };
+        let marker = ContentRecordHeader {
+            spine_index: 12,
+            text_len: 0,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: false,
+            spine_end: true,
+        };
+        for record in [block, marker] {
+            let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
+            encode_content_record_header(record, &mut bytes).expect("record encodes");
+            assert_eq!(decode_content_record_header(&bytes), Ok(record));
+        }
+    }
+
+    #[test]
+    fn content_record_header_rejects_bad_bytes() {
+        let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
+        encode_content_record_header(
+            ContentRecordHeader {
+                spine_index: 3,
+                text_len: 9,
+                role: TextRole::Body,
+                style: FontStyle::Regular,
+                align: TextAlign::Justify,
+                paragraph_end: false,
+                spine_end: false,
+            },
+            &mut bytes,
+        )
+        .expect("record encodes");
+        let mut bad_role = bytes;
+        bad_role[4] = 9;
+        assert!(decode_content_record_header(&bad_role).is_err());
+        // A spine-end marker carrying text is structurally invalid: replay
+        // would mis-frame the stream.
+        let mut text_on_marker = bytes;
+        text_on_marker[7] = 2;
+        assert!(decode_content_record_header(&text_on_marker).is_err());
+        assert!(encode_content_record_header(
+            ContentRecordHeader {
+                spine_index: 0,
+                text_len: 1,
+                role: TextRole::Body,
+                style: FontStyle::Regular,
+                align: TextAlign::Left,
+                paragraph_end: false,
+                spine_end: true,
+            },
+            &mut bytes,
+        )
+        .is_err());
+    }
 
     #[test]
     fn page_cache_records_round_trip() {
