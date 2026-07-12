@@ -40,11 +40,8 @@ pub fn fill_rect(fb: &mut Framebuffer, rect: Rect, white: bool) {
     };
 
     let y_end = rect.y as usize + rect.h as usize;
-    let x_end = rect.x as usize + rect.w as usize;
     for y in rect.y as usize..y_end {
-        for x in rect.x as usize..x_end {
-            fb.set_pixel(x, y, white);
-        }
+        fb.fill_span(rect.x as usize, y, rect.w as usize, white);
     }
 }
 
