@@ -31,7 +31,7 @@ pub const PORTAL_SSID: &str = if display::DEVICE_IS_X3 {
 pub const MAX_VERSION: Version = Version::new(5);
 
 /// Required length of both scratch buffers handed to [`encode`].
-pub const BUFFER_LEN: usize = MAX_VERSION.buffer_len();
+pub const BUFFER_LEN: usize = 173;
 
 /// Encodes `WIFI:T:WPA;S:{PORTAL_SSID};P:{psk};;` at EC level M with the
 /// smallest version that fits (version 4 for the 16-char PSK) and an
