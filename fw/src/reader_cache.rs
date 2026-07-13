@@ -166,12 +166,14 @@ impl<'a> ReaderCacheScratch<'a> {
             xhtml,
             book_sections,
             zip_inflate: ZipInflateScratch::new(),
-            generation: SCRATCH_GENERATION.fetch_add(1, portable_atomic::Ordering::Relaxed),
+            generation: SCRATCH_GENERATION.load(portable_atomic::Ordering::Relaxed),
         }
     }
 
     pub(crate) fn invalidate(&mut self) {
-        self.generation = SCRATCH_GENERATION.fetch_add(1, portable_atomic::Ordering::Relaxed);
+        self.generation = SCRATCH_GENERATION
+            .fetch_add(1, portable_atomic::Ordering::Relaxed)
+            .wrapping_add(1);
     }
 }
 
@@ -238,7 +240,7 @@ pub(crate) fn build_or_load_book_cache(
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
 ) -> Option<BookBuildResume> {
-    scratch.generation = scratch.generation.wrapping_add(1);
+    scratch.invalidate();
     esp_println::println!(
         "epub: cache open index {} chapter {} target {}",
         index,

@@ -784,6 +784,7 @@ fn handle_storage_command(
                 || request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed)
             {
                 esp_println::println!("storage: build continue superseded");
+                invalidate_build_resume(build_resume, epub_scratch);
                 return;
             }
             // The page the reader is looking at: each step ends by putting

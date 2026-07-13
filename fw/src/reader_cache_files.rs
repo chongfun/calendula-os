@@ -1227,8 +1227,8 @@ where
 
     /// Reopen the capture a suspended build step left behind and append
     /// continuation records. The header keeps `complete = false` until the
-    /// final step's `finish`; identity is not re-checked here — the resume
-    /// state is only ever fed back by the same build.
+    /// final step's `finish`; the capture header is verified against the
+    /// source identity before resuming append.
     pub(crate) fn resume_append(
         dir: Option<&'d Directory<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
         source_identity: (u32, u32),
