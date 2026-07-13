@@ -438,6 +438,13 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         StorageCommand::ReceiveUpload => {
             esp_println::println!("app: storage {label} receive upload")
         }
+        StorageCommand::ContinueBookBuild {
+            request_id,
+            book_id,
+            index,
+        } => esp_println::println!(
+            "app: storage {label} continue build request={request_id} book_id={book_id} index={index}"
+        ),
         StorageCommand::LoadChapters {
             request_id,
             book_id,

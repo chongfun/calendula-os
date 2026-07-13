@@ -63,6 +63,10 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     // Storage-command admission for the sync session lifecycle; the loan
     // transition and refusal rules live in app-core with the contracts.
     let mut sync_session = SyncSession::default();
+    // Suspended progressive book build, if one is running in the background:
+    // (request_id, book_id, state). RAM-only — cleared by sleep, the sync
+    // loan, or any new open; the on-disk provisional index stays valid.
+    let mut build_resume: Option<(u32, u32, reader_cache::BookBuildResume)> = None;
     // On a deep-sleep (Power button) wake the panel still shows the sleep
     // screen: deep_sleep_wake is true only when the RTC wake cause is the
     // armed GPIO *and* the pre-sleep handshake recorded that the sleep frame
@@ -280,6 +284,10 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
                 );
+                // A suspended background build does not survive sleep; the
+                // book stays a valid partial cache and crossing its frontier
+                // after wake rebuilds progressively.
+                build_resume = None;
                 flush_pending_progress(
                     &mut epd,
                     &mut sd_cs,
@@ -410,8 +418,19 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     &mut pending_progress,
                     &mut last_progress_write,
                     &mut state_restored,
+                    &mut build_resume,
                     refresh_planner.last_request(),
                 );
+                // Safety net for a full command channel at suspend time: as
+                // long as a build is suspended, keep one continuation queued.
+                // Duplicates are harmless — each just runs one more step.
+                if let Some((request_id, book_id, resume)) = build_resume {
+                    let _ = STORAGE_COMMANDS.try_send(StorageCommand::ContinueBookBuild {
+                        request_id,
+                        book_id,
+                        index: resume.index,
+                    });
+                }
             }
         }
     }
@@ -511,6 +530,7 @@ fn handle_storage_command(
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
+    build_resume: &mut Option<(u32, u32, reader_cache::BookBuildResume)>,
     last_request: Option<RenderRequest>,
 ) {
     let is_open_book = matches!(command, StorageCommand::OpenBook { .. });
@@ -523,6 +543,9 @@ fn handle_storage_command(
     }
     match command {
         StorageCommand::LoanSyncMemory => {
+            // The scratch (and the build's section records in it) is about
+            // to be dismantled; the session ends in a reset anyway.
+            *build_resume = None;
             // The session only ends in a reset, so any coalesced position
             // must reach the card before the scratch is dismantled.
             flush_pending_progress(
@@ -694,8 +717,11 @@ fn handle_storage_command(
                 target_pages
             );
             sd_library.set_reader_status(BookLoadStatus::Loading);
+            // Any rebuild supersedes a background build in flight: the
+            // scratch is about to be rewritten.
+            *build_resume = None;
             let scratch = ensure_epub_scratch(epub_scratch);
-            reader_cache::build_or_load_book_cache(
+            let suspended = reader_cache::build_or_load_book_cache(
                 epd,
                 sd_cs,
                 sd_library,
@@ -705,6 +731,16 @@ fn handle_storage_command(
                 scratch,
                 font_metrics,
             );
+            if let Some(resume) = suspended {
+                // Published provisionally; finish the walk in the
+                // background, one slice per self-enqueued command.
+                *build_resume = Some((request_id, book_id, resume));
+                let _ = STORAGE_COMMANDS.try_send(StorageCommand::ContinueBookBuild {
+                    request_id,
+                    book_id,
+                    index: resume.index,
+                });
+            }
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
@@ -731,6 +767,69 @@ fn handle_storage_command(
                 sd_library.advertised_page_count(),
                 sd_library.chapter_count_for_ui(),
             );
+        }
+        StorageCommand::ContinueBookBuild {
+            request_id,
+            book_id,
+            index,
+        } => {
+            // Take-then-restore: a mismatch (superseded open, stale queue
+            // entry, or no build in flight) simply drops the step.
+            let Some((rid, bid, resume)) = build_resume.take() else {
+                return;
+            };
+            if rid != request_id
+                || bid != book_id
+                || resume.index != index
+                || request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed)
+            {
+                esp_println::println!("storage: build continue superseded");
+                return;
+            }
+            // The page the reader is looking at: each step ends by putting
+            // this page's section window back in the arena. Only a Reading
+            // render carries a global page; other views fall back to the
+            // book's first section, which any later page turn extends from.
+            let current_page = last_request
+                .filter(|request| request.book_id == book_id && request.view == AppView::Reading)
+                .map(|request| request.page)
+                .unwrap_or(0);
+            let scratch = ensure_epub_scratch(epub_scratch);
+            match reader_cache::continue_book_build(
+                epd,
+                sd_cs,
+                sd_library,
+                resume,
+                current_page,
+                scratch,
+                font_metrics,
+            ) {
+                Some(next) => {
+                    *build_resume = Some((rid, bid, next));
+                    let _ = STORAGE_COMMANDS.try_send(StorageCommand::ContinueBookBuild {
+                        request_id,
+                        book_id,
+                        index,
+                    });
+                }
+                None => {
+                    // Finished (or aborted onto a valid partial index):
+                    // announce the final totals so the footer denominator
+                    // catches up on the next repaint.
+                    send_loaded_library_event(&LibraryEvent::Loaded {
+                        book_id,
+                        pages: sd_library.advertised_page_count(),
+                        chapters: sd_library.chapter_count_for_ui(),
+                        current_chapter: sd_library.current_chapter(),
+                        chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                    });
+                    esp_println::println!(
+                        "storage: background build done book_id={} pages={}",
+                        book_id,
+                        sd_library.advertised_page_count()
+                    );
+                }
+            }
         }
         StorageCommand::LoadChapters {
             request_id,
@@ -791,8 +890,9 @@ fn handle_storage_command(
                 portrait,
             );
             let target_page = sd_library.overview_page_at(chapter as usize);
+            *build_resume = None;
             let scratch = ensure_epub_scratch(epub_scratch);
-            reader_cache::build_or_load_book_cache(
+            let suspended = reader_cache::build_or_load_book_cache(
                 epd,
                 sd_cs,
                 sd_library,
@@ -802,6 +902,14 @@ fn handle_storage_command(
                 scratch,
                 font_metrics,
             );
+            if let Some(resume) = suspended {
+                *build_resume = Some((request_id, book_id, resume));
+                let _ = STORAGE_COMMANDS.try_send(StorageCommand::ContinueBookBuild {
+                    request_id,
+                    book_id,
+                    index: resume.index,
+                });
+            }
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),

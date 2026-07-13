@@ -43,6 +43,37 @@ const EPUB_READ_AT_CHUNK_BYTES: usize = 8192;
 const EPUB_OPEN_READ_OP_LIMIT: u32 = 65_536;
 const EPUB_OPEN_READ_BYTE_LIMIT: u32 = 64 * 1024 * 1024;
 
+/// Slice budget for one background build-continuation step. Steps end at
+/// spine boundaries, so a long chapter can overshoot; the budget bounds how
+/// long queued renders and page turns wait behind a step. Each step re-pays
+/// the SD-session + zip-open + OPF-parse overhead, so a smaller slice makes
+/// turns snappier at the cost of a longer total background build.
+const CONTINUE_SLICE_MS: u64 = 400;
+
+/// The suspended state of a progressive book build, held by the display
+/// task between `ContinueBookBuild` storage commands. RAM-only: if it is
+/// dropped (sleep, sync loan, another open), the book stays a valid
+/// partial cache on disk — today's pre-existing semantics — and crossing
+/// the built frontier triggers a fresh progressive rebuild.
+///
+/// The section records accumulated so far live in the EPUB scratch statics
+/// (`book_sections`); the holder must clear this state whenever anything
+/// else may have written the scratch.
+#[derive(Clone, Copy)]
+pub(crate) struct BookBuildResume {
+    pub(crate) index: u16,
+    /// Guards against the catalog changing under `index` between steps
+    /// (a rescan can reorder entries): a continuation whose entry no
+    /// longer matches is dropped instead of building the wrong book.
+    source_identity: (u32, u32),
+    next_spine: u16,
+    section_count: u16,
+    total_pages: u32,
+    book_partial: bool,
+    generate_toc_from_headings: bool,
+    content_capture_ok: bool,
+}
+
 pub(crate) struct ReaderCacheScratch<'a> {
     tail: &'a mut [u8; READER_TAIL_SCRATCH],
     header: &'a mut [u8; READER_HEADER_SCRATCH],
@@ -178,6 +209,10 @@ pub(crate) fn dismantle_scratch(
 
 /// Kept out of line: the storage dispatcher's frame must stay small, and the
 /// EPUB open path below already runs close to the 30 KB stack region.
+///
+/// Returns `Some` when a cold build published the book provisionally and
+/// suspended: the caller owns the background continuation (enqueue a
+/// `ContinueBookBuild` step, feed it back through [`continue_book_build`]).
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_or_load_book_cache(
@@ -189,7 +224,7 @@ pub(crate) fn build_or_load_book_cache(
     target_pages: usize,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
-) {
+) -> Option<BookBuildResume> {
     esp_println::println!(
         "epub: cache open index {} chapter {} target {}",
         index,
@@ -201,10 +236,10 @@ pub(crate) fn build_or_load_book_cache(
     if library.catalog_entry(index).is_none() {
         set_preview_error(library, "BAD INDEX");
         library.set_reader_status(BookLoadStatus::Error);
-        return;
+        return None;
     }
 
-    let status = sd_session::with_root(epd, sd_cs, |root| {
+    let (status, resume) = sd_session::with_root(epd, sd_cs, |root| {
         build_or_load_book_cache_from_root(
             root,
             library,
@@ -218,10 +253,91 @@ pub(crate) fn build_or_load_book_cache(
     .unwrap_or_else(|err| {
         esp_println::println!("epub: session failed: {:?}", err);
         set_preview_error(library, session_error_label(err));
-        BookLoadStatus::Error
+        (BookLoadStatus::Error, None)
     });
 
     library.finish_book_load(index, requested_chapter, status);
+    resume
+}
+
+/// One background step of a progressive book build: re-open the EPUB, skip
+/// to the suspended spine cursor, and walk one slice. Returns the next
+/// suspended state, or `None` when the build finished (or aborted — the
+/// on-disk provisional index stays valid either way). Never touches the
+/// reader status: the book has been `Ready` since the first step published.
+#[inline(never)]
+pub(crate) fn continue_book_build(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    resume: BookBuildResume,
+    current_page: u32,
+    scratch: &mut ReaderCacheScratch<'_>,
+    font_metrics: &mut crate::custom_font::MetricCache,
+) -> Option<BookBuildResume> {
+    let Some(entry) = library.catalog_entry(resume.index as usize) else {
+        esp_println::println!("epub: build continue lost catalog entry, dropping");
+        return None;
+    };
+    if (entry.source_hash, entry.byte_size) != resume.source_identity {
+        esp_println::println!("epub: build continue entry changed, dropping");
+        return None;
+    }
+    let in_books_dir = entry.in_books_dir;
+    let mut open_name = String::<16>::new();
+    let mut display_name = String::<64>::new();
+    let _ = open_name.push_str(&entry.open_name);
+    let _ = display_name.push_str(&entry.display_name);
+
+    let step = sd_session::with_root(epd, sd_cs, |root| {
+        // The BOOKS directory handle stays alive for the whole step: the
+        // file borrows it in this embedded-sdmmc rev.
+        let books = if in_books_dir {
+            match root.open_dir("BOOKS") {
+                Ok(books) => Some(books),
+                Err(err) => {
+                    esp_println::println!("epub: build continue /books failed: {:?}", err);
+                    return Err(ReaderCacheError::MissingSpine);
+                }
+            }
+        } else {
+            None
+        };
+        let file = match &books {
+            Some(books) => books.open_file_in_dir(open_name.as_str(), Mode::ReadOnly),
+            None => root.open_file_in_dir(open_name.as_str(), Mode::ReadOnly),
+        };
+        match file {
+            Ok(file) => build_or_load_epub_cache_from_file(
+                file,
+                root,
+                &display_name,
+                resume.index,
+                0,
+                current_page as usize,
+                current_page,
+                Some(resume),
+                library,
+                scratch,
+                font_metrics,
+            ),
+            Err(err) => {
+                esp_println::println!("epub: build continue open failed: {:?}", err);
+                Err(ReaderCacheError::MissingSpine)
+            }
+        }
+    });
+    match step {
+        Ok(Ok(next)) => next,
+        Ok(Err(err)) => {
+            esp_println::println!("epub: build continue failed: {:?}", err);
+            None
+        }
+        Err(err) => {
+            esp_println::println!("epub: build continue session failed: {:?}", err);
+            None
+        }
+    }
 }
 
 #[inline(never)]
@@ -239,7 +355,7 @@ pub(crate) fn build_or_load_book_cache_from_root<
     target_pages: usize,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
-) -> BookLoadStatus
+) -> (BookLoadStatus, Option<BookBuildResume>)
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -249,7 +365,7 @@ where
     let mut open_name = String::<16>::new();
     let mut display_name = String::<64>::new();
     let Some(entry) = library.catalog_entry(index) else {
-        return BookLoadStatus::Error;
+        return (BookLoadStatus::Error, None);
     };
     let in_books_dir = entry.in_books_dir;
     let source_identity = (entry.source_hash, entry.byte_size);
@@ -285,7 +401,7 @@ where
         scratch,
         font_metrics,
     ) {
-        BookLoadStatus::Ready
+        (BookLoadStatus::Ready, None)
     } else if in_books_dir {
         let load_result = match root.open_dir("BOOKS") {
             Ok(books) => match books.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
@@ -293,8 +409,11 @@ where
                     file,
                     root,
                     &display_name,
+                    index.min(u16::MAX as usize) as u16,
                     requested_chapter,
                     target_pages,
+                    target_pages as u32,
+                    None,
                     library,
                     scratch,
                     font_metrics,
@@ -318,8 +437,11 @@ where
                 file,
                 root,
                 &display_name,
+                index.min(u16::MAX as usize) as u16,
                 requested_chapter,
                 target_pages,
+                target_pages as u32,
+                None,
                 library,
                 scratch,
                 font_metrics,
@@ -332,6 +454,7 @@ where
         };
         status_for_load_result(load_result, library)
     };
+    let (status, resume) = status;
     if matches!(status, BookLoadStatus::Ready) && !library.title.is_empty() {
         // Persist the just-learned EPUB title into the catalog record, in
         // this same session, so future Library windows and boots label the
@@ -344,7 +467,7 @@ where
             library.title.as_str(),
         );
     }
-    status
+    (status, resume)
 }
 
 #[inline(never)]
@@ -738,17 +861,17 @@ fn set_preview_error(library: &mut ReaderStore, message: &str) {
 }
 
 fn status_for_load_result(
-    result: Option<Result<(), ReaderCacheError>>,
+    result: Option<Result<Option<BookBuildResume>, ReaderCacheError>>,
     library: &mut ReaderStore,
-) -> BookLoadStatus {
+) -> (BookLoadStatus, Option<BookBuildResume>) {
     match result {
-        Some(Ok(())) => BookLoadStatus::Ready,
+        Some(Ok(resume)) => (BookLoadStatus::Ready, resume),
         Some(Err(err)) => {
             esp_println::println!("epub: load failed: {:?}", err);
             set_preview_error_from_error(library, err);
-            BookLoadStatus::Error
+            (BookLoadStatus::Error, None)
         }
-        None => BookLoadStatus::Error,
+        None => (BookLoadStatus::Error, None),
     }
 }
 
@@ -828,12 +951,15 @@ fn build_or_load_epub_cache_from_file<
     file: File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     source_path: &str,
+    catalog_index: u16,
     _requested_chapter: u8,
     target_pages: usize,
+    current_page: u32,
+    resume: Option<BookBuildResume>,
     library: &mut ReaderStore,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
-) -> Result<(), ReaderCacheError>
+) -> Result<Option<BookBuildResume>, ReaderCacheError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -866,7 +992,10 @@ where
         source_path,
         source_identity,
         cache_key.as_str(),
+        catalog_index,
         requested_global_page,
+        current_page,
+        resume,
         open_started,
         library,
         font_metrics,
@@ -909,12 +1038,15 @@ fn build_or_load_epub_cache_from_zip<
     source_path: &str,
     source_identity: (u32, u32),
     cache_key: &str,
+    catalog_index: u16,
     requested_global_page: u32,
+    current_page: u32,
+    resume: Option<BookBuildResume>,
     open_started: Instant,
     library: &mut ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
     scratch: ZipBuildScratch<'_>,
-) -> Result<(), ReaderCacheError>
+) -> Result<Option<BookBuildResume>, ReaderCacheError>
 where
     Z: EpubZipOps,
     D: embedded_sdmmc::BlockDevice,
@@ -963,11 +1095,16 @@ where
         package.spine_truncated
     );
 
-    library.set_book_labels(package.meta.title, package.meta.author);
-    library.clear_cover();
+    // Continuations of a progressive build keep the resident labels, cover,
+    // and TOC (and TOC.BIN) from the first step and go straight back to the
+    // remaining spine items.
+    if resume.is_none() {
+        library.set_book_labels(package.meta.title, package.meta.author);
+        library.clear_cover();
+    }
     if zip.is_forward_only() {
         library.clear_toc();
-    } else {
+    } else if resume.is_none() {
         // Stream the whole chapter list into the (currently idle) xhtml
         // scratch as fixed records, then write it to TOC.BIN so the overview
         // can read it from the card instead of holding it all resident.
@@ -1010,16 +1147,31 @@ where
     esp_println::println!("epub: stage BuildV2BookCache");
     let spine_started = Instant::now();
     let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
-    scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
+    // A continuation step trusts the section records accumulated in the
+    // scratch statics by the earlier steps of the same build; the display
+    // task clears the resume state whenever anything else could have
+    // touched the scratch.
+    let (mut section_count, mut total_pages, mut saw_spine, resume_partial) = match resume {
+        Some(state) => (
+            state.section_count as usize,
+            state.total_pages,
+            true,
+            state.book_partial,
+        ),
+        None => {
+            scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
+            (0usize, 0u32, false, false)
+        }
+    };
     let sections = &mut *scratch.book_sections;
-    let mut section_count = 0usize;
-    let mut total_pages = 0u32;
-    let mut saw_spine = false;
     // A spine clipped at MAX_SPINE_ITEMS means the tail chapters were dropped at
     // parse, so the book is partial even if every kept section caches cleanly.
-    let mut book_partial = package.spine_truncated;
+    let mut book_partial = resume_partial || package.spine_truncated;
     let visible_page_capacity = library.page_capacity().max(1);
-    let generate_toc_from_headings = library.toc_count() == 0;
+    let generate_toc_from_headings = match resume {
+        Some(state) => state.generate_toc_from_headings,
+        None => library.toc_count() == 0,
+    };
     let start_spine_index = package
         .text_reference_href
         .and_then(|href| {
@@ -1029,21 +1181,33 @@ where
                 .position(|item| href_matches_spine(href, item.href.of(package.opf_text)))
         })
         .unwrap_or_else(|| inferred_start_spine_index(&package));
+    let resume_spine_index = resume.map(|state| state.next_spine as usize).unwrap_or(0);
 
     // Capture the push_block stream into CONT.BIN alongside the build, so a
     // type-settings change can replay it without re-parsing the EPUB. The
     // capture is a pure accelerator: it disables itself on any failure and
     // never fails the build. Its directory handle outlives the whole walk
-    // because the capture's file handle borrows it.
+    // because the capture's file handle borrows it. Continuation steps
+    // append to the file the first step created; the header stays
+    // incomplete until the final step finishes it.
     let content_dir = reader_cache_files::open_v2_content_dir(root, cache_key);
-    let mut content =
-        reader_cache_files::ContentCapture::begin(content_dir.as_ref(), source_identity);
+    let mut content = match resume {
+        None => reader_cache_files::ContentCapture::begin(content_dir.as_ref(), source_identity),
+        Some(state) if state.content_capture_ok => {
+            reader_cache_files::ContentCapture::resume_append(content_dir.as_ref(), source_identity)
+        }
+        Some(_) => reader_cache_files::ContentCapture::disabled(),
+    };
 
     // The SECTIONS directory stays open for the whole spine walk; every
     // section flush is one file open instead of a four-level dir walk.
+    // The closure yields `Ok(Some(next_spine))` when the step suspends —
+    // either the first step covered the requested page and can publish, or
+    // a continuation step used up its slice budget.
     let walk = reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
         for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
             *index >= start_spine_index
+                && *index >= resume_spine_index
                 && !item.href.is_empty()
                 && !spine_item_is_navigation(item, &package)
         }) {
@@ -1152,9 +1316,92 @@ where
             }
             sink.finish_spine(false);
             content.spine_end(spine_u16);
+
+            // Suspend at spine boundaries: the first step stops as soon as
+            // the flushed sections cover the requested page (publish now,
+            // finish in the background); continuation steps stop when the
+            // slice budget is spent so queued renders and page turns stay
+            // responsive between steps.
+            let step_done = match resume {
+                None => section_count > 0 && total_pages > requested_global_page,
+                Some(_) => open_started.elapsed().as_millis() >= CONTINUE_SLICE_MS,
+            };
+            if step_done && spine_index + 1 < package.spine.len() {
+                return Ok(Some(spine_u16.saturating_add(1)));
+            }
         }
-        Ok::<(), ReaderCacheError>(())
+        Ok::<Option<u16>, ReaderCacheError>(None)
     });
+
+    let suspended_next = match &walk {
+        Ok(next) => *next,
+        Err(_) => None,
+    };
+    if let Some(next_spine) = suspended_next {
+        // Suspending: flush the capture but keep it incomplete for the next
+        // step's append.
+        let content_ok = content.suspend(content_dir.as_ref());
+        let state = BookBuildResume {
+            index: catalog_index,
+            source_identity,
+            next_spine,
+            section_count: section_count.min(u16::MAX as usize) as u16,
+            total_pages,
+            book_partial,
+            generate_toc_from_headings,
+            content_capture_ok: content_ok,
+        };
+        if resume.is_none() {
+            // First step: publish the provisional book so the reader starts
+            // now. Partial is forced true — the index only spans the built
+            // range until the background walk finishes.
+            publish_book_cache(
+                root,
+                cache_key,
+                source_identity,
+                requested_global_page,
+                "first",
+                open_started,
+                spine_started,
+                io_start,
+                section_write_micros,
+                library,
+                &sections[..section_count],
+                total_pages,
+                true,
+            );
+        } else {
+            // Continuation step: persist the grown index so page turns can
+            // extend into it, then put the reader's resident section window
+            // back — the build borrowed the one arena.
+            let wrote = reader_cache_files::write_v2_book_index(
+                root,
+                cache_key,
+                source_identity,
+                total_pages,
+                &sections[..section_count],
+                library,
+                true,
+            );
+            library.set_book_index(total_pages, true, &sections[..section_count]);
+            let _ = reader_cache_files::load_v2_section_by_global_page(
+                root,
+                cache_key,
+                source_identity,
+                current_page.min(total_pages.saturating_sub(1)),
+                library,
+            );
+            esp_println::println!(
+                "epub: build continue next_spine={} sections={} pages={} index_ok={} step_ms={}",
+                next_spine,
+                section_count,
+                total_pages,
+                wrote,
+                open_started.elapsed().as_millis(),
+            );
+        }
+        return Ok(Some(state));
+    }
 
     // Keep CONT.BIN only when the walk captured the whole book: a partial
     // or failed capture is deleted so replay can never resurrect a
@@ -1167,12 +1414,18 @@ where
     walk?;
 
     if section_count > 0 && total_pages > 0 {
+        // A finished continuation republishes at the page the reader is on,
+        // not the page the open originally requested.
+        let (label, publish_page) = match resume {
+            Some(_) => ("final", current_page),
+            None => ("full", requested_global_page),
+        };
         publish_book_cache(
             root,
             cache_key,
             source_identity,
-            requested_global_page,
-            "full",
+            publish_page,
+            label,
             open_started,
             spine_started,
             io_start,
@@ -1182,7 +1435,7 @@ where
             total_pages,
             book_partial,
         );
-        Ok(())
+        Ok(None)
     } else if saw_spine {
         Err(ReaderCacheError::NoBodyText)
     } else {

@@ -1214,6 +1214,63 @@ where
         capture
     }
 
+    /// A capture that never writes: continuation steps of a build whose
+    /// earlier step already lost the capture.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            file: None,
+            stage: [0u8; RECORD_STAGE_BYTES],
+            len: 0,
+            source_identity: (0, 0),
+        }
+    }
+
+    /// Reopen the capture a suspended build step left behind and append
+    /// continuation records. The header keeps `complete = false` until the
+    /// final step's `finish`; identity is not re-checked here — the resume
+    /// state is only ever fed back by the same build.
+    pub(crate) fn resume_append(
+        dir: Option<&'d Directory<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+        source_identity: (u32, u32),
+    ) -> Self {
+        let mut capture = Self::disabled();
+        capture.source_identity = source_identity;
+        let Some(dir) = dir else {
+            return capture;
+        };
+        if let Ok(file) = dir.open_file_in_dir(CACHE_CONTENT_FILE, Mode::ReadWriteAppend) {
+            capture.file = Some(file);
+        }
+        capture
+    }
+
+    /// Flush and keep the (still incomplete) file for a later
+    /// `resume_append`: the build is suspending, not finishing. Returns
+    /// whether the capture is still healthy; a failed one is deleted so no
+    /// truncated stream lingers on the card.
+    pub(crate) fn suspend(
+        mut self,
+        dir: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+    ) -> bool {
+        if self.len > 0 {
+            let flushed = match self.file.as_ref() {
+                Some(file) => file.write(&self.stage[..self.len]).is_ok(),
+                None => false,
+            };
+            if !flushed {
+                self.file = None;
+            }
+            self.len = 0;
+        }
+        let healthy = self.file.take().is_some();
+        if !healthy {
+            if let Some(dir) = dir {
+                let _ = dir.delete_file_in_dir(CACHE_CONTENT_FILE);
+            }
+        }
+        healthy
+    }
+
     /// Record one `push_block` call. The text follows the fixed record
     /// header; see `proto::cache::ContentRecordHeader`.
     pub(crate) fn push_block_record(

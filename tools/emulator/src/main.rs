@@ -344,6 +344,7 @@ impl Emulator {
             Some(StorageCommand::StoreWifiCredentials(_)) => Some("StoreWifiCredentials"),
             Some(StorageCommand::ForgetWifiCredentials) => Some("ForgetWifiCredentials"),
             Some(StorageCommand::ReceiveUpload) => Some("ReceiveUpload"),
+            Some(StorageCommand::ContinueBookBuild { .. }) => Some("ContinueBookBuild"),
             Some(StorageCommand::LoadChapters { .. }) => Some("LoadChapters"),
             Some(StorageCommand::JumpChapter { .. }) => Some("JumpChapter"),
             None => None,

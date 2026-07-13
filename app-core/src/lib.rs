@@ -331,6 +331,15 @@ pub enum StorageCommand {
         type_settings: TypeSettings,
         portrait: bool,
     },
+    /// One background step of a progressive book build. The display task
+    /// enqueues these to itself after an OpenBook published provisionally,
+    /// so renders and page turns interleave with the remaining spine walk.
+    /// Refused during a sync loan like every other scratch-using command.
+    ContinueBookBuild {
+        request_id: u32,
+        book_id: u32,
+        index: u16,
+    },
     /// Load the full chapter list (TOC.BIN) into the reader's section buffer
     /// for the Chapters overview. The reading section reloads on exit.
     LoadChapters {
