@@ -48,6 +48,10 @@ const EPUB_OPEN_READ_BYTE_LIMIT: u32 = 64 * 1024 * 1024;
 /// long queued renders and page turns wait behind a step. Each step re-pays
 /// the SD-session + zip-open + OPF-parse overhead, so a smaller slice makes
 /// turns snappier at the cost of a longer total background build.
+///
+/// NOTE: Budget checks only run at spine boundaries. Suspending mid-spine
+/// is not possible because saving and restoring the XML parser and ZIP
+/// decompressor state would exceed the RAM constraints of the ESP32-C3.
 const CONTINUE_SLICE_MS: u64 = 400;
 
 /// The suspended state of a progressive book build, held by the display
@@ -72,6 +76,7 @@ pub(crate) struct BookBuildResume {
     book_partial: bool,
     generate_toc_from_headings: bool,
     content_capture_ok: bool,
+    pub(crate) scratch_generation: u32,
 }
 
 pub(crate) struct ReaderCacheScratch<'a> {
@@ -84,6 +89,7 @@ pub(crate) struct ReaderCacheScratch<'a> {
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
     book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     zip_inflate: ZipInflateScratch,
+    pub(crate) generation: u32,
 }
 
 struct TocScratch<'a> {
@@ -158,6 +164,7 @@ impl<'a> ReaderCacheScratch<'a> {
             xhtml,
             book_sections,
             zip_inflate: ZipInflateScratch::new(),
+            generation: 0,
         }
     }
 }
@@ -225,6 +232,7 @@ pub(crate) fn build_or_load_book_cache(
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
 ) -> Option<BookBuildResume> {
+    scratch.generation = scratch.generation.wrapping_add(1);
     esp_println::println!(
         "epub: cache open index {} chapter {} target {}",
         index,
@@ -279,6 +287,10 @@ pub(crate) fn continue_book_build(
         esp_println::println!("epub: build continue lost catalog entry, dropping");
         return None;
     };
+    if resume.scratch_generation != scratch.generation {
+        esp_println::println!("epub: build continue scratch generation mismatch, dropping");
+        return None;
+    }
     if (entry.source_hash, entry.byte_size) != resume.source_identity {
         esp_println::println!("epub: build continue entry changed, dropping");
         return None;
@@ -1008,6 +1020,7 @@ where
             xhtml: scratch.xhtml,
             book_sections: scratch.book_sections,
             zip_inflate: &mut scratch.zip_inflate,
+            scratch_generation: scratch.generation,
         },
     )
 }
@@ -1021,6 +1034,7 @@ struct ZipBuildScratch<'a> {
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
     book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     zip_inflate: &'a mut ZipInflateScratch,
+    scratch_generation: u32,
 }
 
 #[inline(never)]
@@ -1350,6 +1364,7 @@ where
             book_partial,
             generate_toc_from_headings,
             content_capture_ok: content_ok,
+            scratch_generation: scratch.scratch_generation,
         };
         if resume.is_none() {
             // First step: publish the provisional book so the reader starts

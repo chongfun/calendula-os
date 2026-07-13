@@ -1239,7 +1239,23 @@ where
             return capture;
         };
         if let Ok(file) = dir.open_file_in_dir(CACHE_CONTENT_FILE, Mode::ReadWriteAppend) {
-            capture.file = Some(file);
+            let mut header = [0u8; CONTENT_HEADER_BYTES];
+            let mut ok = false;
+            if file.seek_from_start(0).is_ok() && file.read(&mut header).is_ok() {
+                if let Ok(decoded) = decode_content_header(&header) {
+                    if (decoded.source_hash, decoded.source_size) == source_identity
+                        && !decoded.complete
+                    {
+                        ok = file.seek_from_start(file.length()).is_ok();
+                    }
+                }
+            }
+            if ok {
+                capture.file = Some(file);
+            } else {
+                drop(file);
+                let _ = dir.delete_file_in_dir(CACHE_CONTENT_FILE);
+            }
         }
         capture
     }
