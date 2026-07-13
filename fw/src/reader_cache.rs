@@ -142,6 +142,8 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
     }
 }
 
+static SCRATCH_GENERATION: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
 impl<'a> ReaderCacheScratch<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -164,8 +166,12 @@ impl<'a> ReaderCacheScratch<'a> {
             xhtml,
             book_sections,
             zip_inflate: ZipInflateScratch::new(),
-            generation: 0,
+            generation: SCRATCH_GENERATION.fetch_add(1, portable_atomic::Ordering::Relaxed),
         }
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.generation = SCRATCH_GENERATION.fetch_add(1, portable_atomic::Ordering::Relaxed);
     }
 }
 

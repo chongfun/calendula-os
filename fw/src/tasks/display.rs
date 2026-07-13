@@ -287,7 +287,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // A suspended background build does not survive sleep; the
                 // book stays a valid partial cache and crossing its frontier
                 // after wake rebuilds progressively.
-                build_resume = None;
+                invalidate_build_resume(&mut build_resume, &mut epub_scratch);
                 flush_pending_progress(
                     &mut epd,
                     &mut sd_cs,
@@ -545,7 +545,7 @@ fn handle_storage_command(
         StorageCommand::LoanSyncMemory => {
             // The scratch (and the build's section records in it) is about
             // to be dismantled; the session ends in a reset anyway.
-            *build_resume = None;
+            invalidate_build_resume(build_resume, epub_scratch);
             // The session only ends in a reset, so any coalesced position
             // must reach the card before the scratch is dismantled.
             flush_pending_progress(
@@ -719,7 +719,7 @@ fn handle_storage_command(
             sd_library.set_reader_status(BookLoadStatus::Loading);
             // Any rebuild supersedes a background build in flight: the
             // scratch is about to be rewritten.
-            *build_resume = None;
+            invalidate_build_resume(build_resume, epub_scratch);
             let scratch = ensure_epub_scratch(epub_scratch);
             let suspended = reader_cache::build_or_load_book_cache(
                 epd,
@@ -890,7 +890,7 @@ fn handle_storage_command(
                 portrait,
             );
             let target_page = sd_library.overview_page_at(chapter as usize);
-            *build_resume = None;
+            invalidate_build_resume(build_resume, epub_scratch);
             let scratch = ensure_epub_scratch(epub_scratch);
             let suspended = reader_cache::build_or_load_book_cache(
                 epd,
@@ -1085,6 +1085,16 @@ fn send_resumed_position(
         font_family: request.font_family as u8,
         front_buttons: request.front_buttons as u8,
     });
+}
+
+fn invalidate_build_resume(
+    build_resume: &mut Option<(u32, u32, reader_cache::BookBuildResume)>,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+) {
+    *build_resume = None;
+    if let Some(scratch) = epub_scratch.as_mut() {
+        scratch.invalidate();
+    }
 }
 
 /// Kept out of line: first-call initialization moves a multi-KB scratch
