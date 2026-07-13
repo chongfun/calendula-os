@@ -35,10 +35,18 @@ fonts only):**
    pass. Awaiting PR and the on-device A/B in the commit message (Type Size
    change on the 11.7 MB baseline book: replay-vs-full timings, identical
    `total=` counts, corrupt-CONT.BIN fallback still opens).
-3. **B4** — progressive first open (issue 02). Its prerequisites (B3, D1)
-   landed. Sequence after B6: both restructure the reader_cache open flow,
-   and B6 shrinks the background phase B4 hides. Large; interleaves with
-   display-task storage dispatch.
+3. **B4** — progressive first open (issue 02). **IMPLEMENTED 2026-07-12 on
+   branch `opt/b4-progressive-open`, stacked on `opt/b6-content-cache`**
+   (merge B6's PR first): first step publishes a provisional partial
+   BOOK.BIN once the requested page's section flushes; the rest of the
+   spine walk runs as self-enqueued `ContinueBookBuild` slices (~400 ms,
+   spine-boundary granularity) that rewrite the growing index and restore
+   the reader's section window each step. Resume state is RAM-only and
+   guarded (request-id, catalog identity, sleep, sync loan); dropping it
+   degrades to the pre-existing partial-book semantics. All check.sh gates
+   + `channel-stress --host` pass. Awaiting PR and on-device: `storage-cache
+   --cold` time-to-first-page, `page-turn` during a background build vs the
+   550 ms budget, mid-build sleep/reopen.
 4. **A3** — panel-native framebuffer byte order (issue 01). Reading path
    (~10–13 ms per turn and prestage) and frees 8 KB; heavy golden re-bless;
    coordinate with the portrait work before starting.
