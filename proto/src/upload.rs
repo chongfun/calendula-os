@@ -121,29 +121,39 @@ fn strip_epub_suffix(name: &str) -> Option<&str> {
     None
 }
 
+/// Append a readable catalog label from a filename stem. Iterates characters,
+/// not bytes: stepping a multi-byte character one byte at a time would push
+/// each byte as its own `char` and turn "Café" into "CafÃ©".
 fn push_pretty_file_stem(stem: &str, out: &mut String<64>) {
     let mut capitalize_next = true;
-    for byte in stem.bytes() {
-        let ch = match byte {
-            b'-' | b'_' => {
+    for ch in stem.chars() {
+        let ch = match ch {
+            '-' | '_' => {
                 capitalize_next = true;
-                b' '
+                ' '
             }
-            b'a'..=b'z' if capitalize_next => {
+            'a'..='z' if capitalize_next => {
                 capitalize_next = false;
-                byte - b'a' + b'A'
+                ch.to_ascii_uppercase()
             }
-            b'A'..=b'Z' | b'0'..=b'9' => {
+            'A'..='Z' | '0'..='9' => {
                 capitalize_next = false;
-                byte
+                ch
             }
-            b'.' => break,
-            _ => byte,
+            '.' => break,
+            _ => {
+                if ch.is_alphanumeric() {
+                    capitalize_next = false;
+                }
+                ch
+            }
         };
-        if ch == b' ' && out.as_str().ends_with(' ') {
+        if ch == ' ' && out.as_str().ends_with(' ') {
             continue;
         }
-        let _ = out.push(ch as char);
+        if out.push(ch).is_err() {
+            break;
+        }
     }
     while out.as_str().ends_with(' ') {
         out.pop();
@@ -297,6 +307,34 @@ mod tests {
 
         assert_eq!(label1.as_str(), "MyCoolBook One");
         assert_eq!(label1, label2);
+    }
+
+    #[test]
+    fn pretty_file_stems_preserve_utf8() {
+        let mut label = String::<64>::new();
+        push_pretty_file_stem("calendula_wireless_Café_Test", &mut label);
+        assert_eq!(label.as_str(), "Calendula Wireless Café Test");
+
+        label.clear();
+        push_pretty_file_stem("Märchen 😀", &mut label);
+        assert_eq!(label.as_str(), "Märchen 😀");
+    }
+
+    #[test]
+    fn pretty_file_stems_preserve_non_ascii_boundaries() {
+        let mut label = String::<64>::new();
+        push_pretty_file_stem("élan_café", &mut label);
+        assert_eq!(label.as_str(), "élan Café");
+    }
+
+    #[test]
+    fn pretty_file_stems_stop_at_the_label_budget() {
+        // A stem of multi-byte characters can exhaust the 64-byte budget
+        // mid-character; the push must fail rather than truncate one.
+        let mut label = String::<64>::new();
+        push_pretty_file_stem(&"é".repeat(40), &mut label);
+        assert!(label.len() <= 64);
+        assert!(label.chars().all(|ch| ch == 'é' || ch == 'É'));
     }
 
     #[test]
