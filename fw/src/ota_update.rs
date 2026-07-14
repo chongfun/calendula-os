@@ -99,16 +99,29 @@ fn read_file_exact<
 /// the trigger file is removed so a corrupt image can't wedge every boot, and
 /// the running firmware is left untouched.
 pub fn apply_pending_update(root: &SdRoot) -> bool {
-    match try_apply(root) {
+    let outcome = try_apply(root);
+    // One-shot either way: a flashed image must not re-flash, and a bad one
+    // must not wedge every boot. Both run here rather than inside `try_apply`,
+    // where the trigger's own read handle is still open — reclaiming its
+    // clusters needs the file closed first.
+    let mut trigger_removed = false;
+    if !matches!(outcome, Err(UpdateError::NoTrigger)) {
+        trigger_removed = upload_store::remove_file_reclaiming_clusters(root, TRIGGER_FILE)
+            != upload_store::RemoveStatus::Failed;
+    }
+    match outcome {
         Ok(()) => {
+            if !trigger_removed {
+                esp_println::println!(
+                    "ota: WARNING trigger removal failed; next boot will re-apply"
+                );
+            }
             esp_println::println!("ota: update applied; resetting");
             true
         }
         Err(UpdateError::NoTrigger) => false,
         Err(e) => {
             esp_println::println!("ota: update failed: {:?}", e);
-            // A bad trigger file must not re-run forever.
-            let _ = root.delete_file_in_dir(TRIGGER_FILE);
             false
         }
     }
@@ -117,7 +130,10 @@ pub fn apply_pending_update(root: &SdRoot) -> bool {
 fn try_apply(root: &SdRoot) -> Result<(), UpdateError> {
     let file = root
         .open_file_in_dir(TRIGGER_FILE, Mode::ReadOnly)
-        .map_err(|_| UpdateError::NoTrigger)?;
+        .map_err(|e| match e {
+            embedded_sdmmc::Error::NotFound => UpdateError::NoTrigger,
+            _ => UpdateError::ReadFile,
+        })?;
     let len = file.length() as usize;
     esp_println::println!("ota: {} found, {} bytes", TRIGGER_FILE, len);
 
@@ -148,8 +164,6 @@ fn try_apply(root: &SdRoot) -> Result<(), UpdateError> {
         switch.entry.ota_seq
     );
 
-    // One-shot: drop the trigger so the next boot runs the new firmware once.
-    let _ = root.delete_file_in_dir(TRIGGER_FILE);
     Ok(())
 }
 
