@@ -148,7 +148,7 @@ fn push_pretty_file_stem(stem: &str, out: &mut String<64>) {
                 ch
             }
         };
-        if ch == ' ' && out.as_str().ends_with(' ') {
+        if ch == ' ' && (out.is_empty() || out.as_str().ends_with(' ')) {
             continue;
         }
         if out.push(ch).is_err() {
@@ -325,6 +325,10 @@ mod tests {
         let mut label = String::<64>::new();
         push_pretty_file_stem("élan_café", &mut label);
         assert_eq!(label.as_str(), "élan Café");
+
+        label.clear();
+        push_pretty_file_stem("_leading_separator", &mut label);
+        assert_eq!(label.as_str(), "Leading Separator");
     }
 
     #[test]
