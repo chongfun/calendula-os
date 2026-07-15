@@ -110,12 +110,33 @@ pub fn apply_pending_update(root: &SdRoot) -> bool {
             != upload_store::RemoveStatus::Failed;
     }
     match outcome {
-        Ok(()) => {
+        Ok(dest) => {
             if !trigger_removed {
                 esp_println::println!(
-                    "ota: WARNING trigger removal failed; next boot will re-apply"
+                    "ota: WARNING trigger removal failed; aborting otadata switch to prevent boot loop"
                 );
+                return false;
             }
+
+            // Point otadata at the freshly written slot
+            let mut flash = flash_storage();
+            let (s0, s1) = match read_otadata(&mut flash) {
+                Ok(s) => s,
+                Err(e) => {
+                    esp_println::println!("ota: failed to read otadata for switch: {:?}", e);
+                    return false;
+                }
+            };
+            let switch = ota::plan_switch(&s0, &s1, dest, OTA_COUNT);
+            if let Err(e) = write_select_entry(&mut flash, switch.target_sector, &switch.entry) {
+                esp_println::println!("ota: failed to write otadata switch: {:?}", e);
+                return false;
+            }
+            esp_println::println!(
+                "ota: otadata sector {} -> seq {}",
+                switch.target_sector,
+                switch.entry.ota_seq
+            );
             esp_println::println!("ota: update applied; resetting");
             true
         }
@@ -127,7 +148,7 @@ pub fn apply_pending_update(root: &SdRoot) -> bool {
     }
 }
 
-fn try_apply(root: &SdRoot) -> Result<(), UpdateError> {
+fn try_apply(root: &SdRoot) -> Result<u32, UpdateError> {
     let file = root
         .open_file_in_dir(TRIGGER_FILE, Mode::ReadOnly)
         .map_err(|e| match e {
@@ -153,18 +174,7 @@ fn try_apply(root: &SdRoot) -> Result<(), UpdateError> {
     // Pass 2: erase + stream the image into the inactive slot.
     write_image(&mut flash, OTA_SLOT_OFFSET[dest as usize], &file, len)?;
 
-    // Point otadata at the freshly written slot (re-read: the write above did
-    // not touch otadata, but re-reading keeps the switch self-consistent).
-    let (s0, s1) = read_otadata(&mut flash)?;
-    let switch = ota::plan_switch(&s0, &s1, dest, OTA_COUNT);
-    write_select_entry(&mut flash, switch.target_sector, &switch.entry)?;
-    esp_println::println!(
-        "ota: otadata sector {} -> seq {}",
-        switch.target_sector,
-        switch.entry.ota_seq
-    );
-
-    Ok(())
+    Ok(dest)
 }
 
 /// On-device validation of the flash + otadata path when no SD card reader is
