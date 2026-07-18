@@ -1155,6 +1155,7 @@ where
 /// the build itself never fails on its account.
 pub(crate) struct ContentCapture<
     'd,
+    's,
     D,
     T,
     const MAX_DIRS: usize,
@@ -1166,14 +1167,14 @@ pub(crate) struct ContentCapture<
 {
     /// `None` once disabled (setup or write failure).
     file: Option<File<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
-    stage: [u8; RECORD_STAGE_BYTES],
+    stage: &'s mut [u8],
     len: usize,
     source_identity: (u32, u32),
     spine_count: u16,
 }
 
-impl<'d, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
-    ContentCapture<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+impl<'d, 's, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    ContentCapture<'d, 's, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -1185,10 +1186,11 @@ where
     pub(crate) fn begin(
         dir: Option<&'d Directory<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
         source_identity: (u32, u32),
+        stage: &'s mut [u8],
     ) -> Self {
         let mut capture = Self {
             file: None,
-            stage: [0u8; RECORD_STAGE_BYTES],
+            stage,
             len: 0,
             source_identity,
             spine_count: 0,
@@ -1423,7 +1425,7 @@ where
         if file.seek_from_start(toc_offset as u32).is_err() {
             return false;
         }
-        let mut toc = [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS];
+        library.clear_toc();
         if !read_records_batched(
             file,
             TOC_RECORD_BYTES,
@@ -1435,29 +1437,22 @@ where
                 if !toc_record_fits_text(record, header.toc_text_bytes) {
                     return false;
                 }
-                toc[index] = record;
+                library.toc[index] = record;
+                library.toc_page[index] = 0;
                 true
             },
         ) {
+            library.clear_toc();
             return false;
         }
-        library.clear_toc();
         if header.toc_text_bytes > 0 {
             let text_len = header.toc_text_bytes as usize;
             if read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
+                library.clear_toc();
                 return false;
             }
             library.toc_text_len = text_len;
             library.toc_count = header.toc_count as usize;
-            for (index, record) in toc
-                .iter()
-                .take(header.toc_count as usize)
-                .copied()
-                .enumerate()
-            {
-                library.toc[index] = record;
-                library.toc_page[index] = 0;
-            }
         }
         let mut title = [0u8; 64];
         let mut author = [0u8; 64];

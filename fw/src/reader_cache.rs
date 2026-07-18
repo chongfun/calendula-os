@@ -923,14 +923,15 @@ where
     let io_start = crate::sd_session::sd_stats::snapshot();
     let mut section_write_micros: u64 = 0;
     esp_println::println!("epub: stage ParseContainerAndOpf");
+    let (stage_buf, container_buf) = scratch.container.split_at_mut(256);
     let container_entry = zip.find_entry("META-INF/container.xml", scratch.header, scratch.name)?;
     let container_len = zip.read_entry_streamed(
         container_entry,
         scratch.compressed,
-        scratch.container,
+        container_buf,
         &mut *scratch.zip_inflate,
     )?;
-    let container_xml = core::str::from_utf8(&scratch.container[..container_len])
+    let container_xml = core::str::from_utf8(&container_buf[..container_len])
         .map_err(|_| ReaderCacheError::Utf8)?;
     let opf_path = find_full_path(container_xml).ok_or(ReaderCacheError::MissingOpfPath)?;
 
@@ -1037,7 +1038,7 @@ where
     // because the capture's file handle borrows it.
     let content_dir = reader_cache_files::open_v2_content_dir(root, cache_key);
     let mut content =
-        reader_cache_files::ContentCapture::begin(content_dir.as_ref(), source_identity);
+        reader_cache_files::ContentCapture::begin(content_dir.as_ref(), source_identity, stage_buf);
 
     // The SECTIONS directory stays open for the whole spine walk; every
     // section flush is one file open instead of a four-level dir walk.
@@ -1167,7 +1168,7 @@ where
     walk?;
 
     if section_count > 0 && total_pages > 0 {
-        publish_book_cache(
+        let published = publish_book_cache(
             root,
             cache_key,
             source_identity,
@@ -1182,7 +1183,12 @@ where
             total_pages,
             book_partial,
         );
-        Ok(())
+        if published {
+            Ok(())
+        } else {
+            reader_cache_files::empty_cache_dir(root, cache_key, section_count as u16);
+            Err(ReaderCacheError::NoBodyText)
+        }
     } else if saw_spine {
         Err(ReaderCacheError::NoBodyText)
     } else {
@@ -1194,7 +1200,7 @@ where
 /// the requested section, refresh chapter tracking and the cover, and print
 /// the ready/bench lines. Used by the full EPUB build (`label` "full") and
 /// the CONT.BIN replay path (`label` "replay").
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)] // Intentionally retained wide signature to pass borrow-checked references and telemetry stats directly without struct wrapping
 fn publish_book_cache<
     D,
     T,
@@ -1215,7 +1221,8 @@ fn publish_book_cache<
     sections_slice: &[BookV2SectionRecord],
     total_pages: u32,
     book_partial: bool,
-) where
+) -> bool
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
@@ -1229,18 +1236,18 @@ fn publish_book_cache<
         book_partial,
     );
     library.set_book_index(total_pages, book_partial || !wrote_index, sections_slice);
-    match reader_cache_files::load_v2_section_by_global_page(
-        root,
-        cache_key,
-        source_identity,
-        requested_global_page.min(total_pages.saturating_sub(1)),
-        library,
-    ) {
-        CacheLoadResult::Hit { .. } => {}
-        _ => {
-            let first = sections_slice[0];
-            library.set_current_section_range(first.start_page, first.page_count as usize);
-        }
+    let hit = matches!(
+        reader_cache_files::load_v2_section_by_global_page(
+            root,
+            cache_key,
+            source_identity,
+            requested_global_page.min(total_pages.saturating_sub(1)),
+            library,
+        ),
+        CacheLoadResult::Hit { .. }
+    );
+    if !hit {
+        return false;
     }
     reader_layout::rebuild_toc_page_targets(library);
     refresh_chapter_tracking(
@@ -1275,6 +1282,7 @@ fn publish_book_cache<
         io.write_blocks,
         cache_key
     );
+    true
 }
 
 /// Forwards `push_block` to the build sink while recording the exact call
@@ -1284,6 +1292,7 @@ fn publish_book_cache<
 struct CapturingBlockSink<
     'w,
     'v,
+    's,
     S,
     D,
     T,
@@ -1296,12 +1305,13 @@ struct CapturingBlockSink<
     T: TimeSource,
 {
     inner: &'w mut S,
-    capture: &'w mut reader_cache_files::ContentCapture<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    capture:
+        &'w mut reader_cache_files::ContentCapture<'v, 's, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     spine_index: u16,
 }
 
 impl<S, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
-    XhtmlBlockSink for CapturingBlockSink<'_, '_, S, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+    XhtmlBlockSink for CapturingBlockSink<'_, '_, '_, S, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
 where
     S: XhtmlBlockSink,
     D: embedded_sdmmc::BlockDevice,
@@ -1414,7 +1424,7 @@ where
         reader_cache_files::delete_v2_content_file(root, cache_key);
         return false;
     }
-    publish_book_cache(
+    let published = publish_book_cache(
         root,
         cache_key,
         source_identity,
@@ -1429,6 +1439,11 @@ where
         total_pages,
         book_partial,
     );
+    if !published {
+        esp_println::println!("epub: content replay publishing failed, falling back to full build");
+        reader_cache_files::empty_cache_dir(root, cache_key, section_count as u16);
+        return false;
+    }
     true
 }
 
@@ -1473,7 +1488,7 @@ where
 /// captured spine item, mirroring the full build's spine loop. The marker
 /// discipline is strict — every group ends in a spine-end record and never
 /// changes spine index mid-group — so any violation means a corrupt file.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)] // Intentionally retained wide signature to pass borrow-checked references and layout settings directly without struct wrapping
 fn replay_content_records<
     'r,
     D,
