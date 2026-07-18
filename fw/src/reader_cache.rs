@@ -923,17 +923,21 @@ where
     let io_start = crate::sd_session::sd_stats::snapshot();
     let mut section_write_micros: u64 = 0;
     esp_println::println!("epub: stage ParseContainerAndOpf");
-    let (stage_buf, container_buf) = scratch.container.split_at_mut(256);
     let container_entry = zip.find_entry("META-INF/container.xml", scratch.header, scratch.name)?;
     let container_len = zip.read_entry_streamed(
         container_entry,
         scratch.compressed,
-        container_buf,
+        scratch.container,
         &mut *scratch.zip_inflate,
     )?;
-    let container_xml = core::str::from_utf8(&container_buf[..container_len])
+    let container_xml = core::str::from_utf8(&scratch.container[..container_len])
         .map_err(|_| ReaderCacheError::Utf8)?;
-    let opf_path = find_full_path(container_xml).ok_or(ReaderCacheError::MissingOpfPath)?;
+    let opf_path_str = find_full_path(container_xml).ok_or(ReaderCacheError::MissingOpfPath)?;
+    let mut opf_path_buf = String::<256>::new();
+    opf_path_buf
+        .push_str(opf_path_str)
+        .map_err(|_| ReaderCacheError::Utf8)?;
+    let opf_path = opf_path_buf.as_str();
 
     let opf_entry = zip.find_entry(opf_path, scratch.header, scratch.name)?;
     esp_println::println!(
@@ -1037,6 +1041,7 @@ where
     // never fails the build. Its directory handle outlives the whole walk
     // because the capture's file handle borrows it.
     let content_dir = reader_cache_files::open_v2_content_dir(root, cache_key);
+    let (stage_buf, _) = scratch.container.split_at_mut(256);
     let mut content =
         reader_cache_files::ContentCapture::begin(content_dir.as_ref(), source_identity, stage_buf);
 

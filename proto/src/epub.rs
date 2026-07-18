@@ -5001,4 +5001,38 @@ mod tests {
     fn push_u32(bytes: &mut StdVec<u8>, value: u32) {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
+
+    #[test]
+    fn test_load_epub_package_supports_4096_byte_container() {
+        let mut container_content = StdVec::new();
+        container_content.extend_from_slice(b"<?xml version=\"1.0\"?>\n<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\n  <rootfiles>\n    <rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/>\n  </rootfiles>\n  <!-- ");
+        while container_content.len() < 4092 {
+            container_content.push(b'a');
+        }
+        container_content.extend_from_slice(b" -->");
+        assert_eq!(container_content.len(), 4096);
+
+        let opf_content = b"<?xml version=\"1.0\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" unique-identifier=\"pub-id\" version=\"3.0\">\n  <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n    <dc:title>Test Book</dc:title>\n    <dc:creator>Test Author</dc:creator>\n  </metadata>\n  <manifest>\n    <item id=\"x\" href=\"x.xhtml\" media-type=\"application/xhtml+xml\"/>\n  </manifest>\n  <spine>\n    <itemref idref=\"x\"/>\n  </spine>\n</package>";
+
+        let zip_bytes = stored_zip(&[
+            ("META-INF/container.xml", container_content.as_slice()),
+            ("OEBPS/content.opf", opf_content.as_slice()),
+        ]);
+
+        let mut container_scratch = [0u8; 4096];
+        let mut opf_scratch = [0u8; 4096];
+
+        let package = load_epub_package(
+            &zip_bytes,
+            &mut container_scratch,
+            &mut opf_scratch,
+            BookId(1),
+            "test.epub",
+        )
+        .expect("should load successfully with 4096-byte container");
+
+        assert_eq!(package.meta.title, "Test Book");
+        assert_eq!(package.meta.author, "Test Author");
+        assert_eq!(package.opf_path, "OEBPS/content.opf");
+    }
 }
