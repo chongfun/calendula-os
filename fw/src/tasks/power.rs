@@ -1,4 +1,7 @@
-use crate::{AppView, DisplayCommand, PowerEvent, DISPLAY_COMMANDS, POWER_EVENTS};
+use crate::{
+    AppView, DisplayCommand, PowerEvent, DISPLAY_COMMANDS, POWER_EVENTS, WAKE_PIN_HANDOFF,
+    WAKE_PIN_REQUESTS,
+};
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::peripherals::{GPIO3, LPWR};
@@ -77,7 +80,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) -> Duration {
         match POWER_EVENTS.receive().await {
             PowerEvent::DisplayAsleep => {
                 esp_println::println!("power: deep sleep");
-                let mut button = steal_wake_button();
+                let mut button = take_wake_button().await;
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
             PowerEvent::Activity(view) => return idle_timeout(view),
@@ -86,12 +89,37 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) -> Duration {
     }
 }
 
-/// Re-materialises the Power button (GPIO3) as a deep-sleep wake source.
-#[allow(unsafe_code)]
+/// Takes sole ownership of the Power button (GPIO3) and re-materialises it as
+/// a deep-sleep wake source.
+///
+/// The input task owns GPIO3 as an `Input<'static>` and polls it for the whole
+/// run, so the pin has to change hands before it can be armed: this asks the
+/// input task to stop polling and surrender that handle, waits for it, and
+/// drops it. Only then is this task the pin's single owner, which is what
+/// makes the steal below sound. The wait costs the terminal sleep path about
+/// one 15 ms poll tick, plus any in-progress sample.
+///
+/// Dropping the `Input` leaves the pad configured as it was — esp-hal's pin
+/// drivers have no `Drop` glue — so the button's pull-up survives the gap
+/// until the wake source re-enables it.
+async fn take_wake_button() -> GPIO3<'static> {
+    WAKE_PIN_REQUESTS.send(()).await;
+    // The received handle is a temporary: its scope ends at this semicolon,
+    // which retires the last `Input` on GPIO3 before the steal below.
+    WAKE_PIN_HANDOFF.receive().await;
+    steal_wake_button()
+}
+
+/// Re-materialises the Power button (GPIO3) once its previous handle is gone.
+#[expect(
+    unsafe_code,
+    reason = "Caller guarantees exclusive GPIO3 ownership via handoff protocol"
+)]
 fn steal_wake_button() -> GPIO3<'static> {
-    // SAFETY: only reached on the terminal deep-sleep path. The input task's
-    // `Input<'static>` handle on GPIO3 is about to be torn down by the chip
-    // reset that ends deep sleep, so this second handle never coexists with a
-    // live one.
+    // SAFETY: the caller has taken the input task's `Input<'static>` handle on
+    // GPIO3 and dropped it, and the input task stops polling the pin before it
+    // gives that handle up, so no other handle on GPIO3 is live. Reached only
+    // on the terminal deep-sleep path, which never returns the pin to the
+    // input task: the chip resets on wake.
     unsafe { GPIO3::steal() }
 }

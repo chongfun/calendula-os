@@ -119,6 +119,18 @@ pub static DISPLAY_EVENTS: Channel<CriticalSectionRawMutex, DisplayEvent, 8> = C
 pub static LIBRARY_EVENTS: Channel<CriticalSectionRawMutex, LibraryEvent, 8> = Channel::new();
 pub static STORAGE_COMMANDS: Channel<CriticalSectionRawMutex, StorageCommand, 4> = Channel::new();
 pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Channel::new();
+// Power button (GPIO3) handoff for the terminal deep-sleep path. The input
+// task owns the pin and polls it for the whole run; the power task needs it
+// back as the RTC wake source, and re-materialising it there is only sound
+// while no other handle is live. A request on WAKE_PIN_REQUESTS asks the input
+// task to stop polling and surrender its `Input`, which comes back over
+// WAKE_PIN_HANDOFF. One request is ever sent -- the branch that sends it does
+// not return -- so both stay at a single slot.
+//
+// SAFETY INVARIANT: WAKE_PIN_HANDOFF must be consumed immediately before
+// GPIO3::steal(). No other code may construct GPIO3 directly.
+pub static WAKE_PIN_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+pub static WAKE_PIN_HANDOFF: Channel<CriticalSectionRawMutex, Input<'static>, 1> = Channel::new();
 pub static SYNC_COMMANDS: Channel<CriticalSectionRawMutex, SyncCommand, 2> = Channel::new();
 pub static SYNC_EVENTS: Channel<CriticalSectionRawMutex, SyncEvent, 4> = Channel::new();
 pub static SYNC_LOANS: Channel<CriticalSectionRawMutex, sync_mem::SyncLoan, 1> = Channel::new();
@@ -287,7 +299,7 @@ fn main() -> ! {
             tasks::input::run(
                 adc1,
                 InputPins {
-                    power: power_button,
+                    power: Some(power_button),
                     aux_pin: aux_adc,
                     nav_pin: nav_adc,
                     page_pin: page_adc,
@@ -306,7 +318,7 @@ fn main() -> ! {
                 tasks::input::run(
                     adc1,
                     InputPins {
-                        power: power_button,
+                        power: Some(power_button),
                         nav_pin: nav_adc,
                         page_pin: page_adc,
                         gauge: battery_gauge,
