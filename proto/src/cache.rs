@@ -1601,6 +1601,9 @@ mod tests {
             if replayed_spines != hdr.spine_count {
                 return Err(());
             }
+            if pos != data.len() {
+                return Err(());
+            }
 
             Ok(())
         };

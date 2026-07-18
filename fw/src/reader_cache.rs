@@ -1615,6 +1615,9 @@ where
     if replayed_spines != expected_spines {
         return Err(());
     }
+    if pos != fill || refill_content_buf(file, buf, &mut pos, &mut fill, 1)? {
+        return Err(());
+    }
     Ok(())
 }
 
