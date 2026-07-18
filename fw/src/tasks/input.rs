@@ -1,4 +1,4 @@
-use crate::{Button, InputEvent, INPUT_EVENTS};
+use crate::{Button, InputEvent, INPUT_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS};
 use embassy_time::{Instant, Timer};
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
 use esp_hal::gpio::Input;
@@ -48,7 +48,12 @@ struct Band {
 }
 
 pub struct InputPins {
-    pub power: Input<'static>,
+    /// Power button. Held as an `Option` because the deep-sleep path takes it:
+    /// the power task re-materialises GPIO3 as the RTC wake source, which is
+    /// only sound once this task's handle is gone, so `release_power_button`
+    /// hands it over and stops polling. Deep sleep is terminal, so the pin
+    /// never comes back.
+    pub power: Option<Input<'static>>,
     /// X4 only: battery voltage on the GPIO0 ADC divider. On the X3 GPIO0 is
     /// I2C SCL, so the aux channel does not exist and the gauge replaces it.
     #[cfg(not(feature = "device-x3"))]
@@ -160,6 +165,10 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     loop {
         Timer::after_millis(POLL_MS).await;
 
+        if release_power_button(&mut pins).await {
+            return;
+        }
+
         if battery_ticks == 0 {
             battery = read_power(&mut adc, &mut pins, &mut gauge_failures).await;
         }
@@ -200,7 +209,11 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             esp_println::println!("input: battery seeded ({} mV, {}%)", battery_mv, percent);
         }
 
-        let power_pressed = debounce_active_low(pins.power.is_low(), &mut power_ticks);
+        let power = pins
+            .power
+            .as_ref()
+            .expect("power button owned by input task");
+        let power_pressed = debounce_active_low(power.is_low(), &mut power_ticks);
         if power_pressed && !last_power {
             emit(Some(Button::Power), sample, battery_mv, percent);
             log_input(Some(Button::Power), sample);
@@ -223,6 +236,27 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             log_input(Some(button), sample);
         }
     }
+}
+
+/// Surrenders the Power button to the power task if it has asked for it,
+/// leaving this task with nothing on GPIO3. Returns true if ownership was
+/// transferred, indicating the task should terminate.
+///
+/// The power task blocks on the handoff before it arms the wake source and
+/// cuts power, so this costs the deep-sleep path about one poll tick, plus
+/// any in-progress sample. The send never blocks in practice: the request
+/// is only sent once per boot, so the single handoff slot is always free.
+async fn release_power_button(pins: &mut InputPins) -> bool {
+    if WAKE_PIN_REQUESTS.try_receive().is_err() {
+        return false;
+    }
+    let power = pins
+        .power
+        .take()
+        .expect("wake pin requested after ownership transfer");
+    esp_println::println!("input: released power button for deep sleep");
+    WAKE_PIN_HANDOFF.send(power).await;
+    true
 }
 
 /// Read the battery, returning `(millivolts, percent, aux_raw)`. `aux_raw`

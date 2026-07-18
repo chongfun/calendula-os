@@ -112,10 +112,14 @@ board_io/display task
 input_task
   polls GPIO3 and ADC ladders
   debounced ADC/power edges -> reader Button actions -> InputEvent
+  owns GPIO3 until the deep-sleep path asks for it: a WAKE_PIN_REQUESTS ping
+  stops the polling and surrenders the Input over WAKE_PIN_HANDOFF
 
 power_task
   observes activity and display-settled events
   asks display_task to sleep the SSD1677, then enters ESP32-C3 deep sleep
+  takes GPIO3 off input_task before arming it as the wake source, so the pin
+  has a single owner when it is re-materialised
 
 wifi_task
   parked until SyncCommand::Start arrives from the Wireless screen
