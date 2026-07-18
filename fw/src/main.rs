@@ -70,7 +70,7 @@ pub use app_core::{
     PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, StorageCommand,
     SyncCommand, SyncEvent,
 };
-use core::sync::atomic::{AtomicBool, AtomicU32};
+use core::sync::atomic::AtomicU32;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -109,8 +109,6 @@ pub mod upload;
 mod views;
 
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
-pub static INPUT_START: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-pub static INPUT_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 4> = Channel::new();
 // 8 slots (270 B each) is enough for the cache-build burst case: required
