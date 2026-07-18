@@ -78,8 +78,8 @@ pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;
 /// normalization semantics change (the `READER_LAYOUT_VERSION` discipline).
 pub const CACHE_CONTENT_FILE: &str = "CONT.BIN";
 pub const CONTENT_MAGIC: u32 = 0x5834_434E; // X4CN
-pub const CONTENT_VERSION: u16 = 1;
-pub const CONTENT_HEADER_BYTES: usize = 16;
+pub const CONTENT_VERSION: u16 = 2;
+pub const CONTENT_HEADER_BYTES: usize = 24;
 pub const CONTENT_RECORD_HEADER_BYTES: usize = 8;
 const CONTENT_FLAG_COMPLETE: u8 = 1;
 const CONTENT_RECORD_FLAG_PARAGRAPH_END: u8 = 1;
@@ -92,6 +92,8 @@ pub struct ContentHeader {
     /// False until the capture has recorded the whole spine walk; replay
     /// only ever runs from a complete capture.
     pub complete: bool,
+    pub spine_count: u16,
+    pub content_len: u32,
 }
 
 /// One captured `push_block` call (text follows the header), or — with
@@ -120,6 +122,9 @@ pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<us
     out[7] = 0;
     write_u32(out, 8, header.source_hash);
     write_u32(out, 12, header.source_size);
+    write_u16(out, 16, header.spine_count);
+    write_u16(out, 18, 0);
+    write_u32(out, 20, header.content_len);
     Ok(CONTENT_HEADER_BYTES)
 }
 
@@ -135,6 +140,8 @@ pub fn decode_content_header(input: &[u8]) -> Result<ContentHeader, CacheError> 
         source_hash: read_u32(input, 8)?,
         source_size: read_u32(input, 12)?,
         complete: input[6] & CONTENT_FLAG_COMPLETE != 0,
+        spine_count: read_u16(input, 16)?,
+        content_len: read_u32(input, 20)?,
     })
 }
 
@@ -1027,6 +1034,8 @@ mod tests {
                 source_hash: 0xDEAD_BEEF,
                 source_size: 3_200_141,
                 complete,
+                spine_count: 42,
+                content_len: 12345,
             };
             let mut bytes = [0u8; CONTENT_HEADER_BYTES];
             encode_content_header(header, &mut bytes).expect("header encodes");
@@ -1039,6 +1048,8 @@ mod tests {
                 source_hash: 1,
                 source_size: 2,
                 complete: true,
+                spine_count: 0,
+                content_len: 0,
             },
             &mut bytes,
         )
@@ -1462,5 +1473,143 @@ mod tests {
         assert!(record.title_str().len() <= TOC_CHAPTER_TITLE_BYTES);
         assert!(record.title_str().len() >= TOC_CHAPTER_TITLE_BYTES - 3);
         assert!(long.starts_with(record.title_str()));
+    }
+
+    #[test]
+    fn test_content_replay_truncation_regression() {
+        use crate::text::{TextAlign, TextRole};
+
+        // Create a buffer for mock CONT.BIN
+        let mut buffer = [0u8; 1024];
+
+        // 1. Initial header (will overwrite at the end)
+        let header = ContentHeader {
+            source_hash: 0x12345678,
+            source_size: 100000,
+            complete: true,
+            spine_count: 2,
+            content_len: 0, // placeholder
+        };
+        encode_content_header(header, &mut buffer[..CONTENT_HEADER_BYTES]).unwrap();
+
+        let mut offset = CONTENT_HEADER_BYTES;
+
+        // Spine 0:
+        // Record 1 (text block)
+        let rec1 = ContentRecordHeader {
+            spine_index: 0,
+            text_len: 4,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: true,
+            spine_end: false,
+        };
+        offset += encode_content_record_header(rec1, &mut buffer[offset..]).unwrap();
+        buffer[offset..offset + 4].copy_from_slice(b"abcd");
+        offset += 4;
+
+        // Record 2 (spine end)
+        let rec2 = ContentRecordHeader {
+            spine_index: 0,
+            text_len: 0,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: false,
+            spine_end: true,
+        };
+        offset += encode_content_record_header(rec2, &mut buffer[offset..]).unwrap();
+        let spine_0_end_offset = offset;
+
+        // Spine 1:
+        // Record 3 (text block)
+        let rec3 = ContentRecordHeader {
+            spine_index: 1,
+            text_len: 4,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: true,
+            spine_end: false,
+        };
+        offset += encode_content_record_header(rec3, &mut buffer[offset..]).unwrap();
+        buffer[offset..offset + 4].copy_from_slice(b"efgh");
+        offset += 4;
+
+        // Record 4 (spine end)
+        let rec4 = ContentRecordHeader {
+            spine_index: 1,
+            text_len: 0,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: false,
+            spine_end: true,
+        };
+        offset += encode_content_record_header(rec4, &mut buffer[offset..]).unwrap();
+        let full_len = offset;
+
+        // Update the header with the correct total size
+        let final_header = ContentHeader {
+            source_hash: 0x12345678,
+            source_size: 100000,
+            complete: true,
+            spine_count: 2,
+            content_len: full_len as u32,
+        };
+        encode_content_header(final_header, &mut buffer[..CONTENT_HEADER_BYTES]).unwrap();
+
+        // 2. Validate parsing of the FULL buffer
+        let parsed_header = decode_content_header(&buffer[..CONTENT_HEADER_BYTES]).unwrap();
+        assert_eq!(parsed_header.spine_count, 2);
+        assert_eq!(parsed_header.content_len, full_len as u32);
+
+        let replay = |data: &[u8]| -> Result<(), ()> {
+            if data.len() < CONTENT_HEADER_BYTES {
+                return Err(());
+            }
+            let hdr = decode_content_header(&data[..CONTENT_HEADER_BYTES]).map_err(|_| ())?;
+            if data.len() != hdr.content_len as usize {
+                return Err(());
+            }
+
+            let mut pos = CONTENT_HEADER_BYTES;
+            let mut replayed_spines = 0u16;
+
+            while pos < data.len() {
+                if pos + CONTENT_RECORD_HEADER_BYTES > data.len() {
+                    return Err(());
+                }
+                let record =
+                    decode_content_record_header(&data[pos..pos + CONTENT_RECORD_HEADER_BYTES])
+                        .map_err(|_| ())?;
+                pos += CONTENT_RECORD_HEADER_BYTES;
+
+                if record.spine_end {
+                    replayed_spines = replayed_spines.saturating_add(1);
+                    continue;
+                }
+
+                let text_len = record.text_len as usize;
+                if pos + text_len > data.len() {
+                    return Err(());
+                }
+                pos += text_len;
+            }
+
+            if replayed_spines != hdr.spine_count {
+                return Err(());
+            }
+
+            Ok(())
+        };
+
+        // Full replay succeeds
+        assert!(replay(&buffer[..full_len]).is_ok());
+
+        // 3. Truncating immediately after spine 0's spine_end
+        let truncated = &buffer[..spine_0_end_offset];
+        assert!(replay(truncated).is_err());
     }
 }

@@ -1169,6 +1169,7 @@ pub(crate) struct ContentCapture<
     stage: [u8; RECORD_STAGE_BYTES],
     len: usize,
     source_identity: (u32, u32),
+    spine_count: u16,
 }
 
 impl<'d, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -1190,6 +1191,7 @@ where
             stage: [0u8; RECORD_STAGE_BYTES],
             len: 0,
             source_identity,
+            spine_count: 0,
         };
         let Some(dir) = dir else {
             return capture;
@@ -1204,6 +1206,8 @@ where
                 source_hash: source_identity.0,
                 source_size: source_identity.1,
                 complete: false,
+                spine_count: 0,
+                content_len: 0,
             },
             &mut header,
         );
@@ -1278,6 +1282,7 @@ where
         if self.file.is_none() {
             return;
         }
+        self.spine_count = self.spine_count.saturating_add(1);
         let mut header = [0u8; CONTENT_RECORD_HEADER_BYTES];
         if encode_content_record_header(
             ContentRecordHeader {
@@ -1347,12 +1352,15 @@ where
                 self.len = 0;
             }
             if let Some(file) = self.file.as_ref() {
+                let file_len = file.length();
                 let mut header = [0u8; CONTENT_HEADER_BYTES];
                 kept = encode_content_header(
                     ContentHeader {
                         source_hash: self.source_identity.0,
                         source_size: self.source_identity.1,
                         complete: true,
+                        spine_count: self.spine_count,
+                        content_len: file_len,
                     },
                     &mut header,
                 )

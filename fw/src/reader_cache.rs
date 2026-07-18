@@ -1349,11 +1349,14 @@ where
     T: TimeSource,
 {
     let open_started = Instant::now();
-    match reader_cache_files::read_v2_content_header(root, cache_key) {
+    let header = match reader_cache_files::read_v2_content_header(root, cache_key) {
         Some(header)
             if header.complete
                 && header.source_hash == source_identity.0
-                && header.source_size == source_identity.1 => {}
+                && header.source_size == source_identity.1 =>
+        {
+            header
+        }
         Some(_) => {
             // Incomplete or written for a different file under the same
             // key: dead weight, delete it.
@@ -1361,7 +1364,7 @@ where
             return false;
         }
         None => return false,
-    }
+    };
     // The old BOOK.BIN is layout-invalid but its labels and TOC copy are
     // settings-independent; carry them into the rewritten index. Bail to
     // the full build when they can't be recovered — it re-parses them.
@@ -1399,6 +1402,8 @@ where
                 &mut scratch.xhtml[..],
                 visible_page_capacity,
                 generate_toc_from_headings,
+                header.spine_count,
+                header.content_len,
             )
         })
         .unwrap_or(Err(()))
@@ -1491,20 +1496,26 @@ fn replay_content_records<
     buf: &mut [u8],
     visible_page_capacity: usize,
     generate_toc_from_headings: bool,
+    expected_spines: u16,
+    expected_len: u32,
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if file.length() != expected_len {
+        return Err(());
+    }
     if file.seek_from_start(CONTENT_HEADER_BYTES as u32).is_err() {
         return Err(());
     }
     let mut pos = 0usize;
     let mut fill = 0usize;
+    let mut replayed_spines = 0u16;
     'groups: loop {
         // Peek the next group's spine index; clean EOF here ends the walk.
         if !refill_content_buf(file, buf, &mut pos, &mut fill, CONTENT_RECORD_HEADER_BYTES)? {
-            return Ok(());
+            break 'groups;
         }
         let group_spine =
             decode_content_record_header(&buf[pos..pos + CONTENT_RECORD_HEADER_BYTES])
@@ -1556,6 +1567,7 @@ where
             pos += CONTENT_RECORD_HEADER_BYTES;
             if record.spine_end {
                 sink.finish_spine(false);
+                replayed_spines = replayed_spines.saturating_add(1);
                 continue 'groups;
             }
             let text_len = record.text_len as usize;
@@ -1585,6 +1597,10 @@ where
             }
         }
     }
+    if replayed_spines != expected_spines {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn spine_item_is_navigation(
