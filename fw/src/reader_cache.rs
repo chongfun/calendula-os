@@ -778,7 +778,6 @@ fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheErr
         ReaderCacheError::Epub(_) => "OPF",
         ReaderCacheError::Xhtml(proto::epub::XhtmlError::TooManyRuns) => "TEXT FULL",
         ReaderCacheError::Utf8 => "UTF8",
-        ReaderCacheError::MissingOpfPath => "NO OPF",
         ReaderCacheError::MissingSpine => "NO SPINE",
         ReaderCacheError::NoBodyText => "NO BODY TEXT",
         ReaderCacheError::EntryNameTooLong => "PATH LONG",
@@ -792,7 +791,6 @@ enum ReaderCacheError {
     Epub(proto::epub::EpubError),
     Xhtml(proto::epub::XhtmlError),
     Utf8,
-    MissingOpfPath,
     MissingSpine,
     NoBodyText,
     EntryNameTooLong,
@@ -923,20 +921,16 @@ where
     let io_start = crate::sd_session::sd_stats::snapshot();
     let mut section_write_micros: u64 = 0;
     esp_println::println!("epub: stage ParseContainerAndOpf");
-    let container_entry = zip.find_entry("META-INF/container.xml", scratch.header, scratch.name)?;
-    let container_len = zip.read_entry_streamed(
-        container_entry,
+    let mut opf_path_buf = String::<256>::new();
+    proto::epub::load_container_xml_and_find_opf_path(
+        &mut zip,
+        scratch.header,
+        scratch.name,
         scratch.compressed,
         scratch.container,
         &mut *scratch.zip_inflate,
+        &mut opf_path_buf,
     )?;
-    let container_xml = core::str::from_utf8(&scratch.container[..container_len])
-        .map_err(|_| ReaderCacheError::Utf8)?;
-    let opf_path_str = find_full_path(container_xml).ok_or(ReaderCacheError::MissingOpfPath)?;
-    let mut opf_path_buf = String::<256>::new();
-    opf_path_buf
-        .push_str(opf_path_str)
-        .map_err(|_| ReaderCacheError::Utf8)?;
     let opf_path = opf_path_buf.as_str();
 
     let opf_entry = zip.find_entry(opf_path, scratch.header, scratch.name)?;
@@ -1854,21 +1848,6 @@ where
         );
         Err(())
     }
-}
-
-fn find_full_path(xml: &str) -> Option<&str> {
-    let key = "full-path";
-    let start = xml.find(key)?;
-    let after_key = &xml[start + key.len()..];
-    let equals = after_key.find('=')?;
-    let after_equals = after_key[equals + 1..].trim_start();
-    let quote = after_equals.as_bytes().first().copied()?;
-    if quote != b'"' && quote != b'\'' {
-        return None;
-    }
-    let value = &after_equals[1..];
-    let end = value.as_bytes().iter().position(|byte| *byte == quote)?;
-    Some(&value[..end])
 }
 
 fn resolve_epub_href(

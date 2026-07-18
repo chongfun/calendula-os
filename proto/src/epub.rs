@@ -1514,6 +1514,35 @@ pub fn load_epub_package<'a>(
     )
 }
 
+/// Helper to extract the OPF path from an EPUB's META-INF/container.xml entry
+/// using the streaming Zip operations.
+pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
+    zip: &mut Z,
+    header_scratch: &mut [u8; 46],
+    name_scratch: &mut [u8],
+    compressed_scratch: &mut [u8],
+    container_scratch: &mut [u8],
+    zip_inflate: &mut ZipInflateScratch,
+    opf_path_buf: &mut heapless::String<256>,
+) -> Result<(), ZipError> {
+    let container_entry = zip.find_entry("META-INF/container.xml", header_scratch, name_scratch)?;
+    let container_len = zip.read_entry_streamed(
+        container_entry,
+        compressed_scratch,
+        container_scratch,
+        zip_inflate,
+    )?;
+    let container_xml =
+        core::str::from_utf8(&container_scratch[..container_len]).map_err(|_| ZipError::Inflate)?;
+    let opf_path =
+        find_attr_value(container_xml, "rootfile", "full-path").ok_or(ZipError::EntryNotFound)?;
+    opf_path_buf.clear();
+    opf_path_buf
+        .push_str(opf_path)
+        .map_err(|_| ZipError::NameTooLong)?;
+    Ok(())
+}
+
 pub fn parse_opf<'a>(
     opf_xml: &'a str,
     book_id: BookId,
@@ -5003,7 +5032,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_epub_package_supports_4096_byte_container() {
+    fn test_load_container_xml_and_find_opf_path_requires_4096_capacity() {
         let mut container_content = StdVec::new();
         container_content.extend_from_slice(b"<?xml version=\"1.0\"?>\n<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\n  <rootfiles>\n    <rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/>\n  </rootfiles>\n  <!-- ");
         while container_content.len() < 4092 {
@@ -5012,27 +5041,48 @@ mod tests {
         container_content.extend_from_slice(b" -->");
         assert_eq!(container_content.len(), 4096);
 
-        let opf_content = b"<?xml version=\"1.0\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" unique-identifier=\"pub-id\" version=\"3.0\">\n  <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n    <dc:title>Test Book</dc:title>\n    <dc:creator>Test Author</dc:creator>\n  </metadata>\n  <manifest>\n    <item id=\"x\" href=\"x.xhtml\" media-type=\"application/xhtml+xml\"/>\n  </manifest>\n  <spine>\n    <itemref idref=\"x\"/>\n  </spine>\n</package>";
+        let zip_bytes = stored_zip(&[("META-INF/container.xml", container_content.as_slice())]);
 
-        let zip_bytes = stored_zip(&[
-            ("META-INF/container.xml", container_content.as_slice()),
-            ("OEBPS/content.opf", opf_content.as_slice()),
-        ]);
+        let mut header_scratch = [0u8; 46];
+        let mut name_scratch = [0u8; 256];
+        let mut compressed_scratch = [0u8; 1024];
+        let mut zip_inflate = ZipInflateScratch::new();
+        let mut opf_path_buf = heapless::String::<256>::new();
 
-        let mut container_scratch = [0u8; 4096];
-        let mut opf_scratch = [0u8; 4096];
+        // 1. With 3840 bytes (the regression limit), it must fail with OutputTooSmall
+        let mut zip_small = ZipLocalStream::new(SliceStream {
+            bytes: &zip_bytes,
+            cursor: 0,
+        });
+        let mut small_container_scratch = [0u8; 3840];
+        let res_small = load_container_xml_and_find_opf_path(
+            &mut zip_small,
+            &mut header_scratch,
+            &mut name_scratch,
+            &mut compressed_scratch,
+            &mut small_container_scratch,
+            &mut zip_inflate,
+            &mut opf_path_buf,
+        );
+        assert_eq!(res_small, Err(ZipError::OutputTooSmall));
 
-        let package = load_epub_package(
-            &zip_bytes,
-            &mut container_scratch,
-            &mut opf_scratch,
-            BookId(1),
-            "test.epub",
-        )
-        .expect("should load successfully with 4096-byte container");
-
-        assert_eq!(package.meta.title, "Test Book");
-        assert_eq!(package.meta.author, "Test Author");
-        assert_eq!(package.opf_path, "OEBPS/content.opf");
+        // 2. With 4096 bytes (the fixed limit), it must succeed
+        let mut zip_full = ZipLocalStream::new(SliceStream {
+            bytes: &zip_bytes,
+            cursor: 0,
+        });
+        let mut full_container_scratch = [0u8; 4096];
+        let mut zip_inflate = ZipInflateScratch::new(); // reset inflation
+        let res_full = load_container_xml_and_find_opf_path(
+            &mut zip_full,
+            &mut header_scratch,
+            &mut name_scratch,
+            &mut compressed_scratch,
+            &mut full_container_scratch,
+            &mut zip_inflate,
+            &mut opf_path_buf,
+        );
+        assert!(res_full.is_ok());
+        assert_eq!(opf_path_buf.as_str(), "OEBPS/content.opf");
     }
 }
