@@ -530,8 +530,8 @@ pub(crate) fn load_custom_font_manifest(
 /// reducer's 128-chapter `sd_chapter_for_page` cap. Cheap in-RAM resolve every
 /// render; only touches SD (a 48-byte TOC title read) when the chapter actually
 /// changes. Returns the new uncapped chapter so the caller can forward it to the
-/// reducer, else `None` when nothing changed (or the page map is not resident,
-/// e.g. a built-in book).
+/// reducer, else `None` when nothing changed (or the chapter map is not
+/// resident, e.g. a built-in book).
 #[inline(never)]
 pub(crate) fn track_reading_chapter(
     epd: &mut Epd,
@@ -539,7 +539,7 @@ pub(crate) fn track_reading_chapter(
     global_page: u32,
     library: &mut ReaderStore,
 ) -> Option<u16> {
-    if library.chapter_page_count == 0 {
+    if !library.chapter_start_ready {
         return None;
     }
     let current = library.current_chapter_for_page(global_page);
@@ -683,9 +683,9 @@ where
 }
 
 /// Keep the resident current-chapter index and title pointed at the page just
-/// loaded. The full chapter-page map is read from TOC.BIN once per book (or
-/// after a repaginating settings change); the title is a single 48-byte record
-/// re-read only when the chapter actually changes.
+/// loaded. The per-section chapter marks are read from TOC.BIN once per book
+/// (or after a repaginating settings change); the title is a single 48-byte
+/// record re-read only when the chapter actually changes.
 fn refresh_chapter_tracking<
     D,
     T,
@@ -709,9 +709,9 @@ fn refresh_chapter_tracking<
         config,
         library.custom_font_identity(),
     );
-    if library.chapter_page_count == 0 || library.chapter_page_token != token {
-        if reader_cache_files::load_v2_toc_page_map(root, cache_key, source_identity, library) {
-            library.chapter_page_token = token;
+    if !library.chapter_start_ready || library.chapter_start_token != token {
+        if reader_cache_files::load_v2_toc_chapter_map(root, cache_key, source_identity, library) {
+            library.chapter_start_token = token;
         } else {
             return;
         }
