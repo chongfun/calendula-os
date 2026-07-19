@@ -33,6 +33,12 @@ pub async fn run(lpwr: LPWR<'static>) {
     // Boot lands on the Home shell, so start on the short leash.
     let mut idle = idle_timeout(AppView::Home);
     let mut deadline = Instant::now() + idle;
+    // Names each sleep request. An Activity press can abandon a handshake
+    // while its sleep command is still queued or running; the next
+    // handshake must not adopt that sleep's terminal acknowledgement,
+    // so every request mints a fresh generation and acknowledgements
+    // carry it back.
+    let mut sleep_generation: u32 = 0;
 
     loop {
         match select(POWER_EVENTS.receive(), Timer::at(deadline)).await {
@@ -47,15 +53,20 @@ pub async fn run(lpwr: LPWR<'static>) {
                 PowerEvent::SleepNow => {
                     // Only reached if a late button press aborted the
                     // handshake; resume on that press's idle tier.
-                    idle = enter_sleep(&mut rtc).await;
+                    sleep_generation = sleep_generation.wrapping_add(1);
+                    idle = enter_sleep(&mut rtc, sleep_generation).await;
                     deadline = Instant::now() + idle;
                 }
-                PowerEvent::DisplaySettled | PowerEvent::DisplayAsleep => {}
+                PowerEvent::DisplaySettled
+                | PowerEvent::DisplayAsleep(_)
+                | PowerEvent::DisplayRefreshFailed
+                | PowerEvent::DisplaySleepFailed(_) => {}
             },
             // Idle timeout elapsed with no activity.
             Either::Second(_) => {
                 esp_println::println!("power: idle timeout");
-                idle = enter_sleep(&mut rtc).await;
+                sleep_generation = sleep_generation.wrapping_add(1);
+                idle = enter_sleep(&mut rtc, sleep_generation).await;
                 deadline = Instant::now() + idle;
             }
         }
@@ -72,19 +83,44 @@ pub async fn run(lpwr: LPWR<'static>) {
 /// landed in, so the resumed idle clock ticks at the cancelling view's leash.
 /// Waiting for `DisplayAsleep` before cutting power guarantees the e-ink panel
 /// has settled on its sleep image and progress is safely on the SD card.
-async fn enter_sleep(rtc: &mut Rtc<'_>) -> Duration {
+async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
     esp_println::println!("power: display sleep");
-    DISPLAY_COMMANDS.send(DisplayCommand::Sleep).await;
+    DISPLAY_COMMANDS
+        .send(DisplayCommand::Sleep { generation })
+        .await;
 
     loop {
         match POWER_EVENTS.receive().await {
-            PowerEvent::DisplayAsleep => {
+            PowerEvent::DisplayAsleep(acked) if acked == generation => {
                 esp_println::println!("power: deep sleep");
                 let mut button = take_wake_button().await;
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
             PowerEvent::Activity(view) => return idle_timeout(view),
-            PowerEvent::DisplaySettled | PowerEvent::SleepNow => {}
+            PowerEvent::DisplaySleepFailed(acked) if acked == generation => {
+                // The display task could not complete the sleep transition
+                // (progress flush or panel handshake failed). Cutting power
+                // anyway would lose reading position or freeze a mid-refresh
+                // panel; stay awake and retry at the shell leash.
+                esp_println::println!("power: display sleep failed; staying awake");
+                return idle_timeout(AppView::Home);
+            }
+            // Anything else is not this sleep's terminal acknowledgement.
+            // A refresh failure belongs to a render queued ahead of our
+            // Sleep command; a sleep acknowledgement with another
+            // generation is the stale answer of a handshake abandoned on
+            // Activity, whose Sleep command was still queued when ours was
+            // sent (the four-slot channel permits both in flight).
+            // Abandoning the handshake over any of them would let our
+            // sleep proceed unobserved: its DisplayAsleep would land in
+            // the outer loop, leaving the panel dark with the MCU awake.
+            // Keep waiting for the matching acknowledgement — the display
+            // task answers every Sleep command with one.
+            PowerEvent::DisplayAsleep(_)
+            | PowerEvent::DisplaySleepFailed(_)
+            | PowerEvent::DisplayRefreshFailed
+            | PowerEvent::DisplaySettled
+            | PowerEvent::SleepNow => {}
         }
     }
 }

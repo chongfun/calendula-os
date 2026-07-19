@@ -261,6 +261,20 @@ impl RefreshPlanner {
         self.panel_shows_sleep_screen = panel_shows_sleep_screen;
     }
 
+    /// Records a failed panel transition (SPI transfer or BUSY handshake).
+    /// A flush or sleep that errored may have run partially, so the panel's
+    /// RAM, waveform, and power state are all unknown: forget the screen
+    /// contents so the next render re-inits the panel and pays the deep
+    /// full waveform instead of fast-diffing against a frame that may never
+    /// have landed. Configuration (fast-refresh enablement, interval)
+    /// describes policy, not panel state, and survives.
+    pub fn record_failure(&mut self) {
+        self.screen_on = false;
+        self.fast_refreshes = 0;
+        self.last_request = None;
+        self.panel_shows_sleep_screen = false;
+    }
+
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
         // Only the library list actually redraws when the scan count moves;
         // other views repaint identical pixels and can ride the partial.
@@ -304,7 +318,14 @@ pub struct RenderRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayCommand {
     Render(RenderRequest),
-    Sleep,
+    /// `generation` names this sleep request: the display task echoes it in
+    /// `PowerEvent::DisplayAsleep`/`DisplaySleepFailed` so the power task's
+    /// handshake can tell its own sleep's acknowledgement from a stale one
+    /// left by an earlier sleep it abandoned on `Activity`. The command
+    /// channel holds four slots, so two sleep requests can be in flight.
+    Sleep {
+        generation: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -549,7 +570,24 @@ impl PortalPsk {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayEvent {
     Settled,
+    /// The panel completed a sleep transition. Informational for the app:
+    /// like `SleepFailed`, it does not end a render cycle, and the sleep's
+    /// handshake may already have been abandoned with render/open work
+    /// queued behind the Sleep command — the app must not reset any
+    /// bookkeeping on it. Renders are acknowledged individually by
+    /// `Settled`/`RefreshFailed` regardless of interleaved sleeps.
     Asleep,
+    /// A panel refresh (render flush or wake init) did not complete: the
+    /// SPI transfer failed or the BUSY handshake never finished. The
+    /// panel's contents are unknown and the frame must not be treated as
+    /// shown; this ends the render cycle, so the app clears its render
+    /// lock and runs the failed-render recovery.
+    RefreshFailed,
+    /// A sleep transition failed (progress flush or panel handshake).
+    /// Distinct from `RefreshFailed` because it does not end a render
+    /// cycle: a render queued behind the sleep command is still pending,
+    /// so the app must not clear its render lock over it.
+    SleepFailed,
     Library(LibraryEvent),
 }
 
@@ -679,8 +717,36 @@ pub enum PowerEvent {
     /// short on the shell views).
     Activity(AppView),
     DisplaySettled,
-    DisplayAsleep,
+    /// The panel completed the sleep handshake for the identified
+    /// `DisplayCommand::Sleep` generation; only the matching handshake may
+    /// cut power on it.
+    DisplayAsleep(u32),
+    /// A panel refresh (render flush or wake init) did not complete. A
+    /// refresh failure can belong to a render queued ahead of a Sleep
+    /// command, and the sleep handshake must not be abandoned over
+    /// someone else's frame.
+    DisplayRefreshFailed,
+    /// The display task could not complete the identified sleep request
+    /// (progress flush or panel handshake failed); the power task must
+    /// stay awake — never cut power behind a failed sleep handshake. The
+    /// generation lets a later handshake ignore a stale failure from a
+    /// sleep it abandoned on `Activity`.
+    DisplaySleepFailed(u32),
     SleepNow,
+}
+
+/// Keep the display and power acknowledgements for a panel refresh paired.
+/// A failed transfer must never advance the app render queue or authorize a
+/// later power transition as though the panel had settled.
+pub const fn display_refresh_outcome(success: bool) -> (DisplayEvent, PowerEvent) {
+    if success {
+        (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+    } else {
+        (
+            DisplayEvent::RefreshFailed,
+            PowerEvent::DisplayRefreshFailed,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2222,6 +2288,21 @@ mod tests {
     }
 
     #[test]
+    fn panel_refresh_failure_is_never_acknowledged_as_settled() {
+        assert_eq!(
+            display_refresh_outcome(true),
+            (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+        );
+        assert_eq!(
+            display_refresh_outcome(false),
+            (
+                DisplayEvent::RefreshFailed,
+                PowerEvent::DisplayRefreshFailed
+            )
+        );
+    }
+
+    #[test]
     fn refresh_plan_keeps_library_selection_fast() {
         let mut planner = RefreshPlanner::new();
         let mut state = ReaderState::boot();
@@ -2336,6 +2417,42 @@ mod tests {
         let conservative = RefreshPlanner::new()
             .with_panel_shows_sleep_screen(true)
             .with_fast_refresh_enabled(false);
+        assert_eq!(conservative.mode_for(request), RefreshMode::Full);
+    }
+
+    #[test]
+    fn refresh_plan_failure_forces_reinit_and_full_waveform() {
+        let mut request = ReaderState::boot().render_request(RenderKind::Page);
+
+        // A failed flush or sleep handshake leaves the panel's RAM and
+        // waveform state unknown: the planner forgets the screen, so the
+        // next render hits the init guard (screen off, no last request)
+        // and pays the deep full waveform instead of fast-diffing against
+        // a frame that may never have landed.
+        let mut planner = RefreshPlanner::new();
+        planner.record_render(request, RefreshMode::Full);
+        planner.record_failure();
+        assert!(!planner.screen_on());
+        assert_eq!(planner.last_request(), None);
+        assert_eq!(planner.mode_for(request), RefreshMode::Full);
+
+        // The failure clears panel state, not policy: after one successful
+        // render, same-context turns ride the fast differential again.
+        planner.record_render(request, RefreshMode::Full);
+        request.selection = 1;
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+
+        // A failure also revokes a deep-sleep wake seed — the sleep screen
+        // can no longer be assumed to be on the panel.
+        let mut seeded = RefreshPlanner::new().with_panel_shows_sleep_screen(true);
+        seeded.record_failure();
+        assert_eq!(seeded.mode_for(request), RefreshMode::Full);
+
+        // Disabled fast refresh stays disabled through a failure.
+        let mut conservative = RefreshPlanner::new().with_fast_refresh_enabled(false);
+        conservative.record_render(request, RefreshMode::Full);
+        conservative.record_failure();
+        conservative.record_render(request, RefreshMode::Full);
         assert_eq!(conservative.mode_for(request), RefreshMode::Full);
     }
 

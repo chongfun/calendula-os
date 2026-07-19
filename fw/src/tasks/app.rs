@@ -227,12 +227,58 @@ pub async fn run() {
                     }
                 }
                 DisplayEvent::Asleep => {
+                    // Informational only. When the power task's handshake is
+                    // still active, deep sleep follows and reboots the chip,
+                    // so app state is moot. When that handshake was abandoned
+                    // on Activity, the very input that abandoned it queued
+                    // render/open work behind the Sleep command — resetting
+                    // the render lock or open suppression here would erase
+                    // that work's bookkeeping mid-flight. Every render is
+                    // answered by its own Settled/RefreshFailed regardless of
+                    // interleaved sleeps, so those acks alone advance state.
                     esp_println::println!("app: display asleep");
+                }
+                DisplayEvent::SleepFailed => {
+                    // A sleep transition failed, not the current render: a
+                    // render sent after the input that aborted the sleep
+                    // handshake may still be queued behind that Sleep
+                    // command, and its own Settled/RefreshFailed is coming.
+                    // Clearing the render lock here would double-render and
+                    // drop the coalesced pending frame, so leave both.
+                    esp_println::println!("app: display sleep failed");
+                }
+                DisplayEvent::RefreshFailed => {
+                    // The frame never reached the panel. Clear the render
+                    // lock so the next input re-renders instead of queueing
+                    // behind an acknowledgement that will never arrive, but
+                    // drop the coalesced pending render: it described a
+                    // frame for a panel state that no longer holds.
+                    esp_println::println!("app: display refresh failed");
                     rendering = false;
                     render_pending = false;
-                    opening_book = None;
-                    suppress_input_until_open_settled = false;
-                    block_confirm_until = None;
+                    // This failure ends the display cycle the same way
+                    // Settled would, and it is the only other drain point
+                    // for the parked storage command: a queued book open
+                    // left in pending_storage would otherwise hold
+                    // opening_book forever and suppress every input.
+                    if let Some(command) = pending_storage.take() {
+                        log_storage_command("send", command);
+                        if let Some(book_id) = open_book_id(command) {
+                            opening_book = Some(book_id);
+                            suppress_input_until_open_settled = true;
+                        }
+                        STORAGE_COMMANDS.send(command).await;
+                    }
+                    // Loaded may already have cleared opening_book before
+                    // this failure discarded its render; without Settled
+                    // ever arriving, the suppression flag must be released
+                    // here or input stays ignored for good.
+                    if suppress_input_until_open_settled && opening_book.is_none() {
+                        suppress_input_until_open_settled = false;
+                        block_confirm_until = Some(
+                            Instant::now() + Duration::from_millis(POST_OPEN_CONFIRM_BLOCK_MS),
+                        );
+                    }
                 }
                 DisplayEvent::Library(event) => {
                     if let Some(book_id) = loaded_book_id(&event) {
