@@ -43,6 +43,25 @@ pub fn encode_catalog_header(count: u16, out: &mut [u8; CATALOG_HEADER_BYTES]) {
     out[5..7].copy_from_slice(&count.to_le_bytes());
 }
 
+/// A deliberately invalid header, written first and left in place while
+/// records are still landing: version 0 is never accepted by readers, and
+/// for a non-empty partial file a count of 0 cannot agree with the file
+/// length either. The writer commits the real header by seeking back only
+/// after every record is durable, so a scan interrupted mid-write leaves a
+/// catalog that fails to load (and triggers a fresh scan) instead of one
+/// that quietly truncates the library — or worse, drives the orphan sweep
+/// into reclaiming caches of books that are still on the card.
+pub fn encode_catalog_placeholder_header(out: &mut [u8; CATALOG_HEADER_BYTES]) {
+    out.fill(0);
+    out[..4].copy_from_slice(CATALOG_MAGIC);
+}
+
+/// The exact byte length of a catalog holding `count` records; readers
+/// reject files whose length disagrees with their committed header.
+pub fn catalog_file_len(count: u16) -> usize {
+    CATALOG_HEADER_BYTES + count as usize * CATALOG_RECORD_BYTES
+}
+
 /// The book count, or `None` when the magic or version doesn't match (the
 /// caller then runs a fresh scan).
 pub fn decode_catalog_header(header: &[u8; CATALOG_HEADER_BYTES]) -> Option<u16> {
@@ -236,6 +255,22 @@ mod tests {
         let mut wrong_magic = header;
         wrong_magic[0] = b'Y';
         assert_eq!(decode_catalog_header(&wrong_magic), None);
+    }
+
+    #[test]
+    fn placeholder_header_never_decodes() {
+        let mut header = [0u8; CATALOG_HEADER_BYTES];
+        encode_catalog_placeholder_header(&mut header);
+        assert_eq!(decode_catalog_header(&header), None);
+    }
+
+    #[test]
+    fn file_len_matches_header_plus_records() {
+        assert_eq!(catalog_file_len(0), CATALOG_HEADER_BYTES);
+        assert_eq!(
+            catalog_file_len(3),
+            CATALOG_HEADER_BYTES + 3 * CATALOG_RECORD_BYTES
+        );
     }
 
     #[test]
