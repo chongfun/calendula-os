@@ -1141,6 +1141,11 @@ impl ReaderStore {
     /// starts), so it keeps advancing past the 128-entry resident/event caps
     /// and past chapter 255.
     pub(crate) fn current_chapter_for_page(&self, page: u32) -> u16 {
+        // Dropped marks (a cleared or rebuilt section table) must never pair
+        // with the current sections, even if a caller skips the ready check.
+        if !self.chapter_start_ready {
+            return 0;
+        }
         let count = self.book_section_count.min(MAX_BOOK_SECTIONS);
         proto::cache::chapter_for_page(
             &self.chapter_start[..count],
