@@ -150,7 +150,11 @@ a software reset; boot restore then reloads the saved position.
 Before the loan the display task flushes any coalesced reading position
 to durable state, because the session's only exit is the reset; a failed
 flush refuses the loan rather than dismantling the scratch over an unsaved
-position. (An earlier
+position. The refusal is an answer, not a silence: `SYNC_LOANS` carries
+`Result<SyncLoan, SyncError>`, the wifi task reports `SyncError::Storage`
+to the Wireless screen and re-parks for the next Start, and Confirm
+retries the session (nothing was loaned, so no reset is needed and the
+position write is retried first). (An earlier
 iteration also exchanged the position with a kosync server here; that
 shipped unused and was removed — the session is purely a book server.)
 

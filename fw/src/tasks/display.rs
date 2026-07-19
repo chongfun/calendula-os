@@ -540,11 +540,16 @@ fn handle_storage_command(
                 pending_progress,
                 last_progress_write,
             ) {
-                esp_println::println!("storage: sync loan deferred; progress persistence failed");
+                // The wifi task is blocked on this answer; a silent return
+                // would strand it (and the Wireless screen) forever. Refuse
+                // observably so it can report the failure and re-park.
+                esp_println::println!("storage: sync loan refused; progress persistence failed");
+                let _ = crate::SYNC_LOANS.try_send(Err(app_core::SyncError::Storage));
                 return;
             }
             ensure_epub_scratch(epub_scratch);
             let Some(scratch) = epub_scratch.take() else {
+                let _ = crate::SYNC_LOANS.try_send(Err(app_core::SyncError::Storage));
                 return;
             };
             sync_session.loan_granted();
@@ -558,9 +563,10 @@ fn handle_storage_command(
                 }
             });
             loan.catalog_len = crate::library_sd::write_catalog_listing(epd, sd_cs, loan.http_b);
-            if crate::SYNC_LOANS.try_send(loan).is_err() {
-                // Unreachable in practice: the wifi task requests exactly
-                // one loan per boot. The memory is gone either way.
+            if crate::SYNC_LOANS.try_send(Ok(loan)).is_err() {
+                // Unreachable in practice: the wifi task blocks on each
+                // answer before it can request again. The memory is gone
+                // either way.
                 esp_println::println!("storage: sync loan channel full");
             }
         }
