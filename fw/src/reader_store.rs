@@ -175,7 +175,7 @@ pub(crate) struct ReaderStore {
     active_index: Option<usize>,
     pub(crate) current_index: Option<usize>,
     pub(crate) loaded_index: Option<usize>,
-    pub(crate) loaded_chapter: u8,
+    pub(crate) loaded_chapter: u16,
     pub(crate) reader_status: BookLoadStatus,
     pub(crate) title: String<64>,
     pub(crate) author: String<64>,
@@ -699,7 +699,7 @@ impl ReaderStore {
         self.clear_book_index();
     }
 
-    pub(crate) fn finish_book_load(&mut self, index: usize, chapter: u8, status: BookLoadStatus) {
+    pub(crate) fn finish_book_load(&mut self, index: usize, chapter: u16, status: BookLoadStatus) {
         if matches!(status, BookLoadStatus::Ready) {
             self.set_current_index(index);
         }
@@ -1235,10 +1235,10 @@ impl ReaderStore {
         self.error.as_str()
     }
 
-    pub(crate) fn chapter_count_for_ui(&self) -> u8 {
+    pub(crate) fn chapter_count_for_ui(&self) -> u16 {
         // The full on-disk count (when known) drives the overview's
         // selection range; it can run past the 128-entry resident/event
-        // caps, so only the u8 message width bounds it.
+        // caps, so only the u16 message width bounds it.
         let count = if self.toc_total > 0 {
             self.toc_total
         } else if self.toc_count > 0 {
@@ -1246,7 +1246,7 @@ impl ReaderStore {
         } else {
             self.book_section_count
         };
-        count.min(u8::MAX as usize).max(1) as u8
+        count.min(u16::MAX as usize).max(1) as u16
     }
 
     pub(crate) fn set_current_index(&mut self, index: usize) {
