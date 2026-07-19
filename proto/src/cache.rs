@@ -316,6 +316,11 @@ impl ContentGroupReader<'_> {
 ///
 /// - every group ends in a spine-end marker and never changes spine index
 ///   mid-group;
+/// - group spine indices strictly increase (gaps are fine — the capture
+///   skips navigation items): the writer walks the spine in `enumerate()`
+///   order and its indices can't saturate (`MAX_SPINE_ITEMS` is far below
+///   `u16::MAX`), so a reordered or duplicated group is corruption that
+///   would otherwise publish chapters out of order;
 /// - clean EOF is only accepted on a group boundary with exactly
 ///   `expected_spines` groups replayed;
 /// - a driver returning [`ContentReplayFlow::Continue`] must have drained
@@ -336,6 +341,7 @@ pub fn replay_content_stream(
     let mut pos = 0usize;
     let mut fill = 0usize;
     let mut replayed_spines = 0u16;
+    let mut last_group_spine: Option<u16> = None;
     loop {
         // Peek the next group's spine index; clean EOF here ends the walk.
         if !refill_content_buf(read, buf, &mut pos, &mut fill, CONTENT_RECORD_HEADER_BYTES)? {
@@ -345,6 +351,11 @@ pub fn replay_content_stream(
             decode_content_record_header(&buf[pos..pos + CONTENT_RECORD_HEADER_BYTES])
                 .map_err(|_| ContentReplayError)?
                 .spine_index;
+        // Rejected before the group runs, so a reordered stream can't
+        // publish a single section in the wrong place.
+        if last_group_spine.is_some_and(|last| group_spine <= last) {
+            return Err(ContentReplayError);
+        }
         let mut group = ContentGroupReader {
             read: &mut *read,
             buf: &mut *buf,
@@ -360,6 +371,7 @@ pub fn replay_content_stream(
         if !group.done {
             return Err(ContentReplayError);
         }
+        last_group_spine = Some(group_spine);
         replayed_spines = replayed_spines.saturating_add(1);
     }
     if replayed_spines != expected_spines {
@@ -1879,5 +1891,39 @@ mod tests {
         )
         .unwrap();
         assert!(run_content_replay(&flipped[..full_len]).is_err());
+
+        // 7. Two complete, internally valid groups in the wrong order
+        // (spine 1's group before spine 0's): group indices must strictly
+        // increase, or replay would publish chapters out of order instead
+        // of falling back to the full build.
+        let group_0 = &buffer[CONTENT_HEADER_BYTES..spine_0_end_offset];
+        let group_1 = &buffer[spine_0_end_offset..full_len];
+        let mut swapped = [0u8; 1024];
+        swapped[..CONTENT_HEADER_BYTES].copy_from_slice(&buffer[..CONTENT_HEADER_BYTES]);
+        swapped[CONTENT_HEADER_BYTES..CONTENT_HEADER_BYTES + group_1.len()]
+            .copy_from_slice(group_1);
+        swapped[CONTENT_HEADER_BYTES + group_1.len()..full_len].copy_from_slice(group_0);
+        assert!(run_content_replay(&swapped[..full_len]).is_err());
+
+        // 8. The same complete group twice: a duplicate index is equally
+        // impossible in a real capture and must not publish a chapter
+        // twice.
+        let dup_len = CONTENT_HEADER_BYTES + 2 * group_0.len();
+        let mut duplicated = [0u8; 1024];
+        encode_content_header(
+            ContentHeader {
+                source_hash: 0x12345678,
+                source_size: 100000,
+                complete: true,
+                spine_count: 2,
+                content_len: dup_len as u32,
+            },
+            &mut duplicated[..CONTENT_HEADER_BYTES],
+        )
+        .unwrap();
+        duplicated[CONTENT_HEADER_BYTES..CONTENT_HEADER_BYTES + group_0.len()]
+            .copy_from_slice(group_0);
+        duplicated[CONTENT_HEADER_BYTES + group_0.len()..dup_len].copy_from_slice(group_0);
+        assert!(run_content_replay(&duplicated[..dup_len]).is_err());
     }
 }
