@@ -7,7 +7,7 @@ use crate::reader_store::{
     MAX_READER_BLOCK_TEXT,
 };
 use crate::sd_session::{self, SdSessionError};
-use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings, STYLE_MARKER};
+use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use esp_hal::gpio::Output;
@@ -2060,31 +2060,26 @@ where
         match &mut self.line_ink {
             LineInkCursor::BuiltIn(cursor) => cursor.push_str(text),
             LineInkCursor::Custom(cursor) => {
-                let mut chars = text.chars();
-                while let Some(ch) = chars.next() {
-                    if ch == STYLE_MARKER {
-                        if let Some(code) = chars.next() {
+                crate::custom_font::for_each_metric(
+                    self.root,
+                    self.library,
+                    &mut *self.font_metrics,
+                    cursor.settings.size,
+                    cursor.settings.weight,
+                    cursor.style,
+                    text,
+                    |style, metric| {
+                        if cursor.style != style {
                             cursor.reset_pair();
-                            cursor.style =
-                                display::font::style_from_marker_code(code).unwrap_or(cursor.style);
+                            cursor.style = style;
                         }
-                        continue;
-                    }
-                    let metric = crate::custom_font::measure_char(
-                        self.root,
-                        self.library,
-                        &mut *self.font_metrics,
-                        cursor.settings.size,
-                        cursor.settings.weight,
-                        cursor.style,
-                        ch,
-                    );
-                    if let Some(metric) = metric {
-                        cursor.push_metric(metric);
-                    } else {
-                        cursor.push_fallback();
-                    }
-                }
+                        if let Some(metric) = metric {
+                            cursor.push_metric(metric);
+                        } else {
+                            cursor.push_fallback();
+                        }
+                    },
+                );
             }
         }
     }
