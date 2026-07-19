@@ -36,7 +36,10 @@ pub(crate) type SpiError = <SpiDmaBus<'static, Async> as embedded_hal_async::spi
 /// BUSY handshake after a command never completed. Either way the panel's
 /// RAM/waveform state is unknown, so callers must not report the frame as
 /// settled or the panel as asleep.
-#[allow(dead_code)] // The payloads exist for the Debug log line.
+// The payloads are read only through the derived Debug in log lines, which
+// dead_code does not count as a use; both device builds compile this module
+// the same way, so the expectation is fulfilled on X4 and X3 alike.
+#[expect(dead_code, reason = "The payloads exist for the Debug log line.")]
 #[derive(Debug)]
 pub(crate) enum PanelError {
     Spi(SpiError),

@@ -204,7 +204,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         prev_prestaged = false;
                         let (display_event, power_event) = app_core::display_refresh_outcome(false);
                         send_required_display_event(&display_event);
-                        let _ = POWER_EVENTS.try_send(power_event);
+                        send_required_power_event(power_event).await;
                         continue;
                     }
                     esp_println::println!("display: wake init complete");
@@ -263,7 +263,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // Sleep queued by power_task after DisplaySettled waits behind it.
                     let (display_event, power_event) = app_core::display_refresh_outcome(true);
                     send_required_display_event(&display_event);
-                    let _ = POWER_EVENTS.try_send(power_event);
+                    send_required_power_event(power_event).await;
                     let prestage_start = Instant::now();
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
                         .await
@@ -290,7 +290,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.record_failure();
                     let (display_event, power_event) = app_core::display_refresh_outcome(false);
                     send_required_display_event(&display_event);
-                    let _ = POWER_EVENTS.try_send(power_event);
+                    send_required_power_event(power_event).await;
                 }
             }
             Either::First(DisplayCommand::Sleep { generation }) => {
@@ -314,7 +314,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // failure releases its handshake wait.
                     esp_println::println!("display: sleep deferred; progress persistence failed");
                     send_required_display_event(&DisplayEvent::SleepFailed);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySleepFailed(generation));
+                    send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                     continue;
                 }
                 let request = refresh_planner.last_request().or_else(|| {
@@ -377,7 +377,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
                 if panel_slept {
                     send_required_display_event(&DisplayEvent::Asleep);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep(generation));
+                    send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
                 } else {
                     // The panel never acknowledged the sleep sequence, so it
                     // may still be mid-refresh. Cutting power now would
@@ -390,7 +390,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.record_failure();
                     esp_println::println!("display: sleep transition failed");
                     send_required_display_event(&DisplayEvent::SleepFailed);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySleepFailed(generation));
+                    send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                 }
                 esp_println::println!(
                     "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",
@@ -1006,6 +1006,30 @@ fn send_loaded_library_event(event: &LibraryEvent) {
         return;
     }
     send_required_library_event(event);
+}
+
+/// Power acknowledgements get a bounded-wait send instead of a silent
+/// try_send drop: the power task's sleep handshake blocks on the matching
+/// `DisplayAsleep`/`DisplaySleepFailed`, and losing one on a momentarily
+/// full queue would leave the MCU awake behind a dark panel until the next
+/// input. The wait must stay bounded rather than fully blocking — the power
+/// task stops draining `POWER_EVENTS` while it is itself blocked sending a
+/// Sleep command into a full `DISPLAY_COMMANDS` queue, which only this task
+/// drains, so an unbounded send here could deadlock both tasks. In that
+/// window the acks being sent are refresh acks the power task ignores, so
+/// timing out and logging the drop is safe; sleep acks are only sent after
+/// the power task's Sleep send completed, when it is back in its receive
+/// loop and drains the queue within the bound.
+async fn send_required_power_event(event: PowerEvent) {
+    if embassy_time::with_timeout(
+        embassy_time::Duration::from_millis(20),
+        POWER_EVENTS.send(event),
+    )
+    .await
+    .is_err()
+    {
+        esp_println::println!("display: power event queue full, dropped {:?}", event);
+    }
 }
 
 fn send_required_display_event(event: &DisplayEvent) {
