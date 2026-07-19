@@ -1,23 +1,23 @@
 use crate::reader_layout;
 use crate::reader_store::{
-    ReaderStore, EMPTY_BOOK_SECTION_RECORD, EMPTY_TOC_RECORD, MAX_BOOK_SECTIONS,
-    MAX_OVERVIEW_CHAPTERS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
+    ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS, MAX_OVERVIEW_CHAPTERS,
+    MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
 };
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::cache::{
-    decode_block, decode_book_v2_header, decode_book_v2_section, decode_content_header,
-    decode_cover_header, decode_page, decode_section_v2_header, decode_toc, decode_toc_chapter,
-    decode_toc_file_header, encode_block, encode_book_v2_header, encode_book_v2_section,
-    encode_content_header, encode_content_record_header, encode_page, encode_section_v2_header,
-    encode_toc, encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord,
-    ContentHeader, ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES,
-    BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE,
-    CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES,
-    CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR, CONTENT_HEADER_BYTES,
-    CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES,
-    TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
+    decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
+    decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
+    encode_book_v2_header, encode_book_v2_section, encode_content_header,
+    encode_content_record_header, encode_page, encode_section_v2_header, encode_toc,
+    encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord, ContentHeader,
+    ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
+    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE, CACHE_COVER_FILE,
+    CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE,
+    CACHE_V2_DIR, CONTENT_HEADER_BYTES, CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES,
+    PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES,
+    TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -421,6 +421,116 @@ where
     .unwrap_or(0)
 }
 
+/// Bounds the TOC and label counts a BOOK.BIN header may claim before any
+/// body loader trusts them.
+fn v2_toc_label_bounds_ok(header: &BookV2Header) -> bool {
+    header.toc_count as usize <= MAX_SD_TOC_ITEMS
+        && header.toc_text_bytes as usize <= MAX_SD_TOC_TEXT_BYTES
+        && header.title_text_bytes as usize <= 64
+        && header.author_text_bytes as usize <= 64
+}
+
+/// Read the TOC records and text at the file's current position (just past
+/// the section records) into the library. The one decoder of BOOK.BIN's
+/// TOC body — `load_v2_book_index` and `load_v2_book_labels_and_toc` both
+/// call it. On any failure the library's TOC is left cleared and false is
+/// returned.
+fn read_v2_toc_into_library<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    header: &BookV2Header,
+    library: &mut ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    library.clear_toc();
+    if !read_records_batched(
+        file,
+        TOC_RECORD_BYTES,
+        header.toc_count as usize,
+        |index, bytes| {
+            let Ok(record) = decode_toc(bytes) else {
+                return false;
+            };
+            if !toc_record_fits_text(record, header.toc_text_bytes) {
+                return false;
+            }
+            library.toc[index] = record;
+            library.toc_page[index] = 0;
+            true
+        },
+    ) {
+        library.clear_toc();
+        return false;
+    }
+    if header.toc_text_bytes > 0 {
+        let text_len = header.toc_text_bytes as usize;
+        if read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
+            library.clear_toc();
+            return false;
+        }
+        library.toc_text_len = text_len;
+        library.toc_count = header.toc_count as usize;
+    }
+    true
+}
+
+/// Read the title/author labels at the file's current position (just past
+/// the TOC text) and publish them to the library — the shared tail of both
+/// BOOK.BIN body loaders. A book with neither label leaves the store's
+/// labels untouched.
+fn read_v2_labels_into_library<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    header: &BookV2Header,
+    library: &mut ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut title = [0u8; 64];
+    let mut author = [0u8; 64];
+    let mut title_str = "";
+    let mut author_str = "";
+    if header.title_text_bytes > 0 {
+        let title_len = header.title_text_bytes as usize;
+        if read_exact_file(file, &mut title[..title_len]).is_err() {
+            return false;
+        }
+        let Ok(parsed_title) = core::str::from_utf8(&title[..title_len]) else {
+            return false;
+        };
+        title_str = parsed_title;
+    }
+    if header.author_text_bytes > 0 {
+        let author_len = header.author_text_bytes as usize;
+        if read_exact_file(file, &mut author[..author_len]).is_err() {
+            return false;
+        }
+        let Ok(parsed_author) = core::str::from_utf8(&author[..author_len]) else {
+            return false;
+        };
+        author_str = parsed_author;
+    }
+    if header.title_text_bytes > 0 || header.author_text_bytes > 0 {
+        library.set_book_labels(title_str, author_str);
+    }
+    true
+}
+
 pub(crate) fn load_v2_book_index<
     D,
     T,
@@ -451,10 +561,7 @@ where
                 != reader_layout::reader_layout_config(library.type_settings(), library.portrait())
             || header.custom_font_identity != library.custom_font_identity()
             || header.section_count as usize > MAX_BOOK_SECTIONS
-            || header.toc_count as usize > MAX_SD_TOC_ITEMS
-            || header.toc_text_bytes as usize > MAX_SD_TOC_TEXT_BYTES
-            || header.title_text_bytes as usize > 64
-            || header.author_text_bytes as usize > 64
+            || !v2_toc_label_bounds_ok(&header)
             || header.total_pages == 0
         {
             return BookIndexLoadResult::Invalid;
@@ -477,68 +584,11 @@ where
         ) {
             return BookIndexLoadResult::Invalid;
         }
-        let mut toc = [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS];
-        if !read_records_batched(
-            file,
-            TOC_RECORD_BYTES,
-            header.toc_count as usize,
-            |index, bytes| {
-                let Ok(record) = decode_toc(bytes) else {
-                    return false;
-                };
-                if !toc_record_fits_text(record, header.toc_text_bytes) {
-                    return false;
-                }
-                toc[index] = record;
-                true
-            },
-        ) {
+        if !read_v2_toc_into_library(file, &header, library) {
             return BookIndexLoadResult::Invalid;
         }
-        library.clear_toc();
-        if header.toc_text_bytes > 0 {
-            let text_len = header.toc_text_bytes as usize;
-            if read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
-                return BookIndexLoadResult::Invalid;
-            }
-            library.toc_text_len = text_len;
-            library.toc_count = header.toc_count as usize;
-            for (index, record) in toc
-                .iter()
-                .take(header.toc_count as usize)
-                .copied()
-                .enumerate()
-            {
-                library.toc[index] = record;
-                library.toc_page[index] = 0;
-            }
-        }
-        let mut title = [0u8; 64];
-        let mut author = [0u8; 64];
-        let mut title_str = "";
-        let mut author_str = "";
-        if header.title_text_bytes > 0 {
-            let title_len = header.title_text_bytes as usize;
-            if read_exact_file(file, &mut title[..title_len]).is_err() {
-                return BookIndexLoadResult::Invalid;
-            }
-            let Ok(parsed_title) = core::str::from_utf8(&title[..title_len]) else {
-                return BookIndexLoadResult::Invalid;
-            };
-            title_str = parsed_title;
-        }
-        if header.author_text_bytes > 0 {
-            let author_len = header.author_text_bytes as usize;
-            if read_exact_file(file, &mut author[..author_len]).is_err() {
-                return BookIndexLoadResult::Invalid;
-            }
-            let Ok(parsed_author) = core::str::from_utf8(&author[..author_len]) else {
-                return BookIndexLoadResult::Invalid;
-            };
-            author_str = parsed_author;
-        }
-        if header.title_text_bytes > 0 || header.author_text_bytes > 0 {
-            library.set_book_labels(title_str, author_str);
+        if !read_v2_labels_into_library(file, &header, library) {
+            return BookIndexLoadResult::Invalid;
         }
         library.set_book_index(
             header.total_pages,
@@ -995,19 +1045,15 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if ensure_v2_cache_dirs(root, key).is_err() {
-        esp_println::println!("cache: v2 ensure dirs failed key={}", key);
-        return f(None);
-    }
     // One handle walks the chain via change_dir, so the whole build holds a
-    // single directory slot instead of the four-level ladder.
-    let Ok(mut dir) = root.open_dir(CACHE_ROOT_DIR) else {
+    // single directory slot instead of the four-level ladder. The caller is
+    // responsible for `ensure_v2_cache_dirs` when the tree might not exist
+    // yet (the full build runs it once up front); a missing tree lands in
+    // the `f(None)` fallback like any other open failure.
+    let Some(mut dir) = open_v2_book_dir(root, key) else {
         return f(None);
     };
-    if dir.change_dir(CACHE_V2_DIR).is_err()
-        || dir.change_dir(key).is_err()
-        || dir.change_dir(CACHE_SECTIONS_DIR).is_err()
-    {
+    if dir.change_dir(CACHE_SECTIONS_DIR).is_err() {
         return f(None);
     }
     f(Some(&dir))
@@ -1043,9 +1089,34 @@ where
     }
 }
 
+/// Open the book's cache directory (`XTEINK/CACHE2/<key>`) with one handle
+/// walked via `change_dir` — the single owner of that path walk. Opening a
+/// directory another walk also passes through is fine: this embedded-sdmmc
+/// rev allows duplicate directory opens (directories hold no cached
+/// state); only deleting an open directory errors.
+pub(crate) fn open_v2_book_dir<
+    'v,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &'v Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> Option<Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut dir = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    dir.change_dir(CACHE_V2_DIR).ok()?;
+    dir.change_dir(key).ok()?;
+    Some(dir)
+}
+
 /// Open the book's `CONT.BIN` (settings-independent content cache) and run
-/// `f` with it. One directory handle walks the chain via `change_dir`, like
-/// `with_v2_sections_dir`.
+/// `f` with it.
 pub(crate) fn with_v2_content_file<
     R,
     D,
@@ -1063,34 +1134,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut dir = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    dir.change_dir(CACHE_V2_DIR).ok()?;
-    dir.change_dir(key).ok()?;
+    let dir = open_v2_book_dir(root, key)?;
     let file = dir.open_file_in_dir(CACHE_CONTENT_FILE, mode).ok()?;
     Some(f(&file))
-}
-
-/// Read `CONT.BIN`'s header, if the file exists and decodes.
-pub(crate) fn read_v2_content_header<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
-) -> Option<ContentHeader>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    with_v2_content_file(root, key, Mode::ReadOnly, |file| {
-        let mut bytes = [0u8; CONTENT_HEADER_BYTES];
-        read_exact_file(file, &mut bytes).ok()?;
-        decode_content_header(&bytes).ok()
-    })
-    .flatten()
 }
 
 /// Delete the book's `CONT.BIN`. Failures are ignored — a stale or corrupt
@@ -1109,43 +1155,10 @@ pub(crate) fn delete_v2_content_file<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(mut dir) = root.open_dir(CACHE_ROOT_DIR) else {
+    let Some(dir) = open_v2_book_dir(root, key) else {
         return;
     };
-    if dir.change_dir(CACHE_V2_DIR).is_err() || dir.change_dir(key).is_err() {
-        return;
-    }
     let _ = upload_store::remove_file_reclaiming_clusters(&dir, CACHE_CONTENT_FILE);
-}
-
-/// Open (creating as needed) the book cache directory that holds CONT.BIN,
-/// one handle walked via `change_dir`. The capture's file handle borrows
-/// it, so the caller keeps it alive for the whole build. Opening a
-/// directory the SECTIONS walk also passes through is fine: this
-/// embedded-sdmmc rev allows duplicate directory opens (directories hold
-/// no cached state); only deleting an open directory errors.
-pub(crate) fn open_v2_content_dir<
-    'v,
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &'v Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
-) -> Option<Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    if ensure_v2_cache_dirs(root, key).is_err() {
-        return None;
-    }
-    let mut dir = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    dir.change_dir(CACHE_V2_DIR).ok()?;
-    dir.change_dir(key).ok()?;
-    Some(dir)
 }
 
 /// Captures the build's `push_block` stream into `<key>/CONT.BIN` so a later
@@ -1260,20 +1273,6 @@ where
             return;
         }
 
-        // Ensure both header and text are flushed/staged together: if they don't
-        // fit in the remaining stage capacity, flush the existing buffer first.
-        let total_len = header.len() + text.len();
-        if total_len > self.stage.len() - self.len && self.len > 0 {
-            let Some(file) = self.file.as_ref() else {
-                return;
-            };
-            if file.write(&self.stage[..self.len]).is_err() {
-                self.file = None;
-                return;
-            }
-            self.len = 0;
-        }
-
         self.stage_push(&header);
         self.stage_push(text.as_bytes());
     }
@@ -1306,30 +1305,16 @@ where
         self.stage_push(&header);
     }
 
-    /// Batch small record writes through the staging buffer, the
-    /// `WriteStage` pattern; any write failure disables the capture.
+    /// Batch small record writes through the caller-owned staging buffer
+    /// via the shared `staged_write`; any write failure disables the
+    /// capture.
     fn stage_push(&mut self, bytes: &[u8]) {
         let Some(file) = self.file.as_ref() else {
             return;
         };
-        if bytes.len() > self.stage.len() - self.len {
-            if self.len > 0 && file.write(&self.stage[..self.len]).is_err() {
-                self.file = None;
-                return;
-            }
-            self.len = 0;
+        if staged_write(file, self.stage, &mut self.len, bytes).is_err() {
+            self.file = None;
         }
-        let Some(file) = self.file.as_ref() else {
-            return;
-        };
-        if bytes.len() >= self.stage.len() {
-            if file.write(bytes).is_err() {
-                self.file = None;
-            }
-            return;
-        }
-        self.stage[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        self.len += bytes.len();
     }
 
     /// Flush and mark the capture complete (`keep = true`, the whole spine
@@ -1343,15 +1328,10 @@ where
     ) -> bool {
         let mut kept = false;
         if keep {
-            if self.len > 0 {
-                let flushed = match self.file.as_ref() {
-                    Some(file) => file.write(&self.stage[..self.len]).is_ok(),
-                    None => false,
-                };
-                if !flushed {
+            if let Some(file) = self.file.as_ref() {
+                if staged_flush(file, self.stage, &mut self.len).is_err() {
                     self.file = None;
                 }
-                self.len = 0;
             }
             if let Some(file) = self.file.as_ref() {
                 let file_len = file.length();
@@ -1413,10 +1393,7 @@ where
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.section_count as usize > MAX_BOOK_SECTIONS
-            || header.toc_count as usize > MAX_SD_TOC_ITEMS
-            || header.toc_text_bytes as usize > MAX_SD_TOC_TEXT_BYTES
-            || header.title_text_bytes as usize > 64
-            || header.author_text_bytes as usize > 64
+            || !v2_toc_label_bounds_ok(&header)
         {
             return false;
         }
@@ -1425,63 +1402,8 @@ where
         if file.seek_from_start(toc_offset as u32).is_err() {
             return false;
         }
-        library.clear_toc();
-        if !read_records_batched(
-            file,
-            TOC_RECORD_BYTES,
-            header.toc_count as usize,
-            |index, bytes| {
-                let Ok(record) = decode_toc(bytes) else {
-                    return false;
-                };
-                if !toc_record_fits_text(record, header.toc_text_bytes) {
-                    return false;
-                }
-                library.toc[index] = record;
-                library.toc_page[index] = 0;
-                true
-            },
-        ) {
-            library.clear_toc();
-            return false;
-        }
-        if header.toc_text_bytes > 0 {
-            let text_len = header.toc_text_bytes as usize;
-            if read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
-                library.clear_toc();
-                return false;
-            }
-            library.toc_text_len = text_len;
-            library.toc_count = header.toc_count as usize;
-        }
-        let mut title = [0u8; 64];
-        let mut author = [0u8; 64];
-        let mut title_str = "";
-        let mut author_str = "";
-        if header.title_text_bytes > 0 {
-            let title_len = header.title_text_bytes as usize;
-            if read_exact_file(file, &mut title[..title_len]).is_err() {
-                return false;
-            }
-            let Ok(parsed_title) = core::str::from_utf8(&title[..title_len]) else {
-                return false;
-            };
-            title_str = parsed_title;
-        }
-        if header.author_text_bytes > 0 {
-            let author_len = header.author_text_bytes as usize;
-            if read_exact_file(file, &mut author[..author_len]).is_err() {
-                return false;
-            }
-            let Ok(parsed_author) = core::str::from_utf8(&author[..author_len]) else {
-                return false;
-            };
-            author_str = parsed_author;
-        }
-        if header.title_text_bytes > 0 || header.author_text_bytes > 0 {
-            library.set_book_labels(title_str, author_str);
-        }
-        true
+        read_v2_toc_into_library(file, &header, library)
+            && read_v2_labels_into_library(file, &header, library)
     })
     .unwrap_or(false)
 }
@@ -1959,6 +1881,51 @@ where
 /// stack inside the EPUB open path, in the same tight budget region.
 const RECORD_STAGE_BYTES: usize = 256;
 
+/// Append `bytes` to `file` through a caller-owned staging buffer: flush
+/// the stage when the bytes don't fit the remaining capacity, and bypass
+/// it entirely for writes at least as large as the whole buffer. The one
+/// implementation of the batching arithmetic — `WriteStage` and
+/// `ContentCapture` both delegate here.
+fn staged_write<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    buf: &mut [u8],
+    len: &mut usize,
+    bytes: &[u8],
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if bytes.len() > buf.len() - *len {
+        staged_flush(file, buf, len)?;
+    }
+    if bytes.len() >= buf.len() {
+        return file.write(bytes).map_err(|_| ());
+    }
+    buf[*len..*len + bytes.len()].copy_from_slice(bytes);
+    *len += bytes.len();
+    Ok(())
+}
+
+/// Write out whatever `staged_write` has accumulated. `len` resets even on
+/// failure so a disabled writer can't replay stale bytes.
+fn staged_flush<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    buf: &[u8],
+    len: &mut usize,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if *len == 0 {
+        return Ok(());
+    }
+    let result = file.write(&buf[..*len]).map_err(|_| ());
+    *len = 0;
+    result
+}
+
 /// Batch small writes through one staging buffer — the write-side twin of
 /// `read_records_batched`. The FAT layer pays the same per-call overhead on
 /// writes (block lookup plus a read-modify-write of the current sector), so
@@ -1995,24 +1962,11 @@ where
     }
 
     fn push(&mut self, bytes: &[u8]) -> Result<(), ()> {
-        if bytes.len() > self.buf.len() - self.len {
-            self.flush()?;
-        }
-        if bytes.len() >= self.buf.len() {
-            return self.file.write(bytes).map_err(|_| ());
-        }
-        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        self.len += bytes.len();
-        Ok(())
+        staged_write(self.file, &mut self.buf, &mut self.len, bytes)
     }
 
     fn flush(&mut self) -> Result<(), ()> {
-        if self.len == 0 {
-            return Ok(());
-        }
-        let result = self.file.write(&self.buf[..self.len]).map_err(|_| ());
-        self.len = 0;
-        result
+        staged_flush(self.file, &self.buf, &mut self.len)
     }
 }
 
@@ -2056,7 +2010,13 @@ where
     true
 }
 
-fn read_exact_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+pub(crate) fn read_exact_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     mut out: &mut [u8],
 ) -> Result<(), ()>

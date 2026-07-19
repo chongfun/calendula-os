@@ -1515,7 +1515,10 @@ pub fn load_epub_package<'a>(
 }
 
 /// Helper to extract the OPF path from an EPUB's META-INF/container.xml entry
-/// using the streaming Zip operations.
+/// using the streaming Zip operations. Errors keep their nature — zip
+/// failures stay `EpubError::Zip`, text and structure failures map to
+/// `Utf8`/`MissingOpfPath` — matching `load_epub_package`'s handling of
+/// the identical cases so callers surface the right diagnostics.
 pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
     zip: &mut Z,
     header_scratch: &mut [u8; 46],
@@ -1524,22 +1527,26 @@ pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
     container_scratch: &mut [u8],
     zip_inflate: &mut ZipInflateScratch,
     opf_path_buf: &mut heapless::String<256>,
-) -> Result<(), ZipError> {
-    let container_entry = zip.find_entry("META-INF/container.xml", header_scratch, name_scratch)?;
-    let container_len = zip.read_entry_streamed(
-        container_entry,
-        compressed_scratch,
-        container_scratch,
-        zip_inflate,
-    )?;
+) -> Result<(), EpubError> {
+    let container_entry = zip
+        .find_entry("META-INF/container.xml", header_scratch, name_scratch)
+        .map_err(EpubError::Zip)?;
+    let container_len = zip
+        .read_entry_streamed(
+            container_entry,
+            compressed_scratch,
+            container_scratch,
+            zip_inflate,
+        )
+        .map_err(EpubError::Zip)?;
     let container_xml =
-        core::str::from_utf8(&container_scratch[..container_len]).map_err(|_| ZipError::Inflate)?;
+        core::str::from_utf8(&container_scratch[..container_len]).map_err(|_| EpubError::Utf8)?;
     let opf_path =
-        find_attr_value(container_xml, "rootfile", "full-path").ok_or(ZipError::EntryNotFound)?;
+        find_attr_value(container_xml, "rootfile", "full-path").ok_or(EpubError::MissingOpfPath)?;
     opf_path_buf.clear();
     opf_path_buf
         .push_str(opf_path)
-        .map_err(|_| ZipError::NameTooLong)?;
+        .map_err(|_| EpubError::Zip(ZipError::NameTooLong))?;
     Ok(())
 }
 
@@ -5064,7 +5071,7 @@ mod tests {
             &mut zip_inflate,
             &mut opf_path_buf,
         );
-        assert_eq!(res_small, Err(ZipError::OutputTooSmall));
+        assert_eq!(res_small, Err(EpubError::Zip(ZipError::OutputTooSmall)));
 
         // 2. With 4096 bytes (the fixed limit), it must succeed
         let mut zip_full = ZipLocalStream::new(SliceStream {
