@@ -5,6 +5,8 @@ use esp_hal::gpio::Input;
 #[cfg(not(feature = "device-x3"))]
 use esp_hal::peripherals::GPIO0;
 use esp_hal::peripherals::{ADC1, GPIO1, GPIO2};
+#[cfg(feature = "device-x3")]
+use portable_atomic::{AtomicU32, Ordering};
 
 type BoardAdc = ADC1<'static>;
 type BoardAdcDriver = Adc<'static, BoardAdc, esp_hal::Blocking>;
@@ -35,10 +37,14 @@ const RAW_LOG_TICKS: u8 = 67;
 // sampling cost input jitter and standing I2C traffic for a value the UI
 // hysteresis-holds anyway. Buttons still sample every tick.
 const BATTERY_SAMPLE_TICKS: u32 = 200;
-// A dead gauge fails once per battery sample; log the first error (with
-// its kind) and then one line per ~minute instead of one per sample.
+/// X3 battery telemetry, packed `percent << 16 | mv`, written by the
+/// thread-executor `battery_run` task and read lock-free by the
+/// interrupt-priority input loop — the gauge's clock-stretched I2C reads
+/// (up to ~5 ms behind the raised bus timeout) have no place at interrupt
+/// priority. Starts as a flat 100% so the boot paint never shows a
+/// spurious 0%.
 #[cfg(feature = "device-x3")]
-const GAUGE_ERR_LOG_SAMPLES: u32 = 20;
+static CACHED_GAUGE: AtomicU32 = AtomicU32::new(100 << 16);
 
 #[derive(Clone, Copy)]
 struct Band {
@@ -55,13 +61,12 @@ pub struct InputPins {
     /// never comes back.
     pub power: Option<Input<'static>>,
     /// X4 only: battery voltage on the GPIO0 ADC divider. On the X3 GPIO0 is
-    /// I2C SCL, so the aux channel does not exist and the gauge replaces it.
+    /// I2C SCL, so the aux channel does not exist and the `battery_run`
+    /// task's cached gauge word replaces it.
     #[cfg(not(feature = "device-x3"))]
     pub aux_pin: AdcPin<GPIO0<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
     pub nav_pin: AdcPin<GPIO1<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
     pub page_pin: AdcPin<GPIO2<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
-    #[cfg(feature = "device-x3")]
-    pub gauge: BatteryGauge,
 }
 
 #[derive(Clone, Copy)]
@@ -155,7 +160,6 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut raw_log_ticks = 0u8;
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
-    let mut gauge_failures: u32 = 0;
     // (mv, percent, aux) from the most recent battery sample; ticks between
     // samples reuse it. Tick 0 reads immediately so the boot seed below
     // still pushes a real reading before the first paint.
@@ -170,7 +174,7 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         }
 
         if battery_ticks == 0 {
-            battery = read_power(&mut adc, &mut pins, &mut gauge_failures).await;
+            battery = read_power(&mut adc, &mut pins).await;
         }
         battery_ticks = (battery_ticks + 1) % BATTERY_SAMPLE_TICKS;
         let (battery_mv, raw_percent, aux) = battery;
@@ -264,43 +268,46 @@ async fn release_power_button(pins: &mut InputPins) -> bool {
 /// the X4, the gauge voltage on the X3 (which has no aux ADC). On an I2C
 /// error the X3 reports a flat full battery rather than a spurious 0%.
 #[cfg(not(feature = "device-x3"))]
-async fn read_power(
-    adc: &mut BoardAdcDriver,
-    pins: &mut InputPins,
-    _gauge_failures: &mut u32,
-) -> (u16, u8, u16) {
+async fn read_power(adc: &mut BoardAdcDriver, pins: &mut InputPins) -> (u16, u8, u16) {
     let aux = read_adc(adc, &mut pins.aux_pin).await;
     (battery_mv(aux), battery_percent(aux), aux)
 }
 
 #[cfg(feature = "device-x3")]
-async fn read_power(
-    _adc: &mut BoardAdcDriver,
-    pins: &mut InputPins,
-    gauge_failures: &mut u32,
-) -> (u16, u8, u16) {
-    match pins.gauge.read().await {
-        Ok((mv, percent)) => {
-            if *gauge_failures > 0 {
-                esp_println::println!(
-                    "input: bq27220 recovered after {} failed reads",
-                    *gauge_failures
+async fn read_power(_adc: &mut BoardAdcDriver, _pins: &mut InputPins) -> (u16, u8, u16) {
+    let packed = CACHED_GAUGE.load(Ordering::Relaxed);
+    let mv = packed as u16;
+    let percent = (packed >> 16) as u8;
+    (mv, percent, mv)
+}
+
+/// X3 battery telemetry, deliberately independent of the 15 ms button
+/// scanner now that input runs at interrupt priority: the slow-moving
+/// gauge is sampled every 30 seconds on the thread executor, and the
+/// input loop reads the cached word without touching I2C. On errors the
+/// last good reading stays displayed (boot seed: flat 100%).
+#[cfg(feature = "device-x3")]
+#[embassy_executor::task]
+pub async fn battery_run(mut gauge: BatteryGauge) {
+    let mut failures = 0u32;
+    loop {
+        match gauge.read().await {
+            Ok((mv, percent)) => {
+                if failures > 0 {
+                    esp_println::println!("battery: gauge recovered after {} failures", failures);
+                    failures = 0;
+                }
+                CACHED_GAUGE.store(
+                    u32::from(mv) | (u32::from(percent) << 16),
+                    Ordering::Relaxed,
                 );
-                *gauge_failures = 0;
             }
-            (mv, percent, mv)
-        }
-        Err(err) => {
-            *gauge_failures = gauge_failures.saturating_add(1);
-            if *gauge_failures == 1 || (*gauge_failures).is_multiple_of(GAUGE_ERR_LOG_SAMPLES) {
-                esp_println::println!(
-                    "input: bq27220 read failed ({:?}, {} consecutive)",
-                    err,
-                    *gauge_failures
-                );
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                esp_println::println!("battery: gauge read failed ({:?})", error);
             }
-            (0, 100, 0)
         }
+        Timer::after_secs(30).await;
     }
 }
 
