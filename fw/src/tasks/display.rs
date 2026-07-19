@@ -293,7 +293,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     let _ = POWER_EVENTS.try_send(power_event);
                 }
             }
-            Either::First(DisplayCommand::Sleep) => {
+            Either::First(DisplayCommand::Sleep { generation }) => {
                 let sleep_start = Instant::now();
                 esp_println::println!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
@@ -313,8 +313,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // task's idle clock re-requests sleep once the sleep
                     // failure releases its handshake wait.
                     esp_println::println!("display: sleep deferred; progress persistence failed");
-                    send_required_display_event(&DisplayEvent::Failed);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySleepFailed);
+                    send_required_display_event(&DisplayEvent::SleepFailed);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySleepFailed(generation));
                     continue;
                 }
                 let request = refresh_planner.last_request().or_else(|| {
@@ -377,7 +377,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
                 if panel_slept {
                     send_required_display_event(&DisplayEvent::Asleep);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep(generation));
                 } else {
                     // The panel never acknowledged the sleep sequence, so it
                     // may still be mid-refresh. Cutting power now would
@@ -389,8 +389,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // re-inits the panel with the full waveform.
                     refresh_planner.record_failure();
                     esp_println::println!("display: sleep transition failed");
-                    send_required_display_event(&DisplayEvent::Failed);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySleepFailed);
+                    send_required_display_event(&DisplayEvent::SleepFailed);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySleepFailed(generation));
                 }
                 esp_println::println!(
                     "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",

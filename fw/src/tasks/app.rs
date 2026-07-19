@@ -234,13 +234,22 @@ pub async fn run() {
                     suppress_input_until_open_settled = false;
                     block_confirm_until = None;
                 }
-                DisplayEvent::Failed => {
+                DisplayEvent::SleepFailed => {
+                    // A sleep transition failed, not the current render: a
+                    // render sent after the input that aborted the sleep
+                    // handshake may still be queued behind that Sleep
+                    // command, and its own Settled/RefreshFailed is coming.
+                    // Clearing the render lock here would double-render and
+                    // drop the coalesced pending frame, so leave both.
+                    esp_println::println!("app: display sleep failed");
+                }
+                DisplayEvent::RefreshFailed => {
                     // The frame never reached the panel. Clear the render
                     // lock so the next input re-renders instead of queueing
                     // behind an acknowledgement that will never arrive, but
                     // drop the coalesced pending render: it described a
                     // frame for a panel state that no longer holds.
-                    esp_println::println!("app: display transition failed");
+                    esp_println::println!("app: display refresh failed");
                     rendering = false;
                     render_pending = false;
                     // This failure ends the display cycle the same way

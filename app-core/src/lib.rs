@@ -318,7 +318,14 @@ pub struct RenderRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayCommand {
     Render(RenderRequest),
-    Sleep,
+    /// `generation` names this sleep request: the display task echoes it in
+    /// `PowerEvent::DisplayAsleep`/`DisplaySleepFailed` so the power task's
+    /// handshake can tell its own sleep's acknowledgement from a stale one
+    /// left by an earlier sleep it abandoned on `Activity`. The command
+    /// channel holds four slots, so two sleep requests can be in flight.
+    Sleep {
+        generation: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -564,11 +571,17 @@ impl PortalPsk {
 pub enum DisplayEvent {
     Settled,
     Asleep,
-    /// A panel transition (refresh, wake init, or sleep) did not complete:
-    /// the SPI transfer failed or the BUSY handshake never finished. The
-    /// panel's contents are unknown, so the frame must not be treated as
-    /// shown nor the panel as asleep.
-    Failed,
+    /// A panel refresh (render flush or wake init) did not complete: the
+    /// SPI transfer failed or the BUSY handshake never finished. The
+    /// panel's contents are unknown and the frame must not be treated as
+    /// shown; this ends the render cycle, so the app clears its render
+    /// lock and runs the failed-render recovery.
+    RefreshFailed,
+    /// A sleep transition failed (progress flush or panel handshake).
+    /// Distinct from `RefreshFailed` because it does not end a render
+    /// cycle: a render queued behind the sleep command is still pending,
+    /// so the app must not clear its render lock over it.
+    SleepFailed,
     Library(LibraryEvent),
 }
 
@@ -698,17 +711,21 @@ pub enum PowerEvent {
     /// short on the shell views).
     Activity(AppView),
     DisplaySettled,
-    DisplayAsleep,
-    /// A panel refresh (render flush or wake init) did not complete. The
-    /// power events carry no operation identity, so failures are split by
-    /// kind: a refresh failure can belong to a render queued ahead of a
-    /// Sleep command, and the sleep handshake must not be abandoned over
+    /// The panel completed the sleep handshake for the identified
+    /// `DisplayCommand::Sleep` generation; only the matching handshake may
+    /// cut power on it.
+    DisplayAsleep(u32),
+    /// A panel refresh (render flush or wake init) did not complete. A
+    /// refresh failure can belong to a render queued ahead of a Sleep
+    /// command, and the sleep handshake must not be abandoned over
     /// someone else's frame.
     DisplayRefreshFailed,
-    /// The display task could not complete a requested sleep transition
+    /// The display task could not complete the identified sleep request
     /// (progress flush or panel handshake failed); the power task must
-    /// stay awake — never cut power behind a failed sleep handshake.
-    DisplaySleepFailed,
+    /// stay awake — never cut power behind a failed sleep handshake. The
+    /// generation lets a later handshake ignore a stale failure from a
+    /// sleep it abandoned on `Activity`.
+    DisplaySleepFailed(u32),
     SleepNow,
 }
 
@@ -719,7 +736,10 @@ pub const fn display_refresh_outcome(success: bool) -> (DisplayEvent, PowerEvent
     if success {
         (DisplayEvent::Settled, PowerEvent::DisplaySettled)
     } else {
-        (DisplayEvent::Failed, PowerEvent::DisplayRefreshFailed)
+        (
+            DisplayEvent::RefreshFailed,
+            PowerEvent::DisplayRefreshFailed,
+        )
     }
 }
 
@@ -2269,7 +2289,10 @@ mod tests {
         );
         assert_eq!(
             display_refresh_outcome(false),
-            (DisplayEvent::Failed, PowerEvent::DisplayRefreshFailed)
+            (
+                DisplayEvent::RefreshFailed,
+                PowerEvent::DisplayRefreshFailed
+            )
         );
     }
 
