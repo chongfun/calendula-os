@@ -570,6 +570,12 @@ impl PortalPsk {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayEvent {
     Settled,
+    /// The panel completed a sleep transition. Informational for the app:
+    /// like `SleepFailed`, it does not end a render cycle, and the sleep's
+    /// handshake may already have been abandoned with render/open work
+    /// queued behind the Sleep command — the app must not reset any
+    /// bookkeeping on it. Renders are acknowledged individually by
+    /// `Settled`/`RefreshFailed` regardless of interleaved sleeps.
     Asleep,
     /// A panel refresh (render flush or wake init) did not complete: the
     /// SPI transfer failed or the BUSY handshake never finished. The

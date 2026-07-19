@@ -227,12 +227,16 @@ pub async fn run() {
                     }
                 }
                 DisplayEvent::Asleep => {
+                    // Informational only. When the power task's handshake is
+                    // still active, deep sleep follows and reboots the chip,
+                    // so app state is moot. When that handshake was abandoned
+                    // on Activity, the very input that abandoned it queued
+                    // render/open work behind the Sleep command — resetting
+                    // the render lock or open suppression here would erase
+                    // that work's bookkeeping mid-flight. Every render is
+                    // answered by its own Settled/RefreshFailed regardless of
+                    // interleaved sleeps, so those acks alone advance state.
                     esp_println::println!("app: display asleep");
-                    rendering = false;
-                    render_pending = false;
-                    opening_book = None;
-                    suppress_input_until_open_settled = false;
-                    block_confirm_until = None;
                 }
                 DisplayEvent::SleepFailed => {
                     // A sleep transition failed, not the current render: a
