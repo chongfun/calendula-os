@@ -12,12 +12,12 @@ use crate::sync_mem::{self, SyncLoan};
 use crate::upload::{sanitized_name, UploadBegin, UploadChunk};
 use crate::{
     StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
-    SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS,
+    SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_INTERRUPTS, UPLOAD_RESULTS, UPLOAD_RETURNS,
 };
 use app_core::{SyncError, WifiCredentials};
 use embassy_executor::Spawner;
 use embassy_futures::join::join3;
-use embassy_futures::select::select;
+use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{
@@ -218,12 +218,9 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
 async fn exit_after_uploads() -> ! {
     loop {
         if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            let mut waited_ms = 0u32;
-            while crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst)
-                && waited_ms < 120_000
-            {
-                Timer::after_millis(100).await;
-                waited_ms += 100;
+            if crate::upload::UPLOAD_SESSION_ACTIVE.load(portable_atomic::Ordering::SeqCst) {
+                crate::UPLOAD_STOP_REQUESTS.send(()).await;
+                crate::UPLOAD_STOPPED.receive().await;
             }
             reset_now();
         }
@@ -339,8 +336,24 @@ async fn upload_server(
             if filled == request_buf.len() {
                 break None;
             }
-            let Ok(read) = socket.read(&mut request_buf[filled..]).await else {
-                break None;
+            let read = match select(
+                socket.read(&mut request_buf[filled..]),
+                UPLOAD_INTERRUPTS.wait(),
+            )
+            .await
+            {
+                Either::First(Ok(read)) => read,
+                Either::First(Err(_)) => break None,
+                // Nothing is pipelined while headers trickle in, but a
+                // consumed signal obliges the cleanup here (the post-parse
+                // check below can no longer see it), and dropping the read
+                // frees this serial server from a stalled client for the
+                // retry that follows a cancelled sleep.
+                Either::Second(()) => {
+                    reclaim_upload_pipeline(&mut pool);
+                    session_started = false;
+                    break None;
+                }
             };
             if read == 0 {
                 break None;
@@ -359,6 +372,13 @@ async fn upload_server(
             socket.close();
             continue;
         };
+        // A sleep-ended session may have died while this server was idle
+        // (or between requests): consume the interrupt now so this request
+        // starts a fresh session instead of feeding a writer that is gone.
+        if UPLOAD_INTERRUPTS.try_take().is_some() {
+            reclaim_upload_pipeline(&mut pool);
+            session_started = false;
+        }
         // Reborrow the pieces by index so the buffer stays usable for the
         // body bytes that arrived with the headers.
         let path_at = method_len + 1;
@@ -396,6 +416,8 @@ async fn upload_server(
             let ok = match name {
                 Some(name) => {
                     if !session_started {
+                        crate::upload::UPLOAD_SESSION_ACTIVE
+                            .store(true, portable_atomic::Ordering::SeqCst);
                         STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
                         session_started = true;
                     }
@@ -408,7 +430,14 @@ async fn upload_server(
                             identity_hash: 0,
                         })
                         .await;
-                    UPLOAD_RESULTS.receive().await
+                    match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
+                        Either::First(ok) => ok,
+                        Either::Second(()) => {
+                            reclaim_upload_pipeline(&mut pool);
+                            session_started = false;
+                            false
+                        }
+                    }
                 }
                 None => false,
             };
@@ -437,11 +466,12 @@ async fn upload_server(
             };
 
             if !session_started {
+                crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
                 STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
                 session_started = true;
             }
             let leftover_range = body_start..filled;
-            let ok = stream_book(
+            let ok = match stream_book(
                 &mut socket,
                 request_buf,
                 leftover_range,
@@ -449,7 +479,14 @@ async fn upload_server(
                 begin,
                 &mut pool,
             )
-            .await;
+            .await
+            {
+                StreamOutcome::Done(ok) => ok,
+                StreamOutcome::Interrupted => {
+                    session_started = false;
+                    false
+                }
+            };
             let _ = write_http_response(
                 &mut socket,
                 if ok {
@@ -468,8 +505,37 @@ async fn upload_server(
     }
 }
 
-/// Streams one book body to the display task; true when the card write
-/// succeeded end to end.
+/// How one book stream ended: a writer verdict, or the session dying
+/// underneath it (sleep won while the body was still streaming), which
+/// obliges the caller to start a fresh session for the next request.
+enum StreamOutcome {
+    Done(bool),
+    Interrupted,
+}
+
+/// The writer exited on Sleep while this task may have been mid-pipeline:
+/// pull every stale message out of the upload channels, take the loaned
+/// buffers back into the pool, and drop the in-flight claim. Chunk sends
+/// never block (a send is always preceded by acquiring one of the two
+/// buffers, so at most one buffered chunk is ever queued), which is why
+/// unblocking the two receive sides is enough to cancel the producer.
+fn reclaim_upload_pipeline(pool: &mut heapless::Vec<&'static mut [u8], 2>) {
+    esp_println::println!("upload: session interrupted; reclaiming pipeline");
+    while UPLOAD_BEGINS.try_receive().is_ok() {}
+    while let Ok(chunk) = UPLOAD_CHUNKS.try_receive() {
+        if let Some(buffer) = chunk.buffer {
+            let _ = pool.push(buffer);
+        }
+    }
+    while let Ok(buffer) = UPLOAD_RETURNS.try_receive() {
+        let _ = pool.push(buffer);
+    }
+    while UPLOAD_RESULTS.try_receive().is_ok() {}
+    crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
+}
+
+/// Streams one book body to the display task; `Done(true)` when the card
+/// write succeeded end to end.
 async fn stream_book(
     socket: &mut TcpSocket<'_>,
     request_buf: &[u8],
@@ -477,7 +543,7 @@ async fn stream_book(
     content_length: usize,
     begin: UploadBegin,
     pool: &mut heapless::Vec<&'static mut [u8], 2>,
-) -> bool {
+) -> StreamOutcome {
     esp_println::println!("upload: '{}' {} bytes", begin.name, content_length);
     crate::upload::UPLOAD_IN_FLIGHT.store(true, portable_atomic::Ordering::SeqCst);
     UPLOAD_BEGINS.send(begin).await;
@@ -491,7 +557,13 @@ async fn stream_book(
     while remaining > 0 && !failed {
         let buffer = match pool.pop() {
             Some(buffer) => buffer,
-            None => UPLOAD_RETURNS.receive().await,
+            None => match select(UPLOAD_RETURNS.receive(), UPLOAD_INTERRUPTS.wait()).await {
+                Either::First(buffer) => buffer,
+                Either::Second(()) => {
+                    reclaim_upload_pipeline(pool);
+                    return StreamOutcome::Interrupted;
+                }
+            },
         };
         let mut len = 0;
         if !leftover.is_empty() {
@@ -502,12 +574,26 @@ async fn stream_book(
         }
         while len < buffer.len() && len < remaining {
             let window = buffer.len().min(remaining);
-            match socket.read(&mut buffer[len..window]).await {
-                Ok(0) | Err(_) => {
+            match select(
+                socket.read(&mut buffer[len..window]),
+                UPLOAD_INTERRUPTS.wait(),
+            )
+            .await
+            {
+                Either::First(Ok(0)) | Either::First(Err(_)) => {
                     failed = true;
                     break;
                 }
-                Ok(read) => len += read,
+                Either::First(Ok(read)) => len += read,
+                // The writer is gone, so the bytes read so far describe a
+                // book no one will finish: don't sit out a stalled client's
+                // socket timeout for them. Dropping the read future is
+                // cancel-safe; the buffer in hand goes straight back.
+                Either::Second(()) => {
+                    let _ = pool.push(buffer);
+                    reclaim_upload_pipeline(pool);
+                    return StreamOutcome::Interrupted;
+                }
             }
         }
         remaining -= len.min(remaining);
@@ -532,7 +618,13 @@ async fn stream_book(
             .await;
     }
     // Refill the pool for the next file.
-    let result = UPLOAD_RESULTS.receive().await;
+    let result = match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
+        Either::First(result) => result,
+        Either::Second(()) => {
+            reclaim_upload_pipeline(pool);
+            return StreamOutcome::Interrupted;
+        }
+    };
     crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
     // Heap slack per upload: the join-time log plus this one bound the
     // radio buffering budget (AMPDU reorder buffers allocate under load).
@@ -549,7 +641,7 @@ async fn stream_book(
             Err(_) => break,
         }
     }
-    result && !failed
+    StreamOutcome::Done(result && !failed)
 }
 
 // ------------------------------------------------------------------

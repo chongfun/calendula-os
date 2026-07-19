@@ -168,13 +168,16 @@ bytes, and `POST /delete?name=` removes a book (card-root entries carry
 `root=1`; uploads always land in /BOOKS). Upload bytes reach the display
 task — still the single SD owner — through `fw::upload`'s two-buffer
 ping-pong: 4 KB chunks carry loaned buffers one way and the buffers come
-back on a return channel once written. The display task holds one SD
-session for the whole upload phase and writes `/BOOKS/<8.3>.EPU` (the
-catalog scan accepts `.epu` alongside `.epub`), recording the browser's
-original filename in a `/XTEINK/LABELS/<stem>.TXT` sidecar so the shelf
-and Library can label the book with it. The done press waits for
-any in-flight upload before the session-ending reset; the boot rescan
-then surfaces the new books.
+back on a return channel once written. The display task holds one
+interruptible SD session for the upload phase and writes
+`/BOOKS/<8.3>.EPU` (the catalog scan accepts `.epu` alongside `.epub`),
+recording the browser's original filename in a `/XTEINK/LABELS/<stem>.TXT`
+sidecar so the shelf and Library can label the book with it. Power/idle
+sleep and the done press abort an active writer through the upload-store
+transaction (the staged file's FAT chain is reclaimed, replaced originals
+untouched), close the SD session, and only then sleep or reset; the done
+press waits for the stop acknowledgement so the reset never races an open
+FAT writer. The boot rescan then surfaces the new books.
 
 Station credentials come from `/XTEINK/WIFI.BIN` (written by the
 onboarding portal below), falling back to compile-time `option_env!`

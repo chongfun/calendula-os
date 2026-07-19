@@ -74,6 +74,7 @@ use core::sync::atomic::AtomicU32;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use esp_backtrace as _;
 use esp_hal::analog::adc::{
     Adc, AdcCalCurve, AdcCalScheme, AdcChannel, AdcConfig, AdcPin, Attenuation,
@@ -146,6 +147,20 @@ pub static UPLOAD_BEGINS: Channel<CriticalSectionRawMutex, upload::UploadBegin, 
 pub static UPLOAD_CHUNKS: Channel<CriticalSectionRawMutex, upload::UploadChunk, 2> = Channel::new();
 pub static UPLOAD_RETURNS: Channel<CriticalSectionRawMutex, &'static mut [u8], 2> = Channel::new();
 pub static UPLOAD_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
+/// Wireless Exit asks the board I/O task to abort and close the upload
+/// session (any in-flight book is aborted and its clusters reclaimed).
+pub static UPLOAD_STOP_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+/// Acknowledges the stop: every FAT handle is closed and the volume is
+/// unmounted, so the session-ending reset cannot race an open writer.
+pub static UPLOAD_STOPPED: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+/// A Sleep exit closed the upload session while the book server may be
+/// mid-request. The server consumes this to fail the interrupted request,
+/// reclaim the loaned buffers, and restart the session on the next request.
+/// Only observable when sleep turns out non-terminal (a late activity event
+/// cancels the handshake, or display shutdown fails); a completed deep
+/// sleep resets before anything reads it. Wireless Exit doesn't raise it —
+/// that path ends in a reset behind the UPLOAD_STOPPED handshake.
+pub static UPLOAD_INTERRUPTS: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 #[cfg(not(feature = "device-x3"))]
