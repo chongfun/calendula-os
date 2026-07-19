@@ -878,17 +878,27 @@ fn handle_storage_command(
             // the loop refused it already.
         }
         StorageCommand::StoreWifiCredentials(credentials) => {
-            let stored = reader_cache::store_wifi_credentials(
-                epd,
-                sd_cs,
-                hal_ext::nvm::WifiCredentialsRecord {
-                    ssid: credentials.ssid,
-                    ssid_len: credentials.ssid_len,
-                    password: credentials.password,
-                    password_len: credentials.password_len,
-                },
+            let record = hal_ext::nvm::WifiCredentialsRecord {
+                ssid: credentials.ssid,
+                ssid_len: credentials.ssid_len,
+                password: credentials.password,
+                password_len: credentials.password_len,
+            };
+            let written = reader_cache::store_wifi_credentials(epd, sd_cs, record);
+            // Reacquire the card and use the exact boot-time read path before
+            // telling the portal it may show success. This proves the record
+            // survived handle/volume closure, closing the race where the
+            // portal's success page beat a write that never actually landed
+            // and the session-ending reset lost the credentials.
+            let confirmed = written
+                && reader_cache::load_wifi_credentials(epd, sd_cs)
+                    .is_some_and(|stored| stored == record);
+            esp_println::println!(
+                "storage: wifi credentials written={} confirmed={}",
+                written,
+                confirmed
             );
-            esp_println::println!("storage: wifi credentials stored={}", stored);
+            let _ = crate::WIFI_STORAGE_RESULTS.try_send(confirmed);
         }
         StorageCommand::ForgetWifiCredentials => {
             let forgotten = reader_cache::forget_wifi_credentials(epd, sd_cs);
