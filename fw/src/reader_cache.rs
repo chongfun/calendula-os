@@ -778,6 +778,7 @@ fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheErr
         ReaderCacheError::MissingSpine => "NO SPINE",
         ReaderCacheError::NoBodyText => "NO BODY TEXT",
         ReaderCacheError::SectionRead => "SECTION READ",
+        ReaderCacheError::IndexWrite => "CACHE WRITE",
         ReaderCacheError::EntryNameTooLong => "PATH LONG",
     };
     set_preview_error(library, message);
@@ -794,6 +795,9 @@ enum ReaderCacheError {
     /// The book built and its cache was written, but the requested section
     /// failed to load back from the card.
     SectionRead,
+    /// The book built, but writing BOOK.BIN failed partway; the cache dir
+    /// was cleared because a truncated index serves no load path.
+    IndexWrite,
     EntryNameTooLong,
 }
 
@@ -1198,20 +1202,42 @@ where
             total_pages,
             book_partial,
         );
-        if published {
-            Ok(())
-        } else {
-            // The build itself succeeded; only the requested section failed
-            // to read back. Keep the freshly written cache — the next open
-            // retries the fast path against it — and report the read
-            // failure rather than a bogus content diagnosis.
-            Err(ReaderCacheError::SectionRead)
+        match published {
+            BookPublishOutcome::Ready => Ok(()),
+            BookPublishOutcome::SectionReadFailed => {
+                // The build and index write succeeded; only the requested
+                // section failed to read back. Keep the freshly written
+                // cache — the next open retries the fast path against it —
+                // and report the read failure rather than a bogus content
+                // diagnosis.
+                Err(ReaderCacheError::SectionRead)
+            }
+            BookPublishOutcome::IndexWriteFailed => {
+                // The index write failed partway, so BOOK.BIN may be a
+                // truncated file that serves neither the fast path nor
+                // replay (the labels load bails on it). Clear the debris —
+                // sections and CONT.BIN are useless without an index — so
+                // the next open rebuilds from the EPUB cleanly.
+                reader_cache_files::empty_cache_dir(root, cache_key, section_count as u16);
+                Err(ReaderCacheError::IndexWrite)
+            }
         }
     } else if saw_spine {
         Err(ReaderCacheError::NoBodyText)
     } else {
         Err(ReaderCacheError::MissingSpine)
     }
+}
+
+/// How the publish tail ended. The two failures need different cleanup:
+/// a failed index write leaves a truncated BOOK.BIN behind (created or
+/// truncated before the body writes), while a section read-back miss
+/// leaves a fully written, valid cache worth keeping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BookPublishOutcome {
+    Ready,
+    IndexWriteFailed,
+    SectionReadFailed,
 }
 
 /// The shared publish tail of a section-cache build: write BOOK.BIN, load
@@ -1239,7 +1265,7 @@ fn publish_book_cache<
     sections_slice: &[BookV2SectionRecord],
     total_pages: u32,
     book_partial: bool,
-) -> bool
+) -> BookPublishOutcome
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -1254,7 +1280,7 @@ where
         book_partial,
     );
     if !wrote_index {
-        return false;
+        return BookPublishOutcome::IndexWriteFailed;
     }
     library.set_book_index(total_pages, book_partial, sections_slice);
     let hit = matches!(
@@ -1268,7 +1294,7 @@ where
         CacheLoadResult::Hit { .. }
     );
     if !hit {
-        return false;
+        return BookPublishOutcome::SectionReadFailed;
     }
     reader_layout::rebuild_toc_page_targets(library);
     refresh_chapter_tracking(
@@ -1303,7 +1329,7 @@ where
         io.write_blocks,
         cache_key
     );
-    true
+    BookPublishOutcome::Ready
 }
 
 /// Forwards `push_block` to the build sink while recording the exact call
@@ -1486,7 +1512,10 @@ where
         total_pages,
         book_partial,
     );
-    if !published {
+    if published != BookPublishOutcome::Ready {
+        // Either failure leaves the replay's cache state unusable (a
+        // truncated BOOK.BIN or an unreadable section); the full build
+        // rewrites everything, so clear it all either way.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
         reader_cache_files::empty_cache_dir(root, cache_key, section_count as u16);
         return false;
