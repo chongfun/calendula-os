@@ -11,9 +11,10 @@ use heapless::String;
 const CATALOG_ROOT_DIR: &str = "XTEINK";
 const CATALOG_FILE: &str = "CATALOG.BIN";
 use proto::catalog::{
-    catalog_identity_staged, catalog_record_identity, decode_catalog_record, encode_catalog_header,
-    encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
-    CatalogRecord, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
+    catalog_file_len, catalog_identity_staged, catalog_record_identity, decode_catalog_record,
+    encode_catalog_header, encode_catalog_placeholder_header, encode_catalog_record,
+    encode_catalog_title, sort_catalog_identities, stage_catalog_identity, CatalogRecord,
+    CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
     CATALOG_RECORD_TITLE_OFFSET, CATALOG_TITLE_BYTES,
 };
 
@@ -34,29 +35,35 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         // arena, and the section window is invalidated below so a stale page
         // can't be served from clobbered text afterwards.
         let scanned = write_catalog_streaming(root, &mut library.text);
-        if let Ok(count) = scanned {
-            if count > 0 {
-                esp_println::println!("sd: catalog written, {} epub(s)", count);
-                // Drop the cached data of books no longer on the card before
-                // reloading the window: this is the one moment the full book
-                // set is known and the catalog is fresh.
-                sweep_orphan_caches(root, &mut library.text);
-            }
-        }
-        // The arena held scan scratch, not section text: drop the resident
-        // section (and any Chapters TOC window) so nothing renders from it.
-        library.clear_lines();
-        library.text_holds_toc = false;
-        match scanned {
+        let status = match scanned {
             Ok(0) => LibraryScanStatus::Empty,
-            Ok(_) => {
-                // Reload the header count + the first list window from the file
-                // we just wrote, so the streaming readers and the store agree.
-                let _ = read_catalog_window(root, library, 0);
-                LibraryScanStatus::Ready
+            Ok(count) => {
+                esp_println::println!("sd: catalog written, {} epub(s)", count);
+                // Re-open and fully validate the finalized catalog (header,
+                // version, length, first window) before it is allowed to
+                // drive destructive orphan reclamation: a torn or
+                // misbehaving write must never convince the sweep that
+                // still-present books are gone. This also reloads the
+                // header count + first list window from the file just
+                // written, so the streaming readers and the store agree.
+                if read_catalog_window(root, library, 0).is_err() {
+                    LibraryScanStatus::Error
+                } else {
+                    // Drop the cached data of books no longer on the card:
+                    // this is the one moment the full book set is known and
+                    // the catalog is proven fresh.
+                    sweep_orphan_caches(root, &mut library.text);
+                    LibraryScanStatus::Ready
+                }
             }
             Err(()) => LibraryScanStatus::Error,
-        }
+        };
+        // The arena held scan (and sweep) scratch, not section text: drop
+        // the resident section (and any Chapters TOC window) so nothing
+        // renders from it.
+        library.clear_lines();
+        library.text_holds_toc = false;
+        status
     })
     .unwrap_or_else(|err| {
         esp_println::println!("sd: session failed: {:?}", err);
@@ -122,13 +129,47 @@ pub(crate) fn load_catalog_cache(
 fn walk_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     visit: &mut impl FnMut(&str, &str, bool, u32),
-) where
+) -> Result<(), ()>
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    collect_epubs(root, "/", false, visit);
-    if let Ok(books) = root.open_dir("BOOKS") {
-        collect_epubs(&books, "/books/", true, visit);
+    collect_epubs(root, "/", false, visit)?;
+    // Only a genuinely absent /BOOKS is an empty result; any other failure
+    // (SD/FAT flakiness) must fail the walk, or the scan would commit a
+    // catalog missing every /BOOKS book and the orphan sweep would reclaim
+    // their caches.
+    match root.open_dir("BOOKS") {
+        Ok(books) => collect_epubs(&books, "/books/", true, visit)?,
+        Err(embedded_sdmmc::Error::NotFound) => {}
+        Err(_) => return Err(()),
+    }
+    Ok(())
+}
+
+/// Seed and per-entry step of an order-sensitive FNV-1a over every field
+/// `walk_epubs` reports, with a NUL between fields so adjacent strings can't
+/// alias. Two walks fold to the same value only when they visit the same
+/// books, with the same sizes, in the same order.
+const WALK_FINGERPRINT_SEED: u32 = 0x811c_9dc5;
+
+fn fold_walk_entry(
+    hash: &mut u32,
+    path: &str,
+    open_name: &str,
+    in_books_dir: bool,
+    byte_size: u32,
+) {
+    for byte in path
+        .bytes()
+        .chain(core::iter::once(0))
+        .chain(open_name.bytes())
+        .chain(core::iter::once(0))
+        .chain(core::iter::once(in_books_dir as u8))
+        .chain(byte_size.to_le_bytes())
+    {
+        *hash ^= byte as u32;
+        *hash = hash.wrapping_mul(0x0100_0193);
     }
 }
 
@@ -166,14 +207,28 @@ where
         .map_err(|_| ())?;
 
     let mut counted = 0usize;
+    let mut counted_fingerprint = WALK_FINGERPRINT_SEED;
     {
-        let mut count = |_: &str, _: &str, _: bool, _: u32| counted += 1;
-        walk_epubs(root, &mut count);
+        let mut count = |path: &str, open_name: &str, in_books_dir: bool, byte_size: u32| {
+            counted += 1;
+            fold_walk_entry(
+                &mut counted_fingerprint,
+                path,
+                open_name,
+                in_books_dir,
+                byte_size,
+            );
+        };
+        walk_epubs(root, &mut count)?;
     }
     let count = counted.min(u16::MAX as usize) as u16;
 
+    // Keep the header deliberately invalid while records are being written;
+    // the real version and count are committed only after every directory
+    // pass succeeded, so an interrupted scan leaves an unloadable catalog
+    // (and a rescan) instead of a truncated library.
     let mut header = [0u8; CATALOG_HEADER_BYTES];
-    encode_catalog_header(count, &mut header);
+    encode_catalog_placeholder_header(&mut header);
     file.write(&header).map_err(|_| ())?;
 
     let total = count as usize;
@@ -181,8 +236,10 @@ where
     while cursor < total {
         let mut batch_len = 0usize;
         let mut seen = 0usize;
+        let mut fingerprint = WALK_FINGERPRINT_SEED;
         {
             let mut collect = |path: &str, open_name: &str, in_books_dir: bool, byte_size: u32| {
+                fold_walk_entry(&mut fingerprint, path, open_name, in_books_dir, byte_size);
                 if seen >= cursor && batch_len < batch_capacity {
                     let at = batch_len * CATALOG_RECORD_BYTES;
                     let record: &mut [u8; CATALOG_RECORD_BYTES] = (&mut scratch
@@ -202,10 +259,17 @@ where
                 }
                 seen += 1;
             };
-            walk_epubs(root, &mut collect);
+            walk_epubs(root, &mut collect)?;
         }
-        if batch_len == 0 {
-            break;
+        // Every pass over a card that hasn't changed must reproduce the
+        // counting walk exactly -- same books, same order. A differing count
+        // or fingerprint means the card was ejected, mutated (books added,
+        // removed, or replaced between walks), or the directory chain is
+        // failing mid-scan; records staged across passes would then mix
+        // snapshots, and the file must not be committed.
+        let expected = batch_capacity.min(total - cursor);
+        if batch_len != expected || seen != counted || fingerprint != counted_fingerprint {
+            return Err(());
         }
         // The walk has returned, so file opens are legal again: resolve each
         // staged record's title (cheap for the common case -- a dir open that
@@ -229,6 +293,12 @@ where
             .map_err(|_| ())?;
         cursor += batch_len;
     }
+    if cursor != total {
+        return Err(());
+    }
+    encode_catalog_header(count, &mut header);
+    file.seek_from_start(0).map_err(|_| ())?;
+    file.write(&header).map_err(|_| ())?;
     Ok(count)
 }
 
@@ -257,6 +327,12 @@ where
     let mut header = [0u8; CATALOG_HEADER_BYTES];
     read_exact_file(&file, &mut header)?;
     let count = proto::catalog::decode_catalog_header(&header).ok_or(())?;
+    // A committed header whose count disagrees with the file length means
+    // the file was truncated or appended outside the writer's control;
+    // nothing downstream may trust its record offsets.
+    if file.length() as usize != catalog_file_len(count) {
+        return Err(());
+    }
     f(&file, count)
 }
 
@@ -828,13 +904,14 @@ fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
     prefix: &str,
     in_books_dir: bool,
     visit: &mut impl FnMut(&str, &str, bool, u32),
-) where
+) -> Result<(), ()>
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let mut lfn_storage = [0u8; 192];
     let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
-    let _ = dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
+    dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
             return;
         }
@@ -862,7 +939,8 @@ fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
                 visit,
             );
         }
-    });
+    })
+    .map_err(|_| ())
 }
 
 fn visit_prefixed(
