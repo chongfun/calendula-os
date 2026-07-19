@@ -1,7 +1,7 @@
 use crate::reader_layout;
 use crate::reader_store::{
-    ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS, MAX_OVERVIEW_CHAPTERS,
-    MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
+    ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS, MAX_SD_TOC_ITEMS,
+    MAX_SD_TOC_TEXT_BYTES,
 };
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
@@ -1704,11 +1704,12 @@ where
     .unwrap_or(false)
 }
 
-/// Fill the resident `chapter_page` map (chapter -> global start page) from
-/// TOC.BIN, so the firmware can resolve the current chapter for any reading
-/// page across the whole book -- past the 128-entry resident/event caps. The
-/// book index must already be loaded so `page_for_spine` resolves.
-pub(crate) fn load_v2_toc_page_map<
+/// Fill the resident per-section `chapter_start` marks from TOC.BIN, so the
+/// firmware can resolve the current chapter for any reading page across the
+/// whole book -- past the 128-entry resident/event caps and past chapter 255
+/// (the map is bounded by the section count, not the chapter count). The
+/// book index must already be loaded so spines resolve to sections.
+pub(crate) fn load_v2_toc_chapter_map<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1735,30 +1736,27 @@ where
         if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
             return false;
         }
-        let count = (header.chapter_count as usize).min(MAX_OVERVIEW_CHAPTERS);
+        let section_count = library.book_section_count.min(MAX_BOOK_SECTIONS);
+        library.chapter_start.fill(0);
+        library.chapter_start_ready = false;
         if !read_records_batched(
             file,
             TOC_CHAPTER_RECORD_BYTES,
             header.chapter_count as usize,
             |index, bytes| {
-                if index >= MAX_OVERVIEW_CHAPTERS {
-                    // Drain the rest of the file but keep only the first
-                    // MAX_OVERVIEW_CHAPTERS starts.
-                    return true;
-                }
                 let spine = i16::from_le_bytes([bytes[0], bytes[1]]);
-                let page = if spine < 0 {
-                    0
-                } else {
-                    library.page_for_spine(spine as u16).min(u16::MAX as u32) as u16
-                };
-                library.chapter_page[index] = page;
+                proto::cache::mark_chapter_start(
+                    &mut library.chapter_start[..section_count],
+                    &library.book_sections[..section_count],
+                    index as u16,
+                    spine,
+                );
                 true
             },
         ) {
             return false;
         }
-        library.chapter_page_count = count;
+        library.chapter_start_ready = true;
         true
     })
     .unwrap_or(false)

@@ -288,7 +288,7 @@ pub struct RenderRequest {
     pub view: AppView,
     pub page: u32,
     pub page_count: u32,
-    pub chapter: u8,
+    pub chapter: u16,
     pub selection: u16,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
@@ -336,7 +336,7 @@ pub enum StorageCommand {
         request_id: u32,
         book_id: u32,
         index: u16,
-        chapter: u8,
+        chapter: u16,
         target_pages: u16,
         type_settings: TypeSettings,
         /// Paginate into the portrait page box. Rides beside the type
@@ -347,7 +347,7 @@ pub enum StorageCommand {
         request_id: u32,
         book_id: u32,
         index: u16,
-        chapter: u8,
+        chapter: u16,
         target_pages: u16,
         type_settings: TypeSettings,
         portrait: bool,
@@ -366,7 +366,7 @@ pub enum StorageCommand {
         request_id: u32,
         book_id: u32,
         index: u16,
-        chapter: u8,
+        chapter: u16,
         type_settings: TypeSettings,
         portrait: bool,
     },
@@ -600,7 +600,7 @@ pub enum LibraryEvent {
     Loaded {
         book_id: u32,
         pages: u32,
-        chapters: u8,
+        chapters: u16,
         /// The chapter the reading page currently sits in, computed by the
         /// firmware over the whole book. Unlike `chapter_pages` (capped at
         /// `MAX_SD_CHAPTERS`), this tracks position into a long book so the
@@ -610,7 +610,7 @@ pub enum LibraryEvent {
     },
     ChapterPage {
         book_id: u32,
-        chapter: u8,
+        chapter: u16,
         page: u32,
     },
     /// The firmware re-resolved the current chapter for the page just rendered,
@@ -626,7 +626,7 @@ pub enum LibraryEvent {
     },
     Restored {
         book_id: u32,
-        chapter: u8,
+        chapter: u16,
         page: u32,
         /// The book's total page count, read from the cache index header at
         /// restore so the Home progress bar has a denominator before the book
@@ -786,7 +786,7 @@ pub struct ReaderState {
     pub view: AppView,
     pub page: u32,
     pub selection: u16,
-    pub chapter: u8,
+    pub chapter: u16,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
     pub front_buttons: FrontButtons,
@@ -804,7 +804,7 @@ pub struct ReaderState {
     pub battery_percent: u8,
     pub library_count: u16,
     pub sd_page_count: u32,
-    pub sd_chapter_count: u8,
+    pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     pub read_request_pending: bool,
     /// Portrait reading's summoned key sheet is up: the next named-key
@@ -952,13 +952,11 @@ impl ReaderState {
                         next.page = self.sd_page_count.saturating_sub(1);
                     }
                     next.chapter = next.sd_chapter_for_page(next.page);
-                    next.selection = next.chapter as u16;
+                    next.selection = next.chapter;
                 } else {
-                    next.chapter = wrap_next(
-                        self.chapter as u16,
-                        (ctx.builtin_chapter_count as u16).max(1),
-                    ) as u8;
-                    next.selection = next.chapter as u16;
+                    next.chapter =
+                        wrap_next(self.chapter, (ctx.builtin_chapter_count as u16).max(1));
+                    next.selection = next.chapter;
                     next.page = 0;
                 }
             }
@@ -968,13 +966,11 @@ impl ReaderState {
                         next.page = self.page - 1;
                     }
                     next.chapter = next.sd_chapter_for_page(next.page);
-                    next.selection = next.chapter as u16;
+                    next.selection = next.chapter;
                 } else {
-                    next.chapter = wrap_prev(
-                        self.chapter as u16,
-                        (ctx.builtin_chapter_count as u16).max(1),
-                    ) as u8;
-                    next.selection = next.chapter as u16;
+                    next.chapter =
+                        wrap_prev(self.chapter, (ctx.builtin_chapter_count as u16).max(1));
+                    next.selection = next.chapter;
                     next.page = 0;
                 }
             }
@@ -983,20 +979,20 @@ impl ReaderState {
                 // `chapter` already tracks the reading position (kept current
                 // by the firmware's Loaded event, un-capped); opening the list
                 // lands the cursor there rather than on the saturated guess.
-                next.selection = self.chapter as u16;
+                next.selection = self.chapter;
             }
             (AppView::Reading, Some(Button::Back)) => {
                 next.view = AppView::Home;
                 next.selection = 0;
             }
             (AppView::Chapters, Some(Button::Next | Button::PageNext)) => {
-                next.selection = wrap_next(self.selection, self.chapter_item_count(ctx) as u16);
+                next.selection = wrap_next(self.selection, self.chapter_item_count(ctx));
             }
             (AppView::Chapters, Some(Button::Previous | Button::PagePrevious)) => {
-                next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx) as u16);
+                next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx));
             }
             (AppView::Chapters, Some(Button::Confirm)) => {
-                next.chapter = self.selection as u8;
+                next.chapter = self.selection;
                 next.page = if ReaderSource::from_book_id(self.book_id).is_sd() {
                     u32::from(
                         self.sd_chapter_pages
@@ -1128,7 +1124,7 @@ impl ReaderState {
                     // The firmware owns the true current chapter over the whole
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
-                    self.chapter = current_chapter.min(u8::MAX as u16) as u8;
+                    self.chapter = current_chapter;
                     self.dirty = Rect::FULL;
                 }
             }
@@ -1153,7 +1149,7 @@ impl ReaderState {
                     // view shows page-within-chapter, not the chapter itself, so no
                     // repaint is needed -- Home/sleep/Chapters and the persisted
                     // position pick up the corrected value when next used.
-                    self.chapter = current_chapter.min(u8::MAX as u16) as u8;
+                    self.chapter = current_chapter;
                 }
             }
             LibraryEvent::CustomFont { available } => {
@@ -1186,7 +1182,7 @@ impl ReaderState {
                 }
                 if self.read_request_pending {
                     self.view = AppView::Reading;
-                    self.selection = chapter as u16;
+                    self.selection = chapter;
                 } else if self.view == AppView::Library {
                     let restored_index =
                         ReaderSource::from_book_id(book_id).sd_index().unwrap_or(0);
@@ -1194,7 +1190,7 @@ impl ReaderState {
                 } else if self.view == AppView::Chapters {
                     // Home/Settings keep their own key selection; only the
                     // chapter list tracks the restored chapter cursor.
-                    self.selection = chapter as u16;
+                    self.selection = chapter;
                 }
                 self.read_request_pending = false;
                 if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
@@ -1306,7 +1302,7 @@ impl ReaderState {
     pub fn persisted(self) -> PersistedAppState {
         PersistedAppState {
             book_id: self.book_id,
-            chapter: self.chapter as u16,
+            chapter: self.chapter,
             screen: self.page,
             shell_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
             reading_orientation: self.orientation as u8,
@@ -1334,17 +1330,17 @@ impl ReaderState {
         self.library_count.max(ctx.builtin_book_count as u16).max(1)
     }
 
-    pub fn chapter_item_count(self, ctx: ReducerContext) -> u8 {
+    pub fn chapter_item_count(self, ctx: ReducerContext) -> u16 {
         if ReaderSource::from_book_id(self.book_id).is_sd() {
             self.sd_chapter_count.max(1)
         } else {
-            ctx.builtin_chapter_count.max(1)
+            u16::from(ctx.builtin_chapter_count.max(1))
         }
     }
 
-    pub fn sd_chapter_for_page(self, page: u32) -> u8 {
-        let mut selected = 0u8;
-        for index in 0..self.sd_chapter_count.min(MAX_SD_CHAPTERS as u8) {
+    pub fn sd_chapter_for_page(self, page: u32) -> u16 {
+        let mut selected = 0u16;
+        for index in 0..self.sd_chapter_count.min(MAX_SD_CHAPTERS as u16) {
             if u32::from(self.sd_chapter_pages[index as usize]) <= page {
                 selected = index;
             } else {
@@ -1427,7 +1423,7 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
         HomeAction::Read => {
             if ReaderSource::from_book_id(state.book_id).is_sd() {
                 state.view = AppView::Reading;
-                state.selection = state.chapter as u16;
+                state.selection = state.chapter;
             } else if state.library_count > 0 {
                 state.view = AppView::Library;
             } else {
@@ -1830,6 +1826,21 @@ mod tests {
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.chapter, 1);
         assert_eq!(state.page, 12);
+    }
+
+    #[test]
+    fn long_toc_selection_keeps_u16_indices() {
+        let ctx = ReducerContext::new(1, 1);
+        for chapter_count in [255u16, 256, 257, 322] {
+            let mut state = ReaderState::boot();
+            state.book_id = ReaderSource::sd(0).book_id();
+            state.view = AppView::Chapters;
+            state.sd_chapter_count = chapter_count;
+            state.selection = chapter_count - 1;
+            let state = press(state, Button::Confirm);
+            assert_eq!(state.chapter, chapter_count - 1);
+            assert_eq!(state.chapter_item_count(ctx), chapter_count);
+        }
     }
 
     #[test]

@@ -15,10 +15,6 @@ pub(crate) use proto::upload::derive_catalog_label;
 /// inside one loaded window and only crossings re-read the card.
 pub(crate) const LIBRARY_WINDOW: usize = 16;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
-/// Chapter-page map covering the whole on-disk TOC (not the 128-capped
-/// resident/event arrays), so the current chapter tracks reading position
-/// through a long book. One u16 page per chapter; 512 bytes resident.
-pub(crate) const MAX_OVERVIEW_CHAPTERS: usize = 256;
 /// Longest current-chapter title kept resident for the Home/sleep colophon;
 /// read on demand from TOC.BIN as the chapter changes.
 const MAX_CURRENT_CHAPTER_TITLE: usize = 60;
@@ -175,7 +171,7 @@ pub(crate) struct ReaderStore {
     active_index: Option<usize>,
     pub(crate) current_index: Option<usize>,
     pub(crate) loaded_index: Option<usize>,
-    pub(crate) loaded_chapter: u8,
+    pub(crate) loaded_chapter: u16,
     pub(crate) reader_status: BookLoadStatus,
     pub(crate) title: String<64>,
     pub(crate) author: String<64>,
@@ -211,21 +207,24 @@ pub(crate) struct ReaderStore {
     pub(crate) text_holds_toc: bool,
     pub(crate) toc_window_start: usize,
     pub(crate) toc_window_len: usize,
-    /// Start page of every chapter in the book (chapter -> page_for_spine),
-    /// filled once at open from TOC.BIN. Covers the whole TOC, so the current
-    /// chapter never gets stuck at the 128-entry cap.
-    pub(crate) chapter_page: [u16; MAX_OVERVIEW_CHAPTERS],
-    /// Number of valid entries in `chapter_page`; independent of the overview's
-    /// `toc_total` so the current-chapter map survives a Chapters visit.
-    pub(crate) chapter_page_count: usize,
+    /// Per-section chapter-start marks (`chapter + 1`, 0 = none), parallel to
+    /// `book_sections` and filled once at open from TOC.BIN. Chapter start
+    /// pages are always section start pages, so this section-bounded map
+    /// covers a TOC of any length -- the current chapter never gets stuck at
+    /// the 128-entry resident cap or a fixed per-chapter array (322-chapter
+    /// trade books resolve past 255). 640 bytes resident.
+    pub(crate) chapter_start: [u16; MAX_BOOK_SECTIONS],
+    /// Whether `chapter_start` holds the current book's marks; independent of
+    /// the overview's `toc_total` so the map survives a Chapters visit.
+    pub(crate) chapter_start_ready: bool,
     /// `(source_hash, source_size, font_config, custom_font_identity)` the
-    /// `chapter_page` map was built for. The book index reloads every section
+    /// `chapter_start` map was built for. The book index reloads every section
     /// crossing, so this token keeps the map from being re-read from disk
     /// except on a new book, a repaginating settings change, or a custom pack
     /// replacement.
-    pub(crate) chapter_page_token: (u32, u32, u16, u64),
+    pub(crate) chapter_start_token: (u32, u32, u16, u64),
     /// Current chapter and its title, resolved by the firmware from
-    /// `chapter_page` + the reading page on each section load, for the
+    /// `chapter_start` + the reading page on each section load, for the
     /// Home/sleep colophon and the overview's starting selection.
     pub(crate) current_chapter: u16,
     pub(crate) current_chapter_title: String<MAX_CURRENT_CHAPTER_TITLE>,
@@ -307,9 +306,9 @@ impl ReaderStore {
             text_holds_toc: false,
             toc_window_start: 0,
             toc_window_len: 0,
-            chapter_page: [0; MAX_OVERVIEW_CHAPTERS],
-            chapter_page_count: 0,
-            chapter_page_token: (0, 0, 0, 0),
+            chapter_start: [0; MAX_BOOK_SECTIONS],
+            chapter_start_ready: false,
+            chapter_start_token: (0, 0, 0, 0),
             current_chapter: 0,
             current_chapter_title: String::new(),
             current_chapter_source: (0, 0),
@@ -686,6 +685,9 @@ impl ReaderStore {
         for record in self.book_sections.iter_mut() {
             *record = EMPTY_BOOK_SECTION_RECORD;
         }
+        // `chapter_start` runs parallel to `book_sections`; marks derived from
+        // the old section table must not pair with a new one.
+        self.chapter_start_ready = false;
     }
 
     pub(crate) fn begin_book_load(&mut self) {
@@ -699,7 +701,7 @@ impl ReaderStore {
         self.clear_book_index();
     }
 
-    pub(crate) fn finish_book_load(&mut self, index: usize, chapter: u8, status: BookLoadStatus) {
+    pub(crate) fn finish_book_load(&mut self, index: usize, chapter: u16, status: BookLoadStatus) {
         if matches!(status, BookLoadStatus::Ready) {
             self.set_current_index(index);
         }
@@ -861,7 +863,22 @@ impl ReaderStore {
         self.book_total_pages = total_pages.max(1);
         self.book_cache_ready = true;
         self.book_cache_partial = partial;
-        self.book_section_count = sections.len().min(self.book_sections.len());
+        let count = sections.len().min(self.book_sections.len());
+        // `chapter_start` runs parallel to `book_sections`; a rebuilt or
+        // regrown section table (same book, same layout token) can slot
+        // sections differently, so its marks must be re-derived. The index
+        // also reloads unchanged on every section crossing, so only an actual
+        // change may invalidate -- otherwise every crossing would re-read the
+        // whole TOC from SD.
+        if count != self.book_section_count
+            || sections[..count]
+                .iter()
+                .zip(self.book_sections.iter())
+                .any(|(new, old)| new != old)
+        {
+            self.chapter_start_ready = false;
+        }
+        self.book_section_count = count;
         for (index, record) in sections.iter().take(self.book_section_count).enumerate() {
             self.book_sections[index] = *record;
         }
@@ -1119,30 +1136,22 @@ impl ReaderStore {
         self.page_for_spine(spine as u16).min(u16::MAX as u32) as u16
     }
 
-    /// The chapter a page falls in, over the full chapter-page map -- so it
-    /// keeps advancing past the 128-entry resident/event caps.
-    ///
-    /// `chapter_page` is not strictly increasing: several TOC chapters can
-    /// share one spine (so they share a start page), and an entry with no
-    /// resolvable spine is 0. So we cannot stop at the first entry past the
-    /// page. Instead take the greatest start page not beyond `page`, then name
-    /// the FIRST chapter at that page -- the chapter that opens the spine the
-    /// reader is in, rather than the last one swept up by a plateau of zeros.
+    /// The chapter a page falls in, resolved over the per-section chapter
+    /// marks -- covers the whole on-disk TOC (chapter starts are section
+    /// starts), so it keeps advancing past the 128-entry resident/event caps
+    /// and past chapter 255.
     pub(crate) fn current_chapter_for_page(&self, page: u32) -> u16 {
-        let count = self.chapter_page_count.min(MAX_OVERVIEW_CHAPTERS);
-        let mut best_page = 0u32;
-        for index in 0..count {
-            let start = u32::from(self.chapter_page[index]);
-            if start <= page && start >= best_page {
-                best_page = start;
-            }
+        // Dropped marks (a cleared or rebuilt section table) must never pair
+        // with the current sections, even if a caller skips the ready check.
+        if !self.chapter_start_ready {
+            return 0;
         }
-        for index in 0..count {
-            if u32::from(self.chapter_page[index]) == best_page {
-                return index as u16;
-            }
-        }
-        0
+        let count = self.book_section_count.min(MAX_BOOK_SECTIONS);
+        proto::cache::chapter_for_page(
+            &self.chapter_start[..count],
+            &self.book_sections[..count],
+            page,
+        )
     }
 
     pub(crate) fn set_current_chapter(&mut self, chapter: u16, title: &str, source: (u32, u32)) {
@@ -1235,10 +1244,10 @@ impl ReaderStore {
         self.error.as_str()
     }
 
-    pub(crate) fn chapter_count_for_ui(&self) -> u8 {
+    pub(crate) fn chapter_count_for_ui(&self) -> u16 {
         // The full on-disk count (when known) drives the overview's
         // selection range; it can run past the 128-entry resident/event
-        // caps, so only the u8 message width bounds it.
+        // caps, so only the u16 message width bounds it.
         let count = if self.toc_total > 0 {
             self.toc_total
         } else if self.toc_count > 0 {
@@ -1246,7 +1255,7 @@ impl ReaderStore {
         } else {
             self.book_section_count
         };
-        count.min(u8::MAX as usize).max(1) as u8
+        count.min(u16::MAX as usize).max(1) as u16
     }
 
     pub(crate) fn set_current_index(&mut self, index: usize) {

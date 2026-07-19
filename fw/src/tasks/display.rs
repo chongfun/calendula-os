@@ -704,7 +704,7 @@ fn handle_storage_command(
                     reader_cache::load_position(epd, sd_cs, sd_library, index as usize)
                 {
                     if saved_chapter > 0 || saved_screen > 0 {
-                        chapter = saved_chapter.min(u8::MAX as u16) as u8;
+                        chapter = saved_chapter;
                         target_pages = saved_screen.min(u16::MAX as u32) as u16;
                         resumed = true;
                         esp_println::println!(
@@ -1053,7 +1053,7 @@ fn send_required_display_event(event: &DisplayEvent) {
 /// the current display settings unchanged.
 fn send_resumed_position(
     book_id: u32,
-    chapter: u8,
+    chapter: u16,
     target_pages: u16,
     last_request: Option<RenderRequest>,
 ) {
@@ -1156,7 +1156,7 @@ fn restore_saved_state(
     let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
-        chapter: record.chapter.min(u8::MAX as u16) as u8,
+        chapter: record.chapter,
         page: record.screen,
         page_count,
         reading_orientation: record.reading_orientation,
@@ -1195,7 +1195,7 @@ fn sleep_request_from_saved_state(
         view: AppView::Home,
         page: record.screen,
         page_count,
-        chapter: record.chapter.min(u8::MAX as u16) as u8,
+        chapter: record.chapter,
         selection: 0,
         book_id: ReaderSource::sd(index).book_id(),
         orientation: display_orientation_from_u8(record.reading_orientation)

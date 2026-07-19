@@ -60,9 +60,9 @@ pub const COVER_BYTES: usize = COVER_STRIDE * COVER_HEIGHT;
 pub const CACHE_TOC_FILE: &str = "TOC.BIN";
 pub const TOC_FILE_MAGIC: u32 = 0x5834_5443; // X4TC
                                              // v2: chapter title budget grew 44->60 bytes (record 48->64). 64-byte records
-                                             // keep MAX_OVERVIEW_CHAPTERS (256) fitting the 16KB overview text buffer exactly
-                                             // (256*64 == 16384). A v1 TOC.BIN is rejected here and rebuilt (chapter-list
-                                             // re-parse only, no re-pagination).
+                                             // keep a 256-record overview window (TOC_WINDOW_CAPACITY) fitting the 16KB
+                                             // overview text buffer exactly (256*64 == 16384). A v1 TOC.BIN is rejected
+                                             // here and rebuilt (chapter-list re-parse only, no re-pagination).
 pub const TOC_FILE_VERSION: u16 = 2;
 pub const TOC_FILE_HEADER_BYTES: usize = 16;
 pub const TOC_CHAPTER_TITLE_BYTES: usize = 60;
@@ -867,6 +867,63 @@ fn valid_cache_v2_version(version: u16) -> bool {
     version == CACHE_V2_VERSION || version == CACHE_V2_COMPAT_VERSION
 }
 
+/// Record, into `chapter_start`, that TOC entry `chapter` opens at the section
+/// carrying `spine`. `chapter_start` runs parallel to `sections` and holds
+/// `chapter + 1` (0 = no chapter opens here) so an all-zero boot value means
+/// "empty". The first chapter to claim a section keeps it: a run of TOC
+/// entries sharing one spine resolves to the run's first entry.
+///
+/// Chapter start pages are always section start pages, so a map bounded by the
+/// section count covers a table of contents of any length -- the reason this
+/// is keyed by section rather than by chapter index.
+pub fn mark_chapter_start(
+    chapter_start: &mut [u16],
+    sections: &[BookV2SectionRecord],
+    chapter: u16,
+    spine: i16,
+) {
+    if spine < 0 || chapter == u16::MAX {
+        return;
+    }
+    let spine = spine as u16;
+    // A spine split across several sections keeps the chapter on its first
+    // section, mirroring `page_for_spine`.
+    let Some(index) = sections.iter().position(|section| section.spine == spine) else {
+        return;
+    };
+    if let Some(slot) = chapter_start.get_mut(index) {
+        if *slot == 0 {
+            *slot = chapter + 1;
+        }
+    }
+}
+
+/// The chapter `page` falls in: the chapter marked on the section with the
+/// greatest start page not beyond `page` (ties go to the lowest chapter
+/// index). Sections without a mark defer to the nearest marked section before
+/// them, so pages deep in a split or TOC-less spine still name the chapter
+/// that opened it. 0 when no marked section starts at or before `page`.
+pub fn chapter_for_page(chapter_start: &[u16], sections: &[BookV2SectionRecord], page: u32) -> u16 {
+    let mut best: Option<(u32, u16)> = None;
+    for (slot, section) in chapter_start.iter().zip(sections) {
+        if *slot == 0 || section.start_page > page {
+            continue;
+        }
+        let chapter = *slot - 1;
+        let better = match best {
+            None => true,
+            Some((best_page, best_chapter)) => {
+                section.start_page > best_page
+                    || (section.start_page == best_page && chapter < best_chapter)
+            }
+        };
+        if better {
+            best = Some((section.start_page, chapter));
+        }
+    }
+    best.map_or(0, |(_, chapter)| chapter)
+}
+
 pub fn decode_page_header(input: &[u8]) -> Result<PageCacheHeader, CacheError> {
     require(input, PAGE_HEADER_BYTES)?;
     if read_u32(input, 0)? != CACHE_MAGIC {
@@ -1277,6 +1334,68 @@ mod tests {
             decode_content_header(&bytes[..CONTENT_HEADER_BYTES - 1]),
             Err(CacheError::BufferTooSmall)
         );
+    }
+
+    fn section(section: u16, spine: u16, start_page: u32) -> BookV2SectionRecord {
+        BookV2SectionRecord {
+            section,
+            spine,
+            start_page,
+            page_count: 10,
+            partial: false,
+        }
+    }
+
+    /// Regression: a 322-entry TOC must keep resolving past chapter 255. The
+    /// map is bounded by the section count (chapter starts are section
+    /// starts), so no per-chapter array caps it.
+    #[test]
+    fn chapter_tracking_resolves_past_256_chapters() {
+        // 320 sections (the firmware's MAX_BOOK_SECTIONS), 10 pages each.
+        // Chapters 0..=2 share spine 0 (front-matter entries on the title
+        // page); chapters 3..=321 sit one per spine on spines 1..=319.
+        let sections: std::vec::Vec<BookV2SectionRecord> = (0..320u16)
+            .map(|i| section(i, i, u32::from(i) * 10))
+            .collect();
+        let mut chapter_start = [0u16; 320];
+        for chapter in 0..322u16 {
+            let spine: i16 = if chapter <= 2 { 0 } else { chapter as i16 - 2 };
+            mark_chapter_start(&mut chapter_start, &sections, chapter, spine);
+        }
+
+        // Jumping to the last chapter and rendering its pages stays at 321.
+        assert_eq!(chapter_for_page(&chapter_start, &sections, 3190), 321);
+        assert_eq!(chapter_for_page(&chapter_start, &sections, 3195), 321);
+        // A chapter past the old 256-entry cap but before the end.
+        assert_eq!(chapter_for_page(&chapter_start, &sections, 2990), 301);
+        // The shared-spine plateau names the run's first entry.
+        assert_eq!(chapter_for_page(&chapter_start, &sections, 5), 0);
+        assert_eq!(chapter_for_page(&chapter_start, &sections, 10), 3);
+    }
+
+    #[test]
+    fn chapter_tracking_covers_split_and_unlisted_spines() {
+        // Spine 1 spans sections 1-2; spine 2 (section 3) has no TOC entry.
+        let sections = [
+            section(0, 0, 0),
+            section(1, 1, 10),
+            section(2, 1, 20),
+            section(3, 2, 30),
+        ];
+        let mut chapter_start = [0u16; 4];
+        mark_chapter_start(&mut chapter_start, &sections, 0, 0);
+        mark_chapter_start(&mut chapter_start, &sections, 1, 1);
+        // Unresolvable spines never claim a section.
+        mark_chapter_start(&mut chapter_start, &sections, 2, -1);
+        assert_eq!(chapter_start, [1, 2, 0, 0]);
+
+        // Pages in the split spine's second section keep its chapter, and the
+        // TOC-less spine defers to the chapter that opened before it.
+        assert_eq!(chapter_for_page(&chapter_start, &sections, 25), 1);
+        assert_eq!(chapter_for_page(&chapter_start, &sections, 35), 1);
+        // No marked section at or before the page resolves to chapter 0.
+        let unmarked = [0u16; 4];
+        assert_eq!(chapter_for_page(&unmarked, &sections, 25), 0);
     }
 
     #[test]
