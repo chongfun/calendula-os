@@ -401,9 +401,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
             }
             Either::Second(StorageCommand::ReceiveUpload) => {
                 if sync_session.admits(&StorageCommand::ReceiveUpload) {
-                    // Diverges: the display task becomes the upload writer
-                    // for the rest of the sync session.
+                    // The display task is the upload writer until Sleep or
+                    // wireless Exit closes the session; a Sleep exit has
+                    // already been re-queued on DISPLAY_COMMANDS.
                     crate::sd_session::upload_session(&mut epd, &mut sd_cs).await;
+                    continue;
                 }
                 esp_println::println!("storage: upload refused outside sync");
             }

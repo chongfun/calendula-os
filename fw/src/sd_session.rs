@@ -1,7 +1,12 @@
 use crate::display_flush::Epd;
 use crate::upload::{UploadBegin, UploadChunk, UploadName};
-use crate::{UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS};
+use crate::{
+    DISPLAY_COMMANDS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS, UPLOAD_STOPPED,
+    UPLOAD_STOP_REQUESTS,
+};
+use app_core::DisplayCommand;
 use core::sync::atomic::{AtomicU8, Ordering};
+use embassy_futures::select::{select, Either};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
@@ -459,9 +464,12 @@ where
 
 /// The upload phase: one SD session held open for the rest of the sync
 /// session, writing browser-sent books to /BOOKS as they stream in.
-/// Diverges by design — only the session-ending reset leaves it, so the
-/// display task must not be needed for anything else once this starts.
-pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -> ! {
+/// Returns only after every open FAT handle has been dropped and the
+/// display SPI clock has been restored. Sleep is re-queued for the normal
+/// display shutdown path; wireless Exit receives an explicit stopped
+/// acknowledgement.
+pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
+    crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
     epd.deselect_display();
     sd_cs.set_high();
     esp_println::println!("upload: session enter");
@@ -483,7 +491,11 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
     let card = SdCard::new(spi, SdDelay);
     if card.num_bytes().is_err() {
         esp_println::println!("upload: card init failed");
-        refuse_uploads_forever().await;
+        let exit = refuse_uploads_until_exit().await;
+        // `card` has no Drop; its borrow of the EPD bus ends at its last
+        // use above, so the SPI clock restore below is free to re-borrow.
+        finish_upload_session(epd, exit).await;
+        return;
     }
     card.spi(|device| {
         let _ = device
@@ -494,12 +506,19 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         VolumeManager::new_with_limits(CountingDevice(card), StaticTime, 5000);
     let Ok(volume) = volume_mgr.open_volume(VolumeIdx(0)) else {
         esp_println::println!("upload: volume open failed");
-        refuse_uploads_forever().await;
+        let exit = refuse_uploads_until_exit().await;
+        drop(volume_mgr);
+        finish_upload_session(epd, exit).await;
+        return;
     };
     let raw_volume = volume.to_raw_volume();
     let Ok(raw_root) = volume_mgr.open_root_dir(raw_volume) else {
         esp_println::println!("upload: root open failed");
-        refuse_uploads_forever().await;
+        let exit = refuse_uploads_until_exit().await;
+        let _ = volume_mgr.close_volume(raw_volume);
+        drop(volume_mgr);
+        finish_upload_session(epd, exit).await;
+        return;
     };
     let root = Directory::new(raw_root, &volume_mgr);
     // New books invalidate the catalog snapshot: the next boot's cache
@@ -508,33 +527,83 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         let _ = upload_store::remove_file_reclaiming_clusters(&xteink, "CATALOG.BIN");
         esp_println::println!("upload: catalog snapshot invalidated");
     }
-    let books = match root.open_dir("BOOKS") {
-        Ok(books) => books,
-        Err(_) => match root.make_dir_in_dir("BOOKS") {
-            Ok(()) => match root.open_dir("BOOKS") {
-                Ok(books) => books,
-                Err(_) => refuse_uploads_forever().await,
+    // The books handle lives inside this block so every FAT handle is dead
+    // by scope before the close-and-acknowledge tail below: UPLOAD_STOPPED
+    // must not be sent (nor Sleep re-queued) while the volume is mounted,
+    // which is also why a missing/uncreatable BOOKS directory refuses
+    // uploads until an exit arrives instead of parking in a forever loop
+    // that would acknowledge over live handles.
+    let exit = {
+        let books = match root.open_dir("BOOKS") {
+            Ok(books) => Ok(books),
+            Err(_) => match root.make_dir_in_dir("BOOKS") {
+                Ok(()) => root.open_dir("BOOKS"),
+                Err(error) => Err(error),
             },
-            Err(_) => refuse_uploads_forever().await,
-        },
+        };
+        match books {
+            Ok(books) => serve_uploads(&root, &books).await,
+            Err(_) => {
+                esp_println::println!("upload: BOOKS setup failed");
+                refuse_uploads_until_exit().await
+            }
+        }
     };
+    drop(root);
+    let _ = volume_mgr.close_volume(raw_volume);
+    drop(volume_mgr);
+    finish_upload_session(epd, exit).await;
+}
 
+/// The serving loop of a fully set-up session: writes and deletes books as
+/// begins arrive, until Sleep or wireless Exit ends the session.
+async fn serve_uploads<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> UploadSessionExit
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     loop {
-        let begin = UPLOAD_BEGINS.receive().await;
+        let begin = match select(
+            UPLOAD_BEGINS.receive(),
+            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+        )
+        .await
+        {
+            Either::First(begin) => begin,
+            Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
+            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
+                return UploadSessionExit::Sleep { generation }
+            }
+            // The wireless screen is already painted; renders queued during
+            // the upload phase describe views this session never shows.
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => continue,
+        };
         let ok = if begin.delete {
             let removed = if begin.in_books {
-                upload_store::remove_file_reclaiming_clusters(&books, begin.name.as_str())
+                upload_store::remove_file_reclaiming_clusters(books, begin.name.as_str())
                     == upload_store::RemoveStatus::Removed
             } else {
-                upload_store::remove_file_reclaiming_clusters(&root, begin.name.as_str())
+                upload_store::remove_file_reclaiming_clusters(root, begin.name.as_str())
                     == upload_store::RemoveStatus::Removed
             };
             if removed && begin.in_books {
-                upload_store::delete_upload_sidecars(&root, begin.name.as_str());
+                upload_store::delete_upload_sidecars(root, begin.name.as_str());
             }
             removed
         } else {
-            write_one_book(&root, &books, &begin).await.is_some()
+            match write_one_book(root, books, &begin).await {
+                UploadWrite::Finished(name) => name.is_some(),
+                UploadWrite::Interrupted(exit) => return exit,
+            }
         };
         esp_println::println!(
             "upload: '{}' {} ok={}",
@@ -544,6 +613,62 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         );
         UPLOAD_RESULTS.send(ok).await;
     }
+}
+
+/// Restore the display's SPI clock, clear the session-active flag, and hand
+/// control to whichever consumer forced the exit: Sleep re-queues the
+/// display command for the normal shutdown path (progress flush, sleep
+/// frame, panel power-down); wireless Exit gets its stopped
+/// acknowledgement so the reset proceeds over a closed filesystem.
+async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
+    let _ = epd
+        .spi_mut()
+        .apply_config(&SpiConfig::default().with_frequency(Rate::from_hz(DISPLAY_FREQ_HZ)));
+    crate::upload::UPLOAD_SESSION_ACTIVE.store(false, portable_atomic::Ordering::SeqCst);
+    match exit {
+        // The re-queued Sleep keeps its generation so the power task's
+        // handshake still recognizes the eventual acknowledgement as its own.
+        UploadSessionExit::Sleep { generation } => {
+            // The book server may be stranded mid-request (blocked on a
+            // returned buffer or a result that will never come). Every
+            // loaned buffer is back in the channels by now — the writer
+            // recycles each chunk before receiving the next — so the
+            // server can fail the request and reclaim them. Matters only
+            // when sleep turns out non-terminal; a completed deep sleep
+            // resets before the server is polled again.
+            crate::UPLOAD_INTERRUPTS.signal(());
+            // A wireless Exit racing this Sleep may have sent its stop
+            // request after the writer stopped listening (the active flag
+            // clears only above, so exit_after_uploads still saw a live
+            // session). Answer it here — the volume is already closed —
+            // or that task waits forever on an ack no one would send. No
+            // await separates the flag store from this drain, and none
+            // separates the exit task's flag load from its send, so on
+            // this single-threaded executor a request is either drained
+            // here or never sent.
+            if UPLOAD_STOP_REQUESTS.try_receive().is_ok() {
+                UPLOAD_STOPPED.send(()).await;
+            }
+            DISPLAY_COMMANDS
+                .send(DisplayCommand::Sleep { generation })
+                .await
+        }
+        UploadSessionExit::Wireless => UPLOAD_STOPPED.send(()).await,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UploadSessionExit {
+    /// Carries the interrupting Sleep's generation for the re-queue.
+    Sleep {
+        generation: u32,
+    },
+    Wireless,
+}
+
+enum UploadWrite {
+    Finished(Option<UploadName>),
+    Interrupted(UploadSessionExit),
 }
 
 async fn write_one_book<
@@ -556,7 +681,7 @@ async fn write_one_book<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     begin: &UploadBegin,
-) -> Option<UploadName>
+) -> UploadWrite
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -572,8 +697,10 @@ where
         begin.label.as_str(),
     );
     let Ok(pending) = begun else {
-        drain_until_end().await;
-        return None;
+        return match drain_until_end().await {
+            Ok(()) => UploadWrite::Finished(None),
+            Err(exit) => UploadWrite::Interrupted(exit),
+        };
     };
     let malformed = pending.skipped_malformed_sidecars();
     if malformed > 0 {
@@ -585,7 +712,16 @@ where
     let mut failed = false;
     let mut aborted = false;
     loop {
-        let chunk = UPLOAD_CHUNKS.receive().await;
+        let chunk = match next_upload_chunk().await {
+            Ok(chunk) => chunk,
+            Err(exit) => {
+                // The transaction's abort path closes the staged file and
+                // reclaims its cluster chain; the original book (if this
+                // was a replace) is untouched by design.
+                pending.abort(root, books);
+                return UploadWrite::Interrupted(exit);
+            }
+        };
         if !failed && !chunk.abort {
             if let Some(buffer) = &chunk.buffer {
                 // One blocking whole-chunk write, on purpose. Pacing this
@@ -612,21 +748,40 @@ where
     }
     if failed || aborted {
         pending.abort(root, books);
-        return None;
+        return UploadWrite::Finished(None);
     }
     // commit closes the file and retires the replaced copies only if the
     // close succeeded; a failed close discards the target and returns None.
-    pending.commit(root, books)
+    UploadWrite::Finished(pending.commit(root, books))
 }
 
 /// Consumes one file's worth of chunks without a file to write into.
-async fn drain_until_end() {
+async fn drain_until_end() -> Result<(), UploadSessionExit> {
     loop {
-        let chunk = UPLOAD_CHUNKS.receive().await;
+        let chunk = next_upload_chunk().await?;
         let done = chunk.last || chunk.abort;
         recycle(chunk).await;
         if done {
-            return;
+            return Ok(());
+        }
+    }
+}
+
+/// One upload chunk, or the session-ending interrupt that arrived instead.
+async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
+    loop {
+        match select(
+            UPLOAD_CHUNKS.receive(),
+            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+        )
+        .await
+        {
+            Either::First(chunk) => return Ok(chunk),
+            Either::Second(Either::First(())) => return Err(UploadSessionExit::Wireless),
+            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
+                return Err(UploadSessionExit::Sleep { generation })
+            }
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
         }
     }
 }
@@ -637,12 +792,27 @@ async fn recycle(chunk: UploadChunk) {
     }
 }
 
-/// Setup failed: answer every upload attempt with failure, forever; the
-/// session ends with the reset like everything else in sync mode.
-async fn refuse_uploads_forever() -> ! {
+/// Session setup stalled short of an upload-capable BOOKS directory:
+/// answer every upload attempt with failure until Sleep or wireless Exit
+/// ends the session, and report which one did. Touches no SD state — the
+/// caller closes whatever handles it still holds before acknowledging.
+async fn refuse_uploads_until_exit() -> UploadSessionExit {
     loop {
-        let _ = UPLOAD_BEGINS.receive().await;
-        drain_until_end().await;
-        UPLOAD_RESULTS.send(false).await;
+        match select(
+            UPLOAD_BEGINS.receive(),
+            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+        )
+        .await
+        {
+            Either::First(_) => match drain_until_end().await {
+                Ok(()) => UPLOAD_RESULTS.send(false).await,
+                Err(exit) => return exit,
+            },
+            Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
+            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
+                return UploadSessionExit::Sleep { generation }
+            }
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
+        }
     }
 }

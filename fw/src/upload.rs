@@ -21,6 +21,12 @@ pub use proto::upload::{
 /// for it so a done press cannot truncate a file mid-write.
 pub static UPLOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// True from the moment Wi-Fi requests the upload session until board I/O
+/// has closed it. Set before the storage command is queued, which closes
+/// the Exit race where the reset could otherwise beat the SD owner into
+/// the session and skip the stop handshake entirely.
+pub static UPLOAD_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 pub struct UploadBegin {
     pub name: UploadName,
     /// True removes the named book instead of writing one.
