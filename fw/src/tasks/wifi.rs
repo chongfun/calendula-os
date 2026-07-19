@@ -892,20 +892,29 @@ async fn scan_network_options(controller: &mut WifiController<'static>, out: &mu
     networks.sort_by_key(|network| core::cmp::Reverse(network.signal_strength));
     let mut at = 0usize;
     for (index, network) in networks.iter().enumerate() {
+        // `as_str()` yields only the valid UTF-8 prefix of the raw SSID
+        // bytes; a truncated name would submit credentials for a different
+        // network, and the string-based station config cannot represent the
+        // full SSID anyway, so skip such entries.
         let ssid = network.ssid.as_str();
         if ssid.is_empty()
+            || ssid.len() != network.ssid.len()
             || networks[..index]
                 .iter()
                 .any(|earlier| earlier.ssid.as_str() == ssid)
         {
             continue;
         }
+        let option_start = at;
         if !push_bytes(out, &mut at, b"<option value=\"")
             || !push_html_escaped(out, &mut at, ssid.as_bytes())
             || !push_bytes(out, &mut at, b"\">")
             || !push_html_escaped(out, &mut at, ssid.as_bytes())
             || !push_bytes(out, &mut at, b"</option>")
         {
+            // Drop the partial entry so the output ends after a complete
+            // `</option>` before the static suffix is appended.
+            at = option_start;
             break;
         }
     }
