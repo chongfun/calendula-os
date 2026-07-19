@@ -135,10 +135,42 @@ where
     T: TimeSource,
 {
     collect_epubs(root, "/", false, visit)?;
-    if let Ok(books) = root.open_dir("BOOKS") {
-        collect_epubs(&books, "/books/", true, visit)?;
+    // Only a genuinely absent /BOOKS is an empty result; any other failure
+    // (SD/FAT flakiness) must fail the walk, or the scan would commit a
+    // catalog missing every /BOOKS book and the orphan sweep would reclaim
+    // their caches.
+    match root.open_dir("BOOKS") {
+        Ok(books) => collect_epubs(&books, "/books/", true, visit)?,
+        Err(embedded_sdmmc::Error::NotFound) => {}
+        Err(_) => return Err(()),
     }
     Ok(())
+}
+
+/// Seed and per-entry step of an order-sensitive FNV-1a over every field
+/// `walk_epubs` reports, with a NUL between fields so adjacent strings can't
+/// alias. Two walks fold to the same value only when they visit the same
+/// books, with the same sizes, in the same order.
+const WALK_FINGERPRINT_SEED: u32 = 0x811c_9dc5;
+
+fn fold_walk_entry(
+    hash: &mut u32,
+    path: &str,
+    open_name: &str,
+    in_books_dir: bool,
+    byte_size: u32,
+) {
+    for byte in path
+        .bytes()
+        .chain(core::iter::once(0))
+        .chain(open_name.bytes())
+        .chain(core::iter::once(0))
+        .chain(core::iter::once(in_books_dir as u8))
+        .chain(byte_size.to_le_bytes())
+    {
+        *hash ^= byte as u32;
+        *hash = hash.wrapping_mul(0x0100_0193);
+    }
 }
 
 /// Write CATALOG.BIN from the card without ever holding the whole library in
@@ -175,8 +207,18 @@ where
         .map_err(|_| ())?;
 
     let mut counted = 0usize;
+    let mut counted_fingerprint = WALK_FINGERPRINT_SEED;
     {
-        let mut count = |_: &str, _: &str, _: bool, _: u32| counted += 1;
+        let mut count = |path: &str, open_name: &str, in_books_dir: bool, byte_size: u32| {
+            counted += 1;
+            fold_walk_entry(
+                &mut counted_fingerprint,
+                path,
+                open_name,
+                in_books_dir,
+                byte_size,
+            );
+        };
         walk_epubs(root, &mut count)?;
     }
     let count = counted.min(u16::MAX as usize) as u16;
@@ -194,8 +236,10 @@ where
     while cursor < total {
         let mut batch_len = 0usize;
         let mut seen = 0usize;
+        let mut fingerprint = WALK_FINGERPRINT_SEED;
         {
             let mut collect = |path: &str, open_name: &str, in_books_dir: bool, byte_size: u32| {
+                fold_walk_entry(&mut fingerprint, path, open_name, in_books_dir, byte_size);
                 if seen >= cursor && batch_len < batch_capacity {
                     let at = batch_len * CATALOG_RECORD_BYTES;
                     let record: &mut [u8; CATALOG_RECORD_BYTES] = (&mut scratch
@@ -218,11 +262,13 @@ where
             walk_epubs(root, &mut collect)?;
         }
         // Every pass over a card that hasn't changed must reproduce the
-        // counting walk exactly; a short or shrunken pass means the card
-        // was ejected or the directory chain is failing mid-scan, and the
-        // partial file must not be committed.
+        // counting walk exactly -- same books, same order. A differing count
+        // or fingerprint means the card was ejected, mutated (books added,
+        // removed, or replaced between walks), or the directory chain is
+        // failing mid-scan; records staged across passes would then mix
+        // snapshots, and the file must not be committed.
         let expected = batch_capacity.min(total - cursor);
-        if batch_len != expected || seen < total {
+        if batch_len != expected || seen != counted || fingerprint != counted_fingerprint {
             return Err(());
         }
         // The walk has returned, so file opens are legal again: resolve each
