@@ -310,11 +310,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // Sleeping now would drop the coalesced position for
                     // good (deep sleep reboots). Stay awake; the pending
                     // record is retried on the next flush and the power
-                    // task's idle clock re-requests sleep once DisplayFailed
-                    // releases its handshake wait.
+                    // task's idle clock re-requests sleep once the sleep
+                    // failure releases its handshake wait.
                     esp_println::println!("display: sleep deferred; progress persistence failed");
                     send_required_display_event(&DisplayEvent::Failed);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayFailed);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySleepFailed);
                     continue;
                 }
                 let request = refresh_planner.last_request().or_else(|| {
@@ -390,7 +390,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.record_failure();
                     esp_println::println!("display: sleep transition failed");
                     send_required_display_event(&DisplayEvent::Failed);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayFailed);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySleepFailed);
                 }
                 esp_println::println!(
                     "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",

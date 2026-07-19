@@ -243,6 +243,29 @@ pub async fn run() {
                     esp_println::println!("app: display transition failed");
                     rendering = false;
                     render_pending = false;
+                    // This failure ends the display cycle the same way
+                    // Settled would, and it is the only other drain point
+                    // for the parked storage command: a queued book open
+                    // left in pending_storage would otherwise hold
+                    // opening_book forever and suppress every input.
+                    if let Some(command) = pending_storage.take() {
+                        log_storage_command("send", command);
+                        if let Some(book_id) = open_book_id(command) {
+                            opening_book = Some(book_id);
+                            suppress_input_until_open_settled = true;
+                        }
+                        STORAGE_COMMANDS.send(command).await;
+                    }
+                    // Loaded may already have cleared opening_book before
+                    // this failure discarded its render; without Settled
+                    // ever arriving, the suppression flag must be released
+                    // here or input stays ignored for good.
+                    if suppress_input_until_open_settled && opening_book.is_none() {
+                        suppress_input_until_open_settled = false;
+                        block_confirm_until = Some(
+                            Instant::now() + Duration::from_millis(POST_OPEN_CONFIRM_BLOCK_MS),
+                        );
+                    }
                 }
                 DisplayEvent::Library(event) => {
                     if let Some(book_id) = loaded_book_id(&event) {

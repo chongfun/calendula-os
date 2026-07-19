@@ -52,7 +52,8 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 PowerEvent::DisplaySettled
                 | PowerEvent::DisplayAsleep
-                | PowerEvent::DisplayFailed => {}
+                | PowerEvent::DisplayRefreshFailed
+                | PowerEvent::DisplaySleepFailed => {}
             },
             // Idle timeout elapsed with no activity.
             Either::Second(_) => {
@@ -86,7 +87,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) -> Duration {
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
             PowerEvent::Activity(view) => return idle_timeout(view),
-            PowerEvent::DisplayFailed => {
+            PowerEvent::DisplaySleepFailed => {
                 // The display task could not complete the sleep transition
                 // (progress flush or panel handshake failed). Cutting power
                 // anyway would lose reading position or freeze a mid-refresh
@@ -94,7 +95,15 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) -> Duration {
                 esp_println::println!("power: display sleep failed; staying awake");
                 return idle_timeout(AppView::Home);
             }
-            PowerEvent::DisplaySettled | PowerEvent::SleepNow => {}
+            // A refresh failure belongs to a render queued ahead of our
+            // Sleep command, which the display task has not reached yet.
+            // Abandoning the handshake here would let the sleep proceed
+            // unobserved: its DisplayAsleep would land in the outer loop,
+            // leaving the panel dark with the MCU awake. Keep waiting for
+            // the sleep's own acknowledgement, as with DisplaySettled.
+            PowerEvent::DisplayRefreshFailed
+            | PowerEvent::DisplaySettled
+            | PowerEvent::SleepNow => {}
         }
     }
 }

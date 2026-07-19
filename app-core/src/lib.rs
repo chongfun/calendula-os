@@ -699,10 +699,16 @@ pub enum PowerEvent {
     Activity(AppView),
     DisplaySettled,
     DisplayAsleep,
-    /// The display task could not complete a requested transition; the
-    /// power task must not treat the panel as settled or asleep (in
-    /// particular, never cut power behind a failed sleep handshake).
-    DisplayFailed,
+    /// A panel refresh (render flush or wake init) did not complete. The
+    /// power events carry no operation identity, so failures are split by
+    /// kind: a refresh failure can belong to a render queued ahead of a
+    /// Sleep command, and the sleep handshake must not be abandoned over
+    /// someone else's frame.
+    DisplayRefreshFailed,
+    /// The display task could not complete a requested sleep transition
+    /// (progress flush or panel handshake failed); the power task must
+    /// stay awake — never cut power behind a failed sleep handshake.
+    DisplaySleepFailed,
     SleepNow,
 }
 
@@ -713,7 +719,7 @@ pub const fn display_refresh_outcome(success: bool) -> (DisplayEvent, PowerEvent
     if success {
         (DisplayEvent::Settled, PowerEvent::DisplaySettled)
     } else {
-        (DisplayEvent::Failed, PowerEvent::DisplayFailed)
+        (DisplayEvent::Failed, PowerEvent::DisplayRefreshFailed)
     }
 }
 
@@ -2263,7 +2269,7 @@ mod tests {
         );
         assert_eq!(
             display_refresh_outcome(false),
-            (DisplayEvent::Failed, PowerEvent::DisplayFailed)
+            (DisplayEvent::Failed, PowerEvent::DisplayRefreshFailed)
         );
     }
 
