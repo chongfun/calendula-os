@@ -899,9 +899,13 @@ async fn scan_network_options(controller: &mut WifiController<'static>, out: &mu
         let ssid = network.ssid.as_str();
         if ssid.is_empty()
             || ssid.len() != network.ssid.len()
-            || networks[..index]
-                .iter()
-                .any(|earlier| earlier.ssid.as_str() == ssid)
+            || networks[..index].iter().any(|earlier| {
+                // Compare only against entries that pass the same UTF-8
+                // check; a skipped invalid SSID's valid prefix must not
+                // suppress a later legitimate network with that name.
+                let earlier_ssid = earlier.ssid.as_str();
+                earlier_ssid.len() == earlier.ssid.len() && earlier_ssid == ssid
+            })
         {
             continue;
         }
