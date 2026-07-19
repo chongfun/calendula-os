@@ -31,3 +31,26 @@ pub(crate) type Epd = hal_ext::spi_dma::EpdBus<
 >;
 
 pub(crate) type SpiError = <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error;
+
+/// Why a panel operation failed: the SPI transfer itself errored, or the
+/// BUSY handshake after a command never completed. Either way the panel's
+/// RAM/waveform state is unknown, so callers must not report the frame as
+/// settled or the panel as asleep.
+#[allow(dead_code)] // The payloads exist for the Debug log line.
+#[derive(Debug)]
+pub(crate) enum PanelError {
+    Spi(SpiError),
+    Busy(hal_ext::spi_dma::BusyError),
+}
+
+impl From<esp_hal::spi::Error> for PanelError {
+    fn from(value: esp_hal::spi::Error) -> Self {
+        Self::Spi(value)
+    }
+}
+
+impl From<hal_ext::spi_dma::BusyError> for PanelError {
+    fn from(value: hal_ext::spi_dma::BusyError) -> Self {
+        Self::Busy(value)
+    }
+}

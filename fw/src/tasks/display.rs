@@ -195,7 +195,18 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // after the panel already powered down.
                 if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
                     esp_println::println!("display: wake init start");
-                    display_flush::init_panel(&mut epd).await;
+                    if let Err(error) = display_flush::init_panel(&mut epd).await {
+                        // The panel never came up; flushing into it would
+                        // stream into a dead controller. Fail this render —
+                        // the app clears its render lock and the next
+                        // request retries init from scratch.
+                        esp_println::println!("display: wake init failed: {:?}", error);
+                        prev_prestaged = false;
+                        let (display_event, power_event) = app_core::display_refresh_outcome(false);
+                        send_required_display_event(&display_event);
+                        let _ = POWER_EVENTS.try_send(power_event);
+                        continue;
+                    }
                     esp_println::println!("display: wake init complete");
                     prev_prestaged = false;
                 }
@@ -250,8 +261,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // runs on this task before the next command is dequeued, so
                     // `prev_prestaged` is always current by the next flush, and a
                     // Sleep queued by power_task after DisplaySettled waits behind it.
-                    send_required_display_event(&DisplayEvent::Settled);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
+                    let (display_event, power_event) = app_core::display_refresh_outcome(true);
+                    send_required_display_event(&display_event);
+                    let _ = POWER_EVENTS.try_send(power_event);
                     let prestage_start = Instant::now();
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
                         .await
@@ -270,7 +282,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 } else {
                     esp_println::println!("display: SPI transfer failed");
                     prev_prestaged = false;
-                    send_required_display_event(&DisplayEvent::Settled);
+                    let (display_event, power_event) = app_core::display_refresh_outcome(false);
+                    send_required_display_event(&display_event);
+                    let _ = POWER_EVENTS.try_send(power_event);
                 }
             }
             Either::First(DisplayCommand::Sleep) => {
@@ -290,9 +304,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // Sleeping now would drop the coalesced position for
                     // good (deep sleep reboots). Stay awake; the pending
                     // record is retried on the next flush and the power
-                    // task's idle clock re-requests sleep. A button press
-                    // (Activity) releases the power task's handshake wait.
+                    // task's idle clock re-requests sleep once DisplayFailed
+                    // releases its handshake wait.
                     esp_println::println!("display: sleep deferred; progress persistence failed");
+                    send_required_display_event(&DisplayEvent::Failed);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayFailed);
                     continue;
                 }
                 let request = refresh_planner.last_request().or_else(|| {
@@ -338,9 +354,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 };
                 prev_prestaged = false;
                 let panel_slept = display_flush::sleep_panel(&mut epd).await.is_ok();
-                if !panel_slept {
-                    esp_println::println!("display: sleep command failed");
-                }
                 // Whenever the panel actually slept the planner must know the
                 // screen is off — an aborted handshake (a late button press
                 // beating DisplayAsleep) otherwise renders to a powered-down
@@ -356,8 +369,18 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // this marker, and a flush or panel-sleep failure must leave
                 // it false so that boot falls back to the full waveform.
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
-                send_required_display_event(&DisplayEvent::Asleep);
-                let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                if panel_slept {
+                    send_required_display_event(&DisplayEvent::Asleep);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                } else {
+                    // The panel never acknowledged the sleep sequence, so it
+                    // may still be mid-refresh. Cutting power now would
+                    // freeze whatever is on screen; report failure so the
+                    // power task stays awake and retries on its idle clock.
+                    esp_println::println!("display: sleep transition failed");
+                    send_required_display_event(&DisplayEvent::Failed);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayFailed);
+                }
                 esp_println::println!(
                     "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",
                     panel_slept,

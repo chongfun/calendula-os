@@ -50,7 +50,9 @@ pub async fn run(lpwr: LPWR<'static>) {
                     idle = enter_sleep(&mut rtc).await;
                     deadline = Instant::now() + idle;
                 }
-                PowerEvent::DisplaySettled | PowerEvent::DisplayAsleep => {}
+                PowerEvent::DisplaySettled
+                | PowerEvent::DisplayAsleep
+                | PowerEvent::DisplayFailed => {}
             },
             // Idle timeout elapsed with no activity.
             Either::Second(_) => {
@@ -84,6 +86,14 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) -> Duration {
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
             PowerEvent::Activity(view) => return idle_timeout(view),
+            PowerEvent::DisplayFailed => {
+                // The display task could not complete the sleep transition
+                // (progress flush or panel handshake failed). Cutting power
+                // anyway would lose reading position or freeze a mid-refresh
+                // panel; stay awake and retry at the shell leash.
+                esp_println::println!("power: display sleep failed; staying awake");
+                return idle_timeout(AppView::Home);
+            }
             PowerEvent::DisplaySettled | PowerEvent::SleepNow => {}
         }
     }

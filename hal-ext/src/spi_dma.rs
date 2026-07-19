@@ -3,6 +3,15 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::spi::SpiBus;
 
+/// A BUSY handshake that did not complete: the panel either never asserted
+/// busy after a command that must run one (the command was ignored), or
+/// never released it inside the wait ceiling (the controller is wedged).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusyError {
+    NeverAsserted,
+    TimedOut,
+}
+
 pub struct EpdBus<SPI, CS, DC, BUSY, RST> {
     spi: SPI,
     cs: CS,
@@ -76,7 +85,7 @@ where
         self.deselect();
     }
 
-    pub async fn wait_ready(&mut self) {
+    pub async fn wait_ready(&mut self) -> Result<(), BusyError> {
         // Give BUSY time to assert after a command before the level wait;
         // a too-early check would sail straight through a refresh. A bounded
         // edge wait returns as soon as BUSY asserts instead of always burning
@@ -88,8 +97,13 @@ where
         // BUSY is active high. The interrupt-driven level wait returns
         // immediately if the pin is already low, replacing the 20 ms poll
         // loop's wake-ups and exit jitter; the ceiling matches the poll
-        // loop's previous ~15 s give-up.
-        let _ = embassy_time::with_timeout(Duration::from_secs(15), self.busy.wait_for_low()).await;
+        // loop's previous ~15 s give-up — but a wait that hits it now
+        // surfaces as an error instead of silently proceeding over a panel
+        // that is still busy (or a BUSY line that stopped reading).
+        embassy_time::with_timeout(Duration::from_secs(15), self.busy.wait_for_low())
+            .await
+            .map_err(|_| BusyError::TimedOut)?
+            .map_err(|_| BusyError::TimedOut)
     }
 
     /// Two-phase BUSY wait for the UC8253 (Xteink X3): BUSY drops LOW while
@@ -99,21 +113,23 @@ where
     /// has already finished, so proceed), then for the return to HIGH.
     /// Mirrors CrossPoint's `BusyPolarity::X3TwoPhase` poll.
     ///
-    /// Returns `(saw_low, elapsed_ms)` so callers can log whether the
-    /// controller actually went busy — a command that never drops BUSY was
-    /// ignored, which is the difference between "refresh ran invisibly"
-    /// and "refresh never happened" during bring-up.
-    pub async fn wait_two_phase(&mut self) -> (bool, u64) {
+    /// Returns the elapsed milliseconds of a completed handshake. A command
+    /// that never drops BUSY was ignored (`NeverAsserted` — the difference
+    /// between "refresh ran invisibly" and "refresh never happened"); one
+    /// that never returns HIGH inside the 30 s ceiling is `TimedOut`.
+    pub async fn wait_two_phase(&mut self) -> Result<u64, BusyError> {
         let start = Instant::now();
         let saw_low = embassy_time::with_timeout(Duration::from_secs(1), self.busy.wait_for_low())
             .await
             .is_ok();
         if !saw_low {
-            return (false, start.elapsed().as_millis());
+            return Err(BusyError::NeverAsserted);
         }
-        let _ =
-            embassy_time::with_timeout(Duration::from_secs(30), self.busy.wait_for_high()).await;
-        (true, start.elapsed().as_millis())
+        embassy_time::with_timeout(Duration::from_secs(30), self.busy.wait_for_high())
+            .await
+            .map_err(|_| BusyError::TimedOut)?
+            .map_err(|_| BusyError::TimedOut)?;
+        Ok(start.elapsed().as_millis())
     }
 
     /// Raw BUSY level sample, for bring-up probes that need the idle level

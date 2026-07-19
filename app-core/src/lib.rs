@@ -550,6 +550,11 @@ impl PortalPsk {
 pub enum DisplayEvent {
     Settled,
     Asleep,
+    /// A panel transition (refresh, wake init, or sleep) did not complete:
+    /// the SPI transfer failed or the BUSY handshake never finished. The
+    /// panel's contents are unknown, so the frame must not be treated as
+    /// shown nor the panel as asleep.
+    Failed,
     Library(LibraryEvent),
 }
 
@@ -680,7 +685,22 @@ pub enum PowerEvent {
     Activity(AppView),
     DisplaySettled,
     DisplayAsleep,
+    /// The display task could not complete a requested transition; the
+    /// power task must not treat the panel as settled or asleep (in
+    /// particular, never cut power behind a failed sleep handshake).
+    DisplayFailed,
     SleepNow,
+}
+
+/// Keep the display and power acknowledgements for a panel refresh paired.
+/// A failed transfer must never advance the app render queue or authorize a
+/// later power transition as though the panel had settled.
+pub const fn display_refresh_outcome(success: bool) -> (DisplayEvent, PowerEvent) {
+    if success {
+        (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+    } else {
+        (DisplayEvent::Failed, PowerEvent::DisplayFailed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2219,6 +2239,18 @@ mod tests {
 
         request.view = AppView::Home;
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+    }
+
+    #[test]
+    fn panel_refresh_failure_is_never_acknowledged_as_settled() {
+        assert_eq!(
+            display_refresh_outcome(true),
+            (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+        );
+        assert_eq!(
+            display_refresh_outcome(false),
+            (DisplayEvent::Failed, PowerEvent::DisplayFailed)
+        );
     }
 
     #[test]
