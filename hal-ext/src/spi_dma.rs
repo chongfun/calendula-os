@@ -90,10 +90,16 @@ where
         // a too-early check would sail straight through a refresh. A bounded
         // edge wait returns as soon as BUSY asserts instead of always burning
         // the old fixed 1 ms sleep, and its 2 ms ceiling covers a slower
-        // assert the fixed delay would have missed. On timeout BUSY never
-        // rose, so the low wait below falls through immediately.
-        let _ =
-            embassy_time::with_timeout(Duration::from_millis(2), self.busy.wait_for_high()).await;
+        // assert the fixed delay would have missed. Every caller sits right
+        // after a command whose BUSY pulse lasts multiple milliseconds, so a
+        // ceiling hit means the command was ignored (BUSY never rose and the
+        // low wait below would fall through over a panel that never ran it) —
+        // surface that as `NeverAsserted` rather than reporting the
+        // transition settled.
+        embassy_time::with_timeout(Duration::from_millis(2), self.busy.wait_for_high())
+            .await
+            .map_err(|_| BusyError::NeverAsserted)?
+            .map_err(|_| BusyError::NeverAsserted)?;
         // BUSY is active high. The interrupt-driven level wait returns
         // immediately if the pin is already low, replacing the 20 ms poll
         // loop's wake-ups and exit jitter; the ceiling matches the poll

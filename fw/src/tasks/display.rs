@@ -282,6 +282,12 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 } else {
                     esp_println::println!("display: SPI transfer failed");
                     prev_prestaged = false;
+                    // The flush may have run partially, so the panel's RAM
+                    // and waveform state no longer match the planner's model;
+                    // forget it so the next render re-inits the panel and
+                    // takes the full waveform instead of fast-diffing
+                    // against a frame that may never have landed.
+                    refresh_planner.record_failure();
                     let (display_event, power_event) = app_core::display_refresh_outcome(false);
                     send_required_display_event(&display_event);
                     let _ = POWER_EVENTS.try_send(power_event);
@@ -377,6 +383,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // may still be mid-refresh. Cutting power now would
                     // freeze whatever is on screen; report failure so the
                     // power task stays awake and retries on its idle clock.
+                    // The handshake may also have partially powered the
+                    // controller down, so the planner's screen model is no
+                    // longer trustworthy: forget it so the next render
+                    // re-inits the panel with the full waveform.
+                    refresh_planner.record_failure();
                     esp_println::println!("display: sleep transition failed");
                     send_required_display_event(&DisplayEvent::Failed);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayFailed);
@@ -427,6 +438,15 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                             refresh_planner.record_render(loading_request, mode);
                             prev_fb.copy_from(fb);
                             prev_prestaged = false;
+                        } else {
+                            // No Settled/Failed events here — the app isn't
+                            // waiting on this opportunistic plate — but the
+                            // panel state is as unknown as after any failed
+                            // flush: drop the prestage claim and the
+                            // planner's screen model.
+                            esp_println::println!("display: loading plate flush failed");
+                            prev_prestaged = false;
+                            refresh_planner.record_failure();
                         }
                     }
                 }
