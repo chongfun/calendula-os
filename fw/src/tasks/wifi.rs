@@ -883,6 +883,14 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
 /// strongest RSSI first, deduplicated by SSID; the byte count written is
 /// returned. Any failure or overflow just truncates the list — manual
 /// entry remains available through the suffix's "other" option.
+///
+/// Memory: `scan_async` collects the results into an `alloc::vec::Vec` on
+/// the Wi-Fi heap — at most 20 x 47-byte `AccessPointInfo` entries, ~1 KB
+/// freed on return — which is permitted here because the portal runs
+/// inside the wireless session, the only phase where that allocator
+/// exists. The collection never spans an await (the scan completes before
+/// it is built; sorting and rendering are synchronous), so it adds
+/// nothing to the caller's async state.
 async fn scan_network_options(controller: &mut WifiController<'static>, out: &mut [u8]) -> usize {
     let config = ScanConfig::default().with_max(20);
     let Ok(mut networks) = controller.scan_async(&config).await else {
