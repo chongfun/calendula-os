@@ -1253,7 +1253,10 @@ where
         library,
         book_partial,
     );
-    library.set_book_index(total_pages, book_partial || !wrote_index, sections_slice);
+    if !wrote_index {
+        return false;
+    }
+    library.set_book_index(total_pages, book_partial, sections_slice);
     let hit = matches!(
         reader_cache_files::load_v2_section_by_global_page(
             root,
