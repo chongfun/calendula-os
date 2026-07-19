@@ -685,6 +685,9 @@ impl ReaderStore {
         for record in self.book_sections.iter_mut() {
             *record = EMPTY_BOOK_SECTION_RECORD;
         }
+        // `chapter_start` runs parallel to `book_sections`; marks derived from
+        // the old section table must not pair with a new one.
+        self.chapter_start_ready = false;
     }
 
     pub(crate) fn begin_book_load(&mut self) {
@@ -860,7 +863,22 @@ impl ReaderStore {
         self.book_total_pages = total_pages.max(1);
         self.book_cache_ready = true;
         self.book_cache_partial = partial;
-        self.book_section_count = sections.len().min(self.book_sections.len());
+        let count = sections.len().min(self.book_sections.len());
+        // `chapter_start` runs parallel to `book_sections`; a rebuilt or
+        // regrown section table (same book, same layout token) can slot
+        // sections differently, so its marks must be re-derived. The index
+        // also reloads unchanged on every section crossing, so only an actual
+        // change may invalidate -- otherwise every crossing would re-read the
+        // whole TOC from SD.
+        if count != self.book_section_count
+            || sections[..count]
+                .iter()
+                .zip(self.book_sections.iter())
+                .any(|(new, old)| new != old)
+        {
+            self.chapter_start_ready = false;
+        }
+        self.book_section_count = count;
         for (index, record) in sections.iter().take(self.book_section_count).enumerate() {
             self.book_sections[index] = *record;
         }
