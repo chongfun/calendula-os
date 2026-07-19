@@ -206,7 +206,14 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             continue;
         }
 
-        let percent = stable_percent(&mut reported_percent, raw_percent);
+        // Invalid samples are the X3 boot placeholder (flat 100%); keep them
+        // out of the hysteresis state so a first real reading of 99% is not
+        // held at 100% as noise against the placeholder.
+        let percent = if battery_valid {
+            stable_percent(&mut reported_percent, raw_percent)
+        } else {
+            raw_percent
+        };
 
         // The app boots with a placeholder 100% battery and only learns the
         // real charge from a Sample, which otherwise rides on a button press.
