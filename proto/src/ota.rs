@@ -76,6 +76,9 @@ pub enum PartitionTableError {
     BadEntry,
     DuplicateOtaData,
     DuplicateOtaSlot(u8),
+    /// The table defines `ota_2` or beyond; the two-slot updater's sequence
+    /// math would disagree with the bootloader's modulo-N slot selection.
+    UnsupportedOtaSlot(u8),
     MissingOtaData,
     MissingOtaSlot(u8),
     InvalidBounds,
@@ -89,6 +92,8 @@ const PARTITION_TYPE_APP: u8 = 0x00;
 const PARTITION_TYPE_DATA: u8 = 0x01;
 const PARTITION_SUBTYPE_DATA_OTA: u8 = 0x00;
 const PARTITION_SUBTYPE_APP_OTA_0: u8 = 0x10;
+// ESP-IDF defines app subtypes ota_0 (0x10) through ota_15 (0x1F).
+const PARTITION_SUBTYPE_APP_OTA_15: u8 = 0x1F;
 
 /// Discover the actual OTA locations from an ESP-IDF partition table.
 ///
@@ -135,6 +140,17 @@ pub fn parse_ota_layout(table: &[u8], flash_size: u32) -> Result<OtaLayout, Part
                 if slots[slot].replace(partition).is_some() {
                     return Err(PartitionTableError::DuplicateOtaSlot(slot as u8));
                 }
+            }
+            // Fail closed on ota_2..=ota_15: the bootloader selects the active
+            // slot as seq % N over *all* OTA partitions, so treating a valid
+            // N>2 table as two-slot could erase the running partition.
+            (PARTITION_TYPE_APP, subtype)
+                if (PARTITION_SUBTYPE_APP_OTA_0..=PARTITION_SUBTYPE_APP_OTA_15)
+                    .contains(&subtype) =>
+            {
+                return Err(PartitionTableError::UnsupportedOtaSlot(
+                    subtype - PARTITION_SUBTYPE_APP_OTA_0,
+                ));
             }
             _ => {}
         }
@@ -627,6 +643,23 @@ mod tests {
         assert_eq!(destination, 1);
         assert_eq!(layout.slots[destination as usize].offset, 0x780000);
         assert_eq!((switch.entry.ota_seq - 1) % 2, destination);
+    }
+
+    #[test]
+    fn rejects_tables_with_more_than_two_ota_slots() {
+        let mut table = partition_table(0x650000, 0x640000);
+        let terminator = table.split_off(table.len() - 32);
+        table.extend_from_slice(&partition_entry(
+            PARTITION_TYPE_APP,
+            PARTITION_SUBTYPE_APP_OTA_0 + 2,
+            0xC90000,
+            0x100000,
+        ));
+        table.extend_from_slice(&terminator);
+        assert_eq!(
+            parse_ota_layout(&table, 0x1000000),
+            Err(PartitionTableError::UnsupportedOtaSlot(2))
+        );
     }
 
     #[test]

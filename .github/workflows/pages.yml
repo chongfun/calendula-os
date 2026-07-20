@@ -62,6 +62,12 @@ jobs:
               --pattern update.bin --pattern update-x3.bin \
               --pattern FWUPDX3.BIN --dir _site
           fi
+          # Patterns are alternatives: the download succeeds even when one
+          # matches nothing. Every same-origin download link on the page must
+          # exist, or the deploy would publish a 404 install path.
+          for asset in firmware-x4.bin firmware-x3.bin update.bin update-x3.bin; do
+            test -f "_site/$asset" || { echo "missing release asset: $asset" >&2; exit 1; }
+          done
           tools/verify_web_flasher.sh _site
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
