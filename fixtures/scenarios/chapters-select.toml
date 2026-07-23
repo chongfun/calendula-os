@@ -1,3 +1,9 @@
+# Confirm from Home opens the book. Reading in the boot portrait is
+# full-bleed, so the first Confirm there summons the key sheet and the second
+# acts on the Chapters label it revealed.
+[[steps]]
+button = "Confirm"
+
 [[steps]]
 button = "Confirm"
 

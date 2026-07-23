@@ -1250,7 +1250,11 @@ impl ReaderState {
             selection: 0,
             chapter: 0,
             book_id: 1,
-            orientation: DisplayOrientation::LandscapeButtonsBottom,
+            // Calendula boots into the portrait hold. It is the same
+            // `PortraitButtonsLeft` the settings cycle offers, not the
+            // format-only buttons-above variant, so the first Change press
+            // leaves for landscape and the cycle can return here.
+            orientation: DisplayOrientation::PortraitButtonsLeft,
             front_buttons: FrontButtons::PagesRight,
             refresh_policy: RefreshPolicy::FullOnWake,
             font_size: FontSize::Medium,
@@ -2713,6 +2717,9 @@ mod tests {
     #[test]
     fn chapter_selection_changes_reading_chapter() {
         let mut state = ReaderState::boot();
+        // Chapter grammar, not orientation: landscape so Confirm acts at
+        // once instead of first summoning the portrait key sheet.
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
         state.view = AppView::Reading;
         state.book_id = 1;
         let state = press(state, Button::Confirm);
@@ -2725,6 +2732,9 @@ mod tests {
     #[test]
     fn sd_chapter_selection_uses_toc_page_target() {
         let mut state = ReaderState::boot();
+        // Chapter grammar, not orientation: landscape so Confirm acts at
+        // once instead of first summoning the portrait key sheet.
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
         state.view = AppView::Reading;
         state.book_id = ReaderSource::sd(0).book_id();
         state.sd_page_count = 40;
@@ -2952,6 +2962,9 @@ mod tests {
     fn pages_left_swaps_the_front_pairs_whole() {
         let mut state = ReaderState::boot();
         state.front_buttons = FrontButtons::PagesLeft;
+        // The swap is the subject: landscape keeps every press direct, so a
+        // summoned portrait key sheet cannot absorb the first one.
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
         state.view = AppView::Reading;
 
         // Reading: the physical back/confirm pair now turns pages (order
@@ -2987,22 +3000,22 @@ mod tests {
         let mut state = press(ReaderState::boot(), Button::Next);
         state.selection = 5;
 
-        let state = press(state, Button::Confirm);
-        assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
-
-        // Rotated 180 degrees, the physical Previous key sits where Confirm
-        // was, so it carries the change action.
-        let state = press(state, Button::Previous);
-        assert_eq!(state.orientation, DisplayOrientation::PortraitButtonsLeft);
-
-        // Portrait keeps the front column's order: Confirm stays Confirm,
-        // and the cycle wraps back to the default hold (skipping the
-        // unoffered buttons-above portrait).
+        // Portrait is the boot hold and keeps the front column's order, so
+        // Confirm stays Confirm and the first change leaves for landscape.
         let state = press(state, Button::Confirm);
         assert_eq!(
             state.orientation,
             DisplayOrientation::LandscapeButtonsBottom
         );
+
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
+
+        // Rotated 180 degrees, the physical Previous key sits where Confirm
+        // was, so it carries the change action. The cycle wraps back to the
+        // boot hold, skipping the unoffered buttons-above portrait.
+        let state = press(state, Button::Previous);
+        assert_eq!(state.orientation, DisplayOrientation::PortraitButtonsLeft);
     }
 
     #[test]
@@ -3070,7 +3083,9 @@ mod tests {
 
     #[test]
     fn landscape_reading_keeps_direct_key_mappings() {
-        let state = press(ReaderState::boot(), Button::Confirm);
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        let state = press(state, Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
 
         // No sheet in landscape: Confirm opens Chapters on the first press.

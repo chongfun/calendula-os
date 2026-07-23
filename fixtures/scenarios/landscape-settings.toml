@@ -1,0 +1,30 @@
+# Cycle the orientation row out of the boot portrait: one Change lands
+# buttons-below landscape. The Settings screen re-lays itself out with the
+# key rail along the left bezel.
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Settings"
+selection = 5
+orientation = "landscape-bottom"
+last_refresh = "FastClean"
