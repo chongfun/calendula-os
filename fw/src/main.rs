@@ -81,14 +81,12 @@ use esp_hal::analog::adc::{
 };
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-#[cfg(not(feature = "device-x3"))]
 use esp_hal::interrupt::Priority;
 use esp_hal::peripherals::ADC1;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_rtos::embassy::Executor;
-#[cfg(not(feature = "device-x3"))]
 use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
 use tasks::input::InputPins;
@@ -163,7 +161,6 @@ pub static UPLOAD_STOPPED: Channel<CriticalSectionRawMutex, (), 1> = Channel::ne
 pub static UPLOAD_INTERRUPTS: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-#[cfg(not(feature = "device-x3"))]
 static INPUT_EXECUTOR: StaticCell<InterruptExecutor<1>> = StaticCell::new();
 
 type BoardAdc = ADC1<'static>;
@@ -308,11 +305,13 @@ fn main() -> ! {
     .into_async();
     let epd_bus = hal_ext::spi_dma::EpdBus::new(epd_spi, epd_cs, epd_dc, epd_busy, epd_rst);
 
-    // Input polls from an interrupt-priority executor so button sampling
-    // keeps running while the thread executor blocks on SD/EPUB work; a
-    // cold cache build no longer deafens the buttons. Channels between the
-    // tasks already use CriticalSectionRawMutex, so handoff is unchanged.
-    #[cfg(not(feature = "device-x3"))]
+    // Input polls from an interrupt-priority executor on both boards, so
+    // button sampling keeps running while the thread executor blocks on
+    // SD/EPUB work; a cold cache build no longer deafens the buttons.
+    // Channels between the tasks already use CriticalSectionRawMutex, so
+    // handoff is unchanged. The X3's fuel gauge no longer rides in this
+    // loop: its clock-stretched I2C reads have no place at interrupt
+    // priority, so a thread-executor task below samples it instead.
     {
         let input_executor =
             INPUT_EXECUTOR.init(InterruptExecutor::new(sw_ints.software_interrupt1));
@@ -323,6 +322,7 @@ fn main() -> ! {
                 adc1,
                 InputPins {
                     power: Some(power_button),
+                    #[cfg(not(feature = "device-x3"))]
                     aux_pin: aux_adc,
                     nav_pin: nav_adc,
                     page_pin: page_adc,
@@ -336,19 +336,8 @@ fn main() -> ! {
     executor.run(|spawner: Spawner| {
         #[cfg(feature = "device-x3")]
         {
-            esp_println::println!("main: spawn input");
-            spawner.spawn(
-                tasks::input::run(
-                    adc1,
-                    InputPins {
-                        power: Some(power_button),
-                        nav_pin: nav_adc,
-                        page_pin: page_adc,
-                        gauge: battery_gauge,
-                    },
-                )
-                .unwrap(),
-            );
+            esp_println::println!("main: spawn battery");
+            spawner.spawn(tasks::input::battery_run(battery_gauge).unwrap());
         }
         esp_println::println!("main: spawn display");
         spawner.spawn(tasks::display::run(epd_bus, sd_cs, deep_sleep_wake).unwrap());
