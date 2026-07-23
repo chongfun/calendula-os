@@ -34,6 +34,40 @@ pub fn style_from_marker_code(code: char) -> Option<FontStyle> {
     }
 }
 
+/// Cursor over cached styled text: yields every character paired with the
+/// style in effect for it, consuming [`STYLE_MARKER`] escapes on the way.
+/// A marker at the very end, with no code digit behind it, is dropped.
+#[derive(Clone, Debug)]
+pub struct StyledChars<'a> {
+    chars: core::str::Chars<'a>,
+    style: FontStyle,
+}
+
+impl<'a> StyledChars<'a> {
+    pub fn new(text: &'a str, default_style: FontStyle) -> Self {
+        Self {
+            chars: text.chars(),
+            style: default_style,
+        }
+    }
+}
+
+impl Iterator for StyledChars<'_> {
+    type Item = (FontStyle, char);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(ch) = self.chars.next() {
+            if ch != STYLE_MARKER {
+                return Some((self.style, ch));
+            }
+            if let Some(code) = self.chars.next() {
+                self.style = style_from_marker_code(code).unwrap_or(self.style);
+            }
+        }
+        None
+    }
+}
+
 /// Per-glyph bitmap location and layout. Field widths match the SD
 /// font-pack metric record (`proto::font_pack::FONT_PACK_METRIC_BYTES`):
 /// 12 bytes instead of the padded 16 that `usize` offsets cost, which
@@ -479,4 +513,45 @@ pub fn fixed_round(value_fp: i32) -> i16 {
 #[inline]
 pub fn fixed_ceil(value_fp: i32) -> i16 {
     ((value_fp + 15) >> 4) as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the styled text the reader cache stores: a marker plus its
+    /// code digit switches the style for everything that follows.
+    fn styled(parts: &[(&str, FontStyle)]) -> String {
+        let mut out = String::new();
+        for (text, style) in parts {
+            out.push(STYLE_MARKER);
+            out.push(style_marker_code(*style));
+            out.push_str(text);
+        }
+        out
+    }
+
+    #[test]
+    fn styled_chars_carries_the_style_in_effect() {
+        let text = styled(&[("ab", FontStyle::Regular), ("c", FontStyle::Italic)]);
+        let seen: Vec<(FontStyle, char)> = StyledChars::new(&text, FontStyle::Bold).collect();
+
+        assert_eq!(
+            seen,
+            [
+                (FontStyle::Regular, 'a'),
+                (FontStyle::Regular, 'b'),
+                (FontStyle::Italic, 'c'),
+            ]
+        );
+    }
+
+    #[test]
+    fn styled_chars_drops_a_dangling_marker() {
+        let mut text = String::from("ab");
+        text.push(STYLE_MARKER);
+        let seen: Vec<(FontStyle, char)> = StyledChars::new(&text, FontStyle::Regular).collect();
+
+        assert_eq!(seen, [(FontStyle::Regular, 'a'), (FontStyle::Regular, 'b')]);
+    }
 }

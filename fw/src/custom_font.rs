@@ -1,3 +1,12 @@
+//! The custom font pack as the firmware reaches it: the SD-card side of
+//! [`ui::custom_font`], plus glyph drawing.
+//!
+//! Every decision about *when* the card is worth touching lives in
+//! `ui::custom_font`, behind [`PackSource`] and [`PackReader`], where host
+//! tests can count the opens. This module is the implementation of those
+//! two traits over `embedded_sdmmc`, and the drawing that reads the glyph
+//! bitmaps they point at.
+
 use crate::reader_store::ReaderStore;
 use display::fb::Framebuffer;
 use display::font::{
@@ -6,122 +15,129 @@ use display::font::{
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use proto::cache::PageRecord;
 use proto::font_pack::{
-    font_pack_codepoint_index, FontPackFaceRecord, FONT_PACK_DIR, FONT_PACK_FACE_BOLD,
-    FONT_PACK_FACE_BOLD_ITALIC, FONT_PACK_FACE_ITALIC, FONT_PACK_FACE_REGULAR, FONT_PACK_FILE,
-    FONT_PACK_METRIC_BYTES, FONT_PACK_SIZE_LARGE, FONT_PACK_SIZE_MEDIUM, FONT_PACK_SIZE_SMALL,
+    FontPackFaceRecord, FONT_PACK_DIR, FONT_PACK_FACE_BOLD, FONT_PACK_FACE_BOLD_ITALIC,
+    FONT_PACK_FACE_ITALIC, FONT_PACK_FACE_REGULAR, FONT_PACK_FILE, FONT_PACK_SIZE_LARGE,
+    FONT_PACK_SIZE_MEDIUM, FONT_PACK_SIZE_SMALL,
 };
 use proto::text::TextAlign;
+use ui::custom_font::{MetricRecord, PackReader, PackSource};
+
+/// The metric cache is pure RAM bookkeeping, so it lives with the
+/// measurement logic in `ui`; firmware keeps the name it has always used.
+pub(crate) use ui::custom_font::MetricCache;
 
 const MAX_ROW_BYTES: usize = 32;
+/// Whole-glyph read ceiling for the draw path: 32 row bytes x 256 rows is
+/// far past any real glyph; in practice the largest size's glyphs stay
+/// well under this, and an oversized claim falls back to not drawing.
+const MAX_GLYPH_BYTES: usize = 512;
 
-/// Printable ASCII is the first codepoint range of the pack
-/// (`font_pack_codepoint_index(0x20) == 0`), so a face's ASCII metrics are
-/// one contiguous run at the start of its metric table.
-const ASCII_METRIC_COUNT: usize = 95;
-const ASCII_FIRST: u16 = 0x20;
-const ASCII_LAST: u16 = 0x7E;
-/// Regular/Italic/Bold/BoldItalic of the active size all stay resident.
-const METRIC_CACHE_SLOTS: usize = 4;
-
-/// RAM cache of the printable-ASCII metric rows for custom font faces.
-///
-/// Line measurement during a cold book build calls into the pack once per
-/// character of the whole book; without this cache each call was a
-/// directory walk, a file open, a seek, and a 12-byte read. A slot fills
-/// once per face from an open pack file and then serves the overwhelming
-/// majority of characters from RAM; non-ASCII falls through to the
-/// per-char read path. Slots are keyed by pack identity plus the face's
-/// metric-table offset (unique per size and style within a pack), so a
-/// changed pack or size misses and refills naturally.
-pub(crate) struct MetricCache {
-    slots: [MetricSlot; METRIC_CACHE_SLOTS],
-    next_evict: usize,
+/// The font pack on the SD card. Opening it is a directory walk plus a
+/// file open, which is exactly the cost `ui::custom_font` schedules; this
+/// type touches nothing until [`PackSource::with_reader`] is called.
+struct SdFontPack<
+    'a,
+    'volume,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+> where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    root: &'a Directory<'volume, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
 }
 
-#[derive(Clone, Copy)]
-struct MetricSlot {
-    key: Option<(u64, u32)>,
-    records: [[u8; FONT_PACK_METRIC_BYTES]; ASCII_METRIC_COUNT],
-}
-
-const EMPTY_METRIC_SLOT: MetricSlot = MetricSlot {
-    key: None,
-    records: [[0u8; FONT_PACK_METRIC_BYTES]; ASCII_METRIC_COUNT],
-};
-
-impl MetricCache {
-    pub(crate) const fn new() -> Self {
-        Self {
-            slots: [EMPTY_METRIC_SLOT; METRIC_CACHE_SLOTS],
-            next_evict: 0,
-        }
-    }
-
-    fn ascii_index(ch: char) -> Option<usize> {
-        let code = ch as u32;
-        (code >= ASCII_FIRST as u32 && code <= ASCII_LAST as u32)
-            .then(|| (code - ASCII_FIRST as u32) as usize)
-    }
-
-    /// Serve a cached ASCII metric without touching the card. `None` means
-    /// the caller must open the pack: non-ASCII char or unfilled face.
-    fn lookup(&self, identity: u64, face: FontPackFaceRecord, ch: char) -> Option<GlyphMetric> {
-        let index = Self::ascii_index(ch)?;
-        let key = (identity, face.metrics_offset);
-        self.slots
-            .iter()
-            .find(|slot| slot.key == Some(key))
-            .map(|slot| decode_metric(&slot.records[index]))
-    }
-
-    /// Fill the face's slot from an open pack file (one sequential sweep of
-    /// its ASCII run), then serve the char. Non-ASCII and packs without the
-    /// full ASCII range fall back to the per-char read.
-    fn fill_and_lookup<
-        D,
-        T,
-        const MAX_DIRS: usize,
-        const MAX_FILES: usize,
-        const MAX_VOLUMES: usize,
-    >(
-        &mut self,
-        file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-        identity: u64,
-        face: FontPackFaceRecord,
-        ch: char,
-    ) -> Option<GlyphMetric>
-    where
-        D: embedded_sdmmc::BlockDevice,
-        T: TimeSource,
-    {
-        let Some(index) = Self::ascii_index(ch) else {
-            return metric_for_char(file, face, ch);
+impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize> PackSource
+    for SdFontPack<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    fn with_reader(&self, read: &mut dyn FnMut(&mut dyn PackReader)) -> bool {
+        let Ok(xteink) = self.root.open_dir(proto::cache::CACHE_ROOT_DIR) else {
+            return false;
         };
-        let key = (identity, face.metrics_offset);
-        if let Some(slot) = self.slots.iter().find(|slot| slot.key == Some(key)) {
-            return Some(decode_metric(&slot.records[index]));
-        }
-        if (face.metric_count as usize) < ASCII_METRIC_COUNT {
-            return metric_for_char(file, face, ch);
-        }
-        let slot_index = self
-            .slots
-            .iter()
-            .position(|slot| slot.key.is_none())
-            .unwrap_or_else(|| {
-                let evict = self.next_evict;
-                self.next_evict = (self.next_evict + 1) % METRIC_CACHE_SLOTS;
-                evict
-            });
-        let slot = &mut self.slots[slot_index];
-        slot.key = None;
-        file.seek_from_start(face.metrics_offset).ok()?;
-        for record in slot.records.iter_mut() {
-            read_full(file, record)?;
-        }
-        slot.key = Some(key);
-        Some(decode_metric(&slot.records[index]))
+        let Ok(fonts) = xteink.open_dir(FONT_PACK_DIR) else {
+            return false;
+        };
+        let Ok(file) = fonts.open_file_in_dir(FONT_PACK_FILE, Mode::ReadOnly) else {
+            return false;
+        };
+        read(&mut FilePackReader { file: &file });
+        true
     }
+}
+
+/// Metric reads from an open pack file.
+struct FilePackReader<
+    'a,
+    'volume,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+> where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    file: &'a File<'volume, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+}
+
+impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize> PackReader
+    for FilePackReader<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    fn read_records(&mut self, offset: u32, records: &mut [MetricRecord]) -> Option<()> {
+        // One seek for the whole run: metric records are contiguous.
+        self.file.seek_from_start(offset).ok()?;
+        for record in records.iter_mut() {
+            read_full(self.file, record)?;
+        }
+        Some(())
+    }
+}
+
+/// Measure a whole styled text run. Face selection is the only part the
+/// firmware owns; the cache-first, open-once-on-miss policy is
+/// [`ui::custom_font::for_each_metric`].
+// One argument over the limit: the run parameters (size/weight/style) are
+// deliberately separate so the caller's cursor state stays the only owner
+// of layout context; bundling them would just invent a one-use struct.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn for_each_metric<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    source: &ReaderStore,
+    cache: &mut MetricCache,
+    size: FontSize,
+    weight: FontWeight,
+    default_style: FontStyle,
+    text: &str,
+    visit: impl FnMut(FontStyle, Option<GlyphMetric>),
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    ui::custom_font::for_each_metric(
+        &SdFontPack { root },
+        cache,
+        source.custom_font_identity(),
+        |style| custom_face(source, size, weight, style),
+        text,
+        default_style,
+        visit,
+    );
 }
 
 pub(crate) fn draw_reading_page_body<
@@ -192,40 +208,6 @@ where
         true
     });
     ok
-}
-
-pub(crate) fn measure_char<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    source: &ReaderStore,
-    cache: &mut MetricCache,
-    size: FontSize,
-    weight: FontWeight,
-    style: FontStyle,
-    ch: char,
-) -> Option<GlyphMetric>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let face = custom_face(source, size, weight, style)?;
-    let identity = source.custom_font_identity();
-    if let Some(metric) = cache.lookup(identity, face, ch) {
-        return Some(metric);
-    }
-    // Cache miss (unfilled face or non-ASCII): open the pack once for this
-    // char; an ASCII miss fills the face's whole slot while it's open.
-    let xteink = root.open_dir(proto::cache::CACHE_ROOT_DIR).ok()?;
-    let fonts = xteink.open_dir(FONT_PACK_DIR).ok()?;
-    let file = fonts
-        .open_file_in_dir(FONT_PACK_FILE, Mode::ReadOnly)
-        .ok()?;
-    cache.fill_and_lookup(&file, identity, face, ch)
 }
 
 struct CustomFontFile<
@@ -366,7 +348,10 @@ where
         if let Some(metric) = self.cache.lookup(identity, face, ch) {
             return Some(metric);
         }
-        self.cache.fill_and_lookup(self.file, identity, face, ch)
+        // The pack is already open for drawing, so a miss here costs a read
+        // rather than the open `for_each_metric` schedules.
+        self.cache
+            .fill_and_lookup(&mut FilePackReader { file: self.file }, identity, face, ch)
     }
 
     fn draw_glyph_bitmap(
@@ -383,14 +368,19 @@ where
         }
         let glyph_x = x + metric.x_offset as i16;
         let glyph_y = baseline_y + metric.y_offset as i16;
-        let mut row = [0u8; MAX_ROW_BYTES];
+        // One seek + one read for the whole bitmap instead of a
+        // seek/read per row: on-card glyph rows are contiguous, and the
+        // per-row cycle dominated glyph drawing on multi-row glyphs.
+        let glyph_len = row_bytes.checked_mul(metric.height as usize)?;
+        if glyph_len > MAX_GLYPH_BYTES || glyph_len > metric.len as usize {
+            return None;
+        }
+        let offset = face.bitmap_offset.checked_add(metric.offset)?;
+        self.file.seek_from_start(offset).ok()?;
+        let mut bitmap = [0u8; MAX_GLYPH_BYTES];
+        read_full(self.file, &mut bitmap[..glyph_len])?;
         for y in 0..metric.height as usize {
-            let offset = face
-                .bitmap_offset
-                .checked_add(metric.offset)?
-                .checked_add((y * row_bytes) as u32)?;
-            self.file.seek_from_start(offset).ok()?;
-            read_full(self.file, &mut row[..row_bytes])?;
+            let row = &bitmap[y * row_bytes..(y + 1) * row_bytes];
             for (x_byte, &byte) in row.iter().enumerate().take(row_bytes) {
                 if byte == 0 {
                     continue;
@@ -436,57 +426,6 @@ fn custom_face(
         }
     };
     source.custom_font_face(size_px, style)
-}
-
-fn metric_for_char<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
-    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    face: FontPackFaceRecord,
-    ch: char,
-) -> Option<GlyphMetric>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let codepoint = if ch as u32 > u16::MAX as u32 {
-        b'?' as u16
-    } else {
-        ch as u16
-    };
-    metric(file, face, codepoint).or_else(|| metric(file, face, b'?' as u16))
-}
-
-fn metric<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
-    file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    face: FontPackFaceRecord,
-    codepoint: u16,
-) -> Option<GlyphMetric>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let index = font_pack_codepoint_index(codepoint)?;
-    if index >= face.metric_count as usize {
-        return None;
-    }
-    let offset = face
-        .metrics_offset
-        .checked_add((index * FONT_PACK_METRIC_BYTES) as u32)?;
-    let mut bytes = [0u8; FONT_PACK_METRIC_BYTES];
-    file.seek_from_start(offset).ok()?;
-    read_full(file, &mut bytes)?;
-    Some(decode_metric(&bytes))
-}
-
-fn decode_metric(bytes: &[u8; FONT_PACK_METRIC_BYTES]) -> GlyphMetric {
-    GlyphMetric {
-        offset: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        len: u16::from_le_bytes([bytes[4], bytes[5]]),
-        width: bytes[6],
-        height: bytes[7],
-        x_offset: bytes[8] as i8,
-        y_offset: bytes[9] as i8,
-        advance_fp: u16::from_le_bytes([bytes[10], bytes[11]]),
-    }
 }
 
 fn read_full<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
