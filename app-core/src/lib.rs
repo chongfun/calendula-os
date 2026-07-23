@@ -4,6 +4,9 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
+/// The storage/display task's command loop, as sequences a host test can drive.
+pub mod storage_loop;
+
 pub const SETTINGS_ITEMS: u8 = 7;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
