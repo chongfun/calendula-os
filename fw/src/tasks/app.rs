@@ -5,29 +5,14 @@ use crate::{
     SYNC_EVENTS,
 };
 use app_core::{
-    extend_section_command, storage_command_for_transition, AppView, BookOpenRollback, ReaderState,
-    ReducerContext, SyncStatus,
+    extend_section_command, storage_command_for_transition, AppView, BookOpenRollback,
+    ParkedStorage, ReaderState, ReducerContext, StorageDispatch, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select4, Either4};
 use embassy_time::{Duration, Instant};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
-
-/// Storage commands the channel could not take yet, in arrival order.
-///
-/// Two slots is what a single input transition can produce: one navigation
-/// command (open, extend, chapter list, jump) and one deferred write —
-/// progress or a credentials forget, never both, since a transition that
-/// moves the saved position is not the Wireless-screen confirm.
-///
-/// Nothing parked here is irreplaceable. The departing book's position, which
-/// used to travel as its own command and could be separated from the open it
-/// belonged to, now rides inside that open; what is left is a progress record
-/// the next page turn reissues. The slots exist to smooth a momentarily full
-/// channel, not to guarantee delivery.
-const PARKED_STORAGE_SLOTS: usize = 2;
-type ParkedStorage = heapless::Vec<StorageCommand, PARKED_STORAGE_SLOTS>;
 
 #[embassy_executor::task]
 pub async fn run() {
@@ -129,7 +114,6 @@ pub async fn run() {
                 // immediately gets that view's idle leash (e.g. opening a
                 // book starts the long Reading timeout right away).
                 let _ = POWER_EVENTS.try_send(PowerEvent::Activity(state.view));
-                let next_persisted = state.persisted();
                 if previous.type_settings() != state.type_settings()
                     || app_core::is_portrait(previous.orientation)
                         != app_core::is_portrait(state.orientation)
@@ -151,12 +135,6 @@ pub async fn run() {
                         storage_command = Some(extend_section_command(&state, index, request_id));
                     }
                 }
-                if storage_command.is_some() {
-                    // Open/extend commands carry the current type settings,
-                    // so any dispatched command syncs the reader store.
-                    reader_relayout_pending = false;
-                    commit_reader_request_id(request_id);
-                }
                 // A book change closes out the departing book inside its own
                 // open. The separate progress record that used to follow named
                 // the *new* book, so it wrote that book's position file at the
@@ -176,21 +154,49 @@ pub async fn run() {
                 // truly in flight -- a queued command relies on the render's
                 // Settled to be drained, so it must still render.
                 let mut awaiting_chapter_list = false;
+                let mut switch_dispatched = false;
                 if let Some(command) = storage_command {
-                    if let Some(book_id) = open_book_id(command) {
-                        opening_book = Some(book_id);
-                        suppress_input_until_open_settled = true;
-                        // Only a switch can abort, and only a switch has a
-                        // book to go back to.
-                        open_rollback = open_owns_the_switch.then(|| previous.open_rollback());
-                    }
-                    if dispatch_storage(&mut pending_storage, command)
-                        && matches!(command, StorageCommand::LoadChapters { .. })
-                    {
-                        awaiting_chapter_list = true;
+                    match dispatch_storage(&mut pending_storage, command) {
+                        StorageDispatch::Rejected => {
+                            // Nothing reached the storage task, so nothing is
+                            // coming back. Arming the open lock here would wait
+                            // on a Loaded that cannot arrive and ignore every
+                            // button until the battery is pulled; put the reader
+                            // back on the book it never actually left instead.
+                            // The render below then redraws that book.
+                            if open_book_id(command).is_some() {
+                                state = state.restore_after_failed_open(previous.open_rollback());
+                            }
+                        }
+                        outcome => {
+                            // Open/extend commands carry the current type
+                            // settings, so any dispatched command syncs the
+                            // reader store.
+                            reader_relayout_pending = false;
+                            commit_reader_request_id(request_id);
+                            switch_dispatched = open_owns_the_switch;
+                            if let Some(book_id) = open_book_id(command) {
+                                opening_book = Some(book_id);
+                                suppress_input_until_open_settled = true;
+                                // Only a switch can abort, and only a switch
+                                // has a book to go back to.
+                                open_rollback =
+                                    open_owns_the_switch.then(|| previous.open_rollback());
+                            }
+                            if outcome == StorageDispatch::Sent
+                                && matches!(command, StorageCommand::LoadChapters { .. })
+                            {
+                                awaiting_chapter_list = true;
+                            }
+                        }
                     }
                 }
-                if previous_persisted != next_persisted && !open_owns_the_switch {
+                // Read back after the dispatch: a rejected open has rolled the
+                // state to where it started, which leaves nothing to persist
+                // and no risk of writing the arriving book's position for a
+                // switch that never happened.
+                let next_persisted = state.persisted();
+                if previous_persisted != next_persisted && !switch_dispatched {
                     dispatch_storage(
                         &mut pending_storage,
                         StorageCommand::StoreProgress(next_persisted),
@@ -458,24 +464,19 @@ fn library_event_allows_first_render(event: &crate::LibraryEvent) -> bool {
     )
 }
 
-/// Sends `command`, or parks it behind whatever is already waiting.
-///
-/// Nothing may overtake a parked command. The storage task applies commands
-/// in arrival order, so a progress record that slipped past a parked open
-/// would land after the new book was opened and point the global state file
-/// back at the book the reader had just left.
-///
-/// Returns whether the command reached the channel.
-fn dispatch_storage(parked: &mut ParkedStorage, command: StorageCommand) -> bool {
-    if parked.is_empty() && STORAGE_COMMANDS.try_send(command).is_ok() {
-        log_storage_command("send", command);
-        return true;
+/// Sends `command`, parks it behind whatever is already waiting, or reports
+/// that it could do neither. See [`ParkedStorage`] for why an open is never
+/// the thing that gets dropped.
+fn dispatch_storage(parked: &mut ParkedStorage, command: StorageCommand) -> StorageDispatch {
+    let outcome = parked.dispatch(command, |command| {
+        STORAGE_COMMANDS.try_send(command).is_ok()
+    });
+    match outcome {
+        StorageDispatch::Sent => log_storage_command("send", command),
+        StorageDispatch::Parked => log_storage_command("queue", command),
+        StorageDispatch::Rejected => log_storage_command("rejected", command),
     }
-    match parked.push(command) {
-        Ok(()) => log_storage_command("queue", command),
-        Err(_) => log_storage_command("dropped", command),
-    }
-    false
+    outcome
 }
 
 /// Hands every parked command to the storage task in arrival order, blocking
@@ -485,8 +486,7 @@ async fn drain_parked_storage(
     opening_book: &mut Option<u32>,
     suppress_input_until_open_settled: &mut bool,
 ) {
-    while !parked.is_empty() {
-        let command = parked.remove(0);
+    while let Some(command) = parked.pop_front() {
         log_storage_command("send", command);
         if let Some(book_id) = open_book_id(command) {
             *opening_book = Some(book_id);

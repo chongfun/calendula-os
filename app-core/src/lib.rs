@@ -401,6 +401,141 @@ pub enum StorageCommand {
     ReceiveUpload,
 }
 
+/// Slots for storage commands the channel could not take yet.
+///
+/// Two is what a single input transition can produce: one navigation command
+/// (open, extend, chapter list, jump) and one deferred write — progress or a
+/// credentials forget, never both, since a transition that moves the saved
+/// position is not the Wireless-screen confirm.
+pub const PARKED_STORAGE_SLOTS: usize = 2;
+
+/// What became of a storage command handed to [`ParkedStorage::dispatch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageDispatch {
+    /// Straight into the channel.
+    Sent,
+    /// Held for the next drain, behind anything already waiting.
+    Parked,
+    /// Neither, and the caller must cope. Only ever returned for a command
+    /// the queue could not make room for without losing something it is not
+    /// allowed to lose.
+    Rejected,
+}
+
+/// Storage commands the channel could not take yet, in arrival order.
+///
+/// Nothing may overtake what is parked: the storage task applies commands in
+/// the order it receives them, so a progress record that slipped past a parked
+/// open would land after the new book was opened and point the global state
+/// file back at the book the reader had just left.
+///
+/// Most of what parks here is replaceable — a dropped progress record is
+/// reissued by the next page turn. An `OpenBook` is not. It is the only carrier
+/// of the departing book's close-out position, and the app arms an input lock
+/// waiting for the event it will produce, so silently dropping one strands both
+/// the page and the reader. `dispatch` therefore never drops an open: it makes
+/// room, or says so.
+///
+/// RAM: `PARKED_STORAGE_SLOTS` × a 100-byte `Option<StorageCommand>` plus the
+/// length, 204 bytes, in the app task's arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParkedStorage {
+    queue: [Option<StorageCommand>; PARKED_STORAGE_SLOTS],
+    len: usize,
+}
+
+impl Default for ParkedStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ParkedStorage {
+    pub const fn new() -> Self {
+        Self {
+            queue: [None; PARKED_STORAGE_SLOTS],
+            len: 0,
+        }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Sends `command` if nothing is waiting and the channel takes it, parks it
+    /// otherwise, and only reports [`StorageDispatch::Rejected`] when it can do
+    /// neither without dropping something irreplaceable.
+    pub fn dispatch(
+        &mut self,
+        command: StorageCommand,
+        try_send: impl FnOnce(StorageCommand) -> bool,
+    ) -> StorageDispatch {
+        if self.is_empty() && try_send(command) {
+            return StorageDispatch::Sent;
+        }
+        if self.push_back(command) {
+            return StorageDispatch::Parked;
+        }
+        // Full. An open may still displace a write it has already subsumed:
+        // it carries the departing book's position in `previous`, so a parked
+        // `StoreProgress` for that same book is recording something this
+        // command will write anyway.
+        if let Some(slot) = self.subsumed_by(command) {
+            self.remove(slot);
+            let _ = self.push_back(command);
+            return StorageDispatch::Parked;
+        }
+        StorageDispatch::Rejected
+    }
+
+    /// The parked write `command` makes redundant, if any.
+    fn subsumed_by(&self, command: StorageCommand) -> Option<usize> {
+        let StorageCommand::OpenBook {
+            previous: Some(departing),
+            ..
+        } = command
+        else {
+            return None;
+        };
+        self.queue[..self.len].iter().position(|parked| {
+            matches!(
+                parked,
+                Some(StorageCommand::StoreProgress(record)) if record.book_id == departing.book_id
+            )
+        })
+    }
+
+    pub fn push_back(&mut self, command: StorageCommand) -> bool {
+        if self.len == PARKED_STORAGE_SLOTS {
+            return false;
+        }
+        self.queue[self.len] = Some(command);
+        self.len += 1;
+        true
+    }
+
+    pub fn pop_front(&mut self) -> Option<StorageCommand> {
+        let command = self.queue[0].take()?;
+        self.queue.copy_within(1..self.len, 0);
+        self.len -= 1;
+        self.queue[self.len] = None;
+        Some(command)
+    }
+
+    fn remove(&mut self, slot: usize) {
+        if slot >= self.len {
+            return;
+        }
+        self.queue.copy_within(slot + 1..self.len, slot);
+        self.len -= 1;
+        self.queue[self.len] = None;
+    }
+}
+
 /// Where the reader sits before a book-open transaction, so an abort can put
 /// it back. Held by the app task, which is the only place that still knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1852,6 +1987,147 @@ mod tests {
             chapter_pages: [0; MAX_SD_CHAPTERS],
             position,
         }
+    }
+
+    /// A storage channel that is already full, so every send fails and the
+    /// parking slots are the only thing standing between a command and the bin.
+    fn full_channel(_: StorageCommand) -> bool {
+        false
+    }
+
+    fn progress_for(book_index: u16, page: u32) -> StorageCommand {
+        StorageCommand::StoreProgress(reading(book_index, 0, page).persisted())
+    }
+
+    fn open_closing(previous: &ReaderState, next: &ReaderState) -> StorageCommand {
+        storage_command_for_transition(previous, next, 1).expect("a book change owes an open")
+    }
+
+    #[test]
+    fn a_saturated_queue_still_takes_the_open() {
+        // Both slots spoken for: a navigation command and a progress record
+        // for the book being read, which is the state a busy storage task
+        // leaves behind after a page turn against a full channel.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        assert_eq!(
+            parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(progress_for(0, 120), full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(parked.len(), PARKED_STORAGE_SLOTS);
+
+        // Selecting another book must not be the thing that gets dropped: it
+        // carries the departing book's only close-out record, and the app arms
+        // an input lock waiting on the event it produces.
+        let open = open_closing(&reader, &reading(1, 0, 0));
+        assert_eq!(parked.dispatch(open, full_channel), StorageDispatch::Parked);
+
+        // The progress record gave up its slot, not the extend that came first
+        // and not the open. Nothing is lost: the open carries book 0's page.
+        let drained = [parked.pop_front(), parked.pop_front(), parked.pop_front()];
+        assert!(
+            matches!(drained[0], Some(StorageCommand::ExtendSection { .. })),
+            "arrival order must hold, got {:?}",
+            drained[0]
+        );
+        assert_eq!(drained[1], Some(open));
+        assert_eq!(drained[2], None);
+    }
+
+    #[test]
+    fn an_open_with_nothing_to_displace_is_refused_not_dropped() {
+        // Two navigation commands, neither of them redundant. There is no safe
+        // room to make, so the queue has to say so rather than quietly bin the
+        // open and leave the app waiting for an event that cannot come.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        for _ in 0..PARKED_STORAGE_SLOTS {
+            assert_eq!(
+                parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
+                StorageDispatch::Parked
+            );
+        }
+
+        let open = open_closing(&reader, &reading(1, 0, 0));
+        assert_eq!(
+            parked.dispatch(open, full_channel),
+            StorageDispatch::Rejected
+        );
+        assert_eq!(parked.len(), PARKED_STORAGE_SLOTS);
+    }
+
+    #[test]
+    fn a_refused_open_leaves_the_reader_where_it_was() {
+        // What the app task does with a Rejected open: the state has already
+        // moved to the new book, and putting it back is what keeps input alive
+        // instead of locked behind an open that never happened.
+        let before = reading(0, 4, 120);
+        let committed = reading(1, 0, 0);
+        let recovered = committed.restore_after_failed_open(before.open_rollback());
+
+        assert_eq!(recovered.book_id, before.book_id);
+        assert_eq!(recovered.page, 120);
+        // Nothing left to persist, so no progress record names the book the
+        // reader never reached.
+        assert_eq!(recovered.persisted(), before.persisted());
+    }
+
+    #[test]
+    fn a_progress_record_for_another_book_is_never_displaced() {
+        // Only the departing book's own record is subsumed by the open. A
+        // record for any other book is still the only copy of that page.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        assert_eq!(
+            parked.dispatch(progress_for(2, 77), full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
+            StorageDispatch::Parked
+        );
+
+        let open = open_closing(&reader, &reading(1, 0, 0));
+        assert_eq!(
+            parked.dispatch(open, full_channel),
+            StorageDispatch::Rejected
+        );
+        assert_eq!(parked.pop_front(), Some(progress_for(2, 77)));
+    }
+
+    #[test]
+    fn an_empty_queue_sends_straight_through() {
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        assert_eq!(
+            parked.dispatch(extend_section_command(&reader, 0, 1), |_| true),
+            StorageDispatch::Sent
+        );
+        assert!(parked.is_empty());
+    }
+
+    #[test]
+    fn nothing_overtakes_a_parked_command() {
+        // The channel frees up while something is parked. The next command
+        // still queues behind it: the storage task applies what it receives in
+        // order, and a progress record that landed after a later open would
+        // point the global state file back at the book just left.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        let extend = extend_section_command(&reader, 0, 1);
+        assert_eq!(
+            parked.dispatch(extend, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(progress_for(0, 121), |_| true),
+            StorageDispatch::Parked
+        );
+        assert_eq!(parked.pop_front(), Some(extend));
     }
 
     #[test]
