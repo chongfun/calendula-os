@@ -11,7 +11,8 @@ use crate::{
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::storage_loop::{
-    loop_arm, Drained, LoopArm, OpenAction, OpenSequence, SleepAction, SleepRefusal, SleepSequence,
+    loop_arm, Drained, LoopArm, OpenAction, OpenSequence, PanelDown, PanelDownDrain, SleepAction,
+    SleepRefusal, SleepSequence,
 };
 use app_core::{
     book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
@@ -445,6 +446,49 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // it false so that boot falls back to the full waveform.
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
                 if panel_slept {
+                    // The panel is down and deep sleep is imminent, but a
+                    // render can still be queued behind this Sleep -- usually
+                    // one the storage drain above provoked, since applying a
+                    // book open emits Loaded and the app repaints on it.
+                    // Returning to the loop with it queued would re-init the
+                    // panel and paint a page over the sleep image.
+                    //
+                    // The rules are in app-core so they can be driven from a
+                    // host test. Nothing in here awaits, which is what makes
+                    // handing the held sleeps back infallible; the refresh
+                    // acknowledgement is deliberately display-only, since the
+                    // power task ignores DisplayRefreshFailed in both of its
+                    // loops and sending it would mean awaiting.
+                    let mut drain = PanelDownDrain::new(DISPLAY_COMMANDS.capacity());
+                    while drain.wants_more() {
+                        let Ok(queued) = DISPLAY_COMMANDS.try_receive() else {
+                            break;
+                        };
+                        match drain.took(&queued) {
+                            PanelDown::FailRender => {
+                                esp_println::println!(
+                                    "display: render failed; panel already asleep"
+                                );
+                                send_required_display_event(&DisplayEvent::RefreshFailed);
+                            }
+                            PanelDown::HoldSleep => {}
+                        }
+                    }
+                    for held in drain.held_sleeps() {
+                        if DISPLAY_COMMANDS
+                            .try_send(DisplayCommand::Sleep { generation: held })
+                            .is_err()
+                        {
+                            // Unreachable: the slot it came from is still free.
+                            // Logged because the cost of being wrong is a power
+                            // task waiting forever for an acknowledgement only
+                            // the sleep arm can send.
+                            esp_println::println!(
+                                "display: sleep requeue failed generation={}",
+                                held
+                            );
+                        }
+                    }
                     send_required_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
                 } else {

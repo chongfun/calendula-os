@@ -24,7 +24,7 @@
 //! `build_or_load_book_cache` — negligible against that chain's 30-43 KB
 //! region, and none of it is added to the deep frames themselves.
 
-use crate::{PersistedAppState, StorageCommand, SyncSession};
+use crate::{DisplayCommand, PersistedAppState, StorageCommand, SyncSession};
 use display::font::TypeSettings;
 
 /// Which arm of the loop answers a storage command.
@@ -201,6 +201,92 @@ impl SleepSequence {
         } else {
             SleepPhase::Refused(SleepRefusal::ProgressUnwritten)
         };
+    }
+}
+
+/// The display command channel's depth, and so the most sleep requests that can
+/// be waiting behind one another when the panel goes down.
+pub const MAX_HELD_SLEEPS: usize = 4;
+
+/// What the panel-down drain does with one command taken off the display queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelDown {
+    /// A frame that will never reach the panel. Answer it as a refresh that
+    /// failed — which is the truth — rather than discarding it. `RefreshFailed`
+    /// clears the app's render lock and drops its coalesced frame, so a sleep
+    /// later abandoned on a button press repaints from scratch. A silent drop
+    /// would strand that lock instead, and every later input would queue behind
+    /// an acknowledgement that is never coming.
+    FailRender,
+    /// A sleep request this drain must not consume. The power task waits for a
+    /// matching acknowledgement for every `Sleep` it sends, and only the sleep
+    /// arm produces one, so it is held and put back once the drain is done.
+    HoldSleep,
+}
+
+/// What is still queued for a panel that has already gone down.
+///
+/// Deep sleep is imminent here, but the display queue can still hold a render —
+/// most often one the pre-sleep storage drain provoked, since applying a book
+/// open emits `Loaded` and the app repaints on it. Processing that render would
+/// re-init the panel and paint a page over the sleep image, racing the power
+/// task's power cut; whichever wins, the device can end up sleeping on a page.
+///
+/// Nothing here may `await`. That is what makes putting the held sleeps back
+/// infallible: no producer can refill the channel mid-drain, so every slot this
+/// drain frees is still free when it hands one back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PanelDownDrain {
+    taken: usize,
+    budget: usize,
+    held: [u32; MAX_HELD_SLEEPS],
+    held_len: usize,
+}
+
+impl PanelDownDrain {
+    /// `budget` is the display channel's capacity. It is clamped to
+    /// [`MAX_HELD_SLEEPS`], which is that same depth: the drain can never need
+    /// to hold more sleep requests than the channel is able to contain.
+    pub const fn new(budget: usize) -> Self {
+        Self {
+            taken: 0,
+            budget: if budget > MAX_HELD_SLEEPS {
+                MAX_HELD_SLEEPS
+            } else {
+                budget
+            },
+            held: [0; MAX_HELD_SLEEPS],
+            held_len: 0,
+        }
+    }
+
+    /// Whether to take another command off the queue.
+    pub const fn wants_more(&self) -> bool {
+        self.taken < self.budget
+    }
+
+    /// The verdict for one command taken off the queue.
+    pub fn took(&mut self, command: &DisplayCommand) -> PanelDown {
+        self.taken += 1;
+        match *command {
+            DisplayCommand::Sleep { generation } => {
+                if self.held_len < MAX_HELD_SLEEPS {
+                    self.held[self.held_len] = generation;
+                    self.held_len += 1;
+                }
+                PanelDown::HoldSleep
+            }
+            DisplayCommand::Render(_) => PanelDown::FailRender,
+        }
+    }
+
+    /// The sleep generations to put back, in the order they were queued.
+    ///
+    /// The whole queue is drained before any of these go back, so returning
+    /// them to the tail restores their original order rather than reversing it —
+    /// and nothing can have overtaken them, because nothing here awaits.
+    pub fn held_sleeps(&self) -> impl Iterator<Item = u32> + '_ {
+        self.held[..self.held_len].iter().copied()
     }
 }
 
@@ -512,7 +598,10 @@ impl OpenSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{book_open_outcome, BookOpenOutcome, ReaderSource};
+    use crate::{
+        book_open_outcome, AppView, BookOpenOutcome, DisplayOrientation, FrontButtons,
+        ReaderSource, RefreshPolicy, RenderKind, RenderRequest, SyncStatus,
+    };
     use display::font::{FontFamily, FontSize, FontWeight, LineSpacing};
 
     const SETTINGS: TypeSettings = TypeSettings {
@@ -1168,5 +1257,143 @@ mod tests {
             assert_eq!(loop_arm(&command, SyncSession::Idle), LoopArm::Apply);
             assert_eq!(loop_arm(&command, SyncSession::Loaned), LoopArm::Apply);
         }
+    }
+
+    /// The display queue the panel-down drain works against, and what came back
+    /// out of it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct PanelDownResult {
+        failed_renders: usize,
+        left_queued: [Option<u32>; MAX_HELD_SLEEPS],
+        left_len: usize,
+        renders_left: usize,
+    }
+
+    /// Drives the panel-down drain the way the display task does: take until the
+    /// budget or the queue runs out, answer renders, then hand the held sleeps
+    /// back.
+    fn run_panel_down(queued: &[DisplayCommand]) -> PanelDownResult {
+        let mut inbox = queued.iter().copied();
+        let mut drain = PanelDownDrain::new(MAX_HELD_SLEEPS);
+        let mut result = PanelDownResult::default();
+        while drain.wants_more() {
+            let Some(command) = inbox.next() else { break };
+            match drain.took(&command) {
+                PanelDown::FailRender => result.failed_renders += 1,
+                PanelDown::HoldSleep => {}
+            }
+        }
+        for generation in drain.held_sleeps() {
+            result.left_queued[result.left_len] = Some(generation);
+            result.left_len += 1;
+        }
+        // Whatever the budget did not reach stays in the channel for the loop.
+        result.renders_left = inbox
+            .filter(|command| matches!(command, DisplayCommand::Render(_)))
+            .count();
+        result
+    }
+
+    fn render_command() -> DisplayCommand {
+        DisplayCommand::Render(RenderRequest {
+            kind: RenderKind::Page,
+            view: AppView::Reading,
+            page: 12,
+            page_count: 400,
+            chapter: 2,
+            selection: 0,
+            book_id: 3,
+            orientation: DisplayOrientation::LandscapeButtonsBottom,
+            front_buttons: FrontButtons::PagesRight,
+            reading_sheet: false,
+            refresh_policy: RefreshPolicy::FullOnWake,
+            font_size: FontSize::Medium,
+            line_spacing: LineSpacing::Normal,
+            font_weight: FontWeight::Normal,
+            font_family: FontFamily::Literata,
+            last_button: None,
+            aux_raw: 0,
+            nav_raw: 0,
+            page_raw: 0,
+            battery_mv: 0,
+            battery_percent: 100,
+            library_count: 4,
+            sync_status: SyncStatus::NotConfigured,
+            wifi_ssid: [0; 32],
+            wifi_ssid_len: 0,
+            dirty: display::Rect::FULL,
+        })
+    }
+
+    // Regression: applying a drained book open emits Loaded, the app repaints on
+    // it, and that render lands while the sleep frame is still being flushed.
+    // Returning to the loop with it queued repaints a page over the sleep image.
+    #[test]
+    fn a_render_queued_behind_the_sleep_is_answered_not_left_to_repaint() {
+        let result = run_panel_down(&[render_command()]);
+        assert_eq!(result.failed_renders, 1);
+        assert_eq!(result.renders_left, 0);
+    }
+
+    // Answered, not discarded: a dropped render never acknowledges, so a sleep
+    // abandoned on a button press would leave the app's render lock held and
+    // every later input queued behind an acknowledgement that never comes.
+    #[test]
+    fn every_drained_render_gets_an_acknowledgement() {
+        let result = run_panel_down(&[render_command(), render_command(), render_command()]);
+        assert_eq!(result.failed_renders, 3);
+        assert_eq!(result.renders_left, 0);
+    }
+
+    // The power task waits for a matching acknowledgement for every Sleep it
+    // sends, and only the sleep arm produces one, so the drain must not eat one.
+    #[test]
+    fn a_queued_sleep_survives_the_drain() {
+        let result = run_panel_down(&[
+            render_command(),
+            DisplayCommand::Sleep { generation: 9 },
+            render_command(),
+        ]);
+        assert_eq!(result.failed_renders, 2);
+        assert_eq!(result.left_len, 1);
+        assert_eq!(result.left_queued[0], Some(9));
+    }
+
+    #[test]
+    fn held_sleeps_go_back_in_the_order_they_were_queued() {
+        let result = run_panel_down(&[
+            DisplayCommand::Sleep { generation: 7 },
+            render_command(),
+            DisplayCommand::Sleep { generation: 8 },
+        ]);
+        assert_eq!(result.failed_renders, 1);
+        assert_eq!(result.left_len, 2);
+        assert_eq!(result.left_queued[0], Some(7));
+        assert_eq!(result.left_queued[1], Some(8));
+    }
+
+    #[test]
+    fn a_queue_of_nothing_but_sleeps_is_handed_back_whole() {
+        let sleeps: [DisplayCommand; MAX_HELD_SLEEPS] =
+            core::array::from_fn(|slot| DisplayCommand::Sleep {
+                generation: slot as u32,
+            });
+        let result = run_panel_down(&sleeps);
+        assert_eq!(result.failed_renders, 0);
+        assert_eq!(result.left_len, MAX_HELD_SLEEPS);
+        for slot in 0..MAX_HELD_SLEEPS {
+            assert_eq!(result.left_queued[slot], Some(slot as u32));
+        }
+    }
+
+    #[test]
+    fn the_drain_stops_at_the_channels_depth() {
+        let mut queued = [render_command(); MAX_HELD_SLEEPS + 2];
+        queued[MAX_HELD_SLEEPS] = render_command();
+        let result = run_panel_down(&queued);
+        assert_eq!(result.failed_renders, MAX_HELD_SLEEPS);
+        // Bounded like the storage drain: it catches up on what was accepted,
+        // it does not chase a producer. Anything past the depth is the loop's.
+        assert_eq!(result.renders_left, 2);
     }
 }
