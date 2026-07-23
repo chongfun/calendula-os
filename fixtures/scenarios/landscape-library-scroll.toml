@@ -1,7 +1,7 @@
-# The Library in portrait with a catalog far larger than one resident
-# window, scrolled past the taller page's ten visible rows. Pins the
-# portrait row count and the shared scroll math that sizes the firmware's
-# streamed window.
+# The Library in landscape with a catalog far larger than one resident
+# window, scrolled past the wide page's visible rows. Pins the landscape row
+# count and the shared scroll math that sizes the firmware's streamed window;
+# sd-library-large-scroll covers the same math in the boot portrait.
 
 [[steps]]
 button = "Next"
@@ -23,9 +23,6 @@ button = "Next"
 
 [[steps]]
 button = "Confirm"
-
-[[steps]]
-button = "Previous"
 
 [[steps]]
 button = "Back"
@@ -64,6 +61,6 @@ button = "Next"
 
 [expect]
 view = "Library"
-orientation = "portrait-left"
+orientation = "landscape-bottom"
 library_count = 40
 selection = 12
