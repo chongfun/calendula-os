@@ -376,6 +376,46 @@ pub(crate) fn store_app_state(
     .is_some_and(|result| result.is_ok())
 }
 
+#[inline(never)]
+pub(crate) fn store_global_state(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    record: AppStateRecord,
+) -> bool {
+    sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::write_state_file(root, record)
+    })
+    .ok()
+    .is_some_and(|result| result.is_ok())
+}
+
+#[inline(never)]
+pub(crate) fn store_book_position(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    record: AppStateRecord,
+) -> bool {
+    let book_key = app_core::ReaderSource::from_book_id(record.book_id)
+        .sd_index()
+        .and_then(|index| library.catalog_entry(index as usize))
+        .map(|entry| proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size));
+    sd_session::with_root(epd, sd_cs, |root| {
+        if let Some(key) = &book_key {
+            reader_cache_files::write_position_file(
+                root,
+                key.as_str(),
+                record.chapter,
+                record.screen,
+            )
+        } else {
+            Ok(())
+        }
+    })
+    .ok()
+    .is_some_and(|result| result.is_ok())
+}
+
 /// The saved per-book position for a catalog entry, if any.
 #[inline(never)]
 pub(crate) fn load_position(

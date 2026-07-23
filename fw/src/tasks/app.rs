@@ -159,7 +159,14 @@ pub async fn run() {
                     }
                 }
                 if previous_persisted != next_persisted {
-                    let command = StorageCommand::StoreProgress(next_persisted);
+                    let command = if previous_persisted.book_id != next_persisted.book_id {
+                        StorageCommand::StoreBookSwitch {
+                            previous: previous_persisted,
+                            next: next_persisted,
+                        }
+                    } else {
+                        StorageCommand::StoreProgress(next_persisted)
+                    };
                     if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
                         pending_storage = Some(command);
                     }
@@ -366,7 +373,8 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
             chapters: _,
             current_chapter: _,
             chapter_pages: _,
-        } => state.book_id == book_id,
+            resuming,
+        } => state.book_id == book_id && !resuming,
         crate::LibraryEvent::ChapterPage {
             book_id,
             chapter,
@@ -463,7 +471,7 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         } => esp_println::println!(
             "app: storage {label} extend request={request_id} book_id={book_id} index={index} chapter={chapter} target={target_pages}"
         ),
-        StorageCommand::StoreProgress(_) => {
+        StorageCommand::StoreProgress(_) | StorageCommand::StoreBookSwitch { .. } => {
             esp_println::println!("app: storage {label} progress")
         }
         StorageCommand::LoadCatalogCache => {

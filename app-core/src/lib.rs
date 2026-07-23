@@ -371,6 +371,10 @@ pub enum StorageCommand {
         portrait: bool,
     },
     StoreProgress(PersistedAppState),
+    StoreBookSwitch {
+        previous: PersistedAppState,
+        next: PersistedAppState,
+    },
     /// Hand the EPUB scratch to the wifi task as sync-session heap. One
     /// way: after this the display task refuses scratch-using commands
     /// until the session's software reset reboots the reader.
@@ -414,6 +418,7 @@ impl SyncSession {
             SyncSession::Loaned => matches!(
                 command,
                 StorageCommand::StoreProgress(_)
+                    | StorageCommand::StoreBookSwitch { .. }
                     | StorageCommand::StoreWifiCredentials(_)
                     | StorageCommand::ReceiveUpload
             ),
@@ -607,6 +612,7 @@ pub enum LibraryEvent {
         /// colophon and chapter cursor do not stick past the cap.
         current_chapter: u16,
         chapter_pages: [u16; MAX_SD_CHAPTERS],
+        resuming: bool,
     },
     ChapterPage {
         book_id: u32,
@@ -1115,6 +1121,7 @@ impl ReaderState {
                 chapters,
                 current_chapter,
                 chapter_pages,
+                resuming: _,
             } => {
                 if self.book_id == book_id {
                     self.sd_page_count = pages.max(1);
@@ -2470,7 +2477,7 @@ mod tests {
     /// One of every StorageCommand variant, so the admission table below is
     /// exhaustive by construction: a new variant fails the count assertion
     /// until it is classified here.
-    fn every_storage_command() -> [StorageCommand; 10] {
+    fn every_storage_command() -> [StorageCommand; 11] {
         let persisted = PersistedAppState {
             book_id: 0,
             chapter: 0,
@@ -2522,6 +2529,10 @@ mod tests {
                 portrait: false,
             },
             StorageCommand::StoreProgress(persisted),
+            StorageCommand::StoreBookSwitch {
+                previous: persisted,
+                next: persisted,
+            },
             StorageCommand::LoanSyncMemory,
             StorageCommand::StoreWifiCredentials(credentials),
             StorageCommand::ForgetWifiCredentials,
@@ -2548,7 +2559,9 @@ mod tests {
         for command in every_storage_command() {
             let loan_safe = matches!(
                 command,
-                StorageCommand::StoreProgress(_) | StorageCommand::StoreWifiCredentials(_)
+                StorageCommand::StoreProgress(_)
+                    | StorageCommand::StoreBookSwitch { .. }
+                    | StorageCommand::StoreWifiCredentials(_)
             );
             assert_eq!(
                 session.admits(&command),
@@ -2557,7 +2570,7 @@ mod tests {
             );
             admitted += usize::from(loan_safe);
         }
-        assert_eq!(admitted, 2);
+        assert_eq!(admitted, 3);
         assert!(session.admits(&StorageCommand::ReceiveUpload));
         // Notably refused: a second loan of memory that is already gone.
         assert!(!session.admits(&StorageCommand::LoanSyncMemory));

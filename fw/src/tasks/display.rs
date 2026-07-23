@@ -11,8 +11,9 @@ use crate::{
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::{
-    display_orientation_from_u8, refresh_policy_from_u8, AppView, DisplayOrientation, ReaderSource,
-    RefreshPlanner, RenderKind, RenderRequest, SyncSession, SyncStatus,
+    display_orientation_from_u8, refresh_policy_from_u8, AppView, DisplayOrientation,
+    PersistedAppState, ReaderSource, RefreshPlanner, RenderKind, RenderRequest, SyncSession,
+    SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
@@ -741,6 +742,7 @@ fn handle_storage_command(
                     chapters: sd_library.chapter_count_for_ui(),
                     current_chapter: sd_library.current_chapter(),
                     chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                    resuming: resumed,
                 });
                 if resumed {
                     send_resumed_position(book_id, chapter, target_pages, last_request);
@@ -773,6 +775,7 @@ fn handle_storage_command(
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                resuming: resumed,
             });
             if resumed {
                 send_resumed_position(book_id, chapter, target_pages, last_request);
@@ -826,6 +829,7 @@ fn handle_storage_command(
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                resuming: false,
             });
         }
         StorageCommand::JumpChapter {
@@ -870,6 +874,7 @@ fn handle_storage_command(
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                resuming: true,
             });
             send_resumed_position(book_id, chapter, target_page, last_request);
         }
@@ -895,34 +900,7 @@ fn handle_storage_command(
             esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
         StorageCommand::StoreProgress(record) => {
-            let (source_hash, source_size) = source_identity(sd_library, record.book_id);
-            // The reducer derives chapter from the 128-capped sd_chapter_for_page,
-            // so a deep position would save a stuck chapter that the sleep/boot
-            // colophon then shows wrong until the book reopens. The firmware
-            // tracks the true chapter over the whole book; adopt it for the
-            // loaded SD book so saved/restored state names the chapter right.
-            let chapter = if ReaderSource::from_book_id(record.book_id).is_sd()
-                && sd_library.loaded_index == ReaderStore::selected_book_index(record.book_id)
-            {
-                sd_library.current_chapter()
-            } else {
-                record.chapter
-            };
-            let record = AppStateRecord {
-                book_id: record.book_id,
-                chapter,
-                screen: record.screen,
-                shell_orientation: record.shell_orientation,
-                reading_orientation: record.reading_orientation,
-                refresh_policy: record.refresh_policy,
-                font_size: record.font_size,
-                line_spacing: record.line_spacing,
-                font_weight: record.font_weight,
-                font_family: record.font_family,
-                front_buttons: record.front_buttons,
-                source_hash,
-                source_size,
-            };
+            let record = record_for_persisted(sd_library, record);
             // Coalesce same-context page turns; anything beyond the screen
             // number changing (book, chapter, orientation, policy) is rare
             // and worth landing immediately. A pending record for the same
@@ -983,6 +961,31 @@ fn handle_storage_command(
                     Instant::now().as_millis(),
                 );
             }
+        }
+        StorageCommand::StoreBookSwitch { previous, next } => {
+            let record_prev = record_for_persisted(sd_library, previous);
+            let record_next = record_for_persisted(sd_library, next);
+            // Write the previous book's progress to its position file first.
+            // If there was a pending progress save for the same book, clear it.
+            if pending_progress
+                .map(|pending| pending.book_id == record_prev.book_id)
+                .unwrap_or(false)
+            {
+                *pending_progress = None;
+            }
+            let progress_start = Instant::now();
+            let stored_pos = reader_cache::store_book_position(epd, sd_cs, sd_library, record_prev);
+            // Write the new book as the active state in STATE.BIN.
+            let stored_state = reader_cache::store_global_state(epd, sd_cs, record_next);
+            esp_println::println!(
+                "bench: store_book_switch action=write ok_pos={} ok_state={} prev_book_id={} next_book_id={} elapsed_ms={} t_ms={}",
+                stored_pos,
+                stored_state,
+                record_prev.book_id,
+                record_next.book_id,
+                progress_start.elapsed().as_millis(),
+                Instant::now().as_millis(),
+            );
         }
     }
 }
@@ -1252,5 +1255,31 @@ fn flush_pending_progress(
         stored
     } else {
         true
+    }
+}
+
+fn record_for_persisted(sd_library: &ReaderStore, record: PersistedAppState) -> AppStateRecord {
+    let (source_hash, source_size) = source_identity(sd_library, record.book_id);
+    let chapter = if ReaderSource::from_book_id(record.book_id).is_sd()
+        && sd_library.loaded_index == ReaderStore::selected_book_index(record.book_id)
+    {
+        sd_library.current_chapter()
+    } else {
+        record.chapter
+    };
+    AppStateRecord {
+        book_id: record.book_id,
+        chapter,
+        screen: record.screen,
+        shell_orientation: record.shell_orientation,
+        reading_orientation: record.reading_orientation,
+        refresh_policy: record.refresh_policy,
+        font_size: record.font_size,
+        line_spacing: record.line_spacing,
+        font_weight: record.font_weight,
+        font_family: record.font_family,
+        front_buttons: record.front_buttons,
+        source_hash,
+        source_size,
     }
 }
