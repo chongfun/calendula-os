@@ -1209,7 +1209,7 @@ fn sleep_request_from_saved_state(
         selection: 0,
         book_id: ReaderSource::sd(index).book_id(),
         orientation: display_orientation_from_u8(record.reading_orientation)
-            .unwrap_or(DisplayOrientation::LandscapeButtonsBottom),
+            .unwrap_or(DisplayOrientation::PortraitButtonsLeft),
         front_buttons: app_core::front_buttons_from_u8(record.front_buttons)
             .unwrap_or(app_core::FrontButtons::PagesRight),
         reading_sheet: false,

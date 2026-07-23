@@ -562,13 +562,18 @@ The firmware now has the e-reader surfaces as explicit app state:
 - `Library`: selects a book or opens settings.
 - `Reading`: owns the active book/page position.
 - `Chapters`: selects a chapter within the current book.
-- `Settings`: cycles refresh policy, font size, line spacing, typeface, and
-  type weight. `DisplayOrientation` is persisted for future reading-layout
-  work, but it is not currently exposed as a user-facing setting.
+- `Settings`: cycles seven rows -- typeface, type size, type weight, line
+  spacing, refresh policy, `DisplayOrientation`, and the front-button layout.
+  The orientation row offers three of the four holds; the buttons-above
+  portrait variant stays in the enum for the persistence format only.
 
-Every surface renders in landscape: the X4 is held that way for its side page
-buttons, so `Home`, `Library`, and `Settings` share the reading posture rather
-than rotating into portrait. Home is cover-led: the current book is the visual
+Every surface renders in one hold, so `Home`, `Library`, and `Settings` share
+the reading posture rather than rotating independently. Calendula boots into
+the portrait hold (`PortraitButtonsLeft`); the landscape holds stay in the
+Settings cycle for the X4's side page buttons. Upstream MarigoldOS boots into
+buttons-below landscape instead: only the boot default differs, while the
+enum, its persisted byte values, and the cycle order stay shared, so the
+saved-state format reads the same on both. Home is cover-led: the current book is the visual
 anchor, with a restrained menu down the side for Continue, Library, Sync, and
 Settings.
 Reading mode keeps the page quiet: tiny book title, rendered-screen count within
