@@ -554,26 +554,48 @@ pub struct SleepGate {
     deferred: bool,
 }
 
+/// What the app still owes before the panel may sleep.
+///
+/// All three have to be clear. The first two are durability — work that has not
+/// reached the storage task cannot survive a terminal sleep. The third is what
+/// the panel keeps showing: the sleep screen is drawn from the last frame that
+/// reached it, so sleeping between an open answering and its frame settling
+/// leaves the reader looking at a book they are no longer in, for as long as
+/// the device stays off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SleepBlockers {
+    /// A book open was accepted and has not answered yet.
+    pub open_unresolved: bool,
+    /// Commands are parked, waiting on the next drain to send them.
+    pub parked_storage: bool,
+    /// An open answered, but the frame resolving it has not settled.
+    pub awaiting_open_frame: bool,
+}
+
+impl SleepBlockers {
+    pub const fn any(self) -> bool {
+        self.open_unresolved || self.parked_storage || self.awaiting_open_frame
+    }
+}
+
 impl SleepGate {
     pub const fn new() -> Self {
         Self { deferred: false }
     }
 
-    /// A Power press. `storage_pending` is whether the app still holds storage
-    /// work of its own — an unresolved book open, or parked commands the next
-    /// drain has yet to send. Returns whether the sleep request goes out now.
-    pub fn press(&mut self, storage_pending: bool) -> bool {
-        if storage_pending {
+    /// A Power press. Returns whether the sleep request goes out now.
+    pub fn press(&mut self, blockers: SleepBlockers) -> bool {
+        if blockers.any() {
             self.deferred = true;
             return false;
         }
         true
     }
 
-    /// Storage work reached a resting point. Returns whether a press that was
-    /// held back should go out now; only ever true once per press.
-    pub fn release(&mut self, storage_pending: bool) -> bool {
-        if self.deferred && !storage_pending {
+    /// A display cycle ended. Returns whether a press that was held back should
+    /// go out now; only ever true once per press.
+    pub fn release(&mut self, blockers: SleepBlockers) -> bool {
+        if self.deferred && !blockers.any() {
             self.deferred = false;
             return true;
         }
@@ -2073,68 +2095,123 @@ mod tests {
         storage_command_for_transition(previous, next, 1).expect("a book change owes an open")
     }
 
-    /// The app owes the storage task nothing.
-    const SETTLED: bool = false;
-    /// An open is parked or inflight, or commands are waiting to drain.
-    const STORAGE_PENDING: bool = true;
+    /// The app owes nothing: no open outstanding, nothing parked, and the
+    /// frame that resolves the last open has settled.
+    const NOTHING_OWED: SleepBlockers = SleepBlockers {
+        open_unresolved: false,
+        parked_storage: false,
+        awaiting_open_frame: false,
+    };
+
+    /// An open is parked or inflight.
+    const OPEN_UNRESOLVED: SleepBlockers = SleepBlockers {
+        open_unresolved: true,
+        parked_storage: false,
+        awaiting_open_frame: true,
+    };
+
+    /// The open answered, but the frame it produced has not reached the panel.
+    const AWAITING_FRAME: SleepBlockers = SleepBlockers {
+        open_unresolved: false,
+        parked_storage: false,
+        awaiting_open_frame: true,
+    };
 
     #[test]
     fn power_sleeps_immediately_when_nothing_is_owed() {
         let mut gate = SleepGate::new();
-        assert!(gate.press(SETTLED));
+        assert!(gate.press(NOTHING_OWED));
         assert!(!gate.is_deferred());
         // Nothing was held back, so a later resting point sends nothing.
-        assert!(!gate.release(SETTLED));
+        assert!(!gate.release(NOTHING_OWED));
     }
 
     #[test]
-    fn power_during_a_parked_open_waits_for_it() {
+    fn a_deferred_press_waits_for_the_frame_that_resolves_the_open() {
+        // Power pressed while opening Book B, which then loads at its restored
+        // page. The library event clears the open, but the frame showing that
+        // page has not been drawn: the sleep screen is taken from whatever last
+        // reached the panel, so sleeping here would leave Book B's provisional
+        // page frozen on it for as long as the reader is away.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(OPEN_UNRESOLVED));
+
+        // Loaded arrives. Not a resting point — the render is still to come.
+        assert!(
+            !gate.release(AWAITING_FRAME),
+            "the library event alone must not release the press"
+        );
+        assert!(gate.is_deferred());
+
+        // The render settles and the suppression lifts.
+        assert!(gate.release(NOTHING_OWED));
+        assert!(!gate.is_deferred());
+    }
+
+    #[test]
+    fn a_deferred_press_waits_for_the_rollback_frame_too() {
+        // Same, for the open that fails: BookOpenFailed puts the reader back on
+        // Book A, and sleeping before that frame lands would strand the panel
+        // showing Book B — a book the reader is not in and did not open.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(OPEN_UNRESOLVED));
+        assert!(
+            !gate.release(AWAITING_FRAME),
+            "the rollback event alone must not release the press"
+        );
+        assert!(gate.release(NOTHING_OWED));
+    }
+
+    #[test]
+    fn power_during_a_parked_open_waits_for_the_drain_and_the_frame() {
         // The open has not reached the storage task at all: it sits in the
-        // app's parking slots until a render settles. Sleeping now would take
-        // the departing book's only close-out position with it.
+        // app's parking slots until a render settles.
         let mut gate = SleepGate::new();
-        assert!(!gate.press(STORAGE_PENDING));
-        assert!(gate.is_deferred());
+        let parked = SleepBlockers {
+            open_unresolved: false,
+            parked_storage: true,
+            awaiting_open_frame: true,
+        };
+        assert!(!gate.press(parked));
+        assert!(!gate.release(parked));
 
-        // The drain sends the open, which is now inflight — still not a
-        // resting point.
-        assert!(!gate.release(STORAGE_PENDING));
-        assert!(gate.is_deferred());
-
-        // The open answered and the queue is empty.
-        assert!(gate.release(SETTLED));
-        assert!(!gate.is_deferred());
-    }
-
-    #[test]
-    fn power_during_an_inflight_open_waits_for_it() {
-        // Already handed to the storage task. The display task takes sleep
-        // down a different channel and would pick it up first, so the press
-        // still has to wait for the open to answer.
-        let mut gate = SleepGate::new();
-        assert!(!gate.press(STORAGE_PENDING));
-        assert!(gate.release(SETTLED));
-    }
-
-    #[test]
-    fn a_deferred_sleep_survives_an_aborted_open() {
-        // BookOpenFailed resolves the open just as much as Loaded does: the
-        // reader is back on the old book and the press it made is still owed.
-        let mut gate = SleepGate::new();
-        assert!(!gate.press(STORAGE_PENDING));
-        assert!(gate.release(SETTLED));
-        assert!(!gate.is_deferred());
+        // The drain sends it; now it is inflight, still not a resting point.
+        assert!(!gate.release(OPEN_UNRESOLVED));
+        assert!(gate.release(NOTHING_OWED));
     }
 
     #[test]
     fn a_deferred_sleep_is_sent_once() {
-        // release() runs at every drain and every library event, so it has to
-        // be idempotent or the power task would field a burst of requests.
+        // release() runs at every display cycle, so it has to be idempotent or
+        // the power task would field a burst of requests.
         let mut gate = SleepGate::new();
-        assert!(!gate.press(STORAGE_PENDING));
-        assert!(gate.release(SETTLED));
-        assert!(!gate.release(SETTLED));
-        assert!(!gate.release(STORAGE_PENDING));
+        assert!(!gate.press(OPEN_UNRESOLVED));
+        assert!(gate.release(NOTHING_OWED));
+        assert!(!gate.release(NOTHING_OWED));
+        assert!(!gate.release(OPEN_UNRESOLVED));
+    }
+
+    #[test]
+    fn every_blocker_holds_the_press_on_its_own() {
+        for blocker in [
+            SleepBlockers {
+                open_unresolved: true,
+                ..NOTHING_OWED
+            },
+            SleepBlockers {
+                parked_storage: true,
+                ..NOTHING_OWED
+            },
+            SleepBlockers {
+                awaiting_open_frame: true,
+                ..NOTHING_OWED
+            },
+        ] {
+            let mut gate = SleepGate::new();
+            assert!(!gate.press(blocker), "{blocker:?} must hold the press");
+            assert!(!gate.release(blocker));
+            assert!(gate.release(NOTHING_OWED));
+        }
     }
 
     #[test]
