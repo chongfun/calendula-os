@@ -1258,6 +1258,38 @@ fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppS
     }
 }
 
+/// Where the reader is in the book at `index`.
+///
+/// The book's own position file is authoritative. It is written when that book
+/// is left and read when it is opened, so it can only ever describe this book —
+/// which is the whole point of keeping it: the global state record is a single
+/// slot that names one book, and reading position out of it is what let a stale
+/// record hand one book's page to another.
+///
+/// The record's own `chapter`/`screen` are a mirror, still written so MarigoldOS
+/// (which reads position from the global file) keeps resuming from cards this
+/// firmware wrote. They are consulted only when the per-book file is missing or
+/// fails its checksum, and they are safe in that role because the identity that
+/// selected this book came from the very same record.
+fn book_position(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    index: u16,
+    mirror: AppStateRecord,
+) -> (u16, u32) {
+    match reader_cache::load_position(epd, sd_cs, library, usize::from(index)) {
+        Some(position) => position,
+        None => {
+            esp_println::println!(
+                "restore: no per-book position for index={}; using the global mirror",
+                index
+            );
+            (mirror.chapter, mirror.screen)
+        }
+    }
+}
+
 /// One boot-time attempt to map durable reader state back onto the scanned
 /// catalog by stable source identity (path hash + byte size) and hand the
 /// saved position to the app as a `Restored` event. The volatile book id
@@ -1291,26 +1323,28 @@ fn restore_saved_state(
         );
         return;
     };
+    // Stage the restored book's catalog entry so the position, colophon, and
+    // page-count reads below resolve it, and so the first Home paint names it
+    // before any open.
+    crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
+    let (chapter, screen) = book_position(epd, sd_cs, library, index, record);
     esp_println::println!(
         "restore: index={} chapter={} screen={}",
         index,
-        record.chapter,
-        record.screen
+        chapter,
+        screen
     );
-    // Stage the restored book's catalog entry so the colophon/page-count reads
-    // below resolve it, and so the first Home paint names it before any open.
-    crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
     // Resolve the chapter title now so wake-to-Home (rendered before the book
     // is opened) names the chapter; without this the colophon shows a numeral
     // until the book is first opened this session.
-    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
+    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
     // The book's total page count, so the Home progress bar has a denominator
     // on wake before the book is opened (read from the cache index header).
     let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
-        chapter: record.chapter,
-        page: record.screen,
+        chapter,
+        page: screen,
         page_count,
         reading_orientation: record.reading_orientation,
         refresh_policy: record.refresh_policy,
@@ -1328,9 +1362,12 @@ fn sleep_request_from_saved_state(
     library: &mut ReaderStore,
     pending_progress: &Option<AppStateRecord>,
 ) -> Option<RenderRequest> {
-    let record = match *pending_progress {
-        Some(record) => record,
-        None => reader_cache::load_app_state(epd, sd_cs)?,
+    // A coalesced record is state the card has not seen yet, so it outranks
+    // both stored copies; only a record read back from the card has to defer
+    // to the book's own position file.
+    let (record, unflushed) = match *pending_progress {
+        Some(record) => (record, true),
+        None => (reader_cache::load_app_state(epd, sd_cs)?, false),
     };
     let hint = ReaderSource::from_book_id(record.book_id).sd_index();
     let index = crate::library_sd::find_index_by_identity(
@@ -1341,14 +1378,19 @@ fn sleep_request_from_saved_state(
         hint,
     )?;
     crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
-    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
+    let (chapter, screen) = if unflushed {
+        (record.chapter, record.screen)
+    } else {
+        book_position(epd, sd_cs, library, index, record)
+    };
+    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
     let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     Some(RenderRequest {
         kind: RenderKind::Page,
         view: AppView::Home,
-        page: record.screen,
+        page: screen,
         page_count,
-        chapter: record.chapter,
+        chapter,
         selection: 0,
         book_id: ReaderSource::sd(index).book_id(),
         orientation: display_orientation_from_u8(record.reading_orientation)

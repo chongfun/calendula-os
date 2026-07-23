@@ -876,6 +876,7 @@ pub(crate) fn empty_cache_dir<
     let Ok(cache) = xteink.open_dir(CACHE_V2_DIR) else {
         return;
     };
+    let position_kept;
     {
         let Ok(book) = cache.open_dir(key) else {
             return;
@@ -895,10 +896,43 @@ pub(crate) fn empty_cache_dir<
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_TOC_FILE);
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_COVER_FILE);
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_CONTENT_FILE);
+        // Everything above is re-derivable from the EPUB; the position is not.
+        // POS*.BIN is the authoritative record of where the reader is in this
+        // book, so it is never swept, and the directory holding it has to stay
+        // as well. A book moved off the card and back keys to the same name and
+        // size, so its place is still waiting when it returns.
+        //
+        // This was already the effect — the directory delete below silently
+        // failed while the position files were in it — but it was incidental,
+        // and the position is load-bearing now that nothing else records it.
+        position_kept = has_position_file(&book);
     }
-    // Likewise the book handle: closed by the scope above, deletable here
-    // (a directory entry has no chain to reclaim).
-    let _ = cache.delete_file_in_dir(key);
+    if !position_kept {
+        // Likewise the book handle: closed by the scope above, deletable here
+        // (a directory entry has no chain to reclaim).
+        let _ = cache.delete_file_in_dir(key);
+    }
+}
+
+/// Whether a book's cache directory still holds a reading position, in either
+/// the durable A/B pair or the legacy single file.
+fn has_position_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    POSITION_GENERATIONS
+        .iter()
+        .chain(core::iter::once(&POSITION_FILE))
+        .any(|name| book.open_file_in_dir(*name, Mode::ReadOnly).is_ok())
 }
 
 pub(crate) fn write_v2_book_index<
