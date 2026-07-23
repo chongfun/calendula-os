@@ -66,6 +66,13 @@ pub enum SleepRefusal {
     /// up next and `upload_session` does its own sleep handling, re-queueing
     /// this generation once the filesystem is closed.
     UploadQueued,
+    /// The declined upload request would not go back on the queue, which can
+    /// only mean a producer refilled the slot it came out of. The request
+    /// itself is lost, but a full queue is not: the channel now holds a whole
+    /// budget's worth of accepted work, so refuse and let the ordinary loop
+    /// apply it through the normal routing rather than this drain's restricted
+    /// path.
+    UploadLost,
     /// The coalesced progress record would not land. Sleeping now would lose it
     /// for good, so stay awake and let the next flush retry.
     ProgressUnwritten,
@@ -171,24 +178,20 @@ impl SleepSequence {
     /// Whether the command the drain declined actually made it back onto the
     /// queue.
     ///
-    /// Only a request that is still queued is worth staying awake for, which is
-    /// why this takes the answer rather than assuming it. If the requeue failed
-    /// the request is simply gone — nothing will start the writer, so deferring
-    /// would leave the panel up indefinitely waiting on a session that can no
-    /// longer begin. Better to treat the slot as spent, finish the drain, and
-    /// let the panel go down; the loss itself is the caller's to report.
+    /// Either answer refuses the sleep, but for opposite reasons, and the
+    /// difference is why this takes the result rather than assuming it. A
+    /// put-back that landed means the loop will answer the request. A put-back
+    /// that failed can only mean a producer refilled the slot the command came
+    /// out of — so the channel is *full*, not one short. Carrying on would then
+    /// be the worst of both: the drain would spend its remaining budget on a
+    /// queue that had grown behind it and hand whatever it could not reach to a
+    /// terminal sleep.
     pub fn requeued(&mut self, restored: bool) {
-        if restored {
-            self.phase = SleepPhase::Refused(SleepRefusal::UploadQueued);
-            return;
-        }
-        // Not applied, but the slot it occupied is consumed either way, so the
-        // drain's budget has to account for it or the loop could outrun the
-        // channel's depth.
-        self.drained += 1;
-        if self.drained >= self.budget {
-            self.phase = SleepPhase::Flushing;
-        }
+        self.phase = SleepPhase::Refused(if restored {
+            SleepRefusal::UploadQueued
+        } else {
+            SleepRefusal::UploadLost
+        });
     }
 
     /// Whether the coalesced progress record reached the card.
@@ -967,20 +970,22 @@ mod tests {
     }
 
     fn run_sleep(queue: &mut Queue, progress_lands: bool) -> (SleepOutcome, usize) {
-        run_sleep_with(queue, progress_lands, true)
+        run_sleep_with(queue, progress_lands, None)
     }
 
     /// Drives a whole sleep transition the way the display task does, returning
     /// what the panel did and how many queued commands were applied on the way.
     ///
-    /// `requeue_lands` stands in for the put-back succeeding. On device it
-    /// always does — the slot the command came from cannot be refilled before
-    /// the send — so the false case exists to pin down what the sequence does if
-    /// that ever stops holding.
+    /// `refill` stands in for a producer enqueuing one more command in the window
+    /// between the drain taking a command off the queue and putting it back.
+    /// That refill is the *only* thing that can make the put-back fail, so it is
+    /// the only honest way to reach the lost-upload path: forcing the failure
+    /// without it would model a queue that cannot occur — one short of full —
+    /// and would validate accounting rather than behaviour.
     fn run_sleep_with(
         queue: &mut Queue,
         progress_lands: bool,
-        requeue_lands: bool,
+        mut refill: Option<StorageCommand>,
     ) -> (SleepOutcome, usize) {
         let mut sequence = SleepSequence::new(Queue::CAPACITY);
         let mut applied = 0;
@@ -996,7 +1001,10 @@ mod tests {
                             sequence.applied();
                         }
                         Drained::RequeueAndRefuse => {
-                            let restored = requeue_lands && queue.push(command);
+                            if let Some(refill) = refill.take() {
+                                assert!(queue.push(refill), "the producer wins the freed slot");
+                            }
+                            let restored = queue.push(command);
                             sequence.requeued(restored);
                         }
                     },
@@ -1076,32 +1084,49 @@ mod tests {
         assert_eq!(queue.pop(), Some(StorageCommand::ReceiveUpload));
     }
 
-    // A sleep is only worth deferring for a request that is still queued. If the
-    // put-back fails the request is gone, and nothing will ever start the writer
-    // it was asking for — so refusing would hold the panel up forever rather
-    // than briefly.
-    #[test]
-    fn a_lost_requeue_does_not_hold_the_panel_up_for_a_request_that_is_gone() {
-        let mut queue = Queue::default();
-        assert!(queue.push(StorageCommand::ReceiveUpload));
-        let (outcome, applied) = run_sleep_with(&mut queue, true, false);
-        assert_eq!(outcome, SleepOutcome::Slept);
-        assert_eq!(applied, 0, "the upload was never applied, only lost");
-        assert_eq!(queue.len, 0);
-    }
-
-    #[test]
-    fn a_lost_requeue_still_spends_its_slot_of_the_drain_budget() {
+    /// A full queue at the moment of a refill, with the upload at its head.
+    fn queue_refilled_behind_an_upload() -> (Queue, StorageCommand) {
         let mut queue = Queue::default();
         assert!(queue.push(StorageCommand::ReceiveUpload));
         for page in 0..Queue::CAPACITY as u32 - 1 {
             assert!(queue.push(StorageCommand::StoreProgress(persisted(3, 1, page))));
         }
-        // Four slots, one spent on the lost upload: the rest still drain, and
-        // the loop stays inside the channel's depth.
-        let (outcome, applied) = run_sleep_with(&mut queue, true, false);
+        // What the producer slips into the slot the upload vacates. An open is
+        // the costly thing to lose this way: it carries the departing book's
+        // only close-out position and nothing reissues it.
+        (queue, open(4, 0, 0, Some(persisted(3, 1, 40))))
+    }
+
+    // Regression: an upload that cannot go back means a producer refilled the
+    // queue behind it, so the channel holds a whole budget's worth of accepted
+    // work. Draining on would spend the remaining budget on a queue that grew,
+    // and hand what it could not reach to a terminal sleep.
+    #[test]
+    fn an_upload_that_cannot_be_put_back_leaves_the_refilled_queue_intact() {
+        let (mut queue, refill) = queue_refilled_behind_an_upload();
+        let (outcome, applied) = run_sleep_with(&mut queue, true, Some(refill));
+        assert_eq!(outcome, SleepOutcome::Refused(SleepRefusal::UploadLost));
+        assert_eq!(applied, 0);
+        assert_eq!(
+            queue.len,
+            Queue::CAPACITY,
+            "every accepted command must survive the refusal"
+        );
+    }
+
+    #[test]
+    fn the_retry_after_a_lost_upload_drains_everything_and_sleeps() {
+        let (mut queue, refill) = queue_refilled_behind_an_upload();
+        assert_eq!(
+            run_sleep_with(&mut queue, true, Some(refill)).0,
+            SleepOutcome::Refused(SleepRefusal::UploadLost)
+        );
+        // The power task's idle clock re-requests sleep. No upload is queued
+        // this time — it is the thing that was lost — so nothing defers the
+        // drain and the whole backlog lands before the panel goes down.
+        let (outcome, applied) = run_sleep(&mut queue, true);
         assert_eq!(outcome, SleepOutcome::Slept);
-        assert_eq!(applied, Queue::CAPACITY - 1);
+        assert_eq!(applied, Queue::CAPACITY);
         assert_eq!(queue.len, 0);
     }
 
