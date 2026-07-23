@@ -11,8 +11,7 @@ use crate::{
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::storage_loop::{
-    loop_arm, Drained, LoopArm, OpenAction, OpenSequence, PanelDown, PanelDownDrain, SleepAction,
-    SleepRefusal, SleepSequence,
+    loop_arm, Drained, LoopArm, OpenAction, OpenSequence, SleepAction, SleepRefusal, SleepSequence,
 };
 use app_core::{
     book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
@@ -446,51 +445,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // it false so that boot falls back to the full waveform.
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
                 if panel_slept {
-                    // The panel is down and deep sleep is imminent, but a
-                    // render can still be queued behind this Sleep -- usually
-                    // one the storage drain above provoked, since applying a
-                    // book open emits Loaded and the app repaints on it.
-                    // Returning to the loop with it queued would re-init the
-                    // panel and paint a page over the sleep image.
-                    //
-                    // The rules are in app-core so they can be driven from a
-                    // host test. Nothing in here awaits, which is what makes
-                    // handing the held sleeps back infallible; the refresh
-                    // acknowledgement is deliberately display-only, since the
-                    // power task ignores DisplayRefreshFailed in both of its
-                    // loops and sending it would mean awaiting.
-                    let mut drain = PanelDownDrain::new(DISPLAY_COMMANDS.capacity());
-                    while drain.wants_more() {
-                        let Ok(queued) = DISPLAY_COMMANDS.try_receive() else {
-                            break;
-                        };
-                        match drain.took(&queued) {
-                            PanelDown::FailRender => {
-                                esp_println::println!(
-                                    "display: render failed; panel already asleep"
-                                );
-                                send_required_display_event(&DisplayEvent::RefreshFailed);
-                            }
-                            PanelDown::HoldSleep => {}
-                        }
-                    }
-                    for held in drain.held_sleeps() {
-                        if DISPLAY_COMMANDS
-                            .try_send(DisplayCommand::Sleep { generation: held })
-                            .is_err()
-                        {
-                            // Unreachable: the slot it came from is still free.
-                            // Logged because the cost of being wrong is a power
-                            // task waiting forever for an acknowledgement only
-                            // the sleep arm can send.
-                            esp_println::println!(
-                                "display: sleep requeue failed generation={}",
-                                held
-                            );
-                        }
-                    }
                     send_required_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
+                    park_until_resumed(generation).await;
                 } else {
                     // The panel never acknowledged the sleep sequence, so it
                     // may still be mid-refresh. Cutting power now would
@@ -579,6 +536,68 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     );
                 }
             },
+        }
+    }
+}
+
+/// Holds the display task still from the moment the panel goes down until the
+/// power task says the sleep was abandoned.
+///
+/// This is the whole guarantee that a slept panel keeps showing its sleep
+/// image. A render is routinely queued behind the `Sleep` — the pre-sleep
+/// storage drain provokes one itself, since applying a book open emits
+/// `Loaded` and the app repaints on it, and the sleep frame's full-waveform
+/// flush gives it seconds to arrive. Returning to the command loop with that
+/// render waiting re-initialises the panel and paints a page over the sleep
+/// image, racing the power cut. Nothing the loop could do with that render is
+/// right: painting it is the bug, and answering it discards the repaint the
+/// abandoning press is owed. So the task does not go back to the loop at all.
+///
+/// On the ordinary path this never returns — `enter_deep_sleep_button` is `!`
+/// and the chip reboots on wake. It returns only when the press that abandoned
+/// the handshake releases it, and then the queued render is still queued and
+/// repaints, which is exactly what that press asked for.
+///
+/// The wait is bounded so a lost `DisplayAsleep` cannot freeze the device.
+/// That acknowledgement is a 20 ms bounded send into a queue the power task is
+/// already draining, so losing it should not happen; if it ever does, the power
+/// task waits for an ack that will not come and an unbounded park here would
+/// wait on a resume that will not come either, leaving both tasks stopped
+/// behind a dark panel. Waking early risks repainting over the sleep image —
+/// far better than a device that has to be reset.
+async fn park_until_resumed(generation: u32) {
+    // Deep sleep follows its acknowledgement within about one input poll tick
+    // (the power task's wake-button handoff), so seconds here are already many
+    // orders of margin.
+    const ABANDONED_HANDSHAKE_CEILING_SECS: u64 = 5;
+    // `Timer::at` rather than a remaining-time subtraction: discarding a stale
+    // resume can put the deadline in the past, and `Instant - Instant` panics
+    // there. A deadline already passed simply fires at once.
+    let deadline =
+        Instant::now() + embassy_time::Duration::from_secs(ABANDONED_HANDSHAKE_CEILING_SECS);
+    loop {
+        match select(
+            crate::DISPLAY_RESUME.wait(),
+            embassy_time::Timer::at(deadline),
+        )
+        .await
+        {
+            Either::First(resumed) if resumed == generation => {
+                esp_println::println!("display: sleep abandoned; resuming");
+                return;
+            }
+            // A resume left over from a sleep this task never parked for, e.g.
+            // one whose panel handshake failed. Not ours; keep waiting.
+            Either::First(stale) => {
+                esp_println::println!("display: ignoring stale resume generation={}", stale)
+            }
+            Either::Second(_) => {
+                esp_println::println!(
+                    "display: no deep sleep or resume within {} s; releasing the panel",
+                    ABANDONED_HANDSHAKE_CEILING_SECS
+                );
+                return;
+            }
         }
     }
 }
