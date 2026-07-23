@@ -11,7 +11,6 @@ use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use esp_hal::gpio::Output;
-use hal_ext::nvm::AppStateRecord;
 use heapless::String;
 use proto::book::BookId;
 use proto::cache::{BookV2SectionRecord, CONTENT_HEADER_BYTES};
@@ -20,6 +19,7 @@ use proto::epub::{
     EpubZipOps, NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
+use proto::nvm::AppStateRecord;
 use proto::text::{TextAlign, TextRole};
 use ui::reading::StyledInkCursor;
 
@@ -512,7 +512,7 @@ pub(crate) fn ensure_toc_window(
 pub(crate) fn store_wifi_credentials(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
-    record: hal_ext::nvm::WifiCredentialsRecord,
+    record: proto::nvm::WifiCredentialsRecord,
 ) -> bool {
     sd_session::with_root(epd, sd_cs, |root| {
         reader_cache_files::write_wifi_file(root, record).is_ok()
@@ -533,7 +533,7 @@ pub(crate) fn forget_wifi_credentials(epd: &mut Epd, sd_cs: &mut Output<'static>
 pub(crate) fn load_wifi_credentials(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
-) -> Option<hal_ext::nvm::WifiCredentialsRecord> {
+) -> Option<proto::nvm::WifiCredentialsRecord> {
     #[allow(clippy::redundant_closure)]
     sd_session::with_root(epd, sd_cs, |root| reader_cache_files::read_wifi_file(root))
         .ok()

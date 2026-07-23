@@ -22,7 +22,7 @@ use display::BAND_BYTES;
 use embassy_futures::select::{select, Either};
 use embassy_time::Instant;
 use esp_hal::gpio::Output;
-use hal_ext::nvm::AppStateRecord;
+use proto::nvm::AppStateRecord;
 use static_cell::ConstStaticCell;
 
 /// Same-book page-turn progress is coalesced: at most one durable state write
@@ -918,7 +918,7 @@ fn handle_storage_command(
             // the loop refused it already.
         }
         StorageCommand::StoreWifiCredentials(credentials) => {
-            let record = hal_ext::nvm::WifiCredentialsRecord {
+            let record = proto::nvm::WifiCredentialsRecord {
                 ssid: credentials.ssid,
                 ssid_len: credentials.ssid_len,
                 password: credentials.password,
