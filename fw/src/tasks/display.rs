@@ -11,8 +11,9 @@ use crate::{
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::{
-    display_orientation_from_u8, refresh_policy_from_u8, AppView, DisplayOrientation, ReaderSource,
-    RefreshPlanner, RenderKind, RenderRequest, SyncSession, SyncStatus,
+    book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
+    DisplayOrientation, PersistedAppState, ReaderSource, RefreshPlanner, RenderKind, RenderRequest,
+    SyncSession, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
@@ -463,7 +464,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     &mut pending_progress,
                     &mut last_progress_write,
                     &mut state_restored,
-                    refresh_planner.last_request(),
                 );
             }
         }
@@ -564,9 +564,14 @@ fn handle_storage_command(
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
-    last_request: Option<RenderRequest>,
 ) {
     let is_open_book = matches!(command, StorageCommand::OpenBook { .. });
+    // Only an open closes out another book; an extend stays inside the one
+    // already loaded and owes nothing to any other.
+    let opening_previous = match command {
+        StorageCommand::OpenBook { previous, .. } => previous,
+        _ => None,
+    };
     // The session decides what may run: progress writes stay alive during a
     // sync session (they are cheap and harmless); everything
     // that touches the EPUB scratch is gone until the session's reset.
@@ -663,6 +668,7 @@ fn handle_storage_command(
             target_pages,
             type_settings,
             portrait,
+            ..
         }
         | StorageCommand::ExtendSection {
             request_id,
@@ -683,6 +689,34 @@ fn handle_storage_command(
                     index
                 );
                 return;
+            }
+            // Step one of the book-open transaction: the departing book's page,
+            // written to that book's own position file while its catalog entry
+            // is still the active one. It has to happen before load_active_entry
+            // below swaps the slot to the incoming book, or the key this write
+            // needs can no longer be resolved.
+            if let Some(previous) = opening_previous {
+                if !close_out_departing_book(
+                    epd,
+                    sd_cs,
+                    sd_library,
+                    pending_progress,
+                    last_progress_write,
+                    previous,
+                ) {
+                    // Nothing has been opened yet, so the reader is still whole
+                    // on the book it was reading. Announcing the new one now
+                    // would strand that page: the app has already left the book
+                    // that owns it and will never reissue it.
+                    esp_println::println!(
+                        "storage: book open {:?} book_id={} departing={}",
+                        book_open_outcome(false, false),
+                        book_id,
+                        previous.book_id,
+                    );
+                    send_required_library_event(&LibraryEvent::BookOpenFailed { book_id });
+                    return;
+                }
             }
             // Read this book's catalog record into the active-entry slot so the
             // reader pipeline (load_position, build_or_load) resolves it from
@@ -735,16 +769,17 @@ fn handle_storage_command(
                     sd_library.advertised_page_count(),
                     sd_library.chapter_count_for_ui(),
                 );
-                send_loaded_library_event(&LibraryEvent::Loaded {
+                finish_book_open(
+                    epd,
+                    sd_cs,
+                    sd_library,
+                    pending_progress,
+                    last_progress_write,
                     book_id,
-                    pages: sd_library.advertised_page_count(),
-                    chapters: sd_library.chapter_count_for_ui(),
-                    current_chapter: sd_library.current_chapter(),
-                    chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
-                });
-                if resumed {
-                    send_resumed_position(book_id, chapter, target_pages, last_request);
-                }
+                    chapter,
+                    resumed.then_some(target_pages as u32),
+                    opening_previous,
+                );
                 return;
             }
             esp_println::println!(
@@ -767,16 +802,17 @@ fn handle_storage_command(
                 scratch,
                 font_metrics,
             );
-            send_loaded_library_event(&LibraryEvent::Loaded {
+            finish_book_open(
+                epd,
+                sd_cs,
+                sd_library,
+                pending_progress,
+                last_progress_write,
                 book_id,
-                pages: sd_library.advertised_page_count(),
-                chapters: sd_library.chapter_count_for_ui(),
-                current_chapter: sd_library.current_chapter(),
-                chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
-            });
-            if resumed {
-                send_resumed_position(book_id, chapter, target_pages, last_request);
-            }
+                chapter,
+                resumed.then_some(target_pages as u32),
+                opening_previous,
+            );
             esp_println::println!(
                 "storage: open complete status={:?} pages={} chapters={}",
                 sd_library.reader_status(),
@@ -819,13 +855,15 @@ fn handle_storage_command(
                 sd_library.overview_chapter_count()
             );
             // Re-render the overview with the full list resident, syncing the
-            // selection range to the full chapter count.
+            // selection range to the full chapter count. The reader has not
+            // moved, so the app's own page stands.
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                position: None,
             });
         }
         StorageCommand::JumpChapter {
@@ -864,14 +902,16 @@ fn handle_storage_command(
                 scratch,
                 font_metrics,
             );
+            // The page came from the on-disk TOC, not from the app, so it
+            // rides with the load rather than following as a second event.
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                position: Some(target_page as u32),
             });
-            send_resumed_position(book_id, chapter, target_page, last_request);
         }
         StorageCommand::ReceiveUpload => {
             // Handled in the task loop before dispatch; reaching here means
@@ -905,34 +945,7 @@ fn handle_storage_command(
             esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
         StorageCommand::StoreProgress(record) => {
-            let (source_hash, source_size) = source_identity(sd_library, record.book_id);
-            // The reducer derives chapter from the 128-capped sd_chapter_for_page,
-            // so a deep position would save a stuck chapter that the sleep/boot
-            // colophon then shows wrong until the book reopens. The firmware
-            // tracks the true chapter over the whole book; adopt it for the
-            // loaded SD book so saved/restored state names the chapter right.
-            let chapter = if ReaderSource::from_book_id(record.book_id).is_sd()
-                && sd_library.loaded_index == ReaderStore::selected_book_index(record.book_id)
-            {
-                sd_library.current_chapter()
-            } else {
-                record.chapter
-            };
-            let record = AppStateRecord {
-                book_id: record.book_id,
-                chapter,
-                screen: record.screen,
-                shell_orientation: record.shell_orientation,
-                reading_orientation: record.reading_orientation,
-                refresh_policy: record.refresh_policy,
-                font_size: record.font_size,
-                line_spacing: record.line_spacing,
-                font_weight: record.font_weight,
-                font_family: record.font_family,
-                front_buttons: record.front_buttons,
-                source_hash,
-                source_size,
-            };
+            let record = record_for_persisted(sd_library, record);
             // Coalesce same-context page turns; anything beyond the screen
             // number changing (book, chapter, orientation, policy) is rare
             // and worth landing immediately. A pending record for the same
@@ -1059,30 +1072,126 @@ fn send_required_display_event(event: &DisplayEvent) {
     }
 }
 
-/// Announces a per-book resume to the app as a Restored event, carrying
-/// the current display settings unchanged.
-fn send_resumed_position(
+/// Step one of a book-open transaction: get the departing book's page onto
+/// the card, and clear anything the coalescer was still holding for it.
+///
+/// Returns whether the open may proceed. A refusal leaves the reader entirely
+/// on the old book, with that book's position still owed and retried by the
+/// next flush — there is no half-applied switch to reconcile later, which is
+/// what lets the pending state stay a single latest-value slot.
+fn close_out_departing_book(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &ReaderStore,
+    pending_progress: &mut Option<AppStateRecord>,
+    last_progress_write: &mut Option<Instant>,
+    previous: PersistedAppState,
+) -> bool {
+    // A coalesced record for another book still has to land: it names that
+    // book in the global state file, and this transaction is about to point
+    // that file somewhere else.
+    if pending_progress.is_some_and(|pending| pending.book_id != previous.book_id)
+        && !flush_pending_progress(
+            epd,
+            sd_cs,
+            sd_library,
+            pending_progress,
+            last_progress_write,
+        )
+    {
+        return false;
+    }
+    let record = record_for_persisted(sd_library, previous);
+    let start = Instant::now();
+    let stored = reader_cache::store_book_position(epd, sd_cs, sd_library, record);
+    esp_println::println!(
+        "bench: store_book_position ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+        stored,
+        record.book_id,
+        record.screen,
+        start.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
+    if stored {
+        // Whatever the coalescer held for this book is now on the card, and
+        // the global half of it is about to be rewritten by step three.
+        *pending_progress = None;
+    } else {
+        // Keep it owed so the next flush retries it; the reader is staying on
+        // this book, so the record is still the right one to write.
+        *pending_progress = Some(record);
+    }
+    stored
+}
+
+/// Step three of a book-open transaction: point the global state file at the
+/// book that is now open, at the position the open actually landed on, and
+/// announce it as one event.
+///
+/// A failed pointer write is recoverable and deliberately not fatal — the book
+/// is open and readable, and only a reboot before the retry would return to the
+/// previous one — so the record is left owed and the open is still announced.
+#[allow(clippy::too_many_arguments)]
+fn finish_book_open(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &ReaderStore,
+    pending_progress: &mut Option<AppStateRecord>,
+    last_progress_write: &mut Option<Instant>,
     book_id: u32,
     chapter: u16,
-    target_pages: u16,
-    last_request: Option<RenderRequest>,
+    position: Option<u32>,
+    previous: Option<PersistedAppState>,
 ) {
-    let Some(request) = last_request else {
-        return;
-    };
-    send_required_library_event(&LibraryEvent::Restored {
+    if let Some(previous) = previous {
+        // The book and the position the open actually resolved — which is the
+        // whole reason the pointer moves after the open rather than before it.
+        // Everything else is device-wide reader settings an open does not
+        // touch, so they carry over from the state the app just left; building
+        // this record from defaults would quietly reset the reader's font and
+        // orientation on every book change.
+        let record = record_for_persisted(
+            sd_library,
+            PersistedAppState {
+                book_id,
+                chapter,
+                screen: position.unwrap_or(0),
+                ..previous
+            },
+        );
+        let stored = reader_cache::store_global_state(epd, sd_cs, record);
+        if stored {
+            *pending_progress = None;
+            *last_progress_write = Some(Instant::now());
+        } else {
+            // Left owed rather than retried here: the book is open and the
+            // reader is in it, so the only cost of waiting for the next flush
+            // is a reboot in that window landing back on the old book.
+            *pending_progress = Some(record);
+        }
+        let outcome = book_open_outcome(true, stored);
+        debug_assert!(outcome.book_changed());
+        esp_println::println!(
+            "storage: book open {:?} book_id={} page={}",
+            outcome,
+            book_id,
+            record.screen,
+        );
+        esp_println::println!(
+            "bench: store_global_state ok={} book_id={} page={} t_ms={}",
+            stored,
+            book_id,
+            record.screen,
+            Instant::now().as_millis(),
+        );
+    }
+    send_loaded_library_event(&LibraryEvent::Loaded {
         book_id,
-        chapter,
-        page: target_pages as u32,
-        // The book is loaded here, so carry its known total page count.
-        page_count: request.page_count,
-        reading_orientation: request.orientation as u8,
-        refresh_policy: request.refresh_policy as u8,
-        font_size: request.font_size as u8,
-        line_spacing: request.line_spacing as u8,
-        font_weight: request.font_weight as u8,
-        font_family: request.font_family as u8,
-        front_buttons: request.front_buttons as u8,
+        pages: sd_library.advertised_page_count(),
+        chapters: sd_library.chapter_count_for_ui(),
+        current_chapter: sd_library.current_chapter(),
+        chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+        position,
     });
 }
 
@@ -1113,6 +1222,40 @@ fn ensure_epub_scratch<'a>(
 
 fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
     library.source_identity(book_id)
+}
+
+/// The on-card record for a state the app persisted, with the fields only the
+/// firmware knows filled in.
+///
+/// The reducer derives chapter from the 128-capped `sd_chapter_for_page`, so a
+/// deep position would save a stuck chapter that the sleep/boot colophon then
+/// shows wrong until the book reopens. The firmware tracks the true chapter
+/// over the whole book; adopt it for the loaded SD book so saved and restored
+/// state name the chapter right.
+fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppStateRecord {
+    let (source_hash, source_size) = source_identity(library, state.book_id);
+    let chapter = if ReaderSource::from_book_id(state.book_id).is_sd()
+        && library.loaded_index == ReaderStore::selected_book_index(state.book_id)
+    {
+        library.current_chapter()
+    } else {
+        state.chapter
+    };
+    AppStateRecord {
+        book_id: state.book_id,
+        chapter,
+        screen: state.screen,
+        shell_orientation: state.shell_orientation,
+        reading_orientation: state.reading_orientation,
+        refresh_policy: state.refresh_policy,
+        font_size: state.font_size,
+        line_spacing: state.line_spacing,
+        font_weight: state.font_weight,
+        font_family: state.font_family,
+        front_buttons: state.front_buttons,
+        source_hash,
+        source_size,
+    }
 }
 
 /// One boot-time attempt to map durable reader state back onto the scanned

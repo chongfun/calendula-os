@@ -376,6 +376,64 @@ pub(crate) fn store_app_state(
     .is_some_and(|result| result.is_ok())
 }
 
+/// Writes only the departing book's position file, leaving the global state
+/// file naming whichever book is still active.
+///
+/// The first step of a book-open transaction. It has to be separable from the
+/// global write: until the new book is actually open there is no correct value
+/// to put in the state file, and writing the old book's position through
+/// [`store_app_state`] would point the next boot at a book the reader is in the
+/// middle of leaving.
+///
+/// A book whose catalog entry cannot be resolved reports failure rather than
+/// quietly writing nothing — the transaction treats a silent no-op as a lost
+/// page, which is exactly what it exists to prevent. Built-in books have no
+/// position file and owe nothing, so they succeed.
+#[inline(never)]
+pub(crate) fn store_book_position(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    record: AppStateRecord,
+) -> bool {
+    let Some(index) = app_core::ReaderSource::from_book_id(record.book_id).sd_index() else {
+        return true;
+    };
+    let Some(entry) = library.catalog_entry(index as usize) else {
+        esp_println::println!(
+            "storage: no catalog entry for departing book_id={} index={}",
+            record.book_id,
+            index
+        );
+        return false;
+    };
+    let key = proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size);
+    sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::write_position_file(root, key.as_str(), record.chapter, record.screen)
+    })
+    .ok()
+    .is_some_and(|result| result.is_ok())
+}
+
+/// Writes only the global state file: which book is active, and the reader
+/// settings that travel with it.
+///
+/// The last step of a book-open transaction. The book's own position file was
+/// already written when it was last read, and the open resolved the position
+/// from it, so rewriting it here would only copy it back onto itself.
+#[inline(never)]
+pub(crate) fn store_global_state(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    record: AppStateRecord,
+) -> bool {
+    sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::write_state_file(root, record)
+    })
+    .ok()
+    .is_some_and(|result| result.is_ok())
+}
+
 /// The saved per-book position for a catalog entry, if any.
 #[inline(never)]
 pub(crate) fn load_position(

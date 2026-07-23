@@ -4,12 +4,30 @@ use crate::{
     LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS, SYNC_COMMANDS,
     SYNC_EVENTS,
 };
-use app_core::{AppView, ReaderState, ReducerContext, SyncStatus};
+use app_core::{
+    extend_section_command, storage_command_for_transition, AppView, BookOpenRollback, ReaderState,
+    ReducerContext, SyncStatus,
+};
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select4, Either4};
 use embassy_time::{Duration, Instant};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
+
+/// Storage commands the channel could not take yet, in arrival order.
+///
+/// Two slots is what a single input transition can produce: one navigation
+/// command (open, extend, chapter list, jump) and one deferred write —
+/// progress or a credentials forget, never both, since a transition that
+/// moves the saved position is not the Wireless-screen confirm.
+///
+/// Nothing parked here is irreplaceable. The departing book's position, which
+/// used to travel as its own command and could be separated from the open it
+/// belonged to, now rides inside that open; what is left is a progress record
+/// the next page turn reissues. The slots exist to smooth a momentarily full
+/// channel, not to guarantee delivery.
+const PARKED_STORAGE_SLOTS: usize = 2;
+type ParkedStorage = heapless::Vec<StorageCommand, PARKED_STORAGE_SLOTS>;
 
 #[embassy_executor::task]
 pub async fn run() {
@@ -27,12 +45,15 @@ pub async fn run() {
     let mut rendering = false;
     let mut render_pending = false;
     let mut catalog_refresh_requested = true;
-    let mut pending_storage: Option<StorageCommand> = None;
+    let mut pending_storage = ParkedStorage::new();
     // Type settings changed while away from Reading: the loaded section is
     // paginated under the old layout, so the next entry into Reading must
     // send an extend even though page and chapter are unchanged.
     let mut reader_relayout_pending = false;
     let mut opening_book: Option<u32> = None;
+    // Where to put the reader back if the inflight open aborts. Set only for
+    // a book change, the one open that has somewhere else to return to.
+    let mut open_rollback: Option<BookOpenRollback> = None;
     let mut suppress_input_until_open_settled = false;
     let mut block_confirm_until: Option<Instant> = None;
     // Defer the first paint. ReaderState::boot() defaults to the built-in guide
@@ -115,20 +136,39 @@ pub async fn run() {
                 {
                     reader_relayout_pending = true;
                 }
-                let mut storage_command = storage_command_for_transition(&previous, &state);
+                // Allocate the id speculatively and only commit it if a command
+                // actually goes out: bumping the counter for a transition that
+                // sends nothing would make an inflight open look stale, and the
+                // storage task would skip it without ever answering.
+                let request_id = peek_reader_request_id();
+                let mut storage_command =
+                    storage_command_for_transition(&previous, &state, request_id);
                 if storage_command.is_none()
                     && reader_relayout_pending
                     && state.view == AppView::Reading
                 {
                     if let Some(index) = ReaderSource::from_book_id(state.book_id).sd_index() {
-                        storage_command = Some(extend_section_command(&state, index));
+                        storage_command = Some(extend_section_command(&state, index, request_id));
                     }
                 }
                 if storage_command.is_some() {
                     // Open/extend commands carry the current type settings,
                     // so any dispatched command syncs the reader store.
                     reader_relayout_pending = false;
+                    commit_reader_request_id(request_id);
                 }
+                // A book change closes out the departing book inside its own
+                // open. The separate progress record that used to follow named
+                // the *new* book, so it wrote that book's position file at the
+                // page the open had not resolved yet — erasing the very place
+                // the reader was about to resume from.
+                let open_owns_the_switch = matches!(
+                    storage_command,
+                    Some(StorageCommand::OpenBook {
+                        previous: Some(_),
+                        ..
+                    })
+                );
                 // The chapter overview can't paint its rows until the on-disk
                 // list lands; hold the current frame and let the Loaded event
                 // render once, rather than flashing a partial first frame and
@@ -137,38 +177,27 @@ pub async fn run() {
                 // Settled to be drained, so it must still render.
                 let mut awaiting_chapter_list = false;
                 if let Some(command) = storage_command {
-                    if should_send_storage_immediately(command) {
-                        log_storage_command("send", command);
-                        if let Some(book_id) = open_book_id(command) {
-                            opening_book = Some(book_id);
-                            suppress_input_until_open_settled = true;
-                        }
-                        if STORAGE_COMMANDS.try_send(command).is_err() {
-                            log_storage_command("queue", command);
-                            pending_storage = Some(command);
-                        } else if matches!(command, StorageCommand::LoadChapters { .. }) {
-                            awaiting_chapter_list = true;
-                        }
-                    } else {
-                        log_storage_command("queue", command);
-                        if let Some(book_id) = open_book_id(command) {
-                            opening_book = Some(book_id);
-                            suppress_input_until_open_settled = true;
-                        }
-                        pending_storage = Some(command);
+                    if let Some(book_id) = open_book_id(command) {
+                        opening_book = Some(book_id);
+                        suppress_input_until_open_settled = true;
+                        // Only a switch can abort, and only a switch has a
+                        // book to go back to.
+                        open_rollback = open_owns_the_switch.then(|| previous.open_rollback());
+                    }
+                    if dispatch_storage(&mut pending_storage, command)
+                        && matches!(command, StorageCommand::LoadChapters { .. })
+                    {
+                        awaiting_chapter_list = true;
                     }
                 }
-                if previous_persisted != next_persisted {
-                    let command = StorageCommand::StoreProgress(next_persisted);
-                    if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
-                        pending_storage = Some(command);
-                    }
+                if previous_persisted != next_persisted && !open_owns_the_switch {
+                    dispatch_storage(
+                        &mut pending_storage,
+                        StorageCommand::StoreProgress(next_persisted),
+                    );
                 }
                 if let Some(command) = forget_command_for_transition(&previous, &state) {
-                    log_storage_command("send", command);
-                    if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
-                        pending_storage = Some(command);
-                    }
+                    dispatch_storage(&mut pending_storage, command);
                 }
                 if let Some(command) = sync_command_for_transition(&previous, &state) {
                     esp_println::println!("app: sync command {:?}", command);
@@ -207,14 +236,12 @@ pub async fn run() {
                             esp_println::println!("app: storage queue full for catalog cache");
                         }
                     }
-                    if let Some(command) = pending_storage.take() {
-                        log_storage_command("send", command);
-                        if let Some(book_id) = open_book_id(command) {
-                            opening_book = Some(book_id);
-                            suppress_input_until_open_settled = true;
-                        }
-                        STORAGE_COMMANDS.send(command).await;
-                    }
+                    drain_parked_storage(
+                        &mut pending_storage,
+                        &mut opening_book,
+                        &mut suppress_input_until_open_settled,
+                    )
+                    .await;
                     if render_pending {
                         send_render(RenderKind::Page, &state).await;
                         rendering = true;
@@ -258,17 +285,15 @@ pub async fn run() {
                     render_pending = false;
                     // This failure ends the display cycle the same way
                     // Settled would, and it is the only other drain point
-                    // for the parked storage command: a queued book open
+                    // for the parked storage commands: a queued book open
                     // left in pending_storage would otherwise hold
                     // opening_book forever and suppress every input.
-                    if let Some(command) = pending_storage.take() {
-                        log_storage_command("send", command);
-                        if let Some(book_id) = open_book_id(command) {
-                            opening_book = Some(book_id);
-                            suppress_input_until_open_settled = true;
-                        }
-                        STORAGE_COMMANDS.send(command).await;
-                    }
+                    drain_parked_storage(
+                        &mut pending_storage,
+                        &mut opening_book,
+                        &mut suppress_input_until_open_settled,
+                    )
+                    .await;
                     // Loaded may already have cleared opening_book before
                     // this failure discarded its render; without Settled
                     // ever arriving, the suppression flag must be released
@@ -281,18 +306,14 @@ pub async fn run() {
                     }
                 }
                 DisplayEvent::Library(event) => {
-                    if let Some(book_id) = loaded_book_id(&event) {
-                        if opening_book == Some(book_id) {
-                            opening_book = None;
-                        }
-                    }
-                    let should_render = if boot_render_pending {
-                        library_event_allows_first_render(&event)
-                    } else {
-                        library_event_affects_view(&state, &event)
-                    };
-                    state = state.apply_library_event(ctx, event);
-                    if !should_render {
+                    if !fold_library_event(
+                        ctx,
+                        &mut state,
+                        &mut opening_book,
+                        &mut open_rollback,
+                        boot_render_pending,
+                        &event,
+                    ) {
                         continue;
                     }
                     if rendering {
@@ -305,18 +326,14 @@ pub async fn run() {
                 }
             },
             Either4::Third(event) => {
-                if let Some(book_id) = loaded_book_id(&event) {
-                    if opening_book == Some(book_id) {
-                        opening_book = None;
-                    }
-                }
-                let should_render = if boot_render_pending {
-                    library_event_allows_first_render(&event)
-                } else {
-                    library_event_affects_view(&state, &event)
-                };
-                state = state.apply_library_event(ctx, event);
-                if !should_render {
+                if !fold_library_event(
+                    ctx,
+                    &mut state,
+                    &mut opening_book,
+                    &mut open_rollback,
+                    boot_render_pending,
+                    &event,
+                ) {
                     continue;
                 }
                 if rendering {
@@ -355,6 +372,50 @@ fn first_render_kind(boot_render_pending: &mut bool) -> RenderKind {
     }
 }
 
+/// Folds a library event into reader state and reports whether it owes a
+/// render. Shared by the two arms that deliver library events — the display
+/// event channel and the direct library channel — which must treat them
+/// identically.
+fn fold_library_event(
+    ctx: ReducerContext,
+    state: &mut ReaderState,
+    opening_book: &mut Option<u32>,
+    open_rollback: &mut Option<BookOpenRollback>,
+    boot_render_pending: bool,
+    event: &crate::LibraryEvent,
+) -> bool {
+    if let crate::LibraryEvent::BookOpenFailed { book_id } = *event {
+        // The book was never opened, so the reader has to land back on the
+        // one it was reading rather than sit on a title the storage task
+        // refused. Always repaints: the screen is currently showing the open
+        // that is not going to happen.
+        if *opening_book == Some(book_id) {
+            *opening_book = None;
+        }
+        if let Some(rollback) = open_rollback.take() {
+            esp_println::println!(
+                "app: book open failed book_id={book_id}; back to book_id={}",
+                rollback.book_id
+            );
+            *state = state.restore_after_failed_open(rollback);
+        }
+        return true;
+    }
+    if let Some(book_id) = loaded_book_id(event) {
+        if *opening_book == Some(book_id) {
+            *opening_book = None;
+            *open_rollback = None;
+        }
+    }
+    let should_render = if boot_render_pending {
+        library_event_allows_first_render(event)
+    } else {
+        library_event_affects_view(state, event)
+    };
+    *state = state.apply_library_event(ctx, *event);
+    should_render
+}
+
 fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) -> bool {
     match *event {
         crate::LibraryEvent::Scanned { count } => {
@@ -366,7 +427,10 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
             chapters: _,
             current_chapter: _,
             chapter_pages: _,
+            position: _,
         } => state.book_id == book_id,
+        // Handled before the reducer; never reaches here.
+        crate::LibraryEvent::BookOpenFailed { .. } => true,
         crate::LibraryEvent::ChapterPage {
             book_id,
             chapter,
@@ -394,14 +458,42 @@ fn library_event_allows_first_render(event: &crate::LibraryEvent) -> bool {
     )
 }
 
-fn should_send_storage_immediately(command: StorageCommand) -> bool {
-    matches!(
-        command,
-        StorageCommand::OpenBook { .. }
-            | StorageCommand::ExtendSection { .. }
-            | StorageCommand::LoadChapters { .. }
-            | StorageCommand::JumpChapter { .. }
-    )
+/// Sends `command`, or parks it behind whatever is already waiting.
+///
+/// Nothing may overtake a parked command. The storage task applies commands
+/// in arrival order, so a progress record that slipped past a parked open
+/// would land after the new book was opened and point the global state file
+/// back at the book the reader had just left.
+///
+/// Returns whether the command reached the channel.
+fn dispatch_storage(parked: &mut ParkedStorage, command: StorageCommand) -> bool {
+    if parked.is_empty() && STORAGE_COMMANDS.try_send(command).is_ok() {
+        log_storage_command("send", command);
+        return true;
+    }
+    match parked.push(command) {
+        Ok(()) => log_storage_command("queue", command),
+        Err(_) => log_storage_command("dropped", command),
+    }
+    false
+}
+
+/// Hands every parked command to the storage task in arrival order, blocking
+/// on each so a full channel defers the drain rather than losing it.
+async fn drain_parked_storage(
+    parked: &mut ParkedStorage,
+    opening_book: &mut Option<u32>,
+    suppress_input_until_open_settled: &mut bool,
+) {
+    while !parked.is_empty() {
+        let command = parked.remove(0);
+        log_storage_command("send", command);
+        if let Some(book_id) = open_book_id(command) {
+            *opening_book = Some(book_id);
+            *suppress_input_until_open_settled = true;
+        }
+        STORAGE_COMMANDS.send(command).await;
+    }
 }
 
 fn open_book_id(command: StorageCommand) -> Option<u32> {
@@ -449,9 +541,11 @@ fn log_storage_command(label: &str, command: StorageCommand) {
             index,
             chapter,
             target_pages,
+            previous,
             ..
         } => esp_println::println!(
-            "app: storage {label} open request={request_id} book_id={book_id} index={index} chapter={chapter} target={target_pages}"
+            "app: storage {label} open request={request_id} book_id={book_id} index={index} chapter={chapter} target={target_pages} closing={}",
+            previous.map_or(0, |state| state.book_id)
         ),
         StorageCommand::ExtendSection {
             request_id,
@@ -539,100 +633,19 @@ fn forget_command_for_transition(
         .then_some(StorageCommand::ForgetWifiCredentials)
 }
 
-fn storage_command_for_transition(
-    previous: &ReaderState,
-    next: &ReaderState,
-) -> Option<StorageCommand> {
-    let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
-    // Entering the overview loads the full chapter list into the section
-    // buffer; the reading section reloads on exit.
-    if next.view == AppView::Chapters && previous.view != AppView::Chapters {
-        return Some(load_chapters_command(next, index));
-    }
-    if next.view != AppView::Reading {
-        return None;
-    }
-
-    if previous.book_id != next.book_id {
-        return Some(open_book_command(next, index));
-    }
-
-    if previous.view != AppView::Reading {
-        if previous.view == AppView::Chapters {
-            // The buffer held the TOC, so the section always reloads. A new
-            // chapter selection resolves its page from the on-disk TOC; a
-            // plain back-out just reloads the page we left.
-            return if next.chapter != previous.chapter {
-                Some(jump_chapter_command(next, index))
-            } else {
-                Some(extend_section_command(next, index))
-            };
-        }
-        // An unchanged book id no longer proves the store holds its
-        // pages: boot restore and the scan default set the active book
-        // without loading anything. Entering Reading always requests
-        // the section; an already-loaded book answers from RAM without
-        // an SD session.
-        return Some(open_book_command(next, index));
-    }
-
-    if previous.page != next.page || previous.chapter != next.chapter {
-        return Some(extend_section_command(next, index));
-    }
-
-    None
-}
-
-fn open_book_command(state: &ReaderState, index: u16) -> StorageCommand {
-    let request_id = next_reader_request_id();
-    StorageCommand::OpenBook {
-        request_id,
-        book_id: state.book_id,
-        index,
-        chapter: state.chapter,
-        target_pages: state.page.min(u16::MAX as u32) as u16,
-        type_settings: state.type_settings(),
-        portrait: app_core::is_portrait(state.orientation),
-    }
-}
-
-fn extend_section_command(state: &ReaderState, index: u16) -> StorageCommand {
-    let request_id = next_reader_request_id();
-    StorageCommand::ExtendSection {
-        request_id,
-        book_id: state.book_id,
-        index,
-        chapter: state.chapter,
-        target_pages: state.page.min(u16::MAX as u32) as u16,
-        type_settings: state.type_settings(),
-        portrait: app_core::is_portrait(state.orientation),
-    }
-}
-
-fn load_chapters_command(state: &ReaderState, index: u16) -> StorageCommand {
-    StorageCommand::LoadChapters {
-        request_id: next_reader_request_id(),
-        book_id: state.book_id,
-        index,
-    }
-}
-
-fn jump_chapter_command(state: &ReaderState, index: u16) -> StorageCommand {
-    StorageCommand::JumpChapter {
-        request_id: next_reader_request_id(),
-        book_id: state.book_id,
-        index,
-        chapter: state.chapter,
-        type_settings: state.type_settings(),
-        portrait: app_core::is_portrait(state.orientation),
-    }
-}
-
-fn next_reader_request_id() -> u32 {
-    let next = LATEST_READER_REQUEST_ID
+/// Reserves the next reader request id without publishing it.
+///
+/// Publishing is a separate step because the id is how the storage task
+/// recognises a stale request: bumping the counter for a transition that ends
+/// up sending nothing would strand an open already in flight, which would be
+/// skipped as stale and never answer with the `Loaded` the app is waiting on.
+fn peek_reader_request_id() -> u32 {
+    LATEST_READER_REQUEST_ID
         .load(Ordering::Relaxed)
         .wrapping_add(1)
-        .max(1);
-    LATEST_READER_REQUEST_ID.store(next, Ordering::Relaxed);
-    next
+        .max(1)
+}
+
+fn commit_reader_request_id(request_id: u32) {
+    LATEST_READER_REQUEST_ID.store(request_id, Ordering::Relaxed);
 }
