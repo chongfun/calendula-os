@@ -49,6 +49,17 @@ static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; M
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PendingWrite {
+    Progress(AppStateRecord),
+    Switch {
+        previous: AppStateRecord,
+        next: AppStateRecord,
+        pos_stored: bool,
+        state_stored: bool,
+    },
+}
+
 #[embassy_executor::task]
 pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool) {
     esp_println::println!("display: started");
@@ -73,7 +84,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     // reset, or a sleep whose final flush failed — leaves the seed false and
     // keeps the full waveform for unknown panel contents.
     let mut refresh_planner = RefreshPlanner::new().with_panel_shows_sleep_screen(deep_sleep_wake);
-    let mut pending_progress: Option<AppStateRecord> = None;
+    let _display_last_touched = Instant::now();
+    let mut pending_write: heapless::Vec<PendingWrite, 2> = heapless::Vec::new();
     let mut last_progress_write: Option<Instant> = None;
     // Durable state is consulted once per boot, after the first catalog with
     // entries lands; later catalog refreshes must not yank reading state.
@@ -301,11 +313,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
                 );
-                if !flush_pending_progress(
+                if !flush_pending_write(
                     &mut epd,
                     &mut sd_cs,
                     sd_library,
-                    &mut pending_progress,
+                    &mut pending_write,
                     &mut last_progress_write,
                 ) {
                     // Sleeping now would drop the coalesced position for
@@ -319,12 +331,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     continue;
                 }
                 let request = refresh_planner.last_request().or_else(|| {
-                    sleep_request_from_saved_state(
-                        &mut epd,
-                        &mut sd_cs,
-                        sd_library,
-                        &pending_progress,
-                    )
+                    sleep_request_from_saved_state(&mut epd, &mut sd_cs, sd_library, &pending_write)
                 });
                 if let Some(request) = request {
                     crate::views::render_sleep(fb, request, sd_library);
@@ -461,7 +468,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     font_metrics,
                     &mut epub_scratch,
                     &mut sync_session,
-                    &mut pending_progress,
+                    &mut pending_write,
                     &mut last_progress_write,
                     &mut state_restored,
                     refresh_planner.last_request(),
@@ -562,7 +569,7 @@ fn handle_storage_command(
     font_metrics: &mut crate::custom_font::MetricCache,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     sync_session: &mut SyncSession,
-    pending_progress: &mut Option<AppStateRecord>,
+    pending_write: &mut heapless::Vec<PendingWrite, 2>,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
     last_request: Option<RenderRequest>,
@@ -579,13 +586,7 @@ fn handle_storage_command(
         StorageCommand::LoanSyncMemory => {
             // The session only ends in a reset, so any coalesced position
             // must reach the card before the scratch is dismantled.
-            if !flush_pending_progress(
-                epd,
-                sd_cs,
-                sd_library,
-                pending_progress,
-                last_progress_write,
-            ) {
+            if !flush_pending_write(epd, sd_cs, sd_library, pending_write, last_progress_write) {
                 // The wifi task is blocked on this answer; a silent return
                 // would strand it (and the Wireless screen) forever. Refuse
                 // observably so it can report the failure and re-park.
@@ -901,82 +902,117 @@ fn handle_storage_command(
         }
         StorageCommand::StoreProgress(record) => {
             let record = record_for_persisted(sd_library, record);
-            // Coalesce same-context page turns; anything beyond the screen
-            // number changing (book, chapter, orientation, policy) is rare
-            // and worth landing immediately. A pending record for the same
-            // book is superseded by the new one; only a different book's
-            // pending position must be preserved first.
-            let context_changed = pending_progress
-                .map(|pending| {
-                    AppStateRecord {
-                        screen: record.screen,
-                        ..pending
-                    } != record
-                })
-                .unwrap_or(false);
+
+            let mut coalesced = false;
+            if let Some(PendingWrite::Switch {
+                next, state_stored, ..
+            }) = pending_write.last_mut()
+            {
+                if next.book_id == record.book_id {
+                    *next = record;
+                    *state_stored = false;
+                    coalesced = true;
+                    esp_println::println!("bench: storage_progress action=coalesce_into_switch book_id={} page={} t_ms={}", record.book_id, record.screen, Instant::now().as_millis());
+                }
+            }
+
+            if !coalesced {
+                if let Some(PendingWrite::Progress(pending)) = pending_write.last_mut() {
+                    if pending.book_id == record.book_id {
+                        let context_changed = AppStateRecord {
+                            screen: record.screen,
+                            ..*pending
+                        } != record;
+                        if !context_changed {
+                            *pending = record;
+                            coalesced = true;
+                            esp_println::println!("bench: storage_progress action=coalesce book_id={} page={} t_ms={}", record.book_id, record.screen, Instant::now().as_millis());
+                        }
+                    }
+                }
+            }
+
             let due = last_progress_write
                 .map(|written| written.elapsed().as_secs() >= PROGRESS_WRITE_MIN_SECS)
                 .unwrap_or(true);
-            if pending_progress
-                .map(|pending| pending.book_id != record.book_id)
-                .unwrap_or(false)
-                && !flush_pending_progress(
-                    epd,
-                    sd_cs,
-                    sd_library,
-                    pending_progress,
-                    last_progress_write,
-                )
-            {
-                // The other book's position couldn't land; overwriting the
-                // pending record now would silently discard it.
-                esp_println::println!(
-                    "storage: progress context switch deferred after write failure"
-                );
-                return;
-            }
-            if context_changed || due {
-                let progress_start = Instant::now();
-                let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
-                if stored {
-                    *pending_progress = None;
-                    *last_progress_write = Some(Instant::now());
-                } else {
-                    *pending_progress = Some(record);
+
+            if !coalesced {
+                if pending_write.is_full()
+                    && !flush_pending_write(
+                        epd,
+                        sd_cs,
+                        sd_library,
+                        pending_write,
+                        last_progress_write,
+                    )
+                {
+                    esp_println::println!(
+                        "storage: progress deferred after write failure (queue full)"
+                    );
+                    return;
                 }
-                esp_println::println!(
-                    "bench: storage_progress action=write ok={} book_id={} page={} elapsed_ms={} t_ms={}",
-                    stored,
-                    record.book_id,
-                    record.screen,
-                    progress_start.elapsed().as_millis(),
-                    Instant::now().as_millis(),
-                );
-            } else {
-                *pending_progress = Some(record);
-                esp_println::println!(
-                    "bench: storage_progress action=coalesce book_id={} page={} t_ms={}",
-                    record.book_id,
-                    record.screen,
-                    Instant::now().as_millis(),
-                );
+
+                if due {
+                    let progress_start = Instant::now();
+                    let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
+                    if stored {
+                        *last_progress_write = Some(Instant::now());
+                    } else {
+                        let _ = pending_write.push(PendingWrite::Progress(record));
+                    }
+                    esp_println::println!(
+                        "bench: storage_progress action=write ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+                        stored,
+                        record.book_id,
+                        record.screen,
+                        progress_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
+                } else {
+                    let _ = pending_write.push(PendingWrite::Progress(record));
+                    esp_println::println!(
+                        "bench: storage_progress action=enqueue book_id={} page={} t_ms={}",
+                        record.book_id,
+                        record.screen,
+                        Instant::now().as_millis(),
+                    );
+                }
             }
         }
         StorageCommand::StoreBookSwitch { previous, next } => {
             let record_prev = record_for_persisted(sd_library, previous);
             let record_next = record_for_persisted(sd_library, next);
-            // Write the previous book's progress to its position file first.
-            // If there was a pending progress save for the same book, clear it.
-            if pending_progress
-                .map(|pending| pending.book_id == record_prev.book_id)
-                .unwrap_or(false)
+
+            if pending_write.is_full()
+                && !flush_pending_write(epd, sd_cs, sd_library, pending_write, last_progress_write)
             {
-                *pending_progress = None;
+                esp_println::println!(
+                    "storage: dropping oldest pending state to make room for new switch"
+                );
+                if !pending_write.is_empty() {
+                    pending_write.remove(0);
+                }
             }
+
             let progress_start = Instant::now();
             let stored_pos = reader_cache::store_book_position(epd, sd_cs, sd_library, record_prev);
-            // Write the new book as the active state in STATE.BIN.
-            let stored_state = reader_cache::store_global_state(epd, sd_cs, record_next);
+            let stored_state = if stored_pos {
+                reader_cache::store_global_state(epd, sd_cs, record_next)
+            } else {
+                false
+            };
+
+            if stored_pos && stored_state {
+                *last_progress_write = Some(Instant::now());
+            } else {
+                let _ = pending_write.push(PendingWrite::Switch {
+                    previous: record_prev,
+                    next: record_next,
+                    pos_stored: stored_pos,
+                    state_stored: stored_state,
+                });
+            }
+
             esp_println::println!(
                 "bench: store_book_switch action=write ok_pos={} ok_state={} prev_book_id={} next_book_id={} elapsed_ms={} t_ms={}",
                 stored_pos,
@@ -1176,9 +1212,19 @@ fn sleep_request_from_saved_state(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
-    pending_progress: &Option<AppStateRecord>,
+    pending_write: &heapless::Vec<PendingWrite, 2>,
 ) -> Option<RenderRequest> {
-    let record = match *pending_progress {
+    let mut recent_record = None;
+    for p in pending_write.iter().rev() {
+        match p {
+            PendingWrite::Progress(record) => recent_record = Some(*record),
+            PendingWrite::Switch { next, .. } => recent_record = Some(*next),
+        }
+        if recent_record.is_some() {
+            break;
+        }
+    }
+    let record = match recent_record {
         Some(record) => record,
         None => reader_cache::load_app_state(epd, sd_cs)?,
     };
@@ -1230,32 +1276,74 @@ fn sleep_request_from_saved_state(
     })
 }
 
-fn flush_pending_progress(
+fn flush_pending_write(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     sd_library: &ReaderStore,
-    pending_progress: &mut Option<AppStateRecord>,
+    pending_write: &mut heapless::Vec<PendingWrite, 2>,
     last_progress_write: &mut Option<Instant>,
 ) -> bool {
-    if let Some(record) = *pending_progress {
-        let start = Instant::now();
-        let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
-        if stored {
-            *pending_progress = None;
-            *last_progress_write = Some(Instant::now());
+    let mut all_cleared = true;
+
+    while !pending_write.is_empty() {
+        let cleared = match &mut pending_write[0] {
+            PendingWrite::Progress(record) => {
+                let start = Instant::now();
+                let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, *record);
+                if stored {
+                    *last_progress_write = Some(Instant::now());
+                }
+                esp_println::println!(
+                    "bench: storage_progress action=flush ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+                    stored,
+                    record.book_id,
+                    record.screen,
+                    start.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
+                stored
+            }
+            PendingWrite::Switch {
+                previous,
+                next,
+                pos_stored,
+                state_stored,
+            } => {
+                let start = Instant::now();
+                if !*pos_stored {
+                    *pos_stored =
+                        reader_cache::store_book_position(epd, sd_cs, sd_library, *previous);
+                }
+                if *pos_stored && !*state_stored {
+                    *state_stored = reader_cache::store_global_state(epd, sd_cs, *next);
+                }
+
+                let all_stored = *pos_stored && *state_stored;
+                if all_stored {
+                    *last_progress_write = Some(Instant::now());
+                }
+                esp_println::println!(
+                    "bench: storage_switch action=flush ok_pos={} ok_state={} prev_book_id={} next_book_id={} elapsed_ms={} t_ms={}",
+                    *pos_stored,
+                    *state_stored,
+                    previous.book_id,
+                    next.book_id,
+                    start.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
+                all_stored
+            }
+        };
+
+        if cleared {
+            pending_write.remove(0);
+        } else {
+            all_cleared = false;
+            break;
         }
-        esp_println::println!(
-            "bench: storage_progress action=flush ok={} book_id={} page={} elapsed_ms={} t_ms={}",
-            stored,
-            record.book_id,
-            record.screen,
-            start.elapsed().as_millis(),
-            Instant::now().as_millis(),
-        );
-        stored
-    } else {
-        true
     }
+
+    all_cleared
 }
 
 fn record_for_persisted(sd_library: &ReaderStore, record: PersistedAppState) -> AppStateRecord {
