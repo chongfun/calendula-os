@@ -313,10 +313,30 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // Bounded by the channel's own depth: draining is only ever
                 // catching up on what was already accepted, never following a
                 // producer that keeps writing.
+                let mut upload_queued = false;
                 for _ in 0..STORAGE_COMMANDS.capacity() {
                     let Ok(command) = STORAGE_COMMANDS.try_receive() else {
                         break;
                     };
+                    if matches!(command, StorageCommand::ReceiveUpload) {
+                        // Not ours to apply. This one is answered by the task
+                        // loop, which hands the card to `upload_session` for
+                        // the rest of the session; its arm inside
+                        // `handle_storage_command` is a no-op, so draining it
+                        // here would discard the only signal that starts the
+                        // writer. The browser would then wait forever on a
+                        // session that never opened, with
+                        // `UPLOAD_SESSION_ACTIVE` still set.
+                        //
+                        // Put it back and refuse this sleep. The loop picks it
+                        // up next, and `upload_session` does its own sleep
+                        // handling: it closes the filesystem, interrupts the
+                        // producer, and re-queues this same generation so the
+                        // power task still recognises the acknowledgement.
+                        let _ = STORAGE_COMMANDS.try_send(command);
+                        upload_queued = true;
+                        break;
+                    }
                     esp_println::println!("storage: draining before sleep");
                     handle_storage_command(
                         command,
@@ -330,6 +350,12 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         &mut last_progress_write,
                         &mut state_restored,
                     );
+                }
+                if upload_queued {
+                    esp_println::println!("display: sleep deferred; upload session pending");
+                    send_required_display_event(&DisplayEvent::SleepFailed);
+                    send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
+                    continue;
                 }
                 if !flush_pending_progress(
                     &mut epd,
