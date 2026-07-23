@@ -28,8 +28,8 @@ use embassy_time::{with_timeout, Duration, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
 use esp_radio::wifi::{
-    ap::AccessPointConfig, sta::StationConfig, AuthenticationMethod, Config as WifiConfig,
-    ControllerConfig, Interface, WifiController,
+    ap::AccessPointConfig, scan::ScanConfig, sta::StationConfig, AuthenticationMethod,
+    Config as WifiConfig, ControllerConfig, Interface, WifiController,
 };
 use proto::captive;
 
@@ -648,21 +648,29 @@ async fn stream_book(
 // Onboarding portal
 // ------------------------------------------------------------------
 
-const PORTAL_PAGE: &str = concat!(
+/// The credential form, served in three pieces so the nearby-network
+/// `<option>` list (scanned once at portal start, HTML-escaped, held in a
+/// loaned buffer) can sit between the static prefix and suffix.
+const PORTAL_PAGE_PREFIX: &str = concat!(
     "<!doctype html><html><head>",
     "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
     "<title>CalendulaOS</title>",
     "<style>body{font-family:Georgia,serif;margin:2.5em auto;max-width:22em;",
     "padding:0 1em;color:#222}h1{font-size:1.25em;letter-spacing:.08em}",
     "label{display:block;margin:1em 0 .2em}",
-    "input{width:100%;font-size:1.05em;padding:.5em;border:1px solid #999;",
+    "input,select{width:100%;font-size:1.05em;padding:.5em;border:1px solid #999;",
     "border-radius:4px;box-sizing:border-box}",
     "button{margin-top:1.2em;font-size:1.05em;padding:.6em 1.6em;",
     "border:1px solid #222;background:#222;color:#fff;border-radius:4px}",
     "</style></head><body><h1>CalendulaOS</h1>",
     "<p>Connect this reader to your Wi-Fi network.</p>",
     "<form method=post action=/save>",
-    "<label>Network name</label><input name=ssid maxlength=32 required>",
+    "<label>Network</label><select name=ssid>",
+);
+
+const PORTAL_PAGE_SUFFIX: &str = concat!(
+    "<option value=\"\">Other or hidden network</option></select>",
+    "<label>Other network name</label><input name=ssid_custom maxlength=32>",
     "<label>Password</label><input name=pass type=password maxlength=64>",
     "<button>Save</button></form></body></html>",
 );
@@ -692,6 +700,10 @@ async fn run_portal(
     http_a: &'static mut [u8],
     http_b: &'static mut [u8],
 ) -> ! {
+    // Scan while the controller is still unconfigured (scanning is not
+    // supported once it runs AP-only); a failed scan just leaves the
+    // dropdown with the manual-entry option.
+    let options_len = scan_network_options(controller, http_b).await;
     let psk = mint_portal_psk(Rng::new());
     let device = Interface::access_point();
     let config = WifiConfig::AccessPoint(
@@ -736,7 +748,7 @@ async fn run_portal(
         join3(
             dhcp_server(stack),
             dns_server(stack),
-            credential_portal(stack, tcp_rx, tcp_tx, http_a, http_b),
+            credential_portal(stack, tcp_rx, tcp_tx, http_a, http_b, options_len),
         ),
     )
     .await;
@@ -796,7 +808,8 @@ async fn credential_portal(
     tcp_rx: &'static mut [u8],
     tcp_tx: &'static mut [u8],
     request_buf: &'static mut [u8],
-    _spare: &'static mut [u8],
+    network_options: &'static mut [u8],
+    network_options_len: usize,
 ) -> ! {
     loop {
         let mut socket = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
@@ -822,8 +835,11 @@ async fn credential_portal(
             }
         };
 
-        let body = if saved { SAVED_PAGE } else { PORTAL_PAGE };
-        let _ = write_http_page(&mut socket, body).await;
+        if saved {
+            let _ = write_http_page(&mut socket, SAVED_PAGE).await;
+        } else {
+            let _ = write_portal_page(&mut socket, &network_options[..network_options_len]).await;
+        }
         socket.close();
         let _ = with_timeout(Duration::from_secs(2), socket.flush()).await;
     }
@@ -836,8 +852,14 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
         return false;
     }
     let mut ssid_buf = [0u8; 32];
+    let mut custom_ssid_buf = [0u8; 32];
     let mut pass_buf = [0u8; 64];
-    let ssid = captive::form_value(request.body, "ssid", &mut ssid_buf).unwrap_or("");
+    let selected = captive::form_value(request.body, "ssid", &mut ssid_buf).unwrap_or("");
+    let custom =
+        captive::form_value(request.body, "ssid_custom", &mut custom_ssid_buf).unwrap_or("");
+    // A typed name always wins; the dropdown's empty "other" option falls
+    // through to it naturally.
+    let ssid = if custom.is_empty() { selected } else { custom };
     let password = captive::form_value(request.body, "pass", &mut pass_buf).unwrap_or("");
     let Some(credentials) = WifiCredentials::from_strs(ssid, password) else {
         return false;
@@ -847,8 +869,117 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
     STORAGE_COMMANDS
         .send(StorageCommand::StoreWifiCredentials(credentials))
         .await;
+    if !crate::WIFI_STORAGE_RESULTS.receive().await {
+        // The card refused or corrupted the write; answering with the form
+        // again (not the success page) tells the user to retry.
+        esp_println::println!("portal: credential storage failed");
+        return false;
+    }
     send_event(SyncEvent::CredentialsSaved(ssid));
     true
+}
+
+/// Scan nearby networks into `out` as HTML-escaped `<option>` elements,
+/// strongest RSSI first, deduplicated by SSID; the byte count written is
+/// returned. Any failure or overflow just truncates the list — manual
+/// entry remains available through the suffix's "other" option.
+///
+/// Memory: `scan_async` collects the results into an `alloc::vec::Vec` on
+/// the Wi-Fi heap — at most 20 x 47-byte `AccessPointInfo` entries (~940
+/// bytes of initialized payload; the allocation itself may be larger
+/// since `Vec` growth and capacity are implementation-dependent), freed
+/// on return — which is permitted here because the portal runs
+/// inside the wireless session, the only phase where that allocator
+/// exists. The collection never spans an await (the scan completes before
+/// it is built; sorting and rendering are synchronous), so it adds
+/// nothing to the caller's async state.
+async fn scan_network_options(controller: &mut WifiController<'static>, out: &mut [u8]) -> usize {
+    let config = ScanConfig::default().with_max(20);
+    let Ok(mut networks) = controller.scan_async(&config).await else {
+        esp_println::println!("portal: network scan failed; manual entry remains available");
+        return 0;
+    };
+    networks.sort_by_key(|network| core::cmp::Reverse(network.signal_strength));
+    let mut at = 0usize;
+    for (index, network) in networks.iter().enumerate() {
+        // `as_str()` yields only the valid UTF-8 prefix of the raw SSID
+        // bytes; a truncated name would submit credentials for a different
+        // network, and the string-based station config cannot represent the
+        // full SSID anyway, so skip such entries.
+        let ssid = network.ssid.as_str();
+        if ssid.is_empty()
+            || ssid.len() != network.ssid.len()
+            || networks[..index].iter().any(|earlier| {
+                // Compare only against entries that pass the same UTF-8
+                // check; a skipped invalid SSID's valid prefix must not
+                // suppress a later legitimate network with that name.
+                let earlier_ssid = earlier.ssid.as_str();
+                earlier_ssid.len() == earlier.ssid.len() && earlier_ssid == ssid
+            })
+        {
+            continue;
+        }
+        let option_start = at;
+        if !push_bytes(out, &mut at, b"<option value=\"")
+            || !push_html_escaped(out, &mut at, ssid.as_bytes())
+            || !push_bytes(out, &mut at, b"\">")
+            || !push_html_escaped(out, &mut at, ssid.as_bytes())
+            || !push_bytes(out, &mut at, b"</option>")
+        {
+            // Drop the partial entry so the output ends after a complete
+            // `</option>` before the static suffix is appended.
+            at = option_start;
+            break;
+        }
+    }
+    esp_println::println!("portal: listed {} bytes of nearby networks", at);
+    at
+}
+
+fn push_html_escaped(out: &mut [u8], at: &mut usize, value: &[u8]) -> bool {
+    for byte in value.iter().copied() {
+        let escaped: &[u8] = match byte {
+            b'&' => b"&amp;",
+            b'<' => b"&lt;",
+            b'>' => b"&gt;",
+            b'\"' => b"&quot;",
+            b'\'' => b"&#39;",
+            _ => core::slice::from_ref(&byte),
+        };
+        if !push_bytes(out, at, escaped) {
+            return false;
+        }
+    }
+    true
+}
+
+fn push_bytes(out: &mut [u8], at: &mut usize, value: &[u8]) -> bool {
+    let Some(end) = at.checked_add(value.len()) else {
+        return false;
+    };
+    if end > out.len() {
+        return false;
+    }
+    out[*at..end].copy_from_slice(value);
+    *at = end;
+    true
+}
+
+/// The portal form with the scanned network options spliced between its
+/// static prefix and suffix, under no-store so a stale list is never
+/// resurrected from browser cache.
+async fn write_portal_page(
+    socket: &mut TcpSocket<'_>,
+    options: &[u8],
+) -> Result<(), embassy_net::tcp::Error> {
+    write_all(
+        socket,
+        b"HTTP/1.1 200 OK\r\ncache-control: no-store\r\ncontent-type: text/html; charset=utf-8\r\nconnection: close\r\n\r\n",
+    )
+    .await?;
+    write_all(socket, PORTAL_PAGE_PREFIX.as_bytes()).await?;
+    write_all(socket, options).await?;
+    write_all(socket, PORTAL_PAGE_SUFFIX.as_bytes()).await
 }
 
 /// Accepts an existing 8.3 catalog open-name verbatim: short, printable

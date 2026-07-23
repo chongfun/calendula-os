@@ -159,6 +159,10 @@ pub static UPLOAD_STOPPED: Channel<CriticalSectionRawMutex, (), 1> = Channel::ne
 /// sleep resets before anything reads it. Wireless Exit doesn't raise it —
 /// that path ends in a reset behind the UPLOAD_STOPPED handshake.
 pub static UPLOAD_INTERRUPTS: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Whether a StoreWifiCredentials write landed AND read back identically
+/// through the boot-time read path; the portal waits on this before it
+/// may show the success page.
+pub static WIFI_STORAGE_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
 
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 static INPUT_EXECUTOR: StaticCell<InterruptExecutor<1>> = StaticCell::new();
