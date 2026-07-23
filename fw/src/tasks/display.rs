@@ -301,6 +301,36 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
                 );
+                // Finish queued storage work first. Deep sleep is terminal, so
+                // anything still in the channel goes with it -- and this loop
+                // takes display commands ahead of storage ones, so a Sleep
+                // routinely arrives in front of a command handed over a moment
+                // earlier. The app cannot close this itself: once it has passed
+                // a command to the channel it has no way to know whether this
+                // task has applied it yet, so the guarantee has to live here,
+                // where the card is owned.
+                //
+                // Bounded by the channel's own depth: draining is only ever
+                // catching up on what was already accepted, never following a
+                // producer that keeps writing.
+                for _ in 0..STORAGE_COMMANDS.capacity() {
+                    let Ok(command) = STORAGE_COMMANDS.try_receive() else {
+                        break;
+                    };
+                    esp_println::println!("storage: draining before sleep");
+                    handle_storage_command(
+                        command,
+                        &mut epd,
+                        &mut sd_cs,
+                        sd_library,
+                        font_metrics,
+                        &mut epub_scratch,
+                        &mut sync_session,
+                        &mut pending_progress,
+                        &mut last_progress_write,
+                        &mut state_restored,
+                    );
+                }
                 if !flush_pending_progress(
                     &mut epd,
                     &mut sd_cs,
