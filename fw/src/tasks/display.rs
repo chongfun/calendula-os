@@ -49,6 +49,28 @@ static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; M
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
+/// Slots in the pending-write queue.
+///
+/// Four holds three chained book switches whose card writes all failed plus
+/// the command that arrives during the fourth, which is as deep as a
+/// transient SD fault realistically goes: opening a book reads the card, so a
+/// fault that outlives this many switches has already stopped the reader.
+const PENDING_WRITE_SLOTS: usize = 4;
+
+/// Durable state the SD card is still owed, oldest first.
+///
+/// Storage commands never write the card themselves; they enqueue here and
+/// [`flush_pending_write`] drains the queue in arrival order, so a newer
+/// record can never be overwritten by an older one that is still waiting.
+///
+/// RAM: this lives for the display task's lifetime in the embassy task arena,
+/// not on the stack. `Switch` is the widest variant — two 28-byte
+/// `AppStateRecord`s plus two flags and the tag — so a slot is 60 bytes and
+/// the queue costs 60 * 4 + 4 (heapless's length field) = 244 bytes, against
+/// the 32 bytes of the `Option<AppStateRecord>` it replaces. The +212 bytes
+/// come out of the display task's arena, not out of the ~43 KB stack region
+/// the EPUB-open chain has to fit in, and are three orders of magnitude below
+/// the two framebuffers that dominate the task's budget.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PendingWrite {
     Progress(AppStateRecord),
@@ -59,6 +81,8 @@ enum PendingWrite {
         state_stored: bool,
     },
 }
+
+type PendingWrites = heapless::Vec<PendingWrite, PENDING_WRITE_SLOTS>;
 
 #[embassy_executor::task]
 pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool) {
@@ -85,7 +109,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     // keeps the full waveform for unknown panel contents.
     let mut refresh_planner = RefreshPlanner::new().with_panel_shows_sleep_screen(deep_sleep_wake);
     let _display_last_touched = Instant::now();
-    let mut pending_write: heapless::Vec<PendingWrite, 2> = heapless::Vec::new();
+    let mut pending_write: PendingWrites = PendingWrites::new();
     let mut last_progress_write: Option<Instant> = None;
     // Durable state is consulted once per boot, after the first catalog with
     // entries lands; later catalog refreshes must not yank reading state.
@@ -569,7 +593,7 @@ fn handle_storage_command(
     font_metrics: &mut crate::custom_font::MetricCache,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     sync_session: &mut SyncSession,
-    pending_write: &mut heapless::Vec<PendingWrite, 2>,
+    pending_write: &mut PendingWrites,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
     last_request: Option<RenderRequest>,
@@ -937,86 +961,57 @@ fn handle_storage_command(
                 .unwrap_or(true);
 
             if !coalesced {
-                if pending_write.is_full()
-                    && !flush_pending_write(
-                        epd,
-                        sd_cs,
-                        sd_library,
-                        pending_write,
-                        last_progress_write,
-                    )
-                {
-                    esp_println::println!(
-                        "storage: progress deferred after write failure (queue full)"
-                    );
-                    return;
-                }
+                // Behind whatever is already waiting, never in front of it: a
+                // record written directly here would land before an older
+                // queued one and then be undone by that entry's flush.
+                enqueue_pending(
+                    epd,
+                    sd_cs,
+                    sd_library,
+                    pending_write,
+                    last_progress_write,
+                    PendingWrite::Progress(record),
+                );
+                esp_println::println!(
+                    "bench: storage_progress action=enqueue book_id={} page={} t_ms={}",
+                    record.book_id,
+                    record.screen,
+                    Instant::now().as_millis(),
+                );
+            }
 
-                if due {
-                    let progress_start = Instant::now();
-                    let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
-                    if stored {
-                        *last_progress_write = Some(Instant::now());
-                    } else {
-                        let _ = pending_write.push(PendingWrite::Progress(record));
-                    }
-                    esp_println::println!(
-                        "bench: storage_progress action=write ok={} book_id={} page={} elapsed_ms={} t_ms={}",
-                        stored,
-                        record.book_id,
-                        record.screen,
-                        progress_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
-                    );
-                } else {
-                    let _ = pending_write.push(PendingWrite::Progress(record));
-                    esp_println::println!(
-                        "bench: storage_progress action=enqueue book_id={} page={} t_ms={}",
-                        record.book_id,
-                        record.screen,
-                        Instant::now().as_millis(),
-                    );
-                }
+            if due {
+                flush_pending_write(epd, sd_cs, sd_library, pending_write, last_progress_write);
             }
         }
         StorageCommand::StoreBookSwitch { previous, next } => {
             let record_prev = record_for_persisted(sd_library, previous);
             let record_next = record_for_persisted(sd_library, next);
 
-            if pending_write.is_full()
-                && !flush_pending_write(epd, sd_cs, sd_library, pending_write, last_progress_write)
-            {
-                esp_println::println!(
-                    "storage: dropping oldest pending state to make room for new switch"
-                );
-                if !pending_write.is_empty() {
-                    pending_write.remove(0);
-                }
-            }
-
-            let progress_start = Instant::now();
-            let stored_pos = reader_cache::store_book_position(epd, sd_cs, sd_library, record_prev);
-            let stored_state = if stored_pos {
-                reader_cache::store_global_state(epd, sd_cs, record_next)
-            } else {
-                false
-            };
-
-            if stored_pos && stored_state {
-                *last_progress_write = Some(Instant::now());
-            } else {
-                let _ = pending_write.push(PendingWrite::Switch {
+            // Same rule as progress: queue first, then drain from the front,
+            // so the switch that arrives last is the one that ends up on the
+            // card. Switches are not throttled, so the flush is unconditional.
+            enqueue_pending(
+                epd,
+                sd_cs,
+                sd_library,
+                pending_write,
+                last_progress_write,
+                PendingWrite::Switch {
                     previous: record_prev,
                     next: record_next,
-                    pos_stored: stored_pos,
-                    state_stored: stored_state,
-                });
-            }
+                    pos_stored: false,
+                    state_stored: false,
+                },
+            );
+
+            let progress_start = Instant::now();
+            let flushed =
+                flush_pending_write(epd, sd_cs, sd_library, pending_write, last_progress_write);
 
             esp_println::println!(
-                "bench: store_book_switch action=write ok_pos={} ok_state={} prev_book_id={} next_book_id={} elapsed_ms={} t_ms={}",
-                stored_pos,
-                stored_state,
+                "bench: store_book_switch action=write ok={} prev_book_id={} next_book_id={} elapsed_ms={} t_ms={}",
+                flushed,
                 record_prev.book_id,
                 record_next.book_id,
                 progress_start.elapsed().as_millis(),
@@ -1212,7 +1207,7 @@ fn sleep_request_from_saved_state(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
-    pending_write: &heapless::Vec<PendingWrite, 2>,
+    pending_write: &PendingWrites,
 ) -> Option<RenderRequest> {
     let mut recent_record = None;
     for p in pending_write.iter().rev() {
@@ -1276,11 +1271,76 @@ fn sleep_request_from_saved_state(
     })
 }
 
+/// The per-book position an entry still owes the card, if any.
+///
+/// `Progress` writes the global record and its book's position in one
+/// session; `Switch` writes the closing book's position, and drops that debt
+/// once `pos_stored` says the position landed.
+fn owed_position(write: &PendingWrite) -> Option<AppStateRecord> {
+    match write {
+        PendingWrite::Progress(record) => Some(*record),
+        PendingWrite::Switch {
+            previous,
+            pos_stored,
+            ..
+        } => (!*pos_stored).then_some(*previous),
+    }
+}
+
+/// Queues `write` behind everything already waiting, making room without
+/// losing durable state when the queue is full.
+///
+/// Every enqueued entry writes the global state record, so an older entry's
+/// global write is always superseded by a newer one: a full queue can drop a
+/// front entry outright once its per-book position is re-recorded later (or
+/// once it owes no position at all), which costs nothing. Only when no front
+/// entry is redundant does this retry the card, and only if that also fails
+/// does it evict the oldest — losing one departed book's page number rather
+/// than the freshest state, which is what the next boot reads.
+#[inline(never)]
+fn enqueue_pending(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &ReaderStore,
+    pending_write: &mut PendingWrites,
+    last_progress_write: &mut Option<Instant>,
+    write: PendingWrite,
+) {
+    while pending_write.is_full() {
+        let superseded = match owed_position(&pending_write[0]) {
+            None => true,
+            Some(position) => pending_write[1..]
+                .iter()
+                .chain(core::iter::once(&write))
+                .filter_map(owed_position)
+                .any(|later| later.book_id == position.book_id),
+        };
+        if !superseded {
+            break;
+        }
+        pending_write.remove(0);
+    }
+
+    if pending_write.is_full() {
+        flush_pending_write(epd, sd_cs, sd_library, pending_write, last_progress_write);
+    }
+
+    if pending_write.is_full() {
+        esp_println::println!(
+            "storage: pending queue saturated; dropping oldest book position book_id={}",
+            owed_position(&pending_write[0]).map_or(0, |record| record.book_id),
+        );
+        pending_write.remove(0);
+    }
+
+    let _ = pending_write.push(write);
+}
+
 fn flush_pending_write(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     sd_library: &ReaderStore,
-    pending_write: &mut heapless::Vec<PendingWrite, 2>,
+    pending_write: &mut PendingWrites,
     last_progress_write: &mut Option<Instant>,
 ) -> bool {
     let mut all_cleared = true;
