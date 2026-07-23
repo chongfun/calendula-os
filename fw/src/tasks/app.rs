@@ -4,7 +4,7 @@ use crate::{
     LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS, SYNC_COMMANDS,
     SYNC_EVENTS,
 };
-use app_core::{AppView, ReaderState, ReducerContext, SyncStatus};
+use app_core::{AppView, PendingStorage, ReaderState, ReducerContext, StorageDispatch, SyncStatus};
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select4, Either4};
 use embassy_time::{Duration, Instant};
@@ -27,7 +27,7 @@ pub async fn run() {
     let mut rendering = false;
     let mut render_pending = false;
     let mut catalog_refresh_requested = true;
-    let mut pending_storage: Option<StorageCommand> = None;
+    let mut pending_storage = PendingStorage::new();
     // Type settings changed while away from Reading: the loaded section is
     // paginated under the old layout, so the next entry into Reading must
     // send an extend even though page and chapter are unchanged.
@@ -137,27 +137,27 @@ pub async fn run() {
                 // Settled to be drained, so it must still render.
                 let mut awaiting_chapter_list = false;
                 if let Some(command) = storage_command {
+                    if let Some(book_id) = open_book_id(command) {
+                        opening_book = Some(book_id);
+                        suppress_input_until_open_settled = true;
+                    }
                     if should_send_storage_immediately(command) {
-                        log_storage_command("send", command);
-                        if let Some(book_id) = open_book_id(command) {
-                            opening_book = Some(book_id);
-                            suppress_input_until_open_settled = true;
-                        }
-                        if STORAGE_COMMANDS.try_send(command).is_err() {
-                            log_storage_command("queue", command);
-                            pending_storage = Some(command);
-                        } else if matches!(command, StorageCommand::LoadChapters { .. }) {
+                        if dispatch_storage(&mut pending_storage, command) == StorageDispatch::Sent
+                            && matches!(command, StorageCommand::LoadChapters { .. })
+                        {
                             awaiting_chapter_list = true;
                         }
                     } else {
                         log_storage_command("queue", command);
-                        if let Some(book_id) = open_book_id(command) {
-                            opening_book = Some(book_id);
-                            suppress_input_until_open_settled = true;
+                        if !pending_storage.push_back(command) {
+                            log_storage_command("dropped", command);
                         }
-                        pending_storage = Some(command);
                     }
                 }
+                // The switch carries the departing book's final page and the
+                // pointer the next boot reads, so it has to survive a full
+                // channel exactly as the open does: parked behind it, never
+                // discarded because the open got there first.
                 if previous_persisted != next_persisted {
                     let command = if previous_persisted.book_id != next_persisted.book_id {
                         StorageCommand::StoreBookSwitch {
@@ -167,15 +167,10 @@ pub async fn run() {
                     } else {
                         StorageCommand::StoreProgress(next_persisted)
                     };
-                    if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
-                        pending_storage = Some(command);
-                    }
+                    dispatch_storage(&mut pending_storage, command);
                 }
                 if let Some(command) = forget_command_for_transition(&previous, &state) {
-                    log_storage_command("send", command);
-                    if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
-                        pending_storage = Some(command);
-                    }
+                    dispatch_storage(&mut pending_storage, command);
                 }
                 if let Some(command) = sync_command_for_transition(&previous, &state) {
                     esp_println::println!("app: sync command {:?}", command);
@@ -214,7 +209,7 @@ pub async fn run() {
                             esp_println::println!("app: storage queue full for catalog cache");
                         }
                     }
-                    if let Some(command) = pending_storage.take() {
+                    while let Some(command) = pending_storage.pop_front() {
                         log_storage_command("send", command);
                         if let Some(book_id) = open_book_id(command) {
                             opening_book = Some(book_id);
@@ -268,7 +263,7 @@ pub async fn run() {
                     // for the parked storage command: a queued book open
                     // left in pending_storage would otherwise hold
                     // opening_book forever and suppress every input.
-                    if let Some(command) = pending_storage.take() {
+                    while let Some(command) = pending_storage.pop_front() {
                         log_storage_command("send", command);
                         if let Some(book_id) = open_book_id(command) {
                             opening_book = Some(book_id);
@@ -447,6 +442,24 @@ async fn send_render(kind: RenderKind, state: &ReaderState) {
     DISPLAY_COMMANDS
         .send(DisplayCommand::Render(state.render_request(kind)))
         .await;
+}
+
+/// Sends `command` to the storage task, or parks it for the next drain.
+///
+/// Nothing may overtake what is already parked: the display task applies
+/// storage commands in the order it receives them, so a `StoreBookSwitch`
+/// that jumped ahead of its own parked `OpenBook` would persist the switch
+/// against the book that is still loaded.
+fn dispatch_storage(pending: &mut PendingStorage, command: StorageCommand) -> StorageDispatch {
+    let outcome = pending.dispatch(command, |command| {
+        STORAGE_COMMANDS.try_send(command).is_ok()
+    });
+    match outcome {
+        StorageDispatch::Sent => log_storage_command("send", command),
+        StorageDispatch::Parked => log_storage_command("queue", command),
+        StorageDispatch::Dropped => log_storage_command("dropped", command),
+    }
+    outcome
 }
 
 fn log_storage_command(label: &str, command: StorageCommand) {

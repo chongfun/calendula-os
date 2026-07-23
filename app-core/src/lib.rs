@@ -393,6 +393,110 @@ pub enum StorageCommand {
     ReceiveUpload,
 }
 
+/// Slots in the app task's parked-storage queue.
+///
+/// One state transition parks at most three commands: the transition's own
+/// storage command, the progress or book-switch record, and a credentials
+/// forget. A second book change cannot stack behind the first, because an
+/// inflight open suppresses input until the display settles, so four slots
+/// leave a spare beyond the deepest reachable burst.
+pub const PENDING_STORAGE_SLOTS: usize = 4;
+
+/// What [`PendingStorage::dispatch`] did with a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageDispatch {
+    /// Handed to the channel; it is on its way to the storage task.
+    Sent,
+    /// Parked for replay when the display acknowledges the current frame.
+    Parked,
+    /// The queue was already full. The command is gone.
+    Dropped,
+}
+
+/// Storage commands the app task could not hand to its channel yet, oldest
+/// first.
+///
+/// The channel holds four commands and the display task can sit on a cache
+/// rebuild for a minute, so meeting a full channel is routine rather than
+/// exceptional. This has to be a queue and not a single slot: a book change
+/// emits `OpenBook` and `StoreBookSwitch` together, and retaining only the
+/// first loses the departing book's page and leaves the on-card active book
+/// pointing at the title the reader just left.
+///
+/// Commands also have to leave in arrival order, which is why `dispatch`
+/// sends directly only while nothing is parked. A `StoreBookSwitch` that
+/// overtook its own parked `OpenBook` would have the storage task write
+/// durable state against the previously loaded book.
+///
+/// RAM: `StorageCommand` is 100 bytes (`StoreWifiCredentials` is the widest
+/// variant), so this costs 4 * 100 + 4 = 404 bytes in the app task's embassy
+/// arena, against the 100 bytes of the `Option<StorageCommand>` it replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingStorage {
+    queue: [Option<StorageCommand>; PENDING_STORAGE_SLOTS],
+    len: usize,
+}
+
+impl Default for PendingStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingStorage {
+    pub const fn new() -> Self {
+        Self {
+            queue: [None; PENDING_STORAGE_SLOTS],
+            len: 0,
+        }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Offers `command` to the channel, parking it instead when the channel
+    /// is full or anything is already parked ahead of it.
+    pub fn dispatch(
+        &mut self,
+        command: StorageCommand,
+        try_send: impl FnOnce(StorageCommand) -> bool,
+    ) -> StorageDispatch {
+        if self.is_empty() && try_send(command) {
+            return StorageDispatch::Sent;
+        }
+        if self.push_back(command) {
+            StorageDispatch::Parked
+        } else {
+            StorageDispatch::Dropped
+        }
+    }
+
+    /// Parks `command` behind everything already waiting. False when the
+    /// queue is full, in which case the command was not retained.
+    pub fn push_back(&mut self, command: StorageCommand) -> bool {
+        if self.len == PENDING_STORAGE_SLOTS {
+            return false;
+        }
+        self.queue[self.len] = Some(command);
+        self.len += 1;
+        true
+    }
+
+    /// The oldest parked command.
+    pub fn pop_front(&mut self) -> Option<StorageCommand> {
+        let command = self.queue[0].take()?;
+        self.queue.copy_within(1..self.len, 0);
+        self.len -= 1;
+        self.queue[self.len] = None;
+        Some(command)
+    }
+}
+
 /// The sync session's storage-admission rules. Granting the loan is one-way:
 /// the EPUB scratch becomes radio heap, so every scratch-using storage command
 /// is refused from then on and only the session-ending software reset brings
@@ -1565,6 +1669,181 @@ mod tests {
     use super::*;
 
     const CTX: ReducerContext = ReducerContext::new(1, 3);
+
+    /// The app task's storage channel: four slots, drained by the display
+    /// task. `try_send` fails once it is full, which is what pushes commands
+    /// into `PendingStorage`.
+    struct FakeChannel {
+        received: [Option<StorageCommand>; 16],
+        received_len: usize,
+        capacity_left: usize,
+    }
+
+    impl FakeChannel {
+        const CAPACITY: usize = 4;
+
+        fn full() -> Self {
+            Self {
+                received: [None; 16],
+                received_len: 0,
+                capacity_left: 0,
+            }
+        }
+
+        fn empty() -> Self {
+            Self {
+                capacity_left: Self::CAPACITY,
+                ..Self::full()
+            }
+        }
+
+        fn try_send(&mut self, command: StorageCommand) -> bool {
+            if self.capacity_left == 0 {
+                return false;
+            }
+            self.capacity_left -= 1;
+            self.received[self.received_len] = Some(command);
+            self.received_len += 1;
+            true
+        }
+
+        fn received(&self) -> &[Option<StorageCommand>] {
+            &self.received[..self.received_len]
+        }
+
+        /// The display task settling: the channel empties and the app task
+        /// replays everything it parked, in order.
+        fn drain(&mut self, pending: &mut PendingStorage) {
+            while let Some(command) = pending.pop_front() {
+                self.capacity_left = Self::CAPACITY;
+                assert!(self.try_send(command), "a drained channel always accepts");
+            }
+        }
+    }
+
+    fn open_book(book_id: u32) -> StorageCommand {
+        StorageCommand::OpenBook {
+            request_id: 7,
+            book_id,
+            index: 0,
+            chapter: 0,
+            target_pages: 4,
+            type_settings: TypeSettings::DEFAULT,
+            portrait: false,
+        }
+    }
+
+    fn persisted(book_id: u32, screen: u32) -> PersistedAppState {
+        PersistedAppState {
+            book_id,
+            chapter: 0,
+            screen,
+            shell_orientation: 3,
+            reading_orientation: 0,
+            refresh_policy: 1,
+            font_size: 1,
+            line_spacing: 1,
+            font_weight: 0,
+            font_family: 0,
+            front_buttons: 0,
+            source_hash: 0,
+            source_size: 0,
+        }
+    }
+
+    fn book_switch(previous: u32, next: u32) -> StorageCommand {
+        StorageCommand::StoreBookSwitch {
+            previous: persisted(previous, 5),
+            next: persisted(next, 0),
+        }
+    }
+
+    #[test]
+    fn book_change_against_a_full_channel_delivers_the_open_and_the_switch() {
+        let mut channel = FakeChannel::full();
+        let mut pending = PendingStorage::new();
+
+        // A book change emits both commands back to back. Retaining only the
+        // first would leave the departing book's page unwritten and the next
+        // boot pointed at the title the reader just left.
+        let open = open_book(9);
+        let switch = book_switch(4, 9);
+        assert_eq!(
+            pending.dispatch(open, |c| channel.try_send(c)),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            pending.dispatch(switch, |c| channel.try_send(c)),
+            StorageDispatch::Parked
+        );
+
+        channel.drain(&mut pending);
+
+        assert_eq!(channel.received(), &[Some(open), Some(switch)]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_parked_command_is_never_overtaken_by_a_later_one() {
+        let mut channel = FakeChannel::full();
+        let mut pending = PendingStorage::new();
+
+        let open = open_book(9);
+        assert_eq!(
+            pending.dispatch(open, |c| channel.try_send(c)),
+            StorageDispatch::Parked
+        );
+
+        // The channel has room again, but the open is still parked: sending
+        // the switch now would persist it against the book still loaded.
+        channel.capacity_left = FakeChannel::CAPACITY;
+        let switch = book_switch(4, 9);
+        assert_eq!(
+            pending.dispatch(switch, |c| channel.try_send(c)),
+            StorageDispatch::Parked
+        );
+        assert!(channel.received().is_empty());
+
+        channel.drain(&mut pending);
+        assert_eq!(channel.received(), &[Some(open), Some(switch)]);
+    }
+
+    #[test]
+    fn an_empty_queue_sends_straight_through() {
+        let mut channel = FakeChannel::empty();
+        let mut pending = PendingStorage::new();
+
+        let open = open_book(9);
+        assert_eq!(
+            pending.dispatch(open, |c| channel.try_send(c)),
+            StorageDispatch::Sent
+        );
+        assert!(pending.is_empty());
+        assert_eq!(channel.received(), &[Some(open)]);
+    }
+
+    #[test]
+    fn saturation_is_reported_rather_than_silently_losing_a_command() {
+        let mut channel = FakeChannel::full();
+        let mut pending = PendingStorage::new();
+
+        for book_id in 0..PENDING_STORAGE_SLOTS as u32 {
+            assert_eq!(
+                pending.dispatch(open_book(book_id), |c| channel.try_send(c)),
+                StorageDispatch::Parked
+            );
+        }
+        assert_eq!(pending.len(), PENDING_STORAGE_SLOTS);
+        assert_eq!(
+            pending.dispatch(book_switch(4, 9), |c| channel.try_send(c)),
+            StorageDispatch::Dropped
+        );
+
+        // Saturation must not corrupt what was already retained.
+        channel.drain(&mut pending);
+        assert_eq!(channel.received().len(), PENDING_STORAGE_SLOTS);
+        assert_eq!(channel.received()[0], Some(open_book(0)));
+    }
 
     #[test]
     fn emulator_demo_psk_stays_within_the_mintable_alphabet() {
