@@ -481,25 +481,15 @@ fn draw_glyph(
     let glyph_y = baseline_y + metric.y_offset as i16;
     let row_bytes = (metric.width as usize).div_ceil(8);
     for y in 0..metric.height as usize {
-        for x_byte in 0..row_bytes {
-            let byte = bitmap[y * row_bytes + x_byte];
-            if byte == 0 {
-                continue;
-            }
-            for bit in 0..8 {
-                let px = x_byte * 8 + bit;
-                if px >= metric.width as usize {
-                    break;
-                }
-                if byte & (0x80 >> bit) != 0 {
-                    let draw_x = glyph_x + px as i16;
-                    let draw_y = glyph_y + y as i16;
-                    if draw_x >= 0 && draw_y >= 0 {
-                        fb.set_pixel(draw_x as usize, draw_y as usize, white);
-                    }
-                }
-            }
-        }
+        let start = (y * row_bytes).min(bitmap.len());
+        let end = ((y + 1) * row_bytes).min(bitmap.len());
+        fb.blit_row(
+            glyph_x as i32,
+            glyph_y as i32 + y as i32,
+            &bitmap[start..end],
+            metric.width as usize,
+            white,
+        );
     }
 
     (metric.advance_fp, drawn)
