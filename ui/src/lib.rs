@@ -4,6 +4,7 @@
 use app_core::PortalPsk;
 
 pub mod app_render;
+pub mod custom_font;
 pub mod icons;
 pub mod join_qr;
 pub mod layout;
