@@ -6,7 +6,7 @@ use crate::{
 };
 use app_core::{
     extend_section_command, storage_command_for_transition, AppView, BookOpenRollback,
-    ParkedStorage, ReaderState, ReducerContext, StorageDispatch, SyncStatus,
+    ParkedStorage, ReaderState, ReducerContext, SleepGate, StorageDispatch, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select4, Either4};
@@ -39,6 +39,8 @@ pub async fn run() {
     // Where to put the reader back if the inflight open aborts. Set only for
     // a book change, the one open that has somewhere else to return to.
     let mut open_rollback: Option<BookOpenRollback> = None;
+    // A Power press arriving while the app still owes the storage task work.
+    let mut sleep_gate = SleepGate::new();
     let mut suppress_input_until_open_settled = false;
     let mut block_confirm_until: Option<Instant> = None;
     // Defer the first paint. ReaderState::boot() defaults to the built-in guide
@@ -90,8 +92,19 @@ pub async fn run() {
                     // button armed as the wake source. Waking is a fresh boot
                     // (deep sleep is terminal), so there is no in-app "asleep"
                     // state to toggle back out of here.
-                    esp_println::println!("app: sleep requested");
-                    let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
+                    //
+                    // Unless the app is still holding storage work. Sleep would
+                    // reach the display task down its own channel and be picked
+                    // up ahead of anything queued behind it, and the pre-sleep
+                    // flush there cannot see a command parked in this task -- so
+                    // a book open in either position would go down with the
+                    // reader's place in the book it was leaving.
+                    if sleep_gate.press(opening_book.is_some() || !pending_storage.is_empty()) {
+                        esp_println::println!("app: sleep requested");
+                        let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
+                    } else {
+                        esp_println::println!("app: sleep deferred until book open settles");
+                    }
                     continue;
                 }
 
@@ -248,6 +261,7 @@ pub async fn run() {
                         &mut suppress_input_until_open_settled,
                     )
                     .await;
+                    release_deferred_sleep(&mut sleep_gate, opening_book, &pending_storage).await;
                     if render_pending {
                         send_render(RenderKind::Page, &state).await;
                         rendering = true;
@@ -300,6 +314,7 @@ pub async fn run() {
                         &mut suppress_input_until_open_settled,
                     )
                     .await;
+                    release_deferred_sleep(&mut sleep_gate, opening_book, &pending_storage).await;
                     // Loaded may already have cleared opening_book before
                     // this failure discarded its render; without Settled
                     // ever arriving, the suppression flag must be released
@@ -320,8 +335,11 @@ pub async fn run() {
                         boot_render_pending,
                         &event,
                     ) {
+                        release_deferred_sleep(&mut sleep_gate, opening_book, &pending_storage)
+                            .await;
                         continue;
                     }
+                    release_deferred_sleep(&mut sleep_gate, opening_book, &pending_storage).await;
                     if rendering {
                         render_pending = true;
                     } else {
@@ -340,8 +358,10 @@ pub async fn run() {
                     boot_render_pending,
                     &event,
                 ) {
+                    release_deferred_sleep(&mut sleep_gate, opening_book, &pending_storage).await;
                     continue;
                 }
+                release_deferred_sleep(&mut sleep_gate, opening_book, &pending_storage).await;
                 if rendering {
                     render_pending = true;
                 } else {
@@ -477,6 +497,20 @@ fn dispatch_storage(parked: &mut ParkedStorage, command: StorageCommand) -> Stor
         StorageDispatch::Rejected => log_storage_command("rejected", command),
     }
     outcome
+}
+
+/// Sends a Power press that was held back, once the app owes the storage task
+/// nothing. Called wherever an open resolves or the parked queue drains, so a
+/// deferred press is never left waiting on an event that already happened.
+async fn release_deferred_sleep(
+    gate: &mut SleepGate,
+    opening_book: Option<u32>,
+    parked: &ParkedStorage,
+) {
+    if gate.release(opening_book.is_some() || !parked.is_empty()) {
+        esp_println::println!("app: deferred sleep released");
+        let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
+    }
 }
 
 /// Hands every parked command to the storage task in arrival order, blocking

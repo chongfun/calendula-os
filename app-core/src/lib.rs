@@ -536,8 +536,70 @@ impl ParkedStorage {
     }
 }
 
+/// Holds a Power press until the app has nothing left to hand the storage task.
+///
+/// Deep sleep is terminal — waking is a fresh boot — so whatever the app is
+/// still holding when the panel sleeps is simply gone. The display task does
+/// flush before it sleeps, but only its own coalesced record: it cannot see a
+/// command parked in the app, and its command channels are separate, so a
+/// `Sleep` is picked up ahead of an `OpenBook` already queued behind it.
+///
+/// A book open is the costly thing to lose that way. It carries the departing
+/// book's only close-out position, and nothing reissues it: the reader has
+/// already left that book, and the transaction deliberately suppresses the
+/// progress record that used to follow. So the press waits for the open to
+/// resolve — either outcome will do — rather than racing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SleepGate {
+    deferred: bool,
+}
+
+impl SleepGate {
+    pub const fn new() -> Self {
+        Self { deferred: false }
+    }
+
+    /// A Power press. `storage_pending` is whether the app still holds storage
+    /// work of its own — an unresolved book open, or parked commands the next
+    /// drain has yet to send. Returns whether the sleep request goes out now.
+    pub fn press(&mut self, storage_pending: bool) -> bool {
+        if storage_pending {
+            self.deferred = true;
+            return false;
+        }
+        true
+    }
+
+    /// Storage work reached a resting point. Returns whether a press that was
+    /// held back should go out now; only ever true once per press.
+    pub fn release(&mut self, storage_pending: bool) -> bool {
+        if self.deferred && !storage_pending {
+            self.deferred = false;
+            return true;
+        }
+        false
+    }
+
+    pub const fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+}
+
 /// Where the reader sits before a book-open transaction, so an abort can put
 /// it back. Held by the app task, which is the only place that still knows.
+///
+/// Carries the departing book's navigation bounds as well as its position. The
+/// Library confirm that starts an open resets those bounds to a one-page book,
+/// and no `Loaded` ever arrives to correct them for a switch that did not
+/// happen — so restoring the page alone would leave the reader on the right
+/// page of a book the reducer believes is one page long, and the next page turn
+/// would clamp them to the start and persist it.
+///
+/// RAM: `sd_chapter_pages` (128 entries) makes this 276 bytes rather than 20,
+/// held in one `Option` in the app task's arena while an open is inflight. The
+/// alternative — not clobbering the bounds until the open is accepted — would
+/// have to move that decision out of the reducer, which is where the shape of a
+/// freshly selected book belongs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BookOpenRollback {
     pub book_id: u32,
@@ -545,6 +607,9 @@ pub struct BookOpenRollback {
     pub page: u32,
     pub view: AppView,
     pub selection: u16,
+    pub sd_page_count: u32,
+    pub sd_chapter_count: u16,
+    pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
 }
 
 /// How a book-open transaction ended.
@@ -1680,22 +1745,27 @@ impl ReaderState {
             page: self.page,
             view: self.view,
             selection: self.selection,
+            sd_page_count: self.sd_page_count,
+            sd_chapter_count: self.sd_chapter_count,
+            sd_chapter_pages: self.sd_chapter_pages,
         }
     }
 
     /// Puts the reader back on the book it was reading when a book-open
     /// transaction aborted.
     ///
-    /// Only what the open moved. The book metadata (`sd_page_count`,
-    /// `sd_chapter_pages`) is deliberately left as-is: the restored book's own
-    /// values arrive with the next load of it, and guessing them here would
-    /// put a second stale copy on screen in the meantime.
+    /// Position and navigation bounds together. Nothing reloads the old book
+    /// after a switch that never happened, so this is the only chance to undo
+    /// what selecting the new one overwrote; see [`BookOpenRollback`].
     pub fn restore_after_failed_open(mut self, rollback: BookOpenRollback) -> Self {
         self.book_id = rollback.book_id;
         self.chapter = rollback.chapter;
         self.page = rollback.page;
         self.view = rollback.view;
         self.selection = rollback.selection;
+        self.sd_page_count = rollback.sd_page_count;
+        self.sd_chapter_count = rollback.sd_chapter_count;
+        self.sd_chapter_pages = rollback.sd_chapter_pages;
         self.dirty = Rect::FULL;
         self
     }
@@ -2003,6 +2073,70 @@ mod tests {
         storage_command_for_transition(previous, next, 1).expect("a book change owes an open")
     }
 
+    /// The app owes the storage task nothing.
+    const SETTLED: bool = false;
+    /// An open is parked or inflight, or commands are waiting to drain.
+    const STORAGE_PENDING: bool = true;
+
+    #[test]
+    fn power_sleeps_immediately_when_nothing_is_owed() {
+        let mut gate = SleepGate::new();
+        assert!(gate.press(SETTLED));
+        assert!(!gate.is_deferred());
+        // Nothing was held back, so a later resting point sends nothing.
+        assert!(!gate.release(SETTLED));
+    }
+
+    #[test]
+    fn power_during_a_parked_open_waits_for_it() {
+        // The open has not reached the storage task at all: it sits in the
+        // app's parking slots until a render settles. Sleeping now would take
+        // the departing book's only close-out position with it.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(STORAGE_PENDING));
+        assert!(gate.is_deferred());
+
+        // The drain sends the open, which is now inflight — still not a
+        // resting point.
+        assert!(!gate.release(STORAGE_PENDING));
+        assert!(gate.is_deferred());
+
+        // The open answered and the queue is empty.
+        assert!(gate.release(SETTLED));
+        assert!(!gate.is_deferred());
+    }
+
+    #[test]
+    fn power_during_an_inflight_open_waits_for_it() {
+        // Already handed to the storage task. The display task takes sleep
+        // down a different channel and would pick it up first, so the press
+        // still has to wait for the open to answer.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(STORAGE_PENDING));
+        assert!(gate.release(SETTLED));
+    }
+
+    #[test]
+    fn a_deferred_sleep_survives_an_aborted_open() {
+        // BookOpenFailed resolves the open just as much as Loaded does: the
+        // reader is back on the old book and the press it made is still owed.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(STORAGE_PENDING));
+        assert!(gate.release(SETTLED));
+        assert!(!gate.is_deferred());
+    }
+
+    #[test]
+    fn a_deferred_sleep_is_sent_once() {
+        // release() runs at every drain and every library event, so it has to
+        // be idempotent or the power task would field a burst of requests.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(STORAGE_PENDING));
+        assert!(gate.release(SETTLED));
+        assert!(!gate.release(SETTLED));
+        assert!(!gate.release(STORAGE_PENDING));
+    }
+
     #[test]
     fn a_saturated_queue_still_takes_the_open() {
         // Both slots spoken for: a navigation command and a progress record
@@ -2226,6 +2360,32 @@ mod tests {
         assert_eq!(recovered.chapter, 4);
         assert_eq!(recovered.page, 120);
         assert_eq!(recovered.view, AppView::Reading);
+    }
+
+    #[test]
+    fn an_aborted_open_leaves_the_reader_able_to_turn_the_page() {
+        // Selecting a book from the shelf resets the reader's idea of how long
+        // the book is, because the new one has not been measured yet. Nothing
+        // reloads the old book when the switch is refused, so a rollback that
+        // restored only the page would leave the reader on page 120 of a book
+        // the reducer thinks is one page long -- and the next page turn clamps
+        // to sd_page_count - 1, putting them at the start and persisting it.
+        let before = reading(0, 4, 120);
+        let rollback = before.open_rollback();
+
+        let mut committed = ReaderState::boot();
+        committed.view = AppView::Library;
+        committed.library_count = 4;
+        committed.selection = 1;
+        let committed = press(committed, Button::Confirm);
+        assert_eq!(committed.sd_page_count, 1, "the shelf resets the bounds");
+
+        let recovered = committed.restore_after_failed_open(rollback);
+        assert_eq!(recovered.sd_page_count, before.sd_page_count);
+        assert_eq!(recovered.sd_chapter_count, before.sd_chapter_count);
+
+        let turned = press(recovered, Button::Next);
+        assert_eq!(turned.page, 121, "the reader must keep reading forward");
     }
 
     #[test]
