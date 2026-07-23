@@ -487,7 +487,19 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // lands on the loading branch. A same-layout open already
                     // shows the plate through the normal render path (the book
                     // isn't loaded yet), so it is skipped here.
-                    if refresh_planner.screen_on() {
+                    //
+                    // Only for an open the handler will actually act on. The
+                    // same begin() gate it applies drops a stale request here
+                    // too -- otherwise a superseded open would spend a
+                    // multi-second full flush painting a plate for a target the
+                    // reader has already navigated past, then be skipped.
+                    if refresh_planner.screen_on()
+                        && OpenSequence::begin(
+                            &command,
+                            LATEST_READER_REQUEST_ID.load(Ordering::Relaxed),
+                        )
+                        .is_some()
+                    {
                         if let Some(loading_request) = open_loading_plate_request(
                             &command,
                             sd_library,
