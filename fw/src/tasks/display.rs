@@ -331,8 +331,27 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                                     sleep.applied();
                                 }
                                 Drained::RequeueAndRefuse => {
-                                    let _ = STORAGE_COMMANDS.try_send(command);
-                                    sleep.requeued();
+                                    // Unreachable: the slot this command came
+                                    // from is still free. Nothing between the
+                                    // receive above and this send awaits, and
+                                    // no task at interrupt priority sends
+                                    // storage commands, so no producer can
+                                    // refill it in between. Reported rather
+                                    // than assumed because being wrong is
+                                    // silent: the request would be gone,
+                                    // UPLOAD_SESSION_ACTIVE would stay set, and
+                                    // the browser would wait on a writer that
+                                    // never starts.
+                                    let restored = match STORAGE_COMMANDS.try_send(command) {
+                                        Ok(()) => true,
+                                        Err(_) => {
+                                            esp_println::println!(
+                                                "storage: upload requeue failed; request lost"
+                                            );
+                                            false
+                                        }
+                                    };
+                                    sleep.requeued(restored);
                                 }
                             },
                         },

@@ -168,9 +168,27 @@ impl SleepSequence {
         }
     }
 
-    /// A drained command was put back on the queue.
-    pub fn requeued(&mut self) {
-        self.phase = SleepPhase::Refused(SleepRefusal::UploadQueued);
+    /// Whether the command the drain declined actually made it back onto the
+    /// queue.
+    ///
+    /// Only a request that is still queued is worth staying awake for, which is
+    /// why this takes the answer rather than assuming it. If the requeue failed
+    /// the request is simply gone — nothing will start the writer, so deferring
+    /// would leave the panel up indefinitely waiting on a session that can no
+    /// longer begin. Better to treat the slot as spent, finish the drain, and
+    /// let the panel go down; the loss itself is the caller's to report.
+    pub fn requeued(&mut self, restored: bool) {
+        if restored {
+            self.phase = SleepPhase::Refused(SleepRefusal::UploadQueued);
+            return;
+        }
+        // Not applied, but the slot it occupied is consumed either way, so the
+        // drain's budget has to account for it or the loop could outrun the
+        // channel's depth.
+        self.drained += 1;
+        if self.drained >= self.budget {
+            self.phase = SleepPhase::Flushing;
+        }
     }
 
     /// Whether the coalesced progress record reached the card.
@@ -948,9 +966,22 @@ mod tests {
         Refused(SleepRefusal),
     }
 
+    fn run_sleep(queue: &mut Queue, progress_lands: bool) -> (SleepOutcome, usize) {
+        run_sleep_with(queue, progress_lands, true)
+    }
+
     /// Drives a whole sleep transition the way the display task does, returning
     /// what the panel did and how many queued commands were applied on the way.
-    fn run_sleep(queue: &mut Queue, progress_lands: bool) -> (SleepOutcome, usize) {
+    ///
+    /// `requeue_lands` stands in for the put-back succeeding. On device it
+    /// always does — the slot the command came from cannot be refilled before
+    /// the send — so the false case exists to pin down what the sequence does if
+    /// that ever stops holding.
+    fn run_sleep_with(
+        queue: &mut Queue,
+        progress_lands: bool,
+        requeue_lands: bool,
+    ) -> (SleepOutcome, usize) {
         let mut sequence = SleepSequence::new(Queue::CAPACITY);
         let mut applied = 0;
         // A phase that fails to advance would spin here exactly as it would in
@@ -965,8 +996,8 @@ mod tests {
                             sequence.applied();
                         }
                         Drained::RequeueAndRefuse => {
-                            assert!(queue.push(command), "the slot it came from is free");
-                            sequence.requeued();
+                            let restored = requeue_lands && queue.push(command);
+                            sequence.requeued(restored);
                         }
                     },
                 },
@@ -1043,6 +1074,35 @@ mod tests {
         assert_eq!(outcome, SleepOutcome::Refused(SleepRefusal::UploadQueued));
         assert_eq!(applied, 1);
         assert_eq!(queue.pop(), Some(StorageCommand::ReceiveUpload));
+    }
+
+    // A sleep is only worth deferring for a request that is still queued. If the
+    // put-back fails the request is gone, and nothing will ever start the writer
+    // it was asking for — so refusing would hold the panel up forever rather
+    // than briefly.
+    #[test]
+    fn a_lost_requeue_does_not_hold_the_panel_up_for_a_request_that_is_gone() {
+        let mut queue = Queue::default();
+        assert!(queue.push(StorageCommand::ReceiveUpload));
+        let (outcome, applied) = run_sleep_with(&mut queue, true, false);
+        assert_eq!(outcome, SleepOutcome::Slept);
+        assert_eq!(applied, 0, "the upload was never applied, only lost");
+        assert_eq!(queue.len, 0);
+    }
+
+    #[test]
+    fn a_lost_requeue_still_spends_its_slot_of_the_drain_budget() {
+        let mut queue = Queue::default();
+        assert!(queue.push(StorageCommand::ReceiveUpload));
+        for page in 0..Queue::CAPACITY as u32 - 1 {
+            assert!(queue.push(StorageCommand::StoreProgress(persisted(3, 1, page))));
+        }
+        // Four slots, one spent on the lost upload: the rest still drain, and
+        // the loop stays inside the channel's depth.
+        let (outcome, applied) = run_sleep_with(&mut queue, true, false);
+        assert_eq!(outcome, SleepOutcome::Slept);
+        assert_eq!(applied, Queue::CAPACITY - 1);
+        assert_eq!(queue.len, 0);
     }
 
     #[test]
