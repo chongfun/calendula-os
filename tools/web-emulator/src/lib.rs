@@ -284,6 +284,9 @@ impl WebEmulator {
             chapters: store.chapters.len().max(1).min(u16::MAX as usize) as u16,
             current_chapter: store.chapter_for_page(self.state.page),
             chapter_pages,
+            // The browser build restores position from localStorage through
+            // its own path, so a load never relocates the reader.
+            position: None,
         };
         self.state = self.state.apply_library_event(self.ctx, event);
     }
@@ -540,6 +543,7 @@ fn storage_command_for_transition(
             target_pages: 5,
             type_settings: next.type_settings(),
             portrait: app_core::is_portrait(next.orientation),
+            previous: (previous.book_id != next.book_id).then(|| previous.persisted()),
         });
     }
 
