@@ -204,9 +204,7 @@ const POSITION_GENERATIONS: [&str; 2] = ["POSA.BIN", "POSB.BIN"];
 /// MarigoldOS v0.4.x durable-position magic; keep byte-identical so cards
 /// carry reading positions between the two firmwares.
 const POSITION_DURABLE_MAGIC: [u8; 4] = *b"MGPS";
-const POSITION_MAGIC: &[u8; 4] = b"X4PS";
-const POSITION_VERSION: u8 = 1;
-const POSITION_BYTES: usize = 15;
+const POSITION_BYTES: usize = proto::nvm::PositionRecord::ENCODED_LEN;
 
 /// Panel-geometry salt mixed into the position checksum. The stored screen
 /// is a page-within-chapter index under this panel's pagination, so a
@@ -225,39 +223,12 @@ const POSITION_GEOMETRY_SALT: u32 = (display::WIDTH as u32 ^ display::HEIGHT as 
 const _: () = assert!(POSITION_GEOMETRY_SALT == 0);
 
 fn encode_position(chapter: u16, screen: u32) -> [u8; POSITION_BYTES] {
-    let mut out = [0u8; POSITION_BYTES];
-    out[..4].copy_from_slice(POSITION_MAGIC);
-    out[4] = POSITION_VERSION;
-    out[5..7].copy_from_slice(&chapter.to_le_bytes());
-    out[7..11].copy_from_slice(&screen.to_le_bytes());
-    let sum = position_checksum(&out[..11]);
-    out[11..15].copy_from_slice(&sum.to_le_bytes());
-    out
-}
-
-/// Byte sum salted with the panel geometry. Salt is 0 on the X4 (its
-/// `WIDTH ^ HEIGHT` cancels the `800 ^ 480` term) so historical checksums
-/// are unchanged; any other geometry shifts every checksum.
-fn position_checksum(bytes: &[u8]) -> u32 {
-    bytes
-        .iter()
-        .map(|byte| *byte as u32)
-        .sum::<u32>()
-        .wrapping_add(POSITION_GEOMETRY_SALT)
+    proto::nvm::PositionRecord { chapter, screen }.encode(POSITION_GEOMETRY_SALT)
 }
 
 fn decode_position(bytes: &[u8]) -> Option<(u16, u32)> {
-    if bytes.len() < POSITION_BYTES || &bytes[..4] != POSITION_MAGIC || bytes[4] != POSITION_VERSION
-    {
-        return None;
-    }
-    let sum = position_checksum(&bytes[..11]);
-    if bytes[11..15] != sum.to_le_bytes() {
-        return None;
-    }
-    let chapter = u16::from_le_bytes([bytes[5], bytes[6]]);
-    let screen = u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]);
-    Some((chapter, screen))
+    proto::nvm::PositionRecord::decode(bytes, POSITION_GEOMETRY_SALT)
+        .map(|record| (record.chapter, record.screen))
 }
 
 /// Per-book reading position beside the book's cache records, so
@@ -330,7 +301,7 @@ pub(crate) fn write_state_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    record: hal_ext::nvm::AppStateRecord,
+    record: proto::nvm::AppStateRecord,
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -360,15 +331,15 @@ pub(crate) fn read_state_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-) -> Option<hal_ext::nvm::AppStateRecord>
+) -> Option<proto::nvm::AppStateRecord>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let mut bytes = [0u8; hal_ext::nvm::AppStateRecord::ENCODED_LEN];
+    let mut bytes = [0u8; proto::nvm::AppStateRecord::ENCODED_LEN];
     if read_two_generation(&xteink, STATE_GENERATIONS, STATE_DURABLE_MAGIC, &mut bytes) {
-        return hal_ext::nvm::AppStateRecord::decode(&bytes);
+        return proto::nvm::AppStateRecord::decode(&bytes);
     }
     let file = xteink
         .open_file_in_dir(CACHE_STATE_FILE, Mode::ReadOnly)
@@ -376,7 +347,7 @@ where
     // One read suffices for a 32-byte record; shorter V1/V2 files decode
     // from their actual length.
     let len = file.read(&mut bytes).ok()?;
-    hal_ext::nvm::AppStateRecord::decode(&bytes[..len])
+    proto::nvm::AppStateRecord::decode(&bytes[..len])
 }
 
 pub(crate) fn read_custom_font_manifest<
@@ -445,7 +416,7 @@ pub(crate) fn write_wifi_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    record: hal_ext::nvm::WifiCredentialsRecord,
+    record: proto::nvm::WifiCredentialsRecord,
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -496,19 +467,19 @@ pub(crate) fn read_wifi_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-) -> Option<hal_ext::nvm::WifiCredentialsRecord>
+) -> Option<proto::nvm::WifiCredentialsRecord>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let mut bytes = [0u8; hal_ext::nvm::WifiCredentialsRecord::ENCODED_LEN];
+    let mut bytes = [0u8; proto::nvm::WifiCredentialsRecord::ENCODED_LEN];
     if read_two_generation(&xteink, WIFI_GENERATIONS, WIFI_DURABLE_MAGIC, &mut bytes) {
-        return hal_ext::nvm::WifiCredentialsRecord::decode(&bytes);
+        return proto::nvm::WifiCredentialsRecord::decode(&bytes);
     }
     let file = xteink.open_file_in_dir(WIFI_FILE, Mode::ReadOnly).ok()?;
     let len = file.read(&mut bytes).ok()?;
-    hal_ext::nvm::WifiCredentialsRecord::decode(&bytes[..len])
+    proto::nvm::WifiCredentialsRecord::decode(&bytes[..len])
 }
 
 pub(crate) fn load_v2_cover_cache<
@@ -876,6 +847,7 @@ pub(crate) fn empty_cache_dir<
     let Ok(cache) = xteink.open_dir(CACHE_V2_DIR) else {
         return;
     };
+    let position_kept;
     {
         let Ok(book) = cache.open_dir(key) else {
             return;
@@ -895,10 +867,43 @@ pub(crate) fn empty_cache_dir<
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_TOC_FILE);
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_COVER_FILE);
         let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_CONTENT_FILE);
+        // Everything above is re-derivable from the EPUB; the position is not.
+        // POS*.BIN is the authoritative record of where the reader is in this
+        // book, so it is never swept, and the directory holding it has to stay
+        // as well. A book moved off the card and back keys to the same name and
+        // size, so its place is still waiting when it returns.
+        //
+        // This was already the effect — the directory delete below silently
+        // failed while the position files were in it — but it was incidental,
+        // and the position is load-bearing now that nothing else records it.
+        position_kept = has_position_file(&book);
     }
-    // Likewise the book handle: closed by the scope above, deletable here
-    // (a directory entry has no chain to reclaim).
-    let _ = cache.delete_file_in_dir(key);
+    if !position_kept {
+        // Likewise the book handle: closed by the scope above, deletable here
+        // (a directory entry has no chain to reclaim).
+        let _ = cache.delete_file_in_dir(key);
+    }
+}
+
+/// Whether a book's cache directory still holds a reading position, in either
+/// the durable A/B pair or the legacy single file.
+fn has_position_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    POSITION_GENERATIONS
+        .iter()
+        .chain(core::iter::once(&POSITION_FILE))
+        .any(|name| book.open_file_in_dir(*name, Mode::ReadOnly).is_ok())
 }
 
 pub(crate) fn write_v2_book_index<

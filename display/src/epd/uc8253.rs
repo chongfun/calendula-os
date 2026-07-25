@@ -249,6 +249,46 @@ const FAST_UNSTAGED_STEPS: &[FlushStep] = &[
     FlushStep::DisplayRefresh,
 ];
 
+/// `FULL_STEPS` for a panel whose charge pump is already on: the same stream
+/// without the `PowerOn`.
+///
+/// A redundant POWER_ON is not a harmless no-op. The controller ignores it, so
+/// BUSY never drops, and the two-phase wait reports a command that was never
+/// acknowledged — failing the whole flush with the frame already loaded into
+/// panel RAM but never refreshed onto the glass. `FastClean` has always had
+/// this split; `Full` not having it is why a second full refresh in a session
+/// could compose a frame, write it, and then abandon it.
+const FULL_POWERED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::Full),
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::White,
+    },
+    FlushStep::DataStop,
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::DelayMs(SETTLE_MS),
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+];
+
 const CLEAN_POWERED_STEPS: &[FlushStep] = &[
     FlushStep::LoadBank(RefreshMode::FastClean),
     FlushStep::WritePlane {
@@ -290,6 +330,7 @@ pub const fn flush_plan(
         requested_mode
     };
     let steps = match effective_mode {
+        RefreshMode::Full | RefreshMode::PowerDown if screen_powered => FULL_POWERED_STEPS,
         RefreshMode::Full | RefreshMode::PowerDown => FULL_STEPS,
         RefreshMode::Fast if previous_staged => FAST_STAGED_STEPS,
         RefreshMode::Fast => FAST_UNSTAGED_STEPS,
@@ -456,6 +497,106 @@ mod tests {
     use super::*;
     use crate::{FB_BYTES, HEIGHT, ROW_BYTES};
 
+    /// Regression: the sleep frame is a `Full` refresh, and `SCREEN_POWERED`
+    /// stays true for a whole session — only `init_panel` and `power_off`
+    /// clear it, and `power_off` runs only inside the sleep sequence. So every
+    /// full refresh after the first sent a second POWER_ON to an already
+    /// powered panel, which the controller ignores. BUSY never dropped, the
+    /// two-phase wait reported the command unacknowledged, and the flush
+    /// failed with the frame in RAM but never on the glass — the sleep image
+    /// composed and then abandoned, leaving the reader's page on a panel about
+    /// to lose power for good.
+    #[test]
+    fn a_full_refresh_on_a_powered_panel_does_not_power_it_on_again() {
+        let plan = flush_plan(RefreshMode::Full, true, false);
+        assert_eq!(plan.effective_mode, RefreshMode::Full);
+        assert!(
+            !plan.steps.contains(&FlushStep::PowerOn),
+            "a redundant POWER_ON never acknowledges and fails the flush"
+        );
+        // The charge pump still has to be turned on when it is off.
+        assert!(flush_plan(RefreshMode::Full, false, false)
+            .steps
+            .contains(&FlushStep::PowerOn));
+    }
+
+    #[test]
+    fn the_powered_full_plan_is_the_full_plan_without_its_power_on() {
+        let expected: Vec<FlushStep> = FULL_STEPS
+            .iter()
+            .copied()
+            .filter(|step| *step != FlushStep::PowerOn)
+            .collect();
+        assert_eq!(FULL_POWERED_STEPS, expected.as_slice());
+        // Same waveform work either way: two refreshes and the settle between.
+        for steps in [FULL_STEPS, FULL_POWERED_STEPS] {
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|step| matches!(step, FlushStep::DisplayRefresh))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn a_power_down_refresh_follows_the_same_charge_pump_rule() {
+        assert!(!flush_plan(RefreshMode::PowerDown, true, false)
+            .steps
+            .contains(&FlushStep::PowerOn));
+        assert!(flush_plan(RefreshMode::PowerDown, false, false)
+            .steps
+            .contains(&FlushStep::PowerOn));
+    }
+
+    /// No plan may refresh into an unpowered panel, and none may power on a
+    /// panel that is already powered. Both directions in one sweep, so a new
+    /// step table cannot be added without satisfying them.
+    #[test]
+    fn every_plan_matches_the_charge_pump_state_it_was_given() {
+        for mode in [
+            RefreshMode::Full,
+            RefreshMode::PowerDown,
+            RefreshMode::Fast,
+            RefreshMode::FastClean,
+        ] {
+            for previous_staged in [false, true] {
+                let powered = flush_plan(mode, true, previous_staged);
+                assert!(
+                    !powered.steps.contains(&FlushStep::PowerOn),
+                    "{:?} (staged {}) powers on an already powered panel",
+                    mode,
+                    previous_staged
+                );
+
+                let unpowered = flush_plan(mode, false, previous_staged);
+                let refresh_at = unpowered
+                    .steps
+                    .iter()
+                    .position(|step| matches!(step, FlushStep::DisplayRefresh));
+                if let Some(refresh_at) = refresh_at {
+                    let power_on_at = unpowered
+                        .steps
+                        .iter()
+                        .position(|step| *step == FlushStep::PowerOn)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{:?} (staged {}) refreshes unpowered",
+                                mode, previous_staged
+                            )
+                        });
+                    assert!(
+                        power_on_at < refresh_at,
+                        "{:?} (staged {}) refreshes before powering on",
+                        mode,
+                        previous_staged
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn fast_with_charge_pump_off_is_an_absolute_clean_plan() {
         let plan = flush_plan(RefreshMode::Fast, false, true);
@@ -507,20 +648,24 @@ mod tests {
 
     #[test]
     fn full_plan_keeps_the_proven_two_refresh_settle_sequence() {
-        let plan = flush_plan(RefreshMode::Full, true, true);
-        assert_eq!(plan.steps, FULL_STEPS);
-        assert_eq!(
-            plan.steps
-                .iter()
-                .filter(|step| matches!(step, FlushStep::DisplayRefresh))
-                .count(),
-            2
-        );
-        assert_eq!(
-            plan.steps.last(),
-            Some(&FlushStep::DataStop),
-            "full settle must leave DTM1 synchronized"
-        );
+        // Both charge-pump states run the same waveform; they differ only in
+        // whether they turn the pump on first.
+        for (screen_powered, expected) in [(false, FULL_STEPS), (true, FULL_POWERED_STEPS)] {
+            let plan = flush_plan(RefreshMode::Full, screen_powered, true);
+            assert_eq!(plan.steps, expected);
+            assert_eq!(
+                plan.steps
+                    .iter()
+                    .filter(|step| matches!(step, FlushStep::DisplayRefresh))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                plan.steps.last(),
+                Some(&FlushStep::DataStop),
+                "full settle must leave DTM1 synchronized"
+            );
+        }
     }
 
     #[test]

@@ -10,9 +10,13 @@ use crate::{
     DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
+use app_core::storage_loop::{
+    loop_arm, Drained, LoopArm, OpenAction, OpenSequence, SleepAction, SleepRefusal, SleepSequence,
+};
 use app_core::{
-    display_orientation_from_u8, refresh_policy_from_u8, AppView, DisplayOrientation, ReaderSource,
-    RefreshPlanner, RenderKind, RenderRequest, SyncSession, SyncStatus,
+    book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
+    DisplayOrientation, PersistedAppState, ReaderSource, RefreshPlanner, RenderKind, RenderRequest,
+    SyncSession, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
@@ -21,7 +25,7 @@ use display::BAND_BYTES;
 use embassy_futures::select::{select, Either};
 use embassy_time::Instant;
 use esp_hal::gpio::Output;
-use hal_ext::nvm::AppStateRecord;
+use proto::nvm::AppStateRecord;
 use static_cell::ConstStaticCell;
 
 /// Same-book page-turn progress is coalesced: at most one durable state write
@@ -300,19 +304,84 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
                 );
-                if !flush_pending_progress(
-                    &mut epd,
-                    &mut sd_cs,
-                    sd_library,
-                    &mut pending_progress,
-                    &mut last_progress_write,
-                ) {
-                    // Sleeping now would drop the coalesced position for
-                    // good (deep sleep reboots). Stay awake; the pending
-                    // record is retried on the next flush and the power
-                    // task's idle clock re-requests sleep once the sleep
-                    // failure releases its handshake wait.
-                    esp_println::println!("display: sleep deferred; progress persistence failed");
+                // Everything owed to the card, in order, before the panel goes
+                // down. The ordering rules live in `SleepSequence` so they can
+                // be driven from a host test; this arm only does what it is
+                // told and reports back what the hardware said.
+                let mut sleep = SleepSequence::new(STORAGE_COMMANDS.capacity());
+                let refusal = loop {
+                    match sleep.next() {
+                        SleepAction::TakeQueued => match STORAGE_COMMANDS.try_receive() {
+                            Err(_) => sleep.queue_empty(),
+                            Ok(command) => match sleep.drained(&command) {
+                                Drained::Apply => {
+                                    esp_println::println!("storage: draining before sleep");
+                                    handle_storage_command(
+                                        command,
+                                        &mut epd,
+                                        &mut sd_cs,
+                                        sd_library,
+                                        font_metrics,
+                                        &mut epub_scratch,
+                                        &mut sync_session,
+                                        &mut pending_progress,
+                                        &mut last_progress_write,
+                                        &mut state_restored,
+                                    );
+                                    sleep.applied();
+                                }
+                                Drained::RequeueAndRefuse => {
+                                    // This send cannot fail today: nothing
+                                    // between the receive above and here
+                                    // awaits, and no task at interrupt priority
+                                    // sends storage commands, so no producer
+                                    // can take the slot the command just
+                                    // vacated. Its answer is still taken rather
+                                    // than assumed, because the only way it
+                                    // could fail is a producer having refilled
+                                    // the queue — which changes what the drain
+                                    // must do next, and the sequence needs to
+                                    // know.
+                                    sleep.requeued(STORAGE_COMMANDS.try_send(command).is_ok());
+                                }
+                            },
+                        },
+                        SleepAction::FlushProgress => {
+                            let stored = flush_pending_progress(
+                                &mut epd,
+                                &mut sd_cs,
+                                sd_library,
+                                &mut pending_progress,
+                                &mut last_progress_write,
+                            );
+                            sleep.flushed(stored);
+                        }
+                        SleepAction::Refuse(refusal) => break Some(refusal),
+                        SleepAction::Proceed => break None,
+                    }
+                };
+                if let Some(refusal) = refusal {
+                    // Stay awake. The power task's idle clock re-requests sleep
+                    // once this failure releases its handshake wait, by which
+                    // time the upload session has run or the pending record has
+                    // been retried by the next flush.
+                    match refusal {
+                        SleepRefusal::UploadQueued => {
+                            esp_println::println!("display: sleep deferred; upload session pending")
+                        }
+                        // The request itself is gone, so the browser is left
+                        // waiting on a writer that will not start and
+                        // UPLOAD_SESSION_ACTIVE stays set. Nothing here can
+                        // recover that. What this refusal does protect is the
+                        // rest of the queue, which is full: the ordinary loop
+                        // applies it before the next sleep attempt.
+                        SleepRefusal::UploadLost => esp_println::println!(
+                            "display: sleep deferred; upload request lost, storage queue full"
+                        ),
+                        SleepRefusal::ProgressUnwritten => esp_println::println!(
+                            "display: sleep deferred; progress persistence failed"
+                        ),
+                    }
                     send_required_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                     continue;
@@ -378,6 +447,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 if panel_slept {
                     send_required_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
+                    park_until_resumed(generation).await;
                 } else {
                     // The panel never acknowledged the sleep sequence, so it
                     // may still be mid-refresh. Cutting power now would
@@ -399,72 +469,146 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     Instant::now().as_millis(),
                 );
             }
-            Either::Second(StorageCommand::ReceiveUpload) => {
-                if sync_session.admits(&StorageCommand::ReceiveUpload) {
-                    // The display task is the upload writer until Sleep or
-                    // wireless Exit closes the session; a Sleep exit has
-                    // already been re-queued on DISPLAY_COMMANDS.
+            Either::Second(command) => match loop_arm(&command, sync_session) {
+                // The display task is the upload writer until Sleep or
+                // wireless Exit closes the session; a Sleep exit has
+                // already been re-queued on DISPLAY_COMMANDS.
+                LoopArm::UploadSession => {
                     crate::sd_session::upload_session(&mut epd, &mut sd_cs).await;
-                    continue;
                 }
-                esp_println::println!("storage: upload refused outside sync");
-            }
-            Either::Second(command) => {
-                // A layout change re-paginates the book, which blocks this
-                // task for the whole rebuild. Paint the title/author plate
-                // first so the wait reads as loading, not frozen: the store
-                // still reports the old settings here, so the reader view
-                // lands on the loading branch. A same-layout open already
-                // shows the plate through the normal render path (the book
-                // isn't loaded yet), so it is skipped here.
-                if refresh_planner.screen_on() {
-                    if let Some(loading_request) = open_loading_plate_request(
-                        &command,
-                        sd_library,
-                        refresh_planner.last_request(),
-                    ) {
-                        crate::views::render(fb, loading_request, sd_library);
-                        let mode = refresh_planner.mode_for(loading_request);
-                        if display_flush::flush(
-                            &mut epd,
-                            fb,
-                            prev_fb,
-                            tx_band,
-                            refresh_planner.screen_on(),
-                            mode,
-                            prev_prestaged,
+                LoopArm::RefusedUpload => {
+                    esp_println::println!("storage: upload refused outside sync");
+                }
+                LoopArm::Apply => {
+                    // A layout change re-paginates the book, which blocks this
+                    // task for the whole rebuild. Paint the title/author plate
+                    // first so the wait reads as loading, not frozen: the store
+                    // still reports the old settings here, so the reader view
+                    // lands on the loading branch. A same-layout open already
+                    // shows the plate through the normal render path (the book
+                    // isn't loaded yet), so it is skipped here.
+                    //
+                    // Only for an open the handler will actually act on. The
+                    // same begin() gate it applies drops a stale request here
+                    // too -- otherwise a superseded open would spend a
+                    // multi-second full flush painting a plate for a target the
+                    // reader has already navigated past, then be skipped.
+                    if refresh_planner.screen_on()
+                        && OpenSequence::begin(
+                            &command,
+                            LATEST_READER_REQUEST_ID.load(Ordering::Relaxed),
                         )
-                        .await
-                        .is_ok()
-                        {
-                            refresh_planner.record_render(loading_request, mode);
-                            prev_fb.copy_from(fb);
-                            prev_prestaged = false;
-                        } else {
-                            // No Settled/Failed events here — the app isn't
-                            // waiting on this opportunistic plate — but the
-                            // panel state is as unknown as after any failed
-                            // flush: drop the prestage claim and the
-                            // planner's screen model.
-                            esp_println::println!("display: loading plate flush failed");
-                            prev_prestaged = false;
-                            refresh_planner.record_failure();
+                        .is_some()
+                    {
+                        if let Some(loading_request) = open_loading_plate_request(
+                            &command,
+                            sd_library,
+                            refresh_planner.last_request(),
+                        ) {
+                            crate::views::render(fb, loading_request, sd_library);
+                            let mode = refresh_planner.mode_for(loading_request);
+                            if display_flush::flush(
+                                &mut epd,
+                                fb,
+                                prev_fb,
+                                tx_band,
+                                refresh_planner.screen_on(),
+                                mode,
+                                prev_prestaged,
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                refresh_planner.record_render(loading_request, mode);
+                                prev_fb.copy_from(fb);
+                                prev_prestaged = false;
+                            } else {
+                                // No Settled/Failed events here — the app isn't
+                                // waiting on this opportunistic plate — but the
+                                // panel state is as unknown as after any failed
+                                // flush: drop the prestage claim and the
+                                // planner's screen model.
+                                esp_println::println!("display: loading plate flush failed");
+                                prev_prestaged = false;
+                                refresh_planner.record_failure();
+                            }
                         }
                     }
+                    handle_storage_command(
+                        command,
+                        &mut epd,
+                        &mut sd_cs,
+                        sd_library,
+                        font_metrics,
+                        &mut epub_scratch,
+                        &mut sync_session,
+                        &mut pending_progress,
+                        &mut last_progress_write,
+                        &mut state_restored,
+                    );
                 }
-                handle_storage_command(
-                    command,
-                    &mut epd,
-                    &mut sd_cs,
-                    sd_library,
-                    font_metrics,
-                    &mut epub_scratch,
-                    &mut sync_session,
-                    &mut pending_progress,
-                    &mut last_progress_write,
-                    &mut state_restored,
-                    refresh_planner.last_request(),
+            },
+        }
+    }
+}
+
+/// Holds the display task still from the moment the panel goes down until the
+/// power task says the sleep was abandoned.
+///
+/// This is the whole guarantee that a slept panel keeps showing its sleep
+/// image. A render is routinely queued behind the `Sleep` — the pre-sleep
+/// storage drain provokes one itself, since applying a book open emits
+/// `Loaded` and the app repaints on it, and the sleep frame's full-waveform
+/// flush gives it seconds to arrive. Returning to the command loop with that
+/// render waiting re-initialises the panel and paints a page over the sleep
+/// image, racing the power cut. Nothing the loop could do with that render is
+/// right: painting it is the bug, and answering it discards the repaint the
+/// abandoning press is owed. So the task does not go back to the loop at all.
+///
+/// On the ordinary path this never returns — `enter_deep_sleep_button` is `!`
+/// and the chip reboots on wake. It returns only when the press that abandoned
+/// the handshake releases it, and then the queued render is still queued and
+/// repaints, which is exactly what that press asked for.
+///
+/// The wait is bounded so a lost `DisplayAsleep` cannot freeze the device.
+/// That acknowledgement is a 20 ms bounded send into a queue the power task is
+/// already draining, so losing it should not happen; if it ever does, the power
+/// task waits for an ack that will not come and an unbounded park here would
+/// wait on a resume that will not come either, leaving both tasks stopped
+/// behind a dark panel. Waking early risks repainting over the sleep image —
+/// far better than a device that has to be reset.
+async fn park_until_resumed(generation: u32) {
+    // Deep sleep follows its acknowledgement within about one input poll tick
+    // (the power task's wake-button handoff), so seconds here are already many
+    // orders of margin.
+    const ABANDONED_HANDSHAKE_CEILING_SECS: u64 = 5;
+    // `Timer::at` rather than a remaining-time subtraction: discarding a stale
+    // resume can put the deadline in the past, and `Instant - Instant` panics
+    // there. A deadline already passed simply fires at once.
+    let deadline =
+        Instant::now() + embassy_time::Duration::from_secs(ABANDONED_HANDSHAKE_CEILING_SECS);
+    loop {
+        match select(
+            crate::DISPLAY_RESUME.wait(),
+            embassy_time::Timer::at(deadline),
+        )
+        .await
+        {
+            Either::First(resumed) if resumed == generation => {
+                esp_println::println!("display: sleep abandoned; resuming");
+                return;
+            }
+            // A resume left over from a sleep this task never parked for, e.g.
+            // one whose panel handshake failed. Not ours; keep waiting.
+            Either::First(stale) => {
+                esp_println::println!("display: ignoring stale resume generation={}", stale)
+            }
+            Either::Second(_) => {
+                esp_println::println!(
+                    "display: no deep sleep or resume within {} s; releasing the panel",
+                    ABANDONED_HANDSHAKE_CEILING_SECS
                 );
+                return;
             }
         }
     }
@@ -564,9 +708,7 @@ fn handle_storage_command(
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
-    last_request: Option<RenderRequest>,
 ) {
-    let is_open_book = matches!(command, StorageCommand::OpenBook { .. });
     // The session decides what may run: progress writes stay alive during a
     // sync session (they are cheap and harmless); everything
     // that touches the EPUB scratch is gone until the session's reset.
@@ -659,140 +801,206 @@ fn handle_storage_command(
             request_id,
             book_id,
             index,
-            chapter,
-            target_pages,
-            type_settings,
-            portrait,
+            ..
         }
         | StorageCommand::ExtendSection {
             request_id,
             book_id,
             index,
-            chapter,
-            target_pages,
-            type_settings,
-            portrait,
+            ..
         } => {
             let storage_start = Instant::now();
-            if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
+            let latest_request_id = LATEST_READER_REQUEST_ID.load(Ordering::Relaxed);
+            // The transaction's order lives in `OpenSequence` so a host test can
+            // drive it against a card model that fails whichever write it likes;
+            // this arm supplies a real card and reports back what it did.
+            let Some(mut open) = OpenSequence::begin(&command, latest_request_id) else {
                 esp_println::println!(
                     "storage: stale open skipped request={} latest={} book_id={} index={}",
                     request_id,
-                    LATEST_READER_REQUEST_ID.load(Ordering::Relaxed),
+                    latest_request_id,
                     book_id,
                     index
                 );
                 return;
-            }
-            // Read this book's catalog record into the active-entry slot so the
-            // reader pipeline (load_position, build_or_load) resolves it from
-            // the card rather than the list window. A failure leaves the entry
-            // unset and the open falls through to the usual bad-index error.
-            crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
-            // Adopt the command's type settings before the RAM fast path:
-            // a settings change drops the loaded page coverage, so the
-            // request falls through to the cache load/rebuild below.
-            sd_library.set_layout(type_settings, portrait);
-            // A fresh selection (chapter 0, page 0) resumes from the
-            // book's own saved position; explicit page requests pass
-            // through untouched. Extends never resume.
-            let mut chapter = chapter;
-            let mut target_pages = target_pages;
-            let mut resumed = false;
-            if is_open_book && chapter == 0 && target_pages == 0 {
-                if let Some((saved_chapter, saved_screen)) =
-                    reader_cache::load_position(epd, sd_cs, sd_library, index as usize)
-                {
-                    if saved_chapter > 0 || saved_screen > 0 {
-                        chapter = saved_chapter;
-                        target_pages = saved_screen.min(u16::MAX as u32) as u16;
-                        resumed = true;
-                        esp_println::println!(
-                            "storage: resume book {} at chapter {} screen {}",
-                            book_id,
-                            chapter,
-                            target_pages
+            };
+            // `Some(ram_hit)` once a section load was reached; a transaction the
+            // close-out refused never gets that far and must not report an open
+            // that did not happen.
+            let mut section_loaded = None;
+            loop {
+                match open.next() {
+                    OpenAction::CloseOutDeparting(previous) => {
+                        let stored = close_out_departing_book(
+                            epd,
+                            sd_cs,
+                            sd_library,
+                            pending_progress,
+                            last_progress_write,
+                            previous,
                         );
+                        if !stored {
+                            esp_println::println!(
+                                "storage: book open {:?} book_id={} departing={}",
+                                book_open_outcome(false, false),
+                                book_id,
+                                previous.book_id,
+                            );
+                        }
+                        open.departing_stored(stored);
                     }
+                    OpenAction::Refuse { book_id } => {
+                        // Nothing has been opened, so the reader is still whole
+                        // on the book it was reading. Announcing the new one
+                        // would strand that page: the app has already left the
+                        // book that owns it and will never reissue it.
+                        send_required_library_event(&LibraryEvent::BookOpenFailed { book_id });
+                        open.refused();
+                    }
+                    OpenAction::StageBook {
+                        index,
+                        type_settings,
+                        portrait,
+                    } => {
+                        // Read this book's catalog record into the active-entry
+                        // slot so the reader pipeline (load_position,
+                        // build_or_load) resolves it from the card rather than
+                        // the list window. A failure leaves the entry unset and
+                        // the open falls through to the usual bad-index error.
+                        crate::library_sd::load_active_entry(
+                            epd,
+                            sd_cs,
+                            sd_library,
+                            index as usize,
+                        );
+                        // Adopt the command's type settings before the RAM fast
+                        // path: a settings change drops the loaded page
+                        // coverage, so the request falls through to the cache
+                        // load/rebuild below.
+                        sd_library.set_layout(type_settings, portrait);
+                        open.staged();
+                    }
+                    OpenAction::LoadSavedPosition { index } => {
+                        let saved =
+                            reader_cache::load_position(epd, sd_cs, sd_library, index as usize);
+                        open.saved_position(saved);
+                        if open.resumed() {
+                            esp_println::println!(
+                                "storage: resume book {} at chapter {} screen {}",
+                                book_id,
+                                open.target_chapter(),
+                                open.target_page()
+                            );
+                        }
+                    }
+                    OpenAction::LoadSection {
+                        index,
+                        chapter,
+                        page,
+                    } => {
+                        // The requested page is usually inside the section
+                        // window that is already loaded; answering from RAM
+                        // keeps ordinary page turns free of card init, FAT, and
+                        // cache-file traffic.
+                        let ram_hit = sd_library.covers_global_page(index as usize, page as u32);
+                        section_loaded = Some(ram_hit);
+                        if ram_hit {
+                            esp_println::println!(
+                                "storage: open hit in RAM request={} book_id={} page={}",
+                                request_id,
+                                book_id,
+                                page
+                            );
+                        } else {
+                            esp_println::println!(
+                                "storage: open command request={} book_id={} index={} chapter={} target={}",
+                                request_id,
+                                book_id,
+                                index,
+                                chapter,
+                                page
+                            );
+                            sd_library.set_reader_status(BookLoadStatus::Loading);
+                            let scratch = ensure_epub_scratch(epub_scratch);
+                            reader_cache::build_or_load_book_cache(
+                                epd,
+                                sd_cs,
+                                sd_library,
+                                index as usize,
+                                chapter,
+                                page as usize,
+                                scratch,
+                                font_metrics,
+                            );
+                        }
+                        open.section_loaded();
+                    }
+                    OpenAction::StorePointer(state) => {
+                        let record = record_for_persisted(sd_library, state);
+                        let stored = reader_cache::store_global_state(epd, sd_cs, record);
+                        if stored {
+                            *pending_progress = None;
+                            *last_progress_write = Some(Instant::now());
+                        } else {
+                            // Left owed rather than retried here: the book is
+                            // open and the reader is in it, so the only cost of
+                            // waiting for the next flush is a reboot in that
+                            // window landing back on the old book.
+                            *pending_progress = Some(record);
+                        }
+                        let outcome = book_open_outcome(true, stored);
+                        debug_assert!(outcome.book_changed());
+                        esp_println::println!(
+                            "storage: book open {:?} book_id={} page={}",
+                            outcome,
+                            record.book_id,
+                            record.screen,
+                        );
+                        esp_println::println!(
+                            "bench: store_global_state ok={} book_id={} page={} t_ms={}",
+                            stored,
+                            record.book_id,
+                            record.screen,
+                            Instant::now().as_millis(),
+                        );
+                        open.pointer_stored(stored);
+                    }
+                    OpenAction::Announce { book_id, position } => {
+                        send_loaded_library_event(&LibraryEvent::Loaded {
+                            book_id,
+                            pages: sd_library.advertised_page_count(),
+                            chapters: sd_library.chapter_count_for_ui(),
+                            current_chapter: sd_library.current_chapter(),
+                            chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                            position,
+                        });
+                        open.announced();
+                    }
+                    OpenAction::Done => break,
                 }
             }
-            // The requested page is usually inside the section window that
-            // is already loaded; answering from RAM keeps ordinary page
-            // turns free of card init, FAT, and cache-file traffic.
-            if sd_library.covers_global_page(index as usize, target_pages as u32) {
+            if let Some(ram_hit) = section_loaded {
+                if !ram_hit {
+                    // Also the bench harness's legacy parse of a completed open.
+                    esp_println::println!(
+                        "storage: open complete status={:?} pages={} chapters={}",
+                        sd_library.reader_status(),
+                        sd_library.advertised_page_count(),
+                        sd_library.chapter_count_for_ui()
+                    );
+                }
                 esp_println::println!(
-                    "storage: open hit in RAM request={} book_id={} page={}",
-                    request_id,
-                    book_id,
-                    target_pages
-                );
-                esp_println::println!(
-                    "bench: storage_open request={} book_id={} index={} ram_hit=true elapsed_ms={} pages={} chapters={}",
+                    "bench: storage_open request={} book_id={} index={} ram_hit={} elapsed_ms={} status={:?} pages={} chapters={}",
                     request_id,
                     book_id,
                     index,
+                    ram_hit,
                     storage_start.elapsed().as_millis(),
+                    sd_library.reader_status(),
                     sd_library.advertised_page_count(),
                     sd_library.chapter_count_for_ui(),
                 );
-                send_loaded_library_event(&LibraryEvent::Loaded {
-                    book_id,
-                    pages: sd_library.advertised_page_count(),
-                    chapters: sd_library.chapter_count_for_ui(),
-                    current_chapter: sd_library.current_chapter(),
-                    chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
-                });
-                if resumed {
-                    send_resumed_position(book_id, chapter, target_pages, last_request);
-                }
-                return;
             }
-            esp_println::println!(
-                "storage: open command request={} book_id={} index={} chapter={} target={}",
-                request_id,
-                book_id,
-                index,
-                chapter,
-                target_pages
-            );
-            sd_library.set_reader_status(BookLoadStatus::Loading);
-            let scratch = ensure_epub_scratch(epub_scratch);
-            reader_cache::build_or_load_book_cache(
-                epd,
-                sd_cs,
-                sd_library,
-                index as usize,
-                chapter,
-                target_pages as usize,
-                scratch,
-                font_metrics,
-            );
-            send_loaded_library_event(&LibraryEvent::Loaded {
-                book_id,
-                pages: sd_library.advertised_page_count(),
-                chapters: sd_library.chapter_count_for_ui(),
-                current_chapter: sd_library.current_chapter(),
-                chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
-            });
-            if resumed {
-                send_resumed_position(book_id, chapter, target_pages, last_request);
-            }
-            esp_println::println!(
-                "storage: open complete status={:?} pages={} chapters={}",
-                sd_library.reader_status(),
-                sd_library.advertised_page_count(),
-                sd_library.chapter_count_for_ui()
-            );
-            esp_println::println!(
-                "bench: storage_open request={} book_id={} index={} ram_hit=false elapsed_ms={} status={:?} pages={} chapters={}",
-                request_id,
-                book_id,
-                index,
-                storage_start.elapsed().as_millis(),
-                sd_library.reader_status(),
-                sd_library.advertised_page_count(),
-                sd_library.chapter_count_for_ui(),
-            );
         }
         StorageCommand::LoadChapters {
             request_id,
@@ -819,13 +1027,15 @@ fn handle_storage_command(
                 sd_library.overview_chapter_count()
             );
             // Re-render the overview with the full list resident, syncing the
-            // selection range to the full chapter count.
+            // selection range to the full chapter count. The reader has not
+            // moved, so the app's own page stands.
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                position: None,
             });
         }
         StorageCommand::JumpChapter {
@@ -864,21 +1074,23 @@ fn handle_storage_command(
                 scratch,
                 font_metrics,
             );
+            // The page came from the on-disk TOC, not from the app, so it
+            // rides with the load rather than following as a second event.
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                position: Some(target_page as u32),
             });
-            send_resumed_position(book_id, chapter, target_page, last_request);
         }
         StorageCommand::ReceiveUpload => {
             // Handled in the task loop before dispatch; reaching here means
             // the loop refused it already.
         }
         StorageCommand::StoreWifiCredentials(credentials) => {
-            let record = hal_ext::nvm::WifiCredentialsRecord {
+            let record = proto::nvm::WifiCredentialsRecord {
                 ssid: credentials.ssid,
                 ssid_len: credentials.ssid_len,
                 password: credentials.password,
@@ -905,34 +1117,7 @@ fn handle_storage_command(
             esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
         StorageCommand::StoreProgress(record) => {
-            let (source_hash, source_size) = source_identity(sd_library, record.book_id);
-            // The reducer derives chapter from the 128-capped sd_chapter_for_page,
-            // so a deep position would save a stuck chapter that the sleep/boot
-            // colophon then shows wrong until the book reopens. The firmware
-            // tracks the true chapter over the whole book; adopt it for the
-            // loaded SD book so saved/restored state names the chapter right.
-            let chapter = if ReaderSource::from_book_id(record.book_id).is_sd()
-                && sd_library.loaded_index == ReaderStore::selected_book_index(record.book_id)
-            {
-                sd_library.current_chapter()
-            } else {
-                record.chapter
-            };
-            let record = AppStateRecord {
-                book_id: record.book_id,
-                chapter,
-                screen: record.screen,
-                shell_orientation: record.shell_orientation,
-                reading_orientation: record.reading_orientation,
-                refresh_policy: record.refresh_policy,
-                font_size: record.font_size,
-                line_spacing: record.line_spacing,
-                font_weight: record.font_weight,
-                font_family: record.font_family,
-                front_buttons: record.front_buttons,
-                source_hash,
-                source_size,
-            };
+            let record = record_for_persisted(sd_library, record);
             // Coalesce same-context page turns; anything beyond the screen
             // number changing (book, chapter, orientation, policy) is rare
             // and worth landing immediately. A pending record for the same
@@ -1059,31 +1244,56 @@ fn send_required_display_event(event: &DisplayEvent) {
     }
 }
 
-/// Announces a per-book resume to the app as a Restored event, carrying
-/// the current display settings unchanged.
-fn send_resumed_position(
-    book_id: u32,
-    chapter: u16,
-    target_pages: u16,
-    last_request: Option<RenderRequest>,
-) {
-    let Some(request) = last_request else {
-        return;
-    };
-    send_required_library_event(&LibraryEvent::Restored {
-        book_id,
-        chapter,
-        page: target_pages as u32,
-        // The book is loaded here, so carry its known total page count.
-        page_count: request.page_count,
-        reading_orientation: request.orientation as u8,
-        refresh_policy: request.refresh_policy as u8,
-        font_size: request.font_size as u8,
-        line_spacing: request.line_spacing as u8,
-        font_weight: request.font_weight as u8,
-        font_family: request.font_family as u8,
-        front_buttons: request.front_buttons as u8,
-    });
+/// Step one of a book-open transaction: get the departing book's page onto
+/// the card, and clear anything the coalescer was still holding for it.
+///
+/// Returns whether the open may proceed. A refusal leaves the reader entirely
+/// on the old book, with that book's position still owed and retried by the
+/// next flush — there is no half-applied switch to reconcile later, which is
+/// what lets the pending state stay a single latest-value slot.
+fn close_out_departing_book(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &ReaderStore,
+    pending_progress: &mut Option<AppStateRecord>,
+    last_progress_write: &mut Option<Instant>,
+    previous: PersistedAppState,
+) -> bool {
+    // A coalesced record for another book still has to land: it names that
+    // book in the global state file, and this transaction is about to point
+    // that file somewhere else.
+    if pending_progress.is_some_and(|pending| pending.book_id != previous.book_id)
+        && !flush_pending_progress(
+            epd,
+            sd_cs,
+            sd_library,
+            pending_progress,
+            last_progress_write,
+        )
+    {
+        return false;
+    }
+    let record = record_for_persisted(sd_library, previous);
+    let start = Instant::now();
+    let stored = reader_cache::store_book_position(epd, sd_cs, sd_library, record);
+    esp_println::println!(
+        "bench: store_book_position ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+        stored,
+        record.book_id,
+        record.screen,
+        start.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
+    if stored {
+        // Whatever the coalescer held for this book is now on the card, and
+        // the global half of it is about to be rewritten by step three.
+        *pending_progress = None;
+    } else {
+        // Keep it owed so the next flush retries it; the reader is staying on
+        // this book, so the record is still the right one to write.
+        *pending_progress = Some(record);
+    }
+    stored
 }
 
 /// Kept out of line: first-call initialization moves a multi-KB scratch
@@ -1113,6 +1323,72 @@ fn ensure_epub_scratch<'a>(
 
 fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
     library.source_identity(book_id)
+}
+
+/// The on-card record for a state the app persisted, with the fields only the
+/// firmware knows filled in.
+///
+/// The reducer derives chapter from the 128-capped `sd_chapter_for_page`, so a
+/// deep position would save a stuck chapter that the sleep/boot colophon then
+/// shows wrong until the book reopens. The firmware tracks the true chapter
+/// over the whole book; adopt it for the loaded SD book so saved and restored
+/// state name the chapter right.
+fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppStateRecord {
+    let (source_hash, source_size) = source_identity(library, state.book_id);
+    let chapter = if ReaderSource::from_book_id(state.book_id).is_sd()
+        && library.loaded_index == ReaderStore::selected_book_index(state.book_id)
+    {
+        library.current_chapter()
+    } else {
+        state.chapter
+    };
+    AppStateRecord {
+        book_id: state.book_id,
+        chapter,
+        screen: state.screen,
+        shell_orientation: state.shell_orientation,
+        reading_orientation: state.reading_orientation,
+        refresh_policy: state.refresh_policy,
+        font_size: state.font_size,
+        line_spacing: state.line_spacing,
+        font_weight: state.font_weight,
+        font_family: state.font_family,
+        front_buttons: state.front_buttons,
+        source_hash,
+        source_size,
+    }
+}
+
+/// Where the reader is in the book at `index`.
+///
+/// The book's own position file is authoritative. It is written when that book
+/// is left and read when it is opened, so it can only ever describe this book —
+/// which is the whole point of keeping it: the global state record is a single
+/// slot that names one book, and reading position out of it is what let a stale
+/// record hand one book's page to another.
+///
+/// The record's own `chapter`/`screen` are a mirror, still written so MarigoldOS
+/// (which reads position from the global file) keeps resuming from cards this
+/// firmware wrote. They are consulted only when the per-book file is missing or
+/// fails its checksum, and they are safe in that role because the identity that
+/// selected this book came from the very same record.
+fn book_position(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    index: u16,
+    mirror: AppStateRecord,
+) -> (u16, u32) {
+    match reader_cache::load_position(epd, sd_cs, library, usize::from(index)) {
+        Some(position) => position,
+        None => {
+            esp_println::println!(
+                "restore: no per-book position for index={}; using the global mirror",
+                index
+            );
+            (mirror.chapter, mirror.screen)
+        }
+    }
 }
 
 /// One boot-time attempt to map durable reader state back onto the scanned
@@ -1148,26 +1424,28 @@ fn restore_saved_state(
         );
         return;
     };
+    // Stage the restored book's catalog entry so the position, colophon, and
+    // page-count reads below resolve it, and so the first Home paint names it
+    // before any open.
+    crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
+    let (chapter, screen) = book_position(epd, sd_cs, library, index, record);
     esp_println::println!(
         "restore: index={} chapter={} screen={}",
         index,
-        record.chapter,
-        record.screen
+        chapter,
+        screen
     );
-    // Stage the restored book's catalog entry so the colophon/page-count reads
-    // below resolve it, and so the first Home paint names it before any open.
-    crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
     // Resolve the chapter title now so wake-to-Home (rendered before the book
     // is opened) names the chapter; without this the colophon shows a numeral
     // until the book is first opened this session.
-    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
+    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
     // The book's total page count, so the Home progress bar has a denominator
     // on wake before the book is opened (read from the cache index header).
     let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
-        chapter: record.chapter,
-        page: record.screen,
+        chapter,
+        page: screen,
         page_count,
         reading_orientation: record.reading_orientation,
         refresh_policy: record.refresh_policy,
@@ -1185,9 +1463,12 @@ fn sleep_request_from_saved_state(
     library: &mut ReaderStore,
     pending_progress: &Option<AppStateRecord>,
 ) -> Option<RenderRequest> {
-    let record = match *pending_progress {
-        Some(record) => record,
-        None => reader_cache::load_app_state(epd, sd_cs)?,
+    // A coalesced record is state the card has not seen yet, so it outranks
+    // both stored copies; only a record read back from the card has to defer
+    // to the book's own position file.
+    let (record, unflushed) = match *pending_progress {
+        Some(record) => (record, true),
+        None => (reader_cache::load_app_state(epd, sd_cs)?, false),
     };
     let hint = ReaderSource::from_book_id(record.book_id).sd_index();
     let index = crate::library_sd::find_index_by_identity(
@@ -1198,14 +1479,19 @@ fn sleep_request_from_saved_state(
         hint,
     )?;
     crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
-    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
+    let (chapter, screen) = if unflushed {
+        (record.chapter, record.screen)
+    } else {
+        book_position(epd, sd_cs, library, index, record)
+    };
+    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
     let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     Some(RenderRequest {
         kind: RenderKind::Page,
         view: AppView::Home,
-        page: record.screen,
+        page: screen,
         page_count,
-        chapter: record.chapter,
+        chapter,
         selection: 0,
         book_id: ReaderSource::sd(index).book_id(),
         orientation: display_orientation_from_u8(record.reading_orientation)

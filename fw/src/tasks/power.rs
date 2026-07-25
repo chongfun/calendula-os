@@ -1,6 +1,6 @@
 use crate::{
-    AppView, DisplayCommand, PowerEvent, DISPLAY_COMMANDS, POWER_EVENTS, WAKE_PIN_HANDOFF,
-    WAKE_PIN_REQUESTS,
+    AppView, DisplayCommand, PowerEvent, DISPLAY_COMMANDS, DISPLAY_RESUME, POWER_EVENTS,
+    WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
 };
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
@@ -96,7 +96,17 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
                 let mut button = take_wake_button().await;
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
-            PowerEvent::Activity(view) => return idle_timeout(view),
+            PowerEvent::Activity(view) => {
+                // The press that lands here may arrive before, during, or
+                // after the display task's sleep sequence. If it has already
+                // parked behind its own acknowledgement, only this releases
+                // it; if it has not parked yet, the signal latches and is
+                // waiting when it does. Naming the generation is what keeps
+                // a resume left over from a sleep the display task never
+                // parked for out of a later one.
+                DISPLAY_RESUME.signal(generation);
+                return idle_timeout(view);
+            }
             PowerEvent::DisplaySleepFailed(acked) if acked == generation => {
                 // The display task could not complete the sleep transition
                 // (progress flush or panel handshake failed). Cutting power

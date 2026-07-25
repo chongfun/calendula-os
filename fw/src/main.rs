@@ -118,6 +118,19 @@ pub static DISPLAY_EVENTS: Channel<CriticalSectionRawMutex, DisplayEvent, 8> = C
 pub static LIBRARY_EVENTS: Channel<CriticalSectionRawMutex, LibraryEvent, 8> = Channel::new();
 pub static STORAGE_COMMANDS: Channel<CriticalSectionRawMutex, StorageCommand, 4> = Channel::new();
 pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Channel::new();
+/// The generation of a sleep handshake the power task gave up on.
+///
+/// Once the display task has put the panel down it parks until deep sleep
+/// takes the chip or this names its own generation. Parking is what keeps a
+/// render from repainting over the sleep image: a task that is not running
+/// cannot touch the panel, and `enter_deep_sleep_button` never returns, so on
+/// the ordinary path the park simply never ends.
+///
+/// A `Signal` rather than a channel because the latest value is the only one
+/// that matters and it must latch: the power task can abandon a handshake
+/// before the display task reaches its park, and that resume has to still be
+/// waiting when it gets there.
+pub static DISPLAY_RESUME: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 // Power button (GPIO3) handoff for the terminal deep-sleep path. The input
 // task owns the pin and polls it for the whole run; the power task needs it
 // back as the RTC wake source, and re-materialising it there is only sound

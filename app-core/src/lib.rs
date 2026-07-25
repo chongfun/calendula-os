@@ -4,6 +4,9 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
+/// The storage/display task's command loop, as sequences a host test can drive.
+pub mod storage_loop;
+
 pub const SETTINGS_ITEMS: u8 = 7;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
@@ -332,6 +335,15 @@ pub enum DisplayCommand {
 pub enum StorageCommand {
     LoadCatalogCache,
     RefreshCatalog,
+    /// Open a book, and — when this is a book change — close out the one being
+    /// left in the same command.
+    ///
+    /// Opening is one transaction the storage task owns end to end: it writes
+    /// `previous`'s position file, opens this book, and only then points the
+    /// global state file here, at the position the open actually landed on.
+    /// Carrying the departing state rather than sending it as a second command
+    /// is what makes the pair impossible to separate — there is no interleaving
+    /// for a queue to reorder, and no half-finished switch to represent.
     OpenBook {
         request_id: u32,
         book_id: u32,
@@ -342,6 +354,9 @@ pub enum StorageCommand {
         /// Paginate into the portrait page box. Rides beside the type
         /// settings because it changes wrap points the same way.
         portrait: bool,
+        /// The departing book's final position, when this open changes books.
+        /// `None` re-opens the book already active, which owes nothing.
+        previous: Option<PersistedAppState>,
     },
     ExtendSection {
         request_id: u32,
@@ -387,6 +402,390 @@ pub enum StorageCommand {
     /// channels and writes browser-sent books to /BOOKS until the
     /// session's reset. Sent by the wifi task at the first upload.
     ReceiveUpload,
+}
+
+/// Slots for storage commands the channel could not take yet.
+///
+/// Two is what a single input transition can produce: one navigation command
+/// (open, extend, chapter list, jump) and one deferred write — progress or a
+/// credentials forget, never both, since a transition that moves the saved
+/// position is not the Wireless-screen confirm.
+pub const PARKED_STORAGE_SLOTS: usize = 2;
+
+/// What became of a storage command handed to [`ParkedStorage::dispatch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageDispatch {
+    /// Straight into the channel.
+    Sent,
+    /// Held for the next drain, behind anything already waiting.
+    Parked,
+    /// Neither, and the caller must cope. Only ever returned for a command
+    /// the queue could not make room for without losing something it is not
+    /// allowed to lose.
+    Rejected,
+}
+
+/// Storage commands the channel could not take yet, in arrival order.
+///
+/// Nothing may overtake what is parked: the storage task applies commands in
+/// the order it receives them, so a progress record that slipped past a parked
+/// open would land after the new book was opened and point the global state
+/// file back at the book the reader had just left.
+///
+/// Most of what parks here is replaceable — a dropped progress record is
+/// reissued by the next page turn. An `OpenBook` is not. It is the only carrier
+/// of the departing book's close-out position, and the app arms an input lock
+/// waiting for the event it will produce, so silently dropping one strands both
+/// the page and the reader. `dispatch` therefore never drops an open: it makes
+/// room, or says so.
+///
+/// RAM: `PARKED_STORAGE_SLOTS` × a 100-byte `Option<StorageCommand>` plus the
+/// length, 204 bytes, in the app task's arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParkedStorage {
+    queue: [Option<StorageCommand>; PARKED_STORAGE_SLOTS],
+    len: usize,
+}
+
+impl Default for ParkedStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ParkedStorage {
+    pub const fn new() -> Self {
+        Self {
+            queue: [None; PARKED_STORAGE_SLOTS],
+            len: 0,
+        }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Sends `command` if nothing is waiting and the channel takes it, parks it
+    /// otherwise, and only reports [`StorageDispatch::Rejected`] when it can do
+    /// neither without dropping something irreplaceable.
+    pub fn dispatch(
+        &mut self,
+        command: StorageCommand,
+        try_send: impl FnOnce(StorageCommand) -> bool,
+    ) -> StorageDispatch {
+        if self.is_empty() && try_send(command) {
+            return StorageDispatch::Sent;
+        }
+        if self.push_back(command) {
+            return StorageDispatch::Parked;
+        }
+        // Full. An open may still displace a write it has already subsumed:
+        // it carries the departing book's position in `previous`, so a parked
+        // `StoreProgress` for that same book is recording something this
+        // command will write anyway.
+        if let Some(slot) = self.subsumed_by(command) {
+            self.remove(slot);
+            let _ = self.push_back(command);
+            return StorageDispatch::Parked;
+        }
+        StorageDispatch::Rejected
+    }
+
+    /// The parked write `command` makes redundant, if any.
+    fn subsumed_by(&self, command: StorageCommand) -> Option<usize> {
+        let StorageCommand::OpenBook {
+            previous: Some(departing),
+            ..
+        } = command
+        else {
+            return None;
+        };
+        self.queue[..self.len].iter().position(|parked| {
+            matches!(
+                parked,
+                Some(StorageCommand::StoreProgress(record)) if record.book_id == departing.book_id
+            )
+        })
+    }
+
+    pub fn push_back(&mut self, command: StorageCommand) -> bool {
+        if self.len == PARKED_STORAGE_SLOTS {
+            return false;
+        }
+        self.queue[self.len] = Some(command);
+        self.len += 1;
+        true
+    }
+
+    pub fn pop_front(&mut self) -> Option<StorageCommand> {
+        let command = self.queue[0].take()?;
+        self.queue.copy_within(1..self.len, 0);
+        self.len -= 1;
+        self.queue[self.len] = None;
+        Some(command)
+    }
+
+    fn remove(&mut self, slot: usize) {
+        if slot >= self.len {
+            return;
+        }
+        self.queue.copy_within(slot + 1..self.len, slot);
+        self.len -= 1;
+        self.queue[self.len] = None;
+    }
+}
+
+/// Holds a Power press until the app has nothing left to hand the storage task.
+///
+/// Deep sleep is terminal — waking is a fresh boot — so whatever the app is
+/// still holding when the panel sleeps is simply gone. The display task does
+/// flush before it sleeps, but only its own coalesced record: it cannot see a
+/// command parked in the app, and its command channels are separate, so a
+/// `Sleep` is picked up ahead of an `OpenBook` already queued behind it.
+///
+/// A book open is the costly thing to lose that way. It carries the departing
+/// book's only close-out position, and nothing reissues it: the reader has
+/// already left that book, and the transaction deliberately suppresses the
+/// progress record that used to follow. So the press waits for the open to
+/// resolve — either outcome will do — rather than racing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SleepGate {
+    deferred: bool,
+}
+
+/// What the app still owes before the panel may sleep.
+///
+/// All three have to be clear. The first two are durability — work that has not
+/// reached the storage task cannot survive a terminal sleep. The third is what
+/// the panel keeps showing: the sleep screen is drawn from the last frame that
+/// reached it, so sleeping between an open answering and its frame settling
+/// leaves the reader looking at a book they are no longer in, for as long as
+/// the device stays off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SleepBlockers {
+    /// A book open was accepted and has not answered yet.
+    pub open_unresolved: bool,
+    /// Commands are parked, waiting on the next drain to send them.
+    pub parked_storage: bool,
+    /// An open answered, but the frame resolving it has not settled.
+    pub awaiting_open_frame: bool,
+}
+
+impl SleepBlockers {
+    pub const fn any(self) -> bool {
+        self.open_unresolved || self.parked_storage || self.awaiting_open_frame
+    }
+}
+
+impl SleepGate {
+    pub const fn new() -> Self {
+        Self { deferred: false }
+    }
+
+    /// A Power press. Returns whether the sleep request goes out now.
+    pub fn press(&mut self, blockers: SleepBlockers) -> bool {
+        if blockers.any() {
+            self.deferred = true;
+            return false;
+        }
+        true
+    }
+
+    /// A display cycle ended. Returns whether a press that was held back should
+    /// go out now; only ever true once per press.
+    pub fn release(&mut self, blockers: SleepBlockers) -> bool {
+        if self.deferred && !blockers.any() {
+            self.deferred = false;
+            return true;
+        }
+        false
+    }
+
+    pub const fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+}
+
+/// Where the reader sits before a book-open transaction, so an abort can put
+/// it back. Held by the app task, which is the only place that still knows.
+///
+/// Carries the departing book's navigation bounds as well as its position. The
+/// Library confirm that starts an open resets those bounds to a one-page book,
+/// and no `Loaded` ever arrives to correct them for a switch that did not
+/// happen — so restoring the page alone would leave the reader on the right
+/// page of a book the reducer believes is one page long, and the next page turn
+/// would clamp them to the start and persist it.
+///
+/// RAM: `sd_chapter_pages` (128 entries) makes this 276 bytes rather than 20,
+/// held in one `Option` in the app task's arena while an open is inflight. The
+/// alternative — not clobbering the bounds until the open is accepted — would
+/// have to move that decision out of the reducer, which is where the shape of a
+/// freshly selected book belongs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookOpenRollback {
+    pub book_id: u32,
+    pub chapter: u16,
+    pub page: u32,
+    pub view: AppView,
+    pub selection: u16,
+    pub sd_page_count: u32,
+    pub sd_chapter_count: u16,
+    pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
+}
+
+/// How a book-open transaction ended.
+///
+/// The policy is deliberately strict, and the strictness is what removes the
+/// need to queue partially finished switches: the reader either completes the
+/// move or stays wholly on the book it started from, so there is never a
+/// half-applied switch for a later command to reconcile.
+///
+/// A book that will not open is deliberately not an outcome here. By that
+/// point the card has been read over and the previous book is no longer
+/// resident, so "keep the old book" would mean showing its title with nothing
+/// behind it; the reader is better served by the load error on the book it
+/// actually asked for. The departing page is safe either way — step one wrote
+/// it before the open was attempted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookOpenOutcome {
+    /// Departing position written, book opened, global pointer moved.
+    Opened,
+    /// The departing book's position never reached the card, so the open was
+    /// not attempted. The reader stays where it was and owes that position.
+    KeptBookPositionUnwritten,
+    /// The book is open and readable, but the global pointer still names the
+    /// old one, so a reboot before the retry returns there. Recoverable: the
+    /// new record is owed to the card and rides the next flush.
+    OpenedPointerOwed,
+}
+
+/// Resolves a book-open transaction from which of its two writes landed.
+///
+/// `pointer_stored` is only meaningful once `previous_stored` holds: the
+/// transaction stops at the first failure, and the ordering here mirrors that.
+pub const fn book_open_outcome(previous_stored: bool, pointer_stored: bool) -> BookOpenOutcome {
+    if !previous_stored {
+        BookOpenOutcome::KeptBookPositionUnwritten
+    } else if !pointer_stored {
+        BookOpenOutcome::OpenedPointerOwed
+    } else {
+        BookOpenOutcome::Opened
+    }
+}
+
+impl BookOpenOutcome {
+    /// Whether the reader ends up on the book the open asked for.
+    pub const fn book_changed(self) -> bool {
+        matches!(self, Self::Opened | Self::OpenedPointerOwed)
+    }
+}
+
+/// The storage command a reader-state transition owes, if any.
+///
+/// Lives here rather than in the firmware task so the dispatch rules are
+/// host-testable — above all that a book change produces exactly one command,
+/// carrying the departing book's position, rather than an open plus a
+/// separate write that a full channel could separate them.
+///
+/// `request_id` is supplied by the caller because the firmware's counter is a
+/// task-owned atomic; the value only has to be the one the storage task will
+/// compare against `LATEST_READER_REQUEST_ID`.
+pub fn storage_command_for_transition(
+    previous: &ReaderState,
+    next: &ReaderState,
+    request_id: u32,
+) -> Option<StorageCommand> {
+    let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
+    // Entering the overview loads the full chapter list into the section
+    // buffer; the reading section reloads on exit.
+    if next.view == AppView::Chapters && previous.view != AppView::Chapters {
+        return Some(StorageCommand::LoadChapters {
+            request_id,
+            book_id: next.book_id,
+            index,
+        });
+    }
+    if next.view != AppView::Reading {
+        return None;
+    }
+
+    if previous.book_id != next.book_id {
+        // The one case that closes out another book. Everything the switch
+        // owes rides in this command.
+        return Some(open_book_command(
+            next,
+            index,
+            request_id,
+            Some(previous.persisted()),
+        ));
+    }
+
+    if previous.view != AppView::Reading {
+        if previous.view == AppView::Chapters {
+            // The buffer held the TOC, so the section always reloads. A new
+            // chapter selection resolves its page from the on-disk TOC; a
+            // plain back-out just reloads the page we left.
+            return if next.chapter != previous.chapter {
+                Some(StorageCommand::JumpChapter {
+                    request_id,
+                    book_id: next.book_id,
+                    index,
+                    chapter: next.chapter,
+                    type_settings: next.type_settings(),
+                    portrait: is_portrait(next.orientation),
+                })
+            } else {
+                Some(extend_section_command(next, index, request_id))
+            };
+        }
+        // An unchanged book id no longer proves the store holds its
+        // pages: boot restore and the scan default set the active book
+        // without loading anything. Entering Reading always requests
+        // the section; an already-loaded book answers from RAM without
+        // an SD session.
+        return Some(open_book_command(next, index, request_id, None));
+    }
+
+    if previous.page != next.page || previous.chapter != next.chapter {
+        return Some(extend_section_command(next, index, request_id));
+    }
+
+    None
+}
+
+/// An open of `state`'s book, closing out `previous` when this changes books.
+pub fn open_book_command(
+    state: &ReaderState,
+    index: u16,
+    request_id: u32,
+    previous: Option<PersistedAppState>,
+) -> StorageCommand {
+    StorageCommand::OpenBook {
+        request_id,
+        book_id: state.book_id,
+        index,
+        chapter: state.chapter,
+        target_pages: state.page.min(u16::MAX as u32) as u16,
+        type_settings: state.type_settings(),
+        portrait: is_portrait(state.orientation),
+        previous,
+    }
+}
+
+pub fn extend_section_command(state: &ReaderState, index: u16, request_id: u32) -> StorageCommand {
+    StorageCommand::ExtendSection {
+        request_id,
+        book_id: state.book_id,
+        index,
+        chapter: state.chapter,
+        target_pages: state.page.min(u16::MAX as u32) as u16,
+        type_settings: state.type_settings(),
+        portrait: is_portrait(state.orientation),
+    }
 }
 
 /// The sync session's storage-admission rules. Granting the loan is one-way:
@@ -597,6 +996,14 @@ pub enum LibraryEvent {
     Scanned {
         count: u16,
     },
+    /// A section load finished: the book's shape, and where the reader now is.
+    ///
+    /// This is the only event an open produces. It used to be followed by a
+    /// second `Restored` whenever the storage task resumed the book somewhere
+    /// other than the requested page, which meant the app rendered the wrong
+    /// page first and then corrected it — two panel refreshes and a visible
+    /// flash. The landing position rides here instead, so one event settles
+    /// the open and one render draws it.
     Loaded {
         book_id: u32,
         pages: u32,
@@ -607,6 +1014,22 @@ pub enum LibraryEvent {
         /// colophon and chapter cursor do not stick past the cap.
         current_chapter: u16,
         chapter_pages: [u16; MAX_SD_CHAPTERS],
+        /// The page the storage task landed on, when it chose it rather than
+        /// the app: a per-book resume, or a chapter jump resolved from the
+        /// on-disk TOC. `None` means the load answered the page that was
+        /// asked for, and the app's own page stands — adopting a page from
+        /// every load would rubber-band the reader back onto an in-flight
+        /// request during quick page turns.
+        position: Option<u32>,
+    },
+    /// A book-open transaction refused to complete, so the book was never
+    /// opened and the reader must go back to the one it was reading.
+    ///
+    /// Sent when the departing book's position could not be written: opening
+    /// on top of that failure would strand a page that nothing else will
+    /// rewrite, because the reader has already left the book that owns it.
+    BookOpenFailed {
+        book_id: u32,
     },
     ChapterPage {
         book_id: u32,
@@ -1115,18 +1538,30 @@ impl ReaderState {
                 chapters,
                 current_chapter,
                 chapter_pages,
+                position,
             } => {
                 if self.book_id == book_id {
                     self.sd_page_count = pages.max(1);
                     self.sd_chapter_count = chapters.max(1);
                     self.sd_chapter_pages = chapter_pages;
-                    self.page = self.page.min(self.sd_page_count.saturating_sub(1));
+                    // A landing page the storage task chose (resume, chapter
+                    // jump) replaces the page that was asked for; otherwise
+                    // the app's own page stands and is only clamped to the
+                    // book it now knows the length of.
+                    self.page = position
+                        .unwrap_or(self.page)
+                        .min(self.sd_page_count.saturating_sub(1));
                     // The firmware owns the true current chapter over the whole
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
                     self.chapter = current_chapter;
                     self.dirty = Rect::FULL;
                 }
+            }
+            LibraryEvent::BookOpenFailed { .. } => {
+                // The app task owns the rollback: it is the only place that
+                // still remembers which book the reader was on before the
+                // open, so it applies `restore_after_failed_open` itself.
             }
             LibraryEvent::ChapterPage {
                 book_id,
@@ -1324,6 +1759,40 @@ impl ReaderState {
             weight: self.font_weight,
             family: self.font_family,
         }
+    }
+
+    /// Where the reader sits before an open, so an aborted transaction can put
+    /// it back. Taken before the state that requests the open, never after.
+    pub fn open_rollback(self) -> BookOpenRollback {
+        BookOpenRollback {
+            book_id: self.book_id,
+            chapter: self.chapter,
+            page: self.page,
+            view: self.view,
+            selection: self.selection,
+            sd_page_count: self.sd_page_count,
+            sd_chapter_count: self.sd_chapter_count,
+            sd_chapter_pages: self.sd_chapter_pages,
+        }
+    }
+
+    /// Puts the reader back on the book it was reading when a book-open
+    /// transaction aborted.
+    ///
+    /// Position and navigation bounds together. Nothing reloads the old book
+    /// after a switch that never happened, so this is the only chance to undo
+    /// what selecting the new one overwrote; see [`BookOpenRollback`].
+    pub fn restore_after_failed_open(mut self, rollback: BookOpenRollback) -> Self {
+        self.book_id = rollback.book_id;
+        self.chapter = rollback.chapter;
+        self.page = rollback.page;
+        self.view = rollback.view;
+        self.selection = rollback.selection;
+        self.sd_page_count = rollback.sd_page_count;
+        self.sd_chapter_count = rollback.sd_chapter_count;
+        self.sd_chapter_pages = rollback.sd_chapter_pages;
+        self.dirty = Rect::FULL;
+        self
     }
 
     pub fn library_item_count(self, ctx: ReducerContext) -> u16 {
@@ -1589,6 +2058,450 @@ mod tests {
 
     fn press(state: ReaderState, button: Button) -> ReaderState {
         state.apply_input(CTX, InputEvent::button(button))
+    }
+
+    /// A reader parked in a book, as if it had been opened and read into.
+    fn reading(book_index: u16, chapter: u16, page: u32) -> ReaderState {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(book_index).book_id();
+        state.chapter = chapter;
+        state.page = page;
+        state.library_count = 4;
+        state.sd_page_count = 500;
+        state.sd_chapter_count = 20;
+        state
+    }
+
+    fn loaded(book_id: u32, position: Option<u32>) -> LibraryEvent {
+        LibraryEvent::Loaded {
+            book_id,
+            pages: 500,
+            chapters: 20,
+            current_chapter: 3,
+            chapter_pages: [0; MAX_SD_CHAPTERS],
+            position,
+        }
+    }
+
+    /// A storage channel that is already full, so every send fails and the
+    /// parking slots are the only thing standing between a command and the bin.
+    fn full_channel(_: StorageCommand) -> bool {
+        false
+    }
+
+    fn progress_for(book_index: u16, page: u32) -> StorageCommand {
+        StorageCommand::StoreProgress(reading(book_index, 0, page).persisted())
+    }
+
+    fn open_closing(previous: &ReaderState, next: &ReaderState) -> StorageCommand {
+        storage_command_for_transition(previous, next, 1).expect("a book change owes an open")
+    }
+
+    /// The app owes nothing: no open outstanding, nothing parked, and the
+    /// frame that resolves the last open has settled.
+    const NOTHING_OWED: SleepBlockers = SleepBlockers {
+        open_unresolved: false,
+        parked_storage: false,
+        awaiting_open_frame: false,
+    };
+
+    /// An open is parked or inflight.
+    const OPEN_UNRESOLVED: SleepBlockers = SleepBlockers {
+        open_unresolved: true,
+        parked_storage: false,
+        awaiting_open_frame: true,
+    };
+
+    /// The open answered, but the frame it produced has not reached the panel.
+    const AWAITING_FRAME: SleepBlockers = SleepBlockers {
+        open_unresolved: false,
+        parked_storage: false,
+        awaiting_open_frame: true,
+    };
+
+    #[test]
+    fn power_sleeps_immediately_when_nothing_is_owed() {
+        let mut gate = SleepGate::new();
+        assert!(gate.press(NOTHING_OWED));
+        assert!(!gate.is_deferred());
+        // Nothing was held back, so a later resting point sends nothing.
+        assert!(!gate.release(NOTHING_OWED));
+    }
+
+    #[test]
+    fn a_deferred_press_waits_for_the_frame_that_resolves_the_open() {
+        // Power pressed while opening Book B, which then loads at its restored
+        // page. The library event clears the open, but the frame showing that
+        // page has not been drawn: the sleep screen is taken from whatever last
+        // reached the panel, so sleeping here would leave Book B's provisional
+        // page frozen on it for as long as the reader is away.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(OPEN_UNRESOLVED));
+
+        // Loaded arrives. Not a resting point — the render is still to come.
+        assert!(
+            !gate.release(AWAITING_FRAME),
+            "the library event alone must not release the press"
+        );
+        assert!(gate.is_deferred());
+
+        // The render settles and the suppression lifts.
+        assert!(gate.release(NOTHING_OWED));
+        assert!(!gate.is_deferred());
+    }
+
+    #[test]
+    fn a_deferred_press_waits_for_the_rollback_frame_too() {
+        // Same, for the open that fails: BookOpenFailed puts the reader back on
+        // Book A, and sleeping before that frame lands would strand the panel
+        // showing Book B — a book the reader is not in and did not open.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(OPEN_UNRESOLVED));
+        assert!(
+            !gate.release(AWAITING_FRAME),
+            "the rollback event alone must not release the press"
+        );
+        assert!(gate.release(NOTHING_OWED));
+    }
+
+    #[test]
+    fn power_during_a_parked_open_waits_for_the_drain_and_the_frame() {
+        // The open has not reached the storage task at all: it sits in the
+        // app's parking slots until a render settles.
+        let mut gate = SleepGate::new();
+        let parked = SleepBlockers {
+            open_unresolved: false,
+            parked_storage: true,
+            awaiting_open_frame: true,
+        };
+        assert!(!gate.press(parked));
+        assert!(!gate.release(parked));
+
+        // The drain sends it; now it is inflight, still not a resting point.
+        assert!(!gate.release(OPEN_UNRESOLVED));
+        assert!(gate.release(NOTHING_OWED));
+    }
+
+    #[test]
+    fn a_deferred_sleep_is_sent_once() {
+        // release() runs at every display cycle, so it has to be idempotent or
+        // the power task would field a burst of requests.
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(OPEN_UNRESOLVED));
+        assert!(gate.release(NOTHING_OWED));
+        assert!(!gate.release(NOTHING_OWED));
+        assert!(!gate.release(OPEN_UNRESOLVED));
+    }
+
+    #[test]
+    fn every_blocker_holds_the_press_on_its_own() {
+        for blocker in [
+            SleepBlockers {
+                open_unresolved: true,
+                ..NOTHING_OWED
+            },
+            SleepBlockers {
+                parked_storage: true,
+                ..NOTHING_OWED
+            },
+            SleepBlockers {
+                awaiting_open_frame: true,
+                ..NOTHING_OWED
+            },
+        ] {
+            let mut gate = SleepGate::new();
+            assert!(!gate.press(blocker), "{blocker:?} must hold the press");
+            assert!(!gate.release(blocker));
+            assert!(gate.release(NOTHING_OWED));
+        }
+    }
+
+    #[test]
+    fn a_saturated_queue_still_takes_the_open() {
+        // Both slots spoken for: a navigation command and a progress record
+        // for the book being read, which is the state a busy storage task
+        // leaves behind after a page turn against a full channel.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        assert_eq!(
+            parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(progress_for(0, 120), full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(parked.len(), PARKED_STORAGE_SLOTS);
+
+        // Selecting another book must not be the thing that gets dropped: it
+        // carries the departing book's only close-out record, and the app arms
+        // an input lock waiting on the event it produces.
+        let open = open_closing(&reader, &reading(1, 0, 0));
+        assert_eq!(parked.dispatch(open, full_channel), StorageDispatch::Parked);
+
+        // The progress record gave up its slot, not the extend that came first
+        // and not the open. Nothing is lost: the open carries book 0's page.
+        let drained = [parked.pop_front(), parked.pop_front(), parked.pop_front()];
+        assert!(
+            matches!(drained[0], Some(StorageCommand::ExtendSection { .. })),
+            "arrival order must hold, got {:?}",
+            drained[0]
+        );
+        assert_eq!(drained[1], Some(open));
+        assert_eq!(drained[2], None);
+    }
+
+    #[test]
+    fn an_open_with_nothing_to_displace_is_refused_not_dropped() {
+        // Two navigation commands, neither of them redundant. There is no safe
+        // room to make, so the queue has to say so rather than quietly bin the
+        // open and leave the app waiting for an event that cannot come.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        for _ in 0..PARKED_STORAGE_SLOTS {
+            assert_eq!(
+                parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
+                StorageDispatch::Parked
+            );
+        }
+
+        let open = open_closing(&reader, &reading(1, 0, 0));
+        assert_eq!(
+            parked.dispatch(open, full_channel),
+            StorageDispatch::Rejected
+        );
+        assert_eq!(parked.len(), PARKED_STORAGE_SLOTS);
+    }
+
+    #[test]
+    fn a_refused_open_leaves_the_reader_where_it_was() {
+        // What the app task does with a Rejected open: the state has already
+        // moved to the new book, and putting it back is what keeps input alive
+        // instead of locked behind an open that never happened.
+        let before = reading(0, 4, 120);
+        let committed = reading(1, 0, 0);
+        let recovered = committed.restore_after_failed_open(before.open_rollback());
+
+        assert_eq!(recovered.book_id, before.book_id);
+        assert_eq!(recovered.page, 120);
+        // Nothing left to persist, so no progress record names the book the
+        // reader never reached.
+        assert_eq!(recovered.persisted(), before.persisted());
+    }
+
+    #[test]
+    fn a_progress_record_for_another_book_is_never_displaced() {
+        // Only the departing book's own record is subsumed by the open. A
+        // record for any other book is still the only copy of that page.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        assert_eq!(
+            parked.dispatch(progress_for(2, 77), full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
+            StorageDispatch::Parked
+        );
+
+        let open = open_closing(&reader, &reading(1, 0, 0));
+        assert_eq!(
+            parked.dispatch(open, full_channel),
+            StorageDispatch::Rejected
+        );
+        assert_eq!(parked.pop_front(), Some(progress_for(2, 77)));
+    }
+
+    #[test]
+    fn an_empty_queue_sends_straight_through() {
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        assert_eq!(
+            parked.dispatch(extend_section_command(&reader, 0, 1), |_| true),
+            StorageDispatch::Sent
+        );
+        assert!(parked.is_empty());
+    }
+
+    #[test]
+    fn nothing_overtakes_a_parked_command() {
+        // The channel frees up while something is parked. The next command
+        // still queues behind it: the storage task applies what it receives in
+        // order, and a progress record that landed after a later open would
+        // point the global state file back at the book just left.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        let extend = extend_section_command(&reader, 0, 1);
+        assert_eq!(
+            parked.dispatch(extend, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(progress_for(0, 121), |_| true),
+            StorageDispatch::Parked
+        );
+        assert_eq!(parked.pop_front(), Some(extend));
+    }
+
+    #[test]
+    fn a_book_change_carries_the_departing_position_in_its_open() {
+        let previous = reading(0, 4, 120);
+        let next = reading(1, 0, 0);
+
+        let command = storage_command_for_transition(&previous, &next, 7)
+            .expect("a book change owes an open");
+
+        match command {
+            StorageCommand::OpenBook {
+                book_id,
+                index,
+                previous: Some(departing),
+                ..
+            } => {
+                assert_eq!(book_id, ReaderSource::sd(1).book_id());
+                assert_eq!(index, 1);
+                // The page the reader actually left, not the one it is going
+                // to: writing the arriving book's state here is what used to
+                // erase its saved position.
+                assert_eq!(departing.book_id, ReaderSource::sd(0).book_id());
+                assert_eq!(departing.chapter, 4);
+                assert_eq!(departing.screen, 120);
+            }
+            other => panic!("expected an open closing out the old book, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staying_in_one_book_owes_no_departing_position() {
+        let previous = reading(0, 4, 120);
+        let mut next = previous;
+        next.page = 121;
+
+        let command = storage_command_for_transition(&previous, &next, 7);
+        assert!(
+            matches!(command, Some(StorageCommand::ExtendSection { .. })),
+            "a page turn extends the loaded section, got {command:?}"
+        );
+
+        // Re-entering a book that never changed opens without closing anything
+        // out, so nothing else is written on the way in.
+        let mut from_home = reading(0, 4, 120);
+        from_home.view = AppView::Home;
+        assert!(matches!(
+            storage_command_for_transition(&from_home, &previous, 7),
+            Some(StorageCommand::OpenBook { previous: None, .. })
+        ));
+    }
+
+    #[test]
+    fn a_resumed_open_lands_the_reader_in_one_event() {
+        // The book was chosen from the shelf, so the app starts it at page 0
+        // and the storage task resolves the real position from the card.
+        let state = reading(1, 0, 0);
+        let landed = state.apply_library_event(CTX, loaded(state.book_id, Some(184)));
+
+        assert_eq!(landed.page, 184);
+        assert_eq!(landed.chapter, 3);
+        // One event carried both the book's shape and where to be in it, so
+        // there is no second update for the app to render a stale page from.
+        assert_eq!(landed.sd_page_count, 500);
+    }
+
+    #[test]
+    fn a_load_without_a_position_leaves_the_reader_where_it_is() {
+        // An extend answering an in-flight request must not drag the reader
+        // back to the page that request was issued for.
+        let state = reading(1, 3, 260);
+        let landed = state.apply_library_event(CTX, loaded(state.book_id, None));
+
+        assert_eq!(landed.page, 260);
+    }
+
+    #[test]
+    fn a_load_position_is_clamped_to_the_book_it_describes() {
+        let state = reading(1, 0, 0);
+        let landed = state.apply_library_event(CTX, loaded(state.book_id, Some(9_000)));
+
+        assert_eq!(landed.page, 499);
+    }
+
+    #[test]
+    fn an_aborted_open_puts_the_reader_back_on_the_book_it_left() {
+        let before = reading(0, 4, 120);
+        let rollback = before.open_rollback();
+
+        // The app has already moved to the new book by the time the storage
+        // task refuses the switch.
+        let committed = reading(1, 0, 0);
+        let recovered = committed.restore_after_failed_open(rollback);
+
+        assert_eq!(recovered.book_id, ReaderSource::sd(0).book_id());
+        assert_eq!(recovered.chapter, 4);
+        assert_eq!(recovered.page, 120);
+        assert_eq!(recovered.view, AppView::Reading);
+    }
+
+    #[test]
+    fn an_aborted_open_leaves_the_reader_able_to_turn_the_page() {
+        // Selecting a book from the shelf resets the reader's idea of how long
+        // the book is, because the new one has not been measured yet. Nothing
+        // reloads the old book when the switch is refused, so a rollback that
+        // restored only the page would leave the reader on page 120 of a book
+        // the reducer thinks is one page long -- and the next page turn clamps
+        // to sd_page_count - 1, putting them at the start and persisting it.
+        let before = reading(0, 4, 120);
+        let rollback = before.open_rollback();
+
+        let mut committed = ReaderState::boot();
+        committed.view = AppView::Library;
+        committed.library_count = 4;
+        committed.selection = 1;
+        let committed = press(committed, Button::Confirm);
+        assert_eq!(committed.sd_page_count, 1, "the shelf resets the bounds");
+
+        let recovered = committed.restore_after_failed_open(rollback);
+        assert_eq!(recovered.sd_page_count, before.sd_page_count);
+        assert_eq!(recovered.sd_chapter_count, before.sd_chapter_count);
+
+        let turned = press(recovered, Button::Next);
+        assert_eq!(turned.page, 121, "the reader must keep reading forward");
+    }
+
+    #[test]
+    fn the_open_transaction_never_leaves_a_book_half_switched() {
+        // Losing the departing page means the switch does not happen at all,
+        // so that page is still the reader's and still owed to the card.
+        assert_eq!(
+            book_open_outcome(false, false),
+            BookOpenOutcome::KeptBookPositionUnwritten
+        );
+        assert!(!book_open_outcome(false, false).book_changed());
+
+        // Open and readable, pointer not yet moved. The reader is in the new
+        // book; only a reboot before the retry goes back to the old one.
+        assert_eq!(
+            book_open_outcome(true, false),
+            BookOpenOutcome::OpenedPointerOwed
+        );
+        assert!(book_open_outcome(true, false).book_changed());
+
+        assert_eq!(book_open_outcome(true, true), BookOpenOutcome::Opened);
+        assert!(book_open_outcome(true, true).book_changed());
+    }
+
+    #[test]
+    fn closing_out_a_book_does_not_widen_the_storage_command() {
+        // `OpenBook` now carries a `PersistedAppState`, but the enum is sized
+        // by `StoreWifiCredentials` (a 32-byte SSID and a 64-byte password),
+        // which is still far wider. Folding the departing state into the open
+        // therefore costs the four-deep command channel nothing at all — the
+        // separate command it replaced was the same 100 bytes.
+        assert_eq!(core::mem::size_of::<StorageCommand>(), 100);
+        assert!(
+            core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
+            "the departing state has outgrown the credentials variant",
+        );
     }
 
     #[test]
@@ -2498,6 +3411,7 @@ mod tests {
                 target_pages: 0,
                 type_settings: TypeSettings::DEFAULT,
                 portrait: false,
+                previous: None,
             },
             StorageCommand::ExtendSection {
                 request_id: 1,

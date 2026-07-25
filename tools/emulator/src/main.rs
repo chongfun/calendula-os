@@ -428,6 +428,7 @@ fn storage_command_for_transition(
             target_pages: 5,
             type_settings: next.type_settings(),
             portrait: app_core::is_portrait(next.orientation),
+            previous: (previous.book_id != next.book_id).then(|| previous.persisted()),
         });
     }
 

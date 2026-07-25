@@ -67,6 +67,8 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Test host
         run: tools/check.sh test-host
+      - name: Test X3 display code
+        run: tools/check.sh test-host-x3
 
   golden-frames:
     runs-on: ubuntu-latest

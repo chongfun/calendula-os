@@ -691,9 +691,10 @@ pub(crate) fn find_index_by_identity(
 /// Empty every book cache under CACHE2 whose book is no longer in the freshly
 /// written catalog -- the orphans left when a book is deleted (through the shelf
 /// or by pulling the card). Each cache is matched by its stored source identity,
-/// not its key name, so a live book's cache is never swept. Reading position
-/// lives in the global STATE.BIN and is untouched. Bounded per pass; any excess
-/// is handled by the next scan.
+/// not its key name, so a live book's cache is never swept. Reading position is
+/// never swept either: `empty_cache_dir` leaves POS*.BIN and the directory
+/// holding it, so a book that leaves the card and comes back resumes where it
+/// was. Bounded per pass; any excess is handled by the next scan.
 ///
 /// The catalog's identities (8 B each) load into `scratch` once, sorted, so
 /// each cache dir checks membership with an in-RAM binary search --

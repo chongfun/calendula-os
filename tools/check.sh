@@ -33,6 +33,14 @@ case "$COMMAND" in
         echo "Running host tests..."
         cargo test --workspace --exclude hal-ext --exclude fw --target "$HOST_TARGET"
         ;;
+    test-host-x3)
+        # The UC8253 panel driver is behind `device-x3`, so its tests -- the
+        # controller step plans among them -- are invisible to the run above.
+        # Scoped to `display` on purpose: `device-x3` flips the whole workspace
+        # to X3 geometry, which the golden frames are not written for.
+        echo "Running X3 host tests..."
+        cargo test -p display --features device-x3 --target "$HOST_TARGET"
+        ;;
     golden-frames)
         echo "Checking emulator golden frames for X4..."
         cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
@@ -66,6 +74,7 @@ case "$COMMAND" in
         "$0" fmt
         "$0" clippy-host
         "$0" test-host
+        "$0" test-host-x3
         ;;
     emulator)
         "$0" golden-frames
@@ -81,7 +90,7 @@ case "$COMMAND" in
         "$0" firmware
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|golden-frames|test-emulator|build-firmware|fast|emulator|firmware|all}"
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|golden-frames|test-emulator|build-firmware|fast|emulator|firmware|all}"
         echo "  'all' runs all required root/firmware verification."
         exit 1
         ;;

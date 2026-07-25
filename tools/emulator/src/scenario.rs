@@ -283,6 +283,10 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             chapters: step.chapters.unwrap_or(1),
             current_chapter: step.chapter.unwrap_or(0),
             chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+            // A scenario that names a page stands in for a resume or a chapter
+            // jump, where the storage task picks where the reader lands;
+            // otherwise the scripted state's own page stands.
+            position: step.page,
         }),
         "ChapterPage" | "chapter-page" | "chapter_page" => Ok(LibraryEvent::ChapterPage {
             book_id: step.book_id.unwrap_or(2),

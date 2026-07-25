@@ -235,6 +235,71 @@ impl WifiCredentialsRecord {
     }
 }
 
+/// Per-book reading position, stored as POS.BIN beside that book's cache.
+///
+/// The authoritative record of where the reader is in a book: the global
+/// [`AppStateRecord`] carries a copy, but only as a mirror for readers that
+/// expect to find position there.
+///
+/// `salt` is mixed into the checksum by the caller rather than fixed here. The
+/// stored screen is a page index under one panel's pagination, so a card moved
+/// between panels of different sizes must fail validation and resume at the
+/// book's start instead of a page that does not exist. The geometry that
+/// decides the salt lives above this crate, and a salt of zero leaves the
+/// checksum byte-identical to an unsalted one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PositionRecord {
+    pub chapter: u16,
+    pub screen: u32,
+}
+
+impl PositionRecord {
+    pub const ENCODED_LEN: usize = 15;
+    const MAGIC: &'static [u8; 4] = b"X4PS";
+    const VERSION: u8 = 1;
+    /// The checksum spans everything before it.
+    const CHECKSUM_AT: usize = 11;
+
+    pub fn encode(self, salt: u32) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..4].copy_from_slice(Self::MAGIC);
+        out[4] = Self::VERSION;
+        out[5..7].copy_from_slice(&self.chapter.to_le_bytes());
+        out[7..11].copy_from_slice(&self.screen.to_le_bytes());
+        let sum = Self::checksum(&out[..Self::CHECKSUM_AT], salt);
+        out[Self::CHECKSUM_AT..].copy_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8], salt: u32) -> Option<Self> {
+        if bytes.len() < Self::ENCODED_LEN
+            || &bytes[..4] != Self::MAGIC
+            || bytes[4] != Self::VERSION
+        {
+            return None;
+        }
+        let sum = Self::checksum(&bytes[..Self::CHECKSUM_AT], salt);
+        if bytes[Self::CHECKSUM_AT..Self::ENCODED_LEN] != sum.to_le_bytes() {
+            return None;
+        }
+        Some(Self {
+            chapter: u16::from_le_bytes([bytes[5], bytes[6]]),
+            screen: u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]),
+        })
+    }
+
+    /// Byte sum shifted by the panel salt. Deliberately not the FNV hash the
+    /// other records use: this envelope is shared with MarigoldOS and has to
+    /// stay byte-identical.
+    fn checksum(bytes: &[u8], salt: u32) -> u32 {
+        bytes
+            .iter()
+            .map(|byte| *byte as u32)
+            .sum::<u32>()
+            .wrapping_add(salt)
+    }
+}
+
 fn checksum(bytes: &[u8]) -> u32 {
     let mut hash = 0x811C_9DC5u32;
     for byte in bytes {
@@ -287,6 +352,86 @@ mod tests {
             source_hash: 0xDEAD_BEEF,
             source_size: 123_456,
         }
+    }
+
+    /// The exact bytes `record()` encodes to, computed independently of this
+    /// implementation.
+    ///
+    /// The other tests here prove old records still decode; this one proves the
+    /// layout itself has not moved. Both files this crate describes are shared
+    /// byte-for-byte with MarigoldOS so cards carry reading state between the
+    /// two firmwares, and every compatibility test in this module would still
+    /// pass if the whole envelope shifted underneath them in lockstep.
+    const STATE_GOLDEN: [u8; AppStateRecord::ENCODED_LEN] = [
+        0x53, 0x4f, 0x34, 0x58, 0x04, 0x02, 0x01, 0x02, 0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x29,
+        0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x40, 0xe2, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
+        0x01, 0x00, 0xa7, 0x76, 0x1e, 0x60,
+    ];
+
+    #[test]
+    fn app_state_encodes_to_the_agreed_bytes() {
+        assert_eq!(record().encode(), STATE_GOLDEN);
+        assert_eq!(AppStateRecord::decode(&STATE_GOLDEN), Some(record()));
+    }
+
+    /// `PositionRecord { chapter: 3, screen: 41 }` at an unsalted checksum.
+    const POSITION_GOLDEN: [u8; PositionRecord::ENCODED_LEN] = [
+        0x58, 0x34, 0x50, 0x53, 0x01, 0x03, 0x00, 0x29, 0x00, 0x00, 0x00, 0x5c, 0x01, 0x00, 0x00,
+    ];
+
+    fn position() -> PositionRecord {
+        PositionRecord {
+            chapter: 3,
+            screen: 41,
+        }
+    }
+
+    #[test]
+    fn position_encodes_to_the_agreed_bytes() {
+        assert_eq!(position().encode(0), POSITION_GOLDEN);
+        assert_eq!(
+            PositionRecord::decode(&POSITION_GOLDEN, 0),
+            Some(position())
+        );
+    }
+
+    #[test]
+    fn position_round_trips_under_any_salt() {
+        for salt in [0, 1, 0x0100_0193, u32::MAX] {
+            let encoded = position().encode(salt);
+            assert_eq!(
+                PositionRecord::decode(&encoded, salt),
+                Some(position()),
+                "salt {salt:#x} must round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn a_position_from_another_panel_is_refused() {
+        // The stored screen is a page index under one pagination. Reading it
+        // back under a different geometry has to fail rather than resume at a
+        // page that does not exist in this one.
+        let written_on_another_panel = position().encode(0x0011_0022);
+        assert_eq!(PositionRecord::decode(&written_on_another_panel, 0), None);
+    }
+
+    #[test]
+    fn a_corrupt_position_is_refused() {
+        for byte in [0, 4, 5, 11] {
+            let mut encoded = position().encode(0);
+            encoded[byte] ^= 0xFF;
+            assert_eq!(
+                PositionRecord::decode(&encoded, 0),
+                None,
+                "a flipped byte {byte} must not decode"
+            );
+        }
+        assert_eq!(
+            PositionRecord::decode(&position().encode(0)[..14], 0),
+            None,
+            "a truncated record must not decode"
+        );
     }
 
     #[test]
