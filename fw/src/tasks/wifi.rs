@@ -28,8 +28,10 @@ use embassy_time::{with_timeout, Duration, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
 use esp_radio::wifi::{
-    ap::AccessPointConfig, scan::ScanConfig, sta::StationConfig, AuthenticationMethod,
-    Config as WifiConfig, ControllerConfig, Interface, WifiController,
+    ap::AccessPointConfig,
+    scan::ScanConfig,
+    sta::{ScanMethod, StationConfig},
+    AuthenticationMethod, Config as WifiConfig, ControllerConfig, Interface, WifiController,
 };
 use proto::captive;
 
@@ -1106,6 +1108,12 @@ impl Session {
                 StationConfig::default()
                     .with_ssid(ssid)
                     .with_password(password.into())
+                    // The default fast scan joins the first BSSID that answers,
+                    // which on multi-AP/mesh networks can be a weak far node.
+                    // All-channels makes the radio's always-on sort-by-signal
+                    // pick the strongest match, costing one full sweep (~1-2 s)
+                    // per join against JOIN_TIMEOUT's ~14 s of headroom.
+                    .with_scan_method(ScanMethod::AllChannels)
                     .with_auth_method(if password.is_empty() {
                         AuthenticationMethod::None
                     } else {
