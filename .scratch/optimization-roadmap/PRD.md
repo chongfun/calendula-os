@@ -9,12 +9,13 @@ Author: research pass over six parallel code-survey agents (display, book pipeli
 **Landed on main since round 1:**
 
 - **A2** — byte-run rasterizer fast paths, landscape frames (#24). Goldens
-  unchanged; the on-device `page-turn` layout_ms A/B is still pending.
+  unchanged; measured on X3 2026-07-25: landscape reading layout 17 ms
+  median / 18 ms p95 (was 19–22 ms per-pixel on the July envelope book).
   Portrait deliberately kept per-pixel — see the ranking note below.
 - **B6** — settings-independent content cache, CONT.BIN (#23). Landed with
   review hardening (`BookPublishOutcome` distinguishes index-write failure
-  from section read-back miss). The on-device A/B (Type Size change on the
-  11.7 MB baseline book) is still pending — it also decides B7.
+  from section read-back miss). Measured on X3 2026-07-25: **replay works
+  but costs ~25 s** — see the B7 verdict below.
 - **B1's goal arrived as an upstream port** (#37, from crosspoint `8da2d42`):
   16-slot non-ASCII metric ring, run measurement through one open pack
   handle, whole-glyph bitmap reads. B1 leaves the queue; its remaining levers
@@ -25,8 +26,9 @@ Author: research pass over six parallel code-survey agents (display, book pipeli
   Fixtures inverted (landscape-* scenarios now cycle out of a portrait boot).
 - **Display SPI at the datasheet 20 MHz on both panels** (#42, ported from
   freeink `9bd931e`): X3 plane writes ~25% faster; X4 refreshes pay
-  ~17–20 ms to move in spec. On-device check pending; each value is a
-  one-constant revert.
+  ~17–20 ms to move in spec. X3 confirmed on device 2026-07-25 (Fast flush
+  415 → 408–409 ms with busy identical at 379; prestage 33 → 28 ms; no
+  regressions). X4 check still pending; each value is a one-constant revert.
 - **Adjacent robustness wave (#25–#36, #38, #41 — not from this roadmap, but
   it moved roadmap ground):** durable two-generation STATE/POS/WIFI.BIN
   persistence (#29 — WIFI.BIN is now a `proto::durable` A/B-generation
@@ -64,25 +66,29 @@ per-pixel portrait path — the #24 fast paths only fire when a user manually
 holds landscape. That inverts A-item priorities: the portrait rasterizer is
 now the top of the queue.
 
-**Next queue (re-ranked 2026-07-25):**
+**Next queue (re-ranked 2026-07-25; bench session done same day — see the
+measured envelope below):**
 
 1. **NEW: A2-P** — portrait byte-run/strided fast paths (issue 01). Extend
    `fill_span`/`blit_row` past their per-pixel Portrait arm
    (`display/src/fb.rs:132,181`). Portrait rows are native columns, so the
    design differs from #24 — candidate shapes in issue 01. Goldens must
    pass unchanged; the equivalence-test harness already enumerates the
-   Portrait frame. The single highest-leverage portrait item.
-2. **Device bench session** — cheap, unblocks several verdicts at once:
-   portrait `page-turn` baseline (`layout_ms` has never been measured in
-   portrait; the 19–22 ms envelope below is landscape), A2 landscape A/B
-   (#24), B6 replay A/B (#23 — decides B7), #42 SPI check on both panels.
-   Run before or alongside A2-P; A2-P's win is measured against this
-   baseline.
-3. **A3** — panel-native framebuffer byte order (issue 01). Its "coordinate
+   Portrait frame. **Opportunity measured 2026-07-25: portrait layout
+   33 ms median vs landscape 17 ms on the same book and firmware — ~16 ms
+   recoverable on every turn of the default orientation.**
+2. **A3** — panel-native framebuffer byte order (issue 01). Its "coordinate
    with the portrait work" blocker is resolved; design the map-folding
    together with A2-P so the index math is written once, land after it
    (A2-P is goldens-unchanged, A3 re-blesses deliberately). ~10–13 ms per
    turn and prestage on the default path; frees 8 KB.
+3. **B7 — PROMOTED from conditional: per-config section caches** (issue
+   02). Its trigger fired twice in the 2026-07-25 session: B6 replay costs
+   24.7–27.1 s per Type Size change, and an **orientation flip pays the
+   same ~24 s replay** (the page box is wrap-relevant), so every
+   portrait↔landscape toggle rebuilds. Per-config caches make returning to
+   a previously-built config instant. The config key must gain the
+   orientation/page-box axis — spec note in issue 02.
 4. **B4 rework** — progressive first open (issue 02). Time-to-first-page on
    the default reading flow. Redesign against #41's storage-owned open
    transaction; the stranded branch is reference only.
@@ -97,18 +103,35 @@ now the top of the queue.
 8. **D5** — portal → station handoff (issue 04). #35 rewrote the portal
    surface — rebase the design on it; verify-after-save must survive the
    handoff.
-9. **B7** — per-config section caches (issue 02), still conditional: decide
-   from B6's device A/B, don't schedule independently.
 
 Tier 3 unchanged: A4, A5, C6, E4, F5, D6 (read its evidence file in issue
-04 first), B7 (conditional, above).
+04 first).
 
-**Pending on-device measurements (single bench session covers the first
-four):** portrait `page-turn` baseline; A2 landscape `layout_ms` A/B (#24);
-B6 settings-change replay A/B + corrupt-CONT.BIN fallback (#23); #42 SPI
-clocks on both panels; portrait wake-restore fallback (reachable only from
-a corrupt orientation byte — flagged untested in #5). C2 additionally needs
-the µA meter.
+**Bench session results (2026-07-25, X3, main 95f4bf2 flashed fresh;
+owner reports all merged round-2 changes were independently
+hardware-verified before this session):**
+
+| Metric | 2026-07-12 envelope | 2026-07-25 measured |
+|---|---|---|
+| Reading layout, portrait (default) | never measured | **33 ms median / 35 p95** (60-turn run; a 187-render run agreed at 32/35) |
+| Reading layout, landscape (A2 fast paths) | 19–22 ms (per-pixel, July book) | **17 ms median / 18 p95** (65 steady renders, same book as portrait) |
+| Fast flush | 415 ms (busy 379) | 408–409 ms (busy 378–379) |
+| Prestage | 33 ms | 28 ms |
+| Press-to-settled (landscape run) | 470–473 ms | 459 ms median |
+| Progress write | 51 ms | 44–60 ms median across runs |
+| Catalog load | 31 ms / 15 EPUBs | 20 ms |
+| Warm book open | 50–85 ms | 57–74 ms (SD), 0 ms (RAM hit) |
+| B6 replay (Type Size change) | — | **24.7 s** (736 pp / 82 sections) and **27.1 s** (1240 pp / 100 sections), ~280–300 ms/section |
+| Orientation flip (portrait↔landscape) | — | ~24 s (same replay path — page box is wrap-relevant) |
+
+Replay authenticity: both Type Size rebuilds read 2.8–3.8 MB from the
+card — far below the 11.7 MB source zip — proving the CONT.BIN path ran,
+not the EPUB fallback. Nearly all replay cost is downstream of the capture
+point (wrap + section writes), which is what promotes B7.
+
+**Still unmeasured:** #42 on the X4 (this session was X3-only);
+full-build-vs-replay ratio at identical settings (caches were warm all
+session); C2 sleep current (needs the µA meter).
 
 ## Status after round 1 (2026-07-12)
 
@@ -163,10 +186,8 @@ the random-access `ZipStream` path.
   (busy 379), FastClean 691 ms (busy 456), prestage 33 ms, reading layout
   19–22 ms, catalog load 31 ms / 15 EPUBs, cold build 14.1 s for an 11.7 MB /
   441-page EPUB, progress write 51 ms, warm reopen (RAM hit) 13–15 ms.
-  **Stale as of 2026-07-25:** these numbers predate #42 (display SPI 20 MHz
-  — X3 plane writes ~25% faster) and the portrait default (#5) — the layout
-  figure is landscape; portrait `layout_ms` has never been measured. The
-  round-2 bench session re-baselines.
+  **Stale as of 2026-07-25:** superseded by the bench-session table in
+  "Status after round 2" (re-baselined on X3 the same day).
 - Observed once, unexplained (2026-07-11): X3 PON busy wait hit its 1 s
   ceiling (`PON busy_low=false 1000ms`) during sleep-entry Full refresh, then
   behaved normally. First suspect if X3 sleep entry ever misbehaves.

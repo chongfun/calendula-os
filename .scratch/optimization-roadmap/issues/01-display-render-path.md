@@ -1,6 +1,6 @@
 # WS-A: Display render path — shave the ~50 ms of software around the 421 ms panel BUSY
 
-Status: A1 DONE (#12, incl. the wait_ready micro-fix). A2 DONE for landscape frames (#24 — goldens unchanged; on-device `layout_ms` A/B pending). NEXT, TOP PRIORITY: A2-P, the portrait extension — portrait became the default orientation (#5) and the shell is portrait-pinned, so the common path still draws per-pixel while #24's fast paths only fire on manual landscape holds. A3 unblocked (portrait landed; design its index math with A2-P, land after). A4/A5 hardware experiments, unscheduled. Baseline shift: #42 clocks both panels' display SPI at the datasheet 20 MHz — X3 plane writes ~25% faster, X4 refreshes pay ~17–20 ms; on-device check pending, each value a one-constant revert.
+Status: A1 DONE (#12, incl. the wait_ready micro-fix). A2 DONE for landscape frames (#24 — goldens unchanged; measured on X3 2026-07-25: landscape layout 17 ms median / 18 p95). NEXT, TOP PRIORITY: A2-P, the portrait extension — portrait became the default orientation (#5) and the shell is portrait-pinned, so the common path still draws per-pixel (measured 33 ms median / 35 p95 same book+session) while #24's fast paths only fire on manual landscape holds. A3 unblocked (portrait landed; design its index math with A2-P, land after). A4/A5 hardware experiments, unscheduled. Baseline shift: #42 clocks both panels' display SPI at the datasheet 20 MHz — X3 confirmed on device (flush 415→408 ms, prestage 33→28 ms, busy unchanged); X4 check pending, each value a one-constant revert.
 
 Owns: `display/` crate, `fw/src/display_flush/`, flush/prestage region of `fw/src/tasks/display.rs`, `hal-ext/src/spi_dma.rs`.
 Do not touch: `fw/src/sd_session.rs` (WS-D), boot-init region of display task (WS-C item 2 owns the double-`init_panel` fix).
@@ -17,7 +17,7 @@ Baseline: press-to-settled 470–473 ms; 421 ms is fast-waveform BUSY (89%). Non
 
 ## A2 (Tier 2, M): Byte-run rasterizer fast paths — DONE for landscape (#24)
 
-Landed 2026-07-25: `Framebuffer::fill_span`/`blit_row` byte-run primitives, landscape frames only, with fast-vs-per-pixel-reference equivalence tests across all four frames; goldens unchanged on both boards. The on-device `page-turn` `layout_ms` A/B is still pending. Portrait deliberately kept per-pixel — that gap is now A2-P below.
+Landed 2026-07-25: `Framebuffer::fill_span`/`blit_row` byte-run primitives, landscape frames only, with fast-vs-per-pixel-reference equivalence tests across all four frames; goldens unchanged on both boards. Measured on X3 the same day: landscape reading layout 17 ms median / 18 p95 (July per-pixel envelope was 19–22 ms on a different book; the same-session portrait per-pixel figure of 33 ms is the cleaner comparator). Portrait deliberately kept per-pixel — that gap is A2-P below.
 
 ## A2-P (NEW, top priority, M): Portrait byte-run/strided fast paths
 
@@ -27,7 +27,7 @@ Landed 2026-07-25: `Framebuffer::fill_span`/`blit_row` byte-run primitives, land
 - (b) Glyphs: process 8 portrait rows per pass with an 8×8 bit-transpose so each pass writes whole destination bytes down a glyph column.
 - (c) `fill_rect`: iterate native rows (portrait columns) instead of portrait rows to recover whole-byte runs for tall fills.
 
-- Impact: unmeasured — the portrait `page-turn` `layout_ms` baseline (round-2 bench session) comes first; expectation is the same shape as A2's landscape win, applied to the path that now renders everything.
+- Impact, measured 2026-07-25 (X3, main 95f4bf2, same book/session/cadence): portrait layout **33 ms median / 35 p95** vs landscape (byte-run paths active) **17 ms median / 18 p95** — ~16 ms recoverable per turn on the default orientation, assuming portrait fast paths reach landscape rates. Caveat: the delta may include a small wrap-width effect (528- vs 792-px lines); the post-A2-P A/B on the same protocol settles it. Both sit far under the 60 ms budget — this is cadence polish plus per-turn energy, not a budget rescue.
 - Must be bit-exact: goldens pass **unchanged** (no re-blessing); extend the existing fast-vs-per-pixel-reference equivalence tests — the harness in `fb.rs` already enumerates the Portrait frame.
 - Verify: emulator runner vs `fixtures/golden` on both boards, display crate tests, portrait `page-turn` watching `layout_ms` p95 vs the 60 ms budget.
 - Coordination: design the index math together with A3 so it is written once; A2-P lands first (goldens-unchanged), A3 re-blesses after.
