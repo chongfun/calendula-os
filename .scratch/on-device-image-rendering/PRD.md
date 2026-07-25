@@ -41,18 +41,19 @@ The project does **not** begin by porting all of JPEGDEC or by writing a decoder
 
 ### Existing cover destination
 
-The destination half of cover rendering is already implemented:
+The destination half of cover rendering is partially implemented:
 
-| Piece | Location |
-| --- | --- |
-| Cover cache format `X4CV`, 202×303 at 1bpp | `proto/src/cache.rs` |
-| Cover cache reader and validation | `fw/src/reader_cache_files.rs` |
-| Resident cover buffer | `fw/src/reader_store.rs` |
-| UI model `UiCover` | `ui/src/lib.rs` |
-| Home and library view wiring | `fw/src/views.rs` |
-| Host-side decode and rasterization | `tools/preview/src/main.rs` |
+| Piece | Location | Status |
+| --- | --- | --- |
+| Cover cache format `X4CV`, 202×303 at 1bpp | `proto/src/cache.rs` | Done |
+| Cover cache reader and validation | `fw/src/reader_cache_files.rs` | Done |
+| Resident cover buffer | `fw/src/reader_store.rs` | Done |
+| UI model `UiCover` | `ui/src/lib.rs` | Done |
+| Cover data path: load → `ReaderStore` → `UiBook.cover` | `fw/src/views.rs` | Done |
+| Cover bitmap rendering in `render_home` / `render_library` | `ui/src/render.rs` | **Not implemented** |
+| Host-side decode and rasterization | `tools/preview/src/main.rs` | Done |
 
-The existing `COVER.BIN` payload is 7,878 bytes. The firmware can load and display it, but nothing on the device creates it.
+The existing `COVER.BIN` file is 7,890 bytes: a 12-byte header (`COVER_HEADER_BYTES`) followed by a 7,878-byte 1bpp bitmap payload (`COVER_BYTES = COVER_STRIDE × COVER_HEIGHT = 26 × 303`). The firmware can load the cover into `ReaderStore`, but `render_home` and `render_library` do not yet draw the cover bitmap — the `active_book.cover` field is populated but unreferenced in the render code. Nothing on the device creates `COVER.BIN`.
 
 `tools/preview` currently:
 
@@ -60,22 +61,24 @@ The existing `COVER.BIN` payload is 7,878 bytes. The firmware can load and displ
 2. reads the image from the EPUB ZIP;
 3. decodes it through the host `image` crate;
 4. uses centered fill-and-crop scaling to 202×303;
-5. applies a hard luma threshold;
+5. applies a hard luma threshold (`luma < 180` → black);
 6. writes `COVER.BIN`.
 
 ### Existing reading path
 
 The reading path has no persistent image concept.
 
-The XHTML parser emits body text through `XhtmlBlockSink::push_block`. `<img>` is represented as placeholder text. `CONT.BIN` captures that text-block stream so a type-settings change can repaginate without reopening the EPUB.
+The XHTML parser emits body text through `XhtmlBlockSink::push_block`. `<img>` is represented as placeholder text (the `alt` attribute, or `"[Image]"` when absent), pushed as an italic centered body block. `CONT.BIN` captures that text-block stream so a type-settings change can repaginate without reopening the EPUB.
 
-Page-cache records identify only a range of text blocks. They cannot identify an image page or carry an EPUB image href.
+The current `CONT.BIN` format (`CONTENT_VERSION = 3`, `CACHE_V2_VERSION = 26`) stores flat 8-byte content-record headers: `spine_index` (u16), `text_len` (u16), `role` (u8), `style` (u8), `align` (u8), and flags (u8, encoding `paragraph_end` and `spine_end`), followed by `text_len` bytes of UTF-8 text. Every parser output — including image placeholders — is a text record.
+
+Page-cache records (`PageRecord`, 4 bytes: `first_block: u16`, `block_count: u16`) identify only a range of text blocks. They cannot identify an image page or carry an EPUB image href.
 
 M2 therefore requires coordinated changes to:
 
 - the XHTML event interface;
-- `CONT.BIN`;
-- section/page cache records;
+- `CONT.BIN` (currently `CONTENT_VERSION = 3`);
+- section/page cache records (currently `CACHE_V2_VERSION = 26`);
 - cache-version invalidation;
 - the reading render path.
 
@@ -92,7 +95,7 @@ After M1:
   - a valid `BOOK.BIN`;
   - `CONT.BIN` replay; or
   - a full EPUB parse and cache build.
-- The generated cover becomes available to the existing home and library UI after the first successful book open.
+- The generated cover becomes available to the home and library UI after the first successful book open. (Note: the cover data path into `ReaderStore` is wired, but `render_home` and `render_library` do not yet draw the cover bitmap. M1 must either add cover bitmap rendering or explicitly defer it.)
 - A valid existing host-generated `COVER.BIN` remains usable and is not regenerated merely because the device decoder exists.
 - A missing, corrupt, unsupported, or malformed cover never prevents the book from opening.
 - A deterministic unsupported-cover result is not retried on every open.
@@ -176,7 +179,7 @@ The X4 release ELF currently occupies the available DRAM:
 | --- | ---: |
 | Statics: `.data`, `.bss`, and rwdata shadow | 294,864 |
 | Main stack | 43,944 |
-| Previous framebuffer slot | 48,001 |
+| Previous framebuffer slot | 48,001 (X4); 52,273 (X3) |
 | Unallocated DRAM | Approximately 0 |
 
 The decoder must not add a large static.
@@ -187,7 +190,7 @@ The display task already owns large EPUB scratch buffers:
 | --- | ---: | --- |
 | ZIP inflate state and window | 43,316 | Any compressed ZIP-entry read |
 | XHTML buffer | 24,576 | XHTML parsing |
-| OPF buffer | 16,385 | Package parsing |
+| OPF buffer | 16,384 | Package parsing |
 | Compressed-input buffer | 8,192 | ZIP reads |
 
 The ZIP inflate scratch is required concurrently with JPEG decoding because image entries may themselves be DEFLATE-compressed.
@@ -718,7 +721,7 @@ Image pages use contain rather than fill:
 - no stretching;
 - no overlap with reader chrome or margins.
 
-The target is the active reader content rectangle, not necessarily the complete physical framebuffer.
+The target is the active reader content rectangle, not necessarily the complete physical framebuffer. M0B must report the exact content-rectangle dimensions for each device and orientation, since these determine the M2 workspace budget and dither buffer sizing.
 
 ### Resampler
 
@@ -746,7 +749,7 @@ The initial candidate is Floyd–Steinberg error diffusion:
 - white padding treated as white source input;
 - two caller-owned `i16` error rows of `target_width + 2`.
 
-At an 800-pixel target the error rows consume approximately 3.2 KB.
+At an 800-pixel X4 target the error rows consume approximately 3.2 KB (`2 × (800 + 2) × 2 = 3,208 bytes`). At an X3 portrait width (528 pixels) the cost is approximately 2.1 KB; at X3 landscape width (792 pixels) it is approximately 3.2 KB.
 
 A stateless ordered Bayer matrix is the fallback when:
 
@@ -1433,9 +1436,9 @@ Tests prove:
 
 ### Page-cache schema
 
-M2 adds an explicit page kind.
+M2 adds an explicit page kind. The current `PageRecord` is 4 bytes (`PAGE_RECORD_BYTES`): `first_block: u16` and `block_count: u16`, with no type discriminant.
 
-Conceptually:
+The M2 replacement, conceptually:
 
 ```rust
 enum PageKind {
@@ -2040,5 +2043,5 @@ Checked: GPL-3.0. Adds a libFuzzer target, sanitizer support, fixes for memory-a
 Checked: Apache-2.0 (`LICENSE`: "Copyright 2020 BitBank Software, Inc."); documented features covering 1/2, 1/4, and 1/8 reduced decode, DC-only progressive thumbnail decode, and optional Floyd–Steinberg dithering to 1, 2, or 4-bpp grayscale.
 Repository contents verified at commit `86282979224c8a32fd51e091ed5a35b0c699a52b`, the revision `crosspoint-reader` pins: the root `Makefile` builds a `demo` executable; `CMakeLists.txt` is an ESP-IDF `idf_component_register` declaration; the tree carries `test_images/`, `examples/`, `MacOS/JPEGDEC_Test`, and `linux/examples`, and no separate conformance test suite.
 
-**[crosspoint-reader]** — sibling firmware for the same X3/X4 hardware, read from a local checkout.
+**[crosspoint-reader]** — sibling firmware for the same X3/X4 hardware, read from a local checkout (private; no public URL).
 The 2-second decode and ~55 KB free-heap figures quoted under "Sibling-firmware data point" are comments recorded in its `PixelCache` implementation, not CalendulaOS benchmark results.
