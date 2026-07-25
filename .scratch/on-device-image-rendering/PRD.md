@@ -113,7 +113,7 @@ After M2:
 - Heuristic promotion of an image embedded in an otherwise textual spine item.
 - Rendering arbitrary SVG.
 - PNG decoding.
-- Progressive JPEG.
+- Progressive JPEG (initially; see "Why progressive JPEG is refused initially").
 - Arithmetic-coded JPEG.
 - Lossless JPEG.
 - 12-bit JPEG samples.
@@ -178,9 +178,58 @@ Full-page art requires a Full refresh because partial refreshes ghost badly on h
 
 The earlier 2–5 second decode estimate is not an acceptance result. M0 and M1 must replace it with measured data.
 
+### Sibling-firmware data point *(measured, different implementation)*
+
+`crosspoint-reader` runs full-page EPUB image decoding on the same SoC and the same X3/X4 panels. Its own source notes record two figures:
+
+- a full-page image decode costs approximately 2 seconds;
+- free heap during an image page runs approximately 55 KB.
+
+These are the closest available hardware measurements, but they are not a substitute for ours. Their decode reads an image already extracted to a plain SD file, so it excludes ZIP inflate; it uses a different decoder; and it produces 2bpp rather than 1bpp output. Treat the 2-second figure as evidence that the order of magnitude is workable, not as a projected result for this design.
+
 ### Flash *(measured)*
 
 The application partition is approximately 6.5 MB and the current firmware image is approximately 3.7 MB. Decoder flash growth is not expected to be the limiting resource, but the final delta must still be reported.
+
+## Prior art: `crosspoint-reader`
+
+`crosspoint-reader` is a C++/Arduino firmware for the same X3/X4 hardware that already ships full inline EPUB image rendering. It was evaluated in full. This section records what was taken and what was rejected, so the decisions are not re-litigated.
+
+Its pipeline: bitbank2 **JPEGDEC** (Apache-2.0, roughly a 17–20 KB object, heap-allocated per decode) in 8-bit grayscale mode, with the same 1/1, 1/2, 1/4, 1/8 built-in reductions; nearest-neighbour downscaling and bilinear upscaling in 16.16 fixed point; a stateless 4×4 Bayer dither to four levels; images lazily extracted from the ZIP to plain SD files; and the dithered 2bpp output cached to a sidecar file so a page is decoded exactly once.
+
+### Rejected: JPEGDEC as a dependency
+
+- It is C, so it arrives through FFI and `unsafe`. Library crates here `forbid(unsafe_code)` and `fw` permits only narrow per-item opt-ins; an entire decoder's FFI surface is not narrow.
+- Its file interface requires a working `seek` callback. Image entries in the target corpus are DEFLATE-compressed inside the ZIP and are not seekable without re-inflating from the entry start.
+- `crosspoint-reader` carries local patches for two real defects it found in JPEGDEC's progressive path — a wild pointer and an incorrect DC write. Vendoring the library means owning that maintenance.
+
+The Apache-2.0 licence is not an obstacle; the architecture is. A `no_std`, allocation-free Rust decoder written against the narrow initial contract in this PRD is the smaller long-term cost.
+
+### Rejected: extracting images to SD before decoding
+
+This is forced on `crosspoint-reader` by the `seek` requirement above. Baseline JPEG decodes forward-only, so this design streams directly from the ZIP entry instead. That avoids writing roughly a megabyte to SD per image, and avoids owning the lifecycle, wear, and space accounting of extracted image files.
+
+### Rejected: nearest-neighbour downscaling
+
+See "Resampler". Their choice is a speed compromise whose failure mode they had to work around.
+
+### Adopted: streaming dimension probe
+
+`crosspoint-reader` sizes an image during layout by feeding roughly the first 1 KB of the entry through a byte-at-a-time state machine that reads JPEG SOF or PNG IHDR dimensions, with early stop, and leaves the image bytes inside the EPUB until its page is first rendered.
+
+This is precisely the metadata step M2 needs, it requires no seeking and no allocation, and it is straightforward to express as a `no_std` Rust state machine. The design is adopted; the C++ source is not copied.
+
+### Adopted: per-axis scale factors
+
+See "Resampler".
+
+### Adopted: bounded in-session failure memo
+
+See "M2 failure behavior".
+
+### Considered: rendered-output cache
+
+See "Rendered-page cache (deferred decision)". Mandatory for their multi-pass renderer; a latency optimisation for this single-pass one.
 
 ## Architecture
 
@@ -273,6 +322,16 @@ The implementation must not assume that every three-component file is YCbCr sole
 
 Support may be widened after M0, but M1 and M2 acceptance tests must describe the actual supported subset precisely.
 
+### Why progressive JPEG is refused initially
+
+Progressive JPEG is excluded for cost, not because it is infeasible.
+
+A useful degradation exists and is worth stating so it is not rediscovered later. A progressive file's first scan is its DC scan, and decoding only that scan yields a complete 1/8-resolution image in raster order. It needs no full coefficient plane and no seeking, because the DC scan precedes the refinement scans in the file. `crosspoint-reader` ships exactly this: it detects progressive input, forces 1/8, and bilinear-upscales the result.
+
+The cost is a second entropy-decoding path with its own successive-approximation and spectral-selection handling, its own bug surface, and its own fixture set, in exchange for a visibly soft image. That is the wrong trade for the first shipping decoder, which must be small enough to audit.
+
+Progressive DC-only decode is therefore listed as a post-M0 widening candidate rather than a permanent exclusion. Until it exists, progressive input is refused and renders the placeholder.
+
 ## Resource and abuse limits
 
 The parser rejects an image before expensive decode work when any configured limit is exceeded.
@@ -352,6 +411,10 @@ The initial policy is:
 - fixed-point bilinear interpolation when enlarging;
 - identical integer rounding on host and firmware.
 
+Horizontal and vertical scale factors are derived independently. Integer rounding of the fitted destination height means the destination aspect ratio does not exactly match the source, so a single scale factor applied to both axes selects the wrong source row and can drop content. Both the source-to-destination and destination-to-source factors are computed per axis.
+
+Nearest-neighbour downscaling is explicitly not the policy. At the reductions this project actually performs — roughly 6:1 for a 1200×1800 cover — it discards almost every source pixel and aliases badly on the line art that dominates the target corpus. `crosspoint-reader` uses nearest-neighbour for speed and needed the per-axis fix above to stop it losing rows outright; that is a symptom worth avoiding rather than a pattern worth copying.
+
 M0 must verify that this can be implemented without a full decoded frame. A different deterministic algorithm may be selected at the M0 gate if it materially reduces memory or runtime, but host and firmware must still share it.
 
 ## Dithering
@@ -367,6 +430,14 @@ The initial output algorithm is Floyd–Steinberg error diffusion:
 The implementation may use two caller-owned `i16` error rows of `target_width + 2` elements. At an 800-pixel target this is approximately 3.2 KB.
 
 An ordered Bayer matrix is the fallback only if M0 shows that Floyd–Steinberg causes unacceptable workspace, runtime, or band-boundary complexity.
+
+### Single-pass rendering is a precondition
+
+Floyd–Steinberg is order-dependent: its output is defined only for one deterministic traversal of the destination. It is available here solely because a render writes the framebuffer exactly once, and the panel flush bands out of the already-completed buffer.
+
+Any future change that renders a page more than once, or that renders it in independently computed strips or bit planes, invalidates this choice and forces a stateless dither such as ordered Bayer. `crosspoint-reader` is the worked example: its renderer invokes the image draw path roughly 14 times per page (a BW pass, an anti-aliasing restore, and two grayscale planes of about six strips each), so it uses a stateless 4×4 Bayer matrix and could not use error diffusion at all.
+
+An implementation that adds multi-pass or strip rendering must revisit this section rather than attempting to preserve error diffusion across passes.
 
 The selected dither implementation must be used by:
 
@@ -695,7 +766,7 @@ The build sink:
 
 1. resolves and normalizes the href;
 2. locates the manifest or ZIP entry;
-3. parses only enough image metadata to identify format, dimensions, and orientation;
+3. parses only enough image metadata to identify format, dimensions, and orientation, by streaming a bounded prefix of the entry — on the order of 1 KB — through the streaming dimension probe described under "Prior art", stopping as soon as the header fields are known and never inflating the whole image at cache-build time;
 4. applies the deterministic image-only-spine rule;
 5. emits either:
    - a normalized image-page event; or
@@ -817,6 +888,33 @@ The display task:
 The page cache stores a stable normalized href rather than a ZIP local-header offset. Offsets may become an optimization later but are not part of the initial persistence contract.
 
 If the EPUB is missing, changed, unreadable, or lacks the referenced entry, the page falls back to the placeholder.
+
+### Rendered-page cache (deferred decision)
+
+Without a cache, every visit to an image page pays the full source-open, inflate, decode, and raster cost again. Paging back and forth across an illustration repeats it each time.
+
+The option is to persist the finished 1bpp raster for the image page and, on a later visit, read it back instead of re-decoding. At the reader content rectangle this is roughly 43 KB per image page in 1bpp, so a book with seventeen full-page illustrations costs under 1 MB of SD space. A revisit becomes a single sequential read.
+
+`crosspoint-reader` treats the equivalent cache as mandatory, because its renderer re-enters the image path about 14 times per page; without it a 2-second decode became a roughly 30-second freeze and a watchdog reset. That pressure does not exist here — a render writes the framebuffer once — so for this design the cache is a latency optimisation, not a correctness requirement.
+
+It is therefore deferred to measured evidence rather than specified now. If it is adopted it must reuse the M1 transactional-publication rules, carry its own version, be invalidated by any change to geometry, resampler, or dither, and never be presented as valid when truncated.
+
+### M2 failure behavior
+
+A decode or source failure on an image page:
+
+- renders the existing placeholder in place of the image;
+- does not fail the page turn, invalidate the page cache, or change reader position;
+- leaves no partially decoded pixels in the submitted framebuffer;
+- emits a bounded diagnostic result.
+
+A failed image is recorded in a bounded in-RAM memo — a fixed-size table of image-path hashes — so the same image does not re-attempt a full decode on every visit within the reading session. The memo:
+
+- is fixed-capacity and allocation-free, and simply stops recording when full;
+- is cleared when the reader is entered, so transient SD or timing failures are retried in a later session;
+- is never persisted, because unlike the M1 negative-cover result it does not distinguish deterministic from transient causes.
+
+Deterministic per-image refusals are not persisted in M2. The image-page record already carries the format and dimensions established at cache-build time, so an unsupported image is normally rejected before a decode is attempted.
 
 ### Framebuffer transaction
 
@@ -1196,17 +1294,23 @@ Mitigation:
 - Initial M2 promotion is limited to image-only spine items.
 - Partial framebuffer output is cleared before placeholder fallback.
 - Host and firmware use the same raster pipeline.
+- The decoder is written in `no_std` Rust rather than wrapping JPEGDEC.
+- Images stream from the ZIP entry rather than being extracted to SD first.
+- Downscaling uses area averaging, not nearest neighbour, with per-axis scale factors.
+- Error diffusion is conditional on single-pass framebuffer rendering.
 
 ## Remaining decision gates
 
 The following are intentionally deferred to measured evidence:
 
-- Floyd–Steinberg versus ordered dithering.
+- Floyd–Steinberg versus ordered dithering, subject to the single-pass precondition.
 - Exact decoder workspace after implementation.
 - Whether 16-bit quantization tables fit the initial support set.
 - Whether a 1/8-plus-upscale cover fast mode is visually acceptable.
 - Whether M2 should proceed after full-page 1bpp inspection.
 - Whether M2 requires a rendering plate.
+- Whether M2 adopts a rendered-page cache, based on measured revisit latency.
+- Whether a later milestone adds progressive JPEG as a DC-only 1/8 decode.
 - Whether X3 eventually needs a different cover-cache geometry.
 - Whether a later milestone should support transparent SVG wrappers.
 - Whether a later milestone should promote standalone image blocks inside textual spine items.
