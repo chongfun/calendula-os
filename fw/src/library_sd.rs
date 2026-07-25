@@ -753,8 +753,11 @@ fn sweep_orphan_caches<
         if live {
             continue;
         }
-        let section_count = header.map(|h| h.section_count).unwrap_or(0);
-        crate::reader_cache_files::empty_cache_dir(root, key.as_str(), section_count);
+        // An unreadable header is exactly the case that used to defeat the
+        // sweep: it named section files from the header's own count, so a
+        // cache with no BOOK.BIN kept its sections forever. The delete lists
+        // the directory now, so it needs nothing from the header.
+        let _ = crate::reader_cache_files::empty_cache_dir(root, key.as_str());
         swept += 1;
     }
     if swept > 0 {

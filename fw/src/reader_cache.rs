@@ -529,6 +529,73 @@ pub(crate) fn forget_wifi_credentials(epd: &mut Epd, sd_cs: &mut Output<'static>
     .unwrap_or(false)
 }
 
+/// Delete one catalog row's rebuildable cache (sections, BOOK/TOC/COVER and
+/// the content stream), keeping its position files and catalog entry. The
+/// row's identity is checked against the cache header before anything is
+/// deleted, so a stale index or a key collision clears nothing. When the
+/// cleared book is the resident one, the loaded state drops with it and the
+/// next open takes the ordinary cache-miss rebuild path instead of
+/// answering from RAM.
+#[inline(never)]
+pub(crate) fn clear_book_cache(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: u16,
+) -> bool {
+    let index = index as usize;
+    if library.catalog_entry(index).is_none()
+        && !crate::library_sd::load_active_entry(epd, sd_cs, library, index)
+    {
+        return false;
+    }
+    let Some(entry) = library.catalog_entry(index) else {
+        return false;
+    };
+    let source_hash = entry.source_hash;
+    let source_size = entry.byte_size;
+    let cache_key = proto::cache::cache_key_for(entry.display_name.as_str(), source_size);
+    let cleared = sd_session::with_root(epd, sd_cs, |root| {
+        if let Some(header) = reader_cache_files::read_cache_header(root, cache_key.as_str()) {
+            if header.source_hash != source_hash || header.source_size != source_size {
+                // Whatever sits under this key is not this book's cache;
+                // refuse rather than delete another book's data.
+                return false;
+            }
+        }
+        // No readable index means the cache is already gone as far as the
+        // reader is concerned; still run the delete to sweep the shells a
+        // truncated pass left behind.
+        //
+        // The delete reports on every file it was supposed to remove, not
+        // just the index: a pass that took BOOK.BIN but stalled on a section
+        // has freed no space and left a directory the sweep will keep
+        // tripping over, and telling the user "cache cleared" for that is a
+        // lie they cannot check.
+        reader_cache_files::empty_cache_dir(root, cache_key.as_str())
+            && reader_cache_files::read_cache_header(root, cache_key.as_str()).is_none()
+    })
+    .unwrap_or(false);
+    if cleared {
+        if library.loaded_index == Some(index) {
+            // The resident sections, book index, and TOC describe files that
+            // no longer exist; RAM answers would strand the reader on the
+            // next section crossing.
+            library.loaded_index = None;
+            library.clear_book_index();
+            library.clear_lines();
+            library.clear_toc();
+            library.text_holds_toc = false;
+            library.reader_status = BookLoadStatus::Empty;
+        }
+        if library.current_index == Some(index) {
+            // COVER.BIN is gone; the resident cover regenerates on rebuild.
+            library.clear_cover();
+        }
+    }
+    cleared
+}
+
 #[inline(never)]
 pub(crate) fn load_wifi_credentials(
     epd: &mut Epd,
@@ -1287,7 +1354,7 @@ where
                 // replay (the labels load bails on it). Clear the debris —
                 // sections and CONT.BIN are useless without an index — so
                 // the next open rebuilds from the EPUB cleanly.
-                reader_cache_files::empty_cache_dir(root, cache_key, section_count as u16);
+                let _ = reader_cache_files::empty_cache_dir(root, cache_key);
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -1586,7 +1653,7 @@ where
         // truncated BOOK.BIN or an unreadable section); the full build
         // rewrites everything, so clear it all either way.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        reader_cache_files::empty_cache_dir(root, cache_key, section_count as u16);
+        let _ = reader_cache_files::empty_cache_dir(root, cache_key);
         return false;
     }
     true

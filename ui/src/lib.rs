@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use app_core::PortalPsk;
+pub use app_core::{LibraryAction, LibraryMenu};
 
 pub mod app_render;
 pub mod custom_font;
@@ -133,6 +134,10 @@ pub struct UiShell<'a> {
     /// The saved Wi-Fi network's name; empty when none is saved. Names
     /// the network on the Wireless screen's idle and forget states.
     pub wifi_ssid: &'a str,
+    /// The Library per-book actions sheet's progress on the selected row:
+    /// the sheet overlays the list, an armed action swaps the key rail and
+    /// asks in the footer, and the settled states show their note there.
+    pub library_menu: app_core::LibraryMenu,
 }
 
 #[cfg(test)]
@@ -174,6 +179,7 @@ mod tests {
             chapters_total: 0,
             sync_status: status,
             wifi_ssid: "",
+            library_menu: app_core::LibraryMenu::None,
         };
         for rendered in [format!("{status:?}"), format!("{shell:?}")] {
             assert!(

@@ -297,10 +297,23 @@ impl Emulator {
             }
             self.last_storage = Some(command);
         }
+        if let Some(command) =
+            app_core::library_action_command_for_transition(&previous, &self.state)
+        {
+            self.last_storage = Some(command);
+            // The emulated card has no real cache; the clear settles
+            // instantly and always succeeds.
+            if let StorageCommand::ClearBookCache { request_id, .. } = command {
+                self.library_event(LibraryEvent::CacheCleared {
+                    request_id,
+                    ok: true,
+                });
+            }
+        }
     }
 
     pub fn library_event(&mut self, event: LibraryEvent) {
-        if let LibraryEvent::Scanned { count } = event {
+        if let LibraryEvent::Scanned { count, .. } = event {
             self.library_entries.clear();
             self.library_entries
                 .extend((0..count).map(|index| format!("SD Book {}", index + 1)));
@@ -346,6 +359,7 @@ impl Emulator {
             Some(StorageCommand::ReceiveUpload) => Some("ReceiveUpload"),
             Some(StorageCommand::LoadChapters { .. }) => Some("LoadChapters"),
             Some(StorageCommand::JumpChapter { .. }) => Some("JumpChapter"),
+            Some(StorageCommand::ClearBookCache { .. }) => Some("ClearBookCache"),
             None => None,
         }
     }

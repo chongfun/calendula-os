@@ -822,11 +822,40 @@ where
     .flatten()
 }
 
-/// Delete one book cache completely: every section file, BOOK/TOC/COVER, then
-/// the emptied `SECTIONS/` and `<key>/` directories themselves. Directory
-/// deletion refuses non-empty targets, so a cache whose header undercounts its
-/// sections just leaves its shells for the next sweep pass. The global reading
-/// position in XTEINK/STATE.BIN is never touched.
+/// Section files deleted per directory-listing pass. embedded-sdmmc will not
+/// let a file be opened while an iteration holds the volume lock, so names are
+/// collected first and deleted once the walk has returned, and the loop
+/// re-lists until the directory comes back empty.
+///
+/// The batch is what keeps that staging off the stack budget: 16 short names
+/// is 392 B, against the 7,680 B a whole `MAX_BOOK_SECTIONS` book would need,
+/// and it costs 20 extra listings only for a book at that cap — an ordinary
+/// book empties in two or three passes. The deepest caller is the publish
+/// failure path inside the EPUB-open chain, which is why this is sized rather
+/// than left to the book.
+const SECTION_SWEEP_BATCH: usize = 16;
+
+/// A FAT short name at its widest: `NNNNNNNN.EXT`.
+const SHORT_NAME_BYTES: usize = 12;
+
+/// Delete one book cache completely: every section file, BOOK/TOC/COVER/CONT,
+/// then the emptied `SECTIONS/` and `<key>/` directories themselves. Returns
+/// whether the cache is actually gone.
+///
+/// Nothing here trusts the cache's own header for what to delete. It used to
+/// remove sections by generated name over `0..section_count`, which left a
+/// header that undercounted (a torn write, a truncated build) with orphan
+/// section files that no later pass could name — the sweep reads
+/// `section_count` from the same BOOK.BIN this deletes, so once the header was
+/// gone the leftovers were unnameable and `SECTIONS/` stayed non-empty
+/// forever. `SECTIONS/` is enumerated instead, so what is on the card decides
+/// what gets deleted.
+///
+/// BOOK.BIN goes first, deliberately. It is the cache's liveness marker, so an
+/// interrupted delete leaves a cache that reads as absent and gets rebuilt,
+/// rather than a header advertising sections that are no longer there.
+///
+/// The global reading position in XTEINK/STATE.BIN is never touched.
 pub(crate) fn empty_cache_dir<
     D,
     T,
@@ -836,53 +865,131 @@ pub(crate) fn empty_cache_dir<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
-    section_count: u16,
-) where
+) -> bool
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) else {
-        return;
+    // A directory that isn't there holds no cache; anything else going wrong
+    // on the way in means we cannot say the cache is gone.
+    let xteink = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
     };
-    let Ok(cache) = xteink.open_dir(CACHE_V2_DIR) else {
-        return;
+    let cache = match xteink.open_dir(CACHE_V2_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
     };
     let position_kept;
+    let mut cleared = true;
     {
-        let Ok(book) = cache.open_dir(key) else {
-            return;
+        let book = match cache.open_dir(key) {
+            Ok(dir) => dir,
+            Err(embedded_sdmmc::Error::NotFound) => return true,
+            Err(_) => return false,
         };
-        if let Ok(sections) = book.open_dir(CACHE_SECTIONS_DIR) {
-            let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-            for spine in 0..section_count {
-                name.clear();
-                section_file_name(spine, &mut name);
-                let _ = upload_store::remove_file_reclaiming_clusters(&sections, name.as_str());
+        for name in [
+            CACHE_BOOK_FILE,
+            CACHE_TOC_FILE,
+            CACHE_COVER_FILE,
+            CACHE_CONTENT_FILE,
+        ] {
+            if upload_store::remove_file_reclaiming_clusters(&book, name)
+                == upload_store::RemoveStatus::Failed
+            {
+                cleared = false;
             }
         }
-        // The SECTIONS handle has dropped; the empty directory can go now
-        // (a directory entry has no chain to reclaim).
-        let _ = book.delete_file_in_dir(CACHE_SECTIONS_DIR);
-        let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_BOOK_FILE);
-        let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_TOC_FILE);
-        let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_COVER_FILE);
-        let _ = upload_store::remove_file_reclaiming_clusters(&book, CACHE_CONTENT_FILE);
+        match book.open_dir(CACHE_SECTIONS_DIR) {
+            Ok(sections) => {
+                if !empty_sections_dir(&sections) {
+                    cleared = false;
+                }
+            }
+            Err(embedded_sdmmc::Error::NotFound) => {}
+            Err(_) => cleared = false,
+        }
+        if cleared {
+            // The SECTIONS handle has dropped; the empty directory can go now
+            // (a directory entry has no chain to reclaim). A refusal here
+            // leaves an empty directory, not cache data, so it does not make
+            // the clear a failure.
+            let _ = book.delete_file_in_dir(CACHE_SECTIONS_DIR);
+        }
         // Everything above is re-derivable from the EPUB; the position is not.
         // POS*.BIN is the authoritative record of where the reader is in this
         // book, so it is never swept, and the directory holding it has to stay
         // as well. A book moved off the card and back keys to the same name and
         // size, so its place is still waiting when it returns.
-        //
-        // This was already the effect — the directory delete below silently
-        // failed while the position files were in it — but it was incidental,
-        // and the position is load-bearing now that nothing else records it.
         position_kept = has_position_file(&book);
     }
-    if !position_kept {
+    if cleared && !position_kept {
         // Likewise the book handle: closed by the scope above, deletable here
         // (a directory entry has no chain to reclaim).
         let _ = cache.delete_file_in_dir(key);
     }
+    cleared
+}
+
+/// Delete every file in an opened `SECTIONS/` directory, by listing rather
+/// than by generated name. Returns false if any delete failed or the directory
+/// still had entries after the pass budget — either way the caller must not
+/// report the cache as cleared.
+fn empty_sections_dir<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    // A full book is MAX_BOOK_SECTIONS files; the spare pass is what proves
+    // the directory came back empty rather than merely running out of budget.
+    let max_passes = MAX_BOOK_SECTIONS.div_ceil(SECTION_SWEEP_BATCH) + 1;
+    for _ in 0..max_passes {
+        let mut names: heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH> =
+            heapless::Vec::new();
+        let mut overflowed = false;
+        if sections
+            .iterate_dir(|entry| {
+                if entry.attributes.is_directory() {
+                    return;
+                }
+                let mut name = String::<SHORT_NAME_BYTES>::new();
+                if write!(name, "{}", entry.name).is_err() {
+                    // A name this pass cannot reproduce is a name it cannot
+                    // delete; say so rather than silently leaving it.
+                    overflowed = true;
+                    return;
+                }
+                if names.push(name).is_err() {
+                    overflowed = true;
+                }
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if names.is_empty() {
+            return !overflowed;
+        }
+        for name in &names {
+            if upload_store::remove_file_reclaiming_clusters(sections, name.as_str())
+                == upload_store::RemoveStatus::Failed
+            {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// Whether a book's cache directory still holds a reading position, in either

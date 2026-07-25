@@ -115,7 +115,13 @@ pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 4>
 // send_required_display_event), so a shorter queue costs at most extra
 // retries, and the ~2.1 KB of .bss saved widens the main stack region.
 pub static DISPLAY_EVENTS: Channel<CriticalSectionRawMutex, DisplayEvent, 8> = Channel::new();
-pub static LIBRARY_EVENTS: Channel<CriticalSectionRawMutex, LibraryEvent, 8> = Channel::new();
+// Sized from app_core so the eviction walk that makes room in this channel
+// (see send_required_library_event) cannot disagree with it about the ring.
+pub static LIBRARY_EVENTS: Channel<
+    CriticalSectionRawMutex,
+    LibraryEvent,
+    { app_core::LIBRARY_EVENT_SLOTS },
+> = Channel::new();
 pub static STORAGE_COMMANDS: Channel<CriticalSectionRawMutex, StorageCommand, 4> = Channel::new();
 pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Channel::new();
 /// The generation of a sleep handshake the power task gave up on.

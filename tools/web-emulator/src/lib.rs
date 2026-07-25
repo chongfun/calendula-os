@@ -79,6 +79,9 @@ impl WebEmulator {
             emu.ctx,
             LibraryEvent::Scanned {
                 count: SHELF.len() as u16,
+                // The fake shelf is fixed for the life of the page, so it
+                // never leaves its first catalog epoch.
+                catalog_epoch: 1,
             },
         );
         emu.restore_active_book(ReaderSource::sd(0).book_id(), 0, 0);
@@ -162,6 +165,19 @@ impl WebEmulator {
                 }
                 _ => {}
             }
+        }
+        if let Some(StorageCommand::ClearBookCache { request_id, .. }) =
+            app_core::library_action_command_for_transition(&previous, &self.state)
+        {
+            // The fake shelf has no on-card cache; the clear settles
+            // instantly and always succeeds.
+            self.state = self.state.apply_library_event(
+                self.ctx,
+                LibraryEvent::CacheCleared {
+                    request_id,
+                    ok: true,
+                },
+            );
         }
 
         if self.state.sync_status == SyncStatus::Starting

@@ -15,8 +15,8 @@ use app_core::storage_loop::{
 };
 use app_core::{
     book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
-    DisplayOrientation, PersistedAppState, ReaderSource, RefreshPlanner, RenderKind, RenderRequest,
-    SyncSession, SyncStatus,
+    DisplayOrientation, EvictionStep, EvictionWalk, PersistedAppState, ReaderSource,
+    RefreshPlanner, RenderKind, RenderRequest, SyncSession, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
@@ -615,6 +615,13 @@ async fn park_until_resumed(generation: u32) {
 }
 
 pub(crate) fn send_library_event(event: &LibraryEvent) {
+    // An event that settles something the app is holding cannot go out the
+    // lossy way: the work is done and will not be redone, so a dropped one
+    // strands the wait. The event says which it is, so no call site has to.
+    if event.must_be_delivered() {
+        send_required_library_event(event);
+        return;
+    }
     if LIBRARY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: library event queue full");
     }
@@ -781,7 +788,10 @@ fn handle_storage_command(
                 // sees an SD book active and leaves it alone.
                 restore_saved_state(epd, sd_cs, sd_library, state_restored);
                 let count = sd_library.catalog_count_u16();
-                send_library_event(&LibraryEvent::Scanned { count });
+                send_library_event(&LibraryEvent::Scanned {
+                    count,
+                    catalog_epoch: sd_library.catalog_epoch(),
+                });
             } else {
                 let _ = STORAGE_COMMANDS.try_send(StorageCommand::RefreshCatalog);
             }
@@ -795,6 +805,7 @@ fn handle_storage_command(
             restore_saved_state(epd, sd_cs, sd_library, state_restored);
             send_library_event(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),
+                catalog_epoch: sd_library.catalog_epoch(),
             });
         }
         StorageCommand::OpenBook {
@@ -1116,6 +1127,34 @@ fn handle_storage_command(
             let forgotten = reader_cache::forget_wifi_credentials(epd, sd_cs);
             esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
+        StorageCommand::ClearBookCache {
+            request_id,
+            index,
+            catalog_epoch,
+        } => {
+            // The row was picked against a catalog this task may since have
+            // replaced, which would leave a different book sitting under it.
+            // Refuse rather than guess: the user can pick again from the list
+            // they can actually see.
+            let ok = if catalog_epoch == sd_library.catalog_epoch() {
+                reader_cache::clear_book_cache(epd, sd_cs, sd_library, index)
+            } else {
+                esp_println::println!(
+                    "storage: clear cache index={} stale epoch={} now={}",
+                    index,
+                    catalog_epoch,
+                    sd_library.catalog_epoch()
+                );
+                false
+            };
+            esp_println::println!(
+                "storage: clear cache request={} index={} ok={}",
+                request_id,
+                index,
+                ok
+            );
+            send_library_event(&LibraryEvent::CacheCleared { request_id, ok });
+        }
         StorageCommand::StoreProgress(record) => {
             let record = record_for_persisted(sd_library, record);
             // Coalesce same-context page turns; anything beyond the screen
@@ -1182,17 +1221,38 @@ fn handle_storage_command(
     }
 }
 
+/// Queue an event the app is waiting on, making room if the channel is full.
+///
+/// It used to make room by taking whatever was at the front and throwing it
+/// away, without looking at it — so delivering one settling event could
+/// silently destroy another, which is the whole thing this function exists to
+/// prevent. It walks the ring now; [`EvictionWalk`] owns which events may be
+/// spent for the newcomer and is host-tested against a modelled channel.
 fn send_required_library_event(event: &LibraryEvent) {
-    const RETRIES: usize = 8;
-    for _ in 0..RETRIES {
-        if LIBRARY_EVENTS.try_send(*event).is_ok() {
-            return;
+    if LIBRARY_EVENTS.try_send(*event).is_ok() {
+        return;
+    }
+    let mut walk = EvictionWalk::new(app_core::LIBRARY_EVENT_SLOTS);
+    while !walk.exhausted() {
+        let Ok(head) = LIBRARY_EVENTS.try_receive() else {
+            break;
+        };
+        match walk.inspect(&head) {
+            EvictionStep::Discard => {
+                // The refresh is spent; its slot is this event's. Nothing
+                // else writes this channel, so the send cannot lose the race.
+                if LIBRARY_EVENTS.try_send(*event).is_ok() {
+                    return;
+                }
+                break;
+            }
+            EvictionStep::Requeue => {
+                // One slot is free (the head came off), so this always lands.
+                let _ = LIBRARY_EVENTS.try_send(head);
+            }
         }
-        let _ = LIBRARY_EVENTS.try_receive();
     }
-    if LIBRARY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!("display: required library event queue full");
-    }
+    esp_println::println!("display: library events all awaited, dropped {:?}", event);
 }
 
 fn send_loaded_library_event(event: &LibraryEvent) {
@@ -1499,6 +1559,7 @@ fn sleep_request_from_saved_state(
         front_buttons: app_core::front_buttons_from_u8(record.front_buttons)
             .unwrap_or(app_core::FrontButtons::PagesRight),
         reading_sheet: false,
+        library_menu: app_core::LibraryMenu::None,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

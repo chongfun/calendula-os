@@ -1,0 +1,22 @@
+# The side browse key opens the per-book actions sheet on the selected
+# row: a bordered card headed by the book, one row per action, with the
+# rail offering cancel/select/previous/next.
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 3
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "PagePrevious"
+
+[expect]
+view = "Library"
+selection = 1
+library_menu = "Sheet"
+library_count = 3

@@ -164,6 +164,12 @@ pub(crate) struct ReaderStore {
     window: [LibraryBookEntry; LIBRARY_WINDOW],
     window_start: usize,
     window_len: usize,
+    /// Bumped every time the catalog is replaced wholesale (a scan, or a load
+    /// of CATALOG.BIN). Row numbers only address a book within one epoch, so
+    /// commands that name a row carry the epoch they were picked in and are
+    /// refused once this has moved on. Scrolling the window is not a change:
+    /// the same rows still name the same books.
+    catalog_epoch: u32,
     /// The one book currently being opened/read. Held apart from the list
     /// window so the reading path never depends on where the Library list
     /// happens to be scrolled; `catalog_entry` returns it for `active_index`.
@@ -274,6 +280,7 @@ impl ReaderStore {
             window: [const { LibraryBookEntry::new() }; LIBRARY_WINDOW],
             window_start: 0,
             window_len: 0,
+            catalog_epoch: 0,
             active_entry: LibraryBookEntry::new(),
             active_index: None,
             current_index: None,
@@ -441,6 +448,15 @@ impl ReaderStore {
         self.window_len = 0;
         self.active_index = None;
         self.current_index = None;
+        // Every catalog replacement starts here, so this is the one place the
+        // epoch has to move. Wrapping is harmless: a row command in flight
+        // across 2^32 catalog rebuilds is not a case worth a wider counter.
+        self.catalog_epoch = self.catalog_epoch.wrapping_add(1);
+    }
+
+    /// The catalog generation the resident rows belong to.
+    pub(crate) fn catalog_epoch(&self) -> u32 {
+        self.catalog_epoch
     }
 
     pub(crate) fn catalog_count(&self) -> usize {

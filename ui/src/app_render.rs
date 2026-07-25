@@ -94,6 +94,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
             &request.wifi_ssid[..request.wifi_ssid_len.min(32) as usize],
         )
         .unwrap_or(""),
+        library_menu: request.library_menu,
     };
     render_shell(fb, &shell);
 }

@@ -353,10 +353,19 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     let layout = shell_layout(shell);
-    dash_key(fb, layout, 0, "home", false);
-    dash_key(fb, layout, 1, "open", true);
-    dash_key(fb, layout, 2, "previous", false);
-    dash_key(fb, layout, 3, "next", false);
+    // While the actions sheet is up, the rail answers only it: no label
+    // may promise an action the press will not take.
+    if matches!(shell.library_menu, app_core::LibraryMenu::Sheet { .. }) {
+        dash_key(fb, layout, 0, "cancel", false);
+        dash_key(fb, layout, 1, "select", true);
+        dash_key(fb, layout, 2, "previous", false);
+        dash_key(fb, layout, 3, "next", false);
+    } else {
+        dash_key(fb, layout, 0, "home", false);
+        dash_key(fb, layout, 1, "open", true);
+        dash_key(fb, layout, 2, "previous", false);
+        dash_key(fb, layout, 3, "next", false);
+    }
     heading(fb, layout, "Library");
 
     match shell.library_status {
@@ -420,8 +429,156 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         y += ROW_STEP;
     }
 
-    position_footer(fb, layout, selected_index + 1, total);
+    // The actions sheet overlays the list; the footer carries a running
+    // action's progress and its settled notes. The selection arrow above
+    // still names the book being acted on.
+    if let app_core::LibraryMenu::Sheet { row } = shell.library_menu {
+        let selected_entry = (shell.selection as usize)
+            .checked_sub(window_start)
+            .and_then(|offset| shell.library_entries.get(offset))
+            .copied()
+            .unwrap_or("this book");
+        render_library_sheet(fb, layout, selected_entry, row);
+    }
+    match shell.library_menu {
+        app_core::LibraryMenu::Busy { action, .. } => match action {
+            app_core::LibraryAction::ClearCache => footer_note(fb, layout, "clearing\u{2026}"),
+        },
+        app_core::LibraryMenu::Done { action, ok } => match (action, ok) {
+            (app_core::LibraryAction::ClearCache, true) => footer_note(fb, layout, "cache cleared"),
+            (app_core::LibraryAction::ClearCache, false) => {
+                footer_note(fb, layout, "cache not cleared")
+            }
+        },
+        // While the sheet is up the page-back key dismisses it, so the
+        // teaching line below would lie; the plain position stands in.
+        app_core::LibraryMenu::Sheet { .. } => {
+            position_footer(fb, layout, selected_index + 1, total)
+        }
+        app_core::LibraryMenu::None => library_footer(fb, layout, selected_index + 1, total),
+    }
     finish_working_screen(fb, shell, layout);
+}
+
+/// Library's resting footer teaches the sheet key — the shell's only
+/// side-key binding a label cannot sit beside — in the corner the battery
+/// leaves free, naming the key by its hold-independent reading function.
+/// Portrait's centered position would collide with a corner line, so the
+/// line splits: hint left, position right.
+fn library_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, total: usize) {
+    let hint = "page-back opens book actions";
+    let italic = literata_small(FontStyle::Italic);
+    if layout.portrait {
+        draw_text(fb, italic, hint, layout.content_x, layout.footer_y(), false);
+        let mut buf = [0u8; 32];
+        let mut cursor = 0;
+        push_str(&mut buf, &mut cursor, "\u{2013} ");
+        push_usize(&mut buf, &mut cursor, current);
+        push_str(&mut buf, &mut cursor, " of ");
+        push_usize(&mut buf, &mut cursor, total);
+        push_str(&mut buf, &mut cursor, " \u{2013}");
+        let label = core::str::from_utf8(&buf[..cursor]).unwrap_or("");
+        let small = literata_small(FontStyle::Regular);
+        let width = measure_text(small, label) as i16;
+        draw_text(
+            fb,
+            small,
+            label,
+            layout.content_right - width,
+            layout.footer_y(),
+            false,
+        );
+    } else if layout.mirrored {
+        let width = measure_text(italic, hint) as i16;
+        draw_text(fb, italic, hint, WIDTH as i16 - 24 - width, FOOTER_Y, false);
+        position_footer(fb, layout, current, total);
+    } else {
+        draw_text(fb, italic, hint, 24, FOOTER_Y, false);
+        position_footer(fb, layout, current, total);
+    }
+}
+
+/// The sheet row label for an action.
+const fn library_action_row(action: app_core::LibraryAction) -> &'static str {
+    match action {
+        app_core::LibraryAction::ClearCache => "Clear cache",
+    }
+}
+
+/// The per-book actions sheet: a bordered card over the lower list, headed
+/// by the book it acts on, one row per action with the browse cursor.
+fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, row: u8) {
+    let header_h: i16 = 46;
+    let row_h: i16 = 48;
+    let pad: i16 = 12;
+    let actions = app_core::LIBRARY_ACTIONS;
+    let height = header_h + row_h * actions.len() as i16 + pad;
+    let bottom = layout.footer_y() - 16;
+    let top = bottom - height;
+    let x0 = layout.content_x - 8;
+    let x1 = layout.content_right + 8;
+    fill_rect(
+        fb,
+        Rect::new(x0 as u16, top as u16, (x1 - x0) as u16, height as u16),
+        true,
+    );
+    // A 2px frame keeps the card legible over whatever rows it covers.
+    for (bx, by, bw, bh) in [
+        (x0, top, x1 - x0, 2),
+        (x0, bottom - 2, x1 - x0, 2),
+        (x0, top, 2, height),
+        (x1 - 2, top, 2, height),
+    ] {
+        fill_rect(
+            fb,
+            Rect::new(bx as u16, by as u16, bw as u16, bh as u16),
+            false,
+        );
+    }
+    let text_x = x0 + 24;
+    draw_text_truncated(
+        fb,
+        literata_small(FontStyle::Italic),
+        title,
+        text_x,
+        top + 32,
+        (x1 - x0 - 48) as usize,
+        false,
+    );
+    hline(fb, x0 + 12, top + header_h - 4, x1 - x0 - 24);
+    let cursor = row as usize % actions.len().max(1);
+    for (index, action) in actions.iter().enumerate() {
+        let y = top + header_h + 32 + row_h * index as i16;
+        if index == cursor {
+            draw_text(
+                fb,
+                literata(FontStyle::Regular),
+                "\u{2192}",
+                text_x,
+                y,
+                false,
+            );
+        }
+        draw_text(
+            fb,
+            literata(FontStyle::Regular),
+            library_action_row(*action),
+            text_x + 36,
+            y,
+            false,
+        );
+    }
+}
+
+/// An italic footer-line note in the position footer's place.
+fn footer_note(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
+    draw_text_centered(
+        fb,
+        literata_small(FontStyle::Italic),
+        text,
+        layout.heading_cx,
+        layout.footer_y(),
+    );
 }
 
 /// Absolute catalog index of the first visible Library row that keeps

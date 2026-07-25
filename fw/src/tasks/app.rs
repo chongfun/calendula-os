@@ -5,9 +5,9 @@ use crate::{
     SYNC_EVENTS,
 };
 use app_core::{
-    extend_section_command, storage_command_for_transition, AppView, BookOpenRollback,
-    ParkedStorage, ReaderState, ReducerContext, SleepBlockers, SleepGate, StorageDispatch,
-    SyncStatus,
+    extend_section_command, library_action_command_for_transition, storage_command_for_transition,
+    AppView, BookOpenRollback, ParkedStorage, ReaderState, ReducerContext, SleepBlockers,
+    SleepGate, StorageDispatch, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select4, Either4};
@@ -222,6 +222,16 @@ pub async fn run() {
                 }
                 if let Some(command) = forget_command_for_transition(&previous, &state) {
                     dispatch_storage(&mut pending_storage, command);
+                }
+                if let Some(command) = library_action_command_for_transition(&previous, &state) {
+                    if dispatch_storage(&mut pending_storage, command) == StorageDispatch::Rejected
+                    {
+                        // The reducer has already put the screen on
+                        // "clearing…", waiting for an event that only the
+                        // storage task sends -- and it never got the command.
+                        // Settle the wait here or it never ends.
+                        state = state.library_action_rejected();
+                    }
                 }
                 if let Some(command) = sync_command_for_transition(&previous, &state) {
                     esp_println::println!("app: sync command {:?}", command);
@@ -463,8 +473,19 @@ fn fold_library_event(
 
 fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) -> bool {
     match *event {
-        crate::LibraryEvent::Scanned { count } => {
-            state.view == AppView::Library && state.library_count != count
+        // A scan replaces the catalog wholesale. Even at an unchanged count
+        // the rows may have been reordered, and the reducer acts on that:
+        // it adopts the epoch, can clamp the selection, and dismisses an open
+        // action sheet. Repainting on the count alone would leave the panel
+        // showing the old rows — and an open sheet the state no longer has —
+        // so the next press would be read against a list the reader cannot
+        // see, up to Confirm opening a book under a sheet still on screen.
+        crate::LibraryEvent::Scanned {
+            count,
+            catalog_epoch,
+        } => {
+            state.view == AppView::Library
+                && (state.library_count != count || state.catalog_epoch != catalog_epoch)
         }
         crate::LibraryEvent::Loaded {
             book_id,
@@ -493,6 +514,17 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
         crate::LibraryEvent::ChapterCursor { .. } => false,
         crate::LibraryEvent::CustomFont { .. } => state.view == AppView::Settings,
         crate::LibraryEvent::Restored { .. } => true,
+        // The settled note only shows while the user is still waiting in
+        // Library on this very request; an abandoned clear's answer changes
+        // nothing on screen, so it must not cost a panel refresh either.
+        crate::LibraryEvent::CacheCleared { request_id, .. } => {
+            state.view == AppView::Library
+                && matches!(
+                    state.library_menu,
+                    app_core::LibraryMenu::Busy { request_id: outstanding, .. }
+                        if outstanding == request_id
+                )
+        }
     }
 }
 
@@ -643,6 +675,15 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         }
         StorageCommand::ForgetWifiCredentials => {
             esp_println::println!("app: storage {label} forget wifi credentials")
+        }
+        StorageCommand::ClearBookCache {
+            request_id,
+            index,
+            catalog_epoch,
+        } => {
+            esp_println::println!(
+                "app: storage {label} clear cache request={request_id} index={index} epoch={catalog_epoch}"
+            )
         }
         StorageCommand::ReceiveUpload => {
             esp_println::println!("app: storage {label} receive upload")
