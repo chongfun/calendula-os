@@ -122,16 +122,38 @@ hardware-verified before this session):**
 | Catalog load | 31 ms / 15 EPUBs | 20 ms |
 | Warm book open | 50–85 ms | 57–74 ms (SD), 0 ms (RAM hit) |
 | B6 replay (Type Size change) | — | **24.7 s** (736 pp / 82 sections) and **27.1 s** (1240 pp / 100 sections), ~280–300 ms/section |
-| Orientation flip (portrait↔landscape) | — | ~24 s (same replay path — page box is wrap-relevant) |
+| Orientation flip (portrait↔landscape) | — | **23.8 s** (same replay path — page box is wrap-relevant) |
+| Full build, same settings (evening session, via the new cache-clear) | 14.1 s (July config: 441 pp, pre-CONT.BIN) | **64.0 s** portrait (1240 pp / 100 sections), **62.2 s** landscape (1303 pp / 82) |
+
+**B6's ratio, measured 2026-07-25 evening (cache cleared on device, then
+rebuilt at identical settings): replay is 2.4–2.6× faster than the full
+build** — 27.1 s vs 64.0 s portrait, 23.8 s vs 62.2 s landscape — saving
+~37 s per settings change. B6 earns its keep; and since 24–27 s of
+user-facing wait remains, B7's promotion stands. Two context notes: the
+full build now also captures CONT.BIN (wr 8.9–9.7 k blocks vs the replay's
+4.1 k), and the July 14.1 s cold build was a ~3× smaller page-count config
+— today's ~64 s first open at current settings also strengthens B4's
+progressive-open case.
 
 Replay authenticity: both Type Size rebuilds read 2.8–3.8 MB from the
 card — far below the 11.7 MB source zip — proving the CONT.BIN path ran,
 not the EPUB fallback. Nearly all replay cost is downstream of the capture
 point (wrap + section writes), which is what promotes B7.
 
-**Still unmeasured:** #42 on the X4 (this session was X3-only);
-full-build-vs-replay ratio at identical settings (caches were warm all
-session); C2 sleep current (needs the µA meter).
+**Still unmeasured, with availability verdicts (2026-07-25):**
+
+- **#42 on the X4 — permanently unavailable: the owner has no X4.** The
+  20 MHz value stands on freeink's fleet evidence; it is a one-constant
+  revert if an X4 user ever reports regressions. This applies to every
+  "verify on both boards" hardware step in this roadmap: X4 coverage is
+  compile/clippy/goldens only (tools/check.sh covers both boards
+  host-side); on-device X4 validation happens only if a contributor with
+  hardware appears. C2's "test both boards" wake-reliability step reduces
+  to X3-only for the same reason.
+- **Full-build-vs-replay ratio** — MEASURED same day via the new Library
+  cache-clear (file-management slice 1, `.scratch/file-management/`):
+  replay 2.4–2.6× faster; numbers in the table above.
+- **C2 sleep current** — needs the µA meter (X3).
 
 ## Status after round 1 (2026-07-12)
 
