@@ -1,10 +1,21 @@
 # On-Device Image Rendering — PRD
 
-Status: **planning; implementation decisions are closed except where explicitly assigned to the M0 decision gate.**
+Status: **Planning. Product behavior and cache architecture are closed except where explicitly assigned to an M0 decision gate. Decoder implementation is intentionally not selected until M0A completes.**
 
-Drafted 2026-07-25 from a review of `fix/svg-wrapped-images`, the current reader-cache architecture, and measurements from the X4 release image. No implementation has landed.
+Drafted 2026-07-25 from:
 
-Numbers marked *(measured)* come from this repository at `c8439e8`. Numbers marked *(estimate)* have not been verified on hardware and are the primary purpose of milestone 0.
+- the current CalendulaOS reader, EPUB, cache, framebuffer, and host-preview architecture;
+- measurements from the X4 release image;
+- the target EPUB corpus;
+- research into `crosspoint-reader`;
+- evaluation of JPEGDEC, TJpgDec, `tjpgdec-rs`, and `zune-jpeg`;
+- review of the available testing and fuzzing infrastructure for those decoders.
+
+Numbers marked **CalendulaOS measured** come from this repository at `c8439e8`.
+
+Numbers marked **sibling-reported** come from comments or measurements recorded by another firmware and are not reproducible CalendulaOS benchmark results.
+
+Numbers marked **estimate** have not been verified on CalendulaOS hardware and must be replaced during M0 or the relevant firmware milestone.
 
 ## Summary
 
@@ -12,15 +23,19 @@ CalendulaOS can display a pre-rasterized 1bpp cover, but it cannot decode an EPU
 
 Today, `tools/preview` uses the host `image` crate to decode a cover, crop it to 202×303, threshold it to 1bpp, and write `COVER.BIN` to the SD card. Books that do not go through that manual step have no cover. EPUB illustrations are never rendered: the XHTML parser reduces `<img>` elements to text placeholders, and the reader never opens the referenced image bytes.
 
-This project adds a `no_std`, allocation-free JPEG pipeline in `proto`, staged so the smallest useful result lands first:
+This project adds a `no_std`, allocation-free JPEG raster pipeline in `proto`, staged so the smallest useful result lands first:
 
-- **M0 — decoder spike:** implement and validate the JPEG decoder, deterministic resampling, and dithering on the host.
+- **M0A — decoder adoption spike:** determine whether `tjpgdec-rs` can be safely adapted to CalendulaOS’s forward-only, luma-only, caller-buffered architecture.
+- **M0B — decoder verification and raster pipeline:** complete the selected baseline decoder, differential harness, resampling, and dithering on the host.
 - **M1 — on-device covers:** generate and cache a book cover on any book-open path when no usable cover exists.
 - **M2 — dedicated image pages:** represent image-only spine items in the content and page caches, then decode them into the framebuffer while reading.
+- **M3 candidate — progressive thumbnails:** consider a bounded DC-only progressive JPEG mode only after baseline JPEG has shipped and corpus evidence justifies the extra decoder surface.
 
 M2 initially supports only EPUB spine items whose rendered body consists of one image. Images embedded among prose remain placeholders. Inline image layout and heuristic promotion of decorative images are explicitly out of scope.
 
-Stopping after M1 is an acceptable outcome if M0 or hardware testing shows that full-page rendering is too slow or visually poor.
+Stopping after M1 is an acceptable outcome if hardware testing shows that full-page rendering is too slow, consumes too much scratch, or produces visually poor 1bpp output.
+
+The project does **not** begin by porting all of JPEGDEC or by writing a decoder from scratch. M0A evaluates the closest native Rust implementation first. Any adopted, adapted, or ported decoder must pass the same independent verification gate.
 
 ## Background
 
@@ -77,9 +92,11 @@ After M1:
   - a valid `BOOK.BIN`;
   - `CONT.BIN` replay; or
   - a full EPUB parse and cache build.
-- The generated cover becomes available to existing home and library UI after the first successful book open.
+- The generated cover becomes available to the existing home and library UI after the first successful book open.
 - A valid existing host-generated `COVER.BIN` remains usable and is not regenerated merely because the device decoder exists.
-- A missing, corrupt, or unsupported cover never prevents the book from opening.
+- A missing, corrupt, unsupported, or malformed cover never prevents the book from opening.
+- A deterministic unsupported-cover result is not retried on every open.
+- A transient I/O or publication failure remains retryable.
 
 Generating covers for every library entry before that book has been opened is out of scope.
 
@@ -88,23 +105,30 @@ Generating covers for every library entry before that book has been opened is ou
 After M2:
 
 - A dedicated image-only EPUB spine item appears as one reader page.
-- The image is scaled to fit inside the reader viewport while preserving its aspect ratio.
+- The image is scaled to fit inside the active reader content viewport while preserving its aspect ratio.
 - Unused viewport area is white.
-- A rendered image page always requests a Full e-ink refresh.
-- Unsupported or malformed images display the existing image placeholder instead of aborting the book open or page render.
+- A successfully rendered image page always requests a Full e-ink refresh.
+- Unsupported, missing, or malformed images display the existing image placeholder instead of aborting the book open or page render.
 - Images that coexist with prose, captions, or additional images remain placeholders.
+- Revisiting an image that deterministically failed during the current reading session does not repeatedly perform the full decode.
+- A transient source or SD failure may be retried later.
 
 ## Goals
 
 - Generate a book’s cover on-device without a host preprocessing step.
 - Preserve generated covers across subsequent opens.
 - Render dedicated full-page illustrations in the reading flow.
-- Keep decoder and parser logic host-testable in `proto`.
+- Keep decoder, parser, scaling, and dither logic host-testable.
 - Remain `no_std`, allocation-free, and panic-free for external input.
-- Stay within the existing RAM, stack, and static-memory budgets.
-- Preserve exact content-cache replay behavior.
+- Use caller-owned, bounded workspace.
+- Read JPEG bytes directly from the existing forward ZIP stream.
+- Avoid extracting image entries to temporary plain files merely to satisfy a decoder interface.
+- Stay within existing RAM, stack, and static-memory budgets.
+- Preserve exact semantic content-cache replay behavior.
 - Make malformed, oversized, unsupported, and truncated images fail locally rather than failing the enclosing book operation.
 - Produce deterministic host and firmware output from the same decoder, resampler, and dither implementation.
+- Establish a verification harness strong enough that an agent-assisted decoder adaptation or port can be reviewed as a behavioral change rather than trusted as a textual translation.
+- Record exact upstream revisions and source provenance for any adopted or derived decoder code.
 
 ## Non-goals
 
@@ -113,18 +137,23 @@ After M2:
 - Heuristic promotion of an image embedded in an otherwise textual spine item.
 - Rendering arbitrary SVG.
 - PNG decoding.
-- Progressive JPEG (initially; see "Why progressive JPEG is refused initially").
+- Progressive JPEG in the initial shipping decoder.
 - Arithmetic-coded JPEG.
 - Lossless JPEG.
 - 12-bit JPEG samples.
+- CMYK or YCCK output.
+- Arbitrary EXIF rotation or mirroring.
 - Grayscale e-ink waveforms or multi-pass panel grayscale.
 - Changes to Wi-Fi upload, synchronization, or book-transfer behavior.
 - Prefetching or background decoding.
 - Maintaining compatibility with old M2 page caches after the page-record schema changes.
+- Matching JPEGDEC’s complete API or every output pixel format.
+- A line-by-line translation of an upstream decoder without an independent behavioral specification.
+- Treating any single decoder implementation as the sole correctness oracle.
 
 ## Evidence
 
-### EPUB corpus *(measured)*
+### EPUB corpus — CalendulaOS measured
 
 `EIGHTY-SIX-VOLUME-1.epub` contains 20 image files:
 
@@ -137,9 +166,9 @@ After M2:
 
 This corpus contains no `<svg>` or SVG `<image>` elements. Its image references are ordinary XHTML `<img>` elements.
 
-This corpus is the initial performance and visual-quality corpus, not the complete JPEG conformance suite.
+This corpus is the initial performance and visual-quality corpus. It is not a JPEG conformance corpus.
 
-### DRAM *(measured)*
+### DRAM — CalendulaOS measured
 
 The X4 release ELF currently occupies the available DRAM:
 
@@ -165,9 +194,9 @@ The ZIP inflate scratch is required concurrently with JPEG decoding because imag
 
 The XHTML and OPF buffers may be reused only after all values borrowing from them have been dropped. The implementation must make this lifetime transition explicit rather than relying on comments or informal sequencing.
 
-### Refresh and latency *(measured budgets, estimated decode)*
+### Refresh and latency
 
-Current refresh behavior:
+Current CalendulaOS behavior:
 
 - Full refresh busy time: approximately 3,000–4,300 ms.
 - Fast refresh: approximately 500 ms.
@@ -178,58 +207,260 @@ Full-page art requires a Full refresh because partial refreshes ghost badly on h
 
 The earlier 2–5 second decode estimate is not an acceptance result. M0 and M1 must replace it with measured data.
 
-### Sibling-firmware data point *(measured, different implementation)*
+### Sibling-firmware data point
 
-`crosspoint-reader` runs full-page EPUB image decoding on the same SoC and the same X3/X4 panels. Its own source notes record two figures:
+`crosspoint-reader` runs EPUB image decoding on the same SoC and X3/X4 panel family. Source comments reviewed during research report approximately two seconds for a full-page decode and approximately 55 KB of free heap during an image page. [crosspoint-reader]
 
-- a full-page image decode costs approximately 2 seconds;
-- free heap during an image page runs approximately 55 KB.
+These are **sibling-reported** figures, not CalendulaOS measurements. The observation is useful only as evidence that the order of magnitude may be viable. The sibling pipeline differs materially:
 
-These are the closest available hardware measurements, but they are not a substitute for ours. Their decode reads an image already extracted to a plain SD file, so it excludes ZIP inflate; it uses a different decoder; and it produces 2bpp rather than 1bpp output. Treat the 2-second figure as evidence that the order of magnitude is workable, not as a projected result for this design.
+- its image may already have been extracted to a seekable SD file;
+- it uses JPEGDEC;
+- it renders 2bpp output;
+- its display path is multi-pass;
+- it persists rendered sidecar artifacts.
 
-### Flash *(measured)*
+The implementation issue that relies on this research must record the exact evaluated `crosspoint-reader` commit and the source locations for each claim. The PRD must not use an unpinned moving branch as a permanent technical reference.
 
-The application partition is approximately 6.5 MB and the current firmware image is approximately 3.7 MB. Decoder flash growth is not expected to be the limiting resource, but the final delta must still be reported.
+### Flash — CalendulaOS measured
+
+The application partition is approximately 6.5 MB and the current firmware image is approximately 3.7 MB.
+
+Decoder flash growth is not expected to be the primary constraint, but M0 and firmware milestones must report:
+
+- `proto` code-size delta;
+- firmware image-size delta;
+- any native or FFI object contribution;
+- any table or lookup data added to read-only memory.
 
 ## Prior art: `crosspoint-reader`
 
-`crosspoint-reader` is a C++/Arduino firmware for the same X3/X4 hardware that already ships full inline EPUB image rendering. It was evaluated in full. This section records what was taken and what was rejected, so the decisions are not re-litigated.
+`crosspoint-reader` is a sibling C++/Arduino firmware for the same hardware family that already renders EPUB images. The research is useful for identifying practical constraints, but its pipeline is not copied wholesale.
 
-Its pipeline: bitbank2 **JPEGDEC** (Apache-2.0, roughly a 17–20 KB object, heap-allocated per decode) in 8-bit grayscale mode, with the same 1/1, 1/2, 1/4, 1/8 built-in reductions; nearest-neighbour downscaling and bilinear upscaling in 16.16 fixed point; a stateless 4×4 Bayer dither to four levels; images lazily extracted from the ZIP to plain SD files; and the dithered 2bpp output cached to a sidecar file so a page is decoded exactly once.
+Before implementation begins, the M0 issue must pin:
 
-### Rejected: JPEGDEC as a dependency
+- the exact `crosspoint-reader` revision;
+- the relevant cover-conversion files;
+- the relevant EPUB page-rendering files;
+- the image-extraction code;
+- the panel-render pass structure;
+- the comments or benchmark output behind reported latency and heap figures.
 
-- It is C, so it arrives through FFI and `unsafe`. Library crates here `forbid(unsafe_code)` and `fw` permits only narrow per-item opt-ins; an entire decoder's FFI surface is not narrow.
-- Its file interface requires a working `seek` callback. Image entries in the target corpus are DEFLATE-compressed inside the ZIP and are not seekable without re-inflating from the entry start.
-- `crosspoint-reader` carries local patches for two real defects it found in JPEGDEC's progressive path — a wild pointer and an incorrect DC write. Vendoring the library means owning that maintenance.
+Observations must distinguish source code, source comments, issue discussions, and locally reproduced measurements.
 
-The Apache-2.0 licence is not an obstacle; the architecture is. A `no_std`, allocation-free Rust decoder written against the narrow initial contract in this PRD is the smaller long-term cost.
+### Adopted lesson: streaming dimension probe
 
-### Rejected: extracting images to SD before decoding
+The sibling firmware obtains image dimensions by feeding a bounded prefix through a small state machine that recognizes JPEG SOF or PNG IHDR metadata and stops once the dimensions are known.
 
-This is forced on `crosspoint-reader` by the `seek` requirement above. Baseline JPEG decodes forward-only, so this design streams directly from the ZIP entry instead. That avoids writing roughly a megabyte to SD per image, and avoids owning the lifecycle, wear, and space accounting of extracted image files.
+M2 adopts the architectural idea:
 
-### Rejected: nearest-neighbour downscaling
+- no allocation;
+- no seek;
+- no whole-image inflate during cache construction;
+- bounded bytes consumed;
+- explicit unsupported, incomplete, and malformed results.
 
-See "Resampler". Their choice is a speed compromise whose failure mode they had to work around.
+The C++ source is not copied.
 
-### Adopted: streaming dimension probe
+### Adopted lesson: separate metadata and raster operations
 
-`crosspoint-reader` sizes an image during layout by feeding roughly the first 1 KB of the entry through a byte-at-a-time state machine that reads JPEG SOF or PNG IHDR dimensions, with early stop, and leaves the image bytes inside the EPUB until its page is first rendered.
+M2 needs image format and dimensions during cache construction, but it does not need pixel decoding until the page is rendered.
 
-This is precisely the metadata step M2 needs, it requires no seeking and no allocation, and it is straightforward to express as a `no_std` Rust state machine. The design is adopted; the C++ source is not copied.
+The PRD therefore separates:
 
-### Adopted: per-axis scale factors
+- `ImageProbe`, which consumes a bounded stream prefix;
+- `JpegDecoder`, which consumes the complete encoded stream;
+- `ImagePageRecord`, which persists normalized metadata;
+- the render-time pipeline, which reopens and decodes the entry.
 
-See "Resampler".
+### Adopted lesson: per-axis scale factors
 
-### Adopted: bounded in-session failure memo
+Horizontal and vertical destination ratios are computed independently.
 
-See "M2 failure behavior".
+A fitted destination dimension is rounded to an integer. Applying one rounded scale to both axes can select the wrong final source row or column and can lose image content.
 
-### Considered: rendered-output cache
+The common resampler therefore computes:
 
-See "Rendered-page cache (deferred decision)". Mandatory for their multi-pass renderer; a latency optimisation for this single-pass one.
+- source-to-destination horizontal ratio;
+- source-to-destination vertical ratio;
+- destination-to-source horizontal ratio;
+- destination-to-source vertical ratio.
+
+### Adopted lesson: bounded failure suppression
+
+A deterministic malformed or unsupported image should not perform the complete failed decode every time the user revisits the page in one reading session.
+
+M2 adopts a bounded in-RAM memo, but not a path-hash-only table. It uses a collision-safe stable image identity and records only deterministic failures.
+
+### Considered lesson: rendered-output cache
+
+A persisted rendered raster can make revisits inexpensive. It also adds format versioning, source invalidation, SD lifecycle, publication, and storage accounting.
+
+This is deferred until native single-pass decode latency is measured.
+
+### Rejected as the default: extracted-image files
+
+JPEGDEC’s SD-file interface expects open, read, close, and seek callbacks. A forward-only DEFLATE `ZipStream` cannot satisfy arbitrary backward seeking directly. Direct JPEGDEC integration would therefore require one or more of:
+
+- seek emulation by restarting inflation;
+- staging the complete compressed JPEG in memory;
+- staging the complete JPEG in a plain SD file;
+- a new JPEGDEC input path;
+- a different decoder.
+
+Extraction is not logically forced by the JPEG format, and JPEGDEC can also read complete memory-backed images. It is the sibling firmware’s chosen adapter between a seek-oriented decoder API and its EPUB storage path. JPEGDEC documents its file callbacks and built-in reduced decode modes, progressive DC-only thumbnails, and low-bit-depth dithering. [JPEGDEC]
+
+CalendulaOS rejects mandatory extraction because it would add:
+
+- an extra full-image SD write before every first decode;
+- temporary-file lifecycle;
+- power-loss cleanup;
+- storage accounting;
+- additional wear;
+- stale-source invalidation;
+- higher implementation complexity.
+
+### Rejected as a direct dependency: JPEGDEC
+
+JPEGDEC is a C++ API around a portable native decoding core. It is designed for microcontrollers, supports reduced decode at 1/2, 1/4, and 1/8, baseline grayscale and YCbCr, progressive DC-only thumbnails, cropping, callbacks, and optional Floyd–Steinberg dithering to 1, 2, or 4-bpp grayscale output. [JPEGDEC]
+
+Its 1-bpp dithered output is the same format this project targets, which is why it is worth citing as prior art even though it is not adopted.
+
+It is not selected as the initial firmware dependency because:
+
+- integration introduces an FFI boundary;
+- the firmware would need narrowly audited `unsafe` declarations and wrappers;
+- the file-oriented input path does not naturally match the forward-only ZIP stream;
+- a full JPEGDEC integration exposes more formats, modes, and state than M1 requires;
+- the sibling project has had to maintain local fixes in the progressive path;
+- repository testing consists primarily of examples, performance programs, and sample images rather than a comprehensive executable conformance suite.
+
+JPEGDEC’s root Makefile builds a demonstration executable, and its ESP-IDF CMake file registers the component rather than defining a decoder test suite. Its repository does contain test images and platform examples, which are useful corpus inputs but are not by themselves a behavioral specification. [JPEGDEC]
+
+The decision is a repository policy choice, not a proven claim that a Rust decoder will require less total engineering effort:
+
+> CalendulaOS accepts a potentially larger initial implementation cost because forward-only streaming, caller-owned workspace, Rust auditability, deterministic output, and a narrow supported contract are higher-priority constraints than minimizing initial decoder-development effort.
+
+### Rejected: nearest-neighbor downscaling
+
+Nearest-neighbor downscaling discards most input samples at the reductions expected for the target corpus and can alias badly on line art and typography.
+
+The initial CalendulaOS policy is area or box averaging for shrink operations.
+
+A faster policy may replace it only at the M0 visual and performance gate.
+
+### Qualified lesson: progressive JPEG thumbnails
+
+JPEGDEC demonstrates that DC-only progressive thumbnail decoding is practical and exposes it as a feature. [JPEGDEC]
+
+This does **not** establish that CalendulaOS can decode every progressive JPEG by reading only the literal first scan, that every component is present in that scan, or that no coefficient or scan-state retention is required.
+
+Progressive support remains out of the initial contract. A later spike must determine:
+
+- supported progressive scan organizations;
+- whether all required DC data can be consumed forward-only;
+- retained coefficient or predictor state;
+- restart handling;
+- successive-approximation handling;
+- behavior when components appear in separate scans;
+- exact failure behavior for unsupported organizations;
+- visual quality of forced 1/8 output.
+
+Until then, progressive images render the placeholder.
+
+## Decoder sourcing strategy
+
+### Decision hierarchy
+
+M0 evaluates decoder sources in this order:
+
+1. **Adapt `tjpgdec-rs` for CalendulaOS.**
+2. **Implement a constrained Rust baseline decoder using the verification harness**, reusing only appropriately licensed algorithms or independently derived behavior.
+3. **Port narrowly selected JPEGDEC algorithms** only when a specific required capability is absent from the first two paths.
+4. **Full JPEGDEC port** only if measurements show that its unique features are necessary and the project accepts the substantially larger verification surface.
+
+No implementation path bypasses the M0 verification requirements.
+
+### Candidate A: `tjpgdec-rs`
+
+`tjpgdec-rs` 0.4.0 is a native Rust port of ChaN’s TJpgDec intended for embedded systems. It declares `no_std` support, uses a caller-provided memory pool, and supports three optimization levels with workspaces of 3,100, 3,500, and 9,644 bytes. Version 0.4.0 is the only published release. Its crate metadata declares `MIT OR Apache-2.0`. [tjpgdec-rs]
+
+The repository README describes the Rust implementation as MIT while the published crate metadata declares the dual licence. Any adoption must resolve that discrepancy against the LICENSE files present at the pinned commit before code is vendored.
+
+Its architecture is close to M1, but it is not a drop-in dependency:
+
+- `prepare` accepts the complete JPEG as `&[u8]`;
+- `decompress` again accepts the complete JPEG as `&[u8]`;
+- it records the SOS location and later slices the source to find entropy data;
+- output callbacks receive RGB888 MCU data;
+- its workspace stores tables through raw pointers;
+- the implementation contains `unsafe`: its linear allocator hands out slices built with `core::slice::from_raw_parts_mut`, justified by an inline comment rather than by a checked invariant;
+- its only in-crate unit test asserts that a buffer-size constant equals 512. [tjpgdec-rs]
+
+M0A must determine whether the adaptation can:
+
+- replace complete-slice input with a forward-only byte source;
+- parse headers and continue directly into entropy data without rewind;
+- emit scaled luma rather than RGB888;
+- remove unnecessary color conversion and RGB work buffers;
+- preserve restart-marker behavior;
+- support the target baseline sampling layouts;
+- eliminate raw-pointer workspace storage, or reduce retained `unsafe` to a separately reviewed and justified module;
+- pass the project’s malformed-input and differential suite;
+- remain smaller than a direct constrained implementation.
+
+The project must pin the exact upstream commit used for evaluation.
+
+Adoption is allowed only as a maintained fork or vendored adaptation with:
+
+- license notices;
+- upstream provenance;
+- a documented patch set;
+- exact behavioral differences;
+- update policy;
+- reproducible verification.
+
+### Candidate B: `zune-jpeg`
+
+`zune-jpeg` is a pure Rust decoder with tests and fuzz targets in its repository. Its documentation states that it works in no-std, but its decode call returns an owned buffer holding the whole image, so it requires an allocator and does not satisfy the caller-owned streaming workspace model without a substantial fork. [zune-jpeg]
+
+It is therefore not the initial firmware decoder.
+
+It is useful as:
+
+- an independent host oracle;
+- a source of regression JPEGs;
+- a source of malformed inputs discovered by fuzzing;
+- a reference for JPEG marker, scan, and color-space handling;
+- a comparison implementation for metadata and decoded luma.
+
+Because JPEG leaves some reconstruction and color-conversion details implementation-defined, `zune-jpeg` output is not required to be bit-identical to every other decoder. Comparisons use explicit tolerances where exact equality is inappropriate.
+
+### Candidate C: TJpgDec C reference
+
+ChaN’s TJpgDec is the upstream algorithm behind `tjpgdec-rs`. It is designed for low-memory embedded decode and documents a 3.5 KB work area independent of image width, with 3.5–8.5 KB of code. Upstream terms are permissive: use, modification, and redistribution are allowed without restriction, at the user’s own responsibility. [TJpgDec]
+
+The `cmumford/TJpgDec` fork adds a libFuzzer target, sanitizer support, fixes for the memory-access errors that fuzzing found, a CMake build, and GitHub Actions CI, while keeping the pristine upstream source on a separate branch. That fork is useful as a reference executable and fuzz-corpus source. Its repository is GPL-3.0, so its modified source must not be copied into CalendulaOS unless the project deliberately accepts that license. It may be used externally as a test oracle. [TJpgDec-fork]
+
+Note that the fork's GPL-3.0 terms differ from the permissive upstream terms above. Provenance must therefore be tracked per file, not per algorithm.
+
+### Candidate D: JPEGDEC algorithm port
+
+JPEGDEC may be used as a source for a narrowly scoped later algorithm, especially:
+
+- progressive DC-only thumbnail handling;
+- optimized scaled IDCT ideas;
+- low-bit-depth output;
+- crop traversal.
+
+A source-derived Rust port must:
+
+- pin the exact JPEGDEC commit;
+- retain Apache-2.0 notices;
+- record source-function provenance;
+- list intentional behavioral differences;
+- receive independent tests rather than using only JPEGDEC output as truth.
+
+A complete agentic translation is not accepted merely because it compiles or matches a few sample images.
 
 ## Architecture
 
@@ -239,20 +470,29 @@ See "Rendered-page cache (deferred decision)". Mandatory for their multi-pass re
 EPUB file
   -> ZIP entry lookup
   -> ZipStream and existing DEFLATE inflate
-  -> JPEG marker and entropy parser
-  -> scaled luma output
-  -> deterministic resampler
+  -> bounded image metadata probe
+  -> selected baseline JPEG decoder
+  -> scaled luma bands
+  -> deterministic geometry and resampler
   -> deterministic 1bpp dither
   -> COVER.BIN       (M1)
      or framebuffer  (M2)
 ```
 
-Every stage is streaming. No stage may allocate or retain a complete decoded image.
+Every stage is bounded and streaming.
+
+No stage may allocate or retain:
+
+- a complete encoded JPEG;
+- a complete decoded luma image;
+- a complete RGB image;
+- a second framebuffer.
 
 ### Module placement
 
-Pure image logic lives in `proto`:
+Pure image logic lives in `proto` or a dedicated workspace crate that follows the same safety requirements:
 
+- image metadata probing;
 - JPEG header and marker parsing;
 - entropy decoding;
 - dequantization and scaled IDCT;
@@ -272,42 +512,100 @@ Firmware owns:
 - refresh-policy selection;
 - telemetry.
 
-Host tools use the same `proto` decoder, resampler, and dither code as firmware.
+Host tools use the same decoder, resampler, geometry, and dither implementation as firmware.
 
 ### Input abstraction
 
-The decoder consumes bytes through a sans-I/O streaming interface supplied by the caller. It must not depend on `std`, filesystem types, `embedded_sdmmc`, or EPUB-specific structures.
+The decoder consumes bytes through a forward-only sans-I/O interface supplied by the caller.
+
+It must not depend on:
+
+- `std`;
+- filesystem types;
+- `embedded_sdmmc`;
+- EPUB-specific structures;
+- `Seek`;
+- a complete `&[u8]`.
+
+Conceptually:
+
+```rust
+trait ByteSource {
+    type Error;
+
+    fn read(&mut self, output: &mut [u8]) -> Result<usize, Self::Error>;
+}
+```
+
+The final interface may use a pull or push model, but it must guarantee:
+
+- no request for an earlier input position;
+- deterministic behavior for every legal chunk size;
+- clean distinction between EOF and I/O failure;
+- bounded buffering;
+- no hidden allocation.
 
 The caller provides:
 
-- encoded input bytes incrementally;
+- encoded bytes incrementally;
 - caller-owned decoder workspace;
 - output-band storage;
-- a callback or sink for completed luma or 1bpp rows.
+- a callback or sink for completed luma rows or bands.
 
 The decoder returns bounded error values and never panics for malformed input.
 
+### Decoder traversal
+
+The initial decoder processes a baseline JPEG in one forward traversal:
+
+1. validate SOI;
+2. consume metadata and table markers;
+3. validate SOF0;
+4. validate SOS and scan organization;
+5. enter entropy decode without rewinding;
+6. emit scaled luma in deterministic image order;
+7. validate required restart and end conditions;
+8. finish at EOI or an explicitly accepted terminal condition.
+
+Header parsing and entropy decoding are states of one decoder instance. M0A must not preserve `tjpgdec-rs`’s current prepare-then-reslice design if doing so requires the complete source.
+
+### Output abstraction
+
+The decoder’s primary output is scaled luma, not RGB.
+
+The output sink receives:
+
+- source-space or scaled-space rectangle;
+- row count;
+- packed or unpacked luma values;
+- final-row indication where useful.
+
+YCbCr chroma may be skipped entirely when only luma is required, provided that the JPEG’s component metadata has been validated as a supported YCbCr organization.
+
+Grayscale JPEG emits its sole component directly.
+
 ## Initial JPEG contract
 
-The first shipping decoder supports only the following:
+The first shipping decoder supports only:
 
-- SOF0 baseline sequential DCT.
-- 8-bit samples.
-- Huffman entropy coding.
-- One-component grayscale JPEG.
-- Three-component YCbCr JPEG when the component ordering and color transform are supported.
-- Common 4:4:4, 4:2:2, and 4:2:0 sampling.
-- One interleaved scan for a three-component image.
-- One scan for a grayscale image.
-- Restart markers and restart intervals.
-- 8-bit and 16-bit quantization tables if M0 demonstrates both can be supported within the workspace budget.
-- Absent EXIF orientation or orientation value 1.
+- SOF0 baseline sequential DCT;
+- 8-bit samples;
+- Huffman entropy coding;
+- one-component grayscale;
+- supported three-component YCbCr;
+- common 4:4:4, 4:2:2, and 4:2:0 sampling;
+- one interleaved scan for a three-component image;
+- one scan for a grayscale image;
+- restart markers and restart intervals;
+- 8-bit quantization tables;
+- 16-bit quantization tables only if M0 verifies them within the workspace and arithmetic limits;
+- absent EXIF orientation or orientation value 1.
 
 The decoder refuses:
 
 - SOF1 extended sequential JPEG;
 - SOF2 progressive JPEG;
-- multiple-scan baseline files;
+- baseline multi-scan or non-interleaved component scans;
 - arithmetic coding;
 - lossless JPEG;
 - 12-bit samples;
@@ -316,25 +614,24 @@ The decoder refuses:
 - mirrored or rotated EXIF orientations;
 - malformed, truncated, or internally inconsistent files.
 
-“Refuse” means return an explicit unsupported or invalid-image result. It must not panic, loop indefinitely, read beyond supplied input, or fail the enclosing book operation.
+“Refuse” means return an explicit unsupported or invalid-image result.
 
-The implementation must not assume that every three-component file is YCbCr solely because it has three components. M0 must define and test the exact metadata and component-ordering rules used to recognize supported YCbCr input.
+Refusal must not:
 
-Support may be widened after M0, but M1 and M2 acceptance tests must describe the actual supported subset precisely.
+- panic;
+- loop indefinitely;
+- read beyond supplied bytes;
+- write beyond output buffers;
+- corrupt retained state;
+- fail the enclosing book operation.
 
-### Why progressive JPEG is refused initially
+The implementation must not infer YCbCr solely from a three-component count. M0 must define and test the exact accepted component identifiers, ordering, sampling constraints, and metadata rules.
 
-Progressive JPEG is excluded for cost, not because it is infeasible.
-
-A useful degradation exists and is worth stating so it is not rediscovered later. A progressive file's first scan is its DC scan, and decoding only that scan yields a complete 1/8-resolution image in raster order. It needs no full coefficient plane and no seeking, because the DC scan precedes the refinement scans in the file. `crosspoint-reader` ships exactly this: it detects progressive input, forces 1/8, and bilinear-upscales the result.
-
-The cost is a second entropy-decoding path with its own successive-approximation and spectral-selection handling, its own bug surface, and its own fixture set, in exchange for a visibly soft image. That is the wrong trade for the first shipping decoder, which must be small enough to audit.
-
-Progressive DC-only decode is therefore listed as a post-M0 widening candidate rather than a permanent exclusion. Until it exists, progressive input is refused and renders the placeholder.
+Support may be widened after M0, but the implementing issue and acceptance suite must describe the actual supported subset precisely.
 
 ## Resource and abuse limits
 
-The parser rejects an image before expensive decode work when any configured limit is exceeded.
+The parser rejects an image before expensive decode work when a configured limit is exceeded.
 
 Initial limits:
 
@@ -343,18 +640,36 @@ Initial limits:
 - Maximum decoded pixel count: 32,000,000 pixels.
 - Maximum uncompressed JPEG entry length: 16 MiB.
 - Maximum normalized EPUB image path: 256 UTF-8 bytes.
-- Marker lengths, table counts, component counts, sampling factors, MCU counts, and restart intervals must be checked for arithmetic overflow before use.
+- Maximum component count: the initial contract’s supported count.
+- Maximum table IDs and table counts: the initial contract’s bounded arrays.
+- Maximum marker length: the JPEG segment’s validated 16-bit length.
+- Maximum scratch use: supplied buffer length.
+- Maximum output dimensions: active cover or reader geometry.
+
+All calculations involving:
+
+- dimensions;
+- MCU counts;
+- block counts;
+- row strides;
+- segment positions;
+- table lengths;
+- sampling factors;
+- restart intervals;
+- output offsets
+
+must use checked arithmetic before conversion or indexing.
 
 Path resolution must:
 
 - remove URL fragments before ZIP lookup;
-- resolve relative to the containing OPF or XHTML path as appropriate;
+- resolve relative to the containing OPF or XHTML path;
 - reject absolute paths;
-- reject any normalized path that escapes the EPUB root through `..`;
+- reject normalized paths that escape the EPUB root through `..`;
 - reject overlength output;
 - avoid lossy UTF-8 conversion.
 
-These are correctness and denial-of-service limits, not claims about the EPUB specification’s theoretical maxima.
+These limits are correctness and denial-of-service controls, not claims about the JPEG or EPUB specifications’ theoretical maxima.
 
 ## Scaling and geometry
 
@@ -362,16 +677,21 @@ These are correctness and denial-of-service limits, not claims about the EPUB sp
 
 Supported decoder reductions are 1/1, 1/2, 1/4, and 1/8.
 
-The decoder chooses the largest reduction whose decoded output is still large enough for the required crop or fit operation in both dimensions.
+The decoder chooses the largest reduction whose decoded output remains large enough for the required crop or fit operation in both dimensions.
 
 A scale that undershoots the target is not chosen merely because it is faster.
 
 For a typical 1200×1800 image targeting 202×303:
 
-- 1/8 produces 150×225 and undershoots the target;
+- 1/8 produces 150×225 and undershoots;
 - 1/4 produces 300×450 and is the normal initial choice.
 
-M0 may benchmark 1/8 followed by upscaling as an optional fast mode, but it cannot become the default unless its resampling policy and visual-quality threshold are explicitly accepted.
+M0 may benchmark 1/8 followed by upscaling as an optional fast mode, but it cannot become the default unless:
+
+- the upsampler is defined;
+- output remains visually acceptable;
+- host and firmware remain deterministic;
+- the performance gain is meaningful on X4.
 
 When the original image is smaller than the target, the decoder uses 1/1 and the common resampler performs any permitted enlargement.
 
@@ -383,10 +703,9 @@ Covers preserve the current product behavior:
 - aspect ratio preserved;
 - centered fill;
 - excess pixels cropped;
-- no stretching;
-- white is used only if malformed geometry prevents a complete output.
+- no stretching.
 
-The host preview path and the device path use the same crop rectangle and resampler.
+The host-preview path and device path use the same crop rectangle and resampler.
 
 ### M2 reader-page geometry
 
@@ -394,170 +713,466 @@ Image pages use contain rather than fill:
 
 - aspect ratio preserved;
 - the entire image remains visible;
-- centered horizontally and vertically within the reader content viewport;
+- centered horizontally and vertically in the reader content viewport;
 - unused pixels are white;
 - no stretching;
-- image pixels do not overlap reader chrome or margins.
+- no overlap with reader chrome or margins.
 
-The target is the active reader content rectangle, not necessarily the full physical framebuffer.
+The target is the active reader content rectangle, not necessarily the complete physical framebuffer.
 
 ### Resampler
 
 The common resampler must be deterministic and streaming.
 
-The initial policy is:
+Initial policy:
 
-- area or box averaging when shrinking;
-- fixed-point bilinear interpolation when enlarging;
+- area or box averaging while shrinking;
+- fixed-point bilinear interpolation while enlarging;
+- independent horizontal and vertical factors;
 - identical integer rounding on host and firmware.
 
-Horizontal and vertical scale factors are derived independently. Integer rounding of the fitted destination height means the destination aspect ratio does not exactly match the source, so a single scale factor applied to both axes selects the wrong source row and can drop content. Both the source-to-destination and destination-to-source factors are computed per axis.
+M0 must verify that the selected decoder emits data in an order that permits the required box-filter row accumulation without retaining a complete decoded frame.
 
-Nearest-neighbour downscaling is explicitly not the policy. At the reductions this project actually performs — roughly 6:1 for a 1200×1800 cover — it discards almost every source pixel and aliases badly on the line art that dominates the target corpus. `crosspoint-reader` uses nearest-neighbour for speed and needed the per-axis fix above to stop it losing rows outright; that is a symptom worth avoiding rather than a pattern worth copying.
-
-M0 must verify that this can be implemented without a full decoded frame. A different deterministic algorithm may be selected at the M0 gate if it materially reduces memory or runtime, but host and firmware must still share it.
+A different deterministic algorithm may be selected at the M0 gate if it materially reduces workspace or runtime.
 
 ## Dithering
 
-The initial output algorithm is Floyd–Steinberg error diffusion:
+The initial candidate is Floyd–Steinberg error diffusion:
 
 - fixed integer arithmetic;
 - deterministic left-to-right row traversal;
 - no floating point;
-- errors clamped to a documented range;
-- white padding participates as white input rather than uninitialized state.
+- documented error clamp;
+- white padding treated as white source input;
+- two caller-owned `i16` error rows of `target_width + 2`.
 
-The implementation may use two caller-owned `i16` error rows of `target_width + 2` elements. At an 800-pixel target this is approximately 3.2 KB.
+At an 800-pixel target the error rows consume approximately 3.2 KB.
 
-An ordered Bayer matrix is the fallback only if M0 shows that Floyd–Steinberg causes unacceptable workspace, runtime, or band-boundary complexity.
+A stateless ordered Bayer matrix is the fallback when:
 
-### Single-pass rendering is a precondition
+- single-pass row order cannot be guaranteed;
+- strip or multi-pass rendering is required;
+- Floyd–Steinberg workspace is too large;
+- runtime is unacceptable;
+- error propagation across output bands becomes fragile.
 
-Floyd–Steinberg is order-dependent: its output is defined only for one deterministic traversal of the destination. It is available here solely because a render writes the framebuffer exactly once, and the panel flush bands out of the already-completed buffer.
+### Single-pass precondition
 
-Any future change that renders a page more than once, or that renders it in independently computed strips or bit planes, invalidates this choice and forces a stateless dither such as ordered Bayer. `crosspoint-reader` is the worked example: its renderer invokes the image draw path roughly 14 times per page (a BW pass, an anti-aliasing restore, and two grayscale planes of about six strips each), so it uses a stateless 4×4 Bayer matrix and could not use error diffusion at all.
+Floyd–Steinberg output depends on one deterministic destination traversal.
 
-An implementation that adds multi-pass or strip rendering must revisit this section rather than attempting to preserve error diffusion across passes.
+CalendulaOS may use it only while:
 
-The selected dither implementation must be used by:
+- the complete framebuffer is prepared once;
+- destination rows are visited in defined order;
+- panel flushing occurs after framebuffer completion;
+- the image is not independently recomputed for separate panel passes.
+
+The sibling renderer is useful as a warning: its panel architecture re-enters image rendering multiple times, so a stateless dither is operationally simpler. The exact number and shape of those passes must be cited from the pinned sibling revision rather than generalized as a permanent constant.
+
+Any CalendulaOS change to multi-pass, strip-by-strip, or independently recomputed rendering must reopen the dither decision.
+
+The selected dither must be shared by:
 
 - firmware cover generation;
 - firmware image-page rendering;
 - `tools/preview`;
 - host golden-output tests.
 
-Existing host-generated threshold-only `COVER.BIN` files remain readable. Only newly generated artifacts are required to match the new deterministic pipeline.
+Existing threshold-only `COVER.BIN` files remain readable.
 
 ## Error model
 
-Errors are divided into three classes.
+Errors are divided into deterministic, transient, and cache-corruption classes.
 
-### Deterministic absence
+### Deterministic absence or refusal
 
 Examples:
 
 - the EPUB declares no cover;
-- the referenced manifest item does not exist;
-- a candidate uses an explicitly unsupported format;
-- an image exceeds a fixed resource limit;
-- the image is malformed in a way that will not change while the source EPUB is unchanged.
+- a cover manifest reference cannot be resolved;
+- the image uses an unsupported format;
+- the JPEG uses an unsupported subtype;
+- dimensions exceed fixed limits;
+- the image is structurally malformed;
+- orientation is unsupported;
+- a path fails normalization or traversal checks.
 
-These outcomes may be persisted as a versioned negative cover result so they are not retried on every open.
+These outcomes may be negative-cached when their identity includes the source-book generation and decoder-policy version.
 
 ### Transient failure
 
 Examples:
 
 - SD read error;
-- temporary file creation or write failure;
-- failed ZIP read caused by an I/O error;
-- inability to publish a completed cache artifact.
+- short read caused by underlying I/O failure rather than source EOF;
+- temporary-file creation failure;
+- write failure;
+- inability to replace the final cache artifact;
+- source EPUB temporarily unavailable.
 
-Transient failures are not negative-cached. A later open may retry.
+Transient failures are not persisted as deterministic negative results.
 
 ### Corrupt cache artifact
 
 Examples:
 
-- bad `COVER.BIN` magic or version;
+- invalid `COVER.BIN` magic or version;
 - invalid dimensions or stride;
 - truncated payload;
-- stale temporary cover file.
+- stale temporary file;
+- invalid rendered-image sidecar;
+- mismatched source identity.
 
-A corrupt generated artifact is never presented as a valid cover. It is removed or replaced when possible.
+A corrupt artifact is never presented as valid.
 
-All public decoder and pipeline errors must be bounded enums suitable for logging without allocation.
+### Decoder error categories
 
-## M0 — Decoder and raster pipeline spike
+The decoder exposes bounded error enums that distinguish at least:
 
-M0 introduces no firmware behavior change.
+- unsupported JPEG process;
+- unsupported precision;
+- unsupported components;
+- unsupported sampling;
+- unsupported scan organization;
+- unsupported color transform;
+- unsupported orientation;
+- invalid marker;
+- invalid segment length;
+- missing table;
+- invalid Huffman table;
+- invalid quantization table;
+- entropy truncation;
+- invalid restart sequence;
+- dimension limit;
+- arithmetic overflow;
+- output buffer too small;
+- workspace too small;
+- source I/O;
+- sink failure.
+
+Host tools may add human-readable context outside the core `no_std` error.
+
+## M0A — Decoder adoption spike
+
+M0A introduces no firmware behavior change.
+
+### Objective
+
+Determine whether adapting `tjpgdec-rs` is smaller, safer, and more maintainable than implementing the same SOF0 subset directly.
 
 ### Deliverables
 
-1. A `proto` JPEG decoder satisfying the initial JPEG contract.
-2. Caller-owned workspace with no allocation and no recursion.
-3. Streaming scaled-luma output.
-4. Shared crop/fit geometry and deterministic resampler.
-5. Shared 1bpp dither.
-6. Host integration capable of decoding EPUB ZIP entries.
-7. Host fixtures and malformed-input tests.
-8. Workspace, stack, output-quality, and runtime measurements.
-9. A written go/no-go decision for M1 and M2.
+1. Pin the evaluated `tjpgdec-rs` commit and crate version.
+2. Produce an adaptation inventory covering:
+   - complete-slice input;
+   - two-phase prepare/decompress behavior;
+   - RGB888 output;
+   - raw-pointer workspace;
+   - `unsafe`;
+   - supported sampling;
+   - restart handling;
+   - quantization-table precision;
+   - error model;
+   - tests.
+3. Implement a minimal forward-only input proof of concept.
+4. Implement or demonstrate luma-only MCU output.
+5. Demonstrate header-to-entropy continuation without rewind.
+6. Measure:
+   - workspace;
+   - MCU buffer;
+   - output-band buffer;
+   - stack;
+   - flash;
+   - host decode speed.
+7. Run the target EPUB corpus through the proof of concept.
+8. Run basic malformed and truncation smoke tests.
+9. Produce an adoption decision:
+   - adapt;
+   - constrained rewrite;
+   - reject and use another path.
 
-### Test corpus
+### M0A acceptance gate
 
-M0 tests include:
+Adaptation proceeds only if:
 
-- all 20 JPEGs in `EIGHTY-SIX-VOLUME-1.epub`;
-- synthetic grayscale JPEG;
-- synthetic 4:4:4 JPEG;
-- synthetic 4:2:2 JPEG;
-- synthetic 4:2:0 JPEG;
-- restart-marker fixture;
-- 16-bit quantization-table fixture if supported;
-- progressive JPEG refusal;
-- SOF1 refusal;
-- multi-scan refusal;
-- CMYK/YCCK refusal;
-- unsupported EXIF-orientation refusal;
-- missing-table cases;
-- malformed marker lengths;
-- truncated entropy data;
-- invalid Huffman tables;
-- oversized dimensions and pixel counts;
-- integer-overflow edge cases;
-- random malformed-input and fuzz corpus.
+- forward-only input does not require buffering the complete JPEG;
+- luma-only output avoids a complete RGB image and unnecessary RGB MCU storage;
+- supported corpus images decode correctly;
+- the resulting code can meet repository safety policy;
+- patch complexity is materially smaller than a constrained decoder;
+- upstream provenance and licensing are clear;
+- the implementation can be covered by the M0B verification harness.
 
-### Measurements
+If adaptation fails, the implementation issue records why rather than silently turning the fork into a rewrite.
 
-M0 reports:
+## M0B — Verification harness and raster pipeline
 
-- caller-owned workspace bytes;
+M0B introduces no firmware behavior change.
+
+### Verification principle
+
+Compilation and visual plausibility are insufficient.
+
+The selected decoder must be tested against:
+
+- independent decoders;
+- generated format combinations;
+- malformed-input mutations;
+- streaming chunk variations;
+- failure injection;
+- memory-safety instrumentation where applicable.
+
+### Pinned reference executables
+
+M0B creates host-only reference runners for at least two independent implementations.
+
+Preferred set:
+
+- libjpeg-turbo or another mature JPEG implementation as a general JPEG oracle;
+- `zune-jpeg` as an independent Rust oracle;
+- JPEGDEC for JPEGDEC-specific progressive or low-bit-depth behavior;
+- the fuzz-hardened TJpgDec fork for comparison with `tjpgdec-rs` ancestry.
+
+Each runner accepts:
+
+- input JPEG;
+- requested scale;
+- crop or fit geometry where supported;
+- output format;
+- decoder mode.
+
+Each runner emits:
+
+- parsed metadata;
+- normalized result category;
+- output dimensions and stride;
+- raw luma or RGB output;
+- checksum;
+- optional timing.
+
+C/C++ runners are built with:
+
+- AddressSanitizer;
+- UndefinedBehaviorSanitizer where supported;
+- warnings enabled;
+- reproducible compiler flags.
+
+### Exact and tolerance comparisons
+
+Exact equality is required for:
+
+- parsed width and height;
+- supported/unsupported classification defined by CalendulaOS;
+- output dimensions;
+- destination geometry;
+- deterministic CalendulaOS resampler output;
+- deterministic CalendulaOS dither output;
+- host versus firmware-compatible build output;
+- repeated decode output;
+- all chunking variations of the same source.
+
+Tolerance comparison is allowed for:
+
+- decoder luma values where different valid integer IDCT rounding is expected;
+- chroma-derived host comparison when a reference does not expose native luma;
+- algorithms where JPEG does not prescribe exact upsampling or color-conversion rounding.
+
+The tolerance must be numeric, documented, and justified.
+
+No decoder is treated as correct merely because it matches JPEGDEC byte-for-byte.
+
+### Conformance matrix
+
+Generated valid fixtures cover:
+
+- grayscale;
+- 4:4:4;
+- 4:2:2 horizontal;
+- supported 4:2:2 variants;
+- 4:2:0;
+- odd widths;
+- odd heights;
+- partial MCUs;
+- minimum dimensions;
+- maximum accepted dimensions;
+- each DCT reduction;
+- restart intervals;
+- multiple valid Huffman table assignments;
+- multiple valid quantization table assignments;
+- 16-bit quantization if supported;
+- unusual but accepted component identifiers;
+- APP and COM segments before and between required markers;
+- byte stuffing;
+- legal marker padding.
+
+Unsupported fixtures cover:
+
+- SOF1;
+- SOF2;
+- arithmetic coding;
+- 12-bit samples;
+- four-component images;
+- baseline multi-scan;
+- unsupported sampling factors;
+- unsupported color transforms;
+- unsupported EXIF orientation.
+
+Malformed fixtures cover:
+
+- every representative truncation boundary;
+- invalid segment lengths;
+- length arithmetic overflow attempts;
+- missing DQT;
+- missing DHT;
+- invalid table IDs;
+- oversubscribed Huffman trees;
+- incomplete Huffman trees where invalid;
+- invalid symbols;
+- invalid SOS selectors;
+- invalid restart order;
+- unexpected markers in entropy data;
+- missing EOI;
+- excessive dimensions;
+- excessive pixel count;
+- malformed EXIF;
+- random mutations.
+
+### Streaming metamorphic tests
+
+Every valid representative fixture is decoded with:
+
+- one-byte source chunks;
+- every chunk size from 1 through at least 512;
+- boundary-aligned chunks around markers;
+- pseudo-random chunk schedules;
+- short final chunks;
+- source callbacks that return less than requested.
+
+All chunkings must produce the same result and output.
+
+The test harness also injects an I/O error after every reachable source position and verifies:
+
+- bounded failure;
+- no panic;
+- no invalid output write;
+- no infinite retry;
+- correct transient classification.
+
+### Output-buffer safety
+
+Every caller-provided buffer is surrounded by guard regions during host tests.
+
+Tests verify:
+
+- guards remain unchanged;
+- reported output length does not exceed capacity;
+- undersized buffers fail before out-of-bounds writes;
+- early sink cancellation stops cleanly;
+- sink errors propagate without further writes.
+
+Rust code uses:
+
+- Miri where supported;
+- debug overflow checks;
+- release-mode tests;
+- sanitizers where available;
+- `cargo-fuzz`.
+
+Any retained `unsafe` requires:
+
+- a written safety invariant;
+- narrow scope;
+- targeted Miri or guard tests;
+- no raw pointer whose validity depends on undocumented pool movement;
+- explicit review before M1.
+
+### Layered port verification
+
+An agent-assisted implementation is divided into independently testable layers:
+
+1. Marker and segment parser.
+2. Dimension and component validator.
+3. Quantization-table parser.
+4. Huffman-table builder.
+5. Entropy bit reader.
+6. Baseline coefficient decode.
+7. Restart handling.
+8. IDCT and reduced IDCT.
+9. MCU assembly.
+10. Luma emission.
+11. Geometry.
+12. Resampling.
+13. Dithering.
+14. Cache serialization.
+
+Each layer receives focused vectors before the next layer lands.
+
+A PR that introduces the complete decoder without these seams is not merge-ready.
+
+### M0B deliverables
+
+1. Selected decoder implementation.
+2. Caller-owned workspace.
+3. Forward-only input.
+4. Streaming scaled-luma output.
+5. Shared geometry.
+6. Shared resampler.
+7. Shared 1bpp dither.
+8. Reference runners.
+9. Generated conformance fixtures.
+10. Malformed corpus.
+11. Differential tests.
+12. Streaming metamorphic tests.
+13. Fuzz targets.
+14. Workspace, stack, code-size, output-quality, and runtime report.
+15. Written M1 and M2 go/no-go decisions.
+
+### M0B measurements
+
+Report:
+
+- decoder struct bytes;
+- table/workspace bytes;
+- MCU workspace bytes;
+- resampler bytes;
+- dither bytes;
+- total concurrent workspace;
 - maximum decoder stack frame from `-Zemit-stack-sizes`;
-- total relevant call-chain stack;
-- host runtime at 1/8, 1/4, 1/2, and 1/1 where applicable;
-- expected MCU count and output-band size;
-- output comparison against a trusted host decoder;
-- 202×303 cover images for visual inspection;
-- X4 and X3 reader-page-size images for visual inspection;
-- Floyd–Steinberg versus ordered-dither comparison;
-- 1/4 downsample versus any proposed 1/8-plus-upscale fast mode.
+- total affected call-chain stack;
+- host runtime at 1/8, 1/4, 1/2, and 1/1;
+- corpus success and refusal counts;
+- fuzz duration and final corpus size;
+- source bytes consumed;
+- expected output-band size;
+- 202×303 cover images;
+- X4 and X3 page-size images;
+- Floyd–Steinberg versus ordered Bayer;
+- 1/4 reduction versus any 1/8-plus-upscale mode.
 
-### M0 acceptance gate
+### M0B acceptance gate
 
 M1 may proceed when:
 
-- all supported fixtures decode correctly;
-- all unsupported and malformed fixtures fail without panic;
+- all supported fixtures decode within the defined exact or tolerance criteria;
+- unsupported fixtures return the intended bounded error;
+- malformed fixtures fail without panic;
+- streaming chunk schedules produce identical results;
+- source-error injection is clean;
+- buffer guards remain intact;
 - the complete pipeline is allocation-free;
-- caller-owned decoder and raster workspace fits in the borrowable scratch budget with margin;
-- stack analysis preserves the firmware stack floor;
+- workspace fits the borrowable scratch with margin;
+- stack analysis preserves the firmware floor;
 - output quality is acceptable at 202×303;
-- host and `no_std` builds produce byte-identical 1bpp output.
+- host and firmware-compatible builds produce byte-identical final 1bpp output;
+- licensing and provenance are recorded;
+- any retained `unsafe` has explicit approval.
 
-M2 may proceed only when full-page 1bpp output is visually useful and the projected decode latency is acceptable enough to justify hardware implementation.
+M2 may proceed only when:
 
-Any widening of JPEG support or change of scaling/dither policy must be written into this PRD or the implementing issue before M1 lands.
+- full-page 1bpp output is visually useful;
+- projected decode latency justifies firmware integration;
+- required output ordering supports the selected dither;
+- the page-render workspace fits concurrently with ZIP inflation.
 
 ## M1 — On-device cover generation
 
@@ -568,7 +1183,7 @@ Cover discovery moves into `proto` so host and firmware use the same rules.
 Order:
 
 1. EPUB 3 manifest item with `properties="cover-image"`.
-2. EPUB 2 cover metadata that resolves to a manifest item.
+2. EPUB 2 cover metadata resolving to a manifest item.
 3. Existing conservative id/href fallback for image manifest entries containing “cover”.
 
 Discovery returns a bounded normalized image path, not a borrowed string tied to OPF scratch.
@@ -576,94 +1191,91 @@ Discovery returns a bounded normalized image path, not a borrowed string tied to
 When discovery occurs while `EpubPackage` borrows `EPUB_OPF`:
 
 1. resolve and copy the selected path into an owned bounded buffer;
-2. copy any required metadata;
-3. end all package and OPF-backed borrows;
+2. copy required metadata;
+3. end package and OPF-backed borrows;
 4. only then lend OPF/XHTML scratch to the decoder.
 
-The borrow transition must be represented by Rust lifetimes and ownership rather than `unsafe` aliasing.
+The borrow transition is represented by Rust ownership and lifetimes rather than scratch aliasing.
 
 ### Cache-independent generation
 
-Cover generation is an `ensure_cover_cache` operation that runs after the reader has attempted to load the existing cover.
+Cover generation is an `ensure_cover_cache` operation after the existing-cover load attempt.
 
-It is not part only of the full text-cache build.
+It is not limited to the full text-cache build.
 
-Book-open sequencing is:
+Book-open sequence:
 
 1. Load or build the text/page cache through the existing fast, replay, or full path.
 2. Attempt to load `COVER.BIN`.
 3. If a valid cover loaded, finish normally.
-4. If the cover is missing or invalid, inspect the versioned negative-cover status.
-5. If no applicable negative status exists, reopen or continue using the source EPUB and attempt cover generation.
+4. If missing or invalid, inspect versioned negative-cover state.
+5. If no applicable negative state exists, open the source EPUB and attempt generation.
 6. Load the newly published cover into `ReaderStore`.
-7. Regardless of cover outcome, return the book’s text cache as ready when the text path succeeded.
+7. Return the successful text-cache result regardless of cover outcome.
 
-This guarantees that a book with an old valid `BOOK.BIN` but no cover can still gain a generated cover.
+A book with a valid old `BOOK.BIN` but no cover can therefore gain a generated cover.
 
-### Existing cover policy
+### Existing-cover policy
 
 - A valid current `COVER.BIN` is trusted.
-- A valid legacy host-generated cover accepted by the existing format reader is trusted.
-- M1 does not re-decode a valid cover solely to change thresholding to dithering.
-- A corrupt or truncated cover is treated as absent and is eligible for regeneration.
-- A stale temporary file is deleted before a new attempt.
-
-Changing this policy later requires an explicit cover-format or generator-policy version.
+- A valid legacy host-generated cover accepted by the existing reader is trusted.
+- M1 does not regenerate a valid cover merely to change thresholding to dithering.
+- A corrupt or truncated cover is treated as absent.
+- A stale temporary cover is removed before a new attempt.
+- Changing this policy requires a cover-generator policy version.
 
 ### Negative result
 
-M1 adds a small versioned negative-cover artifact, separate from `COVER.BIN`.
+M1 adds a small versioned negative-cover artifact separate from `COVER.BIN`.
 
 It records deterministic outcomes such as:
 
 - no cover declared;
 - unsupported image format;
-- unsupported JPEG subtype or orientation;
+- unsupported JPEG subtype;
+- unsupported orientation;
 - permanently invalid image;
-- path rejected by resource or traversal rules.
+- rejected path or resource limit.
 
-The artifact includes a cover-policy version. Increasing decoder support or changing discovery rules invalidates the negative result and allows another attempt.
+Its identity includes:
 
-Transient I/O and publication failures are never written as negative results.
+- book/source generation identity;
+- normalized cover path where available;
+- cover-discovery policy version;
+- decoder-support policy version.
 
-A successful `COVER.BIN` publication removes any prior negative result.
+Increasing decoder support or changing discovery invalidates the result.
+
+Transient I/O and publication failures are never persisted as negative results.
+
+A successful cover publication removes previous negative state.
 
 ### Transactional publication
 
-Cover generation must not write directly into the final `COVER.BIN`.
+Cover generation does not write directly to the final `COVER.BIN`.
 
 Required sequence:
 
-1. Remove any stale temporary sibling.
+1. Remove stale temporary siblings.
 2. Create a temporary cover file.
 3. Write the complete header and payload.
 4. Close the file.
 5. Reopen and validate:
    - magic and version;
-   - dimensions and stride;
+   - dimensions;
+   - stride;
    - exact payload length;
-   - clean EOF after the payload.
-6. Publish the completed file using the safest replace operation supported by the filesystem layer.
-7. Remove the temporary file after either success or failure.
+   - clean EOF.
+6. Publish through the safest replace operation supported by the filesystem.
+7. Remove the temporary file after success or recoverable failure.
 
-A previously valid `COVER.BIN` is preserved until the replacement has been fully written and validated.
+A previously valid cover remains in place until its replacement has been fully written and validated.
 
-If the filesystem API cannot provide an atomic rename, the implementation must still be transactional for ordinary decode and write errors. The implementing issue must document the remaining power-loss window and ensure the next open recognizes and cleans up any interrupted state.
-
-### M1 failure behavior
-
-A cover failure:
-
-- does not delete a previously valid cover;
-- does not make `BOOK.BIN` or section caches invalid;
-- does not change the requested reading page;
-- does not fail a successful text-cache open;
-- leaves no temporary file after recoverable cleanup;
-- emits a bounded diagnostic result.
+If atomic rename is unavailable, the implementation issue documents the residual power-loss window and recovery behavior.
 
 ### M1 observability
 
-Firmware logs or bench output distinguish:
+Events distinguish:
 
 - `cover_hit`;
 - `cover_negative_hit`;
@@ -673,46 +1285,53 @@ Firmware logs or bench output distinguish:
 - `cover_no_declared_image`;
 - `cover_unsupported`;
 - `cover_decode_invalid`;
+- `cover_resource_limit`;
 - `cover_io_error`;
 - `cover_publish_error`.
 
-A successful generation reports:
+Successful generation reports:
 
 - source dimensions;
-- JPEG sampling mode;
+- component/sampling mode;
 - selected DCT scale;
-- output dimensions;
+- target dimensions;
 - encoded bytes consumed;
-- decode/raster duration;
-- publication duration.
+- decoder duration;
+- raster duration;
+- publication duration;
+- total added open latency.
 
 ### M1 acceptance criteria
 
 M1 is complete when:
 
-- a book with valid `BOOK.BIN` and no cover generates a cover;
-- a book opened through `CONT.BIN` replay and no cover generates a cover;
-- a full EPUB cache build generates a cover;
-- a valid existing cover is not regenerated;
-- a corrupt or truncated cover is replaced;
-- a deterministic no-cover result is not retried on the next open;
-- a transient I/O failure is retried on a later open;
-- an injected failure at the beginning, middle, and end of cover writing leaves no valid-looking partial file;
-- an existing valid cover survives a failed replacement attempt;
-- host and device generation produce byte-identical output for the same source image;
-- malformed or unsupported images do not prevent book opening;
-- cold and warm book-open measurements are reported on X4 hardware;
-- the stack and static-memory checks remain satisfied.
+- valid `BOOK.BIN` plus missing cover generates a cover;
+- `CONT.BIN` replay plus missing cover generates a cover;
+- full EPUB cache build plus missing cover generates a cover;
+- valid existing cover is not regenerated;
+- corrupt or truncated cover is replaced;
+- deterministic refusal is not retried on the next open;
+- transient failure is retried on a later open;
+- injected write failures leave no valid-looking partial file;
+- existing valid cover survives failed replacement;
+- host and device generation produce byte-identical output;
+- malformed and unsupported images do not prevent book opening;
+- X4 cold and warm open measurements are reported;
+- stack and static-memory checks remain satisfied.
 
-The initial performance target is no more than 5 seconds of added cover-generation latency for a typical 1200×1800 cover on X4, excluding panel refresh. M1 may exceed that only with a documented product decision based on measured hardware results.
+Initial performance target:
+
+- no more than five seconds of added generation latency for a typical 1200×1800 cover on X4, excluding panel refresh.
+
+Exceeding that target requires a documented product decision based on hardware measurements.
 
 ## M2 — Dedicated image pages
 
-### Initial scope
+### Initial promotion rule
 
 M2 promotes an image only when the complete rendered content of one EPUB spine item is a single eligible image.
 
-Transparent structural wrappers are allowed, including:
+Transparent wrappers may include:
 
 - `html`;
 - `body`;
@@ -732,15 +1351,13 @@ It is not eligible when it contains:
 - another media element;
 - navigation content;
 - a visible heading;
-- any ordinary text block before or after the image.
+- an ordinary text block before or after the image.
 
-This rule intentionally excludes decorative ornaments embedded in chapters and avoids subjective “meaningful container” or aspect-ratio-only heuristics.
-
-Supporting standalone image blocks inside an otherwise textual spine item requires a later scoped extension.
+This intentionally excludes decorative ornaments and avoids aspect-ratio-only heuristics.
 
 ### Parser event model
 
-The XHTML layer introduces a semantic event interface rather than encoding every event as text.
+The XHTML layer introduces semantic events rather than encoding every event as text.
 
 Conceptually:
 
@@ -751,41 +1368,41 @@ enum ContentEvent<'a> {
 }
 ```
 
-An `ImageCandidate` contains only bounded parser-level information:
+An `ImageCandidate` contains bounded parser-level information:
 
 - raw `src` or SVG-image href;
 - alt text;
 - element and structural context;
-- whether any meaningful sibling content exists;
-- hidden, decorative, or presentation flags known from markup;
+- meaningful-sibling state;
+- hidden, decorative, or presentation flags;
 - current XHTML document path.
 
-The parser does not silently turn an eligible image candidate into final placeholder text before the sink can inspect it.
+The parser does not replace the candidate with final placeholder text before the sink can classify it.
 
 The build sink:
 
 1. resolves and normalizes the href;
 2. locates the manifest or ZIP entry;
-3. parses only enough image metadata to identify format, dimensions, and orientation, by streaming a bounded prefix of the entry — on the order of 1 KB — through the streaming dimension probe described under "Prior art", stopping as soon as the header fields are known and never inflating the whole image at cache-build time;
-4. applies the deterministic image-only-spine rule;
-5. emits either:
-   - a normalized image-page event; or
-   - the existing placeholder text event.
-
-The normalized event, rather than the raw parser candidate, is what `CONT.BIN` captures.
+3. feeds a bounded prefix through `ImageProbe`;
+4. records format, dimensions, and orientation;
+5. applies the image-only-spine rule;
+6. emits either:
+   - normalized image-page event; or
+   - existing placeholder text event.
 
 ### Normalized image-page event
 
 An image-page event contains:
 
-- normalized EPUB-root-relative image path;
+- normalized EPUB-root-relative path;
+- stable image-record ID;
 - image format;
 - intrinsic width and height;
-- orientation support result;
-- page fit mode, initially `Contain`;
-- reserved flags for future behavior.
+- orientation status;
+- fit mode, initially `Contain`;
+- reserved flags.
 
-The href is stored as bounded UTF-8 bytes. Fragment identifiers are removed before persistence.
+The stable image-record ID is assigned during cache construction and is collision-free within the book cache.
 
 The event contains no borrowed reference into XHTML or OPF scratch.
 
@@ -799,20 +1416,20 @@ The content stream becomes a typed event stream with at least:
 - `ImagePage`;
 - `SpineEnd`.
 
-For a text event, the payload preserves the existing text, role, style, alignment, and paragraph-end semantics.
+Text events preserve the existing text, role, style, alignment, and paragraph-end semantics.
 
-For an image-page event, the payload contains the normalized image-page metadata and href.
+Image events contain normalized image metadata and href.
 
-Replay must reproduce the same semantic event sequence without reopening the EPUB. It must not need to repeat image discovery, metadata inspection, or classification.
+Replay must reproduce the same semantic event sequence without reopening the EPUB for classification.
 
-A partial, malformed, unknown-kind, overlength, or inconsistent event invalidates `CONT.BIN` and causes the existing full-EPUB fallback.
+A malformed, unknown, overlength, truncated, or inconsistent event invalidates `CONT.BIN` and triggers the existing full-EPUB fallback.
 
-Host tests must prove that:
+Tests prove:
 
-- full parse and content replay produce identical page-cache bytes;
-- image events survive a type-settings change;
-- corrupt image-event framing cannot be replayed as text;
-- old `CONT.BIN` versions are rejected.
+- full parse and replay generate identical page-cache bytes;
+- image events survive type-setting changes;
+- corrupt image framing cannot become text;
+- old versions are rejected.
 
 ### Page-cache schema
 
@@ -830,11 +1447,10 @@ struct PageRecord {
     kind: PageKind,
     flags: u8,
 
-    // Text page:
     first_block: u16,
     block_count: u16,
 
-    // Image page:
+    image_record_id: u16,
     image_href_offset: u32,
     image_href_len: u16,
 }
@@ -842,105 +1458,115 @@ struct PageRecord {
 
 For a text page:
 
-- `first_block` and `block_count` are valid;
+- text range fields are valid;
 - image fields are zero.
 
 For an image page:
 
-- text block fields are zero;
-- image href fields reference bytes in the section payload/string area;
-- the page has exactly one image reference.
+- text fields are zero;
+- image fields identify one normalized image reference.
 
 The exact packed layout may differ, but these invariants are required.
 
-Section headers must distinguish text bytes from general payload bytes, or document that image hrefs share the existing bounded string payload.
-
 ### Cache invalidation
 
-M2 changes both parsing semantics and page-record layout.
+M2 changes parsing semantics and page-record layout.
 
-Therefore M2 must:
+M2 must:
 
 - increment `CONTENT_VERSION`;
 - increment `CACHE_V2_VERSION`;
-- reject older page and section records for the new reader path;
-- not leave the previous cache version inside the compatibility window if doing so could load text-only pages without image metadata;
-- rebuild old caches from the source EPUB;
-- delete or ignore stale sections after a failed rebuild according to the existing cache-publication rules.
+- reject older page and section records;
+- remove the old page-cache version from any compatibility window that would hide images;
+- rebuild from the source EPUB;
+- reject stale or partial rebuilt sections.
 
-A firmware update must not continue using an old valid `BOOK.BIN` in a way that permanently hides newly supported image pages.
-
-M1 by itself does not require this text/page-cache version bump.
+M1 alone does not require this text/page-cache version change.
 
 ### Render-time source access
 
-Rendering an image page introduces an EPUB read into the page-render path.
-
 The display task:
 
-1. obtains the normalized image href from the loaded page record;
+1. obtains the normalized href and stable image ID;
 2. opens the source EPUB;
-3. locates the matching ZIP entry;
+3. locates the ZIP entry;
 4. streams and inflates it;
-5. decodes and rasterizes it into the reader content rectangle;
-6. requests a Full refresh.
+5. decodes and rasterizes into the reader content rectangle;
+6. requests Full refresh.
 
-The page cache stores a stable normalized href rather than a ZIP local-header offset. Offsets may become an optimization later but are not part of the initial persistence contract.
+The cache stores a normalized href, not a ZIP local-header offset.
 
-If the EPUB is missing, changed, unreadable, or lacks the referenced entry, the page falls back to the placeholder.
+If the EPUB is missing, changed, unreadable, or lacks the entry, the page renders the placeholder.
 
-### Rendered-page cache (deferred decision)
+### Rendered-page cache — deferred
 
-Without a cache, every visit to an image page pays the full source-open, inflate, decode, and raster cost again. Paging back and forth across an illustration repeats it each time.
+Without a cache, every visit pays source-open, inflate, decode, resample, and dither cost.
 
-The option is to persist the finished 1bpp raster for the image page and, on a later visit, read it back instead of re-decoding. At the reader content rectangle this is roughly 43 KB per image page in 1bpp, so a book with seventeen full-page illustrations costs under 1 MB of SD space. A revisit becomes a single sequential read.
+A future sidecar could persist the final 1bpp raster. At a roughly 43 KB reader rectangle, seventeen illustrations would consume under 1 MB.
 
-`crosspoint-reader` treats the equivalent cache as mandatory, because its renderer re-enters the image path about 14 times per page; without it a 2-second decode became a roughly 30-second freeze and a watchdog reset. That pressure does not exist here — a render writes the framebuffer once — so for this design the cache is a latency optimisation, not a correctness requirement.
+The cache is not required for correctness in a single-pass renderer and is deferred until revisit latency is measured.
 
-It is therefore deferred to measured evidence rather than specified now. If it is adopted it must reuse the M1 transactional-publication rules, carry its own version, be invalidated by any change to geometry, resampler, or dither, and never be presented as valid when truncated.
+If adopted, its identity includes:
 
-### M2 failure behavior
+- book/source generation identity;
+- normalized image path;
+- source image length and digest or equivalent generation value;
+- target viewport dimensions;
+- crop/fit policy;
+- decoder policy version;
+- resampler version;
+- dither version;
+- output pixel format.
 
-A decode or source failure on an image page:
+It uses M1-style temporary publication and exact payload validation.
 
-- renders the existing placeholder in place of the image;
-- does not fail the page turn, invalidate the page cache, or change reader position;
-- leaves no partially decoded pixels in the submitted framebuffer;
-- emits a bounded diagnostic result.
+### M2 failure memo
 
-A failed image is recorded in a bounded in-RAM memo — a fixed-size table of image-path hashes — so the same image does not re-attempt a full decode on every visit within the reading session. The memo:
+The reading session owns a fixed-capacity table of deterministic image failures.
 
-- is fixed-capacity and allocation-free, and simply stops recording when full;
-- is cleared when the reader is entered, so transient SD or timing failures are retried in a later session;
-- is never persisted, because unlike the M1 negative-cover result it does not distinguish deterministic from transient causes.
+The key is the stable image-record ID plus the current book-cache identity, not only a path hash.
 
-Deterministic per-image refusals are not persisted in M2. The image-page record already carries the format and dimensions established at cache-build time, so an unsupported image is normally rejected before a decode is attempted.
+Each entry contains:
+
+- stable image ID;
+- deterministic error class.
+
+The memo:
+
+- is allocation-free;
+- has fixed capacity;
+- stops recording when full or uses a documented bounded replacement policy;
+- is cleared when leaving the book;
+- never records transient SD, source-open, or I/O failures;
+- is never persisted.
+
+Unsupported format and dimensions should normally be classified during cache construction, so the memo primarily suppresses repeated malformed-JPEG decode work.
 
 ### Framebuffer transaction
 
 The panel must never display a partially decoded image.
 
-The framebuffer sequence is:
+Sequence:
 
-1. prepare the complete page background and fixed chrome;
-2. clear the image content rectangle to white;
-3. decode into the framebuffer;
-4. on success, finalize the image page and submit it;
-5. on any decode or source error:
+1. Prepare fixed page chrome.
+2. Clear the image rectangle to white.
+3. Decode and rasterize.
+4. On success, submit the completed image page.
+5. On failure:
    - clear the image rectangle again;
    - draw the existing placeholder;
-   - submit only the complete fallback page.
+   - submit only the completed fallback page.
 
-No panel refresh begins until decode has either succeeded or the fallback framebuffer has been reconstructed.
+No panel refresh begins until success or fallback is complete.
 
-A successful image page forces Full refresh. A failed image-page attempt may also use Full refresh when required by the planner or golden-output policy, but no partially decoded pixels may survive in the submitted framebuffer.
+A successful image page forces Full refresh.
 
 ### M2 observability
 
-Image-page telemetry distinguishes:
+Telemetry distinguishes:
 
 - image page loaded from cache;
-- EPUB source missing;
+- source EPUB missing;
 - ZIP entry missing;
 - unsupported format;
 - unsupported JPEG subtype;
@@ -948,115 +1574,125 @@ Image-page telemetry distinguishes:
 - resource-limit rejection;
 - decode success;
 - decode failure;
+- deterministic memo hit;
 - placeholder fallback.
 
 Success reports:
 
 - global and section page;
+- stable image ID;
 - source and target dimensions;
-- JPEG sampling;
+- sampling;
 - DCT scale;
 - compressed and uncompressed bytes;
 - source-open time;
 - inflate/decode/raster time;
-- total press-to-frame-ready time;
+- frame-ready time;
 - refresh class.
 
 ### M2 acceptance criteria
 
 M2 is complete when:
 
-- an image-only spine item becomes exactly one image page;
-- an image-only spine item remains an image page after type-settings replay from `CONT.BIN`;
-- full parse and replay generate byte-identical page caches;
-- decorative `alt=""` images inside prose remain placeholders;
-- a chapter containing text plus an image remains text plus placeholder;
-- an image plus caption is not promoted;
-- a spine item with two images is not promoted;
-- overlength, absolute, and root-escaping hrefs are rejected;
-- a missing EPUB or ZIP entry renders a placeholder;
-- malformed, progressive, oversized, or unsupported JPEGs render a placeholder;
-- failures injected after partial framebuffer writes leave no image remnants;
-- successful image pages force Full refresh;
-- old content and page caches are rebuilt rather than silently accepted;
+- image-only spine item becomes exactly one image page;
+- image page survives `CONT.BIN` replay;
+- full parse and replay generate identical page caches;
+- decorative images in prose remain placeholders;
+- text plus image remains text plus placeholder;
+- image plus caption is not promoted;
+- multiple images are not promoted;
+- overlength, absolute, and escaping paths are rejected;
+- missing source or ZIP entry renders placeholder;
+- malformed, progressive, oversized, and unsupported JPEGs render placeholder;
+- transient failures remain retryable;
+- deterministic failures are suppressed within the session;
+- failure after partial framebuffer writes leaves no remnants;
+- successful image page forces Full refresh;
+- old content/page caches rebuild;
 - emulator goldens pass on X4 and X3;
 - X4 hardware page-turn and stack measurements are reported.
 
-The initial performance target is no more than 5 seconds from image-page render start to a completed framebuffer for a typical 1200×1800 illustration, excluding the panel’s Full refresh busy time. Shipping above that target requires an explicit product decision and should consider a rendering plate.
+Initial framebuffer-preparation target:
+
+- no more than five seconds for a typical 1200×1800 illustration, excluding Full-refresh panel busy time.
+
+Shipping above that target requires an explicit product decision and should consider a rendering plate or rendered-page cache.
 
 ## SVG-wrapped images
 
 Arbitrary SVG rasterization remains out of scope.
 
-M2 may later recognize an image-only spine item whose SVG contains exactly one external raster `<image>` reference, but only as a transparent wrapper around a supported JPEG.
+A later extension may recognize an image-only spine item whose SVG contains exactly one external supported raster image.
 
 That extension must:
 
-- ignore SVG `<title>` and `<desc>` as reader prose;
-- avoid affecting EPUB navigation labels;
-- resolve `href` and `xlink:href` safely;
-- reject transforms, clipping, multiple images, embedded data URLs, or vector drawing that would change the raster’s presentation;
-- feed the resolved raster href through the same normalized image-page pipeline.
+- ignore `<title>` and `<desc>` as reader prose where appropriate;
+- preserve navigation labels;
+- resolve `href` and `xlink:href`;
+- reject transforms, clipping, vector drawing, multiple images, and data URLs unless explicitly supported;
+- pass the normalized raster path through the same image-page pipeline.
 
-It is not required for the initial M2 milestone.
-
-A placeholder-only fix must not remove `svg` from parser skip lists unless it implements the complete intended SVG semantics.
+It is not required for initial M2.
 
 ## Scratch-memory and lifetime plan
 
 ### No new large statics
 
-The decoder state and raster workspace are borrowed from existing reader-cache scratch.
+The decoder and raster workspace are borrowed from existing reader scratch.
 
 The implementation must not add:
 
-- a full decoded image buffer;
-- a second framebuffer;
-- a decoder singleton static;
-- a large task-local stack array.
+- full encoded-image storage;
+- full decoded-image storage;
+- second framebuffer;
+- decoder singleton static;
+- large task-local arrays.
 
-### Required lifetime sequence
+### Lifetime sequence for cover generation
 
-For cover generation during a full EPUB open:
+During a full EPUB open:
 
-1. parse the OPF and construct `EpubPackage`;
-2. discover and normalize the cover path;
-3. copy it into a bounded owned value;
-4. complete any text-cache work that still borrows package data;
-5. drop `EpubPackage`, manifest views, spine views, and other OPF-backed references;
-6. borrow OPF/XHTML storage as decoder workspace;
-7. retain the ZIP inflate state and compressed-input buffer separately because they remain concurrently live;
-8. decode and publish the cover.
+1. parse OPF and construct `EpubPackage`;
+2. discover and normalize the cover;
+3. copy path and metadata into bounded owned values;
+4. complete text-cache work that still borrows package data;
+5. drop package, manifest, spine, and OPF-backed views;
+6. lend OPF/XHTML storage as decoder workspace;
+7. retain ZIP inflate state and compressed input separately;
+8. decode and publish.
 
-For cover generation after a `BOOK.BIN` or `CONT.BIN` hit:
+After `BOOK.BIN` or `CONT.BIN` hit:
 
-1. complete the text-cache open;
-2. parse only the package information needed for cover discovery;
+1. complete text-cache open;
+2. parse only package information needed for cover discovery;
 3. copy and normalize the cover path;
 4. drop package borrows;
-5. reuse the scratch for decode.
+5. reuse scratch for decode.
 
-For M2 rendering, no content parser or package object may remain live while the same scratch is lent to the decoder.
+For M2, no parser or package object remains live while the same scratch is lent to the decoder.
 
-The borrow checker must enforce exclusivity. This work must not introduce `unsafe` scratch aliasing.
+The borrow checker enforces exclusivity.
 
 ### Working-set budget
 
-The M0 report must replace estimates with exact sizes.
+M0B replaces estimates with exact values.
 
-Expected caller-owned decoder/raster state includes:
+Expected state includes:
 
-- Huffman tables and lookup acceleration;
+- input buffer;
+- Huffman tables;
 - quantization tables;
 - component and scan metadata;
 - coefficient/IDCT workspace;
-- one scaled MCU or output band;
+- MCU or scaled output band;
 - resampler rows;
-- two dither error rows.
+- dither rows.
 
-The expected total is approximately 10–18 KB, excluding the existing ZIP inflate state and compressed-input buffer.
+Initial planning range:
 
-The implementation must retain at least 8 KB of margin within the scratch actually lent to it. If it cannot, the design returns to the M0 gate.
+- approximately 8–18 KB beyond existing ZIP inflate and compressed-input state.
+
+The selected implementation must retain at least 8 KB of margin in the scratch region actually lent to it.
 
 ### Stack
 
@@ -1065,42 +1701,48 @@ Requirements:
 - no recursion;
 - no large local arrays;
 - no data-dependent stack growth;
-- decoder and raster buffers supplied by the caller;
-- `_stack_start - _stack_end >= 27 KB` remains true;
-- `-Zemit-stack-sizes` output is reported for the complete affected call chains.
+- buffers supplied by caller;
+- `_stack_start - _stack_end >= 27 KB`;
+- complete affected call chains reported through `-Zemit-stack-sizes`.
 
-Any regression near the existing stack floor blocks M1 or M2 until resolved.
+A regression near the current stack floor blocks firmware integration.
 
 ## Refresh policy
 
-- Cover generation itself performs no panel refresh.
-- Existing views display the loaded cover through their current refresh policy.
-- A successfully rendered full-page image requests Full refresh.
-- Placeholder fallback must remain visually correct under the selected refresh.
-- M2 benchmarks report decode time separately from panel busy time.
-- M2 must not block input ownership or violate the display task’s existing single-writer assumptions.
+- Cover generation performs no panel refresh.
+- Existing views display the loaded cover through current refresh behavior.
+- Successful full-page image rendering requests Full refresh.
+- Fallback page must be visually correct under the selected refresh.
+- Benchmarks report decoder/frame preparation separately from panel busy time.
+- Image rendering does not violate the display task’s single-writer ownership.
+- No background task renders into the framebuffer.
 
-A temporary “Rendering…” plate is not part of the initial implementation. It becomes required for product review if measured framebuffer preparation routinely exceeds 2 seconds and the current screen otherwise appears unresponsive.
+A “Rendering…” plate is deferred.
+
+Product review is required when measured framebuffer preparation routinely exceeds two seconds and the unchanged previous screen appears misleading or unresponsive.
 
 ## Robustness and security
 
-All image and cache parsing treats input as untrusted.
+Image and cache inputs are untrusted.
 
 Required protections:
 
 - checked integer arithmetic;
-- bounds checks before every table, buffer, and output access;
-- bounded loops derived from validated dimensions and MCU counts;
-- no panics on malformed input;
+- bounds checks before every table, input, and output access;
+- bounded loops derived from validated dimensions;
+- no panic for external input;
 - no unchecked UTF-8;
 - no path traversal;
-- no recursive parsing;
+- no recursion;
 - no unbounded marker skipping;
-- no allocation based on encoded dimensions;
-- clean cancellation on source read failure;
-- exact cache payload-length validation;
-- version validation before interpreting record layouts;
-- fuzz coverage for decoder and cache record parsing.
+- no allocation from encoded dimensions;
+- exact cache payload validation;
+- version validation before record interpretation;
+- deterministic failure on insufficient workspace;
+- fuzz coverage;
+- streaming chunk tests;
+- source-error injection;
+- output guard testing.
 
 A failed image operation must not corrupt:
 
@@ -1108,102 +1750,150 @@ A failed image operation must not corrupt:
 - section-cache state;
 - book metadata;
 - cover state;
-- the source EPUB;
-- any previously valid cache artifact.
+- source EPUB;
+- a prior valid cache artifact.
 
-## Verification plan
+## Verification commands
 
-Every implementing issue restates the commands relevant to its scope.
+Each implementing issue restates commands relevant to its scope.
 
 Required repository checks:
 
 - `tools/check.sh fmt`;
-- `tools/check.sh fast` for `proto` decoder and cache work;
+- `tools/check.sh fast`;
 - `tools/check.sh emulator` on X4 and X3 for changed rendering;
-- `tools/check.sh firmware` for display-task, SD, scratch, or cache-publication changes;
-- `tools/check.sh all` before a PR is merge-ready.
+- `tools/check.sh firmware` for display-task, SD, scratch, or publication changes;
+- `tools/check.sh all` before merge-ready.
 
-Required host tests:
+Required decoder checks:
 
-- supported JPEG conformance fixtures;
-- unsupported-format refusal;
-- truncated and malformed streams;
-- deterministic resampler output;
-- deterministic dither output;
-- host/device-equivalent cover output;
-- content-event encode/decode;
-- full-parse versus replay equivalence;
-- old-version rejection;
-- path normalization and traversal rejection;
-- injected write and read failures.
+- host unit and integration tests;
+- `no_std` build;
+- debug and release tests;
+- differential corpus;
+- chunking metamorphic tests;
+- failure injection;
+- fuzz targets;
+- Miri for applicable safe/unsafe modules;
+- C/C++ oracle sanitizer runs.
 
 Required hardware results:
 
 - M1 cold open with missing cover;
 - M1 warm open with cached cover;
 - M1 retry after transient failure;
-- M2 first render of an image page;
-- M2 repeat render of the same image page;
+- M2 first image render;
+- M2 repeat image render;
 - X4 page-turn latency;
-- stack-size delta;
+- stack delta;
 - firmware image-size delta;
 - SD bytes and read duration where measurable.
 
-Golden output changes caused by the shared dither must land with the host-tool change that produces them.
+Golden output changes caused by the shared raster pipeline land with the code that produces them.
 
 ## Build sequence
 
-### M0 — Host decoder and raster pipeline
+### M0A — Decoder selection
 
-1. Define supported JPEG and error enums.
-2. Implement marker, table, scan, and entropy parsing.
-3. Implement scaled luma decode.
-4. Implement deterministic crop/fit geometry and resampling.
-5. Implement deterministic 1bpp dithering.
-6. Add synthetic conformance and malformed-input fixtures.
-7. Decode the 20-image EPUB corpus.
-8. Integrate the shared pipeline into `tools/preview`.
-9. Measure workspace, stack, runtime, and output quality.
-10. Close the M0 decision gate separately for M1 and M2.
+1. Pin `tjpgdec-rs`.
+2. Inventory implementation gaps.
+3. Prototype forward-only input.
+4. Prototype luma output.
+5. Measure workspace and stack.
+6. Decode target corpus.
+7. Decide adapt versus constrained rewrite.
 
-### M1 — On-device cover generation
+### M0B — Verification and raster pipeline
 
-11. Move cover discovery and normalized href resolution into `proto`.
-12. Add versioned negative-cover status.
-13. Add temporary-file validation and publication helpers.
-14. Add cache-independent `ensure_cover_cache`.
-15. Wire it after all three text-cache paths.
-16. Load a newly generated cover into `ReaderStore`.
-17. Add failure-injection and legacy-cover tests.
-18. Run X4 hardware open benchmarks.
-19. Land host/device golden-output updates together.
+8. Build independent reference runners.
+9. Add generated JPEG fixtures.
+10. Add malformed corpus.
+11. Add differential tests.
+12. Add streaming metamorphic tests.
+13. Add source-error injection.
+14. Add output guards.
+15. Add fuzz targets.
+16. Complete selected baseline decoder.
+17. Implement geometry and resampler.
+18. Implement candidate dithers.
+19. Produce measurements and M1/M2 gates.
 
-### M2 — Dedicated image pages
+### M1 — Covers
 
-20. Add parser-level image candidates.
-21. Add deterministic image-only-spine classification.
-22. Add normalized image-page content events.
-23. Bump and implement the typed `CONT.BIN` format.
-24. Add page kind and image reference to section/page caches.
-25. Bump cache versions and force old-cache rebuild.
-26. Add render-time EPUB image access.
-27. Add transactional framebuffer fallback.
-28. Force Full refresh for successful image pages.
-29. Add X4 and X3 emulator goldens.
-30. Run X4 hardware page-turn benchmarks.
-31. Decide whether a rendering plate is required.
+20. Move cover discovery and path normalization into `proto`.
+21. Add negative-cover artifact.
+22. Add transactional publication helpers.
+23. Add cache-independent `ensure_cover_cache`.
+24. Wire all text-cache paths.
+25. Load newly generated cover into `ReaderStore`.
+26. Add failure injection and legacy-cover tests.
+27. Run X4 hardware benchmarks.
+
+### M2 — Image pages
+
+28. Add parser image candidates.
+29. Add image-only-spine classification.
+30. Add normalized image-page events.
+31. Bump and implement typed `CONT.BIN`.
+32. Add page kind and image reference.
+33. Bump cache versions.
+34. Add render-time source access.
+35. Add deterministic failure memo.
+36. Add transactional framebuffer fallback.
+37. Force Full refresh.
+38. Add X4/X3 goldens.
+39. Run X4 page-turn benchmarks.
+40. Decide rendering plate and rendered-cache needs.
+
+### Later candidate — progressive thumbnails
+
+41. Measure progressive incidence in representative EPUBs.
+42. Define supported scan organizations.
+43. Build progressive conformance fixtures.
+44. Prototype forward-only DC-only decode.
+45. Compare output and latency.
+46. Decide whether the feature justifies its parser and test surface.
 
 ## Risks
+
+### Decoder adaptation becomes a rewrite
+
+Mitigation:
+
+- explicit M0A gate;
+- patch inventory;
+- time-boxed proof of concept;
+- compare against a constrained implementation rather than continuing indefinitely.
+
+### Agentic port reproduces upstream defects
+
+Mitigation:
+
+- multiple independent oracles;
+- layer-by-layer tests;
+- malformed corpus;
+- fuzzing;
+- no single implementation treated as truth.
+
+### Native Rust candidate contains unsafe internals
+
+Mitigation:
+
+- eliminate raw-pointer workspace where practical;
+- narrow any retained unsafe;
+- document invariants;
+- Miri and guard tests;
+- explicit review gate.
 
 ### Decoder performance is slower than expected
 
 Mitigation:
 
 - M0 before firmware integration;
-- use the largest valid DCT reduction;
-- keep luma-only output;
-- reject unsupported complexity early;
-- stop after M1 if full-page rendering is not worthwhile.
+- reduced IDCT;
+- luma-only output;
+- bounded format contract;
+- stop after M1 if M2 is not worthwhile.
 
 ### Stack regression
 
@@ -1211,25 +1901,26 @@ Mitigation:
 
 - caller-owned state;
 - no recursion;
-- stack-size reporting in every milestone;
-- preserve the build-time stack floor.
+- stack reports;
+- preserve firmware floor.
 
 ### Scratch aliasing
 
 Mitigation:
 
-- copy normalized paths out of borrowed package data;
-- drop package/parser borrows before lending scratch;
-- route workspace through `ReaderCacheScratch`;
-- no `unsafe` aliasing.
+- copy paths out of package data;
+- end parser borrows before decode;
+- route buffers through `ReaderCacheScratch`;
+- no undocumented aliasing.
 
-### Poor 1bpp visual quality
+### Poor 1bpp quality
 
 Mitigation:
 
-- real corpus inspection in M0;
-- shared deterministic dither;
-- separate cover fill and page contain geometry;
+- real corpus inspection;
+- deterministic shared dither;
+- separate cover and page geometry;
+- retain ordered-dither fallback;
 - accept M1 without M2.
 
 ### Repeated cover-generation cost
@@ -1237,80 +1928,117 @@ Mitigation:
 Mitigation:
 
 - valid cover cache;
-- versioned deterministic negative result;
-- transient-only retry behavior.
+- deterministic negative result;
+- transient-only retry.
 
-### Corrupt partial cache files
+### Partial cache files
 
 Mitigation:
 
 - temporary artifact;
 - close and read-back validation;
-- preserve existing valid output;
-- cleanup and recovery tests.
+- preserve prior valid output;
+- recovery tests.
 
 ### M2 cache inconsistency
 
 Mitigation:
 
-- typed semantic events;
-- image metadata persisted in `CONT.BIN`;
+- typed events;
+- persisted image metadata;
 - explicit page kind;
-- mandatory cache-version bump;
-- full-parse/replay byte-equivalence tests.
+- cache-version bump;
+- parse/replay equivalence.
 
-### Decorative images become full pages
+### Decorative-image promotion
 
 Mitigation:
 
-- initial M2 promotes only an entire image-only spine item;
+- only complete image-only spine items;
 - no aspect-ratio-only promotion;
-- no image-plus-text promotion;
-- fixture coverage for ornaments and captions.
+- fixture coverage.
 
-### Unpredictable image-page latency
+### Stale rendered-page sidecar
 
 Mitigation:
 
-- separate source-open, inflate, decode, raster, and panel timing;
-- Full refresh already expected for image pages;
-- explicit 5-second framebuffer-preparation target;
-- rendering plate decision based on measured hardware data.
+- deferred until needed;
+- source identity and digest;
+- geometry/resampler/dither/output-format versions;
+- transactional publication.
+
+### Unpredictable image latency
+
+Mitigation:
+
+- separate timing stages;
+- explicit targets;
+- rendering-plate decision;
+- rendered cache based on measured revisit cost.
 
 ## Decisions closed by this PRD
 
-- M1 generation runs independently of the text-cache path.
-- Existing valid cover files are trusted.
-- Missing and corrupt covers are eligible for generation.
+- Decoder implementation is selected through M0A, not assumed.
+- `tjpgdec-rs` is evaluated before a greenfield decoder or full JPEGDEC port.
+- `zune-jpeg` is an oracle, not the initial firmware dependency.
+- JPEGDEC is prior art and a possible algorithm source, not the initial dependency.
+- A decoder translation is not accepted without differential and fuzz verification.
+- JPEG input is forward-only and does not require a complete source slice.
+- Primary decoder output is luma.
+- M1 generation is independent of the text-cache path.
+- Valid existing covers are trusted.
 - Deterministic negative results are persisted; transient failures are retried.
-- Cover publication uses a temporary validated artifact.
-- The default cover DCT scale may not undershoot the target.
+- Cover publication is transactional.
+- Default cover scale does not undershoot the target.
 - Covers use centered fill-and-crop.
 - Reader image pages use contain with white padding.
-- The first JPEG contract is SOF0-only rather than SOF0/SOF1.
+- Initial JPEG support is SOF0 baseline only.
+- Progressive JPEG is a later measured extension.
 - M2 uses typed parser and content-cache events.
-- M2 adds an explicit image page kind and persisted href.
+- M2 adds explicit image-page records and persisted hrefs.
 - M2 bumps content and page-cache versions.
-- Initial M2 promotion is limited to image-only spine items.
-- Partial framebuffer output is cleared before placeholder fallback.
-- Host and firmware use the same raster pipeline.
-- The decoder is written in `no_std` Rust rather than wrapping JPEGDEC.
-- Images stream from the ZIP entry rather than being extracted to SD first.
-- Downscaling uses area averaging, not nearest neighbour, with per-axis scale factors.
-- Error diffusion is conditional on single-pass framebuffer rendering.
+- Initial promotion is limited to image-only spine items.
+- Failure memo uses collision-safe stable IDs and deterministic errors only.
+- Partial framebuffer output is cleared before fallback.
+- Rendered-page caching is deferred.
+- Host and firmware share the complete raster pipeline.
 
 ## Remaining decision gates
 
-The following are intentionally deferred to measured evidence:
+- Adapted `tjpgdec-rs` versus constrained Rust implementation.
+- Whether any retained unsafe is acceptable.
+- Exact decoder workspace.
+- 16-bit quantization-table support.
+- Floyd–Steinberg versus ordered Bayer.
+- 1/8-plus-upscale fast mode.
+- M2 go/no-go after full-page inspection.
+- Rendering plate.
+- Rendered-page sidecar.
+- Progressive DC-only extension.
+- X3-specific cover geometry.
+- Transparent SVG wrappers.
+- Standalone image blocks inside textual spine items.
 
-- Floyd–Steinberg versus ordered dithering, subject to the single-pass precondition.
-- Exact decoder workspace after implementation.
-- Whether 16-bit quantization tables fit the initial support set.
-- Whether a 1/8-plus-upscale cover fast mode is visually acceptable.
-- Whether M2 should proceed after full-page 1bpp inspection.
-- Whether M2 requires a rendering plate.
-- Whether M2 adopts a rendered-page cache, based on measured revisit latency.
-- Whether a later milestone adds progressive JPEG as a DC-only 1/8 decode.
-- Whether X3 eventually needs a different cover-cache geometry.
-- Whether a later milestone should support transparent SVG wrappers.
-- Whether a later milestone should promote standalone image blocks inside textual spine items.
+## References
+
+External claims in this document carry a bracketed tag resolved here. All entries were checked on 2026-07-25; upstream repositories change, so any decision that turns on a licence or a published figure must be re-checked against the pinned revision at the time it is acted on.
+
+**[tjpgdec-rs]** — https://github.com/planet0104/tjpgdec-rs, crate `tjpgdec-rs`.
+Checked: crates.io metadata (version 0.4.0, the only published release; licence `MIT OR Apache-2.0`); repository README (`no_std` support, caller-provided memory pool, workspace sizes 3,100 / 3,500 / 9,644 bytes for optimization levels 0/1/2); `src/lib.rs` at 0.4.0 (single test `test_basic`, asserting `BUFFER_SIZE == 512`); `src/pool.rs` at 0.4.0 (`unsafe` blocks returning slices via `core::slice::from_raw_parts_mut`).
+No commit is pinned yet. M0A must pin one before evaluation results are recorded.
+
+**[zune-jpeg]** — https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg, crate `zune-jpeg`.
+Checked: crates.io metadata (version 0.5.15; licence `MIT OR Apache-2.0 OR Zlib`); crate documentation (states no-std operation; the decode call returns an owned buffer containing the whole image rather than streaming through callbacks).
+
+**[TJpgDec]** — ChaN's TJpgDec, http://elm-chan.org/fsw/tjpgd/00index.html.
+Checked: 3.5 KB work area independent of image width; 3.5–8.5 KB of code in `.text` + `.rodata`; permissive terms allowing use, modification, and redistribution without restriction at the user's own responsibility.
+
+**[TJpgDec-fork]** — https://github.com/cmumford/TJpgDec.
+Checked: GPL-3.0. Adds a libFuzzer target, sanitizer support, fixes for memory-access errors found by fuzzing, a CMake build, and GitHub Actions CI; retains unmodified upstream source on a separate branch.
+
+**[JPEGDEC]** — https://github.com/bitbank2/JPEGDEC.
+Checked: Apache-2.0 (`LICENSE`: "Copyright 2020 BitBank Software, Inc."); documented features covering 1/2, 1/4, and 1/8 reduced decode, DC-only progressive thumbnail decode, and optional Floyd–Steinberg dithering to 1, 2, or 4-bpp grayscale.
+Repository contents verified at commit `86282979224c8a32fd51e091ed5a35b0c699a52b`, the revision `crosspoint-reader` pins: the root `Makefile` builds a `demo` executable; `CMakeLists.txt` is an ESP-IDF `idf_component_register` declaration; the tree carries `test_images/`, `examples/`, `MacOS/JPEGDEC_Test`, and `linux/examples`, and no separate conformance test suite.
+
+**[crosspoint-reader]** — sibling firmware for the same X3/X4 hardware, read from a local checkout.
+The 2-second decode and ~55 KB free-heap figures quoted under "Sibling-firmware data point" are comments recorded in its `PixelCache` implementation, not CalendulaOS benchmark results.
