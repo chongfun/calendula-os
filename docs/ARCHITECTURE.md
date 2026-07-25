@@ -286,7 +286,7 @@ enum DisplayOrientation {
 }
 ```
 
-Default reader mode is `LandscapeButtonsBottom`, but the low-level display
+Default reader mode is `PortraitButtonsLeft`, but the low-level display
 transform above should stay fixed unless corruption returns.
 
 Addressing follows the OpenX4 community SDK behavior:
@@ -569,12 +569,11 @@ The firmware now has the e-reader surfaces as explicit app state:
 
 Every surface renders in one hold, so `Home`, `Library`, and `Settings` share
 the reading posture rather than rotating independently. Calendula boots into
-the portrait hold (`PortraitButtonsLeft`); the landscape holds stay in the
-Settings cycle for the X4's side page buttons. Upstream MarigoldOS boots into
-buttons-below landscape instead: only the boot default differs, while the
-enum, its persisted byte values, and the cycle order stay shared, so the
-saved-state format reads the same on both. Home is cover-led: the current book
-is the visual anchor, with a restrained menu down the side for Continue,
+the portrait hold (`PortraitButtonsLeft`) as the sole documented boot default;
+the landscape holds stay in the Settings cycle for the X4's side page buttons.
+The shared orientation enum, its persisted byte values, and the cycle order
+remain preserved for saved-state compatibility. Home is cover-led: the current
+book is the visual anchor, with a restrained menu down the side for Continue,
 Library, Sync, and Settings.
 Reading mode keeps the page quiet: tiny book title, rendered-screen count within
 the chapter, symbolic battery, and a thin whole-book progress bar. Home shows a
