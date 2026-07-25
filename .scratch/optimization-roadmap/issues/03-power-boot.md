@@ -2,6 +2,8 @@
 
 Status: C1+C3+C4+C5 DONE (#11; wake-cause gating logs 'main: deep_sleep_wake=', idle timeout tiered Reading 10 min / menus 3 min / Wireless 10 min). Next: C2 (device + µA meter). C6 still blocked on X3 display-path hardware verification. See PRD status for a once-observed X3 PON quirk. (items C1, C3, C4, C5 are code-verifiable; C2 and C6 need a device + meter for sign-off)
 
+Adjacent landings 2026-07-25: #36 put input at interrupt priority on both boards and moved the gauge to its own thread-executor task sampling every 30 s (extends C3 — the gauge is fully off the input tick now); #27 reworked the GPIO3 wake-button handoff (`InputPins.power` is an `Option` handed off cooperatively, replacing the steal-over-a-live-handle pattern C2 cites below).
+
 Owns: `fw/src/tasks/power.rs`, `fw/src/tasks/input.rs`, `hal-ext/src/rtc.rs`, `hal-ext/src/bq27220.rs`, planner-seed surface of `app-core/src/lib.rs`, boot-init region of `fw/src/tasks/display.rs`.
 Do not touch: flush/prestage region of the display task (WS-A), wifi task (WS-D).
 
@@ -20,7 +22,7 @@ Baseline facts: deep sleep is terminal — wake is a cold boot (`hal-ext/src/rtc
 `enter_deep_sleep_button` arms GPIO3 and sleeps (`hal-ext/src/rtc.rs:22-27`) with no GPIO hold/isolation: SD CS (GPIO12), shared SPI (GPIO8/10/7), EPD CS/DC/RST (GPIO21/4/5) float. The SD card is hardware-powered with no power switch — a powered card with floating CS/CLK commonly leaks 100 µA–1 mA; a floating RST can pop the panel out of its ~1 µA sleep. Fix: before `sleep_deep`, latch CS/RST high (RTC-domain pulls for GPIO0–5, GPIO hold for digital pins), leaving GPIO3's wake config untouched. Then measure (µA meter in series across `sleep-sync` cycles).
 
 - Impact: potentially the largest standby win — the difference between ~15 µA and several hundred µA is months vs ~1–2 weeks of shelf life. High uncertainty until measured; may already be fine, but nothing proves it.
-- Risk: wake reliability — test both boards; pin maps differ (GPIO0 is ADC divider on X4, I2C SCL to BQ27220 on X3, `fw/src/main.rs:178-209`). The `steal_wake_button` pattern in `power.rs:48-73` shows how to re-materialize pins on the terminal path.
+- Risk: wake reliability — test both boards; pin maps differ (GPIO0 is ADC divider on X4, I2C SCL to BQ27220 on X3, `fw/src/main.rs:178-209`). The terminal-path pin handling changed in #27: the wake button now arrives via a coordinated `Option` handoff from the input task, not a steal — latch the other pins within that flow.
 - Verify: hardware only — meter + `bench.py sleep-sync --cycles 20` (no missed wakes).
 
 ## C3 (Tier 1, S): X3 battery gauge polled at 66 Hz over clock-stretching I2C

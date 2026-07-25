@@ -1,13 +1,15 @@
 # WS-B: Book pipeline — cold builds, custom fonts, catalog scan, progressive open
 
-Status: B2+B3 DONE (#10). Next: B6 (CONTENT.BIN — brought in 2026-07-12 from the retired docs/OPTIMIZATION_PLAN.md brainstorm; full design inlined below), then B4 (its prerequisites B3, D1 landed; sequence after B6 — both restructure the open flow). B1 is DEMOTED, not dropped: the owner reads with built-in fonts only, so custom-font build speed has near-zero personal ROI; the spec below stays current (unblocked by E2 — store encoded 12-B metric records, as the in-flash FONT_METRICS cache now does) if custom fonts come into use. Note the upload write path now belongs to the upload-store crate (#18).
+Status: B2+B3 DONE (#10). B6 DONE (#23, landed with review hardening — `BookPublishOutcome` distinguishes index-write failure from section read-back miss; on-device A/B still pending, and it decides B7). B1 OFF THE QUEUE (2026-07-25): its goal landed as upstream port #37 — 16-slot non-ASCII metric ring, run measurement through one open pack handle (`for_each_metric`), whole-glyph bitmap reads; the spec below stays as reference only if custom-font cold builds still measure slow (remaining levers: punctuation-run slots, a walk-held pack handle). B4 is implemented on `origin/opt/b4-progressive-open` but STRANDED — see its section. Note the upload write path belongs to the upload-store crate (#18).
 
 Owns: `fw/src/reader_cache*.rs`, `fw/src/custom_font.rs`, `fw/src/library_sd.rs`, `fw/src/reader_layout.rs`, `ui/src/reading.rs`, `proto/`.
 Do not touch: `fw/src/sd_session.rs` — SD chunk/clock/multi-block changes belong to WS-D (this workstream benefits automatically).
 
 Baseline: cold V2 cache build 3.9 s for a 117-page EPUB (~70% CPU inflate+parse+measure, ~30% SD I/O; 537 wr + 723 rd blocks); HPMOR-scale extrapolates to ~2.5 min. Warm reopen 50–85 ms (fine). EPUB open chain must stay inside the 30–43 KB stack region; link-time ASSERT fails under 27 KB.
 
-## B1 (Tier 1, S–M): Custom-font metric cache for non-ASCII glyphs
+## B1 (Tier 1, S–M): Custom-font metric cache for non-ASCII glyphs — CLOSED by upstream port #37
+
+**2026-07-25: #37 (ported from crosspoint `8da2d42`) covers this item's goal** — a 16-slot ring of decoded non-ASCII metrics keyed by (identity, face, codepoint), `measure_char` replaced by `for_each_metric` feeding whole styled runs through one open pack handle, and one seek+read per glyph bitmap on the draw path. The spec below survives as reference: if custom-font cold builds still measure slow, the remaining levers are (a) General-Punctuation slot runs and (c) holding the pack handle across the whole spine walk rather than per run.
 
 `MetricCache` (`fw/src/custom_font.rs:24-125`, 4 slots) covers only ASCII 0x20–0x7E. Every non-ASCII char — curly quotes U+2018/2019/201C/201D, em-dash U+2014, thousands of occurrences per novel — misses into `measure_char` (`custom_font.rs:197-229`): open `/XTEINK` dir → `FONTS` dir → pack file → seek → 12-B read, **per occurrence** (several FAT block reads per apostrophe). Fix, in combination: (a) extend slots with the General-Punctuation run the pack already indexes (~120–240 B/slot); (b) small direct-mapped LRU (16–32 entries, ~400 B) for arbitrary non-ASCII; (c) hold the pack file open across the spine walk (sink already holds `root`).
 
@@ -33,6 +35,8 @@ Baseline: cold V2 cache build 3.9 s for a 117-page EPUB (~70% CPU inflate+parse+
 
 ## B4 (Tier 3, L): Progressive first open — publish the target section early
 
+**STRANDED IMPLEMENTATION (2026-07-25):** `origin/opt/b4-progressive-open` carries a complete implementation (provisional partial BOOK.BIN + self-enqueued `ContinueBookBuild` slices + guarded RAM-only resume state; all check.sh gates passed on 2026-07-12), but it stacks on B6's **pre-review** commit and is now 19 commits behind main. Two of those commits restructure exactly what it modifies: #41 folded book-open into one storage-owned transaction (`StorageCommand::OpenBook` now carries `previous` and the storage task owns the whole transition), and #29 changed reading-state persistence to durable two-generation files. **Rework the design against the transaction-owned open — treat the branch as a design reference, not a rebase candidate.** The provisional-publish and continuation-slice ideas carry over; the resume guards and the publish tail must be re-derived from #41's flow (note `publish_book_cache` now returns `BookPublishOutcome`, from B6's review).
+
 `build_or_load_epub_cache_from_zip` (`fw/src/reader_cache.rs:876`) walks the entire spine before `BookLoadStatus::Ready`. Publish Ready once the section containing the requested page is flushed (`flush_section`, `:1620`, already writes `S%03d.BIN` incrementally), record a provisional/partial `BOOK.BIN`, and continue the walk as re-enqueued storage-command steps on the display task so renders interleave. `partial` flag, `start_page` bookkeeping, and `load_v2_section_by_global_page` already model "not fully indexed"; new parts are resumable build state (spine cursor + running page total) and a final index rewrite.
 
 - Impact: time-to-first-page 3.9 s → ~0.5–1 s; minutes → ~1–2 s on huge books. Total build time unchanged.
@@ -45,7 +49,9 @@ Baseline: cold V2 cache build 3.9 s for a 117-page EPUB (~70% CPU inflate+parse+
 
 Per-word `String<768>` copy to satisfy borrows (`reader_cache.rs:1860-1862`), full line re-measure on wrap (`:1883-1885`), `sanitize_preview_block`'s ~15 scans + two LowerAscii copies (`:2133-2212`). Only while already in this file for B3/B4.
 
-## B6 (Tier 2, M): Settings-independent content cache — CONTENT.BIN
+## B6 (Tier 2, M): Settings-independent content cache — CONTENT.BIN — DONE (#23)
+
+Merged 2026-07-24 as CONT.BIN, with review hardening: `publish_book_cache` returns `BookPublishOutcome { Ready, IndexWriteFailed, SectionReadFailed }`, and a failed index write clears the cache dir instead of stranding a truncated BOOK.BIN. **Still pending on device:** the A/B in the design below — Type Size change on the 11.7 MB baseline book, replay-vs-full timings, identical `total=` counts, corrupt-CONT.BIN fallback. That measurement decides B7. Original design kept for reference:
 
 A Type Size/Weight/Family change flips wrap-relevant bits in `reader_layout_config`, so `load_v2_section_cache` rejects every section (`font_config & !0b11` check, `fw/src/reader_cache_files.rs:914`) and the open re-does the entire EPUB pass — zip read + inflate + XML parse + wrap + section rewrite, a full cold build (14.1 s on the measured 11.7 MB EPUB). Everything upstream of wrapping is settings-independent. Persist the `push_block` argument stream (text, role, style, align, paragraph_end, plus spine-boundary markers) to `XTEINK/CACHE2/<key>/CONTENT.BIN` during the full build; on a layout-config miss, replay it through the same `LibraryBlockSink` instead of re-parsing the EPUB.
 
@@ -72,4 +78,4 @@ Keep caches per layout config instead of overwriting, so flipping back to a prev
 
 Already done in the July build-path work: write staging, held-open SECTIONS dir, dirty-gated rebuilds, 8 KB read_at clamp, warm SD session reuse, style-marker dedup, OPF span strings, streamed whole-spine XHTML, ZIP central-directory hash index. V1 cache migration is disabled by design. Page-turn latency and reopen path are not software targets.
 
-Suggested order: B6 → B4 (with B5 folded in). B7 only if B6's replay measures slow; B1 only if custom fonts come into use.
+Suggested order: B6 ✓ → B4 rework (design against #41's transaction-owned open, with B5 folded in). B7 only if B6's device A/B measures replay slow; B1 closed by #37 unless custom-font builds still measure slow.

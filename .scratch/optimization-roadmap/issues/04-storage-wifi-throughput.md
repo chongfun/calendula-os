@@ -1,6 +1,8 @@
 # WS-D: Storage & Wi-Fi throughput — SD bandwidth, upload speed, session setup, onboarding
 
-Status: D1 DONE (#14 — measured: cold build −5.4%, write_ms −9.5%, progress write −35%; NOT the hoped 2×). D2 REJECTED on measurement — see below. D3 DONE as per-session runtime PSK (#19). Next: D4, then D5. D6: read the evidence file below first. NEW: upload-ceiling investigation below.
+Status: D1 DONE (#14 — measured: cold build −5.4%, write_ms −9.5%, progress write −35%; NOT the hoped 2×). D2 REJECTED on measurement — see below. D3 DONE as per-session runtime PSK (#19). Next: D4, then upload-ceiling investigation, then D5. D6: read the evidence file below first.
+
+Ground moved under this workstream 2026-07-25: WIFI.BIN is now a `proto::durable` two-generation A/B record (#29) — D4's new fields ride that framing, not a bare struct widening. D4 also absorbs strongest-AP join for duplicate SSIDs (crosspoint `e03aa163`, from the upstream sweep). #35 rewrote the portal surface D5 modifies (credentials verified by boot-path re-read after save + nearby-network scan list). #31 made the upload session interruptible via stop-request/stopped channels — new lifecycle context for the upload-ceiling investigation.
 
 Owns: `fw/src/sd_session.rs`, `fw/src/tasks/wifi.rs`, `fw/src/upload.rs`, `fw/src/sync_mem.rs`, vendored/pinned `embedded-sdmmc`.
 Note: `sd_session.rs` changes speed up WS-B's reader path too — this workstream owns the file; WS-B must not modify it.
@@ -61,10 +63,12 @@ The portal AP is open (`AccessPointConfig::default().with_ssid(PORTAL_SSID)`, `w
 
 ## D4 (Tier 2, M): Directed station join — persist channel/BSSID
 
-`Session::join` (`wifi.rs:826-851`) sets only SSID/password/auth → full all-channel scan → ~21 s (docs flag "the 20 s join timeout deserves headroom or scan tuning"; considered, never done). The pinned esp-radio `StationConfig` supports `bssid`/`channel`/scan-method. After a successful join, record channel (+ optionally BSSID) alongside credentials in `/XTEINK/WIFI.BIN` (`hal_ext::nvm::WifiCredentialsRecord` via `StorageCommand::StoreWifiCredentials`, `fw/src/tasks/display.rs:779-791`); next session does a directed join, falling back to full scan on failure (retry loop at `wifi.rs:149-159` exists).
+`Session::join` (`wifi.rs:826-851`) sets only SSID/password/auth → full all-channel scan → ~21 s (docs flag "the 20 s join timeout deserves headroom or scan tuning"; considered, never done). The pinned esp-radio `StationConfig` supports `bssid`/`channel`/scan-method. After a successful join, record channel (+ optionally BSSID) alongside credentials in `/XTEINK/WIFI.BIN` (`hal_ext::nvm::WifiCredentialsRecord` via `StorageCommand::StoreWifiCredentials`); next session does a directed join, falling back to full scan on failure (retry loop at `wifi.rs:149-159` exists).
 
-- Impact: repeat-session join ~21 s → ~3–6 s.
-- Risk: stale channel after router change must degrade gracefully without eating the 35 s JOIN_TIMEOUT twice; WIFI.BIN gains fields — keep old records readable.
+Folded in (2026-07-25, from the upstream sweep): strongest-AP join for duplicate SSIDs (crosspoint `e03aa163`) — when multiple APs advertise the saved SSID, pick the strongest instead of first-found. It shares the scan/join surface this item already touches; bundle it rather than porting separately.
+
+- Impact: repeat-session join ~21 s → ~3–6 s; better AP choice on mesh/repeater networks.
+- Risk: stale channel after router change must degrade gracefully without eating the 35 s JOIN_TIMEOUT twice. WIFI.BIN gains fields — since #29 it is a `proto::durable` two-generation record, so add fields with a version bump inside that framing; the durable layer already handles torn writes and legacy single-file fallback.
 - Verify: serial Start→Serving timestamps across repeated sessions; deliberately change router channel and confirm fallback; `sleep-sync` lifecycle regression.
 
 ## D5 (Tier 2, M): Portal → station handoff in one session
@@ -72,6 +76,7 @@ The portal AP is open (`AccessPointConfig::default().with_ssid(PORTAL_SSID)`, `w
 Today: portal captures credentials → SAVED page says "press done, then run sync again" (`wifi.rs:523-532`) → reset → reboot → user re-enters Wireless → new session → ~21 s join. `run_portal` (`wifi.rs:538-587`) never returns. Instead: after `handle_portal_request` captures credentials (`wifi.rs:676-694`), tear down portal servers, `controller.set_config` to Station on the same `WifiController`, build the STA embassy_net stack from the loaned heap (as the AP path does, `wifi.rs:558-559`), fall through to the join loop and `upload_server`. Loan/reset lifecycle unchanged — still exactly one reset at session end.
 
 - Impact: removes 3 user steps + a full reset/rejoin (~40–60 s); with D4, first-ever sync becomes one continuous flow.
+- Rebase note (2026-07-25): #35 rewrote this surface — the portal now re-reads saved credentials through the boot-time read path before reporting success (WIFI_STORAGE_RESULTS channel) and serves a nearby-network list. The handoff design must preserve verify-after-save (the STA join itself becomes the stronger verification, but the storage read-back still guards the post-reset boot) and rebase on the new portal code; the wifi.rs line references above predate it.
 - Risk: AP→STA reconfig on a live controller is the least-exercised esp-radio path — hardware validation required; two net_tasks must not both run (swap runners or quiesce AP stack first); Wireless screen needs a portal→connecting SyncEvent sequence without reboot (`fixtures/` sync-*.toml scenarios + goldens).
 - Verify: phone onboarding end-to-end on hardware (also covers the DNS sign-in-sheet path, itself flagged untested); emulator scenario + goldens; reset still restores reading position.
 

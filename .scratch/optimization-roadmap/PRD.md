@@ -1,8 +1,114 @@
 # PRD: CalendulaOS optimization roadmap
 
-Status: round 1 landed — see "Status after round 1" below for what's done, what's disproven, and the next queue
-Date: 2026-07-09 (status updated 2026-07-12)
+Status: round 2 landed — see "Status after round 2" below for the current queue
+Date: 2026-07-09 (status updated 2026-07-25)
 Author: research pass over six parallel code-survey agents (display, book pipeline, power/boot, flash/RAM, storage/Wi-Fi, web emulator), each scoped to a mostly-disjoint code region so implementation can proceed in parallel.
+
+## Status after round 2 (2026-07-25)
+
+**Landed on main since round 1:**
+
+- **A2** — byte-run rasterizer fast paths, landscape frames (#24). Goldens
+  unchanged; the on-device `page-turn` layout_ms A/B is still pending.
+  Portrait deliberately kept per-pixel — see the ranking note below.
+- **B6** — settings-independent content cache, CONT.BIN (#23). Landed with
+  review hardening (`BookPublishOutcome` distinguishes index-write failure
+  from section read-back miss). The on-device A/B (Type Size change on the
+  11.7 MB baseline book) is still pending — it also decides B7.
+- **B1's goal arrived as an upstream port** (#37, from crosspoint `8da2d42`):
+  16-slot non-ASCII metric ring, run measurement through one open pack
+  handle, whole-glyph bitmap reads. B1 leaves the queue; its remaining levers
+  (General-Punctuation slot runs, a walk-held pack handle) matter only if
+  custom-font cold builds still measure slow.
+- **Portrait is now the default orientation** (#5): `ReaderState::boot()`
+  starts in PortraitButtonsLeft and the shell was already portrait-pinned.
+  Fixtures inverted (landscape-* scenarios now cycle out of a portrait boot).
+- **Display SPI at the datasheet 20 MHz on both panels** (#42, ported from
+  freeink `9bd931e`): X3 plane writes ~25% faster; X4 refreshes pay
+  ~17–20 ms to move in spec. On-device check pending; each value is a
+  one-constant revert.
+- **Adjacent robustness wave (#25–#36, #38, #41 — not from this roadmap, but
+  it moved roadmap ground):** durable two-generation STATE/POS/WIFI.BIN
+  persistence (#29 — WIFI.BIN is now a `proto::durable` A/B-generation
+  record; D4's new fields ride that framing), book-open folded into one
+  storage-owned transaction (#41 — restructures the open flow B4 modifies),
+  portal credential verify + nearby-network list (#35 — rewrites D5's
+  `run_portal` surface), upload session interruptible by sleep/Exit (#31),
+  X3 input at interrupt priority with the gauge on its own 30 s task (#36),
+  coordinated GPIO3 wake-button handoff (#27 — supersedes the
+  `steal_wake_button` pattern C2 cites), catalog-header durability (#32),
+  u16 chapter indices (#33), FAT cluster reclaim on delete (#26), UTF-8
+  catalog labels (#25), OTA partition-layout fix (#38), web-flasher erase
+  guard (#34).
+
+**B4 is implemented but stranded:** `origin/opt/b4-progressive-open`
+(5 commits, now 19 behind main) stacks on B6's pre-review commit and
+predates both #41's single-transaction open and #29's persistence change.
+Treat the branch as a design reference, not a rebase candidate — rework the
+design against the storage-owned open transaction before re-implementing
+(issue 02).
+
+**Upstream sweep checkpoint (2026-07-25, crosspoint `d0359edf` / freeink
+`e62f6c1`):** #37 and #42 above were the ports taken. Still open from the
+sweep: strongest-AP join for duplicate SSIDs (crosspoint `e03aa163`) —
+folded into D4's scope in issue 04. The UC8279d X3 panel-variant port is
+deliberately deferred until upstream hardware-validates its driver
+(hardware enablement, not an optimization item — tracked outside this
+roadmap). Grayscale LUTs were assessed and rejected (no 2-bpp consumer, RAM
+budget, UC8279 can't use them).
+
+**Ranking directive (owner, 2026-07-25): prioritize the portrait reading
+experience.** Portrait is the default reading orientation and the shell is
+portrait-pinned, so nearly every frame the device draws goes through the
+per-pixel portrait path — the #24 fast paths only fire when a user manually
+holds landscape. That inverts A-item priorities: the portrait rasterizer is
+now the top of the queue.
+
+**Next queue (re-ranked 2026-07-25):**
+
+1. **NEW: A2-P** — portrait byte-run/strided fast paths (issue 01). Extend
+   `fill_span`/`blit_row` past their per-pixel Portrait arm
+   (`display/src/fb.rs:132,181`). Portrait rows are native columns, so the
+   design differs from #24 — candidate shapes in issue 01. Goldens must
+   pass unchanged; the equivalence-test harness already enumerates the
+   Portrait frame. The single highest-leverage portrait item.
+2. **Device bench session** — cheap, unblocks several verdicts at once:
+   portrait `page-turn` baseline (`layout_ms` has never been measured in
+   portrait; the 19–22 ms envelope below is landscape), A2 landscape A/B
+   (#24), B6 replay A/B (#23 — decides B7), #42 SPI check on both panels.
+   Run before or alongside A2-P; A2-P's win is measured against this
+   baseline.
+3. **A3** — panel-native framebuffer byte order (issue 01). Its "coordinate
+   with the portrait work" blocker is resolved; design the map-folding
+   together with A2-P so the index math is written once, land after it
+   (A2-P is goldens-unchanged, A3 re-blesses deliberately). ~10–13 ms per
+   turn and prestage on the default path; frees 8 KB.
+4. **B4 rework** — progressive first open (issue 02). Time-to-first-page on
+   the default reading flow. Redesign against #41's storage-owned open
+   transaction; the stranded branch is reference only.
+5. **C2** — deep-sleep GPIO hold + first-ever sleep-current measurement
+   (issue 03). Top non-reading item, unchanged. #27 reworked the
+   wake-button handoff the plan cites — follow the new pattern.
+6. **D4** — directed Wi-Fi join (issue 04), now also carrying strongest-AP
+   join for duplicate SSIDs (crosspoint `e03aa163`). New WIFI.BIN fields
+   ride the `proto::durable` framing from #29.
+7. **Upload-ceiling investigation** (issue 04) — unchanged; #31's
+   stop-channel session lifecycle is new context.
+8. **D5** — portal → station handoff (issue 04). #35 rewrote the portal
+   surface — rebase the design on it; verify-after-save must survive the
+   handoff.
+9. **B7** — per-config section caches (issue 02), still conditional: decide
+   from B6's device A/B, don't schedule independently.
+
+Tier 3 unchanged: A4, A5, C6, E4, F5, D6 (read its evidence file in issue
+04 first), B7 (conditional, above).
+
+**Pending on-device measurements (single bench session covers the first
+four):** portrait `page-turn` baseline; A2 landscape `layout_ms` A/B (#24);
+B6 settings-change replay A/B + corrupt-CONT.BIN fallback (#23); #42 SPI
+clocks on both panels; portrait wake-restore fallback (reachable only from
+a corrupt orientation byte — flagged untested in #5). C2 additionally needs
+the µA meter.
 
 ## Status after round 1 (2026-07-12)
 
@@ -18,56 +124,10 @@ roadmap, but they own the upload write path now), bench harness fixes (#16,
 entirety, and D1's "~2× SD bandwidth" framing (real win is 5–10% of cold
 builds; the measured evidence now lives in D1's commit message and issue 04).
 
-**Next queue (re-ranked 2026-07-12: reading-common-path items first, then
-whole-device ROI; custom-font items demoted — the owner reads with built-in
-fonts only):**
-
-1. **A2** — byte-run rasterizer fast paths (issue 01). **IMPLEMENTED
-   2026-07-12 on branch `opt/a2-byte-run-rasterizer`**: `fill_span`/`blit_row`
-   byte-run primitives on `Framebuffer`, landscape frames only, portrait
-   stays per-pixel; goldens unchanged on both boards plus
-   fast-vs-per-pixel-reference equivalence tests. Awaiting PR and the
-   on-device `page-turn` bench (`layout_ms` p95).
-2. **NEW: B6** — settings-independent content cache, CONT.BIN (issue 02).
-   **IMPLEMENTED 2026-07-12 on branch `opt/b6-content-cache`**: capture at
-   the `push_block` seam via a wrapping sink, strict-framed replay through
-   the same sink, relaxed BOOK.BIN labels/TOC loader; all check.sh gates
-   pass. Awaiting PR and the on-device A/B in the commit message (Type Size
-   change on the 11.7 MB baseline book: replay-vs-full timings, identical
-   `total=` counts, corrupt-CONT.BIN fallback still opens).
-3. **B4** — progressive first open (issue 02). **IMPLEMENTED 2026-07-12 on
-   branch `opt/b4-progressive-open`, stacked on `opt/b6-content-cache`**
-   (merge B6's PR first): first step publishes a provisional partial
-   BOOK.BIN once the requested page's section flushes; the rest of the
-   spine walk runs as self-enqueued `ContinueBookBuild` slices (~400 ms,
-   spine-boundary granularity) that rewrite the growing index and restore
-   the reader's section window each step. Resume state is RAM-only and
-   guarded (request-id, catalog identity, sleep, sync loan); dropping it
-   degrades to the pre-existing partial-book semantics. All check.sh gates
-   + `channel-stress --host` pass. Awaiting PR and on-device: `storage-cache
-   --cold` time-to-first-page, `page-turn` during a background build vs the
-   550 ms budget, mid-build sleep/reopen.
-4. **A3** — panel-native framebuffer byte order (issue 01). Reading path
-   (~10–13 ms per turn and prestage) and frees 8 KB; heavy golden re-bless;
-   coordinate with the portrait work before starting.
-5. **C2** — deep-sleep GPIO hold + first-ever sleep-current measurement
-   (issue 03). Top non-reading item: the largest standby unknown. Needs a
-   device and a µA meter.
-6. **D4** — directed Wi-Fi join (issue 04). Software-implementable; needs a
-   device for join-time A/B. WIFI.BIN gains fields — keep old records readable.
-7. **Upload-ceiling investigation** (issue 04, replaces D2's slot).
-   Measure-first: find what actually caps uploads at ~160 KB/s.
-8. **D5** — portal → station handoff (issue 04). Hardware-validation-heavy;
-   fires once per device onboarding.
-9. **B1** — custom-font metric cache (issue 02). Demoted from #1: it only
-   affects custom-font (SD font pack) cold builds, and the owner doesn't use
-   custom fonts. The spec stays current in issue 02 (unblocked by E2, S–M)
-   if that ever changes.
-
-Tier 3 unchanged (A4, A5, C6, E4, F5) except **D6**, which now has a complete
-evidence file in issue 04 — read it before deciding — and **NEW: B7**
-(per-config section caches, issue 02), which is conditional: implement only
-if B6's measured replay is still slow on device.
+**Next queue (2026-07-12) — superseded by "Status after round 2" above.**
+Of that queue: A2 merged as #24 (landscape frames), B6 merged as #23, B4's
+branch is stranded (see round-2 status), B1 was closed by upstream port #37,
+and A3/C2/D4/D5/upload-ceiling/B7 carry forward re-ranked.
 
 **docs/OPTIMIZATION_PLAN.md audit (2026-07-12):** that document (a 2026-07-05
 brainstorm predating this roadmap) was checked against main, folded in, and
@@ -103,6 +163,10 @@ the random-access `ZipStream` path.
   (busy 379), FastClean 691 ms (busy 456), prestage 33 ms, reading layout
   19–22 ms, catalog load 31 ms / 15 EPUBs, cold build 14.1 s for an 11.7 MB /
   441-page EPUB, progress write 51 ms, warm reopen (RAM hit) 13–15 ms.
+  **Stale as of 2026-07-25:** these numbers predate #42 (display SPI 20 MHz
+  — X3 plane writes ~25% faster) and the portrait default (#5) — the layout
+  figure is landscape; portrait `layout_ms` has never been measured. The
+  round-2 bench session re-baselines.
 - Observed once, unexplained (2026-07-11): X3 PON busy wait hit its 1 s
   ceiling (`PON busy_low=false 1000ms`) during sleep-entry Full refresh, then
   behaved normally. First suspect if X3 sleep entry ever misbehaves.

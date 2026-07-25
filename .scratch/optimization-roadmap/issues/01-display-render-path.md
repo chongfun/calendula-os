@@ -1,6 +1,6 @@
 # WS-A: Display render path — shave the ~50 ms of software around the 421 ms panel BUSY
 
-Status: A1 DONE (#12, incl. the wait_ready micro-fix). Next: A2 (unblocked by E2; gate on Landscape frames — portrait is active work). A3 open (coordinate with portrait first). A4/A5 hardware experiments, unscheduled.
+Status: A1 DONE (#12, incl. the wait_ready micro-fix). A2 DONE for landscape frames (#24 — goldens unchanged; on-device `layout_ms` A/B pending). NEXT, TOP PRIORITY: A2-P, the portrait extension — portrait became the default orientation (#5) and the shell is portrait-pinned, so the common path still draws per-pixel while #24's fast paths only fire on manual landscape holds. A3 unblocked (portrait landed; design its index math with A2-P, land after). A4/A5 hardware experiments, unscheduled. Baseline shift: #42 clocks both panels' display SPI at the datasheet 20 MHz — X3 plane writes ~25% faster, X4 refreshes pay ~17–20 ms; on-device check pending, each value a one-constant revert.
 
 Owns: `display/` crate, `fw/src/display_flush/`, flush/prestage region of `fw/src/tasks/display.rs`, `hal-ext/src/spi_dma.rs`.
 Do not touch: `fw/src/sd_session.rs` (WS-D), boot-init region of display task (WS-C item 2 owns the double-`init_panel` fix).
@@ -15,14 +15,22 @@ Baseline: press-to-settled 470–473 ms; 421 ms is fast-waveform BUSY (89%). Non
 - Risk check: power_task may send `DisplayCommand::Sleep` after `DisplaySettled`; sleep already handles `prev_prestaged` conservatively (display.rs:298) and commands queue behind the loop iteration.
 - Verify: `bench.py channel-stress --host`, then `page-turn --turns 50` (median drops, `prestage_ms` stays ~23). No pixel change.
 
-## A2 (Tier 2, M): Byte-run rasterizer fast paths
+## A2 (Tier 2, M): Byte-run rasterizer fast paths — DONE for landscape (#24)
 
-All drawing goes per-pixel through `set_pixel` (re-runs frame `map()` per pixel). `render::fill_rect` (`display/src/render.rs:37-49`) and `font::draw_glyph` (`display/src/font.rs:447-467`) can take byte-run paths in Landscape/LandscapeFlipped frames: whole-byte fills with masked edges; glyph rows blitted by shifting the packed MSB-first glyph row into the destination byte pair. Keep per-pixel as Portrait/odd-case fallback — Portrait mode is active work (`docs/plans/2026-07-09-portrait-mode.md`), gate on frame.
+Landed 2026-07-25: `Framebuffer::fill_span`/`blit_row` byte-run primitives, landscape frames only, with fast-vs-per-pixel-reference equivalence tests across all four frames; goldens unchanged on both boards. The on-device `page-turn` `layout_ms` A/B is still pending. Portrait deliberately kept per-pixel — that gap is now A2-P below.
 
-- Impact: Reading layout 20–36 → ~10–15 ms; menus 82–90 ms likely well under half (shortens FastClean view changes + sleep path).
-- Must be bit-exact: goldens are the oracle and must pass **unchanged** (no re-blessing).
-- Verify: emulator runner vs `fixtures/golden`, display crate tests, `page-turn` watching `layout_ms` p95 vs 60 ms budget.
-- Coordination: touches `font.rs` — sequence vs WS-E item 13 (metric struct); land 13 first or rebase.
+## A2-P (NEW, top priority, M): Portrait byte-run/strided fast paths
+
+`fill_span` and `blit_row` fall back to the per-pixel loop in `FbFrame::Portrait` (`display/src/fb.rs:132-133,181-186`) — which #5 made the default reading orientation, on top of the already portrait-pinned shell. So nearly every frame the device draws pays the slowest path, re-running the frame `map()` per pixel. Portrait's map is a transpose (`(x,y) → (WIDTH-1-y, HEIGHT-1-x)`, `fb.rs:107`): a portrait row is a native **column** — one fixed bit position walking row-strided bytes — so #24's whole-byte row runs don't apply directly. Candidate shapes, in order of likely payoff per effort:
+
+- (a) Hoist the map out of the loops: compute base byte index, bit mask, and row stride once per span / glyph row, then walk with pure adds — kills the per-pixel bounds-check + match + multiply without new geometry. Measure this first; it may capture most of the win.
+- (b) Glyphs: process 8 portrait rows per pass with an 8×8 bit-transpose so each pass writes whole destination bytes down a glyph column.
+- (c) `fill_rect`: iterate native rows (portrait columns) instead of portrait rows to recover whole-byte runs for tall fills.
+
+- Impact: unmeasured — the portrait `page-turn` `layout_ms` baseline (round-2 bench session) comes first; expectation is the same shape as A2's landscape win, applied to the path that now renders everything.
+- Must be bit-exact: goldens pass **unchanged** (no re-blessing); extend the existing fast-vs-per-pixel-reference equivalence tests — the harness in `fb.rs` already enumerates the Portrait frame.
+- Verify: emulator runner vs `fixtures/golden` on both boards, display crate tests, portrait `page-turn` watching `layout_ms` p95 vs the 60 ms budget.
+- Coordination: design the index math together with A3 so it is written once; A2-P lands first (goldens-unchanged), A3 re-blesses after.
 
 ## A3 (Tier 2, M–L): Panel-native framebuffer byte order — flush becomes a pure stream
 
@@ -30,6 +38,7 @@ Every RAM write runs `fill_transformed_band` (`display/src/epd/mod.rs:63-110`; X
 
 - Impact: ~10–13 ms per turn (BW plane), same off prestage, ~2×12 ms off Full/FastClean; +8 KB RAM.
 - Churn: `native_pixel` semantics change → emulator PNG dump/present, wasm canvas blit, and the UC8253 twin (`display/src/epd/uc8253.rs`, `tools/emulator/src/panel_uc8253.rs:248,355`, different constants — keep the seam per-panel) need the inverse transform at presentation or deliberate golden re-bless per `docs/agents/visual-verification.md`. X3 `MIRROR_Y` needs its own arm. `dram2` prev_fb slot size unchanged (fb.rs:42-49 repr(C)).
+- Portrait (updated 2026-07-25): the "coordinate with portrait" blocker is resolved — portrait landed and is the default. The fold-in must cover the Portrait arm's transpose too; design the index math together with A2-P (same surface) and land after it, since A2-P is goldens-unchanged while A3 re-blesses deliberately.
 - Verify: rewritten fb.rs unit tests, emulator vs goldens, hardware `page-turn` expecting `flush_ms` ≈ 421+~11 and `prestage_ms` ≈ 11.
 - **Supersedes** the DMA-overlap alternative (two-band pipelining, which would *spend* 8 KB). Do not implement both.
 
@@ -52,4 +61,4 @@ The 421 ms BUSY is the sensed-temperature OTP fast waveform — the only lever b
 
 Partial-window refresh (deliberately shelved ×2), SPI >40 MHz (rated ceiling), MIRROR_Y=true (tested, wrong), software work on the Full waveform ("noise" per IMPLEMENTATION_PLAN). RED prestaging already exists — A1/A3 build on it.
 
-Suggested order: A1 → A2 → A3 → A4 (verify-first) → A5 (experiment).
+Suggested order: A1 ✓ → A2 (landscape) ✓ → A2-P → A3 → A4 (verify-first) → A5 (experiment).
