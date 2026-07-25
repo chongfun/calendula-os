@@ -38,8 +38,12 @@ pub const MIRROR_X: bool = true;
 pub const MIRROR_Y: bool = false;
 pub const REVERSE_BITS: bool = true;
 
-/// Display SPI bus clock — the rated ceiling for this panel's fast refresh.
-pub const SPI_HZ: u32 = 40_000_000;
+/// Display SPI bus clock. 20 MHz is the SSD1677 datasheet write-mode
+/// maximum ("MCU interface: SPI serial peripheral, Maximum 20MHz for
+/// write") and freeink-sdk's shipping X4 value (9bd931e). This tree
+/// previously ran 40 MHz, which worked on this panel but is double the
+/// rated ceiling — in-margin, not in-spec.
+pub const SPI_HZ: u32 = 20_000_000;
 
 pub static INIT_SEQUENCE: &[SpiOp] = &[
     SpiOp::Reset,

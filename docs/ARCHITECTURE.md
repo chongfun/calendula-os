@@ -236,7 +236,7 @@ the user-facing view is always drawn from the latest already-owned snapshot.
 SD/FAT access goes through an SD session: the board I/O task deselects the
 display, clocks the bus down for the card (400 kHz identification with wake
 clocks, then 25 MHz data), opens the FAT root, performs one storage action, and
-restores 40 MHz display SPI before returning to EPD work. The card stays powered
+restores the panel's display SPI clock before returning to EPD work. The card stays powered
 between sessions while the device is awake, so only the first session runs the
 full CMD0/ACMD41 init; later ones reuse the remembered card type and skip the
 handshake, falling back to a cold init if a reused session cannot open the
@@ -291,7 +291,8 @@ transform above should stay fixed unless corruption returns.
 
 Addressing follows the OpenX4 community SDK behavior:
 
-- SPI mode 0, 40 MHz.
+- SPI mode 0, 20 MHz (the SSD1677 write-mode datasheet maximum; the OpenX4
+  SDK's 40 MHz worked only on margin).
 - BUSY is active high.
 - X window is pixel-addressed, `0..799`.
 - Y gate scan is reversed, so the full Y window is `479..0`.

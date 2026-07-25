@@ -58,10 +58,12 @@ pub const CDI_INTERVAL: u8 = 0x07;
 /// Bytes of each LUT sent to the controller.
 pub const LUT_LEN: usize = 42;
 
-/// Display SPI bus clock. CrossPoint's proven default for the UC8253;
-/// papyrix reports pixel corruption above ~20 MHz, so 16 is the safe
-/// reference value. Lower it first if the first bench frames are noisy.
-pub const SPI_HZ: u32 = 16_000_000;
+/// Display SPI bus clock. 20 MHz is the UC8253 datasheet maximum ("Clock
+/// rate up to 20MHz", serial write timing TSCYCW) and what CrossPoint ships
+/// on the X3 since 2026-07-08 (freeink-sdk 9bd931e); papyrix's corruption
+/// reports were above 20 MHz. ~25% faster plane writes than the prior
+/// 16 MHz reference value. Lower back to 16 first if bench frames are noisy.
+pub const SPI_HZ: u32 = 20_000_000;
 
 /// Panel orientation: all three transforms are applied — same as the X4's
 /// SSD1677 but with MIRROR_Y added. These values are verified on hardware:
