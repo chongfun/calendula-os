@@ -1,0 +1,34 @@
+# The Home title page in the landscape hold: the content column narrows to
+# the wide leaf and the icon key strip stands beside the left key column.
+
+# Cycle the orientation out of the boot portrait: Settings from Home, cursor
+# to the Orientation row, and one Change lands buttons-below landscape.
+# Portrait and buttons-below landscape share the direct key mapping, so every
+# press below is both physical and logical. Back returns Home.
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Back"
+
+[expect]
+view = "Home"
+orientation = "landscape-bottom"

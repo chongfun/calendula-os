@@ -87,8 +87,9 @@ Current code status:
   with the four hardware-adjacent actions on the left and the current book on
   the right. Storage-backed EPUB entries fill the same model.
 - `DisplayOrientation` exists with landscape buttons-bottom/top and portrait
-  buttons-left/right modes; default is landscape buttons-bottom. Settings exposes
-  the two landscape modes as Orientation: buttons down / buttons up.
+  buttons-left/right modes; the default is portrait buttons-left. Settings
+  exposes three of the four as Orientation: buttons down / buttons up /
+  portrait.
 - Keep app state as flat structs and render requests as small `Copy` messages.
 
 ## Phase 4: storage and EPUB

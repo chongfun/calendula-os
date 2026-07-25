@@ -286,7 +286,7 @@ enum DisplayOrientation {
 }
 ```
 
-Default reader mode is `LandscapeButtonsBottom`, but the low-level display
+Default reader mode is `PortraitButtonsLeft`, but the low-level display
 transform above should stay fixed unless corruption returns.
 
 Addressing follows the OpenX4 community SDK behavior:
@@ -562,15 +562,19 @@ The firmware now has the e-reader surfaces as explicit app state:
 - `Library`: selects a book or opens settings.
 - `Reading`: owns the active book/page position.
 - `Chapters`: selects a chapter within the current book.
-- `Settings`: cycles refresh policy, font size, line spacing, typeface, and
-  type weight. `DisplayOrientation` is persisted for future reading-layout
-  work, but it is not currently exposed as a user-facing setting.
+- `Settings`: cycles seven rows -- typeface, type size, type weight, line
+  spacing, refresh policy, `DisplayOrientation`, and the front-button layout.
+  The orientation row offers three of the four holds; the buttons-above
+  portrait variant stays in the enum for the persistence format only.
 
-Every surface renders in landscape: the X4 is held that way for its side page
-buttons, so `Home`, `Library`, and `Settings` share the reading posture rather
-than rotating into portrait. Home is cover-led: the current book is the visual
-anchor, with a restrained menu down the side for Continue, Library, Sync, and
-Settings.
+Every surface renders in one hold, so `Home`, `Library`, and `Settings` share
+the reading posture rather than rotating independently. Calendula boots into
+the portrait hold (`PortraitButtonsLeft`) as the sole documented boot default;
+the landscape holds stay in the Settings cycle for the X4's side page buttons.
+The shared orientation enum, its persisted byte values, and the cycle order
+remain preserved for saved-state compatibility. Home is cover-led: the current
+book is the visual anchor, with a restrained menu down the side for Continue,
+Library, Sync, and Settings.
 Reading mode keeps the page quiet: tiny book title, rendered-screen count within
 the chapter, symbolic battery, and a thin whole-book progress bar. Home shows a
 small battery percentage because it is a status surface. GPIO0 is sampled as the

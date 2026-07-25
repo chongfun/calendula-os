@@ -1,37 +1,7 @@
 # Portrait reading is full-bleed; the first named-key press summons the
 # key sheet over the page's bottom band rather than acting, and the reducer
 # holds it up until a key acts on its label (or a page turn dismisses it).
-
-# Cycle the orientation to portrait: Settings from Home, cursor to the
-# Orientation row, one Change lands buttons-top (flipping the mapping, so
-# the physical Previous key carries the second Change into portrait), and
-# Back returns Home.
-[[steps]]
-button = "Next"
-
-[[steps]]
-button = "Next"
-
-[[steps]]
-button = "Next"
-
-[[steps]]
-button = "Next"
-
-[[steps]]
-button = "Next"
-
-[[steps]]
-button = "Next"
-
-[[steps]]
-button = "Confirm"
-
-[[steps]]
-button = "Previous"
-
-[[steps]]
-button = "Back"
+# Portrait is the boot hold, so no orientation detour is needed.
 
 # Open the first SD book and let it load.
 [[steps]]

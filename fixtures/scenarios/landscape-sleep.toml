@@ -1,5 +1,5 @@
-# The sleep bookplate in the portrait hold: centered ceremonial furniture
-# narrowed to the upright leaf, no key rail (no key is listening).
+# The sleep bookplate in the landscape hold: centered ceremonial furniture
+# on the wide leaf, no key rail (no key is listening).
 
 [[steps]]
 button = "Next"
@@ -23,13 +23,10 @@ button = "Next"
 button = "Confirm"
 
 [[steps]]
-button = "Previous"
-
-[[steps]]
 button = "Power"
 
 [expect]
 sleeping = true
-orientation = "portrait-left"
+orientation = "landscape-bottom"
 panel_sleeping = true
 history_contains = "deep_sleep"
