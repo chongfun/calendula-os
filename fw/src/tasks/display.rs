@@ -15,9 +15,9 @@ use app_core::storage_loop::{
 };
 use app_core::{
     book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
-    DisplayOrientation, EvictionStep, EvictionWalk, HoldOutcome, LibraryEventHolder,
-    PersistedAppState, ReaderSource, RefreshPlanner, RenderKind, RenderRequest, SyncSession,
-    SyncStatus,
+    DisplayEventStep, DisplayEventWalk, DisplayOrientation, EvictionStep, EvictionWalk,
+    HoldOutcome, LibraryEventHolder, PersistedAppState, ReaderSource, RefreshPlanner, RenderKind,
+    RenderRequest, SyncSession, SyncStatus,
 };
 use core::cell::Cell;
 use core::sync::atomic::Ordering;
@@ -1426,28 +1426,40 @@ async fn send_required_power_event(event: PowerEvent) {
     }
 }
 
+/// Queues an acknowledgement the app is waiting on, making room if the
+/// channel is full.
+///
+/// It used to make room with a `try_receive` whose answer it then matched for
+/// a library event — so a head that was itself an acknowledgement came off the
+/// queue and went nowhere, which is exactly the loss this function exists to
+/// prevent. It walks the queue now; [`DisplayEventWalk`] owns what may be
+/// moved and what must go back, and is host-tested against a modelled channel.
 fn send_required_display_event(event: &DisplayEvent) {
-    const RETRIES: usize = 8;
-    for _ in 0..RETRIES {
+    let mut walk = DisplayEventWalk::new(DISPLAY_EVENTS.capacity());
+    loop {
         if DISPLAY_EVENTS.try_send(*event).is_ok() {
             return;
         }
-        // Making room by moving a library event to its own channel is only
-        // safe while the holder is free. Occupied, the move would arrive with
-        // nowhere to go and displace an event the app is already waiting on.
-        // The library event is on a path to the app either way — this channel
-        // is one the app drains — so the honest thing is to leave it where it
-        // is and let this send be the one that fails.
-        if !holder().library_event_may_move() {
+        if walk.exhausted() {
             break;
         }
-        if let Ok(DisplayEvent::Library(library_event)) = DISPLAY_EVENTS.try_receive() {
-            send_required_library_event(&library_event);
+        let Ok(head) = DISPLAY_EVENTS.try_receive() else {
+            // Unreachable: an empty channel would have taken the send above.
+            break;
+        };
+        match walk.inspect(head, &holder()) {
+            // Routed, not forced down the required path: the relocated event
+            // may be a refresh, and the library sender is what knows which.
+            DisplayEventStep::Relocate(library_event) => send_library_event(&library_event),
+            DisplayEventStep::Requeue(head) => {
+                let _ = DISPLAY_EVENTS.try_send(head);
+            }
         }
     }
-    if DISPLAY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!("display: required display event queue full");
-    }
+    esp_println::println!(
+        "display: required display event queue full, dropped {:?}",
+        event
+    );
 }
 
 /// Step one of a book-open transaction: get the departing book's page onto

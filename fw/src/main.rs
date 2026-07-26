@@ -110,11 +110,16 @@ mod views;
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
 pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 4> = Channel::new();
-// 8 slots (270 B each) is enough for the cache-build burst case: required
-// events retry with library-event eviction on a full queue (see
-// send_required_display_event), so a shorter queue costs at most extra
-// retries, and the ~2.1 KB of .bss saved widens the main stack region.
-pub static DISPLAY_EVENTS: Channel<CriticalSectionRawMutex, DisplayEvent, 8> = Channel::new();
+// 8 slots (270 B each) is enough for the cache-build burst case: a required
+// event makes room on a full queue by relocating a library event to its own
+// channel (see send_required_display_event), so a shorter queue costs at most
+// extra walking, and the ~2.1 KB of .bss saved widens the main stack region.
+// Sized from app_core so that walk cannot disagree with it about the ring.
+pub static DISPLAY_EVENTS: Channel<
+    CriticalSectionRawMutex,
+    DisplayEvent,
+    { app_core::DISPLAY_EVENT_SLOTS },
+> = Channel::new();
 // Sized from app_core so the eviction walk that makes room in this channel
 // (see send_required_library_event) cannot disagree with it about the ring.
 pub static LIBRARY_EVENTS: Channel<

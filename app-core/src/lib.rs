@@ -1230,6 +1230,84 @@ impl EvictionWalk {
     }
 }
 
+/// Slots in the display-event channel. Lives here for the same reason as
+/// [`LIBRARY_EVENT_SLOTS`]: the walk below is written against it.
+pub const DISPLAY_EVENT_SLOTS: usize = 8;
+
+/// Making room in a full display-event channel for an acknowledgement the app
+/// is waiting on, without discarding another one.
+///
+/// Same shape as [`EvictionWalk`] and the same reason for existing — a sender
+/// cannot look into the channel, so the only way to see the head is to take
+/// it off — but nothing here may be spent. Every non-library event in this
+/// channel is an acknowledgement the app is waiting on, and this walk is
+/// called *by* the only producer of them, so dropping one to make room for
+/// another gains nothing. A library event is different: it has its own
+/// channel to the same consumer, so moving it across is a relocation rather
+/// than a loss, and that is the one way a slot is freed.
+///
+/// Everything else goes straight back, and the walk stops before it repeats,
+/// so a rotation that relocates nothing leaves the queue exactly as it found
+/// it. Relocating mid-walk does move the events already requeued behind the
+/// ones not yet inspected; among acknowledgements that costs nothing, since
+/// repeated `Settled`s are interchangeable and `Asleep`/`SleepFailed` are
+/// informational.
+///
+/// RAM: two usizes, beside the one event the caller already holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayEventWalk {
+    inspected: usize,
+    capacity: usize,
+}
+
+/// What the caller does with the event it just took off the front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayEventStep {
+    /// Send it down the library channel instead; the slot it frees is the
+    /// newcomer's.
+    Relocate(LibraryEvent),
+    /// Put it straight back and look at the next one. One slot is free — the
+    /// head just came off — so the requeue always lands.
+    Requeue(DisplayEvent),
+}
+
+impl DisplayEventWalk {
+    pub const fn new(capacity: usize) -> Self {
+        Self {
+            inspected: 0,
+            capacity,
+        }
+    }
+
+    /// Whether the walk has been all the way round. Checked before taking
+    /// another event, so a walk that relocates nothing leaves the queue it
+    /// gave up on untouched.
+    pub const fn exhausted(&self) -> bool {
+        self.inspected >= self.capacity
+    }
+
+    /// Decide what to do with `head`, the event just taken off the front.
+    ///
+    /// Takes the head and hands it back inside the step, so the caller cannot
+    /// requeue something other than what it inspected — the previous version
+    /// of this decision was an `if let` on the receive, and the events its
+    /// pattern did not match went nowhere at all.
+    ///
+    /// The holder is asked here rather than by the caller: a relocation lands
+    /// in the library channel, which is the thing the holder is gating, so
+    /// this is the one place the answer can be neither forgotten nor applied
+    /// to the wrong event.
+    pub fn inspect(&mut self, head: DisplayEvent, holder: &LibraryEventHolder) -> DisplayEventStep {
+        self.inspected += 1;
+        match head {
+            DisplayEvent::Library(event) if holder.library_event_may_move() => {
+                DisplayEventStep::Relocate(event)
+            }
+            head => DisplayEventStep::Requeue(head),
+        }
+    }
+}
+
 /// The one settling event that had nowhere to go, and the standing orders the
 /// display task owes it while it waits.
 ///
@@ -3532,54 +3610,60 @@ mod tests {
         }
     }
 
-    /// The display task's channel, as far as a sender can see it: push to the
+    /// One of the task's channels, as far as a sender can see it: push to the
     /// back, take from the front, no looking inside. Only this plumbing is
-    /// modelled — the walk driven over it below is the one the firmware runs.
+    /// modelled — the walks driven over it below are the ones the firmware
+    /// runs.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct Ring {
-        slots: [Option<LibraryEvent>; LIBRARY_EVENT_SLOTS],
+    struct Ring<T: Copy + PartialEq, const N: usize> {
+        slots: [Option<T>; N],
         head: usize,
         len: usize,
     }
 
-    impl Ring {
+    type LibraryRing = Ring<LibraryEvent, LIBRARY_EVENT_SLOTS>;
+    type DisplayRing = Ring<DisplayEvent, DISPLAY_EVENT_SLOTS>;
+
+    impl<T: Copy + PartialEq, const N: usize> Ring<T, N> {
         fn new() -> Self {
             Self {
-                slots: [None; LIBRARY_EVENT_SLOTS],
+                slots: [None; N],
                 head: 0,
                 len: 0,
             }
         }
 
-        fn try_send(&mut self, event: LibraryEvent) -> bool {
-            if self.len == LIBRARY_EVENT_SLOTS {
+        fn try_send(&mut self, event: T) -> bool {
+            if self.len == N {
                 return false;
             }
-            self.slots[(self.head + self.len) % LIBRARY_EVENT_SLOTS] = Some(event);
+            self.slots[(self.head + self.len) % N] = Some(event);
             self.len += 1;
             true
         }
 
-        fn try_receive(&mut self) -> Option<LibraryEvent> {
+        fn try_receive(&mut self) -> Option<T> {
             let event = self.slots[self.head].take()?;
-            self.head = (self.head + 1) % LIBRARY_EVENT_SLOTS;
+            self.head = (self.head + 1) % N;
             self.len -= 1;
             Some(event)
         }
 
         /// Everything queued, front to back — the order the app would see.
-        fn drained(mut self) -> [Option<LibraryEvent>; LIBRARY_EVENT_SLOTS] {
-            let mut out = [None; LIBRARY_EVENT_SLOTS];
+        fn drained(mut self) -> [Option<T>; N] {
+            let mut out = [None; N];
             for slot in out.iter_mut() {
                 *slot = self.try_receive();
             }
             out
         }
 
-        fn holds(self, event: LibraryEvent) -> bool {
+        fn holds(self, event: T) -> bool {
             self.drained().contains(&Some(event))
         }
+    }
 
+    impl LibraryRing {
         fn refreshes(self) -> usize {
             self.drained()
                 .iter()
@@ -3591,7 +3675,11 @@ mod tests {
     /// The firmware's `send_required_library_event`, over the modelled ring:
     /// try the channel, then the walk, then the holder — in that order, which
     /// is the order the task uses.
-    fn send_required(queue: &mut Ring, holder: &mut LibraryEventHolder, event: LibraryEvent) {
+    fn send_required(
+        queue: &mut LibraryRing,
+        holder: &mut LibraryEventHolder,
+        event: LibraryEvent,
+    ) {
         if queue.try_send(event) {
             return;
         }
@@ -3620,12 +3708,61 @@ mod tests {
     /// The main loop's placing branch, which runs once the app has drained a
     /// slot. Only ever called where the model has made room, matching the
     /// firmware's `LIBRARY_EVENTS.send().await`.
-    fn place_held(queue: &mut Ring, holder: &mut LibraryEventHolder) {
+    fn place_held(queue: &mut LibraryRing, holder: &mut LibraryEventHolder) {
         let Some(event) = holder.pending() else {
             return;
         };
         assert!(queue.try_send(event), "the placing branch waits for room");
         assert_eq!(holder.placed(), Some(event));
+    }
+
+    /// The firmware's `send_library_event`: the required path for an event
+    /// that settles a wait, the lossy one for a refresh.
+    fn send_library(queue: &mut LibraryRing, holder: &mut LibraryEventHolder, event: LibraryEvent) {
+        if event.must_be_delivered() {
+            send_required(queue, holder, event);
+        } else {
+            queue.try_send(event);
+        }
+    }
+
+    /// The firmware's `send_required_display_event`, over the modelled
+    /// channels. Returns whether the acknowledgement was queued.
+    fn send_required_display(
+        queue: &mut DisplayRing,
+        library: &mut LibraryRing,
+        holder: &mut LibraryEventHolder,
+        event: DisplayEvent,
+    ) -> bool {
+        let mut walk = DisplayEventWalk::new(DISPLAY_EVENT_SLOTS);
+        loop {
+            if queue.try_send(event) {
+                return true;
+            }
+            if walk.exhausted() {
+                return false;
+            }
+            let Some(head) = queue.try_receive() else {
+                return false;
+            };
+            match walk.inspect(head, holder) {
+                DisplayEventStep::Relocate(library_event) => {
+                    send_library(library, holder, library_event);
+                }
+                DisplayEventStep::Requeue(head) => {
+                    queue.try_send(head);
+                }
+            }
+        }
+    }
+
+    fn display_filled(events: impl IntoIterator<Item = DisplayEvent>) -> DisplayRing {
+        let mut ring = DisplayRing::new();
+        for event in events {
+            assert!(ring.try_send(event));
+        }
+        assert_eq!(ring.len, DISPLAY_EVENT_SLOTS, "the channel starts full");
+        ring
     }
 
     /// The three questions the display task asks the holder, from three
@@ -3646,8 +3783,8 @@ mod tests {
         }
     }
 
-    fn filled(events: impl IntoIterator<Item = LibraryEvent>) -> Ring {
-        let mut ring = Ring::new();
+    fn filled(events: impl IntoIterator<Item = LibraryEvent>) -> LibraryRing {
+        let mut ring = LibraryRing::new();
         for event in events {
             assert!(ring.try_send(event));
         }
@@ -3723,6 +3860,107 @@ mod tests {
             [true; 3],
             "placing it lifts the standing orders"
         );
+    }
+
+    /// The sender used to make room with a `try_receive` it then matched for
+    /// a library event, so a head that was itself an acknowledgement came off
+    /// the queue and went nowhere. `Settled` is the one that hurts: the app
+    /// clears its render lock on it and nothing reissues it, so losing one
+    /// leaves later state changes merely pending, with no render left to
+    /// produce another acknowledgement.
+    #[test]
+    fn an_acknowledgement_at_the_head_is_not_spent_making_room() {
+        let before = display_filled([
+            DisplayEvent::Settled,
+            DisplayEvent::RefreshFailed,
+            DisplayEvent::Asleep,
+            DisplayEvent::SleepFailed,
+            DisplayEvent::Settled,
+            DisplayEvent::Settled,
+            DisplayEvent::Asleep,
+            DisplayEvent::Settled,
+        ]);
+        let mut queue = before;
+        let mut library = LibraryRing::new();
+        let mut holder = LibraryEventHolder::new();
+
+        let queued = send_required_display(
+            &mut queue,
+            &mut library,
+            &mut holder,
+            DisplayEvent::RefreshFailed,
+        );
+
+        assert!(
+            !queued,
+            "nothing in the queue may be spent, so the newcomer is the loss"
+        );
+        assert_eq!(
+            queue.drained(),
+            before.drained(),
+            "a walk that relocates nothing disturbs nothing, order included"
+        );
+    }
+
+    /// A library event is the one thing the walk may move: it has its own
+    /// channel to the same consumer, so relocating it frees a slot without
+    /// losing anything.
+    #[test]
+    fn making_room_relocates_the_library_event_and_keeps_every_ack() {
+        let mut queue = display_filled([
+            DisplayEvent::Settled,
+            DisplayEvent::Asleep,
+            DisplayEvent::Library(cleared(7)),
+            DisplayEvent::Settled,
+            DisplayEvent::Settled,
+            DisplayEvent::RefreshFailed,
+            DisplayEvent::Settled,
+            DisplayEvent::Asleep,
+        ]);
+        let mut library = LibraryRing::new();
+        let mut holder = LibraryEventHolder::new();
+
+        let queued =
+            send_required_display(&mut queue, &mut library, &mut holder, DisplayEvent::Settled);
+
+        assert!(queued, "the relocated event's slot is the newcomer's");
+        assert!(
+            library.holds(cleared(7)),
+            "the relocated event goes to the channel the app also drains"
+        );
+        assert!(!queue.holds(DisplayEvent::Library(cleared(7))));
+        let acks = queue
+            .drained()
+            .iter()
+            .filter(|queued| queued.is_some())
+            .count();
+        assert_eq!(acks, DISPLAY_EVENT_SLOTS, "no acknowledgement was spent");
+    }
+
+    /// With the holder occupied, a relocation would arrive in a channel that
+    /// has nowhere to put it, so the walk leaves library events where they
+    /// are — and then there is nothing it may move at all.
+    #[test]
+    fn a_held_event_keeps_library_events_in_the_display_queue() {
+        let before = display_filled(
+            core::iter::once(DisplayEvent::Library(cleared(7)))
+                .chain(core::iter::repeat_n(DisplayEvent::Settled, 7)),
+        );
+        let mut queue = before;
+        let mut library = LibraryRing::new();
+        let mut holder = LibraryEventHolder::new();
+        assert_eq!(holder.hold(&cleared(1)), HoldOutcome::Held);
+
+        let queued =
+            send_required_display(&mut queue, &mut library, &mut holder, DisplayEvent::Settled);
+
+        assert!(!queued);
+        assert_eq!(
+            queue.drained(),
+            before.drained(),
+            "the gate closes the walk without disturbing the queue"
+        );
+        assert_eq!(holder.pending(), Some(cleared(1)));
     }
 
     /// The gates are one rule read from three unrelated places, and the
@@ -3824,7 +4062,7 @@ mod tests {
 
     /// Empties `queue`, appending the request id of every `CacheCleared` it
     /// yields — the order the app would see them in.
-    fn drain_ids_into(queue: &mut Ring, out: &mut [Option<u32>], next: &mut usize) {
+    fn drain_ids_into(queue: &mut LibraryRing, out: &mut [Option<u32>], next: &mut usize) {
         while let Some(event) = queue.try_receive() {
             if let LibraryEvent::CacheCleared { request_id, .. } = event {
                 out[*next] = Some(request_id);
