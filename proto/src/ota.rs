@@ -729,27 +729,26 @@ pub fn parse_identity(name: &[u8]) -> Option<(&[u8], u32)> {
 /// Structural validity is not enough. The descriptor identity is what encodes
 /// the panel and the updater hand-off, so an image that merely parses as an
 /// ESP32-C3 binary can still be the wrong thing entirely: a build for the other
-/// board drives the wrong panel, and a pre-anchor build alternates slots and
-/// overwrites slot 0 on its next update — destroying the anchor this whole
-/// policy exists to keep.
+/// board drives the wrong panel, a pre-anchor build alternates slots and
+/// overwrites slot 0 on its next update, and a candidate from a different
+/// updater generation cannot be serviced by our immutable slot-0 anchor on
+/// subsequent updates.
 ///
-/// Deliberately *not* the exact match [`anchor_can_apply_update`] demands. The
-/// anchor has to run this firmware's hand-off, so it must be this generation;
-/// a staged image is the thing replacing us, and a newer generation is the
-/// normal way forward. Requiring equality here would wall off every future
-/// release from the devices that need it most. So: same board, and any
-/// generation that keeps the anchor.
+/// For the current protocol, the candidate must match the running firmware's
+/// board and updater generation: the anchor in slot 0 must be capable of
+/// applying future updates for the installed firmware.
 pub fn staged_image_is_installable(
     candidate: &[u8; APP_DESC_PROJECT_NAME_LEN],
     running_identity: &[u8],
 ) -> bool {
-    let Some((candidate_board, generation)) = parse_identity(project_name(candidate)) else {
+    let Some((candidate_board, candidate_generation)) = parse_identity(project_name(candidate))
+    else {
         return false;
     };
-    let Some((our_board, _)) = parse_identity(running_identity) else {
+    let Some((our_board, our_generation)) = parse_identity(running_identity) else {
         return false;
     };
-    candidate_board == our_board && generation >= MIN_UPDATER_GENERATION
+    candidate_board == our_board && candidate_generation == our_generation
 }
 
 pub fn anchor_can_apply_update(
@@ -2127,27 +2126,60 @@ mod tests {
         }
     }
 
-    /// A later generation is the normal way forward and must stay installable —
-    /// requiring this generation exactly would wall off every future release.
+    /// An image with a different updater generation must be rejected because an
+    /// immutable slot-0 anchor of generation u1 cannot service future updates
+    /// for a u2 image.
     #[test]
-    fn a_newer_updater_generation_is_still_installable() {
-        assert!(staged_image_is_installable(
+    fn a_different_updater_generation_is_not_installable() {
+        assert!(!staged_image_is_installable(
             &descriptor_field(b"CalendulaOS X4 u2 (MarigoldOS)"),
             X4
         ));
-        assert!(staged_image_is_installable(
+        assert!(!staged_image_is_installable(
             &descriptor_field(b"CalendulaOS X4 u17 (MarigoldOS)"),
             X4
         ));
     }
 
-    /// The anchor is judged more strictly than a staged image, on purpose: it
-    /// has to run *this* hand-off, not merely preserve some anchor.
+    /// Lifecycle test: A u1 anchor attempting to install a u2 candidate must
+    /// be rejected by `staged_image_is_installable`, preventing a one-way
+    /// upgrade that leaves slot 1 unable to use the u1 anchor on future updates.
     #[test]
-    fn the_anchor_rule_stays_stricter_than_the_staged_rule() {
-        let newer = descriptor_field(b"CalendulaOS X4 u2 (MarigoldOS)");
-        assert!(staged_image_is_installable(&newer, X4));
-        assert!(!anchor_can_apply_update(&newer, X4));
+    fn u1_anchor_rejects_u2_installation_to_prevent_one_way_upgrade_deadlock() {
+        let u1_anchor_identity = descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)");
+        let u2_candidate_identity = descriptor_field(b"CalendulaOS X4 u2 (MarigoldOS)");
+
+        // 1. Starts with a u1 anchor (running u1).
+        let running_identity = X4; // "CalendulaOS X4 u1 (MarigoldOS)"
+
+        // 2. Attempt to install u2: must be rejected.
+        assert!(
+            !staged_image_is_installable(&u2_candidate_identity, running_identity),
+            "u1 firmware must reject u2 staged image to avoid losing anchor compatibility"
+        );
+
+        // Prove that same-generation (u1) updates succeed end-to-end:
+        let u1_candidate_identity = descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)");
+        assert!(staged_image_is_installable(
+            &u1_candidate_identity,
+            running_identity
+        ));
+
+        let mut dev = Device::new(ANCHOR_SLOT, ["u1-anchor", "old-fw"], true);
+        dev.trigger = Some("u1-image");
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::WriteUpdateSlot));
+
+        // 3. Boots the resulting slot-1 image (running u1).
+        assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
+
+        // 4. Stages another update while running from slot 1.
+        dev.trigger = Some("u1-image-2");
+        let anchor_usable = anchor_can_apply_update(&u1_anchor_identity, running_identity);
+        assert!(
+            anchor_usable,
+            "u1 anchor must be usable by u1 running image"
+        );
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::BounceToAnchor));
     }
 
     #[test]
