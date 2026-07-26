@@ -52,8 +52,34 @@ pub enum ImageError {
     BadSha,
     /// Body + padding (+ SHA) length does not equal the file length.
     BadSize,
+    /// A slot image carries no SHA-256 trailer, so nothing covers its segment
+    /// headers. Only rejected for resident images — see [`validate_flash_image`].
+    NoHashTrailer,
+    /// Built for a different chip than this firmware runs on.
+    WrongChip,
+    /// A segment is laid out in a way the bootloader would refuse: a length it
+    /// cannot load, or a flash-mapped segment whose address and file offset
+    /// disagree about where in the MMU page it sits.
+    BadSegmentLayout,
     /// The source reported a read error / short read.
     Read,
+}
+
+/// `chip_id` for the ESP32-C3, the only silicon either board uses. The
+/// bootloader refuses an image stamped for another chip, so an anchor claiming
+/// one would not boot however intact it is.
+pub const EXPECTED_CHIP_ID: u16 = 5;
+
+/// Flash is mapped into the address space a 64 KiB MMU page at a time.
+const MMU_PAGE_SIZE: u32 = 0x1_0000;
+
+/// The two windows the ESP32-C3 maps flash into: data (DROM) and instruction
+/// (IROM). Segments loaded elsewhere are copied to RAM instead of mapped —
+/// including the zero-address padding segments esptool inserts — and the
+/// mapping rule below does not apply to them.
+fn is_flash_mapped(load_addr: u32) -> bool {
+    (0x3C00_0000..0x3C80_0000).contains(&load_addr)
+        || (0x4200_0000..0x4280_0000).contains(&load_addr)
 }
 
 /// One application partition discovered in the ESP-IDF partition table.
@@ -211,7 +237,22 @@ pub fn validate_image<S: ImageSource>(
             return Err(ImageError::TooLarge);
         }
     }
-    walk_image(src, image_len, Some(image_len))
+    walk_image(src, image_len, Some(image_len), Strictness::Staged)
+}
+
+/// How hard an image has to work to be believed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Strictness {
+    /// A staged file. It is about to be written to the *inactive* slot, and the
+    /// bootloader gets the final say afterwards with the anchor still intact
+    /// behind it — so a structural check is enough, and an older image without
+    /// a SHA trailer is still installable.
+    Staged,
+    /// An image already resident in a slot, being read as evidence that the
+    /// bootloader *would* boot it. Here a wrong answer is not "the update
+    /// fails", it is "we misidentify the running slot and erase ourselves", so
+    /// every condition we can cheaply reproduce is applied.
+    Resident,
 }
 
 /// Validate an image already resident in a flash partition, to the same
@@ -226,11 +267,26 @@ pub fn validate_image<S: ImageSource>(
 /// [`plan_update_action`] draws. A magic byte alone proves nothing: a flash
 /// interrupted partway through writing slot 0 leaves the first bytes intact and
 /// the tail missing.
+///
+/// # Why the SHA-256 trailer is mandatory here
+///
+/// The XOR checksum covers segment *data* only, so on its own it says nothing
+/// about the segment headers — a corrupted `load_addr` passes it untouched, and
+/// the bootloader then refuses the image we just called bootable. The SHA
+/// trailer covers every byte, headers included, which is what lets this
+/// function stand in for the bootloader's own verdict. An image without one
+/// cannot make that promise and is rejected, however intact it looks. Every
+/// image this project builds appends one.
+///
+/// The remaining conditions checked here — chip id, segment layout — are the
+/// ones a *deliberately* rewritten image could still satisfy the hash with.
+/// This is not a complete reimplementation of `esp_image_format.c`, and it
+/// cannot be: see [`plan_update_action`] for what the residual gap costs.
 pub fn validate_flash_image<S: ImageSource>(
     src: &mut S,
     partition_len: usize,
 ) -> Result<(), ImageError> {
-    walk_image(src, partition_len, None)
+    walk_image(src, partition_len, None, Strictness::Resident)
 }
 
 /// The shared segment walk. `limit` bounds how far the walk may read;
@@ -240,6 +296,7 @@ fn walk_image<S: ImageSource>(
     src: &mut S,
     limit: usize,
     exact_len: Option<usize>,
+    strictness: Strictness,
 ) -> Result<(), ImageError> {
     let mut header = [0u8; HEADER_LEN];
     src.read_exact(&mut header).map_err(|_| ImageError::Read)?;
@@ -249,6 +306,16 @@ fn walk_image<S: ImageSource>(
     let segment_count = header[1];
     // Byte 23 (`hash_appended`) flags a SHA-256 trailer over the whole image.
     let hash_appended = header[23] != 0;
+
+    if strictness == Strictness::Resident {
+        if !hash_appended {
+            return Err(ImageError::NoHashTrailer);
+        }
+        // Bytes 12..14 are `chip_id`.
+        if u16::from_le_bytes([header[12], header[13]]) != EXPECTED_CHIP_ID {
+            return Err(ImageError::WrongChip);
+        }
+    }
 
     let mut sha = Sha256::new();
     sha.update(header);
@@ -272,6 +339,24 @@ fn walk_image<S: ImageSource>(
                 as usize;
         if pos + data_len > limit {
             return Err(ImageError::BadSegments);
+        }
+
+        if strictness == Strictness::Resident {
+            let load_addr =
+                u32::from_le_bytes([seg_header[0], seg_header[1], seg_header[2], seg_header[3]]);
+            // The loader moves whole words, so a ragged segment is not loadable.
+            if !data_len.is_multiple_of(4) {
+                return Err(ImageError::BadSegmentLayout);
+            }
+            // A flash-mapped segment is not copied: the MMU points a 64 KiB page
+            // at it, so its address and its offset in the image must agree on
+            // where inside that page the segment begins. A corrupted `load_addr`
+            // — the one field the XOR checksum never covers — breaks this.
+            if is_flash_mapped(load_addr)
+                && (pos as u32) & (MMU_PAGE_SIZE - 1) != load_addr & (MMU_PAGE_SIZE - 1)
+            {
+                return Err(ImageError::BadSegmentLayout);
+            }
         }
 
         let mut remaining = data_len;
@@ -670,6 +755,18 @@ impl UpdateAction {
 /// what distinguishes the two cases, so it is checked on every path, not just
 /// before a bounce.
 ///
+/// # The residual gap
+///
+/// "Would the bootloader boot this?" is answered by
+/// [`validate_flash_image`], which is not `esp_image_format.c` and does not
+/// reproduce every condition it applies. An anchor could in principle satisfy
+/// our checks — including the SHA-256 over every byte — and still be refused by
+/// the bootloader for a reason we do not model, putting us back in the
+/// mistaken-slot case. Closing that completely means asking the hardware which
+/// partition is mapped for execution rather than inferring it, which is the
+/// right long-term answer. What is here narrows the gap to images that are
+/// bit-intact and stamped for this chip, which is not where corruption lands.
+///
 /// [`WriteUpdateSlot`]: UpdateAction::WriteUpdateSlot
 pub fn plan_update_action(active_slot: u32, anchor_usable: bool) -> UpdateAction {
     if active_slot == UPDATE_SLOT {
@@ -724,19 +821,32 @@ mod tests {
     /// Build a structurally valid ESP-IDF image with the given segment data
     /// lengths, correct XOR checksum, and (optionally) a SHA-256 trailer — the
     /// same construction the bootloader validates against.
+    /// Segment load addresses mirroring a real build: the first segment is
+    /// flash-mapped into DROM at the offset its data actually sits at (the
+    /// congruence the bootloader requires), and the rest are the zero-address
+    /// padding segments esptool emits, which are copied rather than mapped.
+    fn segment_load_addr(index: usize, data_offset: usize) -> u32 {
+        if index == 0 {
+            0x3C00_0000 + data_offset as u32
+        } else {
+            0
+        }
+    }
+
     fn build_image(segment_lens: &[usize], hash_appended: bool) -> Vec<u8> {
         let mut img = Vec::new();
         let mut header = [0u8; HEADER_LEN];
         header[0] = IMAGE_MAGIC;
         header[1] = segment_lens.len() as u8;
+        header[12..14].copy_from_slice(&EXPECTED_CHIP_ID.to_le_bytes());
         header[23] = if hash_appended { 1 } else { 0 };
         img.extend_from_slice(&header);
 
         let mut checksum = CHECKSUM_SEED;
         for (i, &len) in segment_lens.iter().enumerate() {
             let mut seg_header = [0u8; SEG_HEADER_LEN];
-            // load address (arbitrary, not validated) + data length
-            seg_header[0..4].copy_from_slice(&(0x3c00_0000u32 + i as u32).to_le_bytes());
+            let load_addr = segment_load_addr(i, img.len() + SEG_HEADER_LEN);
+            seg_header[0..4].copy_from_slice(&load_addr.to_le_bytes());
             seg_header[4..8].copy_from_slice(&(len as u32).to_le_bytes());
             img.extend_from_slice(&seg_header);
             for j in 0..len {
@@ -905,18 +1015,18 @@ mod tests {
 
     const SLOT_LEN: usize = 0x64_0000;
 
-    #[test]
-    fn accepts_a_flash_image_followed_by_partition_junk() {
-        let img = valid_image(true);
-        assert_eq!(
-            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
-            Ok(())
-        );
+    /// A slot-resident image, shaped like one the build actually produces:
+    /// every segment a whole number of words, and the mapped segment congruent
+    /// with its offset. `valid_image` deliberately is not — its ragged 513- and
+    /// 1-byte segments exist to poke the streaming chunk boundary, and the
+    /// bootloader would not load them.
+    fn resident_image(hash_appended: bool) -> Vec<u8> {
+        build_image(&[70_000, 8, 512, 4], hash_appended)
     }
 
     #[test]
-    fn accepts_a_flash_image_with_no_hash_trailer() {
-        let img = valid_image(false);
+    fn accepts_a_flash_image_followed_by_partition_junk() {
+        let img = resident_image(true);
         assert_eq!(
             validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
             Ok(())
@@ -928,7 +1038,7 @@ mod tests {
     /// wrong, which a magic-and-identity check waves through.
     #[test]
     fn rejects_a_flash_image_whose_body_is_corrupt() {
-        let mut img = valid_image(true);
+        let mut img = resident_image(true);
         let len = img.len();
         img[len / 2] ^= 0xFF;
         assert_eq!(
@@ -941,7 +1051,7 @@ mod tests {
     /// same mask cancel out in the XOR — still fails on the SHA-256 trailer.
     #[test]
     fn rejects_flash_corruption_the_checksum_cannot_see() {
-        let mut img = valid_image(true);
+        let mut img = resident_image(true);
         // Both offsets are segment data, which is what the checksum covers.
         img[HEADER_LEN + SEG_HEADER_LEN] ^= 0xFF;
         img[HEADER_LEN + SEG_HEADER_LEN + 1] ^= 0xFF;
@@ -952,20 +1062,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_flash_image_whose_checksum_is_wrong() {
-        // Without a SHA trailer the XOR checksum byte is the only body guard.
-        let mut img = valid_image(false);
-        let len = img.len();
-        img[len / 2] ^= 0xFF;
-        assert_eq!(
-            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
-            Err(ImageError::BadChecksum)
-        );
-    }
-
-    #[test]
     fn rejects_a_flash_image_with_no_magic() {
-        let mut img = valid_image(true);
+        let mut img = resident_image(true);
         img[0] = 0x00;
         assert_eq!(
             validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
@@ -987,10 +1085,106 @@ mod tests {
     /// headers claim otherwise — the bound is the partition, not a file length.
     #[test]
     fn rejects_a_flash_image_claiming_more_than_the_partition_holds() {
-        let img = valid_image(true);
+        let img = resident_image(true);
         assert_eq!(
             validate_flash_image(&mut in_partition(img, SLOT_LEN), 0x1_0000),
             Err(ImageError::BadSegments)
+        );
+    }
+
+    /// Overwrite segment 0's `load_addr` in place, leaving the segment data —
+    /// and so the XOR checksum — untouched. This is the field the checksum
+    /// never covers.
+    fn set_first_load_addr(img: &mut [u8], load_addr: u32) {
+        img[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&load_addr.to_le_bytes());
+    }
+
+    fn reseal_sha(img: &mut [u8]) {
+        let body = img.len() - SHA_TRAILER_LEN;
+        let mut sha = Sha256::new();
+        sha.update(&img[..body]);
+        let digest = sha.finalize();
+        img[body..].copy_from_slice(&digest);
+    }
+
+    /// The finding's case: same identity, intact segment data, a correct XOR
+    /// checksum, no SHA trailer — and a `load_addr` the bootloader would refuse
+    /// to map. Nothing in the image covers that field, so believing this anchor
+    /// is exactly how the updater comes to erase the slot it is running from.
+    #[test]
+    fn rejects_an_unhashed_flash_image_with_a_corrupt_load_address() {
+        let mut img = resident_image(false);
+        set_first_load_addr(&mut img, 0x3C00_1234);
+
+        // The corruption is genuinely invisible to the file-level checks: as a
+        // staged image, with its exact length known, this still validates.
+        let len = img.len();
+        assert_eq!(
+            validate_image(&mut cursor(img.clone()), len, None),
+            Ok(()),
+            "the XOR checksum cannot see a segment header"
+        );
+
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::NoHashTrailer)
+        );
+    }
+
+    /// And with the hash resealed over the bad address — the case a trailer
+    /// alone would wave through — the layout check is what refuses it.
+    #[test]
+    fn rejects_a_flash_image_whose_mapped_segment_cannot_be_mapped() {
+        let mut img = resident_image(true);
+        set_first_load_addr(&mut img, 0x3C00_1234);
+        reseal_sha(&mut img);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::BadSegmentLayout)
+        );
+    }
+
+    /// A segment that is not flash-mapped is copied to RAM, so the congruence
+    /// rule does not apply — real images carry zero-address padding segments
+    /// that would fail it. Rejecting those would refuse every genuine anchor.
+    #[test]
+    fn accepts_a_flash_image_with_unmapped_padding_segments() {
+        let img = build_image(&[70_000, 8, 512, 4], true);
+        assert!(img.len() > MIN_IMAGE_LEN);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_a_flash_image_without_a_hash_trailer() {
+        let img = resident_image(false);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::NoHashTrailer)
+        );
+    }
+
+    #[test]
+    fn rejects_a_flash_image_built_for_another_chip() {
+        let mut img = resident_image(true);
+        img[12..14].copy_from_slice(&(EXPECTED_CHIP_ID + 1).to_le_bytes());
+        reseal_sha(&mut img);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::WrongChip)
+        );
+    }
+
+    #[test]
+    fn rejects_a_flash_image_with_a_ragged_segment() {
+        // 513 bytes of data in the second segment is not a whole number of
+        // words, so the loader could not move it.
+        let img = build_image(&[70_000, 513], true);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::BadSegmentLayout)
         );
     }
 
