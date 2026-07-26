@@ -81,6 +81,9 @@ pub enum UpdateError {
     NoTrigger,
     ReadFile,
     Invalid(ImageError),
+    /// Structurally sound, but not an image this firmware may install — the
+    /// other board, or an updater generation that would overwrite the anchor.
+    ForeignImage,
     PartitionTable(ota::PartitionTableError),
     Flash,
 }
@@ -261,10 +264,10 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     let (s0, s1) = read_otadata(&mut flash, layout.otadata.offset)?;
 
     // Ask the hardware which slot is executing before believing `otadata`,
-    // which only records which slot was *requested*. When the MMU answers, the
-    // question this decision rests on is settled outright; when it does not,
-    // fall back to the request and let the anchor's validity expose a stale one
-    // (see `ota::plan_update_action`).
+    // which only records which slot was *requested*. An unresolved answer is
+    // kept as `None` rather than folded back into the request: `otadata` is
+    // wrong in exactly the case a write would erase the running firmware, so
+    // `ota::plan_update_action` refuses on it instead of guessing.
     let requested = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(ANCHOR_SLOT);
     let running = crate::mmu::running_slot(&layout);
     match running {
@@ -287,6 +290,26 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     // it was corrupt; the anchor re-validates when it does the write.
     ota::validate_image(&mut SdFile(&file), len, Some(dest_partition.size as usize))
         .map_err(UpdateError::Invalid)?;
+
+    // Structurally sound is not the same as belonging on this device. The
+    // descriptor identity is what carries the panel and the updater hand-off,
+    // and `validate_image` cannot see either: an image for the other board
+    // renamed to our trigger drives the wrong panel, and a pre-anchor build
+    // alternates slots and overwrites slot 0 on its next update — destroying
+    // the anchor this policy exists to keep. The rule is
+    // `ota::staged_image_is_installable`; this is the read that answers it.
+    let mut name = [0u8; APP_DESC_PROJECT_NAME_LEN];
+    file.seek_from_start(APP_DESC_PROJECT_NAME_OFFSET)
+        .map_err(|_| UpdateError::ReadFile)?;
+    read_file_exact(&file, &mut name).map_err(|_| UpdateError::ReadFile)?;
+    if !ota::staged_image_is_installable(&name, crate::PROJECT_NAME.as_bytes()) {
+        esp_println::println!(
+            "ota: staged image is '{}', which this firmware ({}) must not install",
+            core::str::from_utf8(ota::project_name(&name)).unwrap_or("<non-utf8>"),
+            crate::PROJECT_NAME
+        );
+        return Err(UpdateError::ForeignImage);
+    }
     file.seek_from_start(0).map_err(|_| UpdateError::ReadFile)?;
 
     // Writing the slot we are executing from would erase the running firmware
@@ -317,16 +340,19 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
             write_image(&mut flash, dest_partition.offset, &file, len)?;
         }
         UpdateAction::BounceToAnchor => {}
-        UpdateAction::NoUsableAnchor => esp_println::println!(
-            "ota: slot {} holds no firmware that could apply this update; refusing to bounce",
-            ANCHOR_SLOT
-        ),
-        UpdateAction::RunningSlotUnknown => esp_println::println!(
-            "ota: otadata selects slot {0}, but slot {0} would not boot; \
-             this firmware is running from slot {1} and writing it would erase it. Refusing",
-            ANCHOR_SLOT,
-            UPDATE_SLOT
-        ),
+        // Both refusals cover more than one situation — an anchor that cannot
+        // apply the update, or a bounce the bootloader already rejected; an
+        // unbootable anchor, or an MMU that did not answer at all. Log the
+        // inputs the decision was made from rather than a story about them.
+        UpdateAction::NoUsableAnchor | UpdateAction::RunningSlotUnknown => {
+            esp_println::println!(
+                "ota: {:?} — running {:?}, otadata requests slot {}, anchor usable {}",
+                action,
+                running,
+                requested,
+                anchor_usable
+            )
+        }
     }
 
     Ok(Staged { action, layout })

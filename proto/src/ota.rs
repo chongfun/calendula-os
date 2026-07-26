@@ -304,14 +304,17 @@ fn walk_image<S: ImageSource>(
     // Byte 23 (`hash_appended`) flags a SHA-256 trailer over the whole image.
     let hash_appended = header[23] != 0;
 
-    if strictness == Strictness::Resident {
-        if !hash_appended {
-            return Err(ImageError::NoHashTrailer);
-        }
-        // Bytes 12..14 are `chip_id`.
-        if u16::from_le_bytes([header[12], header[13]]) != EXPECTED_CHIP_ID {
-            return Err(ImageError::WrongChip);
-        }
+    // Bytes 12..14 are `chip_id`. Checked for staged images too: one built for
+    // another chip cannot run here whichever slot it is sitting in, and finding
+    // that out before the write is strictly better than after.
+    if u16::from_le_bytes([header[12], header[13]]) != EXPECTED_CHIP_ID {
+        return Err(ImageError::WrongChip);
+    }
+    // The trailer is only demanded of a resident image, whose bytes are being
+    // read as evidence about the bootloader. A staged one is about to be
+    // written to the inactive slot with the bootloader still to pass judgement.
+    if strictness == Strictness::Resident && !hash_appended {
+        return Err(ImageError::NoHashTrailer);
     }
 
     let mut sha = Sha256::new();
@@ -692,6 +695,63 @@ pub fn project_name(field: &[u8; APP_DESC_PROJECT_NAME_LEN]) -> &[u8] {
 /// foreign firmware — CrossPoint or the stock app — parked in the anchor. A
 /// bounce is automatic and unrequested, so it has to be sure the anchor will
 /// finish the job.
+/// The fixed parts of an identity: `CalendulaOS <board> u<gen> (MarigoldOS)`.
+const IDENTITY_PREFIX: &[u8] = b"CalendulaOS ";
+const IDENTITY_SUFFIX: &[u8] = b" (MarigoldOS)";
+
+/// The first updater generation that treats slot 0 as an anchor. Anything
+/// older — `u0`, or the product-only name that predates the marker — alternates
+/// slots, so installing one would destroy the anchor on its next update.
+pub const MIN_UPDATER_GENERATION: u32 = 1;
+
+/// Split an identity into its board and updater generation, or `None` if it is
+/// not one of ours at all.
+pub fn parse_identity(name: &[u8]) -> Option<(&[u8], u32)> {
+    let rest = name.strip_prefix(IDENTITY_PREFIX)?;
+    let rest = rest.strip_suffix(IDENTITY_SUFFIX)?;
+    let sep = rest.iter().rposition(|&b| b == b' ')?;
+    let (board, generation) = rest.split_at(sep);
+    let digits = generation.strip_prefix(b" u")?;
+    if board.is_empty() || digits.is_empty() {
+        return None;
+    }
+    let mut n: u32 = 0;
+    for &d in digits {
+        n = n
+            .checked_mul(10)?
+            .checked_add(d.checked_sub(b'0').filter(|v| *v < 10)? as u32)?;
+    }
+    Some((board, n))
+}
+
+/// Whether a *staged* image may be installed by this firmware.
+///
+/// Structural validity is not enough. The descriptor identity is what encodes
+/// the panel and the updater hand-off, so an image that merely parses as an
+/// ESP32-C3 binary can still be the wrong thing entirely: a build for the other
+/// board drives the wrong panel, and a pre-anchor build alternates slots and
+/// overwrites slot 0 on its next update — destroying the anchor this whole
+/// policy exists to keep.
+///
+/// Deliberately *not* the exact match [`anchor_can_apply_update`] demands. The
+/// anchor has to run this firmware's hand-off, so it must be this generation;
+/// a staged image is the thing replacing us, and a newer generation is the
+/// normal way forward. Requiring equality here would wall off every future
+/// release from the devices that need it most. So: same board, and any
+/// generation that keeps the anchor.
+pub fn staged_image_is_installable(
+    candidate: &[u8; APP_DESC_PROJECT_NAME_LEN],
+    running_identity: &[u8],
+) -> bool {
+    let Some((candidate_board, generation)) = parse_identity(project_name(candidate)) else {
+        return false;
+    };
+    let Some((our_board, _)) = parse_identity(running_identity) else {
+        return false;
+    };
+    candidate_board == our_board && generation >= MIN_UPDATER_GENERATION
+}
+
 pub fn anchor_can_apply_update(
     anchor_field: &[u8; APP_DESC_PROJECT_NAME_LEN],
     running_identity: &[u8],
@@ -2019,6 +2079,93 @@ mod tests {
     /// where a write erases the running firmware — so with no proof, nothing is
     /// written and nothing is selected, whichever slot `otadata` names and
     /// however good the anchor looks.
+    // --- Which staged images may be installed --------------------------------
+
+    #[test]
+    fn the_shipped_identities_parse() {
+        assert_eq!(parse_identity(X4), Some((&b"X4"[..], 1)));
+        assert_eq!(parse_identity(X3), Some((&b"X3"[..], 1)));
+    }
+
+    #[test]
+    fn a_current_image_for_this_board_is_installable() {
+        assert!(staged_image_is_installable(&descriptor_field(X4), X4));
+        assert!(staged_image_is_installable(&descriptor_field(X3), X3));
+    }
+
+    #[test]
+    fn an_image_for_the_other_board_is_not_installable() {
+        assert!(!staged_image_is_installable(&descriptor_field(X3), X4));
+        assert!(!staged_image_is_installable(&descriptor_field(X4), X3));
+    }
+
+    /// The failure that motivates this: a pre-anchor build still alternates
+    /// slots, so installing one destroys slot 0 on its next update.
+    #[test]
+    fn an_image_that_would_overwrite_the_anchor_is_not_installable() {
+        assert!(!staged_image_is_installable(
+            &descriptor_field(b"CalendulaOS X4 u0 (MarigoldOS)"),
+            X4
+        ));
+        assert!(!staged_image_is_installable(
+            &descriptor_field(b"CalendulaOS (MarigoldOS)"),
+            X4
+        ));
+    }
+
+    #[test]
+    fn a_foreign_image_is_not_installable() {
+        for name in [
+            &b"CrossPoint"[..],
+            b"esp-idf",
+            b"",
+            b"CalendulaOS X4 u (MarigoldOS)",
+            b"CalendulaOS X4 uX (MarigoldOS)",
+            b"CalendulaOS X4 u1",
+            b"X4 u1 (MarigoldOS)",
+        ] {
+            assert!(
+                !staged_image_is_installable(&descriptor_field(name), X4),
+                "{:?} must not be installable",
+                core::str::from_utf8(name)
+            );
+        }
+    }
+
+    /// A later generation is the normal way forward and must stay installable —
+    /// requiring this generation exactly would wall off every future release.
+    #[test]
+    fn a_newer_updater_generation_is_still_installable() {
+        assert!(staged_image_is_installable(
+            &descriptor_field(b"CalendulaOS X4 u2 (MarigoldOS)"),
+            X4
+        ));
+        assert!(staged_image_is_installable(
+            &descriptor_field(b"CalendulaOS X4 u17 (MarigoldOS)"),
+            X4
+        ));
+    }
+
+    /// The anchor is judged more strictly than a staged image, on purpose: it
+    /// has to run *this* hand-off, not merely preserve some anchor.
+    #[test]
+    fn the_anchor_rule_stays_stricter_than_the_staged_rule() {
+        let newer = descriptor_field(b"CalendulaOS X4 u2 (MarigoldOS)");
+        assert!(staged_image_is_installable(&newer, X4));
+        assert!(!anchor_can_apply_update(&newer, X4));
+    }
+
+    #[test]
+    fn a_staged_image_for_another_chip_is_rejected() {
+        let mut img = resident_image(true);
+        img[12..14].copy_from_slice(&(EXPECTED_CHIP_ID + 1).to_le_bytes());
+        let len = img.len();
+        assert_eq!(
+            validate_image(&mut cursor(img), len, None),
+            Err(ImageError::WrongChip)
+        );
+    }
+
     #[test]
     fn an_unprovable_running_slot_writes_nothing() {
         for requested in [ANCHOR_SLOT, UPDATE_SLOT] {

@@ -248,6 +248,14 @@ device. Because a slot only boots if its image verifies, an anchor that fails
 validation is proof that `otadata` is stale, and the update is refused rather
 than written.
 
+The image on the card is checked the same way before it is installed, but
+against a looser rule: it must be for **this board** and from an updater
+generation that keeps the anchor (`u1` or later). A newer generation installs
+fine — that is how upgrades arrive — but an image for the other board, a foreign
+one, or a build predating the anchor policy is refused. That last case matters:
+such a build still alternates slots, so installing it would overwrite slot 0 on
+its very next update and take the hatch with it.
+
 ### Backing out a bad update
 
 If an update lands you on a firmware that boots but misbehaves, hold
