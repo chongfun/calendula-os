@@ -172,8 +172,14 @@ Two mechanisms exist, both pioneered by CrossPoint:
 
 ## In-app update (the recovery net)
 
-Once *any* build of this firmware is running, it can update itself from the card
+Once a build of this firmware is running, it can update itself from the card
 with no computer — this is what keeps a locked unit from being a one-way trip:
+
+> [!IMPORTANT]
+> This is the path for updating *between* anchor builds. Moving an install from
+> before the anchor onto the first anchor build is a one-time migration, and it
+> has to go through a computer or the OEM updater — see
+> [Migrating an install from before the anchor](#migrating-an-install-from-before-the-anchor).
 
 1. Copy a new app image to the card root as **`FWUPDATE.BIN`** (the file
    `tools/build-release.sh` produces for X4; the `FWUPDATE.BIN` name
@@ -257,6 +263,33 @@ re-establishing the slot-0 anchor through the computer/OEM installation path.
 An image for the other board, a foreign image, or a build with a different updater
 generation is refused.
 
+### Migrating an install from before the anchor
+
+Builds from before the anchor stamp a product-only identity
+(`CalendulaOS (MarigoldOS)`, with no `<board> u<generation>`) and update by plain
+A/B alternation: they write whichever slot is inactive. So they cannot be relied
+on to put the first anchor build where it has to go, and whether the in-app path
+leaves you with a working recovery net is a coin flip you cannot see:
+
+- if the old build happened to be running from **slot 1**, its write lands in
+  slot 0, the anchor gets the new identity, and everything works from there;
+- if it happened to be running from **slot 0**, the write lands in slot 1 and
+  slot 0 keeps the old build. The new firmware boots and runs normally, but
+  every later in-app update is refused (`NoUsableAnchor`), because the anchor is
+  not an image it will hand off to — and nothing on the device can repair that,
+  since the updater never writes slot 0.
+
+**Install the first anchor build with a computer or the OEM updater.** The web
+flasher, `esptool` at `0x10000`, and `update.bin` on the card all write slot 0,
+which is what this migration needs. Then check the boot log: it prints
+`mmu: executing from slot 0`. If it says slot 1, `otadata` is still selecting the
+old build — hold **Back + Up** at reset to return to slot 0.
+
+If you already took the in-app path and updates are now being refused, the
+firmware itself is fine; reflashing to `0x10000` by either route restores the
+anchor. Release notes for the first anchor build should say so, rather than
+presenting it as an ordinary in-app update.
+
 ### Backing out a bad update
 
 If an update lands you on a firmware that boots but misbehaves, hold
@@ -282,7 +315,7 @@ Implemented and verified on host tooling:
 - [x] `cargo run` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
-      before any candidate `.bin` is written to the inactive slot. Streaming,
+      before any candidate `.bin` is written to the update slot. Streaming,
       no heap; host-tested against synthetic valid and corrupt images.
 - [x] **otadata layer** (`proto::ota`: `seq_crc`, `SelectEntry`, `plan_switch`,
       `active_app_slot`) — the OTA-slot select-entry format, the seq CRC
@@ -290,9 +323,12 @@ Implemented and verified on host tooling:
       on-device value: `seq_crc(1) == 0x4743989A`), and the slot-switch math.
       Host-tested.
 - [x] **Boot-time SD updater** (`fw::ota_update`) — on boot, `/FWUPDATE.BIN` is
-      validated, written with `esp-storage` to the inactive slot discovered
-      from the installed partition table, deleted, selected via `otadata`, and
-      the device resets into it. Only the inactive slot/sector are touched.
+      validated for structure and for descriptor identity, written with
+      `esp-storage` to the **update slot** (slot 1) located in the installed
+      partition table, deleted, selected via `otadata`, and the device resets
+      into it. A trigger found while already running from slot 1 bounces through
+      the anchor instead (see [Slot 0 is an anchor](#slot-0-is-an-anchor-not-half-of-an-ab-pair)).
+      Only the update slot and the inactive `otadata` sector are touched.
 - [x] **OTA rollback acknowledgement** (`fw::ota_update::mark_running_slot_valid`)
       — early boot rewrites an active `NEW`/`PENDING_VERIFY` select entry as
       `VALID`. This covers installs launched from CrossInk/CrossPoint's

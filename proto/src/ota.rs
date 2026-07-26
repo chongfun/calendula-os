@@ -1,6 +1,6 @@
 //! ESP-IDF application-image integrity validation.
 //!
-//! Before a candidate firmware is written into the inactive OTA slot — over the
+//! Before a candidate firmware is written into the update slot — over the
 //! SD card or the air — it must be checked as thoroughly as the bootloader
 //! would check it, because the in-app update path writes the slot raw and flips
 //! `otadata` directly (bypassing the ROM's `esp_image_verify`, which rejects our
@@ -240,10 +240,11 @@ pub fn validate_image<S: ImageSource>(
 /// How hard an image has to work to be believed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Strictness {
-    /// A staged file. It is about to be written to the *inactive* slot, and the
+    /// A staged file. It is about to be written to the update slot, and the
     /// bootloader gets the final say afterwards with the anchor still intact
-    /// behind it — so a structural check is enough, and an older image without
-    /// a SHA trailer is still installable.
+    /// behind it — so a structural check is enough here, and a SHA trailer is
+    /// not demanded. What the image *is* is settled separately, by
+    /// [`staged_image_is_installable`].
     Staged,
     /// An image already resident in a slot, being read as evidence that the
     /// bootloader *would* boot it. Here a wrong answer is not "the update
@@ -312,7 +313,7 @@ fn walk_image<S: ImageSource>(
     }
     // The trailer is only demanded of a resident image, whose bytes are being
     // read as evidence about the bootloader. A staged one is about to be
-    // written to the inactive slot with the bootloader still to pass judgement.
+    // written to the update slot with the bootloader still to pass judgement.
     if strictness == Strictness::Resident && !hash_appended {
         return Err(ImageError::NoHashTrailer);
     }
@@ -520,7 +521,8 @@ impl SelectEntry {
 /// The app OTA slot the bootloader is currently selecting, derived from the two
 /// otadata sectors. `None` means otadata is uninitialised (erased), in which
 /// case the bootloader falls back to the first app partition — treat it as slot
-/// 0. Used to pick the *inactive* slot as an update's destination.
+/// 0. This is the slot `otadata` *requests*; the slot actually executing comes
+/// from the running-slot lookup, and [`plan_update_action`] compares the two.
 pub fn active_app_slot(
     sector0: &[u8; SELECT_ENTRY_LEN],
     sector1: &[u8; SELECT_ENTRY_LEN],
@@ -757,13 +759,15 @@ pub enum UpdateAction {
     /// without erasing the running firmware. Select [`ANCHOR_SLOT`] and reset,
     /// leaving the trigger for the anchor boot to consume.
     BounceToAnchor,
-    /// Running from [`UPDATE_SLOT`] with no anchor that could apply the update.
-    /// Bouncing would move the user off their firmware and strand the update.
+    /// Running from [`UPDATE_SLOT`], and no bounce is left to try: either the
+    /// anchor could not apply the update — bouncing would move the user off
+    /// their firmware and strand it — or `otadata` already selects the anchor,
+    /// meaning the bootloader refused a bounce we already made.
     NoUsableAnchor,
-    /// `otadata` selects the anchor, but the anchor is not an image the
-    /// bootloader could have loaded — so this firmware cannot be running from
-    /// where `otadata` says it is, and the slot a write would erase may be the
-    /// one currently executing. Nothing is written.
+    /// Which slot is executing was not established: either the running-slot
+    /// lookup did not resolve, or it reports the anchor while the anchor fails
+    /// validation, which cannot both be true. The slot a write would erase may
+    /// be the one currently executing, so nothing is written.
     RunningSlotUnknown,
 }
 
@@ -789,38 +793,41 @@ impl UpdateAction {
 
 /// Decide what to do with a pending update.
 ///
-/// `active_slot` is the slot **`otadata` selects**, and `anchor_usable` whether
-/// [`ANCHOR_SLOT`] holds a complete, valid image of our own firmware identity —
-/// one that would both boot and itself apply the trigger file.
+/// `running_slot` is the slot the hardware says is executing — `None` when that
+/// cannot be resolved — `requested_slot` the slot **`otadata` selects**, and
+/// `anchor_usable` whether [`ANCHOR_SLOT`] holds a complete, valid image of our
+/// own firmware identity, one that would both boot and itself apply the trigger
+/// file.
 ///
 /// # `otadata` is a request, not a report
 ///
 /// The bootloader loads the slot `otadata` selects *only if that image
 /// verifies*; when it does not, ESP-IDF falls forward to another app partition
-/// and boots it **without** rewriting `otadata`. So a running firmware that
-/// reads `otadata` may be reading a slot it is not executing.
+/// and boots it **without** rewriting `otadata`. So a firmware that read
+/// `otadata` to learn where it was running could conclude it was on the anchor,
+/// judge the update slot idle, and erase the very image it was executing —
+/// destroying the last bootable copy on the device. That is why `running_slot`
+/// comes from the flash MMU instead, and why `None` is refused rather than
+/// filled in from `requested_slot`: the case that makes `otadata` wrong is
+/// exactly the case a write would be fatal in.
 ///
-/// That matters in exactly one direction. If `otadata` names the anchor and the
-/// anchor does not verify, the bootloader cannot have loaded it — this code is
-/// therefore executing the update slot, the very slot [`WriteUpdateSlot`]
-/// erases. Writing there would erase the running firmware mid-update and
-/// destroy the last bootable image on the device. The anchor's own validity is
-/// what distinguishes the two cases, so it is checked on every path, not just
-/// before a bounce.
+/// # What `anchor_usable` decides, and what it cannot
 ///
-/// # The residual gap
+/// With the running slot established, the anchor's validity is no longer
+/// evidence about *where we are*; it answers whether a bounce could finish the
+/// job. It is checked on every path anyway, because both remaining decisions
+/// need it: whether to hand off, and whether handing off would strand the
+/// update.
 ///
-/// "Would the bootloader boot this?" is answered by
+/// It is an optimistic answer. "Would the bootloader boot this?" is decided by
 /// [`validate_flash_image`], which is not `esp_image_format.c` and does not
-/// reproduce every condition it applies. An anchor could in principle satisfy
-/// our checks — including the SHA-256 over every byte — and still be refused by
-/// the bootloader for a reason we do not model, putting us back in the
-/// mistaken-slot case. Closing that completely means asking the hardware which
-/// partition is mapped for execution rather than inferring it, which is the
-/// right long-term answer. What is here narrows the gap to images that are
-/// bit-intact and stamped for this chip, which is not where corruption lands.
+/// reproduce every condition it applies, so an anchor can satisfy every check
+/// here — including the SHA-256 over every byte — and still be refused. That is
+/// handled after the fact rather than predicted: `otadata` selecting the anchor
+/// while the update slot is executing is a bounce the bootloader already
+/// refused, and is answered with [`NoUsableAnchor`] instead of another attempt.
 ///
-/// [`WriteUpdateSlot`]: UpdateAction::WriteUpdateSlot
+/// [`NoUsableAnchor`]: UpdateAction::NoUsableAnchor
 pub fn plan_update_action(
     running_slot: Option<u32>,
     requested_slot: u32,
