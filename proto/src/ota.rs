@@ -773,10 +773,19 @@ impl UpdateAction {
 ///
 /// [`WriteUpdateSlot`]: UpdateAction::WriteUpdateSlot
 pub fn plan_update_action(
-    running_slot: u32,
+    running_slot: Option<u32>,
     requested_slot: u32,
     anchor_usable: bool,
 ) -> UpdateAction {
+    // Fail closed, as [`may_mark_running_slot_valid`] does. Without proof of
+    // which slot is executing there is no safe write: `otadata` alone cannot
+    // supply it, since the case that makes it wrong — the bootloader falling
+    // forward — is exactly the case a write would erase the running firmware
+    // in. Inferring from the anchor's validity is not enough either, because
+    // an anchor can pass our checks and still be refused by the bootloader.
+    let Some(running_slot) = running_slot else {
+        return UpdateAction::RunningSlotUnknown;
+    };
     // A bounce that did not take. We pointed `otadata` at the anchor and reset;
     // the bootloader handed back the update slot, so the anchor satisfied our
     // checks and failed its own. `validate_flash_image` is not
@@ -1608,7 +1617,7 @@ mod tests {
     #[test]
     fn an_update_from_the_anchor_writes_the_update_slot() {
         assert_eq!(
-            plan_update_action(ANCHOR_SLOT, ANCHOR_SLOT, true),
+            plan_update_action(Some(ANCHOR_SLOT), ANCHOR_SLOT, true),
             UpdateAction::WriteUpdateSlot
         );
         // The anchor's contents are *not* irrelevant here, even though nothing
@@ -1620,7 +1629,7 @@ mod tests {
     #[test]
     fn an_update_from_the_update_slot_bounces_through_a_usable_anchor() {
         assert_eq!(
-            plan_update_action(UPDATE_SLOT, UPDATE_SLOT, true),
+            plan_update_action(Some(UPDATE_SLOT), UPDATE_SLOT, true),
             UpdateAction::BounceToAnchor
         );
     }
@@ -1628,7 +1637,7 @@ mod tests {
     #[test]
     fn a_foreign_anchor_is_refused_rather_than_bounced_into() {
         assert_eq!(
-            plan_update_action(UPDATE_SLOT, UPDATE_SLOT, false),
+            plan_update_action(Some(UPDATE_SLOT), UPDATE_SLOT, false),
             UpdateAction::NoUsableAnchor
         );
     }
@@ -1648,11 +1657,11 @@ mod tests {
     #[test]
     fn an_unbootable_anchor_means_otadata_is_not_where_we_are_running() {
         assert_eq!(
-            plan_update_action(ANCHOR_SLOT, ANCHOR_SLOT, false),
+            plan_update_action(Some(ANCHOR_SLOT), ANCHOR_SLOT, false),
             UpdateAction::RunningSlotUnknown
         );
         assert_eq!(
-            plan_update_action(ANCHOR_SLOT, ANCHOR_SLOT, false).selects_slot(),
+            plan_update_action(Some(ANCHOR_SLOT), ANCHOR_SLOT, false).selects_slot(),
             None,
             "a write here would erase the running firmware"
         );
@@ -1792,6 +1801,30 @@ mod tests {
             dev
         }
 
+        /// The slot `otadata` asks for, or `None` when both sectors are erased.
+        fn requested(&self) -> Option<u32> {
+            active_app_slot(&self.sectors[0], &self.sectors[1], 2)
+        }
+
+        /// `ota_state` of the entry the bootloader would use.
+        fn active_state(&self) -> u32 {
+            active_select_entry(&self.sectors[0], &self.sectors[1])
+                .expect("otadata should be initialised")
+                .1
+                .ota_state
+        }
+
+        /// The boot-time mark-valid step, in `fw::main`'s position: before the
+        /// update check, and only with proof we run the slot otadata names.
+        fn mark_valid_step(&mut self) {
+            if !may_mark_running_slot_valid(Some(self.running_slot()), self.requested()) {
+                return;
+            }
+            if let Some(sw) = plan_mark_app_valid(&self.sectors[0], &self.sectors[1]) {
+                self.sectors[sw.target_sector] = sw.entry.to_bytes();
+            }
+        }
+
         /// The slot `otadata` *asks* for.
         fn active(&self) -> u32 {
             active_app_slot(&self.sectors[0], &self.sectors[1], 2).unwrap_or(ANCHOR_SLOT)
@@ -1818,13 +1851,14 @@ mod tests {
         /// bearing on any rule in this module, and simulating it here would
         /// only be re-asserting `fw` code from `proto`.
         fn boot(&mut self) -> Boot {
+            self.mark_valid_step();
             let active = self.active();
             let running = self.running_slot();
             let Some(image) = self.trigger else {
-                return Boot::Ran(active);
+                return Boot::Ran(running);
             };
 
-            let action = plan_update_action(running, active, self.anchor_usable);
+            let action = plan_update_action(Some(running), active, self.anchor_usable);
             if action == UpdateAction::WriteUpdateSlot {
                 // The invariant the whole slot policy exists to protect. An
                 // erase of the executing slot destroys the running firmware
@@ -1911,19 +1945,95 @@ mod tests {
         assert_eq!(dev.trigger, None, "the retry loop ends by consuming it");
         assert_eq!(dev.slots, ["anchor-fw", "good-fw"], "nothing was written");
 
-        // Boot 3 and onwards: no trigger, so no reset — the device just runs.
-        assert_eq!(dev.boot(), Boot::Ran(ANCHOR_SLOT));
+        // Boot 3 and onwards: no trigger, so no reset. It runs from slot 1 —
+        // where the bootloader put it — not the slot otadata still names.
+        assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
+    }
+
+    /// The other half of a failed bounce. `plan_switch` writes `OTA_IMG_NEW`,
+    /// so the entry naming the anchor is unconfirmed when the bootloader
+    /// refuses it and hands back the update slot. The next boot's mark-valid
+    /// step would then stamp `VALID` on the slot that just failed to boot —
+    /// recording that a dead image had run successfully. It must not.
+    #[test]
+    fn a_failed_bounce_never_blesses_the_slot_that_would_not_boot() {
+        let mut dev = Device::new(UPDATE_SLOT, ["anchor-fw", "good-fw"], true);
+        dev.anchor_boots = false;
+        dev.trigger = Some("new-fw");
+
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::BounceToAnchor));
+        assert_eq!(dev.active(), ANCHOR_SLOT);
+        assert_eq!(
+            dev.active_state(),
+            OTA_IMG_NEW,
+            "the bounce leaves the anchor's entry unconfirmed"
+        );
+
+        // The bootloader refuses the anchor; we wake up on the update slot with
+        // otadata still naming slot 0, and its entry still unconfirmed.
+        assert_eq!(dev.running_slot(), UPDATE_SLOT);
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::NoUsableAnchor));
+        assert_eq!(
+            dev.active_state(),
+            OTA_IMG_NEW,
+            "an image the bootloader rejected must never be marked valid"
+        );
+
+        // Nor on any later boot, with the trigger gone.
+        dev.boot();
+        assert_eq!(dev.active_state(), OTA_IMG_NEW);
+    }
+
+    /// The ordinary case still confirms: a normal update lands, and the boot
+    /// after it marks the slot it is genuinely running valid.
+    #[test]
+    fn a_landed_update_is_marked_valid_on_the_next_boot() {
+        let mut dev = Device::new(ANCHOR_SLOT, ["anchor-fw", "old-fw"], true);
+        dev.trigger = Some("new-fw");
+
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::WriteUpdateSlot));
+        assert_eq!(dev.active(), UPDATE_SLOT);
+        assert_eq!(dev.active_state(), OTA_IMG_NEW, "not yet confirmed");
+
+        assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
+        assert_eq!(
+            dev.active_state(),
+            OTA_IMG_VALID,
+            "the slot we are actually running gets confirmed"
+        );
     }
 
     #[test]
     fn a_failed_bounce_never_reports_a_bounce() {
         // The finding's exact shape: anchor approved, otadata asks for slot 0,
         // the MMU says slot 1 is executing.
-        let action = plan_update_action(UPDATE_SLOT, ANCHOR_SLOT, true);
+        let action = plan_update_action(Some(UPDATE_SLOT), ANCHOR_SLOT, true);
         assert_ne!(action, UpdateAction::BounceToAnchor);
         assert_eq!(action, UpdateAction::NoUsableAnchor);
         assert!(action.consumes_trigger());
         assert_eq!(action.selects_slot(), None);
+    }
+
+    /// An unresolved MMU lookup must not fall back to `otadata`. `otadata` is
+    /// wrong precisely when the bootloader fell forward, and that is the case
+    /// where a write erases the running firmware — so with no proof, nothing is
+    /// written and nothing is selected, whichever slot `otadata` names and
+    /// however good the anchor looks.
+    #[test]
+    fn an_unprovable_running_slot_writes_nothing() {
+        for requested in [ANCHOR_SLOT, UPDATE_SLOT] {
+            for anchor_usable in [true, false] {
+                let action = plan_update_action(None, requested, anchor_usable);
+                assert_eq!(
+                    action,
+                    UpdateAction::RunningSlotUnknown,
+                    "requested={requested} anchor_usable={anchor_usable}"
+                );
+                assert_ne!(action, UpdateAction::WriteUpdateSlot);
+                assert_eq!(action.selects_slot(), None, "otadata must not move");
+                assert!(action.consumes_trigger(), "and it must not re-run");
+            }
+        }
     }
 
     #[test]

@@ -36,8 +36,11 @@ fn running_flash_offset() -> Option<u32> {
 }
 
 /// The app slot this firmware is running from, or `None` if the mapping does
-/// not resolve into one — in which case the caller must fall back to inferring
-/// it, and must not assume the other slot is idle.
+/// not resolve into one. `None` is not a licence to fall back to `otadata`:
+/// `otadata` is wrong exactly when the bootloader fell forward, which is the
+/// case a write would erase the running firmware in. Callers must refuse — see
+/// [`ota::plan_update_action`] and [`ota::may_mark_running_slot_valid`], which
+/// both fail closed on it.
 pub fn running_slot(layout: &ota::OtaLayout) -> Option<u32> {
     let slot = ota::slot_containing(layout, running_flash_offset()?);
     match slot {

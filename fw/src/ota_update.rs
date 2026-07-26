@@ -266,19 +266,20 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     // fall back to the request and let the anchor's validity expose a stale one
     // (see `ota::plan_update_action`).
     let requested = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(ANCHOR_SLOT);
-    let running = match crate::mmu::running_slot(&layout) {
-        Some(running) => {
-            if running != requested {
-                esp_println::println!(
-                    "ota: otadata requests slot {} but slot {} is executing; trusting the MMU",
-                    requested,
-                    running
-                );
-            }
+    let running = crate::mmu::running_slot(&layout);
+    match running {
+        Some(running) if running != requested => esp_println::println!(
+            "ota: otadata requests slot {} but slot {} is executing; trusting the MMU",
+            requested,
             running
-        }
-        None => requested,
-    };
+        ),
+        // Deliberately *not* falling back to `requested`: see
+        // `ota::plan_update_action`, which refuses rather than guess.
+        None => esp_println::println!(
+            "ota: cannot prove which slot is executing; refusing to write either"
+        ),
+        Some(_) => {}
+    }
 
     // Pass 1: prove the whole image before touching flash — and before any
     // decision to reboot. Validating ahead of the bounce below is what keeps a
@@ -304,7 +305,9 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     match action {
         UpdateAction::WriteUpdateSlot => {
             esp_println::println!(
-                "ota: running slot {}, writing slot {} at {:#x} ({} bytes)",
+                // Reaching this arm means the MMU resolved the running slot and
+                // it is not the update slot, so `running` is `Some(ANCHOR_SLOT)`.
+                "ota: running slot {:?}, writing slot {} at {:#x} ({} bytes)",
                 running,
                 UPDATE_SLOT,
                 dest_partition.offset,
