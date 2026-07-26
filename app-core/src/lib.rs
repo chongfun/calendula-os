@@ -279,9 +279,17 @@ impl RefreshPlanner {
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
-        // Only the library list actually redraws when the scan count moves;
-        // other views repaint identical pixels and can ride the partial.
-        request.view == AppView::Library && request.library_count != last.library_count
+        // Only the library list actually redraws when these move; other views
+        // repaint identical pixels and can ride the partial.
+        if request.view != AppView::Library {
+            return false;
+        }
+        // The actions sheet is a bordered card drawn over the lower rows, and
+        // every step of it uncovers or covers text: the card appearing and
+        // going away, the key rail relabelling beside it, the footer turning
+        // from the position line into the wait and then the note. A fast diff
+        // leaves the rows underneath ghosted through it.
+        request.library_count != last.library_count || request.library_menu != last.library_menu
     }
 }
 
@@ -300,7 +308,7 @@ pub struct RenderRequest {
     /// over the page's bottom band.
     pub reading_sheet: bool,
     /// The Library per-book actions sheet's progress; renderers draw the
-    /// sheet, relabel the key rail, and show the question or its note.
+    /// sheet, relabel the key rail, and show the wait or its note.
     pub library_menu: LibraryMenu,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
@@ -4175,6 +4183,51 @@ mod tests {
         request.selection = 1;
 
         assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+    }
+
+    /// Every step of the actions sheet covers or uncovers list rows, so each
+    /// one earns the one-flicker clean rather than ghosting through a partial.
+    #[test]
+    fn refresh_plan_cleans_for_every_library_menu_step() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = in_library(1, 4);
+        let mut last = state.render_request(RenderKind::Page);
+        planner.record_render(last, RefreshMode::Full);
+
+        for button in [
+            Button::PagePrevious, // None -> Sheet: the card covers the rows
+            Button::Confirm,      // Sheet -> Busy: rail and footer change
+        ] {
+            state = press(state, button);
+            let request = state.render_request(RenderKind::Page);
+            assert_ne!(request.library_menu, last.library_menu);
+            assert_eq!(
+                planner.mode_for(request),
+                RefreshMode::FastClean,
+                "{:?} -> {:?} redraws the list area",
+                last.library_menu,
+                request.library_menu
+            );
+            planner.record_render(request, RefreshMode::FastClean);
+            last = request;
+        }
+
+        // Settling swaps the footer note in place...
+        let settled = state.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id: outstanding(state),
+                ok: true,
+            },
+        );
+        let request = settled.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
+
+        // ...and the next press takes the whole card back off the rows.
+        let dismissed = press(settled, Button::Next).render_request(RenderKind::Page);
+        assert_eq!(dismissed.library_menu, LibraryMenu::None);
+        assert_eq!(planner.mode_for(dismissed), RefreshMode::FastClean);
     }
 
     #[test]
