@@ -259,7 +259,26 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     // offset and size from the table the bootloader will actually use.
     let dest_partition = layout.slots[UPDATE_SLOT as usize];
     let (s0, s1) = read_otadata(&mut flash, layout.otadata.offset)?;
-    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(ANCHOR_SLOT);
+
+    // Ask the hardware which slot is executing before believing `otadata`,
+    // which only records which slot was *requested*. When the MMU answers, the
+    // question this decision rests on is settled outright; when it does not,
+    // fall back to the request and let the anchor's validity expose a stale one
+    // (see `ota::plan_update_action`).
+    let requested = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(ANCHOR_SLOT);
+    let active = match crate::mmu::running_slot(&layout) {
+        Some(running) => {
+            if running != requested {
+                esp_println::println!(
+                    "ota: otadata requests slot {} but slot {} is executing; trusting the MMU",
+                    requested,
+                    running
+                );
+            }
+            running
+        }
+        None => requested,
+    };
 
     // Pass 1: prove the whole image before touching flash — and before any
     // decision to reboot. Validating ahead of the bounce below is what keeps a
@@ -527,6 +546,23 @@ pub fn mark_running_slot_valid() {
         Ok(v) => v,
         Err(_) => return,
     };
+
+    // Marking "the running slot" valid is only honest if we are running the
+    // slot otadata names. After a fall-forward we are not, and confirming that
+    // entry would bless an image that just failed to boot — cementing the state
+    // instead of leaving it for `plan_update_action` to notice.
+    let running = crate::mmu::running_slot(&layout);
+    if let (Some(running), Some(requested)) = (running, ota::active_app_slot(&s0, &s1, OTA_COUNT)) {
+        if running != requested {
+            esp_println::println!(
+                "ota: otadata requests slot {} but slot {} is executing; not marking it valid",
+                requested,
+                running
+            );
+            return;
+        }
+    }
+
     let Some(valid) = ota::plan_mark_app_valid(&s0, &s1) else {
         return;
     };

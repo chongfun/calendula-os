@@ -70,9 +70,6 @@ pub enum ImageError {
 /// one would not boot however intact it is.
 pub const EXPECTED_CHIP_ID: u16 = 5;
 
-/// Flash is mapped into the address space a 64 KiB MMU page at a time.
-const MMU_PAGE_SIZE: u32 = 0x1_0000;
-
 /// The two windows the ESP32-C3 maps flash into: data (DROM) and instruction
 /// (IROM). Segments loaded elsewhere are copied to RAM instead of mapped —
 /// including the zero-address padding segments esptool inserts — and the
@@ -781,6 +778,55 @@ pub fn plan_update_action(active_slot: u32, anchor_usable: bool) -> UpdateAction
     } else {
         UpdateAction::RunningSlotUnknown
     }
+}
+
+// ---------------------------------------------------------------------------
+// Which slot is *executing*
+//
+// `otadata` records the slot the bootloader was asked to boot. To learn the one
+// it actually booted, translate a mapped code address back to a flash offset
+// through the ESP32-C3's flash MMU — what ESP-IDF's `spi_flash_cache2phys()`
+// does, and what FreeInk's RecoveryBoot gets from `esp_ota_get_running_
+// partition()`. esp-hal exposes no equivalent, so the arithmetic lives here
+// (host-testable) and `fw::mmu` supplies the one volatile register read.
+//
+// Every constant below was confirmed on an X3: see the tests, which assert the
+// exact vaddr/entry pairs observed there against the offsets the ESP-IDF
+// bootloader itself reported loading from.
+
+/// Bytes of flash one MMU entry maps.
+pub const MMU_PAGE_SIZE: u32 = 0x1_0000;
+/// Entries in the C3's table. IBUS and DBUS share it, so the linker keeps their
+/// virtual addresses from colliding within the 8 MiB window it covers.
+pub const MMU_ENTRY_COUNT: u32 = 128;
+/// Offset within that window; `MMU_ENTRY_COUNT * MMU_PAGE_SIZE - 1`.
+const MMU_VADDR_MASK: u32 = 0x7F_FFFF;
+/// Set on an entry that maps nothing. Observed as exactly `0x100` on hardware.
+const MMU_INVALID_BIT: u32 = 0x100;
+/// Selects the physical page number from a valid entry.
+const MMU_PAGE_MASK: u32 = 0xFF;
+
+/// The MMU table index that maps `vaddr`.
+pub fn mmu_index(vaddr: u32) -> u32 {
+    (vaddr & MMU_VADDR_MASK) / MMU_PAGE_SIZE
+}
+
+/// Resolve `vaddr` to a flash offset given the MMU table `entry` that maps it.
+/// `None` when the entry maps nothing.
+pub fn mmu_flash_offset(vaddr: u32, entry: u32) -> Option<u32> {
+    if entry & MMU_INVALID_BIT != 0 {
+        return None;
+    }
+    Some((entry & MMU_PAGE_MASK) * MMU_PAGE_SIZE + (vaddr % MMU_PAGE_SIZE))
+}
+
+/// The app slot holding `offset`, if it falls in one.
+pub fn slot_containing(layout: &OtaLayout, offset: u32) -> Option<u32> {
+    layout
+        .slots
+        .iter()
+        .position(|p| offset >= p.offset && offset - p.offset < p.size)
+        .map(|i| i as u32)
 }
 
 /// Whether a held recovery combo should repoint `otadata` at the anchor.
@@ -1581,6 +1627,72 @@ mod tests {
         );
         assert_eq!(UpdateAction::NoUsableAnchor.selects_slot(), None);
         assert_eq!(UpdateAction::RunningSlotUnknown.selects_slot(), None);
+    }
+
+    // --- MMU translation, against values captured from an X3 ----------------
+    //
+    // The device was running the probe build from slot 1 (0x650000). Its
+    // ESP-IDF bootloader reported, and the probe read back:
+    //
+    //   segment 0: paddr=0x650020 vaddr=0x3c000020   (DROM)
+    //   segment 4: paddr=0x930020 vaddr=0x422e0020   (IROM)
+    //   boot: Loaded app from partition at offset 0x650000
+    //
+    //   rodata vaddr 0x3c00aab9 -> table[0]  = 0x65
+    //   code   vaddr 0x423175e0 -> table[49] = 0x96
+    //
+    // These are the numbers, not a model of them.
+
+    #[test]
+    fn the_mmu_index_matches_the_hardware_capture() {
+        assert_eq!(mmu_index(0x3C00_AAB9), 0);
+        assert_eq!(mmu_index(0x4231_75E0), 49);
+        // The IROM segment base the bootloader mapped, at table[46] = 0x93.
+        assert_eq!(mmu_index(0x422E_0020), 46);
+    }
+
+    #[test]
+    fn the_mmu_resolves_the_addresses_the_bootloader_mapped() {
+        // rodata: slot 1 + 0xaab9, inside the DROM segment at paddr 0x650020.
+        assert_eq!(mmu_flash_offset(0x3C00_AAB9, 0x65), Some(0x65_AAB9));
+        // code: offset 0x375c0 into the IROM segment at paddr 0x930020.
+        assert_eq!(mmu_flash_offset(0x4231_75E0, 0x96), Some(0x96_75E0));
+        assert_eq!(0x93_0020 + 0x3_75C0, 0x96_75E0);
+    }
+
+    #[test]
+    fn an_unmapped_entry_resolves_to_nothing() {
+        // Every entry past the image read exactly this on hardware.
+        assert_eq!(mmu_flash_offset(0x4231_75E0, 0x100), None);
+    }
+
+    /// The whole point: the addresses above identify slot 1, which is what the
+    /// bootloader said it loaded — not slot 0, which `otadata` could name.
+    #[test]
+    fn the_captured_addresses_identify_the_slot_the_bootloader_loaded() {
+        let layout = OtaLayout {
+            otadata: AppPartition {
+                offset: 0xE000,
+                size: 0x2000,
+            },
+            slots: [
+                AppPartition {
+                    offset: 0x1_0000,
+                    size: 0x64_0000,
+                },
+                AppPartition {
+                    offset: 0x65_0000,
+                    size: 0x64_0000,
+                },
+            ],
+        };
+        for vaddr_entry in [(0x3C00_AAB9u32, 0x65u32), (0x4231_75E0, 0x96)] {
+            let off = mmu_flash_offset(vaddr_entry.0, vaddr_entry.1).unwrap();
+            assert_eq!(slot_containing(&layout, off), Some(UPDATE_SLOT));
+        }
+        // Sanity: the anchor's own first page still resolves to the anchor.
+        assert_eq!(slot_containing(&layout, 0x1_0000), Some(ANCHOR_SLOT));
+        assert_eq!(slot_containing(&layout, 0x0_F000), None);
     }
 
     #[test]
