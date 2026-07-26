@@ -1397,6 +1397,14 @@ fn take_held_library_event() -> Option<LibraryEvent> {
     HELD_LIBRARY_EVENT.lock(|held| held.take())
 }
 
+/// Prefers the display channel so the event keeps its order against the render
+/// acknowledgements, and falls back to the library channel when it is full.
+///
+/// The fallback routes by `must_be_delivered` like every other send. It used
+/// to go straight to the required path, which let a refresh-only event take
+/// the holder — and the holder being occupied is what stops the very next
+/// `Settled` from making room for itself, so a droppable event could strand
+/// the app's render lock.
 fn send_loaded_library_event(event: &LibraryEvent) {
     if DISPLAY_EVENTS
         .try_send(DisplayEvent::Library(*event))
@@ -1404,7 +1412,7 @@ fn send_loaded_library_event(event: &LibraryEvent) {
     {
         return;
     }
-    send_required_library_event(event);
+    send_library_event(event);
 }
 
 /// Power acknowledgements get a bounded-wait send instead of a silent
