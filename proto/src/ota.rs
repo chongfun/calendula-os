@@ -322,7 +322,14 @@ fn walk_image<S: ImageSource>(
 
     let mut buf = [0u8; STREAM_CHUNK];
     for _ in 0..segment_count {
-        if pos + SEG_HEADER_LEN > limit {
+        // `pos` advances by header-controlled lengths, and `usize` is 32 bits on
+        // the device: a corrupt `data_len` can carry these sums past the end of
+        // the address space, where a release build wraps silently and would slip
+        // past the bound. Overflow is itself proof the segments are nonsense.
+        if pos
+            .checked_add(SEG_HEADER_LEN)
+            .is_none_or(|end| end > limit)
+        {
             return Err(ImageError::BadSegments);
         }
         let mut seg_header = [0u8; SEG_HEADER_LEN];
@@ -334,7 +341,7 @@ fn walk_image<S: ImageSource>(
         let data_len =
             u32::from_le_bytes([seg_header[4], seg_header[5], seg_header[6], seg_header[7]])
                 as usize;
-        if pos + data_len > limit {
+        if pos.checked_add(data_len).is_none_or(|end| end > limit) {
             return Err(ImageError::BadSegments);
         }
 
@@ -765,8 +772,22 @@ impl UpdateAction {
 /// bit-intact and stamped for this chip, which is not where corruption lands.
 ///
 /// [`WriteUpdateSlot`]: UpdateAction::WriteUpdateSlot
-pub fn plan_update_action(active_slot: u32, anchor_usable: bool) -> UpdateAction {
-    if active_slot == UPDATE_SLOT {
+pub fn plan_update_action(
+    running_slot: u32,
+    requested_slot: u32,
+    anchor_usable: bool,
+) -> UpdateAction {
+    // A bounce that did not take. We pointed `otadata` at the anchor and reset;
+    // the bootloader handed back the update slot, so the anchor satisfied our
+    // checks and failed its own. `validate_flash_image` is not
+    // `esp_image_format.c` and never will be, so this is reachable — and
+    // bouncing again would only repeat the reset, forever. Refuse instead, and
+    // let the trigger go: the way out is a computer or the OEM updater writing
+    // slot 0, exactly as for any other unusable anchor.
+    if requested_slot == ANCHOR_SLOT && running_slot == UPDATE_SLOT {
+        return UpdateAction::NoUsableAnchor;
+    }
+    if running_slot == UPDATE_SLOT {
         return if anchor_usable {
             UpdateAction::BounceToAnchor
         } else {
@@ -778,6 +799,18 @@ pub fn plan_update_action(active_slot: u32, anchor_usable: bool) -> UpdateAction
     } else {
         UpdateAction::RunningSlotUnknown
     }
+}
+
+/// Whether a mark-valid may proceed: only when the running slot is known *and*
+/// is the one `otadata` selects.
+///
+/// Fails closed. `plan_mark_app_valid` blesses the entry `otadata` names, so
+/// running it without proof we are executing that slot risks confirming an
+/// image the bootloader just rejected — the precise case the running-slot
+/// lookup exists to catch, and precisely when that lookup returning `None`
+/// would otherwise wave it through.
+pub fn may_mark_running_slot_valid(running: Option<u32>, requested: Option<u32>) -> bool {
+    matches!((running, requested), (Some(r), Some(q)) if r == q)
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,7 +1228,7 @@ mod tests {
     /// that would fail it. Rejecting those would refuse every genuine anchor.
     #[test]
     fn accepts_a_flash_image_with_unmapped_padding_segments() {
-        let img = build_image(&[70_000, 8, 512, 4], true);
+        let img = resident_image(true);
         assert!(img.len() > MIN_IMAGE_LEN);
         assert_eq!(
             validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
@@ -1231,6 +1264,20 @@ mod tests {
         assert_eq!(
             validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
             Err(ImageError::BadSegmentLayout)
+        );
+    }
+
+    /// A `data_len` near `u32::MAX` makes `pos + data_len` wrap on the device's
+    /// 32-bit `usize`, where a release build does not trap. Unchecked, the sum
+    /// lands back below `limit` and the walk sails past its own bound.
+    #[test]
+    fn rejects_a_segment_length_that_would_overflow_the_walk() {
+        let mut img = resident_image(true);
+        // Segment 0's length field, immediately after the image header.
+        img[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::BadSegments)
         );
     }
 
@@ -1561,7 +1608,7 @@ mod tests {
     #[test]
     fn an_update_from_the_anchor_writes_the_update_slot() {
         assert_eq!(
-            plan_update_action(ANCHOR_SLOT, true),
+            plan_update_action(ANCHOR_SLOT, ANCHOR_SLOT, true),
             UpdateAction::WriteUpdateSlot
         );
         // The anchor's contents are *not* irrelevant here, even though nothing
@@ -1573,7 +1620,7 @@ mod tests {
     #[test]
     fn an_update_from_the_update_slot_bounces_through_a_usable_anchor() {
         assert_eq!(
-            plan_update_action(UPDATE_SLOT, true),
+            plan_update_action(UPDATE_SLOT, UPDATE_SLOT, true),
             UpdateAction::BounceToAnchor
         );
     }
@@ -1581,7 +1628,7 @@ mod tests {
     #[test]
     fn a_foreign_anchor_is_refused_rather_than_bounced_into() {
         assert_eq!(
-            plan_update_action(UPDATE_SLOT, false),
+            plan_update_action(UPDATE_SLOT, UPDATE_SLOT, false),
             UpdateAction::NoUsableAnchor
         );
     }
@@ -1601,11 +1648,11 @@ mod tests {
     #[test]
     fn an_unbootable_anchor_means_otadata_is_not_where_we_are_running() {
         assert_eq!(
-            plan_update_action(ANCHOR_SLOT, false),
+            plan_update_action(ANCHOR_SLOT, ANCHOR_SLOT, false),
             UpdateAction::RunningSlotUnknown
         );
         assert_eq!(
-            plan_update_action(ANCHOR_SLOT, false).selects_slot(),
+            plan_update_action(ANCHOR_SLOT, ANCHOR_SLOT, false).selects_slot(),
             None,
             "a write here would erase the running firmware"
         );
@@ -1713,7 +1760,12 @@ mod tests {
         sectors: [[u8; SELECT_ENTRY_LEN]; 2],
         slots: [&'static str; 2],
         trigger: Option<&'static str>,
+        /// What *our* validator makes of the anchor.
         anchor_usable: bool,
+        /// What the *bootloader* makes of it. Normally the same, but our
+        /// validator is not `esp_image_format.c`, so an anchor can pass ours
+        /// and fail its — the case that used to bounce forever.
+        anchor_boots: bool,
     }
 
     /// What one boot did, for asserting on the sequence.
@@ -1733,6 +1785,7 @@ mod tests {
                 slots,
                 trigger: None,
                 anchor_usable,
+                anchor_boots: anchor_usable,
             };
             dev.sectors[0] = SelectEntry::new(seq, OTA_IMG_VALID).to_bytes();
             assert_eq!(dev.active(), active_slot, "seeding picked the wrong slot");
@@ -1751,13 +1804,19 @@ mod tests {
         /// other than where `otadata` says it is.
         fn running_slot(&self) -> u32 {
             match self.active() {
-                ANCHOR_SLOT if !self.anchor_usable => UPDATE_SLOT,
+                ANCHOR_SLOT if !self.anchor_boots => UPDATE_SLOT,
                 slot => slot,
             }
         }
 
-        /// One power-on. Mirrors `fw::ota_update::apply_pending_update`'s
-        /// ordering: decide, consume the trigger, write the image, switch.
+        /// One power-on, in `fw::ota_update::apply_pending_update`'s order:
+        /// decide, write the image, consume the trigger, switch.
+        ///
+        /// The firmware aborts the switch if trigger removal fails, so that a
+        /// stale trigger cannot re-run on every boot. This model always
+        /// succeeds at removal: that branch is an SD-write failure with no
+        /// bearing on any rule in this module, and simulating it here would
+        /// only be re-asserting `fw` code from `proto`.
         fn boot(&mut self) -> Boot {
             let active = self.active();
             let running = self.running_slot();
@@ -1765,10 +1824,7 @@ mod tests {
                 return Boot::Ran(active);
             };
 
-            let action = plan_update_action(active, self.anchor_usable);
-            if action.consumes_trigger() {
-                self.trigger = None;
-            }
+            let action = plan_update_action(running, active, self.anchor_usable);
             if action == UpdateAction::WriteUpdateSlot {
                 // The invariant the whole slot policy exists to protect. An
                 // erase of the executing slot destroys the running firmware
@@ -1778,6 +1834,9 @@ mod tests {
                     "about to erase the slot this firmware is executing from"
                 );
                 self.slots[UPDATE_SLOT as usize] = image;
+            }
+            if action.consumes_trigger() {
+                self.trigger = None;
             }
             if let Some(dest) = action.selects_slot() {
                 let sw = plan_switch(&self.sectors[0], &self.sectors[1], dest, 2);
@@ -1818,12 +1877,76 @@ mod tests {
         assert_eq!(dev.running_slot(), UPDATE_SLOT, "but we run from slot 1");
 
         dev.trigger = Some("new-fw");
-        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::RunningSlotUnknown));
+        // `NoUsableAnchor`, not `RunningSlotUnknown`: the MMU told us which slot
+        // is running, so nothing is unknown here — `otadata` names an anchor the
+        // bootloader would not boot. Either way nothing is written.
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::NoUsableAnchor));
         assert_eq!(
             dev.slots[UPDATE_SLOT as usize], "good-fw",
             "the running firmware must survive"
         );
         assert_eq!(dev.trigger, None);
+    }
+
+    /// An anchor our validator approves but the bootloader refuses. The bounce
+    /// selects slot 0, the bootloader hands back slot 1, and `otadata` still
+    /// says slot 0 — so the next boot sees the same inputs that produced the
+    /// bounce. Without the failed-bounce check it bounces again, and the device
+    /// resets forever.
+    #[test]
+    fn a_bounce_the_bootloader_refuses_is_not_retried_forever() {
+        let mut dev = Device::new(UPDATE_SLOT, ["anchor-fw", "good-fw"], true);
+        dev.anchor_boots = false; // passes our checks, fails the bootloader's
+        dev.trigger = Some("new-fw");
+
+        // Boot 1: the anchor looks fine from here, so hand off to it.
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::BounceToAnchor));
+        assert_eq!(dev.active(), ANCHOR_SLOT);
+        assert_eq!(dev.trigger, Some("new-fw"), "the bounce keeps the trigger");
+
+        // Boot 2: the bootloader rejected the anchor and fell back to slot 1,
+        // leaving otadata pointing at slot 0.
+        assert_eq!(dev.running_slot(), UPDATE_SLOT);
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::NoUsableAnchor));
+        assert_eq!(dev.trigger, None, "the retry loop ends by consuming it");
+        assert_eq!(dev.slots, ["anchor-fw", "good-fw"], "nothing was written");
+
+        // Boot 3 and onwards: no trigger, so no reset — the device just runs.
+        assert_eq!(dev.boot(), Boot::Ran(ANCHOR_SLOT));
+    }
+
+    #[test]
+    fn a_failed_bounce_never_reports_a_bounce() {
+        // The finding's exact shape: anchor approved, otadata asks for slot 0,
+        // the MMU says slot 1 is executing.
+        let action = plan_update_action(UPDATE_SLOT, ANCHOR_SLOT, true);
+        assert_ne!(action, UpdateAction::BounceToAnchor);
+        assert_eq!(action, UpdateAction::NoUsableAnchor);
+        assert!(action.consumes_trigger());
+        assert_eq!(action.selects_slot(), None);
+    }
+
+    #[test]
+    fn marking_valid_needs_proof_of_the_running_slot() {
+        assert!(may_mark_running_slot_valid(
+            Some(UPDATE_SLOT),
+            Some(UPDATE_SLOT)
+        ));
+        assert!(may_mark_running_slot_valid(
+            Some(ANCHOR_SLOT),
+            Some(ANCHOR_SLOT)
+        ));
+        // Disagreement: otadata names a slot we are not executing.
+        assert!(!may_mark_running_slot_valid(
+            Some(UPDATE_SLOT),
+            Some(ANCHOR_SLOT)
+        ));
+        // Fail closed. An unreadable MMU is exactly when otadata is least
+        // trustworthy, so it must not be the case that waves the marking
+        // through.
+        assert!(!may_mark_running_slot_valid(None, Some(ANCHOR_SLOT)));
+        assert!(!may_mark_running_slot_valid(Some(UPDATE_SLOT), None));
+        assert!(!may_mark_running_slot_valid(None, None));
     }
 
     #[test]

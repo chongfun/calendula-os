@@ -219,7 +219,7 @@ see two reboots instead of one; slot 0 still never gets written.
 Calendula only bounces into an anchor that could actually finish the job. Each
 build stamps a firmware identity into its app descriptor —
 `CalendulaOS <board> u<updater-generation> (MarigoldOS)` — and the anchor's must
-match exactly. That rules out three cases which would otherwise leave you on a
+match exactly. That rules out four cases which would otherwise leave you on a
 firmware that ignores your trigger file, with no way back (the hatch is a no-op
 once you are *on* slot 0):
 

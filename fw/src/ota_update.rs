@@ -266,7 +266,7 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     // fall back to the request and let the anchor's validity expose a stale one
     // (see `ota::plan_update_action`).
     let requested = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(ANCHOR_SLOT);
-    let active = match crate::mmu::running_slot(&layout) {
+    let running = match crate::mmu::running_slot(&layout) {
         Some(running) => {
             if running != requested {
                 esp_println::println!(
@@ -300,12 +300,12 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     // is worth the full read even when we are seemingly running from the
     // anchor and about to take the ordinary write path.
     let anchor_usable = anchor_holds_our_firmware(&mut flash, &layout);
-    let action = ota::plan_update_action(active, anchor_usable);
+    let action = ota::plan_update_action(running, requested, anchor_usable);
     match action {
         UpdateAction::WriteUpdateSlot => {
             esp_println::println!(
-                "ota: active slot {}, writing slot {} at {:#x} ({} bytes)",
-                active,
+                "ota: running slot {}, writing slot {} at {:#x} ({} bytes)",
+                running,
                 UPDATE_SLOT,
                 dest_partition.offset,
                 dest_partition.size
@@ -552,15 +552,15 @@ pub fn mark_running_slot_valid() {
     // entry would bless an image that just failed to boot — cementing the state
     // instead of leaving it for `plan_update_action` to notice.
     let running = crate::mmu::running_slot(&layout);
-    if let (Some(running), Some(requested)) = (running, ota::active_app_slot(&s0, &s1, OTA_COUNT)) {
-        if running != requested {
-            esp_println::println!(
-                "ota: otadata requests slot {} but slot {} is executing; not marking it valid",
-                requested,
-                running
-            );
-            return;
-        }
+    let requested = ota::active_app_slot(&s0, &s1, OTA_COUNT);
+    if !ota::may_mark_running_slot_valid(running, requested) {
+        esp_println::println!(
+            "ota: cannot prove we run the slot otadata selects (running {:?}, requested {:?}); \
+             not marking it valid",
+            running,
+            requested
+        );
+        return;
     }
 
     let Some(valid) = ota::plan_mark_app_valid(&s0, &s1) else {

@@ -8,9 +8,10 @@
 //! `spi_flash_cache2phys()` does and what FreeInk's `RecoveryBoot` gets from
 //! `esp_ota_get_running_partition()`. esp-hal exposes no equivalent.
 //!
-//! The arithmetic and every constant live in [`proto::ota`], asserted there
-//! against values captured from an X3 running a known slot. This module is only
-//! the volatile read of the table those constants describe.
+//! The arithmetic, and every constant describing what the table *contains*,
+//! live in [`proto::ota`], asserted there against values captured from an X3
+//! running a known slot. What stays here is where the table *is* and the
+//! volatile read of it — the two things a host test cannot exercise.
 
 use proto::ota;
 
