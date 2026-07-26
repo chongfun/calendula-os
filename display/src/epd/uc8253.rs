@@ -492,7 +492,6 @@ use tables::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FB_BYTES, HEIGHT, ROW_BYTES};
 
     /// Regression: the sleep frame is a `Full` refresh, and `SCREEN_POWERED`
     /// stays true for a whole session — only `init_panel` and `power_off`
