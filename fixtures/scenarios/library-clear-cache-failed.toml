@@ -1,0 +1,34 @@
+# A clear that did not happen: the storage task refused the row (a stale
+# catalog epoch, an unreadable index, a delete that left files behind)
+# and the footer says so rather than claiming success. The rail is back
+# to the ordinary Library labels, since the press that dismisses the
+# note also acts.
+
+hold_storage = true
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 3
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "PagePrevious"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+library = "CacheCleared"
+ok = false
+
+[expect]
+view = "Library"
+selection = 1
+library_menu = "DoneFailed"
+pending_storage = "ClearBookCache"
+library_count = 3

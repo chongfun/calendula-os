@@ -1,0 +1,26 @@
+# Confirming "Clear cache" on the per-book actions sheet executes it —
+# the sheet pick was the deliberate step, so no second question — and
+# settles into the "cache cleared" footer note.
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 3
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "PagePrevious"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Library"
+selection = 1
+library_menu = "DoneOk"
+pending_storage = "ClearBookCache"
+library_count = 3

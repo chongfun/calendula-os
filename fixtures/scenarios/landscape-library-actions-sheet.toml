@@ -1,0 +1,47 @@
+# The per-book actions sheet in the landscape hold: the bordered card
+# sits over the wide leaf's list with the rail beside the key column.
+
+[[steps]]
+library = "scanned"
+count = 6
+
+# Cycle the orientation out of the boot portrait, then Back to Home and
+# Back again onto the shelf.
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "PagePrevious"
+
+[expect]
+view = "Library"
+orientation = "landscape-bottom"
+selection = 1
+library_menu = "Sheet"

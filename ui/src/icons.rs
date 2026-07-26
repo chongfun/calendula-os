@@ -63,7 +63,7 @@ pub fn icon_for_label(label: &str) -> &'static Icon {
         "next" => &CHEVRON_RIGHT,
         "close" | "cancel" => &CROSS,
         "change" => &PENCIL,
-        "connect" | "done" => &CHECK,
+        "connect" | "done" | "select" => &CHECK,
         "forget" => &TRASH,
         "set up" => &PLUS,
         "again" => &REFRESH,

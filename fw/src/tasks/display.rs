@@ -14,15 +14,19 @@ use app_core::storage_loop::{
     loop_arm, Drained, LoopArm, OpenAction, OpenSequence, SleepAction, SleepRefusal, SleepSequence,
 };
 use app_core::{
-    book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
-    DisplayOrientation, PersistedAppState, ReaderSource, RefreshPlanner, RenderKind, RenderRequest,
-    SyncSession, SyncStatus,
+    book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView, ChapterCursor,
+    DisplayEventHolder, DisplayHoldOutcome, DisplayOrientation, EvictionStep, EvictionWalk,
+    HoldOutcome, LibraryEventHolder, PersistedAppState, ReaderSource, RefreshPlanner, RenderKind,
+    RenderRequest, SyncSession, SyncStatus,
 };
+use core::cell::Cell;
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::BAND_BYTES;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select4, Either, Either4};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::Instant;
 use esp_hal::gpio::Output;
 use proto::nvm::AppStateRecord;
@@ -137,8 +141,32 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     }
 
     loop {
-        match select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await {
-            Either::First(DisplayCommand::Render(request)) => {
+        // Three ways to make progress, and the third is why the first two are
+        // not enough on their own. A settling event with no room in the
+        // channel is held here rather than dropped, and placing it means
+        // waiting for the app task to drain — which the app task cannot do
+        // while it is blocked handing this task a render. So the wait for
+        // room runs *beside* the display queue, not in front of it: servicing
+        // a render is what releases the consumer that frees the slot.
+        //
+        // Storage stands down while something is held. It is the producer of
+        // settling events, the holder has one slot, and a second command
+        // could fill it with nowhere for the first to go.
+        //
+        // The fourth is the same waiting-for-room branch for a render
+        // acknowledgement, and it constrains nothing: rendering is what
+        // produces acknowledgements, but it is also what releases the app to
+        // drain them, so standing down would be waiting on itself.
+        match select4(
+            DISPLAY_COMMANDS.receive(),
+            storage_command_while_free(),
+            place_held_library_event(),
+            place_held_display_event(),
+        )
+        .await
+        {
+            Either4::Third(()) | Either4::Fourth(()) => {}
+            Either4::First(DisplayCommand::Render(request)) => {
                 let content_context_changed = refresh_planner
                     .last_request()
                     .map(|last| (last.view, last.book_id))
@@ -206,8 +234,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         // request retries init from scratch.
                         esp_println::println!("display: wake init failed: {:?}", error);
                         prev_prestaged = false;
-                        let (display_event, power_event) = app_core::display_refresh_outcome(false);
-                        send_required_display_event(&display_event);
+                        let (display_event, power_event) =
+                            app_core::display_refresh_outcome(false, None);
+                        send_display_event(&display_event);
                         send_required_power_event(power_event).await;
                         continue;
                     }
@@ -242,31 +271,33 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // Keep the current chapter tracking the page just shown, past
                     // the reducer's 128-chapter cap. Cheap in-RAM check; only the
                     // loaded SD reader has an uncapped page map, so this no-ops on
-                    // other views and reads SD only when the chapter changes. Must
-                    // run before Settled: the app clears its render lock on Settled
-                    // and may immediately render or navigate, so the ChapterCursor
-                    // correction has to be queued ahead of it or that next action
-                    // uses the stale chapter.
-                    if request.view == AppView::Reading {
-                        if let Some(current) = reader_cache::track_reading_chapter(
+                    // other views and reads SD only when the chapter changes. It
+                    // rides out inside Settled: the app must apply it before it
+                    // clears the render lock, and one message is the only way to
+                    // promise that (see DisplayEvent::Settled).
+                    let chapter_cursor = if request.view == AppView::Reading {
+                        reader_cache::track_reading_chapter(
                             &mut epd,
                             &mut sd_cs,
                             request.page,
                             sd_library,
-                        ) {
-                            send_loaded_library_event(&LibraryEvent::ChapterCursor {
-                                book_id: request.book_id,
-                                current_chapter: current,
-                            });
-                        }
-                    }
+                        )
+                        .map(|current_chapter| ChapterCursor {
+                            book_id: request.book_id,
+                            page: request.page,
+                            current_chapter,
+                        })
+                    } else {
+                        None
+                    };
                     // Settle before the ~23 ms RED prestage: the panel is visually
                     // done, so unblock the input/power pipeline. The prestage still
                     // runs on this task before the next command is dequeued, so
                     // `prev_prestaged` is always current by the next flush, and a
                     // Sleep queued by power_task after DisplaySettled waits behind it.
-                    let (display_event, power_event) = app_core::display_refresh_outcome(true);
-                    send_required_display_event(&display_event);
+                    let (display_event, power_event) =
+                        app_core::display_refresh_outcome(true, chapter_cursor);
+                    send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                     let prestage_start = Instant::now();
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
@@ -292,12 +323,13 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // takes the full waveform instead of fast-diffing
                     // against a frame that may never have landed.
                     refresh_planner.record_failure();
-                    let (display_event, power_event) = app_core::display_refresh_outcome(false);
-                    send_required_display_event(&display_event);
+                    let (display_event, power_event) =
+                        app_core::display_refresh_outcome(false, None);
+                    send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                 }
             }
-            Either::First(DisplayCommand::Sleep { generation }) => {
+            Either4::First(DisplayCommand::Sleep { generation }) => {
                 let sleep_start = Instant::now();
                 esp_println::println!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
@@ -309,7 +341,18 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // be driven from a host test; this arm only does what it is
                 // told and reports back what the hardware said.
                 let mut sleep = SleepSequence::new(STORAGE_COMMANDS.capacity());
+                // The main loop keeps storage shut while an event is held; this
+                // drain applies storage commands too, so it owes the same rule.
+                // Checked before the first take and after every applied
+                // command, because either end can be where the holder fills:
+                // sleep can arrive with one already waiting, or the first
+                // command drained can produce it. Carrying on past that point
+                // is how a second completion would reach an occupied holder.
+                let mut may_keep_draining = holder().sleep_may_proceed();
                 let refusal = loop {
+                    if !may_keep_draining {
+                        break None;
+                    }
                     match sleep.next() {
                         SleepAction::TakeQueued => match STORAGE_COMMANDS.try_receive() {
                             Err(_) => sleep.queue_empty(),
@@ -329,6 +372,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                                         &mut state_restored,
                                     );
                                     sleep.applied();
+                                    may_keep_draining = holder().sleep_may_proceed();
                                 }
                                 Drained::RequeueAndRefuse => {
                                     // This send cannot fail today: nothing
@@ -360,29 +404,43 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         SleepAction::Proceed => break None,
                     }
                 };
-                if let Some(refusal) = refusal {
+                // A drained `ClearBookCache` can leave its completion held, and
+                // sleep is terminal — waking is a fresh boot — so going down
+                // now would take the event with it and strand the app in
+                // `Busy`. Stay awake instead; the loop's placing branch runs
+                // the moment this returns, the rest of the queue is still
+                // there to drain, and the power task re-requests sleep after.
+                let sleep_holds_an_event = refusal.is_none() && !holder().sleep_may_proceed();
+                if sleep_holds_an_event {
+                    esp_println::println!("display: sleep deferred; library event still held");
+                }
+                if refusal.is_some() || sleep_holds_an_event {
                     // Stay awake. The power task's idle clock re-requests sleep
                     // once this failure releases its handshake wait, by which
                     // time the upload session has run or the pending record has
                     // been retried by the next flush.
-                    match refusal {
-                        SleepRefusal::UploadQueued => {
-                            esp_println::println!("display: sleep deferred; upload session pending")
+                    if let Some(refusal) = refusal {
+                        match refusal {
+                            SleepRefusal::UploadQueued => {
+                                esp_println::println!(
+                                    "display: sleep deferred; upload session pending"
+                                )
+                            }
+                            // The request itself is gone, so the browser is left
+                            // waiting on a writer that will not start and
+                            // UPLOAD_SESSION_ACTIVE stays set. Nothing here can
+                            // recover that. What this refusal does protect is the
+                            // rest of the queue, which is full: the ordinary loop
+                            // applies it before the next sleep attempt.
+                            SleepRefusal::UploadLost => esp_println::println!(
+                                "display: sleep deferred; upload request lost, storage queue full"
+                            ),
+                            SleepRefusal::ProgressUnwritten => esp_println::println!(
+                                "display: sleep deferred; progress persistence failed"
+                            ),
                         }
-                        // The request itself is gone, so the browser is left
-                        // waiting on a writer that will not start and
-                        // UPLOAD_SESSION_ACTIVE stays set. Nothing here can
-                        // recover that. What this refusal does protect is the
-                        // rest of the queue, which is full: the ordinary loop
-                        // applies it before the next sleep attempt.
-                        SleepRefusal::UploadLost => esp_println::println!(
-                            "display: sleep deferred; upload request lost, storage queue full"
-                        ),
-                        SleepRefusal::ProgressUnwritten => esp_println::println!(
-                            "display: sleep deferred; progress persistence failed"
-                        ),
                     }
-                    send_required_display_event(&DisplayEvent::SleepFailed);
+                    send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                     continue;
                 }
@@ -445,7 +503,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // it false so that boot falls back to the full waveform.
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
                 if panel_slept {
-                    send_required_display_event(&DisplayEvent::Asleep);
+                    send_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
                     park_until_resumed(generation).await;
                 } else {
@@ -459,7 +517,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // re-inits the panel with the full waveform.
                     refresh_planner.record_failure();
                     esp_println::println!("display: sleep transition failed");
-                    send_required_display_event(&DisplayEvent::SleepFailed);
+                    send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                 }
                 esp_println::println!(
@@ -469,7 +527,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     Instant::now().as_millis(),
                 );
             }
-            Either::Second(command) => match loop_arm(&command, sync_session) {
+            Either4::Second(command) => match loop_arm(&command, sync_session) {
                 // The display task is the upload writer until Sleep or
                 // wireless Exit closes the session; a Sleep exit has
                 // already been re-queued on DISPLAY_COMMANDS.
@@ -552,6 +610,42 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     }
 }
 
+/// Places the settling event [`send_required_library_event`] could not, once
+/// the channel has room. Pending forever when nothing is held, so it can sit
+/// in the main loop's select as a branch that only fires when it has work.
+///
+/// The sender itself cannot wait: it runs inside `handle_storage_command`,
+/// which is synchronous and has to stay that way — it owns the SD session and
+/// multi-KB scratch near the stack floor. Nor may the *loop* simply wait here
+/// and nowhere else. The app task blocks on `DISPLAY_COMMANDS.send` to hand
+/// over a render, so a display task doing nothing but waiting for library-
+/// event room would be waiting on a consumer waiting on it. Selecting this
+/// against the display queue is what breaks that: servicing the render
+/// releases the app task, which returns to its own select and drains.
+async fn place_held_library_event() {
+    let Some(event) = holder().pending() else {
+        return core::future::pending::<()>().await;
+    };
+    LIBRARY_EVENTS.send(event).await;
+    // Nothing awaits between the send completing and this, so the holder
+    // cannot be observed empty with the event still unsent, or cleared for a
+    // send that a cancellation abandoned.
+    let _ = with_holder(LibraryEventHolder::placed);
+}
+
+/// The next storage command, but only while nothing is held.
+///
+/// Storage is where settling events come from and the holder has one slot, so
+/// applying another command while one waits could produce a second with
+/// nowhere to go. Pending forever until the holder clears, which the loop's
+/// other branches are free to do meanwhile.
+async fn storage_command_while_free() -> StorageCommand {
+    if !holder().storage_may_run() {
+        return core::future::pending::<StorageCommand>().await;
+    }
+    STORAGE_COMMANDS.receive().await
+}
+
 /// Holds the display task still from the moment the panel goes down until the
 /// power task says the sleep was abandoned.
 ///
@@ -615,6 +709,13 @@ async fn park_until_resumed(generation: u32) {
 }
 
 pub(crate) fn send_library_event(event: &LibraryEvent) {
+    // An event that settles something the app is holding cannot go out the
+    // lossy way: the work is done and will not be redone, so a dropped one
+    // strands the wait. The event says which it is, so no call site has to.
+    if event.must_be_delivered() {
+        send_required_library_event(event);
+        return;
+    }
     if LIBRARY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: library event queue full");
     }
@@ -781,7 +882,10 @@ fn handle_storage_command(
                 // sees an SD book active and leaves it alone.
                 restore_saved_state(epd, sd_cs, sd_library, state_restored);
                 let count = sd_library.catalog_count_u16();
-                send_library_event(&LibraryEvent::Scanned { count });
+                send_library_event(&LibraryEvent::Scanned {
+                    count,
+                    catalog_epoch: sd_library.catalog_epoch(),
+                });
             } else {
                 let _ = STORAGE_COMMANDS.try_send(StorageCommand::RefreshCatalog);
             }
@@ -795,6 +899,7 @@ fn handle_storage_command(
             restore_saved_state(epd, sd_cs, sd_library, state_restored);
             send_library_event(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),
+                catalog_epoch: sd_library.catalog_epoch(),
             });
         }
         StorageCommand::OpenBook {
@@ -1116,6 +1221,34 @@ fn handle_storage_command(
             let forgotten = reader_cache::forget_wifi_credentials(epd, sd_cs);
             esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
+        StorageCommand::ClearBookCache {
+            request_id,
+            index,
+            catalog_epoch,
+        } => {
+            // The row was picked against a catalog this task may since have
+            // replaced, which would leave a different book sitting under it.
+            // Refuse rather than guess: the user can pick again from the list
+            // they can actually see.
+            let ok = if catalog_epoch == sd_library.catalog_epoch() {
+                reader_cache::clear_book_cache(epd, sd_cs, sd_library, index)
+            } else {
+                esp_println::println!(
+                    "storage: clear cache index={} stale epoch={} now={}",
+                    index,
+                    catalog_epoch,
+                    sd_library.catalog_epoch()
+                );
+                false
+            };
+            esp_println::println!(
+                "storage: clear cache request={} index={} ok={}",
+                request_id,
+                index,
+                ok
+            );
+            send_library_event(&LibraryEvent::CacheCleared { request_id, ok });
+        }
         StorageCommand::StoreProgress(record) => {
             let record = record_for_persisted(sd_library, record);
             // Coalesce same-context page turns; anything beyond the screen
@@ -1182,19 +1315,100 @@ fn handle_storage_command(
     }
 }
 
+/// Queue an event the app is waiting on, making room if the channel is full.
+///
+/// It used to make room by taking whatever was at the front and throwing it
+/// away, without looking at it — so delivering one settling event could
+/// silently destroy another, which is the whole thing this function exists to
+/// prevent. It walks the ring now; [`EvictionWalk`] owns which events may be
+/// spent for the newcomer and is host-tested against a modelled channel.
 fn send_required_library_event(event: &LibraryEvent) {
-    const RETRIES: usize = 8;
-    for _ in 0..RETRIES {
-        if LIBRARY_EVENTS.try_send(*event).is_ok() {
-            return;
-        }
-        let _ = LIBRARY_EVENTS.try_receive();
+    if LIBRARY_EVENTS.try_send(*event).is_ok() {
+        return;
     }
+    let mut walk = EvictionWalk::new(app_core::LIBRARY_EVENT_SLOTS);
+    while !walk.exhausted() {
+        let Ok(head) = LIBRARY_EVENTS.try_receive() else {
+            break;
+        };
+        match walk.inspect(&head) {
+            EvictionStep::Discard => {
+                // The refresh is spent; its slot is this event's. Nothing
+                // else writes this channel, so the send cannot lose the race.
+                if LIBRARY_EVENTS.try_send(*event).is_ok() {
+                    return;
+                }
+                break;
+            }
+            EvictionStep::Requeue => {
+                // One slot is free (the head came off), so this always lands.
+                let _ = LIBRARY_EVENTS.try_send(head);
+            }
+        }
+    }
+    // Every slot holds something the app is waiting on, so nothing here may
+    // be spent — but this event is awaited too, and dropping it would leave
+    // its wait unanswerable. Hold it for `deliver_held_library_event`, which
+    // retries once the app task has had a turn to drain.
+    hold_library_event(event);
+}
+
+/// The settling event with nowhere to go, and the gates it closes while it
+/// waits. [`LibraryEventHolder`] owns both, and is host-tested; this task
+/// asks it rather than re-deciding at each of the four sites that must agree.
+static HELD_LIBRARY_EVENT: Mutex<CriticalSectionRawMutex, Cell<LibraryEventHolder>> =
+    Mutex::new(Cell::new(LibraryEventHolder::new()));
+
+/// Reads the holder. `Copy`, so this is a snapshot — fine for the gates,
+/// which only ever narrow: nothing but this task fills the holder, and the
+/// one thing that empties it is this task's own placing branch.
+fn holder() -> LibraryEventHolder {
+    HELD_LIBRARY_EVENT.lock(Cell::get)
+}
+
+fn with_holder<T>(update: impl FnOnce(&mut LibraryEventHolder) -> T) -> T {
+    HELD_LIBRARY_EVENT.lock(|cell| {
+        let mut holder = cell.get();
+        let outcome = update(&mut holder);
+        cell.set(holder);
+        outcome
+    })
+}
+
+/// Keeps `event` until the channel has room, or says why it could not.
+///
+/// Both refusals end the same way — one last try for a slot that may have
+/// freed since, and the drop reported if it has not. They are reported apart
+/// because they mean different things about the code above: `NotSettling` is
+/// a caller that routed a refresh here, `Occupied` is two settling events out
+/// of one storage command.
+fn hold_library_event(event: &LibraryEvent) {
+    let outcome = with_holder(|holder| holder.hold(event));
+    let refusal = match outcome {
+        HoldOutcome::Held => return,
+        HoldOutcome::NotSettling => "refresh routed to the holder",
+        HoldOutcome::Occupied => "holder occupied",
+    };
     if LIBRARY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!("display: required library event queue full");
+        esp_println::println!("display: {}, dropped {:?}", refusal, event);
     }
 }
 
+/// Sends a library event down the display channel, falling back to its own
+/// when that one is full.
+///
+/// The two channels reach the app independently, so this is a choice of route
+/// and not of order — anything that must be ordered against a render
+/// acknowledgement travels *inside* it (see `DisplayEvent::Settled`) rather
+/// than relying on which queue it landed in. Only `Loaded` comes through here
+/// now, and it is order-free: whichever way round it and the acknowledgement
+/// arrive, the app folds it and renders.
+///
+/// The fallback routes by `must_be_delivered` like every other send. It used
+/// to go straight to the required path, which let a refresh-only event take
+/// the holder — and the holder being occupied is what stops the very next
+/// `Settled` from making room for itself, so a droppable event could strand
+/// the app's render lock.
 fn send_loaded_library_event(event: &LibraryEvent) {
     if DISPLAY_EVENTS
         .try_send(DisplayEvent::Library(*event))
@@ -1202,7 +1416,7 @@ fn send_loaded_library_event(event: &LibraryEvent) {
     {
         return;
     }
-    send_required_library_event(event);
+    send_library_event(event);
 }
 
 /// Power acknowledgements get a bounded-wait send instead of a silent
@@ -1229,19 +1443,84 @@ async fn send_required_power_event(event: PowerEvent) {
     }
 }
 
-fn send_required_display_event(event: &DisplayEvent) {
-    const RETRIES: usize = 8;
-    for _ in 0..RETRIES {
-        if DISPLAY_EVENTS.try_send(*event).is_ok() {
-            return;
-        }
-        if let Ok(DisplayEvent::Library(library_event)) = DISPLAY_EVENTS.try_receive() {
-            send_required_library_event(&library_event);
-        }
+/// Sends a display event, by the rule the event itself carries.
+///
+/// The two sleep notifications take the lossy path. The handshake the power
+/// task waits on goes over `POWER_EVENTS` beside each of them and the app only
+/// logs these, so a dropped one costs the log line — and letting them compete
+/// for room with an acknowledgement got the priority exactly backwards, since
+/// an acknowledgement is what ends the app's render cycle.
+fn send_display_event(event: &DisplayEvent) {
+    if event.must_be_delivered() {
+        send_required_display_event(event);
+        return;
     }
     if DISPLAY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!("display: required display event queue full");
+        esp_println::println!("display: display event queue full, dropped {:?}", event);
     }
+}
+
+/// Queues an acknowledgement the app is waiting on, holding it if the channel
+/// is full.
+///
+/// This used to make room by walking the queue. That was wrong twice over: the
+/// first version's `try_receive` dropped whatever its pattern did not match,
+/// and the walk that replaced it had to requeue at the tail, reordering the
+/// queue the app reads its acknowledgements from. The queue is left alone now
+/// — [`DisplayEventHolder`] explains why nothing in it is worth spending — and
+/// the acknowledgement waits for room instead.
+fn send_required_display_event(event: &DisplayEvent) {
+    if DISPLAY_EVENTS.try_send(*event).is_ok() {
+        return;
+    }
+    let outcome = with_display_holder(|holder| holder.hold(event));
+    let refusal = match outcome {
+        DisplayHoldOutcome::Held => return,
+        DisplayHoldOutcome::NotRequired => "refresh routed to the acknowledgement holder",
+        // Both end the render cycle and the app clears its lock on either, so
+        // the one already waiting answers for this one too.
+        DisplayHoldOutcome::Occupied => "acknowledgement holder occupied",
+    };
+    if DISPLAY_EVENTS.try_send(*event).is_err() {
+        esp_println::println!("display: {}, dropped {:?}", refusal, event);
+    }
+}
+
+/// The acknowledgement that had nowhere to go, waiting for room. Gates
+/// nothing: see [`DisplayEventHolder`] for why refusing renders while one is
+/// held would deadlock the very task that empties it.
+static HELD_DISPLAY_EVENT: Mutex<CriticalSectionRawMutex, Cell<DisplayEventHolder>> =
+    Mutex::new(Cell::new(DisplayEventHolder::new()));
+
+fn display_holder() -> DisplayEventHolder {
+    HELD_DISPLAY_EVENT.lock(Cell::get)
+}
+
+fn with_display_holder<T>(update: impl FnOnce(&mut DisplayEventHolder) -> T) -> T {
+    HELD_DISPLAY_EVENT.lock(|cell| {
+        let mut holder = cell.get();
+        let outcome = update(&mut holder);
+        cell.set(holder);
+        outcome
+    })
+}
+
+/// Places the acknowledgement [`send_required_display_event`] could not, once
+/// the channel has room. Pending forever when nothing is held, so it can sit
+/// in the main loop's select as a branch that only fires when it has work.
+///
+/// Selecting this against the display queue is what keeps it from deadlocking:
+/// the app blocks on `DISPLAY_COMMANDS.send` to hand over a render, and
+/// servicing that render is what releases it to drain this event's channel.
+async fn place_held_display_event() {
+    let Some(event) = display_holder().pending() else {
+        return core::future::pending::<()>().await;
+    };
+    DISPLAY_EVENTS.send(event).await;
+    // Nothing awaits between the send completing and this, so the holder
+    // cannot be observed empty with the event still unsent, or cleared for a
+    // send that a cancellation abandoned.
+    let _ = with_display_holder(DisplayEventHolder::placed);
 }
 
 /// Step one of a book-open transaction: get the departing book's page onto
@@ -1499,6 +1778,7 @@ fn sleep_request_from_saved_state(
         front_buttons: app_core::front_buttons_from_u8(record.front_buttons)
             .unwrap_or(app_core::FrontButtons::PagesRight),
         reading_sheet: false,
+        library_menu: app_core::LibraryMenu::None,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

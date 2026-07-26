@@ -1,0 +1,48 @@
+# The Library list in the buttons-top landscape hold, pinning the
+# mirrored resting footer: the sheet-key hint moves to the corner
+# opposite the battery, which sits left in this hold.
+#
+# Steps are raw key presses: after the second orientation change lands
+# buttons-top, the mapping inverts, so the two closing presses are raw
+# Next mapping to logical Back (Settings -> Home -> shelf).
+
+[[steps]]
+library = "scanned"
+count = 6
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[expect]
+view = "Library"
+orientation = "landscape-top"
+library_count = 6
+selection = 0
+library_menu = "None"

@@ -1,0 +1,31 @@
+# The moment between picking "Clear cache" and it settling: the footer
+# says "clearing…", and the key rail drops to Back alone. Every other
+# press is swallowed while the storage task works on the row, so no
+# other label may appear and promise otherwise.
+#
+# The emulated card answers a clear instantly, so this scenario holds
+# storage to keep the in-flight state on screen.
+hold_storage = true
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 3
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "PagePrevious"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Library"
+selection = 1
+library_menu = "Busy"
+pending_storage = "ClearBookCache"
+library_count = 3

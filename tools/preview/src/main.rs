@@ -1846,6 +1846,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         chapters_total: chapters.len() as u16,
         sync_status: ui::UiSyncStatus::Idle,
         wifi_ssid: "HOME-WIFI",
+        library_menu: ui::LibraryMenu::None,
     };
     render_shell(&mut fb, &shell);
     write_pbm(&out.join(format!("{name}.pbm")), &fb)?;

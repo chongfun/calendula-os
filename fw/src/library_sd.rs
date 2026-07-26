@@ -585,6 +585,32 @@ pub(crate) fn load_active_entry(
     }
 }
 
+/// One catalog row's cache key and source identity, read straight off the
+/// card.
+///
+/// Unlike [`load_active_entry`] this does not publish the row as the active
+/// entry. The active entry is the *open* book's, held apart from the list
+/// window precisely so the reading path does not depend on where the list is
+/// scrolled — `source_identity` resolves the position record's identity
+/// through it, and the Home colophon its label. A cache clear on some other
+/// row has no business evicting that, so it reads what it needs and leaves
+/// the store alone.
+#[inline(never)]
+pub(crate) fn read_row_cache_identity(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    index: usize,
+) -> Option<(String<{ proto::cache::CACHE_KEY_BYTES }>, u32, u32)> {
+    let record = sd_session::with_root(epd, sd_cs, |root| read_catalog_record_at(root, index))
+        .ok()
+        .flatten()?;
+    Some((
+        proto::cache::cache_key_for(record.display_name.as_str(), record.byte_size),
+        record.source_hash,
+        record.byte_size,
+    ))
+}
+
 /// Persist a book's just-learned title into its catalog record, so the next
 /// window read (and the next boot's catalog cache) label it without probing
 /// the book's cache. Runs inside the open's existing SD session. The record
@@ -739,22 +765,30 @@ fn sweep_orphan_caches<
     }
     let mut swept = 0u32;
     for key in &keys {
-        let header = crate::reader_cache_files::read_cache_header(root, key.as_str());
         // A readable cache that still maps to a catalog book stays. Anything
-        // else -- no book, or an unreadable BOOK.BIN -- is reclaimed.
-        let live = header
-            .as_ref()
-            .map(|h| {
+        // else -- no book, or an unreadable BOOK.BIN -- is reclaimed. The
+        // clear path fails closed on an unreadable header because it deletes
+        // against a key the user named and a collision would be its mistake;
+        // the sweep runs against a catalog it has just proven fresh, and a
+        // cache it cannot match to any book on the card is garbage whoever
+        // wrote it. Keeping it would strand the shells forever.
+        let live = match crate::reader_cache_files::read_cache_header(root, key.as_str()) {
+            crate::reader_cache_files::CacheHeader::Present(h) => {
                 catalog_identity_staged(scratch, staged, h.source_hash, h.source_size)
                     || (truncated
                         && find_in_catalog(root, h.source_hash, h.source_size, None).is_some())
-            })
-            .unwrap_or(false);
+            }
+            crate::reader_cache_files::CacheHeader::Absent
+            | crate::reader_cache_files::CacheHeader::Unreadable => false,
+        };
         if live {
             continue;
         }
-        let section_count = header.map(|h| h.section_count).unwrap_or(0);
-        crate::reader_cache_files::empty_cache_dir(root, key.as_str(), section_count);
+        // An unreadable header is exactly the case that used to defeat the
+        // sweep: it named section files from the header's own count, so a
+        // cache with no BOOK.BIN kept its sections forever. The delete lists
+        // the directory now, so it needs nothing from the header.
+        let _ = crate::reader_cache_files::empty_cache_dir(root, key.as_str());
         swept += 1;
     }
     if swept > 0 {

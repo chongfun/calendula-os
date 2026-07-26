@@ -13,6 +13,12 @@ pub struct Scenario {
     steps: Vec<Step>,
     #[serde(default)]
     expect: Expect,
+    /// Leave picked per-book actions in flight instead of settling them the
+    /// moment they are issued. The emulated card has no cache to delete, so
+    /// a clear normally answers itself instantly and `Busy` never reaches a
+    /// frame — which is exactly the state whose key rail differs.
+    #[serde(default)]
+    hold_storage: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +35,7 @@ struct Step {
     ip: Option<[u8; 4]>,
     error: Option<String>,
     ssid: Option<String>,
+    ok: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -47,6 +54,7 @@ struct Expect {
     font_family: Option<String>,
     sleeping: Option<bool>,
     reading_sheet: Option<bool>,
+    library_menu: Option<String>,
     library_count: Option<u16>,
     last_button: Option<String>,
     last_refresh: Option<String>,
@@ -64,12 +72,27 @@ impl Scenario {
     }
 
     pub fn run(&self, emu: &mut Emulator) -> Result<(), String> {
+        emu.set_hold_storage(self.hold_storage);
         for step in &self.steps {
             if let Some(button) = &step.button {
                 emu.input(parse_button(button)?);
             }
             if let Some(library) = &step.library {
-                emu.library_event(parse_library_event(library, step)?);
+                // A settling event has to name the request it answers, and
+                // only the emulator knows which one is in flight; the rest
+                // parse from the step alone.
+                let event = if library.eq_ignore_ascii_case("CacheCleared") {
+                    let request_id = emu
+                        .outstanding_request()
+                        .ok_or("CacheCleared with no action in flight")?;
+                    LibraryEvent::CacheCleared {
+                        request_id,
+                        ok: step.ok.unwrap_or(true),
+                    }
+                } else {
+                    parse_library_event(library, step)?
+                };
+                emu.library_event(event);
             }
             if let Some(sync) = &step.sync {
                 emu.sync_event(parse_sync_event(sync, step)?);
@@ -109,6 +132,20 @@ impl Scenario {
         }
         if let Some(reading_sheet) = self.expect.reading_sheet {
             expect_eq("reading_sheet", reading_sheet, state.reading_sheet)?;
+        }
+        if let Some(library_menu) = &self.expect.library_menu {
+            let actual = match state.library_menu {
+                app_core::LibraryMenu::None => "None",
+                app_core::LibraryMenu::Sheet { .. } => "Sheet",
+                app_core::LibraryMenu::Busy { .. } => "Busy",
+                app_core::LibraryMenu::Done { ok: true, .. } => "DoneOk",
+                app_core::LibraryMenu::Done { ok: false, .. } => "DoneFailed",
+            };
+            if library_menu != actual {
+                return Err(format!(
+                    "expected library_menu {library_menu}, got {actual}"
+                ));
+            }
         }
         if let Some(front_buttons) = &self.expect.front_buttons {
             let expected = parse_front_buttons(front_buttons)?;
@@ -276,6 +313,9 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
     match kind {
         "Scanned" | "scanned" => Ok(LibraryEvent::Scanned {
             count: step.count.unwrap_or(0),
+            // The emulated card has no catalog to reorder, so every scripted
+            // scan reports the same epoch; nothing here can go stale.
+            catalog_epoch: 1,
         }),
         "Loaded" | "loaded" => Ok(LibraryEvent::Loaded {
             book_id: step.book_id.unwrap_or(2),

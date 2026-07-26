@@ -279,9 +279,17 @@ impl RefreshPlanner {
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
-        // Only the library list actually redraws when the scan count moves;
-        // other views repaint identical pixels and can ride the partial.
-        request.view == AppView::Library && request.library_count != last.library_count
+        // Only the library list actually redraws when these move; other views
+        // repaint identical pixels and can ride the partial.
+        if request.view != AppView::Library {
+            return false;
+        }
+        // The actions sheet is a bordered card drawn over the lower rows, and
+        // every step of it uncovers or covers text: the card appearing and
+        // going away, the key rail relabelling beside it, the footer turning
+        // from the position line into the wait and then the note. A fast diff
+        // leaves the rows underneath ghosted through it.
+        request.library_count != last.library_count || request.library_menu != last.library_menu
     }
 }
 
@@ -299,6 +307,9 @@ pub struct RenderRequest {
     /// Portrait reading's summoned key sheet is up; renderers draw it
     /// over the page's bottom band.
     pub reading_sheet: bool,
+    /// The Library per-book actions sheet's progress; renderers draw the
+    /// sheet, relabel the key rail, and show the wait or its note.
+    pub library_menu: LibraryMenu,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -402,6 +413,29 @@ pub enum StorageCommand {
     /// channels and writes browser-sent books to /BOOKS until the
     /// session's reset. Sent by the wifi task at the first upload.
     ReceiveUpload,
+    /// Delete one book's rebuildable cache (BOOK/TOC/COVER/CONT.BIN and
+    /// SECTIONS/), keeping the position files and the catalog entry. Sent
+    /// when the user confirms "Clear cache?" on a Library row.
+    ///
+    /// A row number alone is not a book. This command can be parked, and the
+    /// storage task resolves the row against whatever catalog it holds when
+    /// the command finally runs — a catalog that a scan in between may have
+    /// reordered, putting a different book under the same row. `catalog_epoch`
+    /// is the catalog the *screen* was showing when the user picked (the epoch
+    /// last reported by [`LibraryEvent::Scanned`]); the storage task refuses
+    /// the clear unless its own catalog still carries that epoch, so a stale
+    /// row deletes nothing instead of deleting the wrong book. Identity is
+    /// then checked a second time against the cache header, which catches a
+    /// key collision the epoch cannot see.
+    ///
+    /// `request_id` is what the answering `LibraryEvent::CacheCleared` echoes
+    /// back; the epoch guards which book gets deleted, not which wait the
+    /// reply belongs to.
+    ClearBookCache {
+        request_id: u32,
+        index: u16,
+        catalog_epoch: u32,
+    },
 }
 
 /// Slots for storage commands the channel could not take yet.
@@ -519,6 +553,15 @@ impl ParkedStorage {
         self.queue[self.len] = Some(command);
         self.len += 1;
         true
+    }
+
+    /// The command at the front, left where it is.
+    ///
+    /// Lets a drain offer a command to a queue that may refuse it without
+    /// having to put it back afterwards: nothing is taken until it has landed,
+    /// so the parked order cannot be disturbed by a refusal.
+    pub fn front(&self) -> Option<StorageCommand> {
+        self.queue[0]
     }
 
     pub fn pop_front(&mut self) -> Option<StorageCommand> {
@@ -757,6 +800,41 @@ pub fn storage_command_for_transition(
     None
 }
 
+/// Confirming a row on the Library actions sheet owes storage one command:
+/// the transition out of `Sheet` into `Busy` is the pick. Back and the
+/// summoning key dismiss to `None`, which owes nothing — the two exits
+/// are distinct states, so the transition cannot be mistaken for a cancel.
+pub fn library_action_command_for_transition(
+    previous: &ReaderState,
+    next: &ReaderState,
+) -> Option<StorageCommand> {
+    let (
+        LibraryMenu::Sheet { .. },
+        LibraryMenu::Busy {
+            action,
+            index,
+            request_id,
+        },
+    ) = (previous.library_menu, next.library_menu)
+    else {
+        return None;
+    };
+    // Exhaustive over the action on purpose. Every `Busy` is a promise that
+    // some command is on its way to settle it, so an action added without a
+    // command here would hang the Library list on "…" forever. Naming the
+    // variants makes that a build failure instead.
+    Some(match action {
+        LibraryAction::ClearCache => StorageCommand::ClearBookCache {
+            request_id,
+            // The row and the catalog it was a row *in*, together: neither
+            // half means anything without the other by the time the storage
+            // task gets to it.
+            index,
+            catalog_epoch: next.catalog_epoch,
+        },
+    })
+}
+
 /// An open of `state`'s book, closing out `previous` when this changes books.
 pub fn open_book_command(
     state: &ReaderState,
@@ -963,12 +1041,45 @@ impl PortalPsk {
     }
 }
 
+/// The reader's true chapter for the page just shown.
+///
+/// The reducer's page map is capped at [`MAX_SD_CHAPTERS`], so past that cap
+/// its own idea of the chapter goes stale; only the loaded SD reader has the
+/// uncapped map. The display task reads the real one off the page it just
+/// rendered and sends it back with the acknowledgement.
+///
+/// It names the page as well as the book because it is an answer about one
+/// particular frame, and the reader need not still be on that frame when the
+/// answer lands: input is applied while a render is in flight, and only the
+/// repaint waits. Applied without the page check, a correction for the page
+/// left behind would pair that chapter with the page moved to — and
+/// [`extend_section_command`] reads the two together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChapterCursor {
+    pub book_id: u32,
+    pub page: u32,
+    pub current_chapter: u16,
+}
+
 // Bounded Copy messages by design: chapter_pages rides inside the event
 // because firmware has no heap to box large variants into.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayEvent {
-    Settled,
+    /// The frame reached the panel and the render cycle is over.
+    ///
+    /// Carries the chapter correction for the page just shown, when there is
+    /// one. It rides here rather than travelling as its own event because the
+    /// app must apply it *before* it clears the render lock — clearing the
+    /// lock is what lets the next navigation read `chapter` — and no pair of
+    /// separate messages can promise that. They were separate once: the
+    /// correction went down whichever channel had room, and the two could be
+    /// split across channels the app selects on independently, or the
+    /// correction dropped outright while the acknowledgement survived. One
+    /// message cannot arrive in the wrong order or half-arrive.
+    Settled {
+        chapter_cursor: Option<ChapterCursor>,
+    },
     /// The panel completed a sleep transition. Informational for the app:
     /// like `SleepFailed`, it does not end a render cycle, and the sleep's
     /// handshake may already have been abandoned with render/open work
@@ -995,6 +1106,11 @@ pub enum DisplayEvent {
 pub enum LibraryEvent {
     Scanned {
         count: u16,
+        /// Bumped by the storage task every time it replaces its catalog.
+        /// Row numbers only mean something within one epoch, so a command
+        /// that names a row carries the epoch it was picked in; see
+        /// [`StorageCommand::ClearBookCache`].
+        catalog_epoch: u32,
     },
     /// A section load finished: the book's shape, and where the reader now is.
     ///
@@ -1036,14 +1152,6 @@ pub enum LibraryEvent {
         chapter: u16,
         page: u32,
     },
-    /// The firmware re-resolved the current chapter for the page just rendered,
-    /// over the whole-book (uncapped) map. Sent on reading renders so the cursor
-    /// keeps tracking past `MAX_SD_CHAPTERS` between section loads, where the
-    /// reducer's own `sd_chapter_for_page` saturates.
-    ChapterCursor {
-        book_id: u32,
-        current_chapter: u16,
-    },
     CustomFont {
         available: bool,
     },
@@ -1063,7 +1171,355 @@ pub enum LibraryEvent {
         font_family: u8,
         front_buttons: u8,
     },
+    /// A `ClearBookCache` settled. `ok` is false when the row was stale (the
+    /// catalog changed under it), could not be resolved, its identity did not
+    /// match the cache on card, or something rebuildable survived the delete.
+    ///
+    /// `request_id` echoes the command this answers, and is the only thing
+    /// that identifies it. The row cannot serve: leaving Library drops the
+    /// wait but not the command, so the same row can be cleared twice with
+    /// both in flight, and then a row match would let the first answer settle
+    /// the second wait — showing a stale-epoch refusal as the outcome of a
+    /// clear that is still running. The reducer shows the note only if the
+    /// user is still waiting on the Library screen for this exact request.
+    CacheCleared {
+        request_id: u32,
+        ok: bool,
+    },
 }
+
+/// Slots in the library-event channel. Lives here because the eviction walk
+/// below is written against it and the two must not drift; the firmware sizes
+/// the channel from this.
+pub const LIBRARY_EVENT_SLOTS: usize = 8;
+
+/// Making room in a full library-event channel for an event that must be
+/// delivered, without discarding another one that must be delivered.
+///
+/// The channel is a ring the sender cannot look into: the only way to see
+/// what is queued is to take it off the front. So making room is a walk —
+/// take the head, and either drop it (a refresh, which the next event or the
+/// next render makes good) or put it back behind the others and look at the
+/// next one. Requeuing moves that event behind whatever was after it, which
+/// is the price of not losing it; a full channel is already a degraded moment
+/// and order among refreshes is not what the app is waiting on.
+///
+/// The walk stops once it has been all the way round. Every slot holding a
+/// settling event means there is none that can be freed honestly, so the walk
+/// ends with nothing spent and the newcomer still in the caller's hands — to
+/// hold and retry, not to drop, since it is awaited exactly like the eight it
+/// could not displace. Stopping *before* the repeat rather than after it is
+/// what leaves the ring exactly as the walk found it: each slot has been
+/// requeued once, which is a full rotation.
+///
+/// RAM: two usizes, beside the one `LibraryEvent` the caller already holds
+/// while it decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvictionWalk {
+    inspected: usize,
+    capacity: usize,
+}
+
+/// What the caller does with the event it just took off the front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionStep {
+    /// Only a refresh: drop it, and the slot it frees is the newcomer's.
+    Discard,
+    /// It settles a wait too. Put it back and take the next one.
+    Requeue,
+}
+
+impl EvictionWalk {
+    pub const fn new(capacity: usize) -> Self {
+        Self {
+            inspected: 0,
+            capacity,
+        }
+    }
+
+    /// Whether the walk has been all the way round. Checked before taking
+    /// another event, so a walk that finds nothing to spend never disturbs
+    /// the ring it gave up on.
+    pub const fn exhausted(&self) -> bool {
+        self.inspected >= self.capacity
+    }
+
+    /// Decide what to do with `head`, the event just taken off the front.
+    pub fn inspect(&mut self, head: &LibraryEvent) -> EvictionStep {
+        self.inspected += 1;
+        if head.must_be_delivered() {
+            EvictionStep::Requeue
+        } else {
+            EvictionStep::Discard
+        }
+    }
+}
+
+/// Slots in the display-event channel. Lives here so the firmware and the
+/// model test below size the same channel.
+pub const DISPLAY_EVENT_SLOTS: usize = 8;
+
+/// The render acknowledgement that had nowhere to go, waiting for room.
+///
+/// The display-event channel used to be made room in by walking it, the way
+/// [`EvictionWalk`] walks the library channel. There is nothing here worth
+/// spending: the informational events take the lossy path, and everything
+/// else is either an acknowledgement the app is waiting on or a library event
+/// carrying its own rule. A walk would also have to put back what it may not
+/// spend, at the tail, behind everything it has not inspected — and this queue
+/// is the one the app reads its render acknowledgements from in order.
+///
+/// So the queue is left alone and the acknowledgement waits instead, placed by
+/// a branch of the display task's select once the app drains a slot — the same
+/// answer as [`LibraryEventHolder`], for the same reason.
+///
+/// Unlike that one, this holder gates nothing. The producer of
+/// acknowledgements is the render arm of the display loop, and refusing
+/// renders while one is held would deadlock: the app blocks on handing over a
+/// render, and servicing renders is exactly what frees the app to drain the
+/// channel this event is waiting for.
+///
+/// RAM: one `Option<DisplayEvent>` — 280 bytes, sized by the `Library`
+/// variant. Sits in the firmware's `.bss`, not on a stack.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayEventHolder {
+    held: Option<DisplayEvent>,
+}
+
+/// What [`DisplayEventHolder::hold`] did with the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayHoldOutcome {
+    /// Taken. The caller's placing branch delivers it once there is room.
+    Held,
+    /// Not an acknowledgement the app is waiting on. Send it the lossy way.
+    NotRequired,
+    /// Occupied by an acknowledgement that has been waiting longer. Both end
+    /// the render cycle and the app clears its render lock on either, so the
+    /// one already waiting is enough and the newcomer may be the loss.
+    Occupied,
+}
+
+impl DisplayEventHolder {
+    pub const fn new() -> Self {
+        Self { held: None }
+    }
+
+    /// The acknowledgement awaiting a slot, if any. Peeking, not taking: it
+    /// stays held until [`Self::placed`] says it landed, so a cancelled send
+    /// cannot lose it.
+    pub const fn pending(&self) -> Option<DisplayEvent> {
+        self.held
+    }
+
+    /// Take responsibility for an acknowledgement the channel refused.
+    pub fn hold(&mut self, event: &DisplayEvent) -> DisplayHoldOutcome {
+        if !event.must_be_delivered() {
+            return DisplayHoldOutcome::NotRequired;
+        }
+        if self.held.is_some() {
+            return DisplayHoldOutcome::Occupied;
+        }
+        self.held = Some(*event);
+        DisplayHoldOutcome::Held
+    }
+
+    /// The held event reached the channel.
+    pub fn placed(&mut self) -> Option<DisplayEvent> {
+        self.held.take()
+    }
+}
+
+impl DisplayEvent {
+    /// Whether dropping this would strand the app rather than cost it a log
+    /// line.
+    ///
+    /// `Settled` and `RefreshFailed` end the render cycle: the app clears its
+    /// render lock on them, drains its parked storage and releases a deferred
+    /// sleep. Nothing reissues them, so a dropped one leaves every later state
+    /// change merely pending, with no render left to be acknowledged.
+    ///
+    /// `Asleep` and `SleepFailed` are notifications. The handshake the power
+    /// task actually waits on travels over its own channel and is sent beside
+    /// each of these; the app only logs them. Dropping one costs the log line.
+    ///
+    /// `Library` carries the library event's own answer, so an event that
+    /// settles a wait is protected whichever channel it is travelling on.
+    pub const fn must_be_delivered(&self) -> bool {
+        match self {
+            Self::Settled { .. } | Self::RefreshFailed => true,
+            Self::Asleep | Self::SleepFailed => false,
+            Self::Library(event) => event.must_be_delivered(),
+        }
+    }
+}
+
+/// The one settling event that had nowhere to go, and the standing orders the
+/// display task owes it while it waits.
+///
+/// When [`EvictionWalk`] finds nothing it may honestly spend, the event is
+/// neither queued nor dropped — it is held here until the app drains a slot.
+/// That single occupied slot then constrains the whole task, because the way
+/// it empties is the app receiving from a channel the display task is not
+/// currently feeding:
+///
+/// - **Storage stands down.** Storage is where settling events come from, and
+///   there is one slot; applying another command could produce a second with
+///   nowhere to go.
+/// - **Sleep waits.** Sleep is terminal here — waking is a fresh boot — so
+///   going down with an event held would take it along and strand the wait it
+///   was going to settle.
+/// - **Library events stay in the display-event channel.** Moving one across
+///   to make room is only free while the holder can catch it; occupied, the
+///   move would arrive with nowhere to go.
+///
+/// Those are three readings of one rule, which is why they live together: they
+/// were three separate `if`s in the task before this type, and two of them had
+/// already drifted out of agreement by the time a reviewer noticed. The fourth
+/// rule is [`Self::hold`]'s own — it accepts only what it is for.
+///
+/// RAM: one `Option<LibraryEvent>` — 276 bytes, sized by the `Loaded`
+/// variant's chapter-page map. Sits in the firmware's `.bss`, not on a stack.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LibraryEventHolder {
+    held: Option<LibraryEvent>,
+}
+
+/// What [`LibraryEventHolder::hold`] did with the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldOutcome {
+    /// Taken. The caller's placing branch delivers it once there is room.
+    Held,
+    /// A refresh, which the next event or the next render makes good. It was
+    /// never the holder's to protect, and letting one in would close every
+    /// gate above on an event nothing is waiting for. Send it the lossy way.
+    NotSettling,
+    /// Occupied by an event that has been waiting longer. Every producer is
+    /// gated on the holder, so reaching here means one storage command
+    /// produced two settling events. The newcomer gets a last try at the
+    /// channel and is the loss if that fails — the older wait survives.
+    Occupied,
+}
+
+impl LibraryEventHolder {
+    pub const fn new() -> Self {
+        Self { held: None }
+    }
+
+    /// The event awaiting a slot, if any. Peeking, not taking: it stays held
+    /// until [`Self::placed`] says it actually landed, so a cancelled send
+    /// cannot lose it.
+    pub const fn pending(&self) -> Option<LibraryEvent> {
+        self.held
+    }
+
+    /// May the task apply another storage command?
+    pub const fn storage_may_run(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// May the task sleep, or keep draining storage on the way down?
+    pub const fn sleep_may_proceed(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// May a library event be moved out of the display-event channel to make
+    /// room there?
+    pub const fn library_event_may_move(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// Take responsibility for an event the library channel refused.
+    pub fn hold(&mut self, event: &LibraryEvent) -> HoldOutcome {
+        if !event.must_be_delivered() {
+            return HoldOutcome::NotSettling;
+        }
+        if self.held.is_some() {
+            return HoldOutcome::Occupied;
+        }
+        self.held = Some(*event);
+        HoldOutcome::Held
+    }
+
+    /// The held event reached the channel. Returns it so a caller can log
+    /// what it placed; the holder is empty either way.
+    pub fn placed(&mut self) -> Option<LibraryEvent> {
+        self.held.take()
+    }
+}
+
+impl LibraryEvent {
+    /// Whether dropping this event would strand the app rather than cost it a
+    /// repaint.
+    ///
+    /// The library-event channel is small and lossy on purpose: most of what
+    /// crosses it is a refresh, and a dropped one is made good by the next
+    /// event or the next render. These three are not refreshes. Each one
+    /// releases a lock the app took when it handed the work over, and nothing
+    /// reissues them — the storage task has already done the work and moved
+    /// on, so a dropped one leaves the app waiting for the rest of the visit:
+    ///
+    /// - `Loaded` and `BookOpenFailed` are the two ways an open ends, and the
+    ///   app suppresses input until one of them arrives.
+    /// - `CacheCleared` settles a per-book action's `LibraryMenu::Busy`, which
+    ///   holds the whole Library list still while it waits.
+    /// - `Restored` is what the boot render waits for before drawing.
+    ///
+    /// The senders route on this, so an event that settles something is
+    /// protected by naming it here rather than by every call site
+    /// remembering which function to reach for.
+    pub const fn must_be_delivered(&self) -> bool {
+        matches!(
+            self,
+            Self::Loaded { .. }
+                | Self::BookOpenFailed { .. }
+                | Self::CacheCleared { .. }
+                | Self::Restored { .. }
+        )
+    }
+}
+
+/// The Library's per-book actions sheet and its follow-through, one step
+/// at a time: the side browse key opens the sheet on the selected row,
+/// the browse keys move its cursor, Confirm executes the action, and the
+/// settled result lingers as a note until the next press. Picking a row
+/// on the sheet is itself the deliberate step, so recoverable actions run
+/// on that one Confirm; an irreversible action (deletion, when it joins)
+/// adds its own per-action confirm stage. One state, because at most one
+/// of these is ever on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LibraryMenu {
+    #[default]
+    None,
+    /// The actions sheet is up; `row` is its cursor into [`LIBRARY_ACTIONS`].
+    Sheet { row: u8 },
+    /// `action`'s storage command is in flight for catalog row `index`; the
+    /// `LibraryEvent` echoing `request_id` settles it.
+    ///
+    /// The request id is what matches the answer to the question. Leaving
+    /// Library drops `Busy` but not the command it launched, so a second
+    /// action can be started — on the same row as the first, even — with both
+    /// still in flight; only an id distinguishes them. `index` rides along
+    /// because the note is about a book, not because it identifies anything.
+    /// While `Busy` is up the Library list is frozen (see `apply_input`), so
+    /// at most one action per visit can be launched.
+    Busy {
+        action: LibraryAction,
+        index: u16,
+        request_id: u32,
+    },
+    /// Transient result note; the next press dismisses it.
+    Done { action: LibraryAction, ok: bool },
+}
+
+/// Per-book actions the Library sheet offers. Slice 1 of the
+/// file-management PRD ships cache-clearing; delete and move join here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryAction {
+    ClearCache,
+}
+
+/// The sheet's rows, top to bottom.
+pub const LIBRARY_ACTIONS: &[LibraryAction] = &[LibraryAction::ClearCache];
 
 /// Wi-Fi session lifecycle as shown on the Wireless screen. The wifi task
 /// owns the radio and reports transitions back as `SyncEvent`s; the reducer
@@ -1161,10 +1617,18 @@ pub enum PowerEvent {
 /// Keep the display and power acknowledgements for a panel refresh paired.
 /// A failed transfer must never advance the app render queue or authorize a
 /// later power transition as though the panel had settled.
-pub const fn display_refresh_outcome(success: bool) -> (DisplayEvent, PowerEvent) {
+pub const fn display_refresh_outcome(
+    success: bool,
+    chapter_cursor: Option<ChapterCursor>,
+) -> (DisplayEvent, PowerEvent) {
     if success {
-        (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+        (
+            DisplayEvent::Settled { chapter_cursor },
+            PowerEvent::DisplaySettled,
+        )
     } else {
+        // A frame that never landed corrects nothing: the cursor is read from
+        // the page that was shown.
         (
             DisplayEvent::RefreshFailed,
             PowerEvent::DisplayRefreshFailed,
@@ -1226,6 +1690,10 @@ pub struct ReaderState {
     pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u16,
+    /// The catalog the Library list is currently drawn from, as reported by
+    /// the last [`LibraryEvent::Scanned`]. Row-addressed storage commands
+    /// carry it so the storage task can tell a live row from a stale one.
+    pub catalog_epoch: u32,
     pub sd_page_count: u32,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
@@ -1233,6 +1701,14 @@ pub struct ReaderState {
     /// Portrait reading's summoned key sheet is up: the next named-key
     /// press acts on the label it revealed instead of summoning again.
     pub reading_sheet: bool,
+    /// The Library per-book actions sheet's progress on the selected row.
+    pub library_menu: LibraryMenu,
+    /// Ids handed to per-book actions, one per pick. Lives beside the menu
+    /// rather than inside it because it has to outlive the wait it named:
+    /// `Busy` is dropped whenever the reader leaves Library, and the next
+    /// pick must still not reuse the id of a command that is out there
+    /// unanswered.
+    pub library_request_seq: u32,
     pub sync_status: SyncStatus,
     /// The saved Wi-Fi network's name; len 0 means none is saved. Fed by
     /// `SyncEvent::NetworkSaved` at boot and `CredentialsSaved` from the
@@ -1269,11 +1745,14 @@ impl ReaderState {
             battery_mv: 0,
             battery_percent: 100,
             library_count: 0,
+            catalog_epoch: 0,
             sd_page_count: 1,
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             read_request_pending: false,
             reading_sheet: false,
+            library_menu: LibraryMenu::None,
+            library_request_seq: 0,
             sync_status: SyncStatus::NotConfigured,
             wifi_ssid: [0; 32],
             wifi_ssid_len: 0,
@@ -1337,6 +1816,77 @@ impl ReaderState {
             }
         }
 
+        // A settled per-book-action note lingers until the next press
+        // acknowledges it; the press itself still acts normally.
+        if matches!(self.library_menu, LibraryMenu::Done { .. }) {
+            next.library_menu = LibraryMenu::None;
+        }
+
+        // The Library actions sheet and the wait that follows a pick run
+        // their own grammar: while either is up, no press may fall through
+        // to move the cursor or open a book — the same press must never
+        // both answer the sheet and act on the list beneath it, and none
+        // may disturb a row the storage task is working on.
+        if self.view == AppView::Library {
+            if let LibraryMenu::Sheet { row } = self.library_menu {
+                match button {
+                    // Opening the sheet and confirming a labeled row is the
+                    // deliberate two-step; the pick executes. Irreversible
+                    // actions add their own confirm stage when they join.
+                    Some(Button::Confirm) if self.selection < self.library_count => {
+                        // A sheet with no actions has nothing to pick, and
+                        // the modulo and the index would both abort on the
+                        // way to finding that out. Not reachable while
+                        // LIBRARY_ACTIONS is a fixed non-empty const, but
+                        // this is a release build that aborts on panic.
+                        let Some(&action) =
+                            LIBRARY_ACTIONS.get(row as usize % LIBRARY_ACTIONS.len().max(1))
+                        else {
+                            return next;
+                        };
+                        // A fresh id per pick, never reused, so an answer to
+                        // an abandoned clear cannot settle this one.
+                        next.library_request_seq = self.library_request_seq.wrapping_add(1);
+                        next.library_menu = LibraryMenu::Busy {
+                            action,
+                            index: self.selection,
+                            request_id: next.library_request_seq,
+                        };
+                        return next;
+                    }
+                    Some(Button::Next | Button::PageNext) => {
+                        let row = wrap_next(row as u16, LIBRARY_ACTIONS.len().max(1) as u16) as u8;
+                        next.library_menu = LibraryMenu::Sheet { row };
+                        return next;
+                    }
+                    Some(Button::Previous) => {
+                        let row = wrap_prev(row as u16, LIBRARY_ACTIONS.len().max(1) as u16) as u8;
+                        next.library_menu = LibraryMenu::Sheet { row };
+                        return next;
+                    }
+                    Some(Button::Power) | None => {}
+                    // Back and the summoning side key both dismiss.
+                    Some(_) => {
+                        next.library_menu = LibraryMenu::None;
+                        return next;
+                    }
+                }
+            }
+            // A picked action holds the list still until it settles. The
+            // storage task is mid-operation on the selected row: a press
+            // that fell through here could move the cursor off the row the
+            // note will name, open a book whose cache is being deleted, or
+            // pick a second action while the first is unanswered. Back is
+            // the deliberate exception — leaving Library is always allowed,
+            // and it drops the claim to the answer along with the state.
+            if matches!(self.library_menu, LibraryMenu::Busy { .. }) {
+                match button {
+                    Some(Button::Back) | Some(Button::Power) | None => {}
+                    Some(_) => return next,
+                }
+            }
+        }
+
         match (self.view, button) {
             (_, None) => {}
             (_, Some(Button::Power)) => {}
@@ -1348,8 +1898,17 @@ impl ReaderState {
             (AppView::Library, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.library_item_count(ctx));
             }
-            (AppView::Library, Some(Button::Previous | Button::PagePrevious)) => {
+            (AppView::Library, Some(Button::Previous)) => {
                 next.selection = wrap_prev(self.selection, self.library_item_count(ctx));
+            }
+            // The side browse key is a navigation alias everywhere else; in
+            // Library it opens the per-book actions sheet instead, the same
+            // key that arms "forget" on the Wireless screen. Only a real
+            // catalog row has actions.
+            (AppView::Library, Some(Button::PagePrevious)) => {
+                if self.selection < self.library_count {
+                    next.library_menu = LibraryMenu::Sheet { row: 0 };
+                }
             }
             // Imprint key grammar: Back always zooms out one level,
             // Confirm always affirms the screen's primary action.
@@ -1501,14 +2060,51 @@ impl ReaderState {
         if next.view != AppView::Reading || !is_portrait(next.orientation) {
             next.reading_sheet = false;
         }
+        // The actions sheet is a Library-surface state; leaving the screen
+        // drops it (an in-flight Busy settles silently — the note only
+        // shows to someone still looking at Library).
+        if next.view != AppView::Library {
+            next.library_menu = LibraryMenu::None;
+        }
 
         next
     }
 
+    /// Adopt the firmware's uncapped chapter for the page just shown.
+    ///
+    /// Silent: the Reading view shows page-within-chapter, not the chapter
+    /// itself, so no repaint is owed — Home, the sleep screen, Chapters and
+    /// the persisted position pick the corrected value up when next used.
+    /// That is also why it can ride with the acknowledgement instead of
+    /// forcing a render of its own.
+    ///
+    /// Applied before the render lock is cleared, since clearing it is what
+    /// lets the next navigation read [`Self::chapter`].
+    ///
+    /// Only onto the frame it describes. A press lands while its render is
+    /// still in flight — the reducer runs and only the repaint is held back —
+    /// so an acknowledgement can arrive for a page the reader has already left,
+    /// and adopting its chapter there would pair one page's number with
+    /// another's chapter. Nothing is lost by declining: the page moved to has
+    /// its own render coming, with its own correction.
+    pub fn apply_chapter_cursor(mut self, cursor: ChapterCursor) -> Self {
+        if self.book_id == cursor.book_id && self.page == cursor.page {
+            self.chapter = cursor.current_chapter;
+        }
+        self
+    }
+
     pub fn apply_library_event(mut self, ctx: ReducerContext, event: LibraryEvent) -> Self {
         match event {
-            LibraryEvent::Scanned { count } => {
+            LibraryEvent::Scanned {
+                count,
+                catalog_epoch,
+            } => {
                 self.library_count = count;
+                // Row numbers are only meaningful inside one epoch; adopt it
+                // so anything the user picks from this list is tagged with
+                // the catalog the list was drawn from.
+                self.catalog_epoch = catalog_epoch;
                 // Boot points at the built-in demo book until the scan
                 // proves the card has real books; the title page then
                 // adopts the first catalog entry instead of the
@@ -1534,6 +2130,11 @@ impl ReaderState {
                     if self.read_request_pending {
                         self.read_request_pending = false;
                     }
+                }
+                // A fresh scan can reorder rows; an open sheet must not
+                // carry over to whatever now sits at the cursor.
+                if matches!(self.library_menu, LibraryMenu::Sheet { .. }) {
+                    self.library_menu = LibraryMenu::None;
                 }
             }
             LibraryEvent::Loaded {
@@ -1579,24 +2180,40 @@ impl ReaderState {
                     self.dirty = Rect::FULL;
                 }
             }
-            LibraryEvent::ChapterCursor {
-                book_id,
-                current_chapter,
-            } => {
-                if self.book_id == book_id {
-                    // Adopt the firmware's uncapped chapter silently. The Reading
-                    // view shows page-within-chapter, not the chapter itself, so no
-                    // repaint is needed -- Home/sleep/Chapters and the persisted
-                    // position pick up the corrected value when next used.
-                    self.chapter = current_chapter;
-                }
-            }
             LibraryEvent::CustomFont { available } => {
                 self.custom_font_available = available;
                 if !available && self.font_family == FontFamily::Custom {
                     self.font_family = FontFamily::Literata;
                 }
                 self.dirty = Rect::FULL;
+            }
+            LibraryEvent::CacheCleared { request_id, ok } => {
+                // Only someone still waiting on the Library screen sees the
+                // note; leaving the screen dropped `Busy` and with it any
+                // claim to the answer. The id has to match too: a clear
+                // started, walked away from, and started again leaves an
+                // older answer still in flight, and it reports on a command
+                // this wait never issued — possibly one the storage task
+                // refused as stale, which would read here as "cache not
+                // cleared" for a clear that is still running.
+                if let LibraryMenu::Busy {
+                    action,
+                    request_id: outstanding,
+                    ..
+                } = self.library_menu
+                {
+                    // Exhaustive for the same reason the command side is: an
+                    // action added without a settle arm here would match no
+                    // pattern and leave its wait up for good. Every action
+                    // this event can answer has to be named.
+                    let settles = match action {
+                        LibraryAction::ClearCache => true,
+                    };
+                    if settles && outstanding == request_id {
+                        self.library_menu = LibraryMenu::Done { action, ok };
+                        self.dirty = Rect::FULL;
+                    }
+                }
             }
             LibraryEvent::Restored {
                 book_id,
@@ -1719,6 +2336,7 @@ impl ReaderState {
             orientation: self.orientation,
             front_buttons: self.front_buttons,
             reading_sheet: self.reading_sheet,
+            library_menu: self.library_menu,
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -1796,6 +2414,22 @@ impl ReaderState {
         self.sd_chapter_count = rollback.sd_chapter_count;
         self.sd_chapter_pages = rollback.sd_chapter_pages;
         self.dirty = Rect::FULL;
+        self
+    }
+
+    /// Settles a picked Library action whose storage command never left the
+    /// app, as the failure it is.
+    ///
+    /// `Busy` waits on an event that only the storage task can send, so a
+    /// command the queue refused would leave the screen saying "clearing…"
+    /// with nothing on its way to answer — until the battery ran out. The
+    /// caller that saw the refusal is the only one who knows, so it says so
+    /// here.
+    pub fn library_action_rejected(mut self) -> Self {
+        if let LibraryMenu::Busy { action, .. } = self.library_menu {
+            self.library_menu = LibraryMenu::Done { action, ok: false };
+            self.dirty = Rect::FULL;
+        }
         self
     }
 
@@ -2614,6 +3248,993 @@ mod tests {
         assert!(!state.wifi_network_saved());
     }
 
+    /// A reader parked on a Library row, as if it had scanned real books.
+    fn in_library(selection: u16, count: u16) -> ReaderState {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Library;
+        state.library_count = count;
+        state.catalog_epoch = EPOCH;
+        state.selection = selection;
+        state
+    }
+
+    const CLEAR: LibraryAction = LibraryAction::ClearCache;
+    /// A catalog epoch that is deliberately not the boot default, so a
+    /// command that forgot to carry one shows up as a mismatch.
+    const EPOCH: u32 = 7;
+
+    /// The id of the action `state` is waiting on.
+    fn outstanding(state: ReaderState) -> u32 {
+        match state.library_menu {
+            LibraryMenu::Busy { request_id, .. } => request_id,
+            other => panic!("no action in flight: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn library_sheet_opens_picks_and_settles() {
+        let state = press(in_library(1, 4), Button::PagePrevious);
+        assert_eq!(state.library_menu, LibraryMenu::Sheet { row: 0 });
+        assert_eq!(state.selection, 1, "opening must not move the cursor");
+
+        // Confirm on the labeled row executes — the sheet was the
+        // deliberate step; recoverable actions ask no second question.
+        let previous = state;
+        let state = press(state, Button::Confirm);
+        assert_eq!(
+            state.library_menu,
+            LibraryMenu::Busy {
+                action: CLEAR,
+                index: 1,
+                request_id: 1
+            }
+        );
+        assert_eq!(
+            state.view,
+            AppView::Library,
+            "confirm must not open the book"
+        );
+        assert_eq!(
+            library_action_command_for_transition(&previous, &state),
+            Some(StorageCommand::ClearBookCache {
+                request_id: 1,
+                index: 1,
+                catalog_epoch: EPOCH
+            })
+        );
+
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id: 1,
+                ok: true,
+            },
+        );
+        assert_eq!(
+            state.library_menu,
+            LibraryMenu::Done {
+                action: CLEAR,
+                ok: true
+            }
+        );
+        // The next press dismisses the note and still acts.
+        let state = press(state, Button::Next);
+        assert_eq!(state.library_menu, LibraryMenu::None);
+        assert_eq!(state.selection, 2);
+    }
+
+    #[test]
+    fn library_sheet_browse_moves_its_cursor_not_the_list() {
+        let sheet = press(in_library(1, 4), Button::PagePrevious);
+        for button in [Button::Next, Button::Previous, Button::PageNext] {
+            let moved = press(sheet, button);
+            assert!(
+                matches!(moved.library_menu, LibraryMenu::Sheet { .. }),
+                "{button:?} must stay on the sheet"
+            );
+            assert_eq!(moved.selection, 1, "{button:?} must not move the list");
+        }
+        // Back and the summoning key dismiss without acting.
+        for button in [Button::Back, Button::PagePrevious] {
+            let dismissed = press(sheet, button);
+            assert_eq!(dismissed.library_menu, LibraryMenu::None);
+            assert_eq!(
+                dismissed.view,
+                AppView::Library,
+                "{button:?} must only dismiss"
+            );
+            assert_eq!(dismissed.selection, 1);
+        }
+    }
+
+    #[test]
+    fn library_sheet_dismissal_emits_nothing() {
+        let sheet = press(in_library(1, 4), Button::PagePrevious);
+        for button in [Button::Back, Button::PagePrevious] {
+            let dismissed = press(sheet, button);
+            assert_eq!(dismissed.library_menu, LibraryMenu::None);
+            assert_eq!(
+                library_action_command_for_transition(&sheet, &dismissed),
+                None,
+                "{button:?} must not owe storage anything"
+            );
+        }
+        // Moving the sheet cursor owes nothing either.
+        let moved = press(sheet, Button::Next);
+        assert_eq!(library_action_command_for_transition(&sheet, &moved), None);
+    }
+
+    #[test]
+    fn library_sheet_never_opens_off_the_catalog() {
+        // The built-in fallback row has no per-book actions.
+        let state = press(in_library(0, 0), Button::PagePrevious);
+        assert_eq!(state.library_menu, LibraryMenu::None);
+    }
+
+    #[test]
+    fn library_sheet_does_not_survive_scans_or_leaving() {
+        let sheet = press(in_library(1, 4), Button::PagePrevious);
+        let state = sheet.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(
+            state.library_menu,
+            LibraryMenu::None,
+            "a rescan may reorder rows; the sheet must not carry over"
+        );
+        assert_eq!(
+            state.catalog_epoch,
+            EPOCH + 1,
+            "the list now belongs to the new catalog"
+        );
+
+        // Leaving the screen while the clear is in flight drops the claim to
+        // the answer: a late settle event shows no note.
+        let busy = press(sheet, Button::Confirm);
+        assert_eq!(
+            busy.library_menu,
+            LibraryMenu::Busy {
+                action: CLEAR,
+                index: 1,
+                request_id: 1
+            }
+        );
+        let away = press(busy, Button::Back);
+        assert_ne!(away.view, AppView::Library);
+        assert_eq!(away.library_menu, LibraryMenu::None);
+        let settled = away.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id: 1,
+                ok: true,
+            },
+        );
+        assert_eq!(settled.library_menu, LibraryMenu::None);
+    }
+
+    #[test]
+    fn clear_cache_failure_shows_the_failed_note() {
+        let busy = press(
+            press(in_library(2, 4), Button::PagePrevious),
+            Button::Confirm,
+        );
+        let state = busy.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id: outstanding(busy),
+                ok: false,
+            },
+        );
+        assert_eq!(
+            state.library_menu,
+            LibraryMenu::Done {
+                action: CLEAR,
+                ok: false
+            }
+        );
+    }
+
+    /// A rescan dismisses the sheet but not the wait, and the asymmetry is
+    /// deliberate: the sheet is a question that a reordered list invalidates,
+    /// while the wait belongs to a command already handed over. Dropping it
+    /// would leave the answer with nothing to settle. The answer is a refusal
+    /// here — the storage task compares the command's epoch against the
+    /// catalog it now holds and will not delete against a stale row — and the
+    /// note has to report that, not silently vanish.
+    #[test]
+    fn a_rescan_keeps_the_wait_it_cannot_cancel() {
+        let busy = press(
+            press(in_library(1, 4), Button::PagePrevious),
+            Button::Confirm,
+        );
+        let request_id = outstanding(busy);
+
+        let rescanned = busy.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(
+            rescanned.library_menu, busy.library_menu,
+            "the command is already out; the wait must survive to receive it"
+        );
+        assert_eq!(rescanned.catalog_epoch, EPOCH + 1);
+
+        // The storage task refused the now-stale row, and the note says so.
+        let settled = rescanned.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id,
+                ok: false,
+            },
+        );
+        assert_eq!(
+            settled.library_menu,
+            LibraryMenu::Done {
+                action: CLEAR,
+                ok: false
+            }
+        );
+    }
+
+    /// While the storage task is deleting a row's cache, the list under it is
+    /// frozen: nothing may start a second action, open the book being worked
+    /// on, or walk the cursor off the row the note is about.
+    #[test]
+    fn library_busy_freezes_the_list() {
+        let busy = press(
+            press(in_library(1, 4), Button::PagePrevious),
+            Button::Confirm,
+        );
+        for button in [
+            Button::Confirm,
+            Button::Next,
+            Button::Previous,
+            Button::PageNext,
+            Button::PagePrevious,
+        ] {
+            let pressed = press(busy, button);
+            assert_eq!(
+                pressed.library_menu, busy.library_menu,
+                "{button:?} must not disturb the action in flight"
+            );
+            assert_eq!(pressed.selection, 1, "{button:?} must not move the list");
+            assert_eq!(pressed.view, AppView::Library, "{button:?} must not leave");
+            assert_eq!(
+                library_action_command_for_transition(&busy, &pressed),
+                None,
+                "{button:?} must not start a second action"
+            );
+        }
+        // Back is the way out, and leaving drops the wait.
+        let away = press(busy, Button::Back);
+        assert_eq!(away.view, AppView::Home);
+        assert_eq!(away.library_menu, LibraryMenu::None);
+    }
+
+    /// Two clears can only ever be in flight across a visit to another screen —
+    /// and the second may well be the *same row* the reader gave up on, so the
+    /// row cannot tell the answers apart. Only the request id can.
+    #[test]
+    fn clear_cache_settles_only_its_own_request() {
+        let first = press(
+            press(in_library(3, 4), Button::PagePrevious),
+            Button::Confirm,
+        );
+        // Walk away mid-clear, come back, and clear the very same row again.
+        // Home's Back key is the way back onto the shelf, which lands the
+        // cursor at the top; three Next presses return it to row 3.
+        let returned = press(press(first, Button::Back), Button::Back);
+        assert_eq!(returned.view, AppView::Library);
+        let returned = press(
+            press(press(returned, Button::Next), Button::Next),
+            Button::Next,
+        );
+        assert_eq!(returned.selection, 3);
+        let second = press(press(returned, Button::PagePrevious), Button::Confirm);
+        assert_ne!(
+            outstanding(second),
+            outstanding(first),
+            "a second pick must not reuse an outstanding id"
+        );
+        assert_eq!(
+            second.library_menu,
+            LibraryMenu::Busy {
+                action: CLEAR,
+                index: 3,
+                request_id: outstanding(second)
+            }
+        );
+
+        // The abandoned first clear lands now — a stale-epoch refusal, say.
+        // It answers a command this wait never issued.
+        let intruder = second.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id: outstanding(first),
+                ok: false,
+            },
+        );
+        assert_eq!(
+            intruder.library_menu, second.library_menu,
+            "an abandoned clear's outcome is not this clear's answer"
+        );
+
+        let mine = intruder.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id: outstanding(second),
+                ok: true,
+            },
+        );
+        assert_eq!(
+            mine.library_menu,
+            LibraryMenu::Done {
+                action: CLEAR,
+                ok: true
+            }
+        );
+    }
+
+    /// A command the storage queue refused produces no event, so the app has
+    /// to settle the wait itself rather than sit on "clearing…" forever.
+    #[test]
+    fn rejected_library_action_settles_as_failed() {
+        let busy = press(
+            press(in_library(1, 4), Button::PagePrevious),
+            Button::Confirm,
+        );
+        let settled = busy.library_action_rejected();
+        assert_eq!(
+            settled.library_menu,
+            LibraryMenu::Done {
+                action: CLEAR,
+                ok: false
+            }
+        );
+        // Nothing in flight, nothing to settle.
+        let resting = in_library(1, 4);
+        assert_eq!(resting.library_action_rejected(), resting);
+    }
+
+    /// The library-event channel drops events when it is full, and a dropped
+    /// `CacheCleared` would leave the list frozen on "clearing…" for the rest
+    /// of the visit — the work is done, so nothing sends it again. Every event
+    /// that settles a wait the app is holding has to say so, or the firmware's
+    /// sender routes it out the lossy path.
+    /// Every event that releases a lock the app took when it handed work over.
+    /// Listed once, so the routing test and the holder tests below cannot
+    /// disagree about which events are which.
+    fn settling_events() -> [LibraryEvent; 4] {
+        [
+            LibraryEvent::CacheCleared {
+                request_id: 1,
+                ok: true,
+            },
+            LibraryEvent::BookOpenFailed { book_id: 2 },
+            LibraryEvent::Loaded {
+                book_id: 2,
+                pages: 1,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: None,
+            },
+            LibraryEvent::Restored {
+                book_id: 2,
+                chapter: 0,
+                page: 0,
+                page_count: 0,
+                reading_orientation: 0,
+                refresh_policy: 0,
+                font_size: 0,
+                line_spacing: 0,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+            },
+        ]
+    }
+
+    /// The rest: the next event or the next render makes a dropped one good.
+    fn refresh_events() -> [LibraryEvent; 3] {
+        [
+            LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: EPOCH,
+            },
+            LibraryEvent::CustomFont { available: true },
+            LibraryEvent::ChapterPage {
+                book_id: 2,
+                chapter: 0,
+                page: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn events_that_settle_a_wait_are_not_droppable() {
+        for event in settling_events() {
+            assert!(
+                event.must_be_delivered(),
+                "{event:?} releases a lock the app is holding"
+            );
+        }
+        for event in refresh_events() {
+            assert!(!event.must_be_delivered(), "{event:?} is only a refresh");
+        }
+    }
+
+    /// One of the task's channels, as far as a sender can see it: push to the
+    /// back, take from the front, no looking inside. Only this plumbing is
+    /// modelled — the walks driven over it below are the ones the firmware
+    /// runs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Ring<T: Copy + PartialEq, const N: usize> {
+        slots: [Option<T>; N],
+        head: usize,
+        len: usize,
+    }
+
+    type LibraryRing = Ring<LibraryEvent, LIBRARY_EVENT_SLOTS>;
+    type DisplayRing = Ring<DisplayEvent, DISPLAY_EVENT_SLOTS>;
+
+    impl<T: Copy + PartialEq, const N: usize> Ring<T, N> {
+        fn new() -> Self {
+            Self {
+                slots: [None; N],
+                head: 0,
+                len: 0,
+            }
+        }
+
+        fn try_send(&mut self, event: T) -> bool {
+            if self.len == N {
+                return false;
+            }
+            self.slots[(self.head + self.len) % N] = Some(event);
+            self.len += 1;
+            true
+        }
+
+        fn try_receive(&mut self) -> Option<T> {
+            let event = self.slots[self.head].take()?;
+            self.head = (self.head + 1) % N;
+            self.len -= 1;
+            Some(event)
+        }
+
+        /// Everything queued, front to back — the order the app would see.
+        fn drained(mut self) -> [Option<T>; N] {
+            let mut out = [None; N];
+            for slot in out.iter_mut() {
+                *slot = self.try_receive();
+            }
+            out
+        }
+
+        fn holds(self, event: T) -> bool {
+            self.drained().contains(&Some(event))
+        }
+    }
+
+    impl LibraryRing {
+        fn refreshes(self) -> usize {
+            self.drained()
+                .iter()
+                .filter(|queued| queued.is_some_and(|event| !event.must_be_delivered()))
+                .count()
+        }
+    }
+
+    /// The firmware's `send_required_library_event`, over the modelled ring:
+    /// try the channel, then the walk, then the holder — in that order, which
+    /// is the order the task uses.
+    fn send_required(
+        queue: &mut LibraryRing,
+        holder: &mut LibraryEventHolder,
+        event: LibraryEvent,
+    ) {
+        if queue.try_send(event) {
+            return;
+        }
+        let mut walk = EvictionWalk::new(LIBRARY_EVENT_SLOTS);
+        while !walk.exhausted() {
+            let Some(head) = queue.try_receive() else {
+                break;
+            };
+            match walk.inspect(&head) {
+                EvictionStep::Discard => {
+                    queue.try_send(event);
+                    return;
+                }
+                EvictionStep::Requeue => {
+                    queue.try_send(head);
+                }
+            }
+        }
+        if holder.hold(&event) != HoldOutcome::Held {
+            // The firmware's last try at a slot that may have freed since,
+            // and then the drop it reports.
+            queue.try_send(event);
+        }
+    }
+
+    /// The main loop's placing branch, which runs once the app has drained a
+    /// slot. Only ever called where the model has made room, matching the
+    /// firmware's `LIBRARY_EVENTS.send().await`.
+    fn place_held(queue: &mut LibraryRing, holder: &mut LibraryEventHolder) {
+        let Some(event) = holder.pending() else {
+            return;
+        };
+        assert!(queue.try_send(event), "the placing branch waits for room");
+        assert_eq!(holder.placed(), Some(event));
+    }
+
+    /// The firmware's `send_display_event`, over the modelled channel: the
+    /// queue, then the holder for an acknowledgement, and the lossy path for
+    /// anything else. Returns whether the event was queued outright.
+    fn send_display(
+        queue: &mut DisplayRing,
+        holder: &mut DisplayEventHolder,
+        event: DisplayEvent,
+    ) -> bool {
+        if queue.try_send(event) {
+            return true;
+        }
+        if holder.hold(&event) != DisplayHoldOutcome::Held {
+            // The firmware's last try at a slot that may have freed since,
+            // and then the drop it reports.
+            queue.try_send(event);
+        }
+        false
+    }
+
+    /// The main loop's placing branch for a held acknowledgement.
+    fn place_held_ack(queue: &mut DisplayRing, holder: &mut DisplayEventHolder) {
+        let Some(event) = holder.pending() else {
+            return;
+        };
+        assert!(queue.try_send(event), "the placing branch waits for room");
+        assert_eq!(holder.placed(), Some(event));
+    }
+
+    fn display_filled(events: impl IntoIterator<Item = DisplayEvent>) -> DisplayRing {
+        let mut ring = DisplayRing::new();
+        for event in events {
+            assert!(ring.try_send(event));
+        }
+        assert_eq!(ring.len, DISPLAY_EVENT_SLOTS, "the channel starts full");
+        ring
+    }
+
+    /// The three questions the display task asks the holder, from three
+    /// unrelated places: the main loop's storage branch, the pre-sleep drain,
+    /// and the display-event sender.
+    fn gates(holder: &LibraryEventHolder) -> [bool; 3] {
+        [
+            holder.storage_may_run(),
+            holder.sleep_may_proceed(),
+            holder.library_event_may_move(),
+        ]
+    }
+
+    /// A plain acknowledgement with no chapter correction riding along.
+    fn settled() -> DisplayEvent {
+        DisplayEvent::Settled {
+            chapter_cursor: None,
+        }
+    }
+
+    fn cleared(request_id: u32) -> LibraryEvent {
+        LibraryEvent::CacheCleared {
+            request_id,
+            ok: true,
+        }
+    }
+
+    fn filled(events: impl IntoIterator<Item = LibraryEvent>) -> LibraryRing {
+        let mut ring = LibraryRing::new();
+        for event in events {
+            assert!(ring.try_send(event));
+        }
+        assert_eq!(ring.len, LIBRARY_EVENT_SLOTS, "the channel starts full");
+        ring
+    }
+
+    /// Making room for one settling event must never be paid for with
+    /// another. An abandoned clear leaves its completion in flight while a
+    /// second clear runs, so two of these really can be queued at once — and
+    /// evicting the head unread would drop the first, stranding the visit it
+    /// belongs to on "clearing…" with nothing left to settle it.
+    #[test]
+    fn making_room_never_spends_an_awaited_event() {
+        // The completion is at the front, exactly where the old sender took
+        // from, with refreshes behind it.
+        let mut queue =
+            filled(
+                core::iter::once(cleared(1)).chain((0..7).map(|count| LibraryEvent::Scanned {
+                    count,
+                    catalog_epoch: EPOCH,
+                })),
+            );
+
+        send_required(&mut queue, &mut LibraryEventHolder::new(), cleared(2));
+
+        assert!(
+            queue.holds(cleared(1)),
+            "the queued completion must survive the newcomer"
+        );
+        assert!(queue.holds(cleared(2)), "the newcomer must land");
+        assert_eq!(queue.len, LIBRARY_EVENT_SLOTS);
+        assert_eq!(
+            queue.refreshes(),
+            6,
+            "exactly one refresh paid for the slot"
+        );
+    }
+
+    /// Every slot already awaited: nothing may be spent, so the walk places
+    /// nothing and leaves the ring exactly as it found it. The newcomer is not
+    /// lost either — it goes to the holder, and reaches the app once the
+    /// consumer has drained a slot.
+    #[test]
+    fn a_channel_of_awaited_events_refuses_the_newcomer() {
+        let before = filled((0..LIBRARY_EVENT_SLOTS as u32).map(cleared));
+        let mut queue = before;
+        let mut holder = LibraryEventHolder::new();
+
+        send_required(&mut queue, &mut holder, cleared(99));
+
+        assert!(
+            !queue.holds(cleared(99)),
+            "nothing could be spent, so the walk placed nothing"
+        );
+        assert_eq!(
+            queue.drained(),
+            before.drained(),
+            "a refused walk disturbs nothing, order included"
+        );
+        assert_eq!(
+            holder.pending(),
+            Some(cleared(99)),
+            "the newcomer is held, not dropped"
+        );
+
+        // The app takes one, which is what the placing branch waits for.
+        queue.try_receive();
+        place_held(&mut queue, &mut holder);
+        assert!(queue.holds(cleared(99)), "the held event still arrives");
+        assert_eq!(
+            gates(&holder),
+            [true; 3],
+            "placing it lifts the standing orders"
+        );
+    }
+
+    /// The correction used to travel as its own event down whichever channel
+    /// had room. It could arrive after the acknowledgement it was supposed to
+    /// precede -- the app selects the two channels independently -- or be
+    /// dropped as a refresh while the acknowledgement it belonged to survived.
+    /// Riding inside `Settled` makes both unrepresentable: one message cannot
+    /// arrive in the wrong order or half-arrive, and the acknowledgement's own
+    /// protection now covers the correction.
+    #[test]
+    fn the_chapter_correction_rides_with_the_acknowledgement() {
+        let cursor = ChapterCursor {
+            book_id: 2,
+            page: 120,
+            current_chapter: 900,
+        };
+
+        let (event, power) = display_refresh_outcome(true, Some(cursor));
+
+        assert_eq!(
+            event,
+            DisplayEvent::Settled {
+                chapter_cursor: Some(cursor)
+            }
+        );
+        assert_eq!(power, PowerEvent::DisplaySettled);
+        assert!(
+            event.must_be_delivered(),
+            "a carried correction is protected exactly as its acknowledgement is"
+        );
+        let mut holder = DisplayEventHolder::new();
+        assert_eq!(holder.hold(&event), DisplayHoldOutcome::Held);
+        assert_eq!(
+            holder.pending(),
+            Some(event),
+            "it waits for room with its correction intact"
+        );
+
+        // A frame that never reached the panel corrects nothing: the cursor is
+        // read off the page that was shown.
+        assert_eq!(
+            display_refresh_outcome(false, Some(cursor)).0,
+            DisplayEvent::RefreshFailed
+        );
+    }
+
+    /// Past `MAX_SD_CHAPTERS` the reducer's own page map saturates, which is
+    /// what the correction is for. It names its book, because an
+    /// acknowledgement can outlive the book it was rendered for.
+    #[test]
+    fn the_chapter_correction_applies_only_to_the_book_still_open() {
+        let state = ReaderState::boot();
+        let book_id = state.book_id;
+        let page = state.page;
+
+        let corrected = state.apply_chapter_cursor(ChapterCursor {
+            book_id,
+            page,
+            current_chapter: 900,
+        });
+
+        assert_eq!(
+            corrected.chapter, 900,
+            "the uncapped chapter is adopted past the reducer's own map"
+        );
+        assert_eq!(
+            corrected.dirty, state.dirty,
+            "Reading shows page-within-chapter, so the correction owes no repaint"
+        );
+
+        let elsewhere = corrected.apply_chapter_cursor(ChapterCursor {
+            book_id: book_id.wrapping_add(1),
+            page,
+            current_chapter: 5,
+        });
+
+        assert_eq!(
+            elsewhere.chapter, 900,
+            "a correction for another book is not this book's"
+        );
+    }
+
+    /// A press is applied while its render is still in flight -- the reducer
+    /// runs and only the repaint waits -- so the acknowledgement for the page
+    /// left behind arrives after the reader has moved on. Adopting its chapter
+    /// then would pair one page's number with another's chapter, and
+    /// `extend_section_command` reads the two together.
+    #[test]
+    fn a_late_correction_does_not_land_on_the_page_moved_to() {
+        let state = reading(0, 3, 120);
+        let rendering_page = state.page;
+        let chapter_of_that_page = state.chapter;
+
+        // Page P is on the panel; the press for Q lands before its
+        // acknowledgement does.
+        let moved_on = press(state, Button::Next);
+        assert_ne!(moved_on.page, rendering_page, "the reader turned the page");
+
+        let settled = moved_on.apply_chapter_cursor(ChapterCursor {
+            book_id: moved_on.book_id,
+            page: rendering_page,
+            current_chapter: chapter_of_that_page.wrapping_add(7),
+        });
+
+        assert_eq!(
+            settled.chapter, moved_on.chapter,
+            "the correction belongs to the page that was rendered, not this one"
+        );
+
+        // Q's own render answers for Q.
+        let settled = settled.apply_chapter_cursor(ChapterCursor {
+            book_id: settled.book_id,
+            page: settled.page,
+            current_chapter: 900,
+        });
+
+        assert_eq!(settled.chapter, 900, "the matching correction still lands");
+    }
+
+    /// The channel is never made room in: a full queue leaves the
+    /// acknowledgement waiting rather than rearranging what is already
+    /// queued, so every event in this list stays exactly where it was.
+    #[test]
+    fn a_full_queue_holds_the_acknowledgement_and_keeps_its_order() {
+        let before = display_filled([
+            settled(),
+            DisplayEvent::Asleep,
+            DisplayEvent::Library(cleared(3)),
+            settled(),
+            DisplayEvent::Library(cleared(7)),
+            DisplayEvent::SleepFailed,
+            settled(),
+            DisplayEvent::Asleep,
+        ]);
+        let mut queue = before;
+        let mut holder = DisplayEventHolder::new();
+
+        let queued = send_display(&mut queue, &mut holder, DisplayEvent::RefreshFailed);
+
+        assert!(!queued, "a full channel takes nothing");
+        assert_eq!(
+            queue.drained(),
+            before.drained(),
+            "the queue is left alone, order included"
+        );
+        assert_eq!(
+            holder.pending(),
+            Some(DisplayEvent::RefreshFailed),
+            "the acknowledgement is held, not dropped"
+        );
+
+        // The app takes one, which is what the placing branch waits for.
+        queue.try_receive();
+        place_held_ack(&mut queue, &mut holder);
+        assert!(queue.holds(DisplayEvent::RefreshFailed));
+        assert_eq!(holder.pending(), None);
+    }
+
+    /// The two sleep notifications are informational -- the handshake the
+    /// power task waits on travels beside them over its own channel, and the
+    /// app only logs these. Protecting them the way an acknowledgement is
+    /// protected would get the priority backwards: they would occupy the
+    /// holder that the event ending the app's render cycle needs.
+    #[test]
+    fn only_a_render_acknowledgement_may_take_the_holder() {
+        for event in [settled(), DisplayEvent::RefreshFailed] {
+            let mut holder = DisplayEventHolder::new();
+            assert!(event.must_be_delivered(), "{event:?} ends the render cycle");
+            assert_eq!(holder.hold(&event), DisplayHoldOutcome::Held);
+            assert_eq!(holder.pending(), Some(event));
+        }
+        for event in [DisplayEvent::Asleep, DisplayEvent::SleepFailed] {
+            let mut holder = DisplayEventHolder::new();
+            assert!(
+                !event.must_be_delivered(),
+                "{event:?} is only a notification"
+            );
+            assert_eq!(holder.hold(&event), DisplayHoldOutcome::NotRequired);
+            assert_eq!(holder.pending(), None);
+        }
+    }
+
+    /// A library event travelling on this channel keeps its own answer, so an
+    /// event that settles a wait is protected whichever channel it is on.
+    #[test]
+    fn a_library_event_on_the_display_channel_keeps_its_own_rule() {
+        for event in settling_events() {
+            assert!(DisplayEvent::Library(event).must_be_delivered());
+        }
+        for event in refresh_events() {
+            assert!(!DisplayEvent::Library(event).must_be_delivered());
+        }
+    }
+
+    /// Two acknowledgements with the app draining neither. Both end the render
+    /// cycle and the app clears its lock on either, so the one already waiting
+    /// answers for the newcomer too -- but it must be the newcomer that gives
+    /// way, not the event that has been waiting longer.
+    #[test]
+    fn an_occupied_acknowledgement_holder_keeps_the_older_one() {
+        let mut holder = DisplayEventHolder::new();
+        assert_eq!(holder.hold(&settled()), DisplayHoldOutcome::Held);
+
+        assert_eq!(
+            holder.hold(&DisplayEvent::RefreshFailed),
+            DisplayHoldOutcome::Occupied
+        );
+
+        assert_eq!(holder.pending(), Some(settled()));
+    }
+
+    /// The gates are one rule read from three unrelated places, and the
+    /// failure they prevent needs all three to agree. Two of them had already
+    /// drifted apart when they were three separate `if`s in the task, so
+    /// assert they move together.
+    #[test]
+    fn a_held_event_closes_every_gate_until_it_is_placed() {
+        let mut holder = LibraryEventHolder::new();
+        assert_eq!(
+            gates(&holder),
+            [true; 3],
+            "an empty holder constrains nothing"
+        );
+
+        assert_eq!(holder.hold(&cleared(1)), HoldOutcome::Held);
+        assert_eq!(
+            gates(&holder),
+            [false; 3],
+            "storage, sleep and the display-event sender all stand down together"
+        );
+
+        assert_eq!(holder.placed(), Some(cleared(1)));
+        assert_eq!(holder.pending(), None);
+        assert_eq!(gates(&holder), [true; 3]);
+    }
+
+    /// The holder protects settling events; a refresh taking it would shut
+    /// storage, sleep and the display-event sender down for an event nothing
+    /// is waiting on — and the display-event sender standing down is exactly
+    /// what strands the acknowledgement behind it. One caller really did route
+    /// refreshes here, so the refusal belongs in the holder rather than in
+    /// each sender.
+    #[test]
+    fn only_a_settling_event_may_take_the_holder() {
+        for event in refresh_events() {
+            let mut holder = LibraryEventHolder::new();
+            assert_eq!(
+                holder.hold(&event),
+                HoldOutcome::NotSettling,
+                "{event:?} is a refresh and belongs on the lossy path"
+            );
+            assert_eq!(holder.pending(), None);
+            assert_eq!(gates(&holder), [true; 3], "{event:?} constrained the task");
+        }
+        for event in settling_events() {
+            let mut holder = LibraryEventHolder::new();
+            assert_eq!(holder.hold(&event), HoldOutcome::Held);
+            assert_eq!(holder.pending(), Some(event));
+        }
+    }
+
+    /// Two settling events out of one storage command is the only way to
+    /// reach an occupied holder, every producer being gated on it. The one
+    /// already waiting has waited longer and has the older wait behind it, so
+    /// it is the one that survives.
+    #[test]
+    fn an_occupied_holder_keeps_the_older_wait() {
+        let mut holder = LibraryEventHolder::new();
+        assert_eq!(holder.hold(&cleared(1)), HoldOutcome::Held);
+
+        assert_eq!(holder.hold(&cleared(2)), HoldOutcome::Occupied);
+
+        assert_eq!(
+            holder.pending(),
+            Some(cleared(1)),
+            "the newcomer must not displace the event already waiting"
+        );
+    }
+
+    /// End to end, at the worst moment the firmware can reach: the channel is
+    /// full of settling events and one more arrives. It must still be the
+    /// case that nothing awaited is lost.
+    #[test]
+    fn a_settling_event_survives_a_channel_with_nothing_to_spend() {
+        let mut queue = filled((0..LIBRARY_EVENT_SLOTS as u32).map(cleared));
+        let mut holder = LibraryEventHolder::new();
+
+        send_required(&mut queue, &mut holder, cleared(99));
+
+        let mut delivered = [None; LIBRARY_EVENT_SLOTS + 1];
+        let mut count = 0;
+        // The app drains the channel, which is what the placing branch is
+        // waiting for; then the branch runs and the held event goes in.
+        drain_ids_into(&mut queue, &mut delivered, &mut count);
+        place_held(&mut queue, &mut holder);
+        drain_ids_into(&mut queue, &mut delivered, &mut count);
+
+        let mut expected = [None; LIBRARY_EVENT_SLOTS + 1];
+        for (slot, id) in expected.iter_mut().zip(0..LIBRARY_EVENT_SLOTS as u32) {
+            *slot = Some(id);
+        }
+        expected[LIBRARY_EVENT_SLOTS] = Some(99);
+        assert_eq!(
+            delivered, expected,
+            "every settling event reaches the app, oldest first"
+        );
+    }
+
+    /// Empties `queue`, appending the request id of every `CacheCleared` it
+    /// yields — the order the app would see them in.
+    fn drain_ids_into(queue: &mut LibraryRing, out: &mut [Option<u32>], next: &mut usize) {
+        while let Some(event) = queue.try_receive() {
+            if let LibraryEvent::CacheCleared { request_id, .. } = event {
+                out[*next] = Some(request_id);
+                *next += 1;
+            }
+        }
+    }
+
     #[test]
     fn forget_is_unreachable_without_a_saved_network() {
         let state = press(ReaderState::boot(), Button::Previous);
@@ -2685,8 +4306,13 @@ mod tests {
 
     #[test]
     fn library_open_key_opens_sd_book() {
-        let state = press(ReaderState::boot(), Button::Back)
-            .apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
+        let state = press(ReaderState::boot(), Button::Back).apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 2,
+                catalog_epoch: 0,
+            },
+        );
         let state = press(press(state, Button::Next), Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.book_id, 3);
@@ -2694,8 +4320,13 @@ mod tests {
 
     #[test]
     fn library_back_key_returns_home_without_opening() {
-        let state = press(ReaderState::boot(), Button::Back)
-            .apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
+        let state = press(ReaderState::boot(), Button::Back).apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 2,
+                catalog_epoch: 0,
+            },
+        );
         let state = press(press(state, Button::Next), Button::Back);
         assert_eq!(state.view, AppView::Home);
         // Browsing did not open anything: the active book is still the
@@ -2810,7 +4441,13 @@ mod tests {
         assert_eq!(state.view, AppView::Library);
         assert!(!state.read_request_pending);
 
-        let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 2,
+                catalog_epoch: 0,
+            },
+        );
         assert_eq!(state.view, AppView::Library);
         assert_eq!(state.library_count, 2);
         assert!(!state.read_request_pending);
@@ -2821,7 +4458,13 @@ mod tests {
         let state = ReaderState::boot();
         assert_eq!(state.book_id, 1);
 
-        let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 3 });
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 3,
+                catalog_epoch: 0,
+            },
+        );
         assert_eq!(state.book_id, ReaderSource::sd(0).book_id());
         assert_eq!(state.chapter, 0);
         assert_eq!(state.page, 0);
@@ -2846,7 +4489,13 @@ mod tests {
         assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
 
         // A later rescan must not yank the restored book back.
-        let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 3 });
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 3,
+                catalog_epoch: 0,
+            },
+        );
         assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
     }
 
@@ -2854,7 +4503,13 @@ mod tests {
     fn scan_keeps_an_open_builtin_book() {
         let mut state = ReaderState::boot();
         state.view = AppView::Reading;
-        let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 3 });
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 3,
+                catalog_epoch: 0,
+            },
+        );
         assert_eq!(state.book_id, 1);
     }
 
@@ -2890,7 +4545,13 @@ mod tests {
         assert_eq!(state.view, AppView::Library);
         assert_eq!(state.book_id, 1);
 
-        let state = state.apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 2,
+                catalog_epoch: 0,
+            },
+        );
         assert_eq!(state.view, AppView::Library);
         assert_eq!(state.library_count, 2);
     }
@@ -3028,12 +4689,16 @@ mod tests {
 
         // The side pair keeps its physical sense: the hardware walk showed
         // the forward key already lands at its natural end in portrait.
+        // In Library the side-back key is repurposed: it opens the per-book
+        // actions sheet instead of scrolling (the front pair scrolls both
+        // ways and side-forward wraps, so navigation survives).
         let mut library = press(state, Button::Back);
         library.library_count = 3;
         let next = press(library, Button::PageNext);
         assert_eq!(next.selection, 1);
-        let previous = press(next, Button::PagePrevious);
-        assert_eq!(previous.selection, 0);
+        let asked = press(next, Button::PagePrevious);
+        assert_eq!(asked.selection, 1);
+        assert_eq!(asked.library_menu, LibraryMenu::Sheet { row: 0 });
     }
 
     #[test]
@@ -3114,8 +4779,12 @@ mod tests {
         let next = press(state, Button::PagePrevious);
         assert_eq!(next.selection, 1);
 
-        let previous = press(next, Button::PageNext);
-        assert_eq!(previous.selection, 0);
+        // The physically-lower key maps to logical side-back, which in
+        // Library opens the per-book actions sheet (see the portrait test
+        // above for the repurpose rationale).
+        let asked = press(next, Button::PageNext);
+        assert_eq!(asked.selection, 1);
+        assert_eq!(asked.library_menu, LibraryMenu::Sheet { row: 0 });
     }
 
     #[test]
@@ -3229,11 +4898,11 @@ mod tests {
     #[test]
     fn panel_refresh_failure_is_never_acknowledged_as_settled() {
         assert_eq!(
-            display_refresh_outcome(true),
-            (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+            display_refresh_outcome(true, None),
+            (settled(), PowerEvent::DisplaySettled)
         );
         assert_eq!(
-            display_refresh_outcome(false),
+            display_refresh_outcome(false, None),
             (
                 DisplayEvent::RefreshFailed,
                 PowerEvent::DisplayRefreshFailed
@@ -3253,6 +4922,51 @@ mod tests {
         request.selection = 1;
 
         assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+    }
+
+    /// Every step of the actions sheet covers or uncovers list rows, so each
+    /// one earns the one-flicker clean rather than ghosting through a partial.
+    #[test]
+    fn refresh_plan_cleans_for_every_library_menu_step() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = in_library(1, 4);
+        let mut last = state.render_request(RenderKind::Page);
+        planner.record_render(last, RefreshMode::Full);
+
+        for button in [
+            Button::PagePrevious, // None -> Sheet: the card covers the rows
+            Button::Confirm,      // Sheet -> Busy: rail and footer change
+        ] {
+            state = press(state, button);
+            let request = state.render_request(RenderKind::Page);
+            assert_ne!(request.library_menu, last.library_menu);
+            assert_eq!(
+                planner.mode_for(request),
+                RefreshMode::FastClean,
+                "{:?} -> {:?} redraws the list area",
+                last.library_menu,
+                request.library_menu
+            );
+            planner.record_render(request, RefreshMode::FastClean);
+            last = request;
+        }
+
+        // Settling swaps the footer note in place...
+        let settled = state.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id: outstanding(state),
+                ok: true,
+            },
+        );
+        let request = settled.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
+
+        // ...and the next press takes the whole card back off the rows.
+        let dismissed = press(settled, Button::Next).render_request(RenderKind::Page);
+        assert_eq!(dismissed.library_menu, LibraryMenu::None);
+        assert_eq!(planner.mode_for(dismissed), RefreshMode::FastClean);
     }
 
     #[test]
@@ -3398,7 +5112,7 @@ mod tests {
     /// One of every StorageCommand variant, so the admission table below is
     /// exhaustive by construction: a new variant fails the count assertion
     /// until it is classified here.
-    fn every_storage_command() -> [StorageCommand; 10] {
+    fn every_storage_command() -> [StorageCommand; 11] {
         let persisted = PersistedAppState {
             book_id: 0,
             chapter: 0,
@@ -3454,6 +5168,11 @@ mod tests {
             StorageCommand::LoanSyncMemory,
             StorageCommand::StoreWifiCredentials(credentials),
             StorageCommand::ForgetWifiCredentials,
+            StorageCommand::ClearBookCache {
+                request_id: 1,
+                index: 0,
+                catalog_epoch: 0,
+            },
         ]
     }
 

@@ -529,6 +529,99 @@ pub(crate) fn forget_wifi_credentials(epd: &mut Epd, sd_cs: &mut Output<'static>
     .unwrap_or(false)
 }
 
+/// Delete one catalog row's rebuildable cache (sections, BOOK/TOC/COVER and
+/// the content stream), keeping its position files and catalog entry. The
+/// row's identity is checked against the cache header before anything is
+/// deleted, so a stale index or a key collision clears nothing. When the
+/// cleared book is the resident one, the loaded state drops with it and the
+/// next open takes the ordinary cache-miss rebuild path instead of
+/// answering from RAM.
+#[inline(never)]
+pub(crate) fn clear_book_cache(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: u16,
+) -> bool {
+    let index = index as usize;
+    let resolved = match library.catalog_entry(index) {
+        Some(entry) => Some((
+            proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size),
+            entry.source_hash,
+            entry.byte_size,
+        )),
+        // The row is neither the open book nor inside the resident list
+        // window, so read it off the card directly rather than through
+        // `load_active_entry`, which would publish it as the active entry and
+        // evict the open book's.
+        None => crate::library_sd::read_row_cache_identity(epd, sd_cs, index),
+    };
+    let Some((cache_key, source_hash, source_size)) = resolved else {
+        return false;
+    };
+    // Whether the delete ran at all, and whether it left nothing behind. The
+    // two differ: a refusal touches nothing, while a partial pass can take
+    // BOOK.BIN and stall on a section, and the resident state has to be
+    // dropped in that case as surely as in the clean one.
+    let (attempted, cleared) = sd_session::with_root(epd, sd_cs, |root| {
+        match reader_cache_files::read_cache_header(root, cache_key.as_str()) {
+            reader_cache_files::CacheHeader::Present(header) => {
+                if header.source_hash != source_hash || header.source_size != source_size {
+                    // Whatever sits under this key is not this book's cache;
+                    // refuse rather than delete another book's data.
+                    return (false, false);
+                }
+            }
+            // An index that will not read cannot say whose cache this is, and
+            // a key is 28 bits of hash — a collision is a case the format
+            // admits. Fail closed: a corrupt or briefly unreadable BOOK.BIN
+            // belonging to another book must not be answered by deleting it.
+            reader_cache_files::CacheHeader::Unreadable => return (false, false),
+            // No index at all is different. Nothing usable is there for
+            // anyone, so sweeping the shells a truncated pass left behind
+            // costs the colliding book nothing it had not already lost — and
+            // its position files are never swept regardless.
+            reader_cache_files::CacheHeader::Absent => {}
+        }
+        //
+        // The delete reports on every file it was supposed to remove, not
+        // just the index: a pass that took BOOK.BIN but stalled on a section
+        // has freed no space and left a directory the sweep will keep
+        // tripping over, and telling the user "cache cleared" for that is a
+        // lie they cannot check.
+        let emptied = reader_cache_files::empty_cache_dir(root, cache_key.as_str());
+        (
+            true,
+            emptied
+                && matches!(
+                    reader_cache_files::read_cache_header(root, cache_key.as_str()),
+                    reader_cache_files::CacheHeader::Absent
+                ),
+        )
+    })
+    .unwrap_or((false, false));
+    // Keyed on the attempt, not the verdict. A half-finished delete leaves
+    // the resident sections, index, TOC, and cover describing files that are
+    // already gone; answering the next read from that RAM would strand the
+    // reader on a section crossing. Dropping it costs a rebuild, which is
+    // what the failed clear will need anyway.
+    if attempted {
+        if library.loaded_index == Some(index) {
+            library.loaded_index = None;
+            library.clear_book_index();
+            library.clear_lines();
+            library.clear_toc();
+            library.text_holds_toc = false;
+            library.reader_status = BookLoadStatus::Empty;
+        }
+        if library.current_index == Some(index) {
+            // COVER.BIN is gone; the resident cover regenerates on rebuild.
+            library.clear_cover();
+        }
+    }
+    cleared
+}
+
 #[inline(never)]
 pub(crate) fn load_wifi_credentials(
     epd: &mut Epd,
@@ -1287,7 +1380,7 @@ where
                 // replay (the labels load bails on it). Clear the debris —
                 // sections and CONT.BIN are useless without an index — so
                 // the next open rebuilds from the EPUB cleanly.
-                reader_cache_files::empty_cache_dir(root, cache_key, section_count as u16);
+                let _ = reader_cache_files::empty_cache_dir(root, cache_key);
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -1586,7 +1679,7 @@ where
         // truncated BOOK.BIN or an unreadable section); the full build
         // rewrites everything, so clear it all either way.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        reader_cache_files::empty_cache_dir(root, cache_key, section_count as u16);
+        let _ = reader_cache_files::empty_cache_dir(root, cache_key);
         return false;
     }
     true

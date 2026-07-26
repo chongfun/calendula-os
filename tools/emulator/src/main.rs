@@ -230,6 +230,10 @@ pub struct Emulator {
     _sd_root: Option<PathBuf>,
     library_entries: Vec<String>,
     last_storage: Option<StorageCommand>,
+    /// Scenario-driven: leave picked per-book actions unsettled so `Busy`
+    /// reaches a frame. Off for interactive use, where a clear that never
+    /// answered would freeze the list for good.
+    hold_storage: bool,
     sd_reader_status: EmulatedReaderStatus,
 }
 
@@ -254,6 +258,7 @@ impl Emulator {
             _sd_root: sd_root,
             library_entries: Vec::new(),
             last_storage: None,
+            hold_storage: false,
             sd_reader_status: EmulatedReaderStatus::Empty,
         };
         emu.panel.init_sequence().expect("panel init");
@@ -297,10 +302,27 @@ impl Emulator {
             }
             self.last_storage = Some(command);
         }
+        if let Some(command) =
+            app_core::library_action_command_for_transition(&previous, &self.state)
+        {
+            self.last_storage = Some(command);
+            // The emulated card has no real cache; the clear settles
+            // instantly and always succeeds — unless a scenario is holding
+            // storage, which is the only way `Busy` survives long enough to
+            // be drawn.
+            if let StorageCommand::ClearBookCache { request_id, .. } = command {
+                if !self.hold_storage {
+                    self.library_event(LibraryEvent::CacheCleared {
+                        request_id,
+                        ok: true,
+                    });
+                }
+            }
+        }
     }
 
     pub fn library_event(&mut self, event: LibraryEvent) {
-        if let LibraryEvent::Scanned { count } = event {
+        if let LibraryEvent::Scanned { count, .. } = event {
             self.library_entries.clear();
             self.library_entries
                 .extend((0..count).map(|index| format!("SD Book {}", index + 1)));
@@ -315,6 +337,18 @@ impl Emulator {
     pub fn sync_event(&mut self, event: app_core::SyncEvent) {
         self.state = self.state.apply_sync_event(event);
         self.render(app_core::RenderKind::Page);
+    }
+
+    /// The request id of the per-book action currently in flight, if any.
+    pub fn outstanding_request(&self) -> Option<u32> {
+        match self.state.library_menu {
+            app_core::LibraryMenu::Busy { request_id, .. } => Some(request_id),
+            _ => None,
+        }
+    }
+
+    pub fn set_hold_storage(&mut self, hold: bool) {
+        self.hold_storage = hold;
     }
 
     pub fn state(&self) -> app_core::ReaderState {
@@ -346,6 +380,7 @@ impl Emulator {
             Some(StorageCommand::ReceiveUpload) => Some("ReceiveUpload"),
             Some(StorageCommand::LoadChapters { .. }) => Some("LoadChapters"),
             Some(StorageCommand::JumpChapter { .. }) => Some("JumpChapter"),
+            Some(StorageCommand::ClearBookCache { .. }) => Some("ClearBookCache"),
             None => None,
         }
     }
