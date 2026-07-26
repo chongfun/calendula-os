@@ -585,6 +585,32 @@ pub(crate) fn load_active_entry(
     }
 }
 
+/// One catalog row's cache key and source identity, read straight off the
+/// card.
+///
+/// Unlike [`load_active_entry`] this does not publish the row as the active
+/// entry. The active entry is the *open* book's, held apart from the list
+/// window precisely so the reading path does not depend on where the list is
+/// scrolled — `source_identity` resolves the position record's identity
+/// through it, and the Home colophon its label. A cache clear on some other
+/// row has no business evicting that, so it reads what it needs and leaves
+/// the store alone.
+#[inline(never)]
+pub(crate) fn read_row_cache_identity(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    index: usize,
+) -> Option<(String<{ proto::cache::CACHE_KEY_BYTES }>, u32, u32)> {
+    let record = sd_session::with_root(epd, sd_cs, |root| read_catalog_record_at(root, index))
+        .ok()
+        .flatten()?;
+    Some((
+        proto::cache::cache_key_for(record.display_name.as_str(), record.byte_size),
+        record.source_hash,
+        record.byte_size,
+    ))
+}
+
 /// Persist a book's just-learned title into its catalog record, so the next
 /// window read (and the next boot's catalog cache) label it without probing
 /// the book's cache. Runs inside the open's existing SD session. The record

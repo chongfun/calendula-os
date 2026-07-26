@@ -544,23 +544,31 @@ pub(crate) fn clear_book_cache(
     index: u16,
 ) -> bool {
     let index = index as usize;
-    if library.catalog_entry(index).is_none()
-        && !crate::library_sd::load_active_entry(epd, sd_cs, library, index)
-    {
-        return false;
-    }
-    let Some(entry) = library.catalog_entry(index) else {
+    let resolved = match library.catalog_entry(index) {
+        Some(entry) => Some((
+            proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size),
+            entry.source_hash,
+            entry.byte_size,
+        )),
+        // The row is neither the open book nor inside the resident list
+        // window, so read it off the card directly rather than through
+        // `load_active_entry`, which would publish it as the active entry and
+        // evict the open book's.
+        None => crate::library_sd::read_row_cache_identity(epd, sd_cs, index),
+    };
+    let Some((cache_key, source_hash, source_size)) = resolved else {
         return false;
     };
-    let source_hash = entry.source_hash;
-    let source_size = entry.byte_size;
-    let cache_key = proto::cache::cache_key_for(entry.display_name.as_str(), source_size);
-    let cleared = sd_session::with_root(epd, sd_cs, |root| {
+    // Whether the delete ran at all, and whether it left nothing behind. The
+    // two differ: a refusal touches nothing, while a partial pass can take
+    // BOOK.BIN and stall on a section, and the resident state has to be
+    // dropped in that case as surely as in the clean one.
+    let (attempted, cleared) = sd_session::with_root(epd, sd_cs, |root| {
         if let Some(header) = reader_cache_files::read_cache_header(root, cache_key.as_str()) {
             if header.source_hash != source_hash || header.source_size != source_size {
                 // Whatever sits under this key is not this book's cache;
                 // refuse rather than delete another book's data.
-                return false;
+                return (false, false);
             }
         }
         // No readable index means the cache is already gone as far as the
@@ -572,15 +580,20 @@ pub(crate) fn clear_book_cache(
         // has freed no space and left a directory the sweep will keep
         // tripping over, and telling the user "cache cleared" for that is a
         // lie they cannot check.
-        reader_cache_files::empty_cache_dir(root, cache_key.as_str())
-            && reader_cache_files::read_cache_header(root, cache_key.as_str()).is_none()
+        let emptied = reader_cache_files::empty_cache_dir(root, cache_key.as_str());
+        (
+            true,
+            emptied && reader_cache_files::read_cache_header(root, cache_key.as_str()).is_none(),
+        )
     })
-    .unwrap_or(false);
-    if cleared {
+    .unwrap_or((false, false));
+    // Keyed on the attempt, not the verdict. A half-finished delete leaves
+    // the resident sections, index, TOC, and cover describing files that are
+    // already gone; answering the next read from that RAM would strand the
+    // reader on a section crossing. Dropping it costs a rebuild, which is
+    // what the failed clear will need anyway.
+    if attempted {
         if library.loaded_index == Some(index) {
-            // The resident sections, book index, and TOC describe files that
-            // no longer exist; RAM answers would strand the reader on the
-            // next section crossing.
             library.loaded_index = None;
             library.clear_book_index();
             library.clear_lines();
