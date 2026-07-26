@@ -765,17 +765,22 @@ fn sweep_orphan_caches<
     }
     let mut swept = 0u32;
     for key in &keys {
-        let header = crate::reader_cache_files::read_cache_header(root, key.as_str());
         // A readable cache that still maps to a catalog book stays. Anything
-        // else -- no book, or an unreadable BOOK.BIN -- is reclaimed.
-        let live = header
-            .as_ref()
-            .map(|h| {
+        // else -- no book, or an unreadable BOOK.BIN -- is reclaimed. The
+        // clear path fails closed on an unreadable header because it deletes
+        // against a key the user named and a collision would be its mistake;
+        // the sweep runs against a catalog it has just proven fresh, and a
+        // cache it cannot match to any book on the card is garbage whoever
+        // wrote it. Keeping it would strand the shells forever.
+        let live = match crate::reader_cache_files::read_cache_header(root, key.as_str()) {
+            crate::reader_cache_files::CacheHeader::Present(h) => {
                 catalog_identity_staged(scratch, staged, h.source_hash, h.source_size)
                     || (truncated
                         && find_in_catalog(root, h.source_hash, h.source_size, None).is_some())
-            })
-            .unwrap_or(false);
+            }
+            crate::reader_cache_files::CacheHeader::Absent
+            | crate::reader_cache_files::CacheHeader::Unreadable => false,
+        };
         if live {
             continue;
         }

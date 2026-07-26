@@ -797,9 +797,27 @@ where
     .unwrap_or(false)
 }
 
-/// Read a book cache's v2 header (for its stored source identity and section
-/// count), or None when the cache has no readable BOOK.BIN. Used by the orphan
-/// sweep to decide whether a cache still belongs to a book on the card.
+/// What a cache's BOOK.BIN had to say about itself.
+///
+/// The three cases are not interchangeable, because a cache key is only 28
+/// bits of hash and collisions are an accepted possibility. `Absent` says the
+/// cache has no index — nothing usable is there, whoever it belongs to.
+/// `Unreadable` says there *is* an index and we could not tell whose it is,
+/// which is exactly when a caller about to delete has to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheHeader {
+    Present(BookV2Header),
+    /// No BOOK.BIN at all.
+    Absent,
+    /// BOOK.BIN is there and says nothing usable: truncated, corrupt, or the
+    /// read failed.
+    Unreadable,
+}
+
+/// Read a book cache's v2 header, for its stored source identity and section
+/// count. Used by the orphan sweep to decide whether a cache still belongs to
+/// a book on the card, and by the clear to prove a key names the book it was
+/// asked about.
 pub(crate) fn read_cache_header<
     D,
     T,
@@ -809,17 +827,36 @@ pub(crate) fn read_cache_header<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
-) -> Option<BookV2Header>
+) -> CacheHeader
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
-        let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        read_exact_file(file, &mut header_bytes).ok()?;
-        decode_book_v2_header(&header_bytes).ok()
-    })
-    .flatten()
+    // Opened step by step rather than through `with_v2_book_file`, which
+    // folds every failure into one `None`. A directory that is not there and
+    // a directory that would not open are the same value to it, and the
+    // difference is the whole point here.
+    macro_rules! open {
+        ($opened:expr) => {
+            match $opened {
+                Ok(handle) => handle,
+                Err(embedded_sdmmc::Error::NotFound) => return CacheHeader::Absent,
+                Err(_) => return CacheHeader::Unreadable,
+            }
+        };
+    }
+    let xteink = open!(root.open_dir(CACHE_ROOT_DIR));
+    let cache = open!(xteink.open_dir(CACHE_V2_DIR));
+    let book_dir = open!(cache.open_dir(key));
+    let file = open!(book_dir.open_file_in_dir(CACHE_BOOK_FILE, Mode::ReadOnly));
+    let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
+    if read_exact_file(&file, &mut header_bytes).is_err() {
+        return CacheHeader::Unreadable;
+    }
+    match decode_book_v2_header(&header_bytes) {
+        Ok(header) => CacheHeader::Present(header),
+        Err(_) => CacheHeader::Unreadable,
+    }
 }
 
 /// Section files deleted per directory-listing pass. embedded-sdmmc will not
@@ -918,6 +955,12 @@ where
             // the clear a failure.
             let _ = book.delete_file_in_dir(CACHE_SECTIONS_DIR);
         }
+        // Everything above worked from a list of names. This is the part that
+        // does not: it asks the directory what is actually left, which is the
+        // only way to catch what the names never covered — a file from an
+        // older layout, a `SECTIONS/` that refused to go, anything a future
+        // format adds without teaching this function about it.
+        cleared = cleared && book_dir_is_reclaimed(&book);
         // Everything above is re-derivable from the EPUB; the position is not.
         // POS*.BIN is the authoritative record of where the reader is in this
         // book, so it is never swept, and the directory holding it has to stay
@@ -957,21 +1000,32 @@ where
     for _ in 0..max_passes {
         let mut names: heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH> =
             heapless::Vec::new();
-        let mut overflowed = false;
+        // Something this pass could not take. It keeps the walk going (there
+        // may still be files worth deleting) but a pass that ends with the
+        // directory non-empty must not read as emptied.
+        let mut blocked = false;
         if sections
             .iterate_dir(|entry| {
-                if entry.attributes.is_directory() {
-                    return;
-                }
                 let mut name = String::<SHORT_NAME_BYTES>::new();
                 if write!(name, "{}", entry.name).is_err() {
                     // A name this pass cannot reproduce is a name it cannot
                     // delete; say so rather than silently leaving it.
-                    overflowed = true;
+                    blocked = true;
+                    return;
+                }
+                if name.as_str() == "." || name.as_str() == ".." {
+                    return;
+                }
+                if entry.attributes.is_directory() {
+                    // Nothing here writes directories. Whatever it is, this
+                    // pass cannot delete it, and skipping it silently was how
+                    // a `SECTIONS/` holding only a subdirectory reported
+                    // itself emptied.
+                    blocked = true;
                     return;
                 }
                 if names.push(name).is_err() {
-                    overflowed = true;
+                    blocked = true;
                 }
             })
             .is_err()
@@ -979,7 +1033,7 @@ where
             return false;
         }
         if names.is_empty() {
-            return !overflowed;
+            return !blocked;
         }
         for name in &names {
             if upload_store::remove_file_reclaiming_clusters(sections, name.as_str())
@@ -990,6 +1044,53 @@ where
         }
     }
     false
+}
+
+/// The files a cleared cache is allowed to keep: the reading position, in
+/// either the durable A/B pair or the legacy single file.
+fn is_kept_after_clear(name: &str) -> bool {
+    POSITION_GENERATIONS
+        .iter()
+        .chain(core::iter::once(&POSITION_FILE))
+        .any(|kept| name.eq_ignore_ascii_case(kept))
+}
+
+/// Whether the book's cache directory holds nothing but its reading position.
+///
+/// This is what success is reported on. The deletes above name what they
+/// expect to find; this asks what is really there, so a clear cannot claim to
+/// have reclaimed a directory it left occupied.
+fn book_dir_is_reclaimed<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let mut reclaimed = true;
+    let walked = book.iterate_dir(|entry| {
+        let mut name = String::<SHORT_NAME_BYTES>::new();
+        if write!(name, "{}", entry.name).is_err() {
+            reclaimed = false;
+            return;
+        }
+        if name.as_str() == "." || name.as_str() == ".." {
+            return;
+        }
+        // A surviving `SECTIONS/` lands here too: it is not a position file,
+        // so it fails the check like any other leftover.
+        if !is_kept_after_clear(name.as_str()) {
+            reclaimed = false;
+        }
+    });
+    walked.is_ok() && reclaimed
 }
 
 /// Whether a book's cache directory still holds a reading position, in either

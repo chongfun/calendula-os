@@ -564,16 +564,25 @@ pub(crate) fn clear_book_cache(
     // BOOK.BIN and stall on a section, and the resident state has to be
     // dropped in that case as surely as in the clean one.
     let (attempted, cleared) = sd_session::with_root(epd, sd_cs, |root| {
-        if let Some(header) = reader_cache_files::read_cache_header(root, cache_key.as_str()) {
-            if header.source_hash != source_hash || header.source_size != source_size {
-                // Whatever sits under this key is not this book's cache;
-                // refuse rather than delete another book's data.
-                return (false, false);
+        match reader_cache_files::read_cache_header(root, cache_key.as_str()) {
+            reader_cache_files::CacheHeader::Present(header) => {
+                if header.source_hash != source_hash || header.source_size != source_size {
+                    // Whatever sits under this key is not this book's cache;
+                    // refuse rather than delete another book's data.
+                    return (false, false);
+                }
             }
+            // An index that will not read cannot say whose cache this is, and
+            // a key is 28 bits of hash — a collision is a case the format
+            // admits. Fail closed: a corrupt or briefly unreadable BOOK.BIN
+            // belonging to another book must not be answered by deleting it.
+            reader_cache_files::CacheHeader::Unreadable => return (false, false),
+            // No index at all is different. Nothing usable is there for
+            // anyone, so sweeping the shells a truncated pass left behind
+            // costs the colliding book nothing it had not already lost — and
+            // its position files are never swept regardless.
+            reader_cache_files::CacheHeader::Absent => {}
         }
-        // No readable index means the cache is already gone as far as the
-        // reader is concerned; still run the delete to sweep the shells a
-        // truncated pass left behind.
         //
         // The delete reports on every file it was supposed to remove, not
         // just the index: a pass that took BOOK.BIN but stalled on a section
@@ -583,7 +592,11 @@ pub(crate) fn clear_book_cache(
         let emptied = reader_cache_files::empty_cache_dir(root, cache_key.as_str());
         (
             true,
-            emptied && reader_cache_files::read_cache_header(root, cache_key.as_str()).is_none(),
+            emptied
+                && matches!(
+                    reader_cache_files::read_cache_header(root, cache_key.as_str()),
+                    reader_cache_files::CacheHeader::Absent
+                ),
         )
     })
     .unwrap_or((false, false));
