@@ -1951,12 +1951,19 @@ impl ReaderState {
                 // refused as stale, which would read here as "cache not
                 // cleared" for a clear that is still running.
                 if let LibraryMenu::Busy {
-                    action: action @ LibraryAction::ClearCache,
+                    action,
                     request_id: outstanding,
                     ..
                 } = self.library_menu
                 {
-                    if outstanding == request_id {
+                    // Exhaustive for the same reason the command side is: an
+                    // action added without a settle arm here would match no
+                    // pattern and leave its wait up for good. Every action
+                    // this event can answer has to be named.
+                    let settles = match action {
+                        LibraryAction::ClearCache => true,
+                    };
+                    if settles && outstanding == request_id {
                         self.library_menu = LibraryMenu::Done { action, ok };
                         self.dirty = Rect::FULL;
                     }
