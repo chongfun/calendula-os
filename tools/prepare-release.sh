@@ -43,11 +43,24 @@ SIZE=$(awk "BEGIN{printf \"%.1f\", $BYTES/1048576}")
 echo "==> firmware.bin is $BYTES bytes (~$SIZE MB)"
 
 echo "==> verifying descriptor stamps in the built firmware"
-# No `grep -q` here: with pipefail it SIGPIPEs `strings` on early exit and
-# fails the pipeline even when the stamp is present.
-ELF=target/riscv32imc-unknown-none-elf/release/fw
-strings "$ELF" | grep -Fx "$VER" >/dev/null || {
-  echo "error: version stamp '$VER' not found in $ELF" >&2; exit 1; }
+# Read a fixed-width app-descriptor field out of the image, truncated at the
+# first NUL — the rule proto::ota::project_name() applies when the updater
+# compares one. Checking the field beats scanning the ELF for a matching string:
+# a stale build, or a stray X3 build left in the shared target directory, fails
+# here instead of passing on a string that merely exists somewhere.
+# (Converting NULs to newlines and cutting at the first one, rather than piping
+# to `head`, keeps pipefail from tripping over a SIGPIPE.)
+desc_field() { # <byte offset into firmware.bin> <field width>
+  local raw
+  raw=$(dd if="$FW" bs=1 skip="$1" count="$2" 2>/dev/null | tr '\000' '\n')
+  printf '%s' "${raw%%$'\n'*}"
+}
+
+# `version` is the 32 bytes at image offset 0x30; the firmware stamps it from
+# env!("CARGO_PKG_VERSION"), so this is what actually shipped.
+ACTUAL_VER=$(desc_field 48 32)
+[[ "$ACTUAL_VER" == "$VER" ]] || {
+  echo "error: $FW carries version '$ACTUAL_VER', expected '$VER'" >&2; exit 1; }
 
 # The firmware identity gates the OTA bounce (see fw::ota_update): an anchor
 # whose descriptor differs in board *or* updater generation is refused, so a
@@ -60,12 +73,10 @@ EXPECTED_ID=$(sed -n 's/^pub const IDENTITY_X4: &str = "\(.*\)";$/\1/p' "$IDENTI
 [[ -n "$EXPECTED_ID" ]] || {
   echo "error: could not read IDENTITY_X4 from $IDENTITY_SRC" >&2; exit 1; }
 
-# Compare the descriptor field the updater actually reads — project_name, the
-# 32 bytes at image offset 0x50 — instead of trusting that some matching string
-# exists somewhere in the ELF. Exact match, so a stale build, a stray X3 build
-# left in the shared target directory, or an older updater generation each fail
-# here rather than shipping.
-ACTUAL_ID=$(dd if="$FW" bs=1 skip=80 count=32 2>/dev/null | tr -d '\000')
+# `project_name` is the 32 bytes at image offset 0x50 — the exact field
+# anchor_can_apply_update() compares. Exact match, so an older updater
+# generation fails here rather than shipping.
+ACTUAL_ID=$(desc_field 80 32)
 [[ "$ACTUAL_ID" == "$EXPECTED_ID" ]] || {
   echo "error: $FW carries project_name '$ACTUAL_ID', expected '$EXPECTED_ID'" >&2; exit 1; }
 echo "==> descriptor identity: $ACTUAL_ID"

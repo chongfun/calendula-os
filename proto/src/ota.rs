@@ -1182,18 +1182,20 @@ mod tests {
         assert!(!UpdateAction::BounceToAnchor.consumes_trigger());
     }
 
+    /// `selects_slot` is a *boot* target, not a write target — the bounce
+    /// deliberately selects the anchor. That the anchor is never written is a
+    /// property of the whole lifecycle, proved by
+    /// [`many_updates_in_a_row_never_write_the_anchor`].
     #[test]
-    fn no_action_ever_selects_the_anchor_as_a_write_target() {
-        for action in [
-            UpdateAction::WriteUpdateSlot,
-            UpdateAction::BounceToAnchor,
-            UpdateAction::NoUsableAnchor,
-        ] {
-            if action == UpdateAction::WriteUpdateSlot {
-                assert_eq!(action.selects_slot(), Some(UPDATE_SLOT));
-                assert_ne!(action.selects_slot(), Some(ANCHOR_SLOT));
-            }
-        }
+    fn each_action_selects_the_slot_it_names() {
+        assert_eq!(
+            UpdateAction::WriteUpdateSlot.selects_slot(),
+            Some(UPDATE_SLOT)
+        );
+        assert_eq!(
+            UpdateAction::BounceToAnchor.selects_slot(),
+            Some(ANCHOR_SLOT)
+        );
         assert_eq!(UpdateAction::NoUsableAnchor.selects_slot(), None);
     }
 

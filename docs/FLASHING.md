@@ -229,8 +229,11 @@ once you are *on* slot 0):
 - a build from an **older updater generation**, which may not recognise this
   trigger at all.
 
-In any of those, the update is refused and left for you to apply with a computer
-or the OEM updater.
+In any of those, the update is refused and slot 1 is left as it was. The trigger
+file is deleted on the way out — a refusal that left it in place would repeat on
+every boot — so it is no longer on the card. Copying it back would only refuse
+again for the same reason: the fix is to flash the image with a computer or the
+OEM updater, both of which write slot 0 and so restore a usable anchor.
 
 ### Backing out a bad update
 

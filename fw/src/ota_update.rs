@@ -301,10 +301,12 @@ fn anchor_holds_our_firmware(flash: &mut FlashStorage, layout: &ota::OtaLayout) 
     }
 
     let mut name = [0u8; APP_DESC_PROJECT_NAME_LEN];
-    if flash
-        .read(anchor.offset + APP_DESC_PROJECT_NAME_OFFSET, &mut name)
-        .is_err()
-    {
+    if let Err(e) = flash.read(anchor.offset + APP_DESC_PROJECT_NAME_OFFSET, &mut name) {
+        esp_println::println!(
+            "ota: failed to read slot {} descriptor: {:?}",
+            ANCHOR_SLOT,
+            e
+        );
         return false;
     }
     if !ota::anchor_can_apply_update(&name, crate::PROJECT_NAME.as_bytes()) {
