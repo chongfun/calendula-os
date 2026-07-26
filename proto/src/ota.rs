@@ -2074,11 +2074,6 @@ mod tests {
         assert_eq!(action.selects_slot(), None);
     }
 
-    /// An unresolved MMU lookup must not fall back to `otadata`. `otadata` is
-    /// wrong precisely when the bootloader fell forward, and that is the case
-    /// where a write erases the running firmware — so with no proof, nothing is
-    /// written and nothing is selected, whichever slot `otadata` names and
-    /// however good the anchor looks.
     // --- Which staged images may be installed --------------------------------
 
     #[test]
@@ -2166,6 +2161,11 @@ mod tests {
         );
     }
 
+    /// An unresolved MMU lookup must not fall back to `otadata`. `otadata` is
+    /// wrong precisely when the bootloader fell forward, and that is the case
+    /// where a write erases the running firmware — so with no proof, nothing is
+    /// written and nothing is selected, whichever slot `otadata` names and
+    /// however good the anchor looks.
     #[test]
     fn an_unprovable_running_slot_writes_nothing() {
         for requested in [ANCHOR_SLOT, UPDATE_SLOT] {

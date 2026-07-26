@@ -263,11 +263,13 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     let dest_partition = layout.slots[UPDATE_SLOT as usize];
     let (s0, s1) = read_otadata(&mut flash, layout.otadata.offset)?;
 
-    // Ask the hardware which slot is executing before believing `otadata`,
-    // which only records which slot was *requested*. An unresolved answer is
-    // kept as `None` rather than folded back into the request: `otadata` is
-    // wrong in exactly the case a write would erase the running firmware, so
-    // `ota::plan_update_action` refuses on it instead of guessing.
+    // `otadata` records which slot was *requested*. If invalid, default to
+    // `ANCHOR_SLOT` to mirror bootloader behavior. For `running`, ask the
+    // hardware MMU which slot is actually executing. An unresolved MMU answer
+    // is kept as `None` (fail-closed) rather than falling back to `requested`:
+    // `otadata` is wrong in exactly the case a write would erase running
+    // firmware, so `ota::plan_update_action` refuses the update when
+    // `running` is `None` instead of guessing.
     let requested = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(ANCHOR_SLOT);
     let running = crate::mmu::running_slot(&layout);
     match running {
