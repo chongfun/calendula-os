@@ -1230,80 +1230,104 @@ impl EvictionWalk {
     }
 }
 
-/// Slots in the display-event channel. Lives here for the same reason as
-/// [`LIBRARY_EVENT_SLOTS`]: the walk below is written against it.
+/// Slots in the display-event channel. Lives here so the firmware and the
+/// model test below size the same channel.
 pub const DISPLAY_EVENT_SLOTS: usize = 8;
 
-/// Making room in a full display-event channel for an acknowledgement the app
-/// is waiting on, without discarding another one.
+/// The render acknowledgement that had nowhere to go, waiting for room.
 ///
-/// Same shape as [`EvictionWalk`] and the same reason for existing — a sender
-/// cannot look into the channel, so the only way to see the head is to take
-/// it off — but nothing here may be spent. Every non-library event in this
-/// channel is an acknowledgement the app is waiting on, and this walk is
-/// called *by* the only producer of them, so dropping one to make room for
-/// another gains nothing. A library event is different: it has its own
-/// channel to the same consumer, so moving it across is a relocation rather
-/// than a loss, and that is the one way a slot is freed.
+/// The display-event channel used to be made room in by walking it, the way
+/// [`EvictionWalk`] walks the library channel. That cannot work here. A sender
+/// cannot look into a channel, so a walk has to take the head off to see it,
+/// and anything it may not spend has to go back — at the tail, behind
+/// everything it has not inspected yet. On the library channel that reordering
+/// is affordable; on this one it is not, because this channel is where
+/// `ChapterCursor` is queued *specifically* to arrive ahead of the `Settled`
+/// that follows it, and a walk can put those two the wrong way round. Nor is
+/// there anything here worth spending: the informational events are sent
+/// lossily and never queue behind an acknowledgement for long, and everything
+/// else is an acknowledgement the app is waiting on.
 ///
-/// Everything else goes straight back, and the walk stops before it repeats,
-/// so a rotation that relocates nothing leaves the queue exactly as it found
-/// it. Relocating mid-walk does move the events already requeued behind the
-/// ones not yet inspected; among acknowledgements that costs nothing, since
-/// repeated `Settled`s are interchangeable and `Asleep`/`SleepFailed` are
-/// informational.
+/// So the queue is left alone and the acknowledgement waits instead, placed by
+/// a branch of the display task's select once the app drains a slot — the same
+/// answer as [`LibraryEventHolder`], for the same reason.
 ///
-/// RAM: two usizes, beside the one event the caller already holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DisplayEventWalk {
-    inspected: usize,
-    capacity: usize,
+/// Unlike that one, this holder gates nothing. The producer of
+/// acknowledgements is the render arm of the display loop, and refusing
+/// renders while one is held would deadlock: the app blocks on handing over a
+/// render, and servicing renders is exactly what frees the app to drain the
+/// channel this event is waiting for.
+///
+/// RAM: one `Option<DisplayEvent>` — 280 bytes, sized by the `Library`
+/// variant. Sits in the firmware's `.bss`, not on a stack.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayEventHolder {
+    held: Option<DisplayEvent>,
 }
 
-/// What the caller does with the event it just took off the front.
+/// What [`DisplayEventHolder::hold`] did with the event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisplayEventStep {
-    /// Send it down the library channel instead; the slot it frees is the
-    /// newcomer's.
-    Relocate(LibraryEvent),
-    /// Put it straight back and look at the next one. One slot is free — the
-    /// head just came off — so the requeue always lands.
-    Requeue(DisplayEvent),
+pub enum DisplayHoldOutcome {
+    /// Taken. The caller's placing branch delivers it once there is room.
+    Held,
+    /// Not an acknowledgement the app is waiting on. Send it the lossy way.
+    NotRequired,
+    /// Occupied by an acknowledgement that has been waiting longer. Both end
+    /// the render cycle and the app clears its render lock on either, so the
+    /// one already waiting is enough and the newcomer may be the loss.
+    Occupied,
 }
 
-impl DisplayEventWalk {
-    pub const fn new(capacity: usize) -> Self {
-        Self {
-            inspected: 0,
-            capacity,
+impl DisplayEventHolder {
+    pub const fn new() -> Self {
+        Self { held: None }
+    }
+
+    /// The acknowledgement awaiting a slot, if any. Peeking, not taking: it
+    /// stays held until [`Self::placed`] says it landed, so a cancelled send
+    /// cannot lose it.
+    pub const fn pending(&self) -> Option<DisplayEvent> {
+        self.held
+    }
+
+    /// Take responsibility for an acknowledgement the channel refused.
+    pub fn hold(&mut self, event: &DisplayEvent) -> DisplayHoldOutcome {
+        if !event.must_be_delivered() {
+            return DisplayHoldOutcome::NotRequired;
         }
+        if self.held.is_some() {
+            return DisplayHoldOutcome::Occupied;
+        }
+        self.held = Some(*event);
+        DisplayHoldOutcome::Held
     }
 
-    /// Whether the walk has been all the way round. Checked before taking
-    /// another event, so a walk that relocates nothing leaves the queue it
-    /// gave up on untouched.
-    pub const fn exhausted(&self) -> bool {
-        self.inspected >= self.capacity
+    /// The held event reached the channel.
+    pub fn placed(&mut self) -> Option<DisplayEvent> {
+        self.held.take()
     }
+}
 
-    /// Decide what to do with `head`, the event just taken off the front.
+impl DisplayEvent {
+    /// Whether dropping this would strand the app rather than cost it a log
+    /// line.
     ///
-    /// Takes the head and hands it back inside the step, so the caller cannot
-    /// requeue something other than what it inspected — the previous version
-    /// of this decision was an `if let` on the receive, and the events its
-    /// pattern did not match went nowhere at all.
+    /// `Settled` and `RefreshFailed` end the render cycle: the app clears its
+    /// render lock on them, drains its parked storage and releases a deferred
+    /// sleep. Nothing reissues them, so a dropped one leaves every later state
+    /// change merely pending, with no render left to be acknowledged.
     ///
-    /// The holder is asked here rather than by the caller: a relocation lands
-    /// in the library channel, which is the thing the holder is gating, so
-    /// this is the one place the answer can be neither forgotten nor applied
-    /// to the wrong event.
-    pub fn inspect(&mut self, head: DisplayEvent, holder: &LibraryEventHolder) -> DisplayEventStep {
-        self.inspected += 1;
-        match head {
-            DisplayEvent::Library(event) if holder.library_event_may_move() => {
-                DisplayEventStep::Relocate(event)
-            }
-            head => DisplayEventStep::Requeue(head),
+    /// `Asleep` and `SleepFailed` are notifications. The handshake the power
+    /// task actually waits on travels over its own channel and is sent beside
+    /// each of these; the app only logs them. Dropping one costs the log line.
+    ///
+    /// `Library` carries the library event's own answer, so an event that
+    /// settles a wait is protected whichever channel it is travelling on.
+    pub const fn must_be_delivered(&self) -> bool {
+        match self {
+            Self::Settled | Self::RefreshFailed => true,
+            Self::Asleep | Self::SleepFailed => false,
+            Self::Library(event) => event.must_be_delivered(),
         }
     }
 }
@@ -3716,44 +3740,32 @@ mod tests {
         assert_eq!(holder.placed(), Some(event));
     }
 
-    /// The firmware's `send_library_event`: the required path for an event
-    /// that settles a wait, the lossy one for a refresh.
-    fn send_library(queue: &mut LibraryRing, holder: &mut LibraryEventHolder, event: LibraryEvent) {
-        if event.must_be_delivered() {
-            send_required(queue, holder, event);
-        } else {
-            queue.try_send(event);
-        }
-    }
-
-    /// The firmware's `send_required_display_event`, over the modelled
-    /// channels. Returns whether the acknowledgement was queued.
-    fn send_required_display(
+    /// The firmware's `send_display_event`, over the modelled channel: the
+    /// queue, then the holder for an acknowledgement, and the lossy path for
+    /// anything else. Returns whether the event was queued outright.
+    fn send_display(
         queue: &mut DisplayRing,
-        library: &mut LibraryRing,
-        holder: &mut LibraryEventHolder,
+        holder: &mut DisplayEventHolder,
         event: DisplayEvent,
     ) -> bool {
-        let mut walk = DisplayEventWalk::new(DISPLAY_EVENT_SLOTS);
-        loop {
-            if queue.try_send(event) {
-                return true;
-            }
-            if walk.exhausted() {
-                return false;
-            }
-            let Some(head) = queue.try_receive() else {
-                return false;
-            };
-            match walk.inspect(head, holder) {
-                DisplayEventStep::Relocate(library_event) => {
-                    send_library(library, holder, library_event);
-                }
-                DisplayEventStep::Requeue(head) => {
-                    queue.try_send(head);
-                }
-            }
+        if queue.try_send(event) {
+            return true;
         }
+        if holder.hold(&event) != DisplayHoldOutcome::Held {
+            // The firmware's last try at a slot that may have freed since,
+            // and then the drop it reports.
+            queue.try_send(event);
+        }
+        false
+    }
+
+    /// The main loop's placing branch for a held acknowledgement.
+    fn place_held_ack(queue: &mut DisplayRing, holder: &mut DisplayEventHolder) {
+        let Some(event) = holder.pending() else {
+            return;
+        };
+        assert!(queue.try_send(event), "the placing branch waits for room");
+        assert_eq!(holder.placed(), Some(event));
     }
 
     fn display_filled(events: impl IntoIterator<Item = DisplayEvent>) -> DisplayRing {
@@ -3862,105 +3874,105 @@ mod tests {
         );
     }
 
-    /// The sender used to make room with a `try_receive` it then matched for
-    /// a library event, so a head that was itself an acknowledgement came off
-    /// the queue and went nowhere. `Settled` is the one that hurts: the app
-    /// clears its render lock on it and nothing reissues it, so losing one
-    /// leaves later state changes merely pending, with no render left to
-    /// produce another acknowledgement.
+    /// The channel is never made room in, so a queue full of anything at all
+    /// leaves the acknowledgement waiting rather than rearranging what is
+    /// already queued. Every event in this list stays exactly where it was,
+    /// including the `ChapterCursor` whose whole reason for being on this
+    /// channel is to arrive ahead of the `Settled` behind it.
     #[test]
-    fn an_acknowledgement_at_the_head_is_not_spent_making_room() {
+    fn a_full_queue_holds_the_acknowledgement_and_keeps_its_order() {
+        let cursor = LibraryEvent::ChapterCursor {
+            book_id: 2,
+            current_chapter: 4,
+        };
         let before = display_filled([
             DisplayEvent::Settled,
-            DisplayEvent::RefreshFailed,
             DisplayEvent::Asleep,
+            DisplayEvent::Library(cursor),
+            DisplayEvent::Settled,
+            DisplayEvent::Library(cleared(7)),
             DisplayEvent::SleepFailed,
             DisplayEvent::Settled,
-            DisplayEvent::Settled,
             DisplayEvent::Asleep,
-            DisplayEvent::Settled,
         ]);
         let mut queue = before;
-        let mut library = LibraryRing::new();
-        let mut holder = LibraryEventHolder::new();
+        let mut holder = DisplayEventHolder::new();
 
-        let queued = send_required_display(
-            &mut queue,
-            &mut library,
-            &mut holder,
-            DisplayEvent::RefreshFailed,
-        );
+        let queued = send_display(&mut queue, &mut holder, DisplayEvent::RefreshFailed);
 
-        assert!(
-            !queued,
-            "nothing in the queue may be spent, so the newcomer is the loss"
-        );
+        assert!(!queued, "a full channel takes nothing");
         assert_eq!(
             queue.drained(),
             before.drained(),
-            "a walk that relocates nothing disturbs nothing, order included"
+            "the queue is left alone, order included"
         );
-    }
-
-    /// A library event is the one thing the walk may move: it has its own
-    /// channel to the same consumer, so relocating it frees a slot without
-    /// losing anything.
-    #[test]
-    fn making_room_relocates_the_library_event_and_keeps_every_ack() {
-        let mut queue = display_filled([
-            DisplayEvent::Settled,
-            DisplayEvent::Asleep,
-            DisplayEvent::Library(cleared(7)),
-            DisplayEvent::Settled,
-            DisplayEvent::Settled,
-            DisplayEvent::RefreshFailed,
-            DisplayEvent::Settled,
-            DisplayEvent::Asleep,
-        ]);
-        let mut library = LibraryRing::new();
-        let mut holder = LibraryEventHolder::new();
-
-        let queued =
-            send_required_display(&mut queue, &mut library, &mut holder, DisplayEvent::Settled);
-
-        assert!(queued, "the relocated event's slot is the newcomer's");
-        assert!(
-            library.holds(cleared(7)),
-            "the relocated event goes to the channel the app also drains"
-        );
-        assert!(!queue.holds(DisplayEvent::Library(cleared(7))));
-        let acks = queue
-            .drained()
-            .iter()
-            .filter(|queued| queued.is_some())
-            .count();
-        assert_eq!(acks, DISPLAY_EVENT_SLOTS, "no acknowledgement was spent");
-    }
-
-    /// With the holder occupied, a relocation would arrive in a channel that
-    /// has nowhere to put it, so the walk leaves library events where they
-    /// are — and then there is nothing it may move at all.
-    #[test]
-    fn a_held_event_keeps_library_events_in_the_display_queue() {
-        let before = display_filled(
-            core::iter::once(DisplayEvent::Library(cleared(7)))
-                .chain(core::iter::repeat_n(DisplayEvent::Settled, 7)),
-        );
-        let mut queue = before;
-        let mut library = LibraryRing::new();
-        let mut holder = LibraryEventHolder::new();
-        assert_eq!(holder.hold(&cleared(1)), HoldOutcome::Held);
-
-        let queued =
-            send_required_display(&mut queue, &mut library, &mut holder, DisplayEvent::Settled);
-
-        assert!(!queued);
         assert_eq!(
-            queue.drained(),
-            before.drained(),
-            "the gate closes the walk without disturbing the queue"
+            holder.pending(),
+            Some(DisplayEvent::RefreshFailed),
+            "the acknowledgement is held, not dropped"
         );
-        assert_eq!(holder.pending(), Some(cleared(1)));
+
+        // The app takes one, which is what the placing branch waits for.
+        queue.try_receive();
+        place_held_ack(&mut queue, &mut holder);
+        assert!(queue.holds(DisplayEvent::RefreshFailed));
+        assert_eq!(holder.pending(), None);
+    }
+
+    /// The two sleep notifications are informational -- the handshake the
+    /// power task waits on travels beside them over its own channel, and the
+    /// app only logs these. Protecting them the way an acknowledgement is
+    /// protected would get the priority backwards: they would occupy the
+    /// holder that the event ending the app's render cycle needs.
+    #[test]
+    fn only_a_render_acknowledgement_may_take_the_holder() {
+        for event in [DisplayEvent::Settled, DisplayEvent::RefreshFailed] {
+            let mut holder = DisplayEventHolder::new();
+            assert!(event.must_be_delivered(), "{event:?} ends the render cycle");
+            assert_eq!(holder.hold(&event), DisplayHoldOutcome::Held);
+            assert_eq!(holder.pending(), Some(event));
+        }
+        for event in [DisplayEvent::Asleep, DisplayEvent::SleepFailed] {
+            let mut holder = DisplayEventHolder::new();
+            assert!(
+                !event.must_be_delivered(),
+                "{event:?} is only a notification"
+            );
+            assert_eq!(holder.hold(&event), DisplayHoldOutcome::NotRequired);
+            assert_eq!(holder.pending(), None);
+        }
+    }
+
+    /// A library event travelling on this channel keeps its own answer, so an
+    /// event that settles a wait is protected whichever channel it is on.
+    #[test]
+    fn a_library_event_on_the_display_channel_keeps_its_own_rule() {
+        for event in settling_events() {
+            assert!(DisplayEvent::Library(event).must_be_delivered());
+        }
+        for event in refresh_events() {
+            assert!(!DisplayEvent::Library(event).must_be_delivered());
+        }
+    }
+
+    /// Two acknowledgements with the app draining neither. Both end the render
+    /// cycle and the app clears its lock on either, so the one already waiting
+    /// answers for the newcomer too -- but it must be the newcomer that gives
+    /// way, not the event that has been waiting longer.
+    #[test]
+    fn an_occupied_acknowledgement_holder_keeps_the_older_one() {
+        let mut holder = DisplayEventHolder::new();
+        assert_eq!(
+            holder.hold(&DisplayEvent::Settled),
+            DisplayHoldOutcome::Held
+        );
+
+        assert_eq!(
+            holder.hold(&DisplayEvent::RefreshFailed),
+            DisplayHoldOutcome::Occupied
+        );
+
+        assert_eq!(holder.pending(), Some(DisplayEvent::Settled));
     }
 
     /// The gates are one rule read from three unrelated places, and the

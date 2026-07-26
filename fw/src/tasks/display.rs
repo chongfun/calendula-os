@@ -15,7 +15,7 @@ use app_core::storage_loop::{
 };
 use app_core::{
     book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
-    DisplayEventStep, DisplayEventWalk, DisplayOrientation, EvictionStep, EvictionWalk,
+    DisplayEventHolder, DisplayHoldOutcome, DisplayOrientation, EvictionStep, EvictionWalk,
     HoldOutcome, LibraryEventHolder, PersistedAppState, ReaderSource, RefreshPlanner, RenderKind,
     RenderRequest, SyncSession, SyncStatus,
 };
@@ -24,7 +24,7 @@ use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::BAND_BYTES;
-use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::Instant;
@@ -152,15 +152,21 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
         // Storage stands down while something is held. It is the producer of
         // settling events, the holder has one slot, and a second command
         // could fill it with nowhere for the first to go.
-        match select3(
+        //
+        // The fourth is the same waiting-for-room branch for a render
+        // acknowledgement, and it constrains nothing: rendering is what
+        // produces acknowledgements, but it is also what releases the app to
+        // drain them, so standing down would be waiting on itself.
+        match select4(
             DISPLAY_COMMANDS.receive(),
             storage_command_while_free(),
             place_held_library_event(),
+            place_held_display_event(),
         )
         .await
         {
-            Either3::Third(()) => {}
-            Either3::First(DisplayCommand::Render(request)) => {
+            Either4::Third(()) | Either4::Fourth(()) => {}
+            Either4::First(DisplayCommand::Render(request)) => {
                 let content_context_changed = refresh_planner
                     .last_request()
                     .map(|last| (last.view, last.book_id))
@@ -229,7 +235,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         esp_println::println!("display: wake init failed: {:?}", error);
                         prev_prestaged = false;
                         let (display_event, power_event) = app_core::display_refresh_outcome(false);
-                        send_required_display_event(&display_event);
+                        send_display_event(&display_event);
                         send_required_power_event(power_event).await;
                         continue;
                     }
@@ -288,7 +294,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // `prev_prestaged` is always current by the next flush, and a
                     // Sleep queued by power_task after DisplaySettled waits behind it.
                     let (display_event, power_event) = app_core::display_refresh_outcome(true);
-                    send_required_display_event(&display_event);
+                    send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                     let prestage_start = Instant::now();
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
@@ -315,11 +321,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // against a frame that may never have landed.
                     refresh_planner.record_failure();
                     let (display_event, power_event) = app_core::display_refresh_outcome(false);
-                    send_required_display_event(&display_event);
+                    send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                 }
             }
-            Either3::First(DisplayCommand::Sleep { generation }) => {
+            Either4::First(DisplayCommand::Sleep { generation }) => {
                 let sleep_start = Instant::now();
                 esp_println::println!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
@@ -430,7 +436,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                             ),
                         }
                     }
-                    send_required_display_event(&DisplayEvent::SleepFailed);
+                    send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                     continue;
                 }
@@ -493,7 +499,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // it false so that boot falls back to the full waveform.
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
                 if panel_slept {
-                    send_required_display_event(&DisplayEvent::Asleep);
+                    send_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
                     park_until_resumed(generation).await;
                 } else {
@@ -507,7 +513,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // re-inits the panel with the full waveform.
                     refresh_planner.record_failure();
                     esp_println::println!("display: sleep transition failed");
-                    send_required_display_event(&DisplayEvent::SleepFailed);
+                    send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                 }
                 esp_println::println!(
@@ -517,7 +523,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     Instant::now().as_millis(),
                 );
             }
-            Either3::Second(command) => match loop_arm(&command, sync_session) {
+            Either4::Second(command) => match loop_arm(&command, sync_session) {
                 // The display task is the upload writer until Sleep or
                 // wireless Exit closes the session; a Sleep exit has
                 // already been re-queued on DISPLAY_COMMANDS.
@@ -1426,40 +1432,84 @@ async fn send_required_power_event(event: PowerEvent) {
     }
 }
 
-/// Queues an acknowledgement the app is waiting on, making room if the
-/// channel is full.
+/// Sends a display event, by the rule the event itself carries.
 ///
-/// It used to make room with a `try_receive` whose answer it then matched for
-/// a library event — so a head that was itself an acknowledgement came off the
-/// queue and went nowhere, which is exactly the loss this function exists to
-/// prevent. It walks the queue now; [`DisplayEventWalk`] owns what may be
-/// moved and what must go back, and is host-tested against a modelled channel.
-fn send_required_display_event(event: &DisplayEvent) {
-    let mut walk = DisplayEventWalk::new(DISPLAY_EVENTS.capacity());
-    loop {
-        if DISPLAY_EVENTS.try_send(*event).is_ok() {
-            return;
-        }
-        if walk.exhausted() {
-            break;
-        }
-        let Ok(head) = DISPLAY_EVENTS.try_receive() else {
-            // Unreachable: an empty channel would have taken the send above.
-            break;
-        };
-        match walk.inspect(head, &holder()) {
-            // Routed, not forced down the required path: the relocated event
-            // may be a refresh, and the library sender is what knows which.
-            DisplayEventStep::Relocate(library_event) => send_library_event(&library_event),
-            DisplayEventStep::Requeue(head) => {
-                let _ = DISPLAY_EVENTS.try_send(head);
-            }
-        }
+/// The two sleep notifications take the lossy path. The handshake the power
+/// task waits on goes over `POWER_EVENTS` beside each of them and the app only
+/// logs these, so a dropped one costs the log line — and letting them compete
+/// for room with an acknowledgement got the priority exactly backwards, since
+/// an acknowledgement is what ends the app's render cycle.
+fn send_display_event(event: &DisplayEvent) {
+    if event.must_be_delivered() {
+        send_required_display_event(event);
+        return;
     }
-    esp_println::println!(
-        "display: required display event queue full, dropped {:?}",
-        event
-    );
+    if DISPLAY_EVENTS.try_send(*event).is_err() {
+        esp_println::println!("display: display event queue full, dropped {:?}", event);
+    }
+}
+
+/// Queues an acknowledgement the app is waiting on, holding it if the channel
+/// is full.
+///
+/// This used to make room by walking the queue. That was wrong twice over: the
+/// first version's `try_receive` dropped whatever its pattern did not match,
+/// and the walk that replaced it had to requeue at the tail, which can put a
+/// `ChapterCursor` behind the `Settled` it was queued ahead of. The queue is
+/// left alone now — [`DisplayEventHolder`] explains why nothing in it is worth
+/// spending — and the acknowledgement waits for room instead.
+fn send_required_display_event(event: &DisplayEvent) {
+    if DISPLAY_EVENTS.try_send(*event).is_ok() {
+        return;
+    }
+    let outcome = with_display_holder(|holder| holder.hold(event));
+    let refusal = match outcome {
+        DisplayHoldOutcome::Held => return,
+        DisplayHoldOutcome::NotRequired => "refresh routed to the acknowledgement holder",
+        // Both end the render cycle and the app clears its lock on either, so
+        // the one already waiting answers for this one too.
+        DisplayHoldOutcome::Occupied => "acknowledgement holder occupied",
+    };
+    if DISPLAY_EVENTS.try_send(*event).is_err() {
+        esp_println::println!("display: {}, dropped {:?}", refusal, event);
+    }
+}
+
+/// The acknowledgement that had nowhere to go, waiting for room. Gates
+/// nothing: see [`DisplayEventHolder`] for why refusing renders while one is
+/// held would deadlock the very task that empties it.
+static HELD_DISPLAY_EVENT: Mutex<CriticalSectionRawMutex, Cell<DisplayEventHolder>> =
+    Mutex::new(Cell::new(DisplayEventHolder::new()));
+
+fn display_holder() -> DisplayEventHolder {
+    HELD_DISPLAY_EVENT.lock(Cell::get)
+}
+
+fn with_display_holder<T>(update: impl FnOnce(&mut DisplayEventHolder) -> T) -> T {
+    HELD_DISPLAY_EVENT.lock(|cell| {
+        let mut holder = cell.get();
+        let outcome = update(&mut holder);
+        cell.set(holder);
+        outcome
+    })
+}
+
+/// Places the acknowledgement [`send_required_display_event`] could not, once
+/// the channel has room. Pending forever when nothing is held, so it can sit
+/// in the main loop's select as a branch that only fires when it has work.
+///
+/// Selecting this against the display queue is what keeps it from deadlocking:
+/// the app blocks on `DISPLAY_COMMANDS.send` to hand over a render, and
+/// servicing that render is what releases it to drain this event's channel.
+async fn place_held_display_event() {
+    let Some(event) = display_holder().pending() else {
+        return core::future::pending::<()>().await;
+    };
+    DISPLAY_EVENTS.send(event).await;
+    // Nothing awaits between the send completing and this, so the holder
+    // cannot be observed empty with the event still unsent, or cleared for a
+    // send that a cancellation abandoned.
+    let _ = with_display_holder(DisplayEventHolder::placed);
 }
 
 /// Step one of a book-open transaction: get the departing book's page onto
