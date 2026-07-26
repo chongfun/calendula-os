@@ -211,7 +211,36 @@ pub fn validate_image<S: ImageSource>(
             return Err(ImageError::TooLarge);
         }
     }
+    walk_image(src, image_len, Some(image_len))
+}
 
+/// Validate an image already resident in a flash partition, to the same
+/// standard as a staged one — segment walk, XOR checksum, appended SHA-256.
+///
+/// Unlike a file, a partition has no length: past the image lies whatever was
+/// there before. The ESP-IDF image is self-delimiting, so the walk measures it
+/// and `partition_len` only bounds how far that walk may run.
+///
+/// This is what makes a slot's contents *evidence about the bootloader* — it
+/// loads a slot only if the image verifies — which is the inference
+/// [`plan_update_action`] draws. A magic byte alone proves nothing: a flash
+/// interrupted partway through writing slot 0 leaves the first bytes intact and
+/// the tail missing.
+pub fn validate_flash_image<S: ImageSource>(
+    src: &mut S,
+    partition_len: usize,
+) -> Result<(), ImageError> {
+    walk_image(src, partition_len, None)
+}
+
+/// The shared segment walk. `limit` bounds how far the walk may read;
+/// `exact_len`, when given, is a known source length the measured image must
+/// match exactly (a file), rather than merely fit within (a partition).
+fn walk_image<S: ImageSource>(
+    src: &mut S,
+    limit: usize,
+    exact_len: Option<usize>,
+) -> Result<(), ImageError> {
     let mut header = [0u8; HEADER_LEN];
     src.read_exact(&mut header).map_err(|_| ImageError::Read)?;
     if header[0] != IMAGE_MAGIC {
@@ -229,7 +258,7 @@ pub fn validate_image<S: ImageSource>(
 
     let mut buf = [0u8; STREAM_CHUNK];
     for _ in 0..segment_count {
-        if pos + SEG_HEADER_LEN > image_len {
+        if pos + SEG_HEADER_LEN > limit {
             return Err(ImageError::BadSegments);
         }
         let mut seg_header = [0u8; SEG_HEADER_LEN];
@@ -241,7 +270,7 @@ pub fn validate_image<S: ImageSource>(
         let data_len =
             u32::from_le_bytes([seg_header[4], seg_header[5], seg_header[6], seg_header[7]])
                 as usize;
-        if pos + data_len > image_len {
+        if pos + data_len > limit {
             return Err(ImageError::BadSegments);
         }
 
@@ -263,8 +292,13 @@ pub fn validate_image<S: ImageSource>(
     // byte sits at that boundary minus one. `pad_len` is always in 1..=16.
     let pad_end = (pos + 16) & !15usize;
     let expected_len = pad_end + if hash_appended { SHA_TRAILER_LEN } else { 0 };
-    if expected_len != image_len {
-        return Err(ImageError::BadSize);
+    match exact_len {
+        // A file: the image must account for every byte of it.
+        Some(len) if expected_len != len => return Err(ImageError::BadSize),
+        // A partition: the image must fit, and still be firmware-sized.
+        None if expected_len > limit => return Err(ImageError::TooLarge),
+        None if expected_len < MIN_IMAGE_LEN => return Err(ImageError::TooSmall),
+        _ => {}
     }
     let pad_len = pad_end - pos;
     if pad_len == 0 || pad_len > 16 {
@@ -588,6 +622,11 @@ pub enum UpdateAction {
     /// Running from [`UPDATE_SLOT`] with no anchor that could apply the update.
     /// Bouncing would move the user off their firmware and strand the update.
     NoUsableAnchor,
+    /// `otadata` selects the anchor, but the anchor is not an image the
+    /// bootloader could have loaded — so this firmware cannot be running from
+    /// where `otadata` says it is, and the slot a write would erase may be the
+    /// one currently executing. Nothing is written.
+    RunningSlotUnknown,
 }
 
 impl UpdateAction {
@@ -605,24 +644,45 @@ impl UpdateAction {
         match self {
             Self::WriteUpdateSlot => Some(UPDATE_SLOT),
             Self::BounceToAnchor => Some(ANCHOR_SLOT),
-            Self::NoUsableAnchor => None,
+            Self::NoUsableAnchor | Self::RunningSlotUnknown => None,
         }
     }
 }
 
 /// Decide what to do with a pending update.
 ///
-/// `active_slot` is the slot the bootloader selected for this boot, and
-/// `anchor_usable` whether [`ANCHOR_SLOT`] holds firmware that would itself
-/// apply the trigger file (ours, not a foreign firmware sharing the device).
+/// `active_slot` is the slot **`otadata` selects**, and `anchor_usable` whether
+/// [`ANCHOR_SLOT`] holds a complete, valid image of our own firmware identity —
+/// one that would both boot and itself apply the trigger file.
+///
+/// # `otadata` is a request, not a report
+///
+/// The bootloader loads the slot `otadata` selects *only if that image
+/// verifies*; when it does not, ESP-IDF falls forward to another app partition
+/// and boots it **without** rewriting `otadata`. So a running firmware that
+/// reads `otadata` may be reading a slot it is not executing.
+///
+/// That matters in exactly one direction. If `otadata` names the anchor and the
+/// anchor does not verify, the bootloader cannot have loaded it — this code is
+/// therefore executing the update slot, the very slot [`WriteUpdateSlot`]
+/// erases. Writing there would erase the running firmware mid-update and
+/// destroy the last bootable image on the device. The anchor's own validity is
+/// what distinguishes the two cases, so it is checked on every path, not just
+/// before a bounce.
+///
+/// [`WriteUpdateSlot`]: UpdateAction::WriteUpdateSlot
 pub fn plan_update_action(active_slot: u32, anchor_usable: bool) -> UpdateAction {
-    if active_slot != UPDATE_SLOT {
-        return UpdateAction::WriteUpdateSlot;
+    if active_slot == UPDATE_SLOT {
+        return if anchor_usable {
+            UpdateAction::BounceToAnchor
+        } else {
+            UpdateAction::NoUsableAnchor
+        };
     }
     if anchor_usable {
-        UpdateAction::BounceToAnchor
+        UpdateAction::WriteUpdateSlot
     } else {
-        UpdateAction::NoUsableAnchor
+        UpdateAction::RunningSlotUnknown
     }
 }
 
@@ -828,6 +888,119 @@ mod tests {
         let img = valid_image(false);
         let len = img.len();
         assert_eq!(validate_image(&mut cursor(img), len, None), Ok(()));
+    }
+
+    // --- Images resident in a flash partition -------------------------------
+    //
+    // A partition has no length: past the image lies whatever was there before.
+    // `validate_flash_image` measures the image from its own structure, so it
+    // has to accept the trailing junk a file-based check would call BadSize.
+
+    /// Slot contents: the image, then whatever the partition already held.
+    fn in_partition(img: Vec<u8>, partition_len: usize) -> Cursor {
+        let mut bytes = img;
+        bytes.resize(partition_len, 0xA5);
+        cursor(bytes)
+    }
+
+    const SLOT_LEN: usize = 0x64_0000;
+
+    #[test]
+    fn accepts_a_flash_image_followed_by_partition_junk() {
+        let img = valid_image(true);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn accepts_a_flash_image_with_no_hash_trailer() {
+        let img = valid_image(false);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Ok(())
+        );
+    }
+
+    /// The case that motivates checking the anchor at all: a write to slot 0
+    /// interrupted partway leaves the header and descriptor intact and the tail
+    /// wrong, which a magic-and-identity check waves through.
+    #[test]
+    fn rejects_a_flash_image_whose_body_is_corrupt() {
+        let mut img = valid_image(true);
+        let len = img.len();
+        img[len / 2] ^= 0xFF;
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::BadChecksum)
+        );
+    }
+
+    /// Corruption the XOR checksum cannot see — two body bytes flipped by the
+    /// same mask cancel out in the XOR — still fails on the SHA-256 trailer.
+    #[test]
+    fn rejects_flash_corruption_the_checksum_cannot_see() {
+        let mut img = valid_image(true);
+        // Both offsets are segment data, which is what the checksum covers.
+        img[HEADER_LEN + SEG_HEADER_LEN] ^= 0xFF;
+        img[HEADER_LEN + SEG_HEADER_LEN + 1] ^= 0xFF;
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::BadSha)
+        );
+    }
+
+    #[test]
+    fn rejects_a_flash_image_whose_checksum_is_wrong() {
+        // Without a SHA trailer the XOR checksum byte is the only body guard.
+        let mut img = valid_image(false);
+        let len = img.len();
+        img[len / 2] ^= 0xFF;
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::BadChecksum)
+        );
+    }
+
+    #[test]
+    fn rejects_a_flash_image_with_no_magic() {
+        let mut img = valid_image(true);
+        img[0] = 0x00;
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::BadMagic)
+        );
+    }
+
+    /// An erased slot reads as all-ones, not as a tiny valid image.
+    #[test]
+    fn rejects_an_erased_slot() {
+        let mut src = cursor(std::vec![0xFF; SLOT_LEN]);
+        assert_eq!(
+            validate_flash_image(&mut src, SLOT_LEN),
+            Err(ImageError::BadMagic)
+        );
+    }
+
+    /// The segment walk must stay inside the partition even when the segment
+    /// headers claim otherwise — the bound is the partition, not a file length.
+    #[test]
+    fn rejects_a_flash_image_claiming_more_than_the_partition_holds() {
+        let img = valid_image(true);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), 0x1_0000),
+            Err(ImageError::BadSegments)
+        );
+    }
+
+    #[test]
+    fn rejects_a_flash_image_too_small_to_be_firmware() {
+        let img = build_image(&[64], true);
+        assert_eq!(
+            validate_flash_image(&mut in_partition(img, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::TooSmall)
+        );
     }
 
     #[test]
@@ -1151,12 +1324,10 @@ mod tests {
             plan_update_action(ANCHOR_SLOT, true),
             UpdateAction::WriteUpdateSlot
         );
-        // The anchor's contents are irrelevant when we aren't running from the
-        // update slot: nothing needs handing off.
-        assert_eq!(
-            plan_update_action(ANCHOR_SLOT, false),
-            UpdateAction::WriteUpdateSlot
-        );
+        // The anchor's contents are *not* irrelevant here, even though nothing
+        // needs handing off: a bad anchor means `otadata` is not describing the
+        // slot we are running from. See
+        // `an_unbootable_anchor_means_otadata_is_not_where_we_are_running`.
     }
 
     #[test]
@@ -1179,7 +1350,25 @@ mod tests {
     fn only_the_bounce_preserves_the_trigger() {
         assert!(UpdateAction::WriteUpdateSlot.consumes_trigger());
         assert!(UpdateAction::NoUsableAnchor.consumes_trigger());
+        assert!(UpdateAction::RunningSlotUnknown.consumes_trigger());
         assert!(!UpdateAction::BounceToAnchor.consumes_trigger());
+    }
+
+    /// The bootloader boots the slot `otadata` names only if that image
+    /// verifies, and falls forward without rewriting `otadata` when it does
+    /// not. So `otadata` naming an unbootable anchor is proof we are running
+    /// somewhere else — and the only place left is the slot a write erases.
+    #[test]
+    fn an_unbootable_anchor_means_otadata_is_not_where_we_are_running() {
+        assert_eq!(
+            plan_update_action(ANCHOR_SLOT, false),
+            UpdateAction::RunningSlotUnknown
+        );
+        assert_eq!(
+            plan_update_action(ANCHOR_SLOT, false).selects_slot(),
+            None,
+            "a write here would erase the running firmware"
+        );
     }
 
     /// `selects_slot` is a *boot* target, not a write target — the bounce
@@ -1197,6 +1386,7 @@ mod tests {
             Some(ANCHOR_SLOT)
         );
         assert_eq!(UpdateAction::NoUsableAnchor.selects_slot(), None);
+        assert_eq!(UpdateAction::RunningSlotUnknown.selects_slot(), None);
     }
 
     #[test]
@@ -1243,14 +1433,28 @@ mod tests {
             dev
         }
 
+        /// The slot `otadata` *asks* for.
         fn active(&self) -> u32 {
             active_app_slot(&self.sectors[0], &self.sectors[1], 2).unwrap_or(ANCHOR_SLOT)
+        }
+
+        /// The slot the bootloader actually loads — which is not always the one
+        /// `otadata` asks for. ESP-IDF verifies the selected image and, when it
+        /// fails, falls forward to another app partition and boots that one
+        /// *without* rewriting `otadata`. The firmware then wakes up somewhere
+        /// other than where `otadata` says it is.
+        fn running_slot(&self) -> u32 {
+            match self.active() {
+                ANCHOR_SLOT if !self.anchor_usable => UPDATE_SLOT,
+                slot => slot,
+            }
         }
 
         /// One power-on. Mirrors `fw::ota_update::apply_pending_update`'s
         /// ordering: decide, consume the trigger, write the image, switch.
         fn boot(&mut self) -> Boot {
             let active = self.active();
+            let running = self.running_slot();
             let Some(image) = self.trigger else {
                 return Boot::Ran(active);
             };
@@ -1260,6 +1464,13 @@ mod tests {
                 self.trigger = None;
             }
             if action == UpdateAction::WriteUpdateSlot {
+                // The invariant the whole slot policy exists to protect. An
+                // erase of the executing slot destroys the running firmware
+                // mid-write, and with a bad anchor it is the last image left.
+                assert_ne!(
+                    running, UPDATE_SLOT,
+                    "about to erase the slot this firmware is executing from"
+                );
                 self.slots[UPDATE_SLOT as usize] = image;
             }
             if let Some(dest) = action.selects_slot() {
@@ -1269,6 +1480,44 @@ mod tests {
             }
             Boot::Acted(action)
         }
+    }
+
+    /// The bootloader fall-forward, end to end.
+    ///
+    /// Slot 0 keeps its magic and identity but its image body is corrupt — an
+    /// interrupted flash. A bounce puts `otadata` on slot 0; the bootloader
+    /// rejects it, boots slot 1 anyway, and leaves `otadata` alone. The next
+    /// boot therefore reads "active = slot 0" while executing slot 1, and the
+    /// naive reading of that is "slot 1 is idle, erase it" — erasing the only
+    /// bootable image on the device.
+    #[test]
+    fn a_corrupt_anchor_never_costs_us_the_running_firmware() {
+        let mut dev = Device::new(UPDATE_SLOT, ["corrupt-anchor", "good-fw"], false);
+        dev.trigger = Some("new-fw");
+
+        // Running from slot 1, so a write is impossible and a bounce is the
+        // only way to land the update — but not into an anchor that won't boot.
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::NoUsableAnchor));
+        assert_eq!(dev.trigger, None, "a refusal is still one-shot");
+        assert_eq!(dev.active(), UPDATE_SLOT, "otadata must not have moved");
+        assert_eq!(dev.slots, ["corrupt-anchor", "good-fw"]);
+
+        // And if something else strands otadata on the dead anchor — the
+        // recovery hatch, a half-finished bounce from an older build — the
+        // next boot with a trigger must still not write the slot it is on.
+        dev.sectors[1] = plan_switch(&dev.sectors[0], &dev.sectors[1], ANCHOR_SLOT, 2)
+            .entry
+            .to_bytes();
+        assert_eq!(dev.active(), ANCHOR_SLOT, "otadata now lies");
+        assert_eq!(dev.running_slot(), UPDATE_SLOT, "but we run from slot 1");
+
+        dev.trigger = Some("new-fw");
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::RunningSlotUnknown));
+        assert_eq!(
+            dev.slots[UPDATE_SLOT as usize], "good-fw",
+            "the running firmware must survive"
+        );
+        assert_eq!(dev.trigger, None);
     }
 
     #[test]

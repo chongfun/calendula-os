@@ -115,6 +115,22 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
     }
 }
 
+/// Adapts a flash partition to [`ota::ImageSource`], reading strictly forward
+/// from `offset`.
+struct FlashImage<'a, 'f> {
+    flash: &'a mut FlashStorage<'f>,
+    offset: u32,
+}
+
+impl ota::ImageSource for FlashImage<'_, '_> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ()> {
+        self.flash.read(self.offset, buf).map_err(|_| ())?;
+        // The walk is bounded by the partition size, which is far below u32::MAX.
+        self.offset += buf.len() as u32;
+        Ok(())
+    }
+}
+
 fn read_file_exact<
     D: BlockDevice,
     T: TimeSource,
@@ -257,9 +273,14 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     // mid-boot, so that case hands the job back to the anchor instead. The rule
     // is `ota::plan_update_action`; this is the I/O that answers it and carries
     // it out.
-    // Short-circuited: the anchor's contents only matter when we are running
-    // from the update slot, and probing it costs two flash reads.
-    let anchor_usable = active == UPDATE_SLOT && anchor_holds_our_firmware(&mut flash, &layout);
+    //
+    // Checked on every path, not just before a bounce: `active` is what
+    // `otadata` *requests*, and the bootloader falls forward to another slot
+    // when the requested one does not verify. The anchor's own validity is the
+    // only evidence available here that `otadata` is telling the truth, so it
+    // is worth the full read even when we are seemingly running from the
+    // anchor and about to take the ordinary write path.
+    let anchor_usable = anchor_holds_our_firmware(&mut flash, &layout);
     let action = ota::plan_update_action(active, anchor_usable);
     match action {
         UpdateAction::WriteUpdateSlot => {
@@ -278,19 +299,33 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
             "ota: slot {} holds no firmware that could apply this update; refusing to bounce",
             ANCHOR_SLOT
         ),
+        UpdateAction::RunningSlotUnknown => esp_println::println!(
+            "ota: otadata selects slot {0}, but slot {0} would not boot; \
+             this firmware is running from slot {1} and writing it would erase it. Refusing",
+            ANCHOR_SLOT,
+            UPDATE_SLOT
+        ),
     }
 
     Ok(Staged { action, layout })
 }
 
-/// Whether the anchor slot holds firmware that will consume the trigger file we
-/// are about to leave behind for it.
+/// Whether the anchor slot holds a complete, valid image of *our* firmware.
 ///
-/// A bare magic check is not enough: a mixed install can leave CrossPoint or the
-/// stock firmware in slot 0, and neither knows what the trigger file is. Nor is
-/// the product name enough — see [`crate::PROJECT_NAME`] for why the board and
-/// updater generation are part of the identity. The rule is
-/// [`ota::anchor_can_apply_update`]; this is the flash read that answers it.
+/// Three questions, cheapest first, and all three have to answer yes:
+///
+/// - **Magic.** Is there an image here at all?
+/// - **Identity.** Would it consume the trigger file we may leave behind for
+///   it? A mixed install can leave CrossPoint or the stock firmware in slot 0,
+///   and neither knows what the trigger file is; nor is the product name enough
+///   — see [`crate::PROJECT_NAME`] for why the board and updater generation are
+///   part of the identity. The rule is [`ota::anchor_can_apply_update`].
+/// - **Integrity.** Would the *bootloader* load it? A flash interrupted partway
+///   through writing slot 0 leaves the magic and descriptor intact and the tail
+///   missing, which passes both checks above. The answer decides more than
+///   whether to bounce: see [`ota::plan_update_action`] on why a firmware that
+///   cannot trust the anchor cannot trust `otadata` about which slot it is
+///   itself running from.
 fn anchor_holds_our_firmware(flash: &mut FlashStorage, layout: &ota::OtaLayout) -> bool {
     let anchor = layout.slots[ANCHOR_SLOT as usize];
 
@@ -314,6 +349,15 @@ fn anchor_holds_our_firmware(flash: &mut FlashStorage, layout: &ota::OtaLayout) 
             "ota: slot {} holds firmware of another identity; it could not apply this update",
             ANCHOR_SLOT
         );
+        return false;
+    }
+
+    let mut src = FlashImage {
+        flash,
+        offset: anchor.offset,
+    };
+    if let Err(e) = ota::validate_flash_image(&mut src, anchor.size as usize) {
+        esp_println::println!("ota: slot {} image is not loadable: {:?}", ANCHOR_SLOT, e);
         return false;
     }
     true
@@ -429,6 +473,12 @@ pub fn recover_to_slot0() -> bool {
     let active = ota::active_app_slot(&s0, &s1, OTA_COUNT);
     // Any bootable firmware will do in the anchor here — unlike the update
     // bounce, the point is to leave the misbehaving slot, not to hand off work.
+    // Deliberately magic-only, so a foreign-but-working anchor is still an
+    // escape. The cost is that a *corrupt* anchor passes and the bootloader
+    // then falls forward to the update slot, leaving `otadata` naming a slot we
+    // are not on — a wasted reboot rather than a hazard, because
+    // `ota::plan_update_action` treats an unbootable anchor as proof of exactly
+    // that and refuses to write.
     let mut head = [0u8; 4];
     let anchor_bootable = flash
         .read(layout.slots[ANCHOR_SLOT as usize].offset, &mut head)

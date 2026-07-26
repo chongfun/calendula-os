@@ -227,13 +227,26 @@ once you are *on* slot 0):
 - a build for the **other board**, which drives a different panel and looks for
   the other trigger filename (`FWUPDATE.BIN` vs `FWUPDX3.BIN`);
 - a build from an **older updater generation**, which may not recognise this
-  trigger at all.
+  trigger at all;
+- a **corrupt or half-written** image — an interrupted flash leaves slot 0's
+  first bytes intact and its tail missing, so the anchor is checked the same way
+  a staged update is: segment walk, checksum, and appended SHA-256.
 
 In any of those, the update is refused and slot 1 is left as it was. The trigger
 file is deleted on the way out — a refusal that left it in place would repeat on
 every boot — so it is no longer on the card. Copying it back would only refuse
 again for the same reason: the fix is to flash the image with a computer or the
 OEM updater, both of which write slot 0 and so restore a usable anchor.
+
+That last check does double duty, because `otadata` records which slot the
+bootloader was *asked* to boot, not which one it did. ESP-IDF verifies the
+selected image and, if it fails, quietly boots the other app partition instead —
+leaving `otadata` pointing at the slot it rejected. A firmware that trusted
+`otadata` could conclude it was running from slot 0, decide slot 1 was idle, and
+erase the very image it was executing, destroying the last bootable copy on the
+device. Because a slot only boots if its image verifies, an anchor that fails
+validation is proof that `otadata` is stale, and the update is refused rather
+than written.
 
 ### Backing out a bad update
 
