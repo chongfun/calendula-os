@@ -189,15 +189,41 @@ impl Framebuffer {
             let stride = ROW_BYTES;
 
             if white {
-                for _ in 0..len {
+                let mut i = 0;
+                while i + 4 <= len {
                     self.data[index] |= mask;
                     index = index.wrapping_add(stride);
+                    self.data[index] |= mask;
+                    index = index.wrapping_add(stride);
+                    self.data[index] |= mask;
+                    index = index.wrapping_add(stride);
+                    self.data[index] |= mask;
+                    index = index.wrapping_add(stride);
+                    i += 4;
+                }
+                while i < len {
+                    self.data[index] |= mask;
+                    index = index.wrapping_add(stride);
+                    i += 1;
                 }
             } else {
                 let not_mask = !mask;
-                for _ in 0..len {
+                let mut i = 0;
+                while i + 4 <= len {
                     self.data[index] &= not_mask;
                     index = index.wrapping_add(stride);
+                    self.data[index] &= not_mask;
+                    index = index.wrapping_add(stride);
+                    self.data[index] &= not_mask;
+                    index = index.wrapping_add(stride);
+                    self.data[index] &= not_mask;
+                    index = index.wrapping_add(stride);
+                    i += 4;
+                }
+                while i < len {
+                    self.data[index] &= not_mask;
+                    index = index.wrapping_add(stride);
+                    i += 1;
                 }
             }
             return;
@@ -304,15 +330,60 @@ impl Framebuffer {
             #[cfg(feature = "device-x3")]
             let stride = ROW_BYTES;
 
-            for i in start_i..end_i {
+            let not_mask = !mask;
+            let mut i = start_i;
+            while i + 4 <= end_i {
                 if bits[i / 8] & (0x80 >> (i & 7)) != 0 {
                     if white {
                         self.data[index] |= mask;
                     } else {
-                        self.data[index] &= !mask;
+                        self.data[index] &= not_mask;
                     }
                 }
                 index = index.wrapping_add(stride);
+
+                let i1 = i + 1;
+                if bits[i1 / 8] & (0x80 >> (i1 & 7)) != 0 {
+                    if white {
+                        self.data[index] |= mask;
+                    } else {
+                        self.data[index] &= not_mask;
+                    }
+                }
+                index = index.wrapping_add(stride);
+
+                let i2 = i + 2;
+                if bits[i2 / 8] & (0x80 >> (i2 & 7)) != 0 {
+                    if white {
+                        self.data[index] |= mask;
+                    } else {
+                        self.data[index] &= not_mask;
+                    }
+                }
+                index = index.wrapping_add(stride);
+
+                let i3 = i + 3;
+                if bits[i3 / 8] & (0x80 >> (i3 & 7)) != 0 {
+                    if white {
+                        self.data[index] |= mask;
+                    } else {
+                        self.data[index] &= not_mask;
+                    }
+                }
+                index = index.wrapping_add(stride);
+
+                i += 4;
+            }
+            while i < end_i {
+                if bits[i / 8] & (0x80 >> (i & 7)) != 0 {
+                    if white {
+                        self.data[index] |= mask;
+                    } else {
+                        self.data[index] &= not_mask;
+                    }
+                }
+                index = index.wrapping_add(stride);
+                i += 1;
             }
             return;
         }
