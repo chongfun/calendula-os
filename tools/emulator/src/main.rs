@@ -339,6 +339,14 @@ impl Emulator {
         self.render(app_core::RenderKind::Page);
     }
 
+    /// The request id of the per-book action currently in flight, if any.
+    pub fn outstanding_request(&self) -> Option<u32> {
+        match self.state.library_menu {
+            app_core::LibraryMenu::Busy { request_id, .. } => Some(request_id),
+            _ => None,
+        }
+    }
+
     pub fn set_hold_storage(&mut self, hold: bool) {
         self.hold_storage = hold;
     }

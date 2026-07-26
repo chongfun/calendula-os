@@ -35,6 +35,7 @@ struct Step {
     ip: Option<[u8; 4]>,
     error: Option<String>,
     ssid: Option<String>,
+    ok: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,7 +78,21 @@ impl Scenario {
                 emu.input(parse_button(button)?);
             }
             if let Some(library) = &step.library {
-                emu.library_event(parse_library_event(library, step)?);
+                // A settling event has to name the request it answers, and
+                // only the emulator knows which one is in flight; the rest
+                // parse from the step alone.
+                let event = if library.eq_ignore_ascii_case("CacheCleared") {
+                    let request_id = emu
+                        .outstanding_request()
+                        .ok_or("CacheCleared with no action in flight")?;
+                    LibraryEvent::CacheCleared {
+                        request_id,
+                        ok: step.ok.unwrap_or(true),
+                    }
+                } else {
+                    parse_library_event(library, step)?
+                };
+                emu.library_event(event);
             }
             if let Some(sync) = &step.sync {
                 emu.sync_event(parse_sync_event(sync, step)?);
