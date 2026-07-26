@@ -1230,6 +1230,100 @@ impl EvictionWalk {
     }
 }
 
+/// The one settling event that had nowhere to go, and the standing orders the
+/// display task owes it while it waits.
+///
+/// When [`EvictionWalk`] finds nothing it may honestly spend, the event is
+/// neither queued nor dropped — it is held here until the app drains a slot.
+/// That single occupied slot then constrains the whole task, because the way
+/// it empties is the app receiving from a channel the display task is not
+/// currently feeding:
+///
+/// - **Storage stands down.** Storage is where settling events come from, and
+///   there is one slot; applying another command could produce a second with
+///   nowhere to go.
+/// - **Sleep waits.** Sleep is terminal here — waking is a fresh boot — so
+///   going down with an event held would take it along and strand the wait it
+///   was going to settle.
+/// - **Library events stay in the display-event channel.** Moving one across
+///   to make room is only free while the holder can catch it; occupied, the
+///   move would arrive with nowhere to go.
+///
+/// Those are three readings of one rule, which is why they live together: they
+/// were three separate `if`s in the task before this type, and two of them had
+/// already drifted out of agreement by the time a reviewer noticed. The fourth
+/// rule is [`Self::hold`]'s own — it accepts only what it is for.
+///
+/// RAM: one `Option<LibraryEvent>` — 276 bytes, sized by the `Loaded`
+/// variant's chapter-page map. Sits in the firmware's `.bss`, not on a stack.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LibraryEventHolder {
+    held: Option<LibraryEvent>,
+}
+
+/// What [`LibraryEventHolder::hold`] did with the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldOutcome {
+    /// Taken. The caller's placing branch delivers it once there is room.
+    Held,
+    /// A refresh, which the next event or the next render makes good. It was
+    /// never the holder's to protect, and letting one in would close every
+    /// gate above on an event nothing is waiting for. Send it the lossy way.
+    NotSettling,
+    /// Occupied by an event that has been waiting longer. Every producer is
+    /// gated on the holder, so reaching here means one storage command
+    /// produced two settling events. The newcomer gets a last try at the
+    /// channel and is the loss if that fails — the older wait survives.
+    Occupied,
+}
+
+impl LibraryEventHolder {
+    pub const fn new() -> Self {
+        Self { held: None }
+    }
+
+    /// The event awaiting a slot, if any. Peeking, not taking: it stays held
+    /// until [`Self::placed`] says it actually landed, so a cancelled send
+    /// cannot lose it.
+    pub const fn pending(&self) -> Option<LibraryEvent> {
+        self.held
+    }
+
+    /// May the task apply another storage command?
+    pub const fn storage_may_run(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// May the task sleep, or keep draining storage on the way down?
+    pub const fn sleep_may_proceed(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// May a library event be moved out of the display-event channel to make
+    /// room there?
+    pub const fn library_event_may_move(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// Take responsibility for an event the library channel refused.
+    pub fn hold(&mut self, event: &LibraryEvent) -> HoldOutcome {
+        if !event.must_be_delivered() {
+            return HoldOutcome::NotSettling;
+        }
+        if self.held.is_some() {
+            return HoldOutcome::Occupied;
+        }
+        self.held = Some(*event);
+        HoldOutcome::Held
+    }
+
+    /// The held event reached the channel. Returns it so a caller can log
+    /// what it placed; the holder is empty either way.
+    pub fn placed(&mut self) -> Option<LibraryEvent> {
+        self.held.take()
+    }
+}
+
 impl LibraryEvent {
     /// Whether dropping this event would strand the app rather than cost it a
     /// repaint.
@@ -3371,9 +3465,11 @@ mod tests {
     /// of the visit — the work is done, so nothing sends it again. Every event
     /// that settles a wait the app is holding has to say so, or the firmware's
     /// sender routes it out the lossy path.
-    #[test]
-    fn events_that_settle_a_wait_are_not_droppable() {
-        for event in [
+    /// Every event that releases a lock the app took when it handed work over.
+    /// Listed once, so the routing test and the holder tests below cannot
+    /// disagree about which events are which.
+    fn settling_events() -> [LibraryEvent; 4] {
+        [
             LibraryEvent::CacheCleared {
                 request_id: 1,
                 ok: true,
@@ -3400,15 +3496,12 @@ mod tests {
                 font_family: 0,
                 front_buttons: 0,
             },
-        ] {
-            assert!(
-                event.must_be_delivered(),
-                "{event:?} releases a lock the app is holding"
-            );
-        }
-        // The rest are refreshes: the next event or the next render makes a
-        // dropped one good, so they may take the lossy path.
-        for event in [
+        ]
+    }
+
+    /// The rest: the next event or the next render makes a dropped one good.
+    fn refresh_events() -> [LibraryEvent; 4] {
+        [
             LibraryEvent::Scanned {
                 count: 4,
                 catalog_epoch: EPOCH,
@@ -3423,7 +3516,18 @@ mod tests {
                 book_id: 2,
                 current_chapter: 0,
             },
-        ] {
+        ]
+    }
+
+    #[test]
+    fn events_that_settle_a_wait_are_not_droppable() {
+        for event in settling_events() {
+            assert!(
+                event.must_be_delivered(),
+                "{event:?} releases a lock the app is holding"
+            );
+        }
+        for event in refresh_events() {
             assert!(!event.must_be_delivered(), "{event:?} is only a refresh");
         }
     }
@@ -3484,8 +3588,10 @@ mod tests {
         }
     }
 
-    /// The firmware's `send_required_library_event`, over the modelled ring.
-    fn send_required(queue: &mut Ring, event: LibraryEvent) {
+    /// The firmware's `send_required_library_event`, over the modelled ring:
+    /// try the channel, then the walk, then the holder — in that order, which
+    /// is the order the task uses.
+    fn send_required(queue: &mut Ring, holder: &mut LibraryEventHolder, event: LibraryEvent) {
         if queue.try_send(event) {
             return;
         }
@@ -3504,6 +3610,33 @@ mod tests {
                 }
             }
         }
+        if holder.hold(&event) != HoldOutcome::Held {
+            // The firmware's last try at a slot that may have freed since,
+            // and then the drop it reports.
+            queue.try_send(event);
+        }
+    }
+
+    /// The main loop's placing branch, which runs once the app has drained a
+    /// slot. Only ever called where the model has made room, matching the
+    /// firmware's `LIBRARY_EVENTS.send().await`.
+    fn place_held(queue: &mut Ring, holder: &mut LibraryEventHolder) {
+        let Some(event) = holder.pending() else {
+            return;
+        };
+        assert!(queue.try_send(event), "the placing branch waits for room");
+        assert_eq!(holder.placed(), Some(event));
+    }
+
+    /// The three questions the display task asks the holder, from three
+    /// unrelated places: the main loop's storage branch, the pre-sleep drain,
+    /// and the display-event sender.
+    fn gates(holder: &LibraryEventHolder) -> [bool; 3] {
+        [
+            holder.storage_may_run(),
+            holder.sleep_may_proceed(),
+            holder.library_event_may_move(),
+        ]
     }
 
     fn cleared(request_id: u32) -> LibraryEvent {
@@ -3539,7 +3672,7 @@ mod tests {
                 })),
             );
 
-        send_required(&mut queue, cleared(2));
+        send_required(&mut queue, &mut LibraryEventHolder::new(), cleared(2));
 
         assert!(
             queue.holds(cleared(1)),
@@ -3555,16 +3688,16 @@ mod tests {
     }
 
     /// Every slot already awaited: nothing may be spent, so the walk places
-    /// nothing and leaves the ring exactly as it found it. The newcomer stays
-    /// with the caller, which holds it and retries once the consumer has had
-    /// a turn — this asserts the ring is untouched, not that the event is
-    /// lost.
+    /// nothing and leaves the ring exactly as it found it. The newcomer is not
+    /// lost either — it goes to the holder, and reaches the app once the
+    /// consumer has drained a slot.
     #[test]
     fn a_channel_of_awaited_events_refuses_the_newcomer() {
         let before = filled((0..LIBRARY_EVENT_SLOTS as u32).map(cleared));
         let mut queue = before;
+        let mut holder = LibraryEventHolder::new();
 
-        send_required(&mut queue, cleared(99));
+        send_required(&mut queue, &mut holder, cleared(99));
 
         assert!(
             !queue.holds(cleared(99)),
@@ -3575,6 +3708,129 @@ mod tests {
             before.drained(),
             "a refused walk disturbs nothing, order included"
         );
+        assert_eq!(
+            holder.pending(),
+            Some(cleared(99)),
+            "the newcomer is held, not dropped"
+        );
+
+        // The app takes one, which is what the placing branch waits for.
+        queue.try_receive();
+        place_held(&mut queue, &mut holder);
+        assert!(queue.holds(cleared(99)), "the held event still arrives");
+        assert_eq!(
+            gates(&holder),
+            [true; 3],
+            "placing it lifts the standing orders"
+        );
+    }
+
+    /// The gates are one rule read from three unrelated places, and the
+    /// failure they prevent needs all three to agree. Two of them had already
+    /// drifted apart when they were three separate `if`s in the task, so
+    /// assert they move together.
+    #[test]
+    fn a_held_event_closes_every_gate_until_it_is_placed() {
+        let mut holder = LibraryEventHolder::new();
+        assert_eq!(
+            gates(&holder),
+            [true; 3],
+            "an empty holder constrains nothing"
+        );
+
+        assert_eq!(holder.hold(&cleared(1)), HoldOutcome::Held);
+        assert_eq!(
+            gates(&holder),
+            [false; 3],
+            "storage, sleep and the display-event sender all stand down together"
+        );
+
+        assert_eq!(holder.placed(), Some(cleared(1)));
+        assert_eq!(holder.pending(), None);
+        assert_eq!(gates(&holder), [true; 3]);
+    }
+
+    /// The holder protects settling events; a refresh taking it would shut
+    /// storage, sleep and the display-event sender down for an event nothing
+    /// is waiting on — and the display-event sender standing down is exactly
+    /// what strands the `Settled` that follows a `ChapterCursor`. One caller
+    /// really did route refreshes here, so the refusal belongs in the holder
+    /// rather than in each sender.
+    #[test]
+    fn only_a_settling_event_may_take_the_holder() {
+        for event in refresh_events() {
+            let mut holder = LibraryEventHolder::new();
+            assert_eq!(
+                holder.hold(&event),
+                HoldOutcome::NotSettling,
+                "{event:?} is a refresh and belongs on the lossy path"
+            );
+            assert_eq!(holder.pending(), None);
+            assert_eq!(gates(&holder), [true; 3], "{event:?} constrained the task");
+        }
+        for event in settling_events() {
+            let mut holder = LibraryEventHolder::new();
+            assert_eq!(holder.hold(&event), HoldOutcome::Held);
+            assert_eq!(holder.pending(), Some(event));
+        }
+    }
+
+    /// Two settling events out of one storage command is the only way to
+    /// reach an occupied holder, every producer being gated on it. The one
+    /// already waiting has waited longer and has the older wait behind it, so
+    /// it is the one that survives.
+    #[test]
+    fn an_occupied_holder_keeps_the_older_wait() {
+        let mut holder = LibraryEventHolder::new();
+        assert_eq!(holder.hold(&cleared(1)), HoldOutcome::Held);
+
+        assert_eq!(holder.hold(&cleared(2)), HoldOutcome::Occupied);
+
+        assert_eq!(
+            holder.pending(),
+            Some(cleared(1)),
+            "the newcomer must not displace the event already waiting"
+        );
+    }
+
+    /// End to end, at the worst moment the firmware can reach: the channel is
+    /// full of settling events and one more arrives. It must still be the
+    /// case that nothing awaited is lost.
+    #[test]
+    fn a_settling_event_survives_a_channel_with_nothing_to_spend() {
+        let mut queue = filled((0..LIBRARY_EVENT_SLOTS as u32).map(cleared));
+        let mut holder = LibraryEventHolder::new();
+
+        send_required(&mut queue, &mut holder, cleared(99));
+
+        let mut delivered = [None; LIBRARY_EVENT_SLOTS + 1];
+        let mut count = 0;
+        // The app drains the channel, which is what the placing branch is
+        // waiting for; then the branch runs and the held event goes in.
+        drain_ids_into(&mut queue, &mut delivered, &mut count);
+        place_held(&mut queue, &mut holder);
+        drain_ids_into(&mut queue, &mut delivered, &mut count);
+
+        let mut expected = [None; LIBRARY_EVENT_SLOTS + 1];
+        for (slot, id) in expected.iter_mut().zip(0..LIBRARY_EVENT_SLOTS as u32) {
+            *slot = Some(id);
+        }
+        expected[LIBRARY_EVENT_SLOTS] = Some(99);
+        assert_eq!(
+            delivered, expected,
+            "every settling event reaches the app, oldest first"
+        );
+    }
+
+    /// Empties `queue`, appending the request id of every `CacheCleared` it
+    /// yields — the order the app would see them in.
+    fn drain_ids_into(queue: &mut Ring, out: &mut [Option<u32>], next: &mut usize) {
+        while let Some(event) = queue.try_receive() {
+            if let LibraryEvent::CacheCleared { request_id, .. } = event {
+                out[*next] = Some(request_id);
+                *next += 1;
+            }
+        }
     }
 
     #[test]

@@ -15,8 +15,9 @@ use app_core::storage_loop::{
 };
 use app_core::{
     book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
-    DisplayOrientation, EvictionStep, EvictionWalk, PersistedAppState, ReaderSource,
-    RefreshPlanner, RenderKind, RenderRequest, SyncSession, SyncStatus,
+    DisplayOrientation, EvictionStep, EvictionWalk, HoldOutcome, LibraryEventHolder,
+    PersistedAppState, ReaderSource, RefreshPlanner, RenderKind, RenderRequest, SyncSession,
+    SyncStatus,
 };
 use core::cell::Cell;
 use core::sync::atomic::Ordering;
@@ -337,9 +338,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // sleep can arrive with one already waiting, or the first
                 // command drained can produce it. Carrying on past that point
                 // is how a second completion would reach an occupied holder.
-                let mut held_during_drain = held_library_event_pending();
+                let mut may_keep_draining = holder().sleep_may_proceed();
                 let refusal = loop {
-                    if held_during_drain {
+                    if !may_keep_draining {
                         break None;
                     }
                     match sleep.next() {
@@ -361,7 +362,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                                         &mut state_restored,
                                     );
                                     sleep.applied();
-                                    held_during_drain = held_library_event_pending();
+                                    may_keep_draining = holder().sleep_may_proceed();
                                 }
                                 Drained::RequeueAndRefuse => {
                                     // This send cannot fail today: nothing
@@ -399,7 +400,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // `Busy`. Stay awake instead; the loop's placing branch runs
                 // the moment this returns, the rest of the queue is still
                 // there to drain, and the power task re-requests sleep after.
-                let sleep_holds_an_event = refusal.is_none() && held_library_event_pending();
+                let sleep_holds_an_event = refusal.is_none() && !holder().sleep_may_proceed();
                 if sleep_holds_an_event {
                     esp_println::println!("display: sleep deferred; library event still held");
                 }
@@ -612,14 +613,14 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
 /// against the display queue is what breaks that: servicing the render
 /// releases the app task, which returns to its own select and drains.
 async fn place_held_library_event() {
-    let Some(event) = peek_held_library_event() else {
+    let Some(event) = holder().pending() else {
         return core::future::pending::<()>().await;
     };
     LIBRARY_EVENTS.send(event).await;
     // Nothing awaits between the send completing and this, so the holder
     // cannot be observed empty with the event still unsent, or cleared for a
     // send that a cancellation abandoned.
-    let _ = take_held_library_event();
+    let _ = with_holder(LibraryEventHolder::placed);
 }
 
 /// The next storage command, but only while nothing is held.
@@ -629,7 +630,7 @@ async fn place_held_library_event() {
 /// nowhere to go. Pending forever until the holder clears, which the loop's
 /// other branches are free to do meanwhile.
 async fn storage_command_while_free() -> StorageCommand {
-    if held_library_event_pending() {
+    if !holder().storage_may_run() {
         return core::future::pending::<StorageCommand>().await;
     }
     STORAGE_COMMANDS.receive().await
@@ -1342,59 +1343,45 @@ fn send_required_library_event(event: &LibraryEvent) {
     hold_library_event(event);
 }
 
-/// The one settling event that had nowhere to go, waiting for room.
-///
-/// One slot is enough: the holder is emptied after every storage command, and
-/// the app task drains the channel between them, so a second event can only
-/// arrive after the first has been placed. A second one landing on an
-/// occupied holder means the consumer has stopped, which the drop reports.
-///
-/// RAM: one `Option<LibraryEvent>` in .bss — 276 bytes, sized by the
-/// `Loaded` variant's chapter-page map.
-static HELD_LIBRARY_EVENT: Mutex<CriticalSectionRawMutex, Cell<Option<LibraryEvent>>> =
-    Mutex::new(Cell::new(None));
+/// The settling event with nowhere to go, and the gates it closes while it
+/// waits. [`LibraryEventHolder`] owns both, and is host-tested; this task
+/// asks it rather than re-deciding at each of the four sites that must agree.
+static HELD_LIBRARY_EVENT: Mutex<CriticalSectionRawMutex, Cell<LibraryEventHolder>> =
+    Mutex::new(Cell::new(LibraryEventHolder::new()));
 
-/// Keeps `event` until the channel has room, if the holder is free.
+/// Reads the holder. `Copy`, so this is a snapshot — fine for the gates,
+/// which only ever narrow: nothing but this task fills the holder, and the
+/// one thing that empties it is this task's own placing branch.
+fn holder() -> LibraryEventHolder {
+    HELD_LIBRARY_EVENT.lock(Cell::get)
+}
+
+fn with_holder<T>(update: impl FnOnce(&mut LibraryEventHolder) -> T) -> T {
+    HELD_LIBRARY_EVENT.lock(|cell| {
+        let mut holder = cell.get();
+        let outcome = update(&mut holder);
+        cell.set(holder);
+        outcome
+    })
+}
+
+/// Keeps `event` until the channel has room, or says why it could not.
 ///
-/// An occupied holder is never displaced: the event already in it has been
-/// waiting longer, and every producer is gated on the holder being free, so
-/// arriving here to find it taken means two required events came out of a
-/// single storage command. One last try for a slot that may have freed since,
-/// and then the newcomer is the loss — reported, and the older wait survives.
+/// Both refusals end the same way — one last try for a slot that may have
+/// freed since, and the drop reported if it has not. They are reported apart
+/// because they mean different things about the code above: `NotSettling` is
+/// a caller that routed a refresh here, `Occupied` is two settling events out
+/// of one storage command.
 fn hold_library_event(event: &LibraryEvent) {
-    let took_the_slot = HELD_LIBRARY_EVENT.lock(|held| {
-        let occupied = held.take();
-        let free = occupied.is_none();
-        held.set(if free { Some(*event) } else { occupied });
-        free
-    });
-    if !took_the_slot && LIBRARY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!(
-            "display: library event holder occupied, dropped {:?}",
-            event
-        );
+    let outcome = with_holder(|holder| holder.hold(event));
+    let refusal = match outcome {
+        HoldOutcome::Held => return,
+        HoldOutcome::NotSettling => "refresh routed to the holder",
+        HoldOutcome::Occupied => "holder occupied",
+    };
+    if LIBRARY_EVENTS.try_send(*event).is_err() {
+        esp_println::println!("display: {}, dropped {:?}", refusal, event);
     }
-}
-
-fn peek_held_library_event() -> Option<LibraryEvent> {
-    HELD_LIBRARY_EVENT.lock(|held| {
-        let event = held.take();
-        held.set(event);
-        event
-    })
-}
-
-fn held_library_event_pending() -> bool {
-    HELD_LIBRARY_EVENT.lock(|held| {
-        let event = held.take();
-        let pending = event.is_some();
-        held.set(event);
-        pending
-    })
-}
-
-fn take_held_library_event() -> Option<LibraryEvent> {
-    HELD_LIBRARY_EVENT.lock(|held| held.take())
 }
 
 /// Prefers the display channel so the event keeps its order against the render
@@ -1451,7 +1438,7 @@ fn send_required_display_event(event: &DisplayEvent) {
         // The library event is on a path to the app either way — this channel
         // is one the app drains — so the honest thing is to leave it where it
         // is and let this send be the one that fails.
-        if held_library_event_pending() {
+        if !holder().library_event_may_move() {
             break;
         }
         if let Ok(DisplayEvent::Library(library_event)) = DISPLAY_EVENTS.try_receive() {
