@@ -230,6 +230,10 @@ pub struct Emulator {
     _sd_root: Option<PathBuf>,
     library_entries: Vec<String>,
     last_storage: Option<StorageCommand>,
+    /// Scenario-driven: leave picked per-book actions unsettled so `Busy`
+    /// reaches a frame. Off for interactive use, where a clear that never
+    /// answered would freeze the list for good.
+    hold_storage: bool,
     sd_reader_status: EmulatedReaderStatus,
 }
 
@@ -254,6 +258,7 @@ impl Emulator {
             _sd_root: sd_root,
             library_entries: Vec::new(),
             last_storage: None,
+            hold_storage: false,
             sd_reader_status: EmulatedReaderStatus::Empty,
         };
         emu.panel.init_sequence().expect("panel init");
@@ -302,12 +307,16 @@ impl Emulator {
         {
             self.last_storage = Some(command);
             // The emulated card has no real cache; the clear settles
-            // instantly and always succeeds.
+            // instantly and always succeeds — unless a scenario is holding
+            // storage, which is the only way `Busy` survives long enough to
+            // be drawn.
             if let StorageCommand::ClearBookCache { request_id, .. } = command {
-                self.library_event(LibraryEvent::CacheCleared {
-                    request_id,
-                    ok: true,
-                });
+                if !self.hold_storage {
+                    self.library_event(LibraryEvent::CacheCleared {
+                        request_id,
+                        ok: true,
+                    });
+                }
             }
         }
     }
@@ -328,6 +337,10 @@ impl Emulator {
     pub fn sync_event(&mut self, event: app_core::SyncEvent) {
         self.state = self.state.apply_sync_event(event);
         self.render(app_core::RenderKind::Page);
+    }
+
+    pub fn set_hold_storage(&mut self, hold: bool) {
+        self.hold_storage = hold;
     }
 
     pub fn state(&self) -> app_core::ReaderState {

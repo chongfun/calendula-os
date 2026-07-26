@@ -355,16 +355,28 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     let layout = shell_layout(shell);
     // While the actions sheet is up, the rail answers only it: no label
     // may promise an action the press will not take.
-    if matches!(shell.library_menu, app_core::LibraryMenu::Sheet { .. }) {
-        dash_key(fb, layout, 0, "cancel", false);
-        dash_key(fb, layout, 1, "select", true);
-        dash_key(fb, layout, 2, "previous", false);
-        dash_key(fb, layout, 3, "next", false);
-    } else {
-        dash_key(fb, layout, 0, "home", false);
-        dash_key(fb, layout, 1, "open", true);
-        dash_key(fb, layout, 2, "previous", false);
-        dash_key(fb, layout, 3, "next", false);
+    match shell.library_menu {
+        app_core::LibraryMenu::Sheet { .. } => {
+            dash_key(fb, layout, 0, "cancel", false);
+            dash_key(fb, layout, 1, "select", true);
+            dash_key(fb, layout, 2, "previous", false);
+            dash_key(fb, layout, 3, "next", false);
+        }
+        // A picked action freezes the list until it settles, and the reducer
+        // swallows every press but Back. Three of the four labels would be
+        // promising exactly what will not happen, so only the one that works
+        // is drawn; the rest of the rail stays bare for the moment it takes.
+        app_core::LibraryMenu::Busy { .. } => {
+            dash_key(fb, layout, 0, "home", false);
+        }
+        // A settled note is dismissed by any press, and that press still
+        // acts, so the ordinary rail is honest again.
+        app_core::LibraryMenu::Done { .. } | app_core::LibraryMenu::None => {
+            dash_key(fb, layout, 0, "home", false);
+            dash_key(fb, layout, 1, "open", true);
+            dash_key(fb, layout, 2, "previous", false);
+            dash_key(fb, layout, 3, "next", false);
+        }
     }
     heading(fb, layout, "Library");
 

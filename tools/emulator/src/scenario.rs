@@ -13,6 +13,12 @@ pub struct Scenario {
     steps: Vec<Step>,
     #[serde(default)]
     expect: Expect,
+    /// Leave picked per-book actions in flight instead of settling them the
+    /// moment they are issued. The emulated card has no cache to delete, so
+    /// a clear normally answers itself instantly and `Busy` never reaches a
+    /// frame — which is exactly the state whose key rail differs.
+    #[serde(default)]
+    hold_storage: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +71,7 @@ impl Scenario {
     }
 
     pub fn run(&self, emu: &mut Emulator) -> Result<(), String> {
+        emu.set_hold_storage(self.hold_storage);
         for step in &self.steps {
             if let Some(button) = &step.button {
                 emu.input(parse_button(button)?);
