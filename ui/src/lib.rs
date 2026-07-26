@@ -1,8 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub use app_core::LibraryMenu;
 use app_core::PortalPsk;
-pub use app_core::{LibraryAction, LibraryMenu};
 
 pub mod app_render;
 pub mod custom_font;
@@ -135,8 +135,9 @@ pub struct UiShell<'a> {
     /// the network on the Wireless screen's idle and forget states.
     pub wifi_ssid: &'a str,
     /// The Library per-book actions sheet's progress on the selected row:
-    /// the sheet overlays the list, an armed action swaps the key rail and
-    /// asks in the footer, and the settled states show their note there.
+    /// the sheet overlays the list and takes the key rail; a picked action
+    /// executes on that press, and the waiting and settled states show in
+    /// the footer where the position line normally sits.
     pub library_menu: app_core::LibraryMenu,
 }
 

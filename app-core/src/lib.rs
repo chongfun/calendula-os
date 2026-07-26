@@ -1573,10 +1573,11 @@ impl ReaderState {
             next.library_menu = LibraryMenu::None;
         }
 
-        // The Library actions sheet and its armed question run their own
-        // grammar: while either is up, no press may fall through to move
-        // the cursor or open a book — the same press must never both
-        // answer the sheet and act on the list beneath it.
+        // The Library actions sheet and the wait that follows a pick run
+        // their own grammar: while either is up, no press may fall through
+        // to move the cursor or open a book — the same press must never
+        // both answer the sheet and act on the list beneath it, and none
+        // may disturb a row the storage task is working on.
         if self.view == AppView::Library {
             if let LibraryMenu::Sheet { row } = self.library_menu {
                 match button {
