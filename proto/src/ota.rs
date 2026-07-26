@@ -699,11 +699,6 @@ pub fn project_name(field: &[u8; APP_DESC_PROJECT_NAME_LEN]) -> &[u8] {
 const IDENTITY_PREFIX: &[u8] = b"CalendulaOS ";
 const IDENTITY_SUFFIX: &[u8] = b" (MarigoldOS)";
 
-/// The first updater generation that treats slot 0 as an anchor. Anything
-/// older — `u0`, or the product-only name that predates the marker — alternates
-/// slots, so installing one would destroy the anchor on its next update.
-pub const MIN_UPDATER_GENERATION: u32 = 1;
-
 /// Split an identity into its board and updater generation, or `None` if it is
 /// not one of ours at all.
 pub fn parse_identity(name: &[u8]) -> Option<(&[u8], u32)> {
@@ -730,25 +725,20 @@ pub fn parse_identity(name: &[u8]) -> Option<(&[u8], u32)> {
 /// the panel and the updater hand-off, so an image that merely parses as an
 /// ESP32-C3 binary can still be the wrong thing entirely: a build for the other
 /// board drives the wrong panel, a pre-anchor build alternates slots and
-/// overwrites slot 0 on its next update, and a candidate from a different
-/// updater generation cannot be serviced by our immutable slot-0 anchor on
+/// overwrites slot 0 on its next update, and an image with a different or
+/// non-canonical identity cannot be serviced by our immutable slot-0 anchor on
 /// subsequent updates.
 ///
-/// For the current protocol, the candidate must match the running firmware's
-/// board and updater generation: the anchor in slot 0 must be capable of
-/// applying future updates for the installed firmware.
+/// For the current protocol, an in-app update must match the running firmware's
+/// descriptor identity exactly (`project_name(candidate) == running_identity`),
+/// ensuring the permanent slot-0 anchor remains capable of servicing future
+/// updates. Moving to a new updater generation requires replacing or
+/// re-establishing the slot-0 anchor via the computer/OEM installation path.
 pub fn staged_image_is_installable(
     candidate: &[u8; APP_DESC_PROJECT_NAME_LEN],
     running_identity: &[u8],
 ) -> bool {
-    let Some((candidate_board, candidate_generation)) = parse_identity(project_name(candidate))
-    else {
-        return false;
-    };
-    let Some((our_board, our_generation)) = parse_identity(running_identity) else {
-        return false;
-    };
-    candidate_board == our_board && candidate_generation == our_generation
+    project_name(candidate) == running_identity
 }
 
 pub fn anchor_can_apply_update(
@@ -2139,6 +2129,26 @@ mod tests {
             &descriptor_field(b"CalendulaOS X4 u17 (MarigoldOS)"),
             X4
         ));
+    }
+
+    /// Regression test for [P1]: An identity alias like `u01` with leading zeros
+    /// parses to generation 1 but does not byte-match the canonical `u1` identity.
+    /// It must be rejected by `staged_image_is_installable` to prevent a one-way
+    /// upgrade where slot 1 running `u01` fails anchor validation on future updates.
+    #[test]
+    fn u01_generation_alias_is_rejected_and_canonical_u1_is_accepted() {
+        let alias_u01 = descriptor_field(b"CalendulaOS X4 u01 (MarigoldOS)");
+        let canonical_u1 = descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)");
+        let running_identity = X4; // "CalendulaOS X4 u1 (MarigoldOS)"
+
+        assert!(
+            !staged_image_is_installable(&alias_u01, running_identity),
+            "u01 alias must be rejected"
+        );
+        assert!(
+            staged_image_is_installable(&canonical_u1, running_identity),
+            "canonical u1 candidate must be accepted"
+        );
     }
 
     /// Lifecycle test: A u1 anchor attempting to install a u2 candidate must
