@@ -42,18 +42,33 @@ BYTES=$(stat -f%z "$FW" 2>/dev/null || stat -c%s "$FW")
 SIZE=$(awk "BEGIN{printf \"%.1f\", $BYTES/1048576}")
 echo "==> firmware.bin is $BYTES bytes (~$SIZE MB)"
 
-echo "==> verifying descriptor stamps in the built ELF"
+echo "==> verifying descriptor stamps in the built firmware"
 # No `grep -q` here: with pipefail it SIGPIPEs `strings` on early exit and
 # fails the pipeline even when the stamp is present.
 ELF=target/riscv32imc-unknown-none-elf/release/fw
 strings "$ELF" | grep -Fx "$VER" >/dev/null || {
   echo "error: version stamp '$VER' not found in $ELF" >&2; exit 1; }
-# The descriptor identity is per-board (proto::ota::IDENTITY_X4/X3) because the
-# updater refuses to bounce into an anchor built for the other panel. This is the
-# X4 ELF, so require the X4 identity specifically -- a stray X3 build here would
-# otherwise pass a product-name-only check.
-strings "$ELF" | grep -F "CalendulaOS X4" >/dev/null || {
-  echo "error: X4 project_name stamp missing from $ELF" >&2; exit 1; }
+
+# The firmware identity gates the OTA bounce (see fw::ota_update): an anchor
+# whose descriptor differs in board *or* updater generation is refused, so a
+# release has to carry the exact current identity — a matching product, or even
+# a matching board prefix, is not enough. Read the expected value from its one
+# definition rather than restating it here; a copy in this script would be free
+# to drift from the string the firmware stamps and the updater compares.
+IDENTITY_SRC=proto/src/ota.rs
+EXPECTED_ID=$(sed -n 's/^pub const IDENTITY_X4: &str = "\(.*\)";$/\1/p' "$IDENTITY_SRC")
+[[ -n "$EXPECTED_ID" ]] || {
+  echo "error: could not read IDENTITY_X4 from $IDENTITY_SRC" >&2; exit 1; }
+
+# Compare the descriptor field the updater actually reads — project_name, the
+# 32 bytes at image offset 0x50 — instead of trusting that some matching string
+# exists somewhere in the ELF. Exact match, so a stale build, a stray X3 build
+# left in the shared target directory, or an older updater generation each fail
+# here rather than shipping.
+ACTUAL_ID=$(dd if="$FW" bs=1 skip=80 count=32 2>/dev/null | tr -d '\000')
+[[ "$ACTUAL_ID" == "$EXPECTED_ID" ]] || {
+  echo "error: $FW carries project_name '$ACTUAL_ID', expected '$EXPECTED_ID'" >&2; exit 1; }
+echo "==> descriptor identity: $ACTUAL_ID"
 
 echo "==> web/index.html labels -> v$VER, ~$SIZE MB"
 export SIZE
