@@ -1041,12 +1041,37 @@ impl PortalPsk {
     }
 }
 
+/// The reader's true chapter for the page just shown.
+///
+/// The reducer's page map is capped at [`MAX_SD_CHAPTERS`], so past that cap
+/// its own idea of the chapter goes stale; only the loaded SD reader has the
+/// uncapped map. The display task reads the real one off the page it just
+/// rendered and sends it back with the acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChapterCursor {
+    pub book_id: u32,
+    pub current_chapter: u16,
+}
+
 // Bounded Copy messages by design: chapter_pages rides inside the event
 // because firmware has no heap to box large variants into.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayEvent {
-    Settled,
+    /// The frame reached the panel and the render cycle is over.
+    ///
+    /// Carries the chapter correction for the page just shown, when there is
+    /// one. It rides here rather than travelling as its own event because the
+    /// app must apply it *before* it clears the render lock — clearing the
+    /// lock is what lets the next navigation read `chapter` — and no pair of
+    /// separate messages can promise that. They were separate once: the
+    /// correction went down whichever channel had room, and the two could be
+    /// split across channels the app selects on independently, or the
+    /// correction dropped outright while the acknowledgement survived. One
+    /// message cannot arrive in the wrong order or half-arrive.
+    Settled {
+        chapter_cursor: Option<ChapterCursor>,
+    },
     /// The panel completed a sleep transition. Informational for the app:
     /// like `SleepFailed`, it does not end a render cycle, and the sleep's
     /// handshake may already have been abandoned with render/open work
@@ -1118,14 +1143,6 @@ pub enum LibraryEvent {
         book_id: u32,
         chapter: u16,
         page: u32,
-    },
-    /// The firmware re-resolved the current chapter for the page just rendered,
-    /// over the whole-book (uncapped) map. Sent on reading renders so the cursor
-    /// keeps tracking past `MAX_SD_CHAPTERS` between section loads, where the
-    /// reducer's own `sd_chapter_for_page` saturates.
-    ChapterCursor {
-        book_id: u32,
-        current_chapter: u16,
     },
     CustomFont {
         available: bool,
@@ -1237,16 +1254,12 @@ pub const DISPLAY_EVENT_SLOTS: usize = 8;
 /// The render acknowledgement that had nowhere to go, waiting for room.
 ///
 /// The display-event channel used to be made room in by walking it, the way
-/// [`EvictionWalk`] walks the library channel. That cannot work here. A sender
-/// cannot look into a channel, so a walk has to take the head off to see it,
-/// and anything it may not spend has to go back — at the tail, behind
-/// everything it has not inspected yet. On the library channel that reordering
-/// is affordable; on this one it is not, because this channel is where
-/// `ChapterCursor` is queued *specifically* to arrive ahead of the `Settled`
-/// that follows it, and a walk can put those two the wrong way round. Nor is
-/// there anything here worth spending: the informational events are sent
-/// lossily and never queue behind an acknowledgement for long, and everything
-/// else is an acknowledgement the app is waiting on.
+/// [`EvictionWalk`] walks the library channel. There is nothing here worth
+/// spending: the informational events take the lossy path, and everything
+/// else is either an acknowledgement the app is waiting on or a library event
+/// carrying its own rule. A walk would also have to put back what it may not
+/// spend, at the tail, behind everything it has not inspected — and this queue
+/// is the one the app reads its render acknowledgements from in order.
 ///
 /// So the queue is left alone and the acknowledgement waits instead, placed by
 /// a branch of the display task's select once the app drains a slot — the same
@@ -1325,7 +1338,7 @@ impl DisplayEvent {
     /// settles a wait is protected whichever channel it is travelling on.
     pub const fn must_be_delivered(&self) -> bool {
         match self {
-            Self::Settled | Self::RefreshFailed => true,
+            Self::Settled { .. } | Self::RefreshFailed => true,
             Self::Asleep | Self::SleepFailed => false,
             Self::Library(event) => event.must_be_delivered(),
         }
@@ -1596,10 +1609,18 @@ pub enum PowerEvent {
 /// Keep the display and power acknowledgements for a panel refresh paired.
 /// A failed transfer must never advance the app render queue or authorize a
 /// later power transition as though the panel had settled.
-pub const fn display_refresh_outcome(success: bool) -> (DisplayEvent, PowerEvent) {
+pub const fn display_refresh_outcome(
+    success: bool,
+    chapter_cursor: Option<ChapterCursor>,
+) -> (DisplayEvent, PowerEvent) {
     if success {
-        (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+        (
+            DisplayEvent::Settled { chapter_cursor },
+            PowerEvent::DisplaySettled,
+        )
     } else {
+        // A frame that never landed corrects nothing: the cursor is read from
+        // the page that was shown.
         (
             DisplayEvent::RefreshFailed,
             PowerEvent::DisplayRefreshFailed,
@@ -2041,6 +2062,23 @@ impl ReaderState {
         next
     }
 
+    /// Adopt the firmware's uncapped chapter for the page just shown.
+    ///
+    /// Silent: the Reading view shows page-within-chapter, not the chapter
+    /// itself, so no repaint is owed — Home, the sleep screen, Chapters and
+    /// the persisted position pick the corrected value up when next used.
+    /// That is also why it can ride with the acknowledgement instead of
+    /// forcing a render of its own.
+    ///
+    /// Applied before the render lock is cleared, since clearing it is what
+    /// lets the next navigation read [`Self::chapter`].
+    pub fn apply_chapter_cursor(mut self, cursor: ChapterCursor) -> Self {
+        if self.book_id == cursor.book_id {
+            self.chapter = cursor.current_chapter;
+        }
+        self
+    }
+
     pub fn apply_library_event(mut self, ctx: ReducerContext, event: LibraryEvent) -> Self {
         match event {
             LibraryEvent::Scanned {
@@ -2125,18 +2163,6 @@ impl ReaderState {
                         *slot = page.min(u16::MAX as u32) as u16;
                     }
                     self.dirty = Rect::FULL;
-                }
-            }
-            LibraryEvent::ChapterCursor {
-                book_id,
-                current_chapter,
-            } => {
-                if self.book_id == book_id {
-                    // Adopt the firmware's uncapped chapter silently. The Reading
-                    // view shows page-within-chapter, not the chapter itself, so no
-                    // repaint is needed -- Home/sleep/Chapters and the persisted
-                    // position pick up the corrected value when next used.
-                    self.chapter = current_chapter;
                 }
             }
             LibraryEvent::CustomFont { available } => {
@@ -3602,7 +3628,7 @@ mod tests {
     }
 
     /// The rest: the next event or the next render makes a dropped one good.
-    fn refresh_events() -> [LibraryEvent; 4] {
+    fn refresh_events() -> [LibraryEvent; 3] {
         [
             LibraryEvent::Scanned {
                 count: 4,
@@ -3613,10 +3639,6 @@ mod tests {
                 book_id: 2,
                 chapter: 0,
                 page: 0,
-            },
-            LibraryEvent::ChapterCursor {
-                book_id: 2,
-                current_chapter: 0,
             },
         ]
     }
@@ -3788,6 +3810,13 @@ mod tests {
         ]
     }
 
+    /// A plain acknowledgement with no chapter correction riding along.
+    fn settled() -> DisplayEvent {
+        DisplayEvent::Settled {
+            chapter_cursor: None,
+        }
+    }
+
     fn cleared(request_id: u32) -> LibraryEvent {
         LibraryEvent::CacheCleared {
             request_id,
@@ -3874,25 +3903,95 @@ mod tests {
         );
     }
 
-    /// The channel is never made room in, so a queue full of anything at all
-    /// leaves the acknowledgement waiting rather than rearranging what is
-    /// already queued. Every event in this list stays exactly where it was,
-    /// including the `ChapterCursor` whose whole reason for being on this
-    /// channel is to arrive ahead of the `Settled` behind it.
+    /// The correction used to travel as its own event down whichever channel
+    /// had room. It could arrive after the acknowledgement it was supposed to
+    /// precede -- the app selects the two channels independently -- or be
+    /// dropped as a refresh while the acknowledgement it belonged to survived.
+    /// Riding inside `Settled` makes both unrepresentable: one message cannot
+    /// arrive in the wrong order or half-arrive, and the acknowledgement's own
+    /// protection now covers the correction.
+    #[test]
+    fn the_chapter_correction_rides_with_the_acknowledgement() {
+        let cursor = ChapterCursor {
+            book_id: 2,
+            current_chapter: 900,
+        };
+
+        let (event, power) = display_refresh_outcome(true, Some(cursor));
+
+        assert_eq!(
+            event,
+            DisplayEvent::Settled {
+                chapter_cursor: Some(cursor)
+            }
+        );
+        assert_eq!(power, PowerEvent::DisplaySettled);
+        assert!(
+            event.must_be_delivered(),
+            "a carried correction is protected exactly as its acknowledgement is"
+        );
+        let mut holder = DisplayEventHolder::new();
+        assert_eq!(holder.hold(&event), DisplayHoldOutcome::Held);
+        assert_eq!(
+            holder.pending(),
+            Some(event),
+            "it waits for room with its correction intact"
+        );
+
+        // A frame that never reached the panel corrects nothing: the cursor is
+        // read off the page that was shown.
+        assert_eq!(
+            display_refresh_outcome(false, Some(cursor)).0,
+            DisplayEvent::RefreshFailed
+        );
+    }
+
+    /// Past `MAX_SD_CHAPTERS` the reducer's own page map saturates, which is
+    /// what the correction is for. It names its book, because an
+    /// acknowledgement can outlive the book it was rendered for.
+    #[test]
+    fn the_chapter_correction_applies_only_to_the_book_still_open() {
+        let state = ReaderState::boot();
+        let book_id = state.book_id;
+
+        let corrected = state.apply_chapter_cursor(ChapterCursor {
+            book_id,
+            current_chapter: 900,
+        });
+
+        assert_eq!(
+            corrected.chapter, 900,
+            "the uncapped chapter is adopted past the reducer's own map"
+        );
+        assert_eq!(
+            corrected.dirty, state.dirty,
+            "Reading shows page-within-chapter, so the correction owes no repaint"
+        );
+
+        let elsewhere = corrected.apply_chapter_cursor(ChapterCursor {
+            book_id: book_id.wrapping_add(1),
+            current_chapter: 5,
+        });
+
+        assert_eq!(
+            elsewhere.chapter, 900,
+            "a correction for another book is not this book's"
+        );
+    }
+
+    /// The channel is never made room in: a full queue leaves the
+    /// acknowledgement waiting rather than rearranging what is already
+    /// queued, so every event in this list stays exactly where it was.
     #[test]
     fn a_full_queue_holds_the_acknowledgement_and_keeps_its_order() {
-        let cursor = LibraryEvent::ChapterCursor {
-            book_id: 2,
-            current_chapter: 4,
-        };
         let before = display_filled([
-            DisplayEvent::Settled,
+            settled(),
             DisplayEvent::Asleep,
-            DisplayEvent::Library(cursor),
-            DisplayEvent::Settled,
+            DisplayEvent::Library(cleared(3)),
+            settled(),
             DisplayEvent::Library(cleared(7)),
             DisplayEvent::SleepFailed,
-            DisplayEvent::Settled,
+            settled(),
             DisplayEvent::Asleep,
         ]);
         let mut queue = before;
@@ -3926,7 +4025,7 @@ mod tests {
     /// holder that the event ending the app's render cycle needs.
     #[test]
     fn only_a_render_acknowledgement_may_take_the_holder() {
-        for event in [DisplayEvent::Settled, DisplayEvent::RefreshFailed] {
+        for event in [settled(), DisplayEvent::RefreshFailed] {
             let mut holder = DisplayEventHolder::new();
             assert!(event.must_be_delivered(), "{event:?} ends the render cycle");
             assert_eq!(holder.hold(&event), DisplayHoldOutcome::Held);
@@ -3962,17 +4061,14 @@ mod tests {
     #[test]
     fn an_occupied_acknowledgement_holder_keeps_the_older_one() {
         let mut holder = DisplayEventHolder::new();
-        assert_eq!(
-            holder.hold(&DisplayEvent::Settled),
-            DisplayHoldOutcome::Held
-        );
+        assert_eq!(holder.hold(&settled()), DisplayHoldOutcome::Held);
 
         assert_eq!(
             holder.hold(&DisplayEvent::RefreshFailed),
             DisplayHoldOutcome::Occupied
         );
 
-        assert_eq!(holder.pending(), Some(DisplayEvent::Settled));
+        assert_eq!(holder.pending(), Some(settled()));
     }
 
     /// The gates are one rule read from three unrelated places, and the
@@ -4003,9 +4099,9 @@ mod tests {
     /// The holder protects settling events; a refresh taking it would shut
     /// storage, sleep and the display-event sender down for an event nothing
     /// is waiting on — and the display-event sender standing down is exactly
-    /// what strands the `Settled` that follows a `ChapterCursor`. One caller
-    /// really did route refreshes here, so the refusal belongs in the holder
-    /// rather than in each sender.
+    /// what strands the acknowledgement behind it. One caller really did route
+    /// refreshes here, so the refusal belongs in the holder rather than in
+    /// each sender.
     #[test]
     fn only_a_settling_event_may_take_the_holder() {
         for event in refresh_events() {
@@ -4746,11 +4842,11 @@ mod tests {
     #[test]
     fn panel_refresh_failure_is_never_acknowledged_as_settled() {
         assert_eq!(
-            display_refresh_outcome(true),
-            (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+            display_refresh_outcome(true, None),
+            (settled(), PowerEvent::DisplaySettled)
         );
         assert_eq!(
-            display_refresh_outcome(false),
+            display_refresh_outcome(false, None),
             (
                 DisplayEvent::RefreshFailed,
                 PowerEvent::DisplayRefreshFailed

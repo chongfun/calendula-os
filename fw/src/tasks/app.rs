@@ -283,7 +283,13 @@ pub async fn run() {
                 }
             }
             Either4::Second(event) => match event {
-                DisplayEvent::Settled => {
+                DisplayEvent::Settled { chapter_cursor } => {
+                    // Before the render lock comes off: clearing it is what
+                    // lets the next navigation read state.chapter, and this
+                    // correction is the whole reason the two travel together.
+                    if let Some(cursor) = chapter_cursor {
+                        state = state.apply_chapter_cursor(cursor);
+                    }
                     rendering = false;
                     if !catalog_refresh_requested {
                         catalog_refresh_requested = true;
@@ -533,9 +539,6 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
                     .map(|stored| *stored != page.min(u16::MAX as u32) as u16)
                     .unwrap_or(false)
         }
-        // The reducer adopts the new chapter without a repaint (Reading shows
-        // page-within-chapter, not the chapter), so it never forces a render.
-        crate::LibraryEvent::ChapterCursor { .. } => false,
         crate::LibraryEvent::CustomFont { .. } => state.view == AppView::Settings,
         crate::LibraryEvent::Restored { .. } => true,
         // The settled note only shows while the user is still waiting in

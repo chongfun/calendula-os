@@ -14,7 +14,7 @@ use app_core::storage_loop::{
     loop_arm, Drained, LoopArm, OpenAction, OpenSequence, SleepAction, SleepRefusal, SleepSequence,
 };
 use app_core::{
-    book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView,
+    book_open_outcome, display_orientation_from_u8, refresh_policy_from_u8, AppView, ChapterCursor,
     DisplayEventHolder, DisplayHoldOutcome, DisplayOrientation, EvictionStep, EvictionWalk,
     HoldOutcome, LibraryEventHolder, PersistedAppState, ReaderSource, RefreshPlanner, RenderKind,
     RenderRequest, SyncSession, SyncStatus,
@@ -234,7 +234,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         // request retries init from scratch.
                         esp_println::println!("display: wake init failed: {:?}", error);
                         prev_prestaged = false;
-                        let (display_event, power_event) = app_core::display_refresh_outcome(false);
+                        let (display_event, power_event) =
+                            app_core::display_refresh_outcome(false, None);
                         send_display_event(&display_event);
                         send_required_power_event(power_event).await;
                         continue;
@@ -270,30 +271,31 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // Keep the current chapter tracking the page just shown, past
                     // the reducer's 128-chapter cap. Cheap in-RAM check; only the
                     // loaded SD reader has an uncapped page map, so this no-ops on
-                    // other views and reads SD only when the chapter changes. Must
-                    // run before Settled: the app clears its render lock on Settled
-                    // and may immediately render or navigate, so the ChapterCursor
-                    // correction has to be queued ahead of it or that next action
-                    // uses the stale chapter.
-                    if request.view == AppView::Reading {
-                        if let Some(current) = reader_cache::track_reading_chapter(
+                    // other views and reads SD only when the chapter changes. It
+                    // rides out inside Settled: the app must apply it before it
+                    // clears the render lock, and one message is the only way to
+                    // promise that (see DisplayEvent::Settled).
+                    let chapter_cursor = if request.view == AppView::Reading {
+                        reader_cache::track_reading_chapter(
                             &mut epd,
                             &mut sd_cs,
                             request.page,
                             sd_library,
-                        ) {
-                            send_loaded_library_event(&LibraryEvent::ChapterCursor {
-                                book_id: request.book_id,
-                                current_chapter: current,
-                            });
-                        }
-                    }
+                        )
+                        .map(|current_chapter| ChapterCursor {
+                            book_id: request.book_id,
+                            current_chapter,
+                        })
+                    } else {
+                        None
+                    };
                     // Settle before the ~23 ms RED prestage: the panel is visually
                     // done, so unblock the input/power pipeline. The prestage still
                     // runs on this task before the next command is dequeued, so
                     // `prev_prestaged` is always current by the next flush, and a
                     // Sleep queued by power_task after DisplaySettled waits behind it.
-                    let (display_event, power_event) = app_core::display_refresh_outcome(true);
+                    let (display_event, power_event) =
+                        app_core::display_refresh_outcome(true, chapter_cursor);
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                     let prestage_start = Instant::now();
@@ -320,7 +322,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // takes the full waveform instead of fast-diffing
                     // against a frame that may never have landed.
                     refresh_planner.record_failure();
-                    let (display_event, power_event) = app_core::display_refresh_outcome(false);
+                    let (display_event, power_event) =
+                        app_core::display_refresh_outcome(false, None);
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                 }
@@ -1390,8 +1393,15 @@ fn hold_library_event(event: &LibraryEvent) {
     }
 }
 
-/// Prefers the display channel so the event keeps its order against the render
-/// acknowledgements, and falls back to the library channel when it is full.
+/// Sends a library event down the display channel, falling back to its own
+/// when that one is full.
+///
+/// The two channels reach the app independently, so this is a choice of route
+/// and not of order — anything that must be ordered against a render
+/// acknowledgement travels *inside* it (see `DisplayEvent::Settled`) rather
+/// than relying on which queue it landed in. Only `Loaded` comes through here
+/// now, and it is order-free: whichever way round it and the acknowledgement
+/// arrive, the app folds it and renders.
 ///
 /// The fallback routes by `must_be_delivered` like every other send. It used
 /// to go straight to the required path, which let a refresh-only event take
@@ -1454,10 +1464,10 @@ fn send_display_event(event: &DisplayEvent) {
 ///
 /// This used to make room by walking the queue. That was wrong twice over: the
 /// first version's `try_receive` dropped whatever its pattern did not match,
-/// and the walk that replaced it had to requeue at the tail, which can put a
-/// `ChapterCursor` behind the `Settled` it was queued ahead of. The queue is
-/// left alone now — [`DisplayEventHolder`] explains why nothing in it is worth
-/// spending — and the acknowledgement waits for room instead.
+/// and the walk that replaced it had to requeue at the tail, reordering the
+/// queue the app reads its acknowledgements from. The queue is left alone now
+/// — [`DisplayEventHolder`] explains why nothing in it is worth spending — and
+/// the acknowledgement waits for room instead.
 fn send_required_display_event(event: &DisplayEvent) {
     if DISPLAY_EVENTS.try_send(*event).is_ok() {
         return;
