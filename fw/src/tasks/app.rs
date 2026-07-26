@@ -580,20 +580,33 @@ fn sleep_blockers(
     }
 }
 
-/// Hands every parked command to the storage task in arrival order, blocking
-/// on each so a full channel defers the drain rather than losing it.
+/// Hands parked commands to the storage task in arrival order, for as long as
+/// the channel takes them. A refusal ends the drain with the rest still
+/// parked, in order; nothing is lost, and the next display cycle offers them
+/// again. Async only so it reads like the other arms of the loop — it never
+/// awaits, which is the point (see the body).
 async fn drain_parked_storage(
     parked: &mut ParkedStorage,
     opening_book: &mut Option<u32>,
     suppress_input_until_open_settled: &mut bool,
 ) {
-    while let Some(command) = parked.pop_front() {
+    while let Some(command) = parked.front() {
+        // Offered, never awaited. Blocking here would park this task inside
+        // the event arm, where it is neither receiving library events nor
+        // returning to its select — and the display task stops taking storage
+        // commands while it holds a settling event that only this task can
+        // receive. Two live tasks, each waiting on the other. Leaving the
+        // command parked instead costs it a wait until the next display cycle
+        // ends, which is where this drain runs from.
+        if STORAGE_COMMANDS.try_send(command).is_err() {
+            return;
+        }
+        parked.pop_front();
         log_storage_command("send", command);
         if let Some(book_id) = open_book_id(command) {
             *opening_book = Some(book_id);
             *suppress_input_until_open_settled = true;
         }
-        STORAGE_COMMANDS.send(command).await;
     }
 }
 

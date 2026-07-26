@@ -555,6 +555,15 @@ impl ParkedStorage {
         true
     }
 
+    /// The command at the front, left where it is.
+    ///
+    /// Lets a drain offer a command to a queue that may refuse it without
+    /// having to put it back afterwards: nothing is taken until it has landed,
+    /// so the parked order cannot be disturbed by a refusal.
+    pub fn front(&self) -> Option<StorageCommand> {
+        self.queue[0]
+    }
+
     pub fn pop_front(&mut self) -> Option<StorageCommand> {
         let command = self.queue[0].take()?;
         self.queue.copy_within(1..self.len, 0);
