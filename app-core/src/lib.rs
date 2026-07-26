@@ -1171,12 +1171,12 @@ pub const LIBRARY_EVENT_SLOTS: usize = 8;
 /// and order among refreshes is not what the app is waiting on.
 ///
 /// The walk stops once it has been all the way round. Every slot holding a
-/// settling event means there is none that can be freed honestly, so the
-/// newcomer is the one that loses and the caller says so — the only case in
-/// which a settling event is dropped, and it needs the app task to have been
-/// away long enough for eight of them to pile up. Stopping *before* the
-/// repeat rather than after it is what leaves the ring exactly as the walk
-/// found it: each slot has been requeued once, which is a full rotation.
+/// settling event means there is none that can be freed honestly, so the walk
+/// ends with nothing spent and the newcomer still in the caller's hands — to
+/// hold and retry, not to drop, since it is awaited exactly like the eight it
+/// could not displace. Stopping *before* the repeat rather than after it is
+/// what leaves the ring exactly as the walk found it: each slot has been
+/// requeued once, which is a full rotation.
 ///
 /// RAM: two usizes, beside the one `LibraryEvent` the caller already holds
 /// while it decides.
@@ -3538,9 +3538,11 @@ mod tests {
         );
     }
 
-    /// The one case where a settling event is dropped: every slot already
-    /// holds one. Nothing may be spent, so the newcomer loses — and the walk
-    /// that refused leaves the ring exactly as it found it.
+    /// Every slot already awaited: nothing may be spent, so the walk places
+    /// nothing and leaves the ring exactly as it found it. The newcomer stays
+    /// with the caller, which holds it and retries once the consumer has had
+    /// a turn — this asserts the ring is untouched, not that the event is
+    /// lost.
     #[test]
     fn a_channel_of_awaited_events_refuses_the_newcomer() {
         let before = filled((0..LIBRARY_EVENT_SLOTS as u32).map(cleared));
@@ -3548,7 +3550,10 @@ mod tests {
 
         send_required(&mut queue, cleared(99));
 
-        assert!(!queue.holds(cleared(99)), "nothing could be spent for it");
+        assert!(
+            !queue.holds(cleared(99)),
+            "nothing could be spent, so the walk placed nothing"
+        );
         assert_eq!(
             queue.drained(),
             before.drained(),

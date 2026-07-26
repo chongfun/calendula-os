@@ -18,11 +18,14 @@ use app_core::{
     DisplayOrientation, EvictionStep, EvictionWalk, PersistedAppState, ReaderSource,
     RefreshPlanner, RenderKind, RenderRequest, SyncSession, SyncStatus,
 };
+use core::cell::Cell;
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::BAND_BYTES;
 use embassy_futures::select::{select, Either};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::Instant;
 use esp_hal::gpio::Output;
 use proto::nvm::AppStateRecord;
@@ -546,9 +549,43 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         &mut last_progress_write,
                         &mut state_restored,
                     );
+                    // The command may have produced an event the channel had
+                    // no room for. This is the first point at which the app
+                    // task can have drained it, so it is where the retry goes.
+                    deliver_held_library_event().await;
                 }
             },
         }
+    }
+}
+
+/// Retries the settling event [`send_required_library_event`] could not place.
+///
+/// The sender runs inside `handle_storage_command`, which is synchronous and
+/// must stay that way — it holds the SD session and multi-KB scratch near the
+/// stack floor. So it cannot wait for room, and it must not: the app task
+/// blocks on `DISPLAY_COMMANDS.send` for renders, so a display task parked on
+/// `LIBRARY_EVENTS.send` would be waiting for a consumer that is waiting for
+/// it. Instead the event is held, and retried here, where awaiting is free
+/// and the app task has had its turn.
+///
+/// Bounded on purpose. Yielding forever would hang the storage loop on a
+/// consumer that may itself be stuck; a handful of turns is far more than a
+/// running app task needs, and past that the drop is real and reported.
+async fn deliver_held_library_event() {
+    const TURNS: usize = 4;
+    for _ in 0..TURNS {
+        let Some(event) = take_held_library_event() else {
+            return;
+        };
+        if LIBRARY_EVENTS.try_send(event).is_ok() {
+            return;
+        }
+        hold_library_event(&event);
+        embassy_futures::yield_now().await;
+    }
+    if let Some(event) = take_held_library_event() {
+        esp_println::println!("display: library event never placed, dropped {:?}", event);
     }
 }
 
@@ -1252,7 +1289,38 @@ fn send_required_library_event(event: &LibraryEvent) {
             }
         }
     }
-    esp_println::println!("display: library events all awaited, dropped {:?}", event);
+    // Every slot holds something the app is waiting on, so nothing here may
+    // be spent — but this event is awaited too, and dropping it would leave
+    // its wait unanswerable. Hold it for `deliver_held_library_event`, which
+    // retries once the app task has had a turn to drain.
+    hold_library_event(event);
+}
+
+/// The one settling event that had nowhere to go, waiting for room.
+///
+/// One slot is enough: the holder is emptied after every storage command, and
+/// the app task drains the channel between them, so a second event can only
+/// arrive after the first has been placed. A second one landing on an
+/// occupied holder means the consumer has stopped, which the drop reports.
+///
+/// RAM: one `Option<LibraryEvent>` in .bss — 276 bytes, sized by the
+/// `Loaded` variant's chapter-page map.
+static HELD_LIBRARY_EVENT: Mutex<CriticalSectionRawMutex, Cell<Option<LibraryEvent>>> =
+    Mutex::new(Cell::new(None));
+
+fn hold_library_event(event: &LibraryEvent) {
+    HELD_LIBRARY_EVENT.lock(|held| {
+        if let Some(displaced) = held.replace(Some(*event)) {
+            esp_println::println!(
+                "display: library event holder occupied, dropped {:?}",
+                displaced
+            );
+        }
+    });
+}
+
+fn take_held_library_event() -> Option<LibraryEvent> {
+    HELD_LIBRARY_EVENT.lock(|held| held.take())
 }
 
 fn send_loaded_library_event(event: &LibraryEvent) {
