@@ -1,5 +1,5 @@
-use super::{fill_transformed_band_impl, RefreshMode, SpiOp};
-use crate::{fb::Framebuffer, Rect, BAND_BYTES, HEIGHT, WIDTH};
+use super::{RefreshMode, SpiOp};
+use crate::{Rect, HEIGHT, WIDTH};
 
 pub const CMD_DRIVER_OUTPUT_CONTROL: u8 = 0x01;
 pub const CMD_BOOSTER_SOFT_START: u8 = 0x0C;
@@ -158,8 +158,4 @@ pub const fn update_control_1(mode: RefreshMode) -> [u8; 2] {
 
 pub const fn is_byte_aligned(rect: Rect) -> bool {
     rect.x & 7 == 0 && rect.w & 7 == 0 && rect.w > 0 && rect.h > 0 && rect.x < WIDTH as u16
-}
-
-pub fn fill_transformed_band(fb: &Framebuffer, band_y: usize, out: &mut [u8; BAND_BYTES]) -> usize {
-    fill_transformed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
 }

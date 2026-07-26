@@ -18,8 +18,7 @@
 //! from the reference, but mirrored or offset output is the expected first
 //! symptom to chase here.
 
-use super::{fill_transformed_band_impl, RefreshMode, SpiOp};
-use crate::{fb::Framebuffer, BAND_BYTES};
+use super::{RefreshMode, SpiOp};
 
 // --- UC8253 command set (subset used by the BW path) ---
 pub const CMD_PANEL_SETTING: u8 = 0x00;
@@ -74,10 +73,6 @@ pub const SPI_HZ: u32 = 20_000_000;
 pub const MIRROR_X: bool = true;
 pub const MIRROR_Y: bool = true;
 pub const REVERSE_BITS: bool = true;
-
-pub fn fill_transformed_band(fb: &Framebuffer, band_y: usize, out: &mut [u8; BAND_BYTES]) -> usize {
-    fill_transformed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
-}
 
 /// One waveform bank: VCOM plus the four transition LUTs, each `LUT_LEN`
 /// bytes. `WW`=white→white, `BW`=black→white, `WB`=white→black, `BB`=
@@ -687,24 +682,5 @@ mod tests {
             &[SleepStep::PowerOff, SleepStep::DeepSleep]
         );
         assert_eq!(sleep_plan(false), &[SleepStep::DeepSleep]);
-    }
-
-    #[test]
-    fn transform_maps_asymmetric_corners_and_emits_short_final_band() {
-        let mut fb = Framebuffer::new();
-        fb.set_pixel(0, HEIGHT - 1, false);
-        fb.set_pixel(crate::WIDTH - 1, 0, false);
-
-        let mut band = [0xAA; crate::BAND_BYTES];
-        let first_len = fill_transformed_band(&fb, 0, &mut band);
-        assert_eq!(first_len, crate::BAND_BYTES);
-        assert_eq!(band[ROW_BYTES - 1], 0xFE);
-
-        let final_y = crate::BAND_ROWS * (HEIGHT / crate::BAND_ROWS);
-        let final_len = fill_transformed_band(&fb, final_y, &mut band);
-        assert_eq!(final_len, (HEIGHT - final_y) * ROW_BYTES);
-        assert_eq!(final_len, 48 * ROW_BYTES);
-        assert_eq!(band[(HEIGHT - final_y - 1) * ROW_BYTES], 0x7F);
-        assert_eq!(FB_BYTES, 52_272);
     }
 }

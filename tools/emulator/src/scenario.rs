@@ -226,10 +226,19 @@ impl Scenario {
             }
         }
         if let Some(panel_sleeping) = self.expect.panel_sleeping {
-            expect_eq("panel_sleeping", panel_sleeping, emu.panel().is_deep_sleep())?;
+            expect_eq(
+                "panel_sleeping",
+                panel_sleeping,
+                emu.panel().is_deep_sleep(),
+            )?;
         }
         if let Some(needle) = &self.expect.history_contains {
-            if !emu.panel().history().iter().any(|entry| entry.contains(needle)) {
+            if !emu
+                .panel()
+                .history()
+                .iter()
+                .any(|entry| entry.contains(needle))
+            {
                 return Err(format!("panel history does not contain {needle:?}"));
             }
         }

@@ -9,16 +9,15 @@ use crate::panel_common::{
     cmd_history_entry, expect_len, ram_history_entry, HISTORY_DEEP_SLEEP, HISTORY_RESET,
 };
 use display::epd::{
-    bank_for, fill_transformed_band, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank,
-    RamPlane, RefreshMode, SleepStep, CDI_INTERVAL, CMD_BOOSTER_SOFT_START, CMD_DATA_STOP,
-    CMD_DEEP_SLEEP, CMD_DISPLAY_REFRESH, CMD_DTM1, CMD_DTM2, CMD_GATE_SOURCE_START, CMD_LUT_BB,
-    CMD_LUT_BW, CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_LV_SELECTION, CMD_PANEL_SETTING,
-    CMD_PLL_CONTROL, CMD_POWER_OFF, CMD_POWER_OFF_SEQ, CMD_POWER_ON, CMD_POWER_SETTING,
-    CMD_RESOLUTION, CMD_VCOM_DATA_INTERVAL, CMD_VCOM_DC, DEEP_SLEEP_CHECK, INIT_SEQUENCE, LUT_LEN,
-    PRESTAGE_STEPS, SpiOp,
+    bank_for, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank, RamPlane, RefreshMode,
+    SleepStep, SpiOp, CDI_INTERVAL, CMD_BOOSTER_SOFT_START, CMD_DATA_STOP, CMD_DEEP_SLEEP,
+    CMD_DISPLAY_REFRESH, CMD_DTM1, CMD_DTM2, CMD_GATE_SOURCE_START, CMD_LUT_BB, CMD_LUT_BW,
+    CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_LV_SELECTION, CMD_PANEL_SETTING, CMD_PLL_CONTROL,
+    CMD_POWER_OFF, CMD_POWER_OFF_SEQ, CMD_POWER_ON, CMD_POWER_SETTING, CMD_RESOLUTION,
+    CMD_VCOM_DATA_INTERVAL, CMD_VCOM_DC, DEEP_SLEEP_CHECK, INIT_SEQUENCE, LUT_LEN, PRESTAGE_STEPS,
 };
 use display::fb::Framebuffer;
-use display::{BAND_BYTES, BAND_ROWS, FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
+use display::{BAND_ROWS, FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
 
 #[derive(Clone, Copy, Debug)]
 struct RamWriteState {
@@ -242,11 +241,10 @@ impl PanelModel {
 
     fn write_framebuffer(&mut self, plane: RamPlane, fb: &Framebuffer) -> Result<(), String> {
         self.begin_ram_write(plane)?;
-        let mut band = [0u8; BAND_BYTES];
         let mut y = 0;
         while y < HEIGHT {
-            let len = fill_transformed_band(fb, y, &mut band);
-            if let Err(err) = self.ram_chunk(&band[..len]) {
+            let band = fb.band(y, BAND_ROWS);
+            if let Err(err) = self.ram_chunk(band) {
                 self.ram_write = None;
                 return Err(err);
             }
@@ -349,17 +347,7 @@ fn plane_index(plane: RamPlane) -> usize {
 }
 
 fn transformed_matches(ram: &[u8; FB_BYTES], fb: &Framebuffer) -> bool {
-    let mut band = [0u8; BAND_BYTES];
-    let mut y = 0;
-    while y < HEIGHT {
-        let len = fill_transformed_band(fb, y, &mut band);
-        let start = y * ROW_BYTES;
-        if ram[start..start + len] != band[..len] {
-            return false;
-        }
-        y += BAND_ROWS;
-    }
-    true
+    ram == fb.bytes()
 }
 
 impl Default for PanelModel {

@@ -100,12 +100,49 @@ impl Framebuffer {
     /// turn composed with the same scan inversion.
     #[inline]
     fn map(&self, x: usize, y: usize) -> Option<(usize, usize)> {
-        match self.frame {
-            FbFrame::Native => (x < WIDTH && y < HEIGHT).then_some((x, y)),
-            FbFrame::Landscape => (x < WIDTH && y < HEIGHT).then(|| (x, HEIGHT - 1 - y)),
-            FbFrame::LandscapeFlipped => (x < WIDTH && y < HEIGHT).then(|| (WIDTH - 1 - x, y)),
-            FbFrame::Portrait => (x < HEIGHT && y < WIDTH).then(|| (WIDTH - 1 - y, HEIGHT - 1 - x)),
+        if x >= self.frame_width() || y >= self.frame_height() {
+            return None;
         }
+        let (nx, ny) = match self.frame {
+            FbFrame::Native => (x, y),
+            FbFrame::Landscape => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (x, HEIGHT - 1 - y)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (x, y)
+                }
+            }
+            FbFrame::LandscapeFlipped => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (WIDTH - 1 - x, y)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (WIDTH - 1 - x, HEIGHT - 1 - y)
+                }
+            }
+            FbFrame::Portrait => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (WIDTH - 1 - y, HEIGHT - 1 - x)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (WIDTH - 1 - y, x)
+                }
+            }
+        };
+
+        Some((nx, ny))
+    }
+
+    #[inline(always)]
+    fn byte_x(native_x: usize) -> usize {
+        ROW_BYTES - 1 - native_x / 8
     }
 
     #[inline]
@@ -114,8 +151,8 @@ impl Framebuffer {
             return;
         };
 
-        let index = native_y * ROW_BYTES + native_x / 8;
-        let mask = 0x80 >> (native_x & 7);
+        let index = native_y * ROW_BYTES + Self::byte_x(native_x);
+        let mask = 0x01 << (native_x & 7);
         if white {
             self.data[index] |= mask;
         } else {
@@ -127,12 +164,41 @@ impl Framebuffer {
     /// equivalent of `len` `set_pixel` calls. The landscape frames map a
     /// frame row onto one native row, so the run is written as whole bytes
     /// with masked edge bytes; Portrait transposes rows into columns and
-    /// keeps the per-pixel path (portrait rendering is active work — its
-    /// behavior stays the pixel-for-pixel reference one).
+    /// uses a dedicated strided column fast path whose output is tested
+    /// against the per-pixel reference.
     pub fn fill_span(&mut self, x: usize, y: usize, len: usize, white: bool) {
         if self.frame == FbFrame::Portrait {
-            for x in x..x.saturating_add(len) {
-                self.set_pixel(x, y, white);
+            let len = len.min(HEIGHT.saturating_sub(x));
+            if len == 0 || y >= WIDTH {
+                return;
+            }
+            let native_x = WIDTH - 1 - y;
+            let byte_x = Self::byte_x(native_x);
+            let mask = 0x01 << (native_x & 7);
+
+            #[cfg(not(feature = "device-x3"))]
+            let start_y = HEIGHT - 1 - x;
+            #[cfg(feature = "device-x3")]
+            let start_y = x;
+
+            let mut index = start_y * ROW_BYTES + byte_x;
+
+            #[cfg(not(feature = "device-x3"))]
+            let stride = ROW_BYTES.wrapping_neg();
+            #[cfg(feature = "device-x3")]
+            let stride = ROW_BYTES;
+
+            if white {
+                for _ in 0..len {
+                    self.data[index] |= mask;
+                    index = index.wrapping_add(stride);
+                }
+            } else {
+                let not_mask = !mask;
+                for _ in 0..len {
+                    self.data[index] &= not_mask;
+                    index = index.wrapping_add(stride);
+                }
             }
             return;
         }
@@ -140,9 +206,29 @@ impl Framebuffer {
             return;
         }
         let native_y = match self.frame {
-            FbFrame::Landscape => HEIGHT - 1 - y,
+            FbFrame::Landscape => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    HEIGHT - 1 - y
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    y
+                }
+            }
+            FbFrame::LandscapeFlipped => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    y
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    HEIGHT - 1 - y
+                }
+            }
             _ => y,
         };
+
         let len = len.min(WIDTH - x);
         // One frame span is one native span: identical in Native and
         // Landscape, x-mirrored in LandscapeFlipped — a solid fill is
@@ -157,17 +243,19 @@ impl Framebuffer {
     /// Fill native bits [x0, x1) on native row `y`; `0 <= x0 < x1 <= WIDTH`.
     fn fill_native_span(&mut self, y: usize, x0: usize, x1: usize, white: bool) {
         let base = y * ROW_BYTES;
-        let first = base + x0 / 8;
-        let last = base + (x1 - 1) / 8;
-        let head = 0xFFu8 >> (x0 & 7);
-        let tail = 0xFFu8 << (7 - ((x1 - 1) & 7));
-        if first == last {
-            Self::apply_mask(&mut self.data[first], head & tail, white);
+        let mem_right = base + (ROW_BYTES - 1 - x0 / 8);
+        let mem_left = base + (ROW_BYTES - 1 - (x1 - 1) / 8);
+
+        let right_mask = 0xFFu8 << (x0 & 7);
+        let left_mask = 0xFFu8 >> (7 - ((x1 - 1) & 7));
+
+        if mem_left == mem_right {
+            Self::apply_mask(&mut self.data[mem_left], left_mask & right_mask, white);
             return;
         }
-        Self::apply_mask(&mut self.data[first], head, white);
-        self.data[first + 1..last].fill(if white { 0xFF } else { 0x00 });
-        Self::apply_mask(&mut self.data[last], tail, white);
+        Self::apply_mask(&mut self.data[mem_right], right_mask, white);
+        self.data[mem_left + 1..mem_right].fill(if white { 0xFF } else { 0x00 });
+        Self::apply_mask(&mut self.data[mem_left], left_mask, white);
     }
 
     /// Blit one packed MSB-first pixel row — a glyph row — at frame
@@ -176,21 +264,55 @@ impl Framebuffer {
     /// from `bits` (anything past `width` in the last byte is ignored),
     /// and `x` may be negative for left-clipped draws. The landscape
     /// frames blit whole source bytes into the row's byte pair (mirroring
-    /// via bit reversal when flipped); Portrait keeps the per-pixel
-    /// reference path.
+    /// via bit reversal when flipped); Portrait uses a dedicated strided
+    /// column fast path whose output is tested against the per-pixel
+    /// reference.
     pub fn blit_row(&mut self, x: i32, y: i32, bits: &[u8], width: usize, white: bool) {
         if y < 0 {
             return;
         }
         let n = width.div_ceil(8).min(bits.len());
         if self.frame == FbFrame::Portrait {
-            for i in 0..(n * 8).min(width) {
+            if y as usize >= WIDTH {
+                return;
+            }
+            let native_x = WIDTH - 1 - y as usize;
+            let byte_x = Self::byte_x(native_x);
+            let mask = 0x01 << (native_x & 7);
+
+            let width = (n * 8).min(width);
+            let start_i = if x < 0 { (-x) as usize } else { 0 };
+            let end_i = width.min(if x < HEIGHT as i32 {
+                (HEIGHT as i32 - x) as usize
+            } else {
+                0
+            });
+            if start_i >= end_i {
+                return;
+            }
+
+            let start_draw_x = (x + start_i as i32) as usize;
+            #[cfg(not(feature = "device-x3"))]
+            let native_y = HEIGHT - 1 - start_draw_x;
+            #[cfg(feature = "device-x3")]
+            let native_y = start_draw_x;
+
+            let mut index = native_y * ROW_BYTES + byte_x;
+
+            #[cfg(not(feature = "device-x3"))]
+            let stride = ROW_BYTES.wrapping_neg();
+            #[cfg(feature = "device-x3")]
+            let stride = ROW_BYTES;
+
+            for i in start_i..end_i {
                 if bits[i / 8] & (0x80 >> (i & 7)) != 0 {
-                    let draw_x = x + i as i32;
-                    if draw_x >= 0 {
-                        self.set_pixel(draw_x as usize, y as usize, white);
+                    if white {
+                        self.data[index] |= mask;
+                    } else {
+                        self.data[index] &= !mask;
                     }
                 }
+                index = index.wrapping_add(stride);
             }
             return;
         }
@@ -198,9 +320,29 @@ impl Framebuffer {
             return;
         }
         let native_y = match self.frame {
-            FbFrame::Landscape => HEIGHT - 1 - y as usize,
+            FbFrame::Landscape => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    HEIGHT - 1 - y as usize
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    y as usize
+                }
+            }
+            FbFrame::LandscapeFlipped => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    y as usize
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    HEIGHT - 1 - y as usize
+                }
+            }
             _ => y as usize,
         };
+
         let base = native_y * ROW_BYTES;
         for (k, &byte) in bits[..n].iter().enumerate() {
             // Zero the padding bits past `width`: they are not part of the
@@ -211,12 +353,8 @@ impl Framebuffer {
                 continue;
             }
             let (byte, bit_x) = match self.frame {
-                // Mirroring x reverses the byte's bits and re-anchors it
-                // from the right edge.
-                FbFrame::LandscapeFlipped => {
-                    (byte.reverse_bits(), WIDTH as i32 - x - 8 * (k as i32 + 1))
-                }
-                _ => (byte, x + 8 * k as i32),
+                FbFrame::LandscapeFlipped => (byte, WIDTH as i32 - x - 8 * (k as i32 + 1)),
+                _ => (byte.reverse_bits(), x + 8 * k as i32),
             };
             self.blit_native_bits(base, bit_x, byte, white);
         }
@@ -226,21 +364,26 @@ impl Framebuffer {
     /// `bit_x` (possibly negative or past the right edge; off-row bits
     /// drop) into the native row starting at byte index `base`.
     #[inline]
-    fn blit_native_bits(&mut self, base: usize, bit_x: i32, bits: u8, white: bool) {
+    fn blit_native_bits(&mut self, base: usize, bit_x: i32, rev_bits: u8, white: bool) {
         if bit_x <= -8 || bit_x >= WIDTH as i32 {
             return;
         }
-        let index = bit_x.div_euclid(8);
+
+        let index = ROW_BYTES as i32 - 1 - bit_x.div_euclid(8);
         let shift = bit_x.rem_euclid(8) as u32;
-        if index >= 0 {
-            Self::apply_mask(&mut self.data[base + index as usize], bits >> shift, white);
+
+        let aligned = (rev_bits as u16) << shift;
+
+        if index >= 0 && index < ROW_BYTES as i32 {
+            Self::apply_mask(&mut self.data[base + index as usize], aligned as u8, white);
         }
-        // `index + 1 >= 0` always holds here (`bit_x > -8` puts `index`
-        // at -1 or later), so only the right edge needs a bound.
-        if shift > 0 && index + 1 < ROW_BYTES as i32 {
+
+        let next_index = index - 1;
+
+        if shift > 0 && next_index >= 0 && next_index < ROW_BYTES as i32 {
             Self::apply_mask(
-                &mut self.data[base + (index + 1) as usize],
-                bits << (8 - shift),
+                &mut self.data[base + next_index as usize],
+                (aligned >> 8) as u8,
                 white,
             );
         }
@@ -264,8 +407,8 @@ impl Framebuffer {
         if x >= WIDTH || y >= HEIGHT {
             return true;
         }
-        let index = y * ROW_BYTES + x / 8;
-        let mask = 0x80 >> (x & 7);
+        let index = y * ROW_BYTES + Self::byte_x(x);
+        let mask = 0x01 << (x & 7);
         self.data[index] & mask != 0
     }
 
@@ -275,8 +418,8 @@ impl Framebuffer {
             return true;
         };
 
-        let index = native_y * ROW_BYTES + native_x / 8;
-        let mask = 0x80 >> (native_x & 7);
+        let index = native_y * ROW_BYTES + Self::byte_x(native_x);
+        let mask = 0x01 << (native_x & 7);
         self.data[index] & mask != 0
     }
 }
@@ -299,11 +442,16 @@ mod tests {
         let mut framed = Framebuffer::new();
         framed.set_frame(FbFrame::Landscape);
         let mut flipped = Framebuffer::new();
+        flipped.set_frame(FbFrame::Native);
 
         for (i, x) in [0usize, 13, 400, 401, WIDTH - 1].iter().enumerate() {
             let y = i * 123 % HEIGHT;
             framed.set_pixel(*x, y, false);
-            flipped.set_pixel(*x, HEIGHT - 1 - y, false);
+            #[cfg(not(feature = "device-x3"))]
+            let expected_y = HEIGHT - 1 - y;
+            #[cfg(feature = "device-x3")]
+            let expected_y = y;
+            flipped.set_pixel(*x, expected_y, false);
         }
 
         assert_eq!(framed.bytes()[..], flipped.bytes()[..]);
@@ -316,11 +464,16 @@ mod tests {
         let mut framed = Framebuffer::new();
         framed.set_frame(FbFrame::LandscapeFlipped);
         let mut mirrored = Framebuffer::new();
+        mirrored.set_frame(FbFrame::Native);
 
         for (i, x) in [0usize, 13, 400, 401, WIDTH - 1].iter().enumerate() {
             let y = i * 123 % HEIGHT;
             framed.set_pixel(*x, y, false);
-            mirrored.set_pixel(WIDTH - 1 - x, y, false);
+            #[cfg(not(feature = "device-x3"))]
+            let expected_y = y;
+            #[cfg(feature = "device-x3")]
+            let expected_y = HEIGHT - 1 - y;
+            mirrored.set_pixel(WIDTH - 1 - x, expected_y, false);
         }
 
         assert_eq!(framed.bytes()[..], mirrored.bytes()[..]);
@@ -501,5 +654,50 @@ mod tests {
         fb.set_pixel(10, WIDTH, false);
         assert_eq!(fb.bytes()[..], before[..]);
         assert!(fb.pixel(HEIGHT, 10));
+    }
+
+    #[test]
+    fn native_frame_round_trips_raw_pixels() {
+        let mut fb = Framebuffer::new(); // Native frame
+        fb.clear(true);
+
+        // Native (0, 0)
+        fb.set_pixel(0, 0, false);
+        assert!(!fb.native_pixel(0, 0));
+        assert!(!fb.pixel(0, 0));
+
+        // Native bottom-right corner
+        fb.set_pixel(WIDTH - 1, HEIGHT - 1, false);
+        assert!(!fb.native_pixel(WIDTH - 1, HEIGHT - 1));
+        assert!(!fb.pixel(WIDTH - 1, HEIGHT - 1));
+
+        // Native arbitrary point
+        fb.set_pixel(123, 456 % HEIGHT, false);
+        assert!(!fb.native_pixel(123, 456 % HEIGHT));
+        assert!(!fb.pixel(123, 456 % HEIGHT));
+    }
+
+    #[cfg(feature = "device-x3")]
+    #[test]
+    fn x3_raw_byte_layout_matches_hardware_spec() {
+        let mut fb = Framebuffer::new(); // Native frame
+        fb.clear(true);
+
+        // Hardware specification for X3:
+        // ROW_BYTES = 99, HEIGHT = 528
+        // MIRROR_X = true -> native x=0 maps to byte index ROW_BYTES - 1 (index 98 in row)
+        // REVERSE_BITS = true -> bit mask for x & 7 is LSB-oriented (0x01 << (x & 7))
+
+        // Native top-left corner (x=0, y=0) -> byte 98, mask 0x01
+        fb.set_pixel(0, 0, false);
+        assert_eq!(fb.bytes()[98] & 0x01, 0);
+
+        // Native top-right corner (x=791, y=0) -> byte 0 (since 791/8 = 98, 98-98 = 0), mask 0x80 (791 & 7 = 7)
+        fb.set_pixel(791, 0, false);
+        assert_eq!(fb.bytes()[0] & 0x80, 0);
+
+        // Native bottom-left corner (x=0, y=527) -> byte 527 * 99 + 98 = 52271, mask 0x01
+        fb.set_pixel(0, 527, false);
+        assert_eq!(fb.bytes()[52271] & 0x01, 0);
     }
 }
