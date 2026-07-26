@@ -330,7 +330,18 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // be driven from a host test; this arm only does what it is
                 // told and reports back what the hardware said.
                 let mut sleep = SleepSequence::new(STORAGE_COMMANDS.capacity());
+                // The main loop keeps storage shut while an event is held; this
+                // drain applies storage commands too, so it owes the same rule.
+                // Checked before the first take and after every applied
+                // command, because either end can be where the holder fills:
+                // sleep can arrive with one already waiting, or the first
+                // command drained can produce it. Carrying on past that point
+                // is how a second completion would reach an occupied holder.
+                let mut held_during_drain = held_library_event_pending();
                 let refusal = loop {
+                    if held_during_drain {
+                        break None;
+                    }
                     match sleep.next() {
                         SleepAction::TakeQueued => match STORAGE_COMMANDS.try_receive() {
                             Err(_) => sleep.queue_empty(),
@@ -350,6 +361,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                                         &mut state_restored,
                                     );
                                     sleep.applied();
+                                    held_during_drain = held_library_event_pending();
                                 }
                                 Drained::RequeueAndRefuse => {
                                     // This send cannot fail today: nothing
@@ -381,12 +393,12 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         SleepAction::Proceed => break None,
                     }
                 };
-                // The drain applies storage commands, and a drained
-                // `ClearBookCache` can leave its completion held. Sleep is
-                // terminal — waking is a fresh boot — so going down now would
-                // take the event with it and strand the app in `Busy`. Stay
-                // awake instead; the loop's placing branch runs the moment
-                // this returns, and the power task re-requests sleep after.
+                // A drained `ClearBookCache` can leave its completion held, and
+                // sleep is terminal — waking is a fresh boot — so going down
+                // now would take the event with it and strand the app in
+                // `Busy`. Stay awake instead; the loop's placing branch runs
+                // the moment this returns, the rest of the queue is still
+                // there to drain, and the power task re-requests sleep after.
                 let sleep_holds_an_event = refusal.is_none() && held_library_event_pending();
                 if sleep_holds_an_event {
                     esp_println::println!("display: sleep deferred; library event still held");
@@ -1342,19 +1354,25 @@ fn send_required_library_event(event: &LibraryEvent) {
 static HELD_LIBRARY_EVENT: Mutex<CriticalSectionRawMutex, Cell<Option<LibraryEvent>>> =
     Mutex::new(Cell::new(None));
 
+/// Keeps `event` until the channel has room, if the holder is free.
+///
+/// An occupied holder is never displaced: the event already in it has been
+/// waiting longer, and every producer is gated on the holder being free, so
+/// arriving here to find it taken means two required events came out of a
+/// single storage command. One last try for a slot that may have freed since,
+/// and then the newcomer is the loss — reported, and the older wait survives.
 fn hold_library_event(event: &LibraryEvent) {
-    let displaced = HELD_LIBRARY_EVENT.lock(|held| held.replace(Some(*event)));
-    if let Some(displaced) = displaced {
-        // The storage arm stands down while the holder is occupied, so this
-        // takes a second producer: a render or sleep path forwarding a
-        // library event out of a full display-event channel. One last try for
-        // a slot that may have freed since, then it is a real loss.
-        if LIBRARY_EVENTS.try_send(displaced).is_err() {
-            esp_println::println!(
-                "display: library event holder occupied, dropped {:?}",
-                displaced
-            );
-        }
+    let took_the_slot = HELD_LIBRARY_EVENT.lock(|held| {
+        let occupied = held.take();
+        let free = occupied.is_none();
+        held.set(if free { Some(*event) } else { occupied });
+        free
+    });
+    if !took_the_slot && LIBRARY_EVENTS.try_send(*event).is_err() {
+        esp_println::println!(
+            "display: library event holder occupied, dropped {:?}",
+            event
+        );
     }
 }
 
@@ -1418,6 +1436,15 @@ fn send_required_display_event(event: &DisplayEvent) {
     for _ in 0..RETRIES {
         if DISPLAY_EVENTS.try_send(*event).is_ok() {
             return;
+        }
+        // Making room by moving a library event to its own channel is only
+        // safe while the holder is free. Occupied, the move would arrive with
+        // nowhere to go and displace an event the app is already waiting on.
+        // The library event is on a path to the app either way — this channel
+        // is one the app drains — so the honest thing is to leave it where it
+        // is and let this send be the one that fails.
+        if held_library_event_pending() {
+            break;
         }
         if let Ok(DisplayEvent::Library(library_event)) = DISPLAY_EVENTS.try_receive() {
             send_required_library_event(&library_event);
