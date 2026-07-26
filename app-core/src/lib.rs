@@ -799,24 +799,31 @@ pub fn library_action_command_for_transition(
     previous: &ReaderState,
     next: &ReaderState,
 ) -> Option<StorageCommand> {
-    match (previous.library_menu, next.library_menu) {
-        (
-            LibraryMenu::Sheet { .. },
-            LibraryMenu::Busy {
-                action: LibraryAction::ClearCache,
-                index,
-                request_id,
-            },
-        ) => Some(StorageCommand::ClearBookCache {
+    let (
+        LibraryMenu::Sheet { .. },
+        LibraryMenu::Busy {
+            action,
+            index,
+            request_id,
+        },
+    ) = (previous.library_menu, next.library_menu)
+    else {
+        return None;
+    };
+    // Exhaustive over the action on purpose. Every `Busy` is a promise that
+    // some command is on its way to settle it, so an action added without a
+    // command here would hang the Library list on "…" forever. Naming the
+    // variants makes that a build failure instead.
+    Some(match action {
+        LibraryAction::ClearCache => StorageCommand::ClearBookCache {
             request_id,
             // The row and the catalog it was a row *in*, together: neither
             // half means anything without the other by the time the storage
             // task gets to it.
             index,
             catalog_epoch: next.catalog_epoch,
-        }),
-        _ => None,
-    }
+        },
+    })
 }
 
 /// An open of `state`'s book, closing out `previous` when this changes books.
@@ -1593,8 +1600,16 @@ impl ReaderState {
                     // deliberate two-step; the pick executes. Irreversible
                     // actions add their own confirm stage when they join.
                     Some(Button::Confirm) if self.selection < self.library_count => {
-                        let actions = LIBRARY_ACTIONS.len() as u16;
-                        let action = LIBRARY_ACTIONS[(row as u16 % actions) as usize];
+                        // A sheet with no actions has nothing to pick, and
+                        // the modulo and the index would both abort on the
+                        // way to finding that out. Not reachable while
+                        // LIBRARY_ACTIONS is a fixed non-empty const, but
+                        // this is a release build that aborts on panic.
+                        let Some(&action) =
+                            LIBRARY_ACTIONS.get(row as usize % LIBRARY_ACTIONS.len().max(1))
+                        else {
+                            return next;
+                        };
                         // A fresh id per pick, never reused, so an answer to
                         // an abandoned clear cannot settle this one.
                         next.library_request_seq = self.library_request_seq.wrapping_add(1);
@@ -1606,12 +1621,12 @@ impl ReaderState {
                         return next;
                     }
                     Some(Button::Next | Button::PageNext) => {
-                        let row = wrap_next(row as u16, LIBRARY_ACTIONS.len() as u16) as u8;
+                        let row = wrap_next(row as u16, LIBRARY_ACTIONS.len().max(1) as u16) as u8;
                         next.library_menu = LibraryMenu::Sheet { row };
                         return next;
                     }
                     Some(Button::Previous) => {
-                        let row = wrap_prev(row as u16, LIBRARY_ACTIONS.len() as u16) as u8;
+                        let row = wrap_prev(row as u16, LIBRARY_ACTIONS.len().max(1) as u16) as u8;
                         next.library_menu = LibraryMenu::Sheet { row };
                         return next;
                     }
@@ -3163,6 +3178,51 @@ mod tests {
         );
         assert_eq!(
             state.library_menu,
+            LibraryMenu::Done {
+                action: CLEAR,
+                ok: false
+            }
+        );
+    }
+
+    /// A rescan dismisses the sheet but not the wait, and the asymmetry is
+    /// deliberate: the sheet is a question that a reordered list invalidates,
+    /// while the wait belongs to a command already handed over. Dropping it
+    /// would leave the answer with nothing to settle. The answer is a refusal
+    /// here — the storage task compares the command's epoch against the
+    /// catalog it now holds and will not delete against a stale row — and the
+    /// note has to report that, not silently vanish.
+    #[test]
+    fn a_rescan_keeps_the_wait_it_cannot_cancel() {
+        let busy = press(
+            press(in_library(1, 4), Button::PagePrevious),
+            Button::Confirm,
+        );
+        let request_id = outstanding(busy);
+
+        let rescanned = busy.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(
+            rescanned.library_menu, busy.library_menu,
+            "the command is already out; the wait must survive to receive it"
+        );
+        assert_eq!(rescanned.catalog_epoch, EPOCH + 1);
+
+        // The storage task refused the now-stale row, and the note says so.
+        let settled = rescanned.apply_library_event(
+            CTX,
+            LibraryEvent::CacheCleared {
+                request_id,
+                ok: false,
+            },
+        );
+        assert_eq!(
+            settled.library_menu,
             LibraryMenu::Done {
                 action: CLEAR,
                 ok: false
