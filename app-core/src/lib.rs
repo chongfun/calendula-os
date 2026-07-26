@@ -1047,9 +1047,17 @@ impl PortalPsk {
 /// its own idea of the chapter goes stale; only the loaded SD reader has the
 /// uncapped map. The display task reads the real one off the page it just
 /// rendered and sends it back with the acknowledgement.
+///
+/// It names the page as well as the book because it is an answer about one
+/// particular frame, and the reader need not still be on that frame when the
+/// answer lands: input is applied while a render is in flight, and only the
+/// repaint waits. Applied without the page check, a correction for the page
+/// left behind would pair that chapter with the page moved to — and
+/// [`extend_section_command`] reads the two together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChapterCursor {
     pub book_id: u32,
+    pub page: u32,
     pub current_chapter: u16,
 }
 
@@ -2072,8 +2080,15 @@ impl ReaderState {
     ///
     /// Applied before the render lock is cleared, since clearing it is what
     /// lets the next navigation read [`Self::chapter`].
+    ///
+    /// Only onto the frame it describes. A press lands while its render is
+    /// still in flight — the reducer runs and only the repaint is held back —
+    /// so an acknowledgement can arrive for a page the reader has already left,
+    /// and adopting its chapter there would pair one page's number with
+    /// another's chapter. Nothing is lost by declining: the page moved to has
+    /// its own render coming, with its own correction.
     pub fn apply_chapter_cursor(mut self, cursor: ChapterCursor) -> Self {
-        if self.book_id == cursor.book_id {
+        if self.book_id == cursor.book_id && self.page == cursor.page {
             self.chapter = cursor.current_chapter;
         }
         self
@@ -3914,6 +3929,7 @@ mod tests {
     fn the_chapter_correction_rides_with_the_acknowledgement() {
         let cursor = ChapterCursor {
             book_id: 2,
+            page: 120,
             current_chapter: 900,
         };
 
@@ -3953,9 +3969,11 @@ mod tests {
     fn the_chapter_correction_applies_only_to_the_book_still_open() {
         let state = ReaderState::boot();
         let book_id = state.book_id;
+        let page = state.page;
 
         let corrected = state.apply_chapter_cursor(ChapterCursor {
             book_id,
+            page,
             current_chapter: 900,
         });
 
@@ -3970,6 +3988,7 @@ mod tests {
 
         let elsewhere = corrected.apply_chapter_cursor(ChapterCursor {
             book_id: book_id.wrapping_add(1),
+            page,
             current_chapter: 5,
         });
 
@@ -3977,6 +3996,43 @@ mod tests {
             elsewhere.chapter, 900,
             "a correction for another book is not this book's"
         );
+    }
+
+    /// A press is applied while its render is still in flight -- the reducer
+    /// runs and only the repaint waits -- so the acknowledgement for the page
+    /// left behind arrives after the reader has moved on. Adopting its chapter
+    /// then would pair one page's number with another's chapter, and
+    /// `extend_section_command` reads the two together.
+    #[test]
+    fn a_late_correction_does_not_land_on_the_page_moved_to() {
+        let state = reading(0, 3, 120);
+        let rendering_page = state.page;
+        let chapter_of_that_page = state.chapter;
+
+        // Page P is on the panel; the press for Q lands before its
+        // acknowledgement does.
+        let moved_on = press(state, Button::Next);
+        assert_ne!(moved_on.page, rendering_page, "the reader turned the page");
+
+        let settled = moved_on.apply_chapter_cursor(ChapterCursor {
+            book_id: moved_on.book_id,
+            page: rendering_page,
+            current_chapter: chapter_of_that_page.wrapping_add(7),
+        });
+
+        assert_eq!(
+            settled.chapter, moved_on.chapter,
+            "the correction belongs to the page that was rendered, not this one"
+        );
+
+        // Q's own render answers for Q.
+        let settled = settled.apply_chapter_cursor(ChapterCursor {
+            book_id: settled.book_id,
+            page: settled.page,
+            current_chapter: 900,
+        });
+
+        assert_eq!(settled.chapter, 900, "the matching correction still lands");
     }
 
     /// The channel is never made room in: a full queue leaves the

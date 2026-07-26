@@ -284,6 +284,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         )
                         .map(|current_chapter| ChapterCursor {
                             book_id: request.book_id,
+                            page: request.page,
                             current_chapter,
                         })
                     } else {
