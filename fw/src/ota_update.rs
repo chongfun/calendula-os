@@ -283,15 +283,14 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     Ok(Staged { action, layout })
 }
 
-/// Whether the anchor slot holds a Calendula image, i.e. one that will consume
-/// the trigger file we are about to leave behind for it.
+/// Whether the anchor slot holds firmware that will consume the trigger file we
+/// are about to leave behind for it.
 ///
-/// A bare magic check is not enough here: a mixed install can leave CrossPoint
-/// or the stock firmware in slot 0, and bouncing into one of those would move
-/// the user off their firmware *and* strand the update, since nothing there
-/// knows what `FWUPDATE.BIN` is. Matching the app descriptor's `project_name`
-/// keeps the bounce to firmware that can finish the job. An older Calendula
-/// still matches, and applies the update from its own inactive-slot logic.
+/// A bare magic check is not enough: a mixed install can leave CrossPoint or the
+/// stock firmware in slot 0, and neither knows what the trigger file is. Nor is
+/// the product name enough — see [`crate::PROJECT_NAME`] for why the board and
+/// updater generation are part of the identity. The rule is
+/// [`ota::anchor_can_apply_update`]; this is the flash read that answers it.
 fn anchor_holds_our_firmware(flash: &mut FlashStorage, layout: &ota::OtaLayout) -> bool {
     let anchor = layout.slots[ANCHOR_SLOT as usize];
 
@@ -308,8 +307,11 @@ fn anchor_holds_our_firmware(flash: &mut FlashStorage, layout: &ota::OtaLayout) 
     {
         return false;
     }
-    if ota::project_name(&name) != crate::PROJECT_NAME.as_bytes() {
-        esp_println::println!("ota: slot {} holds foreign firmware", ANCHOR_SLOT);
+    if !ota::anchor_can_apply_update(&name, crate::PROJECT_NAME.as_bytes()) {
+        esp_println::println!(
+            "ota: slot {} holds firmware of another identity; it could not apply this update",
+            ANCHOR_SLOT
+        );
         return false;
     }
     true

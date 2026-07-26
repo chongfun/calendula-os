@@ -214,11 +214,23 @@ The trade-off: an update staged while you are *already* running from slot 1
 can't be written in place, because that would erase the running firmware. That
 boot instead points `otadata` back at the anchor and resets **without** deleting
 `FWUPDATE.BIN`, so the anchor boot applies it into slot 1 on the next pass. You
-see two reboots instead of one; slot 0 still never gets written. If slot 0 holds
-a *foreign* firmware (a mixed install with CrossPoint or the stock app, detected
-by the app descriptor's `project_name`), Calendula refuses to bounce rather than
-move you off your firmware and strand the update — use a computer or the OEM
-updater in that case.
+see two reboots instead of one; slot 0 still never gets written.
+
+Calendula only bounces into an anchor that could actually finish the job. Each
+build stamps a firmware identity into its app descriptor —
+`CalendulaOS <board> u<updater-generation> (MarigoldOS)` — and the anchor's must
+match exactly. That rules out three cases which would otherwise leave you on a
+firmware that ignores your trigger file, with no way back (the hatch is a no-op
+once you are *on* slot 0):
+
+- a **foreign** firmware, from a mixed install with CrossPoint or the stock app;
+- a build for the **other board**, which drives a different panel and looks for
+  the other trigger filename (`FWUPDATE.BIN` vs `FWUPDX3.BIN`);
+- a build from an **older updater generation**, which may not recognise this
+  trigger at all.
+
+In any of those, the update is refused and left for you to apply with a computer
+or the OEM updater.
 
 ### Backing out a bad update
 
@@ -282,9 +294,12 @@ Implemented and verified on host tooling:
       owns the ADC. Verified on device that it does **not** false-trigger on an
       idle boot; the band values are the same ones the input task uses daily, and
       the otadata switch is the mechanism the self-test already proved.
-      The combo must now read held on 3 consecutive polls 4 ms apart (~12 ms of
-      continuous hold, giving up after ~32 ms on an idle boot), so a single
+      The combo must now read held on 4 consecutive polls 4 ms apart — 12 ms of
+      continuous hold, giving up after 28 ms on an idle boot — so a single
       reading taken while the ADC settles can neither arm nor miss the switch.
+      (N readings span N-1 delays, so those windows are derived constants,
+      `CONFIRM_WINDOW_MS`/`MAX_WINDOW_MS`, asserted against a replay of the poll
+      loop rather than written down.)
       Detection is derived from the input task's own ladder tables
       (`app_core::buttons`), so a recalibrated band cannot move the hatch off the
       buttons documented here. The confirm state machine
@@ -297,9 +312,10 @@ Implemented and verified on host tooling:
       hatch's fallback image is the one first installed and cannot be consumed by
       an update. An update staged while running from slot 1 bounces through the
       anchor (one extra reboot, trigger file preserved) rather than erasing the
-      running firmware; a foreign anchor is detected by app-descriptor
-      `project_name` and refused. Descriptor offset (`0x50`) verified against a
-      built `firmware.bin`.
+      running firmware; an anchor that could not apply the update — foreign,
+      built for the other board, or from an older updater generation — is
+      detected by the app-descriptor firmware identity and refused. Descriptor
+      offset (`0x50`) and both boards' identities verified against built images.
 
 - [x] **Slot policy host-tested across reboots** (`proto::ota`) — the decisions
       (`plan_update_action`, `plan_recovery_switch`, `project_name`) are sans-IO

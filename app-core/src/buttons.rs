@@ -119,9 +119,8 @@ pub enum ComboVerdict {
 /// FreeInk's `RecoveryBoot` polls 16 times for 5 consecutive holds at ~6 ms,
 /// but most of that budget covers `InputManager`'s debounce state machine
 /// warming up, which reading the ADC directly doesn't have. The shorter budget
-/// here still spans ~12 ms of continuous hold, and gives up after ~32 ms on an
-/// idle boot — the overwhelmingly common case, including every deep-sleep wake,
-/// where the added latency is felt.
+/// here still spans [`ComboConfirmer::CONFIRM_WINDOW_MS`] of continuous hold,
+/// and gives up after [`ComboConfirmer::MAX_WINDOW_MS`] on an idle boot.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ComboConfirmer {
     consecutive: u8,
@@ -132,9 +131,20 @@ impl ComboConfirmer {
     /// Readings taken before giving up.
     pub const MAX_POLLS: u8 = 8;
     /// Consecutive in-band readings that confirm a hold.
-    pub const CONFIRM_POLLS: u8 = 3;
+    pub const CONFIRM_POLLS: u8 = 4;
     /// Gap the caller should leave between readings.
     pub const POLL_MS: u32 = 4;
+
+    /// Milliseconds of continuous hold a confirmation actually observes.
+    ///
+    /// Derived, not asserted in prose: the first reading is taken immediately
+    /// and the caller only delays *between* readings, so N readings span N-1
+    /// gaps. Stating the window as a literal is how it drifted from the code
+    /// before.
+    pub const CONFIRM_WINDOW_MS: u32 = (Self::CONFIRM_POLLS as u32 - 1) * Self::POLL_MS;
+    /// Worst case an idle boot spends here — the common path, including every
+    /// deep-sleep wake, where the latency is felt.
+    pub const MAX_WINDOW_MS: u32 = (Self::MAX_POLLS as u32 - 1) * Self::POLL_MS;
 
     pub const fn new() -> Self {
         Self {
@@ -311,12 +321,47 @@ mod tests {
         verdict
     }
 
+    /// The window each constant claims must be the window the poll sequence
+    /// actually produces. N readings are separated by N-1 delays, so asserting
+    /// the elapsed time against a hand-written literal is what caught this
+    /// being off by one interval.
     #[test]
-    fn a_steady_hold_confirms_on_the_third_poll() {
+    fn the_stated_windows_match_the_poll_sequence() {
+        // Replay the caller's loop, accumulating the delays it would take.
         let mut confirmer = ComboConfirmer::new();
         let (nav, page) = held();
-        assert_eq!(confirmer.push(nav, page), ComboVerdict::KeepPolling);
-        assert_eq!(confirmer.push(nav, page), ComboVerdict::KeepPolling);
+        let mut elapsed = 0;
+        loop {
+            match confirmer.push(nav, page) {
+                ComboVerdict::Confirmed => break,
+                ComboVerdict::GaveUp => panic!("a steady hold must confirm"),
+                ComboVerdict::KeepPolling => elapsed += ComboConfirmer::POLL_MS,
+            }
+        }
+        assert_eq!(elapsed, ComboConfirmer::CONFIRM_WINDOW_MS);
+        assert_eq!(ComboConfirmer::CONFIRM_WINDOW_MS, 12);
+
+        let mut confirmer = ComboConfirmer::new();
+        let (nav, page) = idle();
+        let mut elapsed = 0;
+        loop {
+            match confirmer.push(nav, page) {
+                ComboVerdict::GaveUp => break,
+                ComboVerdict::Confirmed => panic!("an idle ladder must not confirm"),
+                ComboVerdict::KeepPolling => elapsed += ComboConfirmer::POLL_MS,
+            }
+        }
+        assert_eq!(elapsed, ComboConfirmer::MAX_WINDOW_MS);
+        assert_eq!(ComboConfirmer::MAX_WINDOW_MS, 28);
+    }
+
+    #[test]
+    fn a_steady_hold_confirms_on_the_fourth_poll() {
+        let mut confirmer = ComboConfirmer::new();
+        let (nav, page) = held();
+        for _ in 1..ComboConfirmer::CONFIRM_POLLS {
+            assert_eq!(confirmer.push(nav, page), ComboVerdict::KeepPolling);
+        }
         assert_eq!(confirmer.push(nav, page), ComboVerdict::Confirmed);
         assert_eq!(confirmer.consecutive(), ComboConfirmer::CONFIRM_POLLS);
     }
@@ -331,7 +376,7 @@ mod tests {
     #[test]
     fn a_hold_still_confirms_after_unsettled_first_readings() {
         assert_eq!(
-            run(&[false, false, true, true, true]),
+            run(&[false, false, true, true, true, true]),
             ComboVerdict::Confirmed
         );
     }
@@ -347,8 +392,8 @@ mod tests {
 
     #[test]
     fn an_interrupted_run_starts_the_count_over() {
-        // Two holds, a break, then three: the first two don't carry over, so
-        // confirmation comes from the second run, on poll 6 rather than poll 5.
+        // Two holds, a break, then four: the first two don't carry over, so
+        // confirmation comes from the second run, on poll 7 rather than poll 6.
         let mut confirmer = ComboConfirmer::new();
         let (nav, page) = held();
         let (idle_nav, idle_page) = idle();
@@ -359,8 +404,9 @@ mod tests {
             ComboVerdict::KeepPolling
         );
         assert_eq!(confirmer.consecutive(), 0, "the break must reset the run");
-        assert_eq!(confirmer.push(nav, page), ComboVerdict::KeepPolling);
-        assert_eq!(confirmer.push(nav, page), ComboVerdict::KeepPolling);
+        for _ in 1..ComboConfirmer::CONFIRM_POLLS {
+            assert_eq!(confirmer.push(nav, page), ComboVerdict::KeepPolling);
+        }
         assert_eq!(confirmer.push(nav, page), ComboVerdict::Confirmed);
     }
 

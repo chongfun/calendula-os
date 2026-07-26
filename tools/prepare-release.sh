@@ -48,8 +48,12 @@ echo "==> verifying descriptor stamps in the built ELF"
 ELF=target/riscv32imc-unknown-none-elf/release/fw
 strings "$ELF" | grep -Fx "$VER" >/dev/null || {
   echo "error: version stamp '$VER' not found in $ELF" >&2; exit 1; }
-strings "$ELF" | grep -F "CalendulaOS (MarigoldOS)" >/dev/null || {
-  echo "error: project_name stamp missing from $ELF" >&2; exit 1; }
+# The descriptor identity is per-board (proto::ota::IDENTITY_X4/X3) because the
+# updater refuses to bounce into an anchor built for the other panel. This is the
+# X4 ELF, so require the X4 identity specifically -- a stray X3 build here would
+# otherwise pass a product-name-only check.
+strings "$ELF" | grep -F "CalendulaOS X4" >/dev/null || {
+  echo "error: X4 project_name stamp missing from $ELF" >&2; exit 1; }
 
 echo "==> web/index.html labels -> v$VER, ~$SIZE MB"
 export SIZE

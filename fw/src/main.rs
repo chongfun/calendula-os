@@ -38,10 +38,36 @@ const fn desc_field<const N: usize>(s: &str) -> [u8; N] {
     out
 }
 
-/// The app descriptor's `project_name`. Also read back out of flash by
-/// `ota_update` to tell our own images from a foreign firmware sharing the
-/// device, so the two must stay one constant.
-pub const PROJECT_NAME: &str = "CalendulaOS (MarigoldOS)";
+/// The app descriptor's `project_name`, and the identity `ota_update` reads
+/// back out of flash to decide whether the slot-0 anchor can apply an update.
+///
+/// Format: `CalendulaOS <board> u<updater-generation> (MarigoldOS)`.
+///
+/// The product name alone is not enough to answer that question. The X4 and X3
+/// builds are the same product but take different OTA trigger filenames
+/// (`FWUPDATE.BIN` vs `FWUPDX3.BIN`) and drive different panels and battery
+/// gauges, so bouncing into an anchor built for the other board would boot
+/// firmware for the wrong hardware *and* strand the update, since that image
+/// never looks for this board's trigger. The board is therefore part of the
+/// identity. So is a generation digit, bumped whenever the trigger filename or
+/// the update hand-off changes, so an anchor too old to recognise this trigger
+/// is refused rather than booted into.
+///
+/// The strings themselves live in [`proto::ota`], beside the comparison that
+/// reads them back and the tests that pin them, so the firmware cannot stamp
+/// one identity while the updater expects another.
+#[cfg(not(feature = "device-x3"))]
+pub const PROJECT_NAME: &str = proto::ota::IDENTITY_X4;
+#[cfg(feature = "device-x3")]
+pub const PROJECT_NAME: &str = proto::ota::IDENTITY_X3;
+
+// The descriptor field is a fixed 32 bytes; `desc_field` would fail const
+// evaluation on an overlong identity, but with an index panic rather than a
+// reason.
+const _: () = assert!(
+    PROJECT_NAME.len() <= 32,
+    "PROJECT_NAME must fit the app descriptor's project_name field"
+);
 
 #[allow(unsafe_code)]
 #[link_section = ".rodata_desc"]

@@ -526,6 +526,20 @@ pub const APP_DESC_PROJECT_NAME_OFFSET: u32 = 0x20 + 48;
 /// Length of the descriptor's fixed-width `project_name` field.
 pub const APP_DESC_PROJECT_NAME_LEN: usize = 32;
 
+/// The firmware identity each device build stamps into its app descriptor, and
+/// compares an anchor against before bouncing an update into it.
+///
+/// Format: `CalendulaOS <board> u<updater-generation> (MarigoldOS)`. Both
+/// builds are the same product at the same version, so the product name alone
+/// cannot answer "could this anchor apply my update?" — the board decides which
+/// trigger filename and which panel the image is for, and the generation digit
+/// is bumped whenever the trigger filename or the update hand-off changes.
+/// `fw` selects one of these by feature; they live here so the strings the
+/// firmware stamps and the strings the tests check are the same constants.
+pub const IDENTITY_X4: &str = "CalendulaOS X4 u1 (MarigoldOS)";
+/// See [`IDENTITY_X4`].
+pub const IDENTITY_X3: &str = "CalendulaOS X3 u1 (MarigoldOS)";
+
 /// The NUL-terminated name inside a fixed-width descriptor `project_name`
 /// field. An unterminated field is taken whole, matching how the bootloader
 /// treats a name that exactly fills the space.
@@ -535,6 +549,31 @@ pub fn project_name(field: &[u8; APP_DESC_PROJECT_NAME_LEN]) -> &[u8] {
         .position(|&b| b == 0)
         .unwrap_or(APP_DESC_PROJECT_NAME_LEN);
     &field[..end]
+}
+
+/// Whether the anchor slot's firmware could itself apply the update the running
+/// firmware found — the precondition for [`UpdateAction::BounceToAnchor`].
+///
+/// `anchor_field` is the raw descriptor field read from the anchor slot, and
+/// `running_identity` the running build's own. The test is exact equality, not
+/// a product-name prefix: the identity carries the board and the updater
+/// generation as well as the product, and a difference in *any* of them means
+/// the anchor would not consume this trigger file. An anchor for the other
+/// board would boot firmware for the wrong panel and never look for this
+/// board's trigger filename; an anchor from an older updater generation may not
+/// recognise the trigger at all. Both must refuse rather than bounce.
+///
+/// Deliberately stricter than the recovery hatch's own check
+/// ([`plan_recovery_switch`], which only asks for a bootable image). The hatch
+/// is an explicit user action whose whole purpose can be falling back to a
+/// foreign firmware — CrossPoint or the stock app — parked in the anchor. A
+/// bounce is automatic and unrequested, so it has to be sure the anchor will
+/// finish the job.
+pub fn anchor_can_apply_update(
+    anchor_field: &[u8; APP_DESC_PROJECT_NAME_LEN],
+    running_identity: &[u8],
+) -> bool {
+    project_name(anchor_field) == running_identity
 }
 
 /// What a boot that found a pending, already-validated update image should do.
@@ -1031,6 +1070,79 @@ mod tests {
     #[test]
     fn project_name_of_an_erased_field_is_empty() {
         assert_eq!(project_name(&[0u8; APP_DESC_PROJECT_NAME_LEN]), b"");
+    }
+
+    /// A descriptor field as it sits in flash: the identity, zero-padded.
+    fn descriptor_field(identity: &[u8]) -> [u8; APP_DESC_PROJECT_NAME_LEN] {
+        let mut field = [0u8; APP_DESC_PROJECT_NAME_LEN];
+        field[..identity.len()].copy_from_slice(identity);
+        field
+    }
+
+    // The identities the two device builds stamp — the same constants `fw`
+    // puts in the descriptor, so these tests cannot drift from the firmware.
+    const X4: &[u8] = IDENTITY_X4.as_bytes();
+    const X3: &[u8] = IDENTITY_X3.as_bytes();
+
+    #[test]
+    fn an_anchor_of_the_same_identity_can_apply_the_update() {
+        assert!(anchor_can_apply_update(&descriptor_field(X4), X4));
+        assert!(anchor_can_apply_update(&descriptor_field(X3), X3));
+    }
+
+    /// The gap this identity closes: both boards ship the same product under
+    /// the same version, but take different trigger filenames and drive
+    /// different panels, so neither may bounce into the other.
+    #[test]
+    fn an_anchor_for_the_other_board_cannot_apply_the_update() {
+        assert!(!anchor_can_apply_update(&descriptor_field(X3), X4));
+        assert!(!anchor_can_apply_update(&descriptor_field(X4), X3));
+    }
+
+    /// Same product, same board, older updater: it may not know this trigger.
+    #[test]
+    fn an_anchor_of_an_older_updater_generation_cannot_apply_the_update() {
+        let older = b"CalendulaOS X4 u0 (MarigoldOS)";
+        assert!(!anchor_can_apply_update(&descriptor_field(older), X4));
+    }
+
+    /// The pre-identity builds, whose descriptor carried only the product name.
+    #[test]
+    fn an_anchor_predating_the_board_identity_cannot_apply_the_update() {
+        let legacy = b"CalendulaOS (MarigoldOS)";
+        assert!(!anchor_can_apply_update(&descriptor_field(legacy), X4));
+    }
+
+    #[test]
+    fn a_foreign_or_erased_anchor_cannot_apply_the_update() {
+        assert!(!anchor_can_apply_update(&descriptor_field(b"CrossInk"), X4));
+        assert!(!anchor_can_apply_update(
+            &[0u8; APP_DESC_PROJECT_NAME_LEN],
+            X4
+        ));
+        assert!(!anchor_can_apply_update(
+            &[0xFFu8; APP_DESC_PROJECT_NAME_LEN],
+            X4
+        ));
+    }
+
+    /// A prefix match would have accepted the other board; equality must not.
+    #[test]
+    fn a_prefix_of_the_identity_is_not_a_match() {
+        assert!(!anchor_can_apply_update(
+            &descriptor_field(b"CalendulaOS X4"),
+            X4
+        ));
+    }
+
+    /// Every identity has to survive the round trip through the fixed-width
+    /// field the bootloader actually stores.
+    #[test]
+    fn the_identities_fit_the_descriptor_field() {
+        for identity in [X4, X3] {
+            assert!(identity.len() <= APP_DESC_PROJECT_NAME_LEN);
+            assert_eq!(project_name(&descriptor_field(identity)), identity);
+        }
     }
 
     #[test]
