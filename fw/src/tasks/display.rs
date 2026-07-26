@@ -23,7 +23,6 @@ use core::cell::Cell;
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
-use display::BAND_BYTES;
 use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -65,8 +64,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     // The previous-frame buffer sits in dram2 so the radio's statics fit
     // in main DRAM; same exclusive &'static mut as the old local cell.
     let prev_fb = crate::sync_mem::take_prev_fb().expect("prev_fb claimed once");
-    static TX_BAND: static_cell::StaticCell<[u8; BAND_BYTES]> = static_cell::StaticCell::new();
-    let tx_band = TX_BAND.init([0; BAND_BYTES]);
+
     let mut epub_scratch = None;
     // Storage-command admission for the sync session lifecycle; the loan
     // transition and refusal rules live in app-core with the contracts.
@@ -257,7 +255,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     &mut epd,
                     fb,
                     prev_fb,
-                    tx_band,
                     refresh_planner.screen_on(),
                     mode,
                     prev_prestaged,
@@ -300,9 +297,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                     let prestage_start = Instant::now();
-                    prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
-                        .await
-                        .is_ok();
+                    prev_prestaged = display_flush::prestage_previous(&mut epd, fb).await.is_ok();
                     esp_println::println!(
                         "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} prestage_ms={} t_ms={}",
                         request.view,
@@ -461,7 +456,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     &mut epd,
                     fb,
                     prev_fb,
-                    tx_band,
                     refresh_planner.screen_on(),
                     RefreshMode::Full,
                     prev_prestaged,
@@ -569,7 +563,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                                 &mut epd,
                                 fb,
                                 prev_fb,
-                                tx_band,
                                 refresh_planner.screen_on(),
                                 mode,
                                 prev_prestaged,

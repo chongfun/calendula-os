@@ -2,13 +2,13 @@ use crate::panel_common::{
     cmd_history_entry, expect_len, ram_history_entry, HISTORY_DEEP_SLEEP, HISTORY_RESET,
 };
 use display::epd::{
-    fill_transformed_band, ram_x_counter, ram_x_range, ram_y_counter, ram_y_range, RefreshMode,
-    SpiOp, CMD_DEEP_SLEEP, CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2,
-    CMD_MASTER_ACTIVATION, CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER,
-    CMD_SET_RAM_Y_RANGE, CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, INIT_SEQUENCE,
+    ram_x_counter, ram_x_range, ram_y_counter, ram_y_range, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
+    CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2, CMD_MASTER_ACTIVATION,
+    CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER, CMD_SET_RAM_Y_RANGE,
+    CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, INIT_SEQUENCE,
 };
 use display::fb::Framebuffer;
-use display::{BAND_BYTES, FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
+use display::{FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
 
 #[derive(Debug)]
 pub struct PanelModel {
@@ -129,7 +129,10 @@ impl PanelModel {
                 &display::epd::FAST_CLEAN_TEMPERATURE,
             )?;
         }
-        self.command(CMD_DISPLAY_UPDATE_CTRL1, &display::epd::update_control_1(mode))?;
+        self.command(
+            CMD_DISPLAY_UPDATE_CTRL1,
+            &display::epd::update_control_1(mode),
+        )?;
         self.command(
             CMD_DISPLAY_UPDATE_CTRL2,
             &[display::epd::update_control_2(mode, true, false)],
@@ -151,7 +154,11 @@ impl PanelModel {
     pub fn deep_sleep(&mut self) -> Result<(), String> {
         self.command(
             CMD_DISPLAY_UPDATE_CTRL2,
-            &[display::epd::update_control_2(RefreshMode::PowerDown, true, false)],
+            &[display::epd::update_control_2(
+                RefreshMode::PowerDown,
+                true,
+                false,
+            )],
         )?;
         self.command(CMD_MASTER_ACTIVATION, &[])?;
         self.command(CMD_DEEP_SLEEP, &[0x01])?;
@@ -187,15 +194,15 @@ impl PanelModel {
             CMD_WRITE_RAM_RED => &mut self.red_ram,
             _ => return Err(format!("unsupported RAM command 0x{ram_command:02X}")),
         };
-        let mut band = [0u8; BAND_BYTES];
         let mut y = 0;
         while y < HEIGHT {
-            let len = fill_transformed_band(fb, y, &mut band);
+            let band = fb.band(y, display::BAND_ROWS);
             let start = y * ROW_BYTES;
-            target[start..start + len].copy_from_slice(&band[..len]);
+            target[start..start + band.len()].copy_from_slice(band);
             y += display::BAND_ROWS;
         }
-        self.history.push(ram_history_entry(ram_command, WIDTH, HEIGHT));
+        self.history
+            .push(ram_history_entry(ram_command, WIDTH, HEIGHT));
         Ok(())
     }
 

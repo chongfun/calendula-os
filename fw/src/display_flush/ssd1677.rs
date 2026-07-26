@@ -1,14 +1,13 @@
 use super::{Epd, PanelError};
 use display::epd::{
-    fill_transformed_band, ram_x_counter, ram_x_range, ram_y_counter, ram_y_range,
-    update_control_1, update_control_2, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
-    CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2, CMD_MASTER_ACTIVATION,
-    CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER, CMD_SET_RAM_Y_RANGE,
-    CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE, FAST_CLEAN_TEMPERATURE,
-    INIT_SEQUENCE, UPDATE_SEQUENCE_LOAD_TEMP,
+    ram_x_counter, ram_x_range, ram_y_counter, ram_y_range, update_control_1, update_control_2,
+    RefreshMode, SpiOp, CMD_DEEP_SLEEP, CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2,
+    CMD_MASTER_ACTIVATION, CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER,
+    CMD_SET_RAM_Y_RANGE, CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE,
+    FAST_CLEAN_TEMPERATURE, INIT_SEQUENCE, UPDATE_SEQUENCE_LOAD_TEMP,
 };
 use display::fb::Framebuffer;
-use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
+use display::{Rect, BAND_ROWS, HEIGHT};
 use embassy_time::Instant;
 
 pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
@@ -28,13 +27,12 @@ pub(crate) async fn flush(
     epd: &mut Epd,
     fb: &Framebuffer,
     prev_fb: &Framebuffer,
-    tx_band: &mut [u8; BAND_BYTES],
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
 ) -> Result<(), PanelError> {
     let bw_start = Instant::now();
-    write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
+    write_ram(epd, CMD_WRITE_RAM_BW, fb).await?;
     esp_println::println!(
         "display: write BW RAM {:?} {} ms",
         mode,
@@ -47,7 +45,7 @@ pub(crate) async fn flush(
             esp_println::println!("display: RED RAM already holds previous");
         } else {
             let red_start = Instant::now();
-            write_ram(epd, CMD_WRITE_RAM_RED, prev_fb, tx_band).await?;
+            write_ram(epd, CMD_WRITE_RAM_RED, prev_fb).await?;
             esp_println::println!(
                 "display: write RED RAM previous {} ms",
                 red_start.elapsed().as_millis()
@@ -55,7 +53,7 @@ pub(crate) async fn flush(
         }
     } else {
         let red_start = Instant::now();
-        write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await?;
+        write_ram(epd, CMD_WRITE_RAM_RED, fb).await?;
         esp_println::println!(
             "display: write RED RAM current {} ms",
             red_start.elapsed().as_millis()
@@ -100,12 +98,8 @@ pub(crate) async fn flush(
 /// Stage `fb` (the frame just shown) into RED RAM while the panel is idle,
 /// so the next fast refresh can skip its previous-frame write entirely.
 /// Runs off the page-turn critical path, right after a refresh settles.
-pub(crate) async fn prestage_previous(
-    epd: &mut Epd,
-    fb: &Framebuffer,
-    tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), PanelError> {
-    write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await
+pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result<(), PanelError> {
+    write_ram(epd, CMD_WRITE_RAM_RED, fb).await
 }
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
@@ -131,12 +125,7 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
     Ok(epd.command(CMD_DEEP_SLEEP, &[0x01]).await?)
 }
 
-async fn write_ram(
-    epd: &mut Epd,
-    ram_command: u8,
-    fb: &Framebuffer,
-    tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), PanelError> {
+async fn write_ram(epd: &mut Epd, ram_command: u8, fb: &Framebuffer) -> Result<(), PanelError> {
     let rect = Rect::FULL;
     epd.command(CMD_SET_RAM_X_RANGE, &ram_x_range(rect)).await?;
     epd.command(CMD_SET_RAM_Y_RANGE, &ram_y_range(rect)).await?;
@@ -149,10 +138,10 @@ async fn write_ram(
     let mut y = 0;
     let mut result = Ok(());
     while y < HEIGHT {
-        let len = fill_transformed_band(fb, y, tx_band);
+        let band = fb.band(y, BAND_ROWS);
         // One DMA transfer per band: SpiDmaBus chunks internally against
         // its 8000-byte buffer, which dma_buffers!(8000) sized to match.
-        if let Err(err) = epd.ram_chunk(&tx_band[..len]).await {
+        if let Err(err) = epd.ram_chunk(band).await {
             result = Err(err);
             break;
         }

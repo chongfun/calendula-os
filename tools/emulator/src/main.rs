@@ -157,7 +157,11 @@ fn scenario_paths(path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
 }
 
 fn output_path(base: &Path, scenario: &Path) -> Result<PathBuf, String> {
-    let suffix = if cfg!(feature = "device-x3") { "-x3" } else { "" };
+    let suffix = if cfg!(feature = "device-x3") {
+        "-x3"
+    } else {
+        ""
+    };
     if base.extension().is_some_and(|ext| ext == "png") {
         return Ok(base.to_owned());
     }

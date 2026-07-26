@@ -14,7 +14,6 @@
 //! clock are all first-boot iteration points.
 
 use super::{Epd, PanelError};
-use display::epd::uc8253::fill_transformed_band;
 use display::epd::uc8253::{
     bank_for, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank, RamPlane, SleepStep,
     CDI_INTERVAL, CMD_DATA_STOP, CMD_DEEP_SLEEP, CMD_DISPLAY_REFRESH, CMD_DTM1, CMD_DTM2,
@@ -23,7 +22,7 @@ use display::epd::uc8253::{
 };
 use display::epd::{RefreshMode, SpiOp};
 use display::fb::Framebuffer;
-use display::{BAND_BYTES, BAND_ROWS, HEIGHT, ROW_BYTES};
+use display::{BAND_ROWS, HEIGHT, ROW_BYTES};
 use embassy_time::{Instant, Timer};
 // riscv32imc has no CAS; portable-atomic provides plain load/store here.
 use portable_atomic::{AtomicBool, Ordering};
@@ -66,7 +65,6 @@ pub(crate) async fn flush(
     epd: &mut Epd,
     fb: &Framebuffer,
     prev_fb: &Framebuffer,
-    tx_band: &mut [u8; BAND_BYTES],
     _screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
@@ -77,18 +75,14 @@ pub(crate) async fn flush(
         plan.requested_mode,
         plan.effective_mode
     );
-    execute_steps(epd, fb, prev_fb, tx_band, plan.effective_mode, plan.steps).await
+    execute_steps(epd, fb, prev_fb, plan.effective_mode, plan.steps).await
 }
 
 /// Stage the just-shown frame into DTM1 ("old" RAM) so the next fast turn's
 /// diff base is loaded off the critical path. The X4's `prestage_previous`
 /// analogue (RED RAM there, DTM1 here).
-pub(crate) async fn prestage_previous(
-    epd: &mut Epd,
-    fb: &Framebuffer,
-    tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), PanelError> {
-    execute_steps(epd, fb, fb, tx_band, RefreshMode::Fast, PRESTAGE_STEPS).await
+pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result<(), PanelError> {
+    execute_steps(epd, fb, fb, RefreshMode::Fast, PRESTAGE_STEPS).await
 }
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
@@ -117,7 +111,6 @@ async fn execute_steps(
     epd: &mut Epd,
     fb: &Framebuffer,
     prev_fb: &Framebuffer,
-    tx_band: &mut [u8; BAND_BYTES],
     mode: RefreshMode,
     steps: &[FlushStep],
 ) -> Result<(), PanelError> {
@@ -134,8 +127,8 @@ async fn execute_steps(
                 };
                 match source {
                     FrameSource::White => fill_plane(epd, command, 0xFF).await?,
-                    FrameSource::Current => send_plane(epd, command, fb, tx_band).await?,
-                    FrameSource::Previous => send_plane(epd, command, prev_fb, tx_band).await?,
+                    FrameSource::Current => send_plane(epd, command, fb).await?,
+                    FrameSource::Previous => send_plane(epd, command, prev_fb).await?,
                 }
             }
             FlushStep::DataStop => epd.command(CMD_DATA_STOP, &[]).await?,
@@ -206,25 +199,19 @@ async fn load_bank(epd: &mut Epd, cdi0: u8, bank: &LutBank) -> Result<(), PanelE
     Ok(())
 }
 
-/// Stream one framebuffer into a RAM plane, band by band, in the panel's
-/// row order (the shared band transform applies the X3's vertical flip).
+/// Stream one already-panel-native framebuffer into a RAM plane, band by band.
 ///
 /// Deliberately does NOT send DATA_STOP: the hardware-proven reference
 /// never puts one between a DTM2 write and the refresh that displays it —
 /// only after DTM1 syncs and white fills. Callers add it where the
 /// reference does.
-async fn send_plane(
-    epd: &mut Epd,
-    ram_cmd: u8,
-    fb: &Framebuffer,
-    tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), PanelError> {
+async fn send_plane(epd: &mut Epd, ram_cmd: u8, fb: &Framebuffer) -> Result<(), PanelError> {
     epd.begin_ram_write(ram_cmd).await?;
     let mut y = 0;
     let mut result = Ok(());
     while y < HEIGHT {
-        let len = fill_transformed_band(fb, y, tx_band);
-        if let Err(err) = epd.ram_chunk(&tx_band[..len]).await {
+        let band = fb.band(y, BAND_ROWS);
+        if let Err(err) = epd.ram_chunk(band).await {
             result = Err(err);
             break;
         }
