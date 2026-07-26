@@ -10,7 +10,7 @@ use app_core::{
     SleepGate, StorageDispatch, SyncStatus,
 };
 use core::sync::atomic::Ordering;
-use embassy_futures::select::{select4, Either4};
+use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_time::{Duration, Instant};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
@@ -61,14 +61,38 @@ pub async fn run() {
     }
 
     loop {
-        match select4(
-            INPUT_EVENTS.receive(),
-            DISPLAY_EVENTS.receive(),
-            LIBRARY_EVENTS.receive(),
-            SYNC_EVENTS.receive(),
+        // The parked queue rides alongside the receivers rather than being
+        // drained only where a display cycle ends: a refused offer used to
+        // wait for the next Settled, and nothing promises another one -- the
+        // commands that freed the channel need not produce any app event. A
+        // parked open would hold `opening_book` and swallow every press until
+        // the reader was rebooted. Racing the send here retries the moment
+        // capacity opens, and staying inside the select is what keeps the
+        // earlier deadlock closed: the library receiver is still live, so the
+        // display task's held event can always land.
+        let received = select(
+            select4(
+                INPUT_EVENTS.receive(),
+                DISPLAY_EVENTS.receive(),
+                LIBRARY_EVENTS.receive(),
+                SYNC_EVENTS.receive(),
+            ),
+            offer_parked_storage(&pending_storage),
         )
-        .await
-        {
+        .await;
+        let event = match received {
+            Either::First(event) => event,
+            Either::Second(command) => {
+                accept_parked_storage(
+                    &mut pending_storage,
+                    &mut opening_book,
+                    &mut suppress_input_until_open_settled,
+                    command,
+                );
+                continue;
+            }
+        };
+        match event {
             Either4::First(event) => {
                 if matches!(event, InputEvent::Sample { button: None, .. }) {
                     // A button-less sample is a pure battery reading (the input
@@ -582,9 +606,9 @@ fn sleep_blockers(
 
 /// Hands parked commands to the storage task in arrival order, for as long as
 /// the channel takes them. A refusal ends the drain with the rest still
-/// parked, in order; nothing is lost, and the next display cycle offers them
-/// again. Async only so it reads like the other arms of the loop — it never
-/// awaits, which is the point (see the body).
+/// parked, in order; nothing is lost, and the loop's own offer branch retries
+/// as soon as a slot frees. Async only so it reads like the other arms of the
+/// loop — it never awaits, which is the point (see the body).
 async fn drain_parked_storage(
     parked: &mut ParkedStorage,
     opening_book: &mut Option<u32>,
@@ -595,18 +619,48 @@ async fn drain_parked_storage(
         // the event arm, where it is neither receiving library events nor
         // returning to its select — and the display task stops taking storage
         // commands while it holds a settling event that only this task can
-        // receive. Two live tasks, each waiting on the other. Leaving the
-        // command parked instead costs it a wait until the next display cycle
-        // ends, which is where this drain runs from.
+        // receive. Two live tasks, each waiting on the other. Waiting for a
+        // slot is only safe from the select, where the receivers stay live.
         if STORAGE_COMMANDS.try_send(command).is_err() {
             return;
         }
-        parked.pop_front();
-        log_storage_command("send", command);
-        if let Some(book_id) = open_book_id(command) {
-            *opening_book = Some(book_id);
-            *suppress_input_until_open_settled = true;
-        }
+        accept_parked_storage(
+            parked,
+            opening_book,
+            suppress_input_until_open_settled,
+            command,
+        );
+    }
+}
+
+/// Waits for the storage task to take the oldest parked command, or forever
+/// when nothing is parked.
+///
+/// Safe to await only as a branch of the main loop's select: losing the race
+/// cancels the send, and winning it means the command is already queued, so
+/// the caller owes it a `pop_front`. `select` polls the receivers first and
+/// returns on the first ready branch, so a completed send is never discarded.
+async fn offer_parked_storage(parked: &ParkedStorage) -> StorageCommand {
+    let Some(command) = parked.front() else {
+        return core::future::pending::<StorageCommand>().await;
+    };
+    STORAGE_COMMANDS.send(command).await;
+    command
+}
+
+/// Records a parked command that has just reached the storage task: it is off
+/// the queue, and an open now owns the input lock until its frame settles.
+fn accept_parked_storage(
+    parked: &mut ParkedStorage,
+    opening_book: &mut Option<u32>,
+    suppress_input_until_open_settled: &mut bool,
+    command: StorageCommand,
+) {
+    parked.pop_front();
+    log_storage_command("send", command);
+    if let Some(book_id) = open_book_id(command) {
+        *opening_book = Some(book_id);
+        *suppress_input_until_open_settled = true;
     }
 }
 
