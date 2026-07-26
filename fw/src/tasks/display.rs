@@ -121,12 +121,12 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
         &mut sd_cs,
         crate::ota_update::apply_pending_update,
     ) {
-        Ok(true) => {
-            esp_println::println!("display: firmware update staged; resetting");
+        Ok(outcome) if outcome.needs_reset() => {
+            esp_println::println!("display: {:?}; resetting", outcome);
             embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
             esp_hal::system::software_reset();
         }
-        Ok(false) => {}
+        Ok(_) => {}
         Err(e) => esp_println::println!("display: update check skipped: {:?}", e),
     }
 

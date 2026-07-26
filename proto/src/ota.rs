@@ -501,6 +501,102 @@ pub fn plan_switch(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Slot policy
+//
+// Slot 0 is a recovery anchor, not half of an A/B pair: in-app updates always
+// land in `UPDATE_SLOT`, and nothing writes `ANCHOR_SLOT`, so the boot-time
+// escape hatch always has a known firmware to fall back to. This is the FreeInk
+// `RecoveryBoot` convention, where the recovery slot is deliberately never
+// reflashed. The decisions live here, apart from the flash and SD I/O that
+// carries them out, so the reboot-crossing behaviour is host-testable.
+// ---------------------------------------------------------------------------
+
+/// The recovery anchor: whatever firmware was first installed at `0x10000`.
+/// Never written by an in-app update.
+pub const ANCHOR_SLOT: u32 = 0;
+/// Where every in-app update lands.
+pub const UPDATE_SLOT: u32 = 1;
+
+/// Offset of the app descriptor's `project_name` within an app image: a 24-byte
+/// image header plus an 8-byte segment header puts `esp_app_desc_t` at `0x20`,
+/// and `project_name` sits 48 bytes into it, past `magic_word`,
+/// `secure_version`, `reserv1[2]`, and `version[32]`.
+pub const APP_DESC_PROJECT_NAME_OFFSET: u32 = 0x20 + 48;
+/// Length of the descriptor's fixed-width `project_name` field.
+pub const APP_DESC_PROJECT_NAME_LEN: usize = 32;
+
+/// The NUL-terminated name inside a fixed-width descriptor `project_name`
+/// field. An unterminated field is taken whole, matching how the bootloader
+/// treats a name that exactly fills the space.
+pub fn project_name(field: &[u8; APP_DESC_PROJECT_NAME_LEN]) -> &[u8] {
+    let end = field
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(APP_DESC_PROJECT_NAME_LEN);
+    &field[..end]
+}
+
+/// What a boot that found a pending, already-validated update image should do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateAction {
+    /// Write the image into [`UPDATE_SLOT`] and select it.
+    WriteUpdateSlot,
+    /// We are running from [`UPDATE_SLOT`], so the image cannot be written
+    /// without erasing the running firmware. Select [`ANCHOR_SLOT`] and reset,
+    /// leaving the trigger for the anchor boot to consume.
+    BounceToAnchor,
+    /// Running from [`UPDATE_SLOT`] with no anchor that could apply the update.
+    /// Bouncing would move the user off their firmware and strand the update.
+    NoUsableAnchor,
+}
+
+impl UpdateAction {
+    /// Whether this action consumes the one-shot trigger file.
+    ///
+    /// Only the bounce keeps it: the anchor boot it hands off to is the one
+    /// that applies the image. Everything else — a completed write, or a
+    /// refusal — must clear the trigger so it cannot re-run or wedge a boot.
+    pub fn consumes_trigger(self) -> bool {
+        !matches!(self, Self::BounceToAnchor)
+    }
+
+    /// The slot `otadata` should select afterwards, if any.
+    pub fn selects_slot(self) -> Option<u32> {
+        match self {
+            Self::WriteUpdateSlot => Some(UPDATE_SLOT),
+            Self::BounceToAnchor => Some(ANCHOR_SLOT),
+            Self::NoUsableAnchor => None,
+        }
+    }
+}
+
+/// Decide what to do with a pending update.
+///
+/// `active_slot` is the slot the bootloader selected for this boot, and
+/// `anchor_usable` whether [`ANCHOR_SLOT`] holds firmware that would itself
+/// apply the trigger file (ours, not a foreign firmware sharing the device).
+pub fn plan_update_action(active_slot: u32, anchor_usable: bool) -> UpdateAction {
+    if active_slot != UPDATE_SLOT {
+        return UpdateAction::WriteUpdateSlot;
+    }
+    if anchor_usable {
+        UpdateAction::BounceToAnchor
+    } else {
+        UpdateAction::NoUsableAnchor
+    }
+}
+
+/// Whether a held recovery combo should repoint `otadata` at the anchor.
+///
+/// `active_slot` is [`active_app_slot`]'s reading — `None` (erased otadata)
+/// means the bootloader already defaults to the anchor, so there is nothing to
+/// undo. `anchor_bootable` only asks for a plausible image: the point is to
+/// leave a misbehaving slot, not to hand off work, so any firmware will do.
+pub fn plan_recovery_switch(active_slot: Option<u32>, anchor_bootable: bool) -> bool {
+    active_slot == Some(UPDATE_SLOT) && anchor_bootable
+}
+
 #[cfg(test)]
 extern crate std;
 
@@ -915,5 +1011,285 @@ mod tests {
         assert_eq!(sw.target_sector, 1);
         assert_eq!(sw.entry.ota_seq, 5); // 4->(3)%2=1 no; 5->(4)%2=0 yes
         assert_eq!((sw.entry.ota_seq - 1) % 2, 0);
+    }
+
+    // --- Slot policy -------------------------------------------------------
+
+    #[test]
+    fn project_name_stops_at_the_terminator() {
+        let mut field = [0u8; APP_DESC_PROJECT_NAME_LEN];
+        field[..5].copy_from_slice(b"hello");
+        assert_eq!(project_name(&field), b"hello");
+    }
+
+    #[test]
+    fn project_name_takes_an_unterminated_field_whole() {
+        let field = [b'x'; APP_DESC_PROJECT_NAME_LEN];
+        assert_eq!(project_name(&field).len(), APP_DESC_PROJECT_NAME_LEN);
+    }
+
+    #[test]
+    fn project_name_of_an_erased_field_is_empty() {
+        assert_eq!(project_name(&[0u8; APP_DESC_PROJECT_NAME_LEN]), b"");
+    }
+
+    #[test]
+    fn an_update_from_the_anchor_writes_the_update_slot() {
+        assert_eq!(
+            plan_update_action(ANCHOR_SLOT, true),
+            UpdateAction::WriteUpdateSlot
+        );
+        // The anchor's contents are irrelevant when we aren't running from the
+        // update slot: nothing needs handing off.
+        assert_eq!(
+            plan_update_action(ANCHOR_SLOT, false),
+            UpdateAction::WriteUpdateSlot
+        );
+    }
+
+    #[test]
+    fn an_update_from_the_update_slot_bounces_through_a_usable_anchor() {
+        assert_eq!(
+            plan_update_action(UPDATE_SLOT, true),
+            UpdateAction::BounceToAnchor
+        );
+    }
+
+    #[test]
+    fn a_foreign_anchor_is_refused_rather_than_bounced_into() {
+        assert_eq!(
+            plan_update_action(UPDATE_SLOT, false),
+            UpdateAction::NoUsableAnchor
+        );
+    }
+
+    #[test]
+    fn only_the_bounce_preserves_the_trigger() {
+        assert!(UpdateAction::WriteUpdateSlot.consumes_trigger());
+        assert!(UpdateAction::NoUsableAnchor.consumes_trigger());
+        assert!(!UpdateAction::BounceToAnchor.consumes_trigger());
+    }
+
+    #[test]
+    fn no_action_ever_selects_the_anchor_as_a_write_target() {
+        for action in [
+            UpdateAction::WriteUpdateSlot,
+            UpdateAction::BounceToAnchor,
+            UpdateAction::NoUsableAnchor,
+        ] {
+            if action == UpdateAction::WriteUpdateSlot {
+                assert_eq!(action.selects_slot(), Some(UPDATE_SLOT));
+                assert_ne!(action.selects_slot(), Some(ANCHOR_SLOT));
+            }
+        }
+        assert_eq!(UpdateAction::NoUsableAnchor.selects_slot(), None);
+    }
+
+    #[test]
+    fn recovery_acts_only_from_the_update_slot_with_a_bootable_anchor() {
+        assert!(plan_recovery_switch(Some(UPDATE_SLOT), true));
+        assert!(!plan_recovery_switch(Some(UPDATE_SLOT), false));
+        assert!(!plan_recovery_switch(Some(ANCHOR_SLOT), true));
+        // Erased otadata already defaults to the anchor: nothing to undo.
+        assert!(!plan_recovery_switch(None, true));
+    }
+
+    // --- The staged-update lifecycle, across reboots ------------------------
+
+    /// Enough of a device to run the update decision over real reboots: two
+    /// otadata sectors the planners actually read and write, the bytes in each
+    /// app slot, and the one-shot trigger file on the card.
+    struct Device {
+        sectors: [[u8; SELECT_ENTRY_LEN]; 2],
+        slots: [&'static str; 2],
+        trigger: Option<&'static str>,
+        anchor_usable: bool,
+    }
+
+    /// What one boot did, for asserting on the sequence.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Boot {
+        /// No trigger present; the reader would start.
+        Ran(u32),
+        Acted(UpdateAction),
+    }
+
+    impl Device {
+        fn new(active_slot: u32, slots: [&'static str; 2], anchor_usable: bool) -> Self {
+            // Seed otadata so the bootloader selects `active_slot`.
+            let seq = active_slot + 1;
+            let mut dev = Self {
+                sectors: [[0xFF; SELECT_ENTRY_LEN]; 2],
+                slots,
+                trigger: None,
+                anchor_usable,
+            };
+            dev.sectors[0] = SelectEntry::new(seq, OTA_IMG_VALID).to_bytes();
+            assert_eq!(dev.active(), active_slot, "seeding picked the wrong slot");
+            dev
+        }
+
+        fn active(&self) -> u32 {
+            active_app_slot(&self.sectors[0], &self.sectors[1], 2).unwrap_or(ANCHOR_SLOT)
+        }
+
+        /// One power-on. Mirrors `fw::ota_update::apply_pending_update`'s
+        /// ordering: decide, consume the trigger, write the image, switch.
+        fn boot(&mut self) -> Boot {
+            let active = self.active();
+            let Some(image) = self.trigger else {
+                return Boot::Ran(active);
+            };
+
+            let action = plan_update_action(active, self.anchor_usable);
+            if action.consumes_trigger() {
+                self.trigger = None;
+            }
+            if action == UpdateAction::WriteUpdateSlot {
+                self.slots[UPDATE_SLOT as usize] = image;
+            }
+            if let Some(dest) = action.selects_slot() {
+                let sw = plan_switch(&self.sectors[0], &self.sectors[1], dest, 2);
+                self.sectors[sw.target_sector] = sw.entry.to_bytes();
+                assert_eq!(self.active(), dest, "the switch did not take effect");
+            }
+            Boot::Acted(action)
+        }
+    }
+
+    #[test]
+    fn an_update_staged_from_the_anchor_lands_in_one_reboot() {
+        let mut dev = Device::new(ANCHOR_SLOT, ["anchor-fw", "old-fw"], true);
+        dev.trigger = Some("new-fw");
+
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::WriteUpdateSlot));
+        assert_eq!(dev.active(), UPDATE_SLOT);
+        assert_eq!(dev.slots[UPDATE_SLOT as usize], "new-fw");
+        assert_eq!(dev.slots[ANCHOR_SLOT as usize], "anchor-fw");
+        assert_eq!(dev.trigger, None, "the trigger must be one-shot");
+
+        // The next boot is an ordinary one.
+        assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
+    }
+
+    /// The hand-off this whole policy rests on: staged while running from the
+    /// update slot, the update still lands, and slot 0 is never written.
+    #[test]
+    fn an_update_staged_from_the_update_slot_bounces_and_then_lands() {
+        let mut dev = Device::new(UPDATE_SLOT, ["anchor-fw", "old-fw"], true);
+        dev.trigger = Some("new-fw");
+
+        // Boot 1: cannot write the slot we run from, so hand off to the anchor.
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::BounceToAnchor));
+        assert_eq!(dev.active(), ANCHOR_SLOT);
+        assert_eq!(
+            dev.trigger,
+            Some("new-fw"),
+            "the bounce must leave the trigger for the anchor boot"
+        );
+        assert_eq!(
+            dev.slots[UPDATE_SLOT as usize], "old-fw",
+            "nothing written yet"
+        );
+
+        // Boot 2: the anchor applies it.
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::WriteUpdateSlot));
+        assert_eq!(dev.active(), UPDATE_SLOT);
+        assert_eq!(dev.slots[UPDATE_SLOT as usize], "new-fw");
+        assert_eq!(dev.trigger, None);
+
+        // Boot 3: settled.
+        assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
+        assert_eq!(dev.slots[ANCHOR_SLOT as usize], "anchor-fw");
+    }
+
+    #[test]
+    fn a_foreign_anchor_refuses_instead_of_stranding_the_update() {
+        let mut dev = Device::new(UPDATE_SLOT, ["crosspoint", "old-fw"], false);
+        dev.trigger = Some("new-fw");
+
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::NoUsableAnchor));
+        // Still on our own firmware, and the trigger is cleared so it cannot
+        // re-run the refusal on every future boot.
+        assert_eq!(dev.active(), UPDATE_SLOT);
+        assert_eq!(dev.trigger, None);
+        assert_eq!(dev.slots[ANCHOR_SLOT as usize], "crosspoint");
+        assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
+    }
+
+    /// The bounce must not be able to loop: whatever slot a boot starts from,
+    /// the sequence reaches a settled state and bounces at most once.
+    #[test]
+    fn the_handoff_always_terminates() {
+        for start in [ANCHOR_SLOT, UPDATE_SLOT] {
+            for anchor_usable in [true, false] {
+                let mut dev = Device::new(start, ["anchor-fw", "old-fw"], anchor_usable);
+                dev.trigger = Some("new-fw");
+
+                let mut bounces = 0;
+                let mut settled = false;
+                for _ in 0..8 {
+                    match dev.boot() {
+                        Boot::Acted(UpdateAction::BounceToAnchor) => bounces += 1,
+                        Boot::Ran(_) => {
+                            settled = true;
+                            break;
+                        }
+                        Boot::Acted(_) => {}
+                    }
+                }
+                assert!(
+                    settled,
+                    "start={start} anchor_usable={anchor_usable} never settled"
+                );
+                assert!(
+                    bounces <= 1,
+                    "start={start} anchor_usable={anchor_usable} bounced {bounces} times"
+                );
+                // The invariant the whole policy exists to protect.
+                assert_eq!(
+                    dev.slots[ANCHOR_SLOT as usize], "anchor-fw",
+                    "the anchor was overwritten"
+                );
+            }
+        }
+    }
+
+    /// Repeated updates keep alternating through the anchor without ever
+    /// writing it — the case plain A/B alternation would have clobbered.
+    #[test]
+    fn many_updates_in_a_row_never_write_the_anchor() {
+        let mut dev = Device::new(ANCHOR_SLOT, ["anchor-fw", "factory"], true);
+        for image in ["fw-1", "fw-2", "fw-3", "fw-4"] {
+            dev.trigger = Some(image);
+            // Each update needs at most a bounce plus a write.
+            for _ in 0..3 {
+                if dev.trigger.is_none() {
+                    break;
+                }
+                dev.boot();
+            }
+            assert_eq!(dev.slots[UPDATE_SLOT as usize], image);
+            assert_eq!(dev.slots[ANCHOR_SLOT as usize], "anchor-fw");
+        }
+    }
+
+    /// After a bounce the hatch is still armed against the firmware the update
+    /// produced: the anchor is intact, so a held combo can back it out.
+    #[test]
+    fn the_hatch_still_works_on_the_firmware_an_update_installed() {
+        let mut dev = Device::new(UPDATE_SLOT, ["anchor-fw", "old-fw"], true);
+        dev.trigger = Some("bad-fw");
+        dev.boot(); // bounce
+        dev.boot(); // write + select
+
+        assert_eq!(dev.active(), UPDATE_SLOT);
+        assert!(plan_recovery_switch(Some(dev.active()), true));
+
+        // The combo's switch lands on the untouched anchor.
+        let sw = plan_switch(&dev.sectors[0], &dev.sectors[1], ANCHOR_SLOT, 2);
+        dev.sectors[sw.target_sector] = sw.entry.to_bytes();
+        assert_eq!(dev.active(), ANCHOR_SLOT);
+        assert_eq!(dev.slots[ANCHOR_SLOT as usize], "anchor-fw");
     }
 }

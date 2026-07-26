@@ -184,27 +184,50 @@ with no computer — this is what keeps a locked unit from being a one-way trip:
    other's image (they share a SoC, but not a display controller or battery
    gauge, so a cross-flash is a black screen).
 2. Reboot. At boot, before the reader starts, the firmware validates the image
-   (`proto::ota::validate_image`), discovers the **inactive** OTA slot from the
-   installed partition table, writes it there, deletes `FWUPDATE.BIN` so it can
-   run only once, flips `otadata` to select the new slot
-   (`proto::ota::plan_switch`), and resets into the new firmware.
+   (`proto::ota::validate_image`), locates the **update slot** in the installed
+   partition table, writes it there, deletes `FWUPDATE.BIN` so it can run only
+   once, flips `otadata` to select it (`proto::ota::plan_switch`), and resets
+   into the new firmware.
    On the first boot after any OTA-slot install (including CrossInk's
    Settings -> SD firmware update flow), Calendula marks the selected `otadata`
    entry valid before the reader starts, so rollback-enabled bootloaders do not
    return to the previous firmware on the next deep-sleep reset.
 
-Only the inactive slot and inactive `otadata` sector are written, so a bad or
+Only the update slot and inactive `otadata` sector are written, so a bad or
 half-copied image never harms the running firmware — the bootloader keeps
 booting the current slot until a complete, valid image flips `otadata`. This
 works on an unlocked unit too (espflash's bootloader is ESP-IDF and honours
 `otadata`), which is how to test it without a locked device.
 
-If an update lands you on a firmware that boots but misbehaves, hold **Back + Up**
-at reset: the recovery hatch repoints `otadata` back at slot 0 (the firmware
-first installed there) and reboots into it. It can't help a firmware that won't
-boot far enough to run the check — that would need a custom bootloader, which no
-app-level firmware provides — so treat it as a strong safety net, not a
-guarantee against every brick.
+### Slot 0 is an anchor, not half of an A/B pair
+
+In-app updates always land in **slot 1**. **Slot 0 is never written** by the
+updater: it keeps whatever was first installed there — by the web flasher,
+`esptool`, or the OEM SD updater, all of which target `0x10000` — so the
+recovery hatch below always has a known firmware to fall back to. This follows
+the FreeInk `RecoveryBoot` convention, where the recovery slot is deliberately
+never reflashed. Plain A/B alternation would eventually write an update over the
+very image the hatch returns to, and would leave the hatch a no-op on every boot
+that happened to be running from slot 0.
+
+The trade-off: an update staged while you are *already* running from slot 1
+can't be written in place, because that would erase the running firmware. That
+boot instead points `otadata` back at the anchor and resets **without** deleting
+`FWUPDATE.BIN`, so the anchor boot applies it into slot 1 on the next pass. You
+see two reboots instead of one; slot 0 still never gets written. If slot 0 holds
+a *foreign* firmware (a mixed install with CrossPoint or the stock app, detected
+by the app descriptor's `project_name`), Calendula refuses to bounce rather than
+move you off your firmware and strand the update — use a computer or the OEM
+updater in that case.
+
+### Backing out a bad update
+
+If an update lands you on a firmware that boots but misbehaves, hold
+**Back + Up** at reset: the recovery hatch confirms the hold across ~12 ms of
+continuous reads, repoints `otadata` back at the slot 0 anchor, and reboots into
+it. It can't help a firmware that won't boot far enough to run the check — that
+would need a custom bootloader, which no app-level firmware provides — so treat
+it as a strong safety net, not a guarantee against every brick.
 
 ## Status
 
@@ -259,6 +282,34 @@ Implemented and verified on host tooling:
       owns the ADC. Verified on device that it does **not** false-trigger on an
       idle boot; the band values are the same ones the input task uses daily, and
       the otadata switch is the mechanism the self-test already proved.
+      The combo must now read held on 3 consecutive polls 4 ms apart (~12 ms of
+      continuous hold, giving up after ~32 ms on an idle boot), so a single
+      reading taken while the ADC settles can neither arm nor miss the switch.
+      Detection is derived from the input task's own ladder tables
+      (`app_core::buttons`), so a recalibrated band cannot move the hatch off the
+      buttons documented here. The confirm state machine
+      (`app_core::buttons::ComboConfirmer`) is sans-IO and host-tested: a steady
+      hold confirms, unsettled first readings still confirm, a transient blip
+      never does, and an idle boot always gives up inside the budget.
+
+- [x] **Slot 0 pinned as the recovery anchor** (`fw::ota_update`) — updates
+      always target slot 1, and nothing in the updater writes slot 0, so the
+      hatch's fallback image is the one first installed and cannot be consumed by
+      an update. An update staged while running from slot 1 bounces through the
+      anchor (one extra reboot, trigger file preserved) rather than erasing the
+      running firmware; a foreign anchor is detected by app-descriptor
+      `project_name` and refused. Descriptor offset (`0x50`) verified against a
+      built `firmware.bin`.
+
+- [x] **Slot policy host-tested across reboots** (`proto::ota`) — the decisions
+      (`plan_update_action`, `plan_recovery_switch`, `project_name`) are sans-IO
+      and tested against a simulated device that carries real `otadata` sectors
+      through successive boots. Covered: an update staged from the anchor lands
+      in one reboot; one staged from the update slot bounces and then lands, with
+      the trigger surviving the first reset; a foreign anchor refuses without
+      stranding the user; the hand-off always terminates and bounces at most
+      once; four updates in a row never write slot 0; and the hatch still finds
+      an intact anchor after an update installed through the bounce.
 
 Not yet done:
 
@@ -268,6 +319,11 @@ Not yet done:
 - [ ] **Live recovery-combo press** — confirm a physical Back+Up hold detects and
       switches on device (detection reuses the input task's proven bands, so this
       is a formality). Optional on-panel progress during an update.
+- [ ] **Bounce-through-the-anchor run on hardware** — the decision and the
+      reboot sequencing are host-tested (above); what remains unproven on device
+      is the I/O around them, specifically that the trigger file really survives
+      the first reset on a physical card. Blocked on the same missing card reader
+      as the end-to-end run above.
 - [ ] **Locked-unit confirmation** — that our app-descriptor eFuse range
       satisfies the stock gate and the OEM SD updater accepts our `update.bin`.
       Needs a locked device; the author's is unlocked.

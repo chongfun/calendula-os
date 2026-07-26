@@ -4,6 +4,9 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
+/// The resistive button ladders, shared by the input task and the boot-time
+/// recovery-combo check.
+pub mod buttons;
 /// The storage/display task's command loop, as sequences a host test can drive.
 pub mod storage_loop;
 

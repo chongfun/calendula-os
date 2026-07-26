@@ -1,29 +1,50 @@
 //! Boot-time firmware self-update from the SD card.
 //!
 //! If `/FWUPDATE.BIN` is present at boot it is validated, written into the
-//! *inactive* OTA slot, selected by flipping `otadata`, deleted (so the next
-//! boot doesn't re-apply it), and the device resets into the new firmware. This
-//! is the recovery/update path that keeps flashing onto a locked unit from
-//! being a one-way trip — the same scheme as the FreeInk SDK's `RecoveryBoot`
-//! and CrossPoint's `FirmwareFlasher`/`OtaBootSwitch`, ported to Rust.
+//! update slot, selected by flipping `otadata`, deleted (so the next boot
+//! doesn't re-apply it), and the device resets into the new firmware. This is
+//! the recovery/update path that keeps flashing onto a locked unit from being a
+//! one-way trip — the same scheme as the FreeInk SDK's `RecoveryBoot` and
+//! CrossPoint's `FirmwareFlasher`/`OtaBootSwitch`, ported to Rust.
 //!
-//! Only the inactive slot and the inactive `otadata` sector are written, so a
+//! # Slot policy: slot 0 is an anchor, not half of an A/B pair
+//!
+//! Updates always land in [`UPDATE_SLOT`] (slot 1). Slot 0 keeps whatever was
+//! first installed there and is never written by this module, so the boot-time
+//! hatch ([`recover_to_slot0`]) always has a known firmware to fall back to.
+//! That is the FreeInk `RecoveryBoot` convention, where the recovery slot is
+//! "deliberately never reflashed"; plain A/B alternation would eventually write
+//! the update over the very image the hatch returns to.
+//!
+//! The cost is that an update staged while already running from slot 1 cannot
+//! be written in place — that would erase the running firmware. Such a boot
+//! instead points `otadata` back at the anchor and resets *without* consuming
+//! the trigger file, so the anchor boot applies the update into slot 1 on the
+//! next pass. One extra reboot, and slot 0 still never gets written.
+//!
+//! Only the update slot and the inactive `otadata` sector are written, so a
 //! failure here never touches the running firmware: the bootloader keeps
 //! selecting the current slot until a complete, valid image flips `otadata`.
 //! Slot locations come from the partition table already installed on the
 //! device; this is essential for locked X3 units that retain the stock layout.
-//! The image format, partition parsing, seq CRC, and slot-switch math live in
-//! [`proto::ota`] and are host-tested; this module is the flash I/O around them.
+//! The image format, partition parsing, seq CRC, slot-switch math, and the slot
+//! policy above ([`ota::plan_update_action`], [`ota::plan_recovery_switch`])
+//! live in [`proto::ota`] and are host-tested — including the reboot-crossing
+//! hand-off, simulated there over real `otadata` sectors. This module is the
+//! flash and SD I/O that answers those decisions and carries them out.
 //!
-//! Untested on hardware as of this writing. Validate on the unlocked unit first
-//! (espflash's bootloader is ESP-IDF and honours `otadata` too), then a locked
-//! one. Flash writes freeze other tasks via a critical section; run this at
-//! boot while the radio is idle.
+//! The flash + `otadata` mechanism is hardware-validated (see `docs/FLASHING.md`);
+//! a full end-to-end `FWUPDATE.BIN` run still awaits a card reader. Flash writes
+//! freeze other tasks via a critical section; run this at boot while the radio
+//! is idle.
 
 use embedded_sdmmc::{BlockDevice, File, Mode, TimeSource};
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use esp_storage::FlashStorage;
-use proto::ota::{self, ImageError, SelectEntry, SELECT_ENTRY_LEN};
+use proto::ota::{
+    self, ImageError, SelectEntry, UpdateAction, ANCHOR_SLOT, APP_DESC_PROJECT_NAME_LEN,
+    APP_DESC_PROJECT_NAME_OFFSET, SELECT_ENTRY_LEN, UPDATE_SLOT,
+};
 
 use crate::sd_session::SdRoot;
 
@@ -64,6 +85,23 @@ pub enum UpdateError {
     Flash,
 }
 
+/// What the boot-time update check decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// Nothing staged, or nothing could be done; carry on booting.
+    Idle,
+    /// The planned [`UpdateAction`] was carried out and `otadata` now selects a
+    /// new slot; the caller should reset into it.
+    Acted(UpdateAction),
+}
+
+impl UpdateOutcome {
+    /// Whether the boot should end in a reset into the newly selected slot.
+    pub fn needs_reset(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
 /// Adapts an open SD file to [`ota::ImageSource`] for the validation pass.
 struct SdFile<'f, D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
     &'f File<'f, D, T, MD, MF, MV>,
@@ -98,66 +136,97 @@ fn read_file_exact<
     Ok(())
 }
 
-/// Check for a pending SD update and apply it. Returns `true` if an update was
-/// flashed and the caller should now `software_reset()` into it. On any failure
-/// the trigger file is removed so a corrupt image can't wedge every boot, and
-/// the running firmware is left untouched.
-pub fn apply_pending_update(root: &SdRoot) -> bool {
-    let outcome = try_apply(root);
-    // One-shot either way: a flashed image must not re-flash, and a bad one
-    // must not wedge every boot. Both run here rather than inside `try_apply`,
-    // where the trigger's own read handle is still open — reclaiming its
-    // clusters needs the file closed first.
-    let mut trigger_removed = false;
-    if !matches!(outcome, Err(UpdateError::NoTrigger)) {
-        trigger_removed = upload_store::remove_file_reclaiming_clusters(root, TRIGGER_FILE)
-            != upload_store::RemoveStatus::Failed;
-    }
-    match outcome {
-        Ok((dest, layout)) => {
-            if !trigger_removed {
-                esp_println::println!(
-                    "ota: WARNING trigger removal failed; aborting otadata switch to prevent boot loop"
-                );
-                return false;
-            }
-
-            // Point otadata at the freshly written slot
-            let mut flash = flash_storage();
-            let (s0, s1) = match read_otadata(&mut flash, layout.otadata.offset) {
-                Ok(s) => s,
-                Err(e) => {
-                    esp_println::println!("ota: failed to read otadata for switch: {:?}", e);
-                    return false;
-                }
-            };
-            let switch = ota::plan_switch(&s0, &s1, dest, OTA_COUNT);
-            if let Err(e) = write_select_entry(
-                &mut flash,
-                layout.otadata.offset,
-                switch.target_sector,
-                &switch.entry,
-            ) {
-                esp_println::println!("ota: failed to write otadata switch: {:?}", e);
-                return false;
-            }
-            esp_println::println!(
-                "ota: otadata sector {} -> seq {}",
-                switch.target_sector,
-                switch.entry.ota_seq
-            );
-            esp_println::println!("ota: update applied; resetting");
-            true
-        }
-        Err(UpdateError::NoTrigger) => false,
+/// Check for a pending SD update and apply it. A non-[`UpdateOutcome::Idle`]
+/// return means the caller should now `software_reset()` into the slot
+/// `otadata` selects. On any failure the trigger file is removed so a corrupt
+/// image can't wedge every boot, and the running firmware is left untouched.
+pub fn apply_pending_update(root: &SdRoot) -> UpdateOutcome {
+    let staged = match try_apply(root) {
+        Ok(staged) => staged,
+        Err(UpdateError::NoTrigger) => return UpdateOutcome::Idle,
         Err(e) => {
             esp_println::println!("ota: update failed: {:?}", e);
-            false
+            // Still a one-shot: clear the trigger so a bad image or a refusal
+            // can't re-run on every boot.
+            remove_trigger(root);
+            return UpdateOutcome::Idle;
         }
+    };
+
+    // `consumes_trigger` is the tested rule: everything but the bounce clears
+    // it. The bounce is the exception because the anchor boot it hands off to
+    // is the one that applies the image — removing it here would discard the
+    // update instead. Removal runs here rather than inside `try_apply`, where
+    // the trigger's own read handle is still open; reclaiming its clusters
+    // needs the file closed.
+    if staged.action.consumes_trigger() && !remove_trigger(root) {
+        esp_println::println!(
+            "ota: WARNING trigger removal failed; aborting otadata switch to prevent boot loop"
+        );
+        return UpdateOutcome::Idle;
     }
+
+    let Some(dest) = staged.action.selects_slot() else {
+        return UpdateOutcome::Idle;
+    };
+    if !select_slot(&staged.layout, dest) {
+        return UpdateOutcome::Idle;
+    }
+    if staged.action == UpdateAction::BounceToAnchor {
+        esp_println::println!(
+            "ota: update pending while running from slot {}; bouncing to the slot {} anchor to apply it",
+            UPDATE_SLOT,
+            ANCHOR_SLOT
+        );
+    } else {
+        esp_println::println!("ota: update applied; resetting");
+    }
+    UpdateOutcome::Acted(staged.action)
 }
 
-fn try_apply(root: &SdRoot) -> Result<(u32, ota::OtaLayout), UpdateError> {
+/// Delete the one-shot trigger, reclaiming its clusters. Returns whether the
+/// card no longer holds it.
+fn remove_trigger(root: &SdRoot) -> bool {
+    upload_store::remove_file_reclaiming_clusters(root, TRIGGER_FILE)
+        != upload_store::RemoveStatus::Failed
+}
+
+/// Point `otadata` at `dest_slot`. Returns whether the write landed.
+fn select_slot(layout: &ota::OtaLayout, dest_slot: u32) -> bool {
+    let mut flash = flash_storage();
+    let (s0, s1) = match read_otadata(&mut flash, layout.otadata.offset) {
+        Ok(s) => s,
+        Err(e) => {
+            esp_println::println!("ota: failed to read otadata for switch: {:?}", e);
+            return false;
+        }
+    };
+    let switch = ota::plan_switch(&s0, &s1, dest_slot, OTA_COUNT);
+    if let Err(e) = write_select_entry(
+        &mut flash,
+        layout.otadata.offset,
+        switch.target_sector,
+        &switch.entry,
+    ) {
+        esp_println::println!("ota: failed to write otadata switch: {:?}", e);
+        return false;
+    }
+    esp_println::println!(
+        "ota: otadata sector {} -> seq {} (slot {})",
+        switch.target_sector,
+        switch.entry.ota_seq,
+        dest_slot
+    );
+    true
+}
+
+/// A carried-out [`UpdateAction`] plus the layout its `otadata` write needs.
+struct Staged {
+    action: UpdateAction,
+    layout: ota::OtaLayout,
+}
+
+fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     let file = root
         .open_file_in_dir(TRIGGER_FILE, Mode::ReadOnly)
         .map_err(|e| match e {
@@ -170,29 +239,80 @@ fn try_apply(root: &SdRoot) -> Result<(u32, ota::OtaLayout), UpdateError> {
     let mut flash = flash_storage();
     let layout = read_ota_layout(&mut flash)?;
 
-    // Destination is the slot we are *not* running from. Derive both the
-    // offset and the size from the table the bootloader will actually use.
+    // The destination is always the update slot, never the anchor. Derive its
+    // offset and size from the table the bootloader will actually use.
+    let dest_partition = layout.slots[UPDATE_SLOT as usize];
     let (s0, s1) = read_otadata(&mut flash, layout.otadata.offset)?;
-    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(0);
-    let dest = (active + 1) % OTA_COUNT;
-    let dest_partition = layout.slots[dest as usize];
+    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(ANCHOR_SLOT);
 
-    // Pass 1: prove the whole image before touching flash.
+    // Pass 1: prove the whole image before touching flash — and before any
+    // decision to reboot. Validating ahead of the bounce below is what keeps a
+    // corrupt file from costing the user a trip through the anchor to discover
+    // it was corrupt; the anchor re-validates when it does the write.
     ota::validate_image(&mut SdFile(&file), len, Some(dest_partition.size as usize))
         .map_err(UpdateError::Invalid)?;
     file.seek_from_start(0).map_err(|_| UpdateError::ReadFile)?;
-    esp_println::println!(
-        "ota: active slot {}, writing slot {} at {:#x} ({} bytes)",
-        active,
-        dest,
-        dest_partition.offset,
-        dest_partition.size
-    );
 
-    // Pass 2: erase + stream the image into the inactive slot.
-    write_image(&mut flash, dest_partition.offset, &file, len)?;
+    // Writing the slot we are executing from would erase the running firmware
+    // mid-boot, so that case hands the job back to the anchor instead. The rule
+    // is `ota::plan_update_action`; this is the I/O that answers it and carries
+    // it out.
+    // Short-circuited: the anchor's contents only matter when we are running
+    // from the update slot, and probing it costs two flash reads.
+    let anchor_usable = active == UPDATE_SLOT && anchor_holds_our_firmware(&mut flash, &layout);
+    let action = ota::plan_update_action(active, anchor_usable);
+    match action {
+        UpdateAction::WriteUpdateSlot => {
+            esp_println::println!(
+                "ota: active slot {}, writing slot {} at {:#x} ({} bytes)",
+                active,
+                UPDATE_SLOT,
+                dest_partition.offset,
+                dest_partition.size
+            );
+            // Pass 2: erase + stream the image into the update slot.
+            write_image(&mut flash, dest_partition.offset, &file, len)?;
+        }
+        UpdateAction::BounceToAnchor => {}
+        UpdateAction::NoUsableAnchor => esp_println::println!(
+            "ota: slot {} holds no firmware that could apply this update; refusing to bounce",
+            ANCHOR_SLOT
+        ),
+    }
 
-    Ok((dest, layout))
+    Ok(Staged { action, layout })
+}
+
+/// Whether the anchor slot holds a Calendula image, i.e. one that will consume
+/// the trigger file we are about to leave behind for it.
+///
+/// A bare magic check is not enough here: a mixed install can leave CrossPoint
+/// or the stock firmware in slot 0, and bouncing into one of those would move
+/// the user off their firmware *and* strand the update, since nothing there
+/// knows what `FWUPDATE.BIN` is. Matching the app descriptor's `project_name`
+/// keeps the bounce to firmware that can finish the job. An older Calendula
+/// still matches, and applies the update from its own inactive-slot logic.
+fn anchor_holds_our_firmware(flash: &mut FlashStorage, layout: &ota::OtaLayout) -> bool {
+    let anchor = layout.slots[ANCHOR_SLOT as usize];
+
+    let mut magic = [0u8; 4];
+    if flash.read(anchor.offset, &mut magic).is_err() || magic[0] != ota::IMAGE_MAGIC {
+        esp_println::println!("ota: slot {} holds no valid image", ANCHOR_SLOT);
+        return false;
+    }
+
+    let mut name = [0u8; APP_DESC_PROJECT_NAME_LEN];
+    if flash
+        .read(anchor.offset + APP_DESC_PROJECT_NAME_OFFSET, &mut name)
+        .is_err()
+    {
+        return false;
+    }
+    if ota::project_name(&name) != crate::PROJECT_NAME.as_bytes() {
+        esp_println::println!("ota: slot {} holds foreign firmware", ANCHOR_SLOT);
+        return false;
+    }
+    true
 }
 
 /// On-device validation of the flash + otadata path when no SD card reader is
@@ -218,19 +338,26 @@ pub fn run_selftest() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(0);
-    if active != 0 {
+    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(ANCHOR_SLOT);
+    if active != ANCHOR_SLOT {
         esp_println::println!("selftest: already running from slot {}; done", active);
         return false;
     }
 
-    if layout.slots[0].size < COPY_LEN || layout.slots[1].size < COPY_LEN {
+    let anchor = layout.slots[ANCHOR_SLOT as usize];
+    let update = layout.slots[UPDATE_SLOT as usize];
+    if anchor.size < COPY_LEN || update.size < COPY_LEN {
         esp_println::println!("selftest: OTA partition too small");
         return false;
     }
-    let src = layout.slots[0].offset;
-    let dst = layout.slots[1].offset;
-    esp_println::println!("selftest: copy slot 0 -> slot 1 ({} bytes)", COPY_LEN);
+    let src = anchor.offset;
+    let dst = update.offset;
+    esp_println::println!(
+        "selftest: copy slot {} -> slot {} ({} bytes)",
+        ANCHOR_SLOT,
+        UPDATE_SLOT,
+        COPY_LEN
+    );
     if flash.erase(dst, dst + COPY_LEN).is_err() {
         esp_println::println!("selftest: erase failed");
         return false;
@@ -253,7 +380,7 @@ pub fn run_selftest() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let switch = ota::plan_switch(&s0, &s1, 1, OTA_COUNT);
+    let switch = ota::plan_switch(&s0, &s1, UPDATE_SLOT, OTA_COUNT);
     if write_select_entry(
         &mut flash,
         layout.otadata.offset,
@@ -266,31 +393,25 @@ pub fn run_selftest() -> bool {
         return false;
     }
     esp_println::println!(
-        "selftest: otadata sector {} -> seq {} (slot 1)",
+        "selftest: otadata sector {} -> seq {} (slot {})",
         switch.target_sector,
-        switch.entry.ota_seq
+        switch.entry.ota_seq,
+        UPDATE_SLOT
     );
     true
 }
 
-/// True when the recovery combo — `Back` (front ladder) + `Up` (side ladder) —
-/// is held, given the two calibrated ADC readings in millivolts. The bands
-/// mirror `tasks::input`'s NAV/PAGE tables; they're on separate pins, so the
-/// combo is unambiguous.
-pub fn recovery_combo_held(nav_mv: u16, page_mv: u16) -> bool {
-    (2400..=2700).contains(&nav_mv) && (1500..=1800).contains(&page_mv)
-}
-
 /// Boot-time escape hatch (the FreeInk SDK `RecoveryBoot` pattern): when the
-/// combo is held at reset and we are running from a slot other than 0, repoint
-/// `otadata` at slot 0 and return `true` so the caller resets into it. Slot 0
-/// is the recovery anchor — the firmware first installed there — so this backs
-/// out of an update in the far slot that boots but misbehaves.
+/// combo is held at reset and we are running from the update slot, repoint
+/// `otadata` at the anchor and return `true` so the caller resets into it.
+/// Because [`apply_pending_update`] never writes the anchor, the firmware first
+/// installed there is still there — so this reliably backs out of an update
+/// that boots but misbehaves.
 ///
-/// No-op (returns `false`) when already effectively on slot 0, or when slot 0
-/// doesn't hold a valid image (so the combo can't switch into an empty slot).
-/// The stock bootloader can't read buttons, so this is the earliest point a
-/// held combo can be honoured — it must run before the main app takes over.
+/// No-op (returns `false`) when already effectively on the anchor, or when the
+/// anchor doesn't hold a valid image (so the combo can't switch into an empty
+/// slot). The stock bootloader can't read buttons, so this is the earliest
+/// point a held combo can be honoured — it must run before the app takes over.
 pub fn recover_to_slot0() -> bool {
     let mut flash = flash_storage();
     let layout = match read_ota_layout(&mut flash) {
@@ -301,18 +422,25 @@ pub fn recover_to_slot0() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    // Only act when running from a non-zero slot. `None` (erased otadata) means
-    // the bootloader already defaults to slot 0, so there's nothing to undo.
-    if ota::active_app_slot(&s0, &s1, OTA_COUNT) != Some(1) {
-        return false;
-    }
-    // Refuse to switch into a slot 0 that isn't a bootable image.
+    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT);
+    // Any bootable firmware will do in the anchor here — unlike the update
+    // bounce, the point is to leave the misbehaving slot, not to hand off work.
     let mut head = [0u8; 4];
-    if flash.read(layout.slots[0].offset, &mut head).is_err() || head[0] != ota::IMAGE_MAGIC {
-        esp_println::println!("recovery: slot 0 has no valid image; ignoring combo");
+    let anchor_bootable = flash
+        .read(layout.slots[ANCHOR_SLOT as usize].offset, &mut head)
+        .is_ok()
+        && head[0] == ota::IMAGE_MAGIC;
+
+    if !ota::plan_recovery_switch(active, anchor_bootable) {
+        if active == Some(UPDATE_SLOT) && !anchor_bootable {
+            esp_println::println!(
+                "recovery: slot {} has no valid image; ignoring combo",
+                ANCHOR_SLOT
+            );
+        }
         return false;
     }
-    let switch = ota::plan_switch(&s0, &s1, 0, OTA_COUNT);
+    let switch = ota::plan_switch(&s0, &s1, ANCHOR_SLOT, OTA_COUNT);
     if write_select_entry(
         &mut flash,
         layout.otadata.offset,
@@ -325,9 +453,10 @@ pub fn recover_to_slot0() -> bool {
         return false;
     }
     esp_println::println!(
-        "recovery: combo held; otadata sector {} -> seq {} (slot 0)",
+        "recovery: combo held; otadata sector {} -> seq {} (slot {})",
         switch.target_sector,
-        switch.entry.ota_seq
+        switch.entry.ota_seq,
+        ANCHOR_SLOT
     );
     true
 }
