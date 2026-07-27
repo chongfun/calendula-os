@@ -103,13 +103,25 @@ pub struct BitmapFont {
 
 impl BitmapFont {
     pub fn glyph(&self, codepoint: u16) -> Option<(&GlyphMetric, &'static [u8])> {
-        let index = self.codepoints.binary_search(&codepoint).ok()?;
+        let index = if (32..=126).contains(&codepoint) {
+            let direct = (codepoint - 32) as usize;
+            if direct < self.codepoints.len() && self.codepoints[direct] == codepoint {
+                direct
+            } else {
+                self.codepoints.binary_search(&codepoint).ok()?
+            }
+        } else {
+            self.codepoints.binary_search(&codepoint).ok()?
+        };
         let metric = self.metrics.get(index)?;
         let offset = metric.offset as usize;
         Some((metric, &self.bitmap[offset..offset + metric.len as usize]))
     }
 
     pub fn kerning_adjust_fp(&self, left: u16, right: u16) -> i16 {
+        if self.kerning.is_empty() {
+            return 0;
+        }
         self.kerning
             .binary_search_by(|entry| (entry.left, entry.right).cmp(&(left, right)))
             .map(|index| self.kerning[index].adjust_fp)
@@ -543,5 +555,119 @@ mod tests {
         let seen: Vec<(FontStyle, char)> = StyledChars::new(&text, FontStyle::Regular).collect();
 
         assert_eq!(seen, [(FontStyle::Regular, 'a'), (FontStyle::Regular, 'b')]);
+    }
+
+    static SYNTHETIC_CODEPOINTS: &[u16] = &[32, 33, 65, 8000];
+    static SYNTHETIC_METRICS: &[GlyphMetric] = &[
+        GlyphMetric {
+            offset: 0,
+            len: 1,
+            width: 8,
+            height: 8,
+            x_offset: 0,
+            y_offset: 0,
+            advance_fp: 128,
+        },
+        GlyphMetric {
+            offset: 1,
+            len: 1,
+            width: 8,
+            height: 8,
+            x_offset: 0,
+            y_offset: 0,
+            advance_fp: 128,
+        },
+        GlyphMetric {
+            offset: 2,
+            len: 2,
+            width: 8,
+            height: 8,
+            x_offset: 0,
+            y_offset: 0,
+            advance_fp: 128,
+        },
+        GlyphMetric {
+            offset: 4,
+            len: 1,
+            width: 8,
+            height: 8,
+            x_offset: 0,
+            y_offset: 0,
+            advance_fp: 128,
+        },
+    ];
+    static SYNTHETIC_BITMAP: &[u8] = &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    static SYNTHETIC_KERNING: &[KerningEntry] = &[KerningEntry {
+        left: 65,
+        right: 66,
+        adjust_fp: -16,
+    }];
+
+    static SYNTHETIC_FONT: BitmapFont = BitmapFont {
+        codepoints: SYNTHETIC_CODEPOINTS,
+        line_height: 12,
+        baseline: 10,
+        metrics: SYNTHETIC_METRICS,
+        bitmap: SYNTHETIC_BITMAP,
+        kerning: SYNTHETIC_KERNING,
+    };
+
+    static DISPLACED_CODEPOINTS: &[u16] = &[33, 65];
+
+    #[test]
+    fn bitmap_font_glyph_lookup_and_kerning() {
+        let displaced_font = BitmapFont {
+            codepoints: DISPLACED_CODEPOINTS,
+            line_height: 12,
+            baseline: 10,
+            metrics: &SYNTHETIC_METRICS[1..3],
+            bitmap: SYNTHETIC_BITMAP,
+            kerning: &[],
+        };
+
+        // Direct ASCII hit (codepoint - 32 == index in codepoints)
+        let (metric, slice) = SYNTHETIC_FONT
+            .glyph(32)
+            .expect("direct ASCII hit for space");
+        assert_eq!(metric, &SYNTHETIC_METRICS[0]);
+        assert_eq!(slice, &[0xAA]);
+
+        let (metric, slice) = SYNTHETIC_FONT
+            .glyph(33)
+            .expect("direct ASCII hit for exclam");
+        assert_eq!(metric, &SYNTHETIC_METRICS[1]);
+        assert_eq!(slice, &[0xBB]);
+
+        // Gapped ASCII fallback (codepoint 65 'A' where index calculation 65 - 32 = 33 is >= codepoints.len())
+        let (metric, slice) = SYNTHETIC_FONT
+            .glyph(65)
+            .expect("gapped ASCII fallback for 'A'");
+        assert_eq!(metric, &SYNTHETIC_METRICS[2]);
+        assert_eq!(slice, &[0xCC, 0xDD]);
+
+        // Displaced ASCII fallback (codepoint 33 where 33 - 32 = 1, but codepoints[1] == 65 != 33)
+        let (metric, slice) = displaced_font
+            .glyph(33)
+            .expect("displaced ASCII fallback for exclam");
+        assert_eq!(metric, &SYNTHETIC_METRICS[1]);
+        assert_eq!(slice, &[0xBB]);
+
+        // Missing ASCII character lookup returns None
+        assert!(SYNTHETIC_FONT.glyph(34).is_none());
+
+        // Non-ASCII lookup (codepoint 8000 outside 32..=126 range)
+        let (metric, slice) = SYNTHETIC_FONT
+            .glyph(8000)
+            .expect("non-ASCII binary search lookup");
+        assert_eq!(metric, &SYNTHETIC_METRICS[3]);
+        assert_eq!(slice, &[0xEE]);
+
+        // Missing non-ASCII character returns None
+        assert!(SYNTHETIC_FONT.glyph(9999).is_none());
+
+        // Kerning lookup & empty kerning table
+        assert_eq!(SYNTHETIC_FONT.kerning_adjust_fp(65, 66), -16);
+        assert_eq!(SYNTHETIC_FONT.kerning_adjust_fp(65, 67), 0);
+        assert_eq!(displaced_font.kerning_adjust_fp(65, 66), 0);
     }
 }
