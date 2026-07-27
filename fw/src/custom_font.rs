@@ -379,27 +379,17 @@ where
         self.file.seek_from_start(offset).ok()?;
         let mut bitmap = [0u8; MAX_GLYPH_BYTES];
         read_full(self.file, &mut bitmap[..glyph_len])?;
-        for y in 0..metric.height as usize {
-            let row = &bitmap[y * row_bytes..(y + 1) * row_bytes];
-            for (x_byte, &byte) in row.iter().enumerate().take(row_bytes) {
-                if byte == 0 {
-                    continue;
-                }
-                for bit in 0..8 {
-                    let px = x_byte * 8 + bit;
-                    if px >= metric.width as usize {
-                        break;
-                    }
-                    if byte & (0x80 >> bit) != 0 {
-                        let draw_x = glyph_x + px as i16;
-                        let draw_y = glyph_y + y as i16;
-                        if draw_x >= 0 && draw_y >= 0 {
-                            fb.set_pixel(draw_x as usize, draw_y as usize, false);
-                        }
-                    }
-                }
-            }
-        }
+        // Same whole-glyph blit the built-in faces take: it batches the
+        // portrait column writes eight rows at a time instead of paying a
+        // coordinate transform per lit pixel.
+        fb.blit_bitmap(
+            glyph_x as i32,
+            glyph_y as i32,
+            &bitmap[..glyph_len],
+            metric.width as usize,
+            metric.height as usize,
+            false,
+        );
         Some(())
     }
 }
