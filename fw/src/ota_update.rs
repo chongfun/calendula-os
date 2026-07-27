@@ -525,9 +525,11 @@ pub fn recover_to_slot0() -> bool {
     // Deliberately magic-only, so a foreign-but-working anchor is still an
     // escape. The cost is that a *corrupt* anchor passes and the bootloader
     // then falls forward to the update slot, leaving `otadata` naming a slot we
-    // are not on — a wasted reboot rather than a hazard, because
-    // `ota::plan_update_action` treats an unbootable anchor as proof of exactly
-    // that and refuses to write.
+    // are not on — a wasted reboot rather than a hazard. Nothing downstream
+    // reads that state as a report of where we run: `ota::plan_update_action`
+    // takes the executing slot from the MMU, and answers `otadata` naming the
+    // anchor while the update slot executes as a bounce already refused, so it
+    // neither writes nor tries again.
     let mut head = [0u8; 4];
     let anchor_bootable = flash
         .read(layout.slots[ANCHOR_SLOT as usize].offset, &mut head)

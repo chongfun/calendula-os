@@ -283,21 +283,38 @@ leaves you with a working recovery net is a coin flip you cannot see:
 
 **Install the first anchor build with a computer or the OEM updater.** The web
 flasher, `esptool` at `0x10000`, and `update.bin` on the card all write slot 0,
-which is what this migration needs. Then check the boot log, which prints the
-slot `otadata` asked for and the slot actually executing — they are not always
-the same, and the difference is the whole diagnosis:
+which is what this migration needs. None of them touch `otadata`, so if it was
+selecting slot 1 the device still boots the *old* build sitting there — with the
+new one unused in slot 0. **Hold Back + Up at the first reset after the flash**,
+every time: builds from before the anchor carry the same hatch, and it points
+`otadata` at slot 0. If `otadata` already selected slot 0, the hold is a no-op.
+
+Confirm from the second-stage bootloader's own line, which prints before any app
+runs and so does not depend on which firmware is executing:
+
+```
+I boot: Loaded app from partition at offset 0x10000
+```
+
+`0x10000` is the anchor. Any other offset means you are still on the update slot:
+either the hold did not register — try again — or the bootloader was asked for
+slot 0 and refused it, in which case the flash did not take and slot 0 needs
+writing again. `E boot: OTA app partition slot 0 is not bootable` immediately
+above tells the two apart.
+
+Once you are running the new build, it prints the same pair itself on every boot,
+which is the more convenient check from then on:
 
 ```
 ota: otadata requests slot Some(0), executing slot Some(0)
 ```
 
-- **requests 0, executing 0** — done. The anchor is the new build and you are
-  running it.
-- **requests 1, executing 1** — the new build is in slot 0 but `otadata` still
-  selects the old one. Hold **Back + Up** at reset to switch over.
+- **requests 0, executing 0** — done. The anchor is the new build.
+- **requests 1, executing 1** — `otadata` still selects the update slot. Hold
+  **Back + Up** at reset to switch over.
 - **requests 0, executing 1** — the bootloader was asked for slot 0, refused it,
   and fell forward. **Back + Up will not help here**: it only moves `otadata`,
-  which already names slot 0. The flash did not take — write slot 0 again.
+  which already names slot 0. Write slot 0 again.
 
 If you already took the in-app path and updates are now being refused, the
 firmware itself is fine; reflashing to `0x10000` by either route restores the
