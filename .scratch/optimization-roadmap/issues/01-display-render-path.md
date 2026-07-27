@@ -1,6 +1,6 @@
 # WS-A: Display render path — shave the ~50 ms of software around the 421 ms panel BUSY
 
-Status: A1 DONE (#12). A2 DONE for landscape frames (#24). A2-P DONE (hoisted map, bit-shift, and division out of portrait inner loops; portrait reading layout dropped to 28–34 ms). A3 DONE (panel-native framebuffer byte order landed; fill_transformed_band_impl and 8 KB TX_BAND static removed; zero-copy fb.band() SPI streaming). A4/A5 hardware experiments, unscheduled.
+Status: A1 DONE (#12). A2 DONE for landscape frames (#24). A2-P DONE (hoisted map, bit-shift, and division out of portrait inner loops; portrait reading layout dropped to 28–34 ms). A3 DONE (panel-native framebuffer byte order landed; fill_transformed_band_impl and 8 KB TX_BAND static removed; zero-copy fb.band() SPI streaming). A6 DONE (#47; O(1) ASCII direct indexing for glyph advance lookups). A4/A5 hardware experiments, unscheduled.
 
 Owns: `display/` crate, `fw/src/display_flush/`, flush/prestage region of `fw/src/tasks/display.rs`, `hal-ext/src/spi_dma.rs`.
 Do not touch: `fw/src/sd_session.rs` (WS-D), boot-init region of display task (WS-C item 2 owns the double-`init_panel` fix).
@@ -19,9 +19,13 @@ Landed 2026-07-26: `fill_span` and `blit_row` in `FbFrame::Portrait` hoist `map(
 
 Landed 2026-07-26: `Framebuffer::data` internal storage is stored in native byte order. Bit-reversal and X/Y mirroring are handled inside coordinate indexing math. `fill_transformed_band_impl` and `REVERSE_BITS_LUT` removed from `epd/mod.rs`. Deleted the 8 KB `TX_BAND` static buffer in `fw/src/tasks/display.rs`. Firmware streams `fb.band()` zero-copy directly over SPI. P1 (`MIRROR_X`) and P2 (`FbFrame::Native` identity) invariants verified; goldens re-blessed.
 
+## A6 (Tier 2, S): O(1) ASCII Direct Indexing for Glyph Advance Lookups — DONE (#47)
+
+Landed 2026-07-26: `BitmapFont::glyph` checks for printable ASCII codepoints (`32..=126`) using direct array offset indexing (`codepoint - 32`), bypassing binary search. Also bypasses kerning table search when the font contains no kerning entries.
+
 ## Follow-on Display & Portrait Path Optimizations
 
-### A6: Pre-computed Line-Wrap Caching (High Impact for Reading Layout)
+### A10: Pre-computed Line-Wrap Caching (High Impact for Reading Layout)
 In Reading View, ~16 ms (Landscape) to ~31 ms (Portrait) of every turn is spent in `ui/src/reading.rs` re-measuring glyph widths and re-computing word wrapping for every paragraph on the page. Pre-calculating and caching line-wrap offsets for adjacent pages while displaying the current page reduces reading layout time (`layout_ms`) to **near-0 ms** ($O(1)$ cache hit).
 
 ### A7: Asynchronous / Pipelined Prestaging (`prestage_ms` ~28 ms)
@@ -52,5 +56,5 @@ The 421 ms BUSY is the sensed-temperature OTP fast waveform — the only lever b
 
 Partial-window refresh (deliberately shelved ×2), SPI >40 MHz (rated ceiling), MIRROR_Y=true (tested, wrong), software work on the Full waveform ("noise" per IMPLEMENTATION_PLAN). RED prestaging already exists — A1/A3 build on it.
 
-Suggested order: A1 ✓ → A2 ✓ → A2-P ✓ → A3 ✓ → A6 (line-wrap cache) → A7 (pipelined prestage) → A4 (verify-first) → A5 (experiment).
+Suggested order: A1 ✓ → A2 ✓ → A2-P ✓ → A3 ✓ → A6 ✓ → A10 (line-wrap cache) → A7 (pipelined prestage) → A4 (verify-first) → A5 (experiment).
 

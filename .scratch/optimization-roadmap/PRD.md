@@ -8,6 +8,7 @@ Author: research pass over six parallel code-survey agents (display, book pipeli
 
 **Landed on main / branch since round 2:**
 
+- **A6** — O(1) ASCII direct indexing for glyph advance lookups (#47). Bypasses binary search for printable ASCII codepoints (32..126) and skips kerning lookup when kerning table is empty in `BitmapFont::glyph`.
 - **A2-P** — portrait byte-run/strided fast paths (issue 01). Hoisted `map()` coordinate math, bounds checking, bit-shifts, and division out of the `fill_span` and `blit_row` inner loops in `display/src/fb.rs`. Measured on X3 hardware: portrait reading layout dropped to `28–34 ms` (averaging ~31 ms per turn).
 - **A3** — panel-native framebuffer byte order (issue 01). Internal `Framebuffer` (`self.data`) is now stored in panel-native byte order across both X4 and X3. Completely eliminated `fill_transformed_band_impl` and the 8 KB static `TX_BAND` buffer allocation in `fw/src/tasks/display.rs`. Display bands now stream zero-copy directly over SPI via `fb.band()`. Goldens re-blessed; P1 and P2 invariants verified.
 - **A2** — byte-run rasterizer fast paths, landscape frames (#24). Landscape reading layout `16–18 ms` (sub-20 ms).
@@ -18,7 +19,7 @@ Author: research pass over six parallel code-survey agents (display, book pipeli
 
 **Next queue (re-ranked 2026-07-26; strictly prioritized for the portrait reading experience):**
 
-1. **A6 — Pre-computed Line-Wrap Caching for Reading View** (issues 01 & 02). Pre-calculates paragraph line-break offsets for adjacent pages while reading in Portrait mode. Reduces Portrait reading `layout_ms` from ~31 ms to **near-0 ms** ($O(1)$ lookup).
+1. **A10 — Pre-computed Line-Wrap Caching for Reading View** (issues 01 & 02). Pre-calculates paragraph line-break offsets for adjacent pages while reading in Portrait mode. Reduces Portrait reading `layout_ms` from ~31 ms to **near-0 ms** ($O(1)$ lookup).
 2. **A7 — Asynchronous / Pipelined Prestaging** (issue 01). Overlaps the previous-frame buffer prestaging (`DTM1`) with panel BUSY wait or SPI DMA transfers. Completely eliminates the **28 ms** prestage delay from the portrait page-turn latency path.
 3. **A8 — 32-Bit Word-Wide Strided Iteration for Portrait Blits** (issue 01). Unrolls `blit_row` column loops with 32-bit `u32` word pointers on RISC-V to process 4 native rows per iteration, further reducing Portrait blitting CPU cycle count by ~20–30%.
 4. **B7 — Per-Config Section Caches & Orientation Toggle Acceleration** (issue 02). Fast return to previously-built configs; avoids ~24 s replay on font size changes and portrait↔landscape toggles.
@@ -33,15 +34,16 @@ Tier 3 unchanged: A4, A5, C6, E4, F5, D6.
 
 **Bench session results (2026-07-26 live X3 measurements):**
 
-| Metric | 2026-07-25 baseline | 2026-07-26 measured (A2-P + A3 landed) |
+| Metric | 2026-07-25 baseline | 2026-07-26 measured (A2-P + A3 + A6 landed) |
 |---|---|---|
+| Total Page Turn Latency | 472 ms median / 1384 ms p95 | **354 ms median / 476 ms p95** |
 | Reading layout, landscape (A2 fast paths) | 17 ms median / 18 ms p95 | **16–18 ms** (sub-20 ms!) |
-| Reading layout, portrait (A2-P strided fast paths) | 33 ms median / 35 ms p95 | **28–34 ms** (~31 ms average) |
+| Reading layout, portrait (A2-P + A6) | 33 ms median / 35 ms p95 | **33 ms median / 35 ms p95** (min 32 ms) |
 | Menu / Settings layout | 82–90 ms (pre-A2) | **3–8 ms** |
-| Fast flush | 408–409 ms (busy 379) | **408–409 ms** (busy 379 ms) |
-| Prestage | 28 ms | **27–28 ms** (8 KB static `TX_BAND` buffer deleted) |
-| Storage open (RAM hit) | 0 ms | **0 ms** |
-| Progress write | 44–60 ms | **41–44 ms** |
+| Fast flush | 408–409 ms (busy 379) | **408 ms median / 435 ms p95** (busy 379 ms) |
+| Prestage | 28 ms | **28 ms median** (min 27 ms, max 29 ms) |
+| Storage open (RAM hit) | 0 ms | **0 ms median** (p95 79 ms) |
+| Progress write | 44–60 ms | **41 ms median** (41 ms p95) |
 | B6 replay (Type Size change) | — | **24.7 s** (736 pp / 82 sections) and **27.1 s** (1240 pp / 100 sections), ~280–300 ms/section |
 | Orientation flip (portrait↔landscape) | — | **23.8 s** (same replay path — page box is wrap-relevant) |
 | Full build, same settings (evening session, via the new cache-clear) | 14.1 s (July config: 441 pp, pre-CONT.BIN) | **64.0 s** portrait (1240 pp / 100 sections), **62.2 s** landscape (1303 pp / 82) |
