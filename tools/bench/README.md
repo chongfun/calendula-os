@@ -30,8 +30,17 @@ Raw serial remains visible in the terminal. Parsed records are appended as
 JSONL under `target/bench/` by default:
 
 ```json
-{"event":"render","flush_ms":421,"layout_ms":24,"mode":"Fast","page":42,"suite":"page-turn"}
+{"event":"render","flush_ms":405,"layout_ms":13,"mode":"Fast","page":42,"suite":"page-turn"}
+{"event":"prestage","staged":true,"elapsed_ms":24,"suite":"page-turn"}
 ```
+
+The `render` event is emitted at the settle — the moment `DisplayEvent::Settled`
+goes out and the glass is done — so the `page turn` figure it anchors is true
+press-to-settled. The RED/DTM1 prestage that runs afterwards is real work on the
+display task and still gates the next command, but the reader does not wait on
+it, so it is its own event. Firmware before 2026-07-27 printed one combined
+render line after the prestage; `report` still summarizes those logs, but their
+`page turn` runs ~24 ms long and must not be compared against a newer run's.
 
 Do not commit run logs. Keep only parser code, suite docs, and stable budgets in
 the repo.

@@ -536,7 +536,7 @@ def summarize_paths(
     print_duration("reading layout", values(reading_renders, "layout_ms"))
     print_duration("page turn", page_turn_durations(events))
     print_duration("render flush", values(renders, "flush_ms"))
-    print_duration("prestage", values(renders, "prestage_ms"))
+    print_duration("prestage", prestage_values(events))
     print_duration("refresh busy", values(refreshes, "busy_ms"))
     print_duration(
         "storage open",
@@ -625,6 +625,23 @@ def print_duration(label: str, data: list[int]) -> None:
     print(f"{label:14} median={median:.0f}ms p95={p95:.0f}ms min={min(data)}ms max={max(data)}ms")
 
 
+def prestage_values(events: list[dict[str, Any]]) -> list[int]:
+    """Prestage durations, from either firmware event shape.
+
+    Firmware from 2026-07-27 emits prestage as its own event, after the
+    render event that ends press-to-settled. Older firmware folded
+    `prestage_ms` into the render line, which is also why its `page turn`
+    figures run ~24 ms long — the render timestamp was printed after the
+    prestage rather than at the settle. Captures from before that change
+    still summarize, but do not compare their `page turn` against a newer
+    run's.
+    """
+    current = values([e for e in events if e.get("event") == "prestage"], "elapsed_ms")
+    if current:
+        return current
+    return values([e for e in events if e.get("event") == "render"], "prestage_ms")
+
+
 def page_turn_durations(events: list[dict[str, Any]]) -> list[int]:
     pending_inputs: list[int] = []
     durations: list[int] = []
@@ -681,11 +698,11 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             percentile(reading_layout, 95) if reading_layout else None,
             page_turn.get("reading_layout_warn_ms"),
         )
-        prestage_values = values(render_events, "prestage_ms")
+        prestage = prestage_values(events)
         warn_if_above(
             warnings,
             "prestage p95",
-            percentile(prestage_values, 95) if prestage_values else None,
+            percentile(prestage, 95) if prestage else None,
             page_turn.get("prestage_warn_ms"),
         )
         fast_busy = [

@@ -296,6 +296,21 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         app_core::display_refresh_outcome(true, chapter_cursor);
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
+                    // Emitted here, at the settle, and not after the prestage
+                    // below. This timestamp is what the bench pairs each input
+                    // against, so printing it later charged the reader for a
+                    // write they never waited on: `Settled` has already gone
+                    // out, and press-to-settled ends on this line.
+                    esp_println::println!(
+                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} t_ms={}",
+                        request.view,
+                        mode,
+                        request.page,
+                        request.chapter,
+                        layout_ms,
+                        flush_ms,
+                        Instant::now().as_millis(),
+                    );
                     let prestage_start = Instant::now();
                     // Unconditional, deliberately. Skipping this write when another
                     // render is already queued reads like a saving and is the exact
@@ -312,14 +327,13 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // so a held button would pay the write on-path every turn
                     // instead of off-path once.
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb).await.is_ok();
+                    // Its own event, after the render one above: prestage is
+                    // real work on this task and still gates the next command,
+                    // but it sits outside press-to-settled and is measured
+                    // separately so neither number can absorb the other.
                     esp_println::println!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} prestage_ms={} t_ms={}",
-                        request.view,
-                        mode,
-                        request.page,
-                        request.chapter,
-                        layout_ms,
-                        flush_ms,
+                        "bench: prestage staged={} elapsed_ms={} t_ms={}",
+                        prev_prestaged,
                         prestage_start.elapsed().as_millis(),
                         Instant::now().as_millis(),
                     );

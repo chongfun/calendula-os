@@ -19,6 +19,39 @@ class BenchParserTests(unittest.TestCase):
         self.assertEqual(event["mode"], "Fast")
         self.assertEqual(event["flush_ms"], 438)
 
+    def test_parse_prestage_event(self) -> None:
+        event = bench.parse_line(
+            "bench: prestage staged=true elapsed_ms=24 t_ms=96284",
+            "page-turn",
+        )[0]
+        self.assertEqual(event["event"], "prestage")
+        self.assertEqual(event["elapsed_ms"], 24)
+        self.assertTrue(event["staged"])
+
+    def test_prestage_values_prefers_standalone_events(self) -> None:
+        events = [
+            {"event": "render", "view": "Reading", "layout_ms": 13, "t_ms": 100},
+            {"event": "prestage", "staged": True, "elapsed_ms": 24, "t_ms": 124},
+        ]
+        self.assertEqual(bench.prestage_values(events), [24])
+
+    def test_prestage_values_falls_back_to_pre_split_render_events(self) -> None:
+        """Captures from before the render/prestage split still summarize."""
+        events = [
+            {"event": "render", "view": "Reading", "prestage_ms": 28, "t_ms": 100},
+            {"event": "render", "view": "Reading", "prestage_ms": 27, "t_ms": 200},
+        ]
+        self.assertEqual(bench.prestage_values(events), [28, 27])
+
+    def test_page_turn_duration_ends_at_the_render_event(self) -> None:
+        """press-to-settled must not absorb the prestage that follows it."""
+        events = [
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1424},
+            {"event": "prestage", "staged": True, "elapsed_ms": 24, "t_ms": 1448},
+        ]
+        self.assertEqual(bench.page_turn_durations(events), [424])
+
     def test_parse_legacy_render(self) -> None:
         event = bench.parse_line(
             "bench: render Reading Fast page=12 ch=5 layout=24ms flush=438ms prestage=16ms t=93958",
