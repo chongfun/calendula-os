@@ -297,6 +297,20 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                     let prestage_start = Instant::now();
+                    // Unconditional, deliberately. Skipping this write when another
+                    // render is already queued reads like a saving and is the exact
+                    // opposite: it is off the critical path here — Settled has gone
+                    // out, the glass is done, nobody is waiting — while the write it
+                    // defers lands *inside* the next Fast flush, ahead of
+                    // DisplayRefresh, where the reader does wait.
+                    // `fast_plan_only_writes_previous_plane_when_not_prestaged`
+                    // (display/src/epd/uc8253.rs) pins the asymmetry: an unstaged
+                    // Fast carries an extra WritePlane(Old, Previous) + DataStop,
+                    // and the X4 writes RED from `prev_fb` for the same reason
+                    // (fw/src/display_flush/ssd1677.rs). The skip is also
+                    // self-sustaining — each skipped turn leaves the next unstaged —
+                    // so a held button would pay the write on-path every turn
+                    // instead of off-path once.
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb).await.is_ok();
                     esp_println::println!(
                         "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} prestage_ms={} t_ms={}",
