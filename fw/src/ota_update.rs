@@ -319,12 +319,12 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
     // is `ota::plan_update_action`; this is the I/O that answers it and carries
     // it out.
     //
-    // Checked on every path, not just before a bounce: `active` is what
-    // `otadata` *requests*, and the bootloader falls forward to another slot
-    // when the requested one does not verify. The anchor's own validity is the
-    // only evidence available here that `otadata` is telling the truth, so it
-    // is worth the full read even when we are seemingly running from the
-    // anchor and about to take the ordinary write path.
+    // A separate question from which slot is executing — the MMU answered that
+    // above — but read on every path, not just before a bounce. Before a bounce
+    // it is the real question: whether the anchor could finish the job. On the
+    // ordinary write path it is corroboration: the MMU says the anchor is
+    // executing, so the anchor booted, and a validator calling it unbootable is
+    // a disagreement `ota::plan_update_action` refuses on rather than resolves.
     let anchor_usable = anchor_holds_our_firmware(&mut flash, &layout);
     let action = ota::plan_update_action(running, requested, anchor_usable);
     match action {
@@ -372,10 +372,9 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
 ///   part of the identity. The rule is [`ota::anchor_can_apply_update`].
 /// - **Integrity.** Would the *bootloader* load it? A flash interrupted partway
 ///   through writing slot 0 leaves the magic and descriptor intact and the tail
-///   missing, which passes both checks above. The answer decides more than
-///   whether to bounce: see [`ota::plan_update_action`] on why a firmware that
-///   cannot trust the anchor cannot trust `otadata` about which slot it is
-///   itself running from.
+///   missing, which passes both checks above. Bouncing into that is a reset the
+///   bootloader answers by falling forward, costing the update — see
+///   [`ota::plan_update_action`], which then refuses rather than bounce again.
 fn anchor_holds_our_firmware(flash: &mut FlashStorage, layout: &ota::OtaLayout) -> bool {
     let anchor = layout.slots[ANCHOR_SLOT as usize];
 
@@ -584,12 +583,20 @@ pub fn mark_running_slot_valid() {
     // instead of leaving it for `plan_update_action` to notice.
     let running = crate::mmu::running_slot(&layout);
     let requested = ota::active_app_slot(&s0, &s1, OTA_COUNT);
+    // Both halves, on every boot, agreeing or not. Which of the two differs is
+    // the only thing that distinguishes "otadata still points at the old slot",
+    // where the recovery combo helps, from "the bootloader rejected the slot
+    // otadata asked for", where it cannot: `recover_to_slot0` moves `otadata`,
+    // which in that case already names the anchor. `docs/FLASHING.md` sends
+    // users here to tell those apart.
+    esp_println::println!(
+        "ota: otadata requests slot {:?}, executing slot {:?}",
+        requested,
+        running
+    );
     if !ota::may_mark_running_slot_valid(running, requested) {
         esp_println::println!(
-            "ota: cannot prove we run the slot otadata selects (running {:?}, requested {:?}); \
-             not marking it valid",
-            running,
-            requested
+            "ota: not marking it valid; cannot prove we run the slot otadata selects"
         );
         return;
     }

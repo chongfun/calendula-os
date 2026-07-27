@@ -247,9 +247,10 @@ enum Strictness {
     /// [`staged_image_is_installable`].
     Staged,
     /// An image already resident in a slot, being read as evidence that the
-    /// bootloader *would* boot it. Here a wrong answer is not "the update
-    /// fails", it is "we misidentify the running slot and erase ourselves", so
-    /// every condition we can cheaply reproduce is applied.
+    /// bootloader *would* boot it. Both answers cost something here — a wrong
+    /// yes strands the update in a bounce the bootloader refuses, a wrong no
+    /// refuses an update that was fine — so every condition we can cheaply
+    /// reproduce is applied.
     Resident,
 }
 
@@ -261,10 +262,10 @@ enum Strictness {
 /// and `partition_len` only bounds how far that walk may run.
 ///
 /// This is what makes a slot's contents *evidence about the bootloader* — it
-/// loads a slot only if the image verifies — which is the inference
-/// [`plan_update_action`] draws. A magic byte alone proves nothing: a flash
-/// interrupted partway through writing slot 0 leaves the first bytes intact and
-/// the tail missing.
+/// loads a slot only if the image verifies — which is what
+/// [`plan_update_action`] needs of the anchor before handing it the update. A
+/// magic byte alone proves nothing: a flash interrupted partway through writing
+/// slot 0 leaves the first bytes intact and the tail missing.
 ///
 /// # Why the SHA-256 trailer is mandatory here
 ///
@@ -279,7 +280,7 @@ enum Strictness {
 /// The remaining conditions checked here — chip id, segment layout — are the
 /// ones a *deliberately* rewritten image could still satisfy the hash with.
 /// This is not a complete reimplementation of `esp_image_format.c`, and it
-/// cannot be: see [`plan_update_action`] for what the residual gap costs.
+/// cannot be: see [`plan_update_action`] for what an optimistic answer costs.
 pub fn validate_flash_image<S: ImageSource>(
     src: &mut S,
     partition_len: usize,

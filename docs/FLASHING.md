@@ -244,15 +244,17 @@ every boot — so it is no longer on the card. Copying it back would only refuse
 again for the same reason: the fix is to flash the image with a computer or the
 OEM updater, both of which write slot 0 and so restore a usable anchor.
 
-That last check does double duty, because `otadata` records which slot the
-bootloader was *asked* to boot, not which one it did. ESP-IDF verifies the
-selected image and, if it fails, quietly boots the other app partition instead —
-leaving `otadata` pointing at the slot it rejected. A firmware that trusted
-`otadata` could conclude it was running from slot 0, decide slot 1 was idle, and
-erase the very image it was executing, destroying the last bootable copy on the
-device. Because a slot only boots if its image verifies, an anchor that fails
-validation is proof that `otadata` is stale, and the update is refused rather
-than written.
+Which slot is *executing* is a separate question, and `otadata` does not answer
+it: it records which slot the bootloader was *asked* to boot, not which one it
+did. ESP-IDF verifies the selected image and, if it fails, quietly boots the
+other app partition instead — leaving `otadata` pointing at the slot it
+rejected. A firmware that believed it could conclude it was running from slot 0,
+decide slot 1 was idle, and erase the very image it was executing, destroying
+the last bootable copy on the device. So the firmware asks the flash MMU which
+partition is mapped for execution, the way `esp_ota_get_running_partition()`
+does; if that lookup cannot resolve, the update is refused rather than guessed
+at. The anchor check above answers something else — whether a bounce could
+finish the job — and both boot log lines are printed on every boot.
 
 The image on the card is checked the same way before it is installed: it must be
 for **this board** and retain the current **updater generation** (such as `u1`).
@@ -281,9 +283,21 @@ leaves you with a working recovery net is a coin flip you cannot see:
 
 **Install the first anchor build with a computer or the OEM updater.** The web
 flasher, `esptool` at `0x10000`, and `update.bin` on the card all write slot 0,
-which is what this migration needs. Then check the boot log: it prints
-`mmu: executing from slot 0`. If it says slot 1, `otadata` is still selecting the
-old build — hold **Back + Up** at reset to return to slot 0.
+which is what this migration needs. Then check the boot log, which prints the
+slot `otadata` asked for and the slot actually executing — they are not always
+the same, and the difference is the whole diagnosis:
+
+```
+ota: otadata requests slot Some(0), executing slot Some(0)
+```
+
+- **requests 0, executing 0** — done. The anchor is the new build and you are
+  running it.
+- **requests 1, executing 1** — the new build is in slot 0 but `otadata` still
+  selects the old one. Hold **Back + Up** at reset to switch over.
+- **requests 0, executing 1** — the bootloader was asked for slot 0, refused it,
+  and fell forward. **Back + Up will not help here**: it only moves `otadata`,
+  which already names slot 0. The flash did not take — write slot 0 again.
 
 If you already took the in-app path and updates are now being refused, the
 firmware itself is fine; reflashing to `0x10000` by either route restores the
