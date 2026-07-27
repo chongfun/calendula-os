@@ -6,15 +6,16 @@ Author: research pass over six parallel code-survey agents (display, book pipeli
 
 ## Status after round 4 (2026-07-27)
 
-**WS-A is nearly finished, with one live item.** Measured on main: an
-isolated portrait turn is 13 ms layout + 405 ms flush (379 ms of it panel
-BUSY) + 24 ms prestage = 448 ms. Layout is done — 2.9% of the turn.
-Prestage is *not* done: A7 merged but never fires (see below), so its
-24 ms is still fully on the critical path and is the largest remaining
-non-BUSY term. After that, nothing in issue 01 is worth more than
-single-digit milliseconds except A4/A5, which are hardware-risk
-experiments, and **the next real wins are in the book pipeline (B7, B4)
-and power (C2)**, which are tens of seconds each.
+**WS-A is finished.** Measured on main, then corrected for an
+instrumentation error: a portrait turn is **424 ms press-to-settled**
+(13 ms layout + ~405 ms flush, 379 ms of it panel BUSY), followed by a
+24 ms prestage the reader never waits for. Layout is done at 3% of the
+turn. Prestage is done too — it was never on the critical path, and A7
+turned out to be a pessimization (below). Nothing left in issue 01 is
+worth more than single-digit milliseconds except A4/A5, which are
+hardware-risk experiments. **Every remaining win is in the book pipeline
+(B7, B4) and power (C2)**, which are tens of seconds each. Stop
+optimizing the render path.
 
 **Landed on main since round 3:**
 
@@ -23,14 +24,29 @@ and power (C2)**, which are tens of seconds each.
   its place. **Portrait reading layout 33 ms → 13 ms median on X3
   (2.5x).** Full detail and the disproof in issue 01; the short version is
   below under "A10's premise was wrong".
-- **A7 — pipelined prestaging (#48) — MERGED BUT INERT, back in the
-  queue.** Landed as a *conditional skip* rather than an overlap: after a
-  flush settles the display task yields once and, if another render is
-  queued, skips `prestage_previous`. Measurement on main says the skip
-  **never fires** — prestage ran on 100 of 100 renders across both
-  cadences and the skip's log line printed zero times. See "Finding 1"
-  under the round-4 baseline below. The 28 ms is still fully on the
-  critical path.
+- **A7 — pipelined prestaging (#48) — REVERTED. The item was a
+  pessimization and is now closed for good.** #48 skipped
+  `prestage_previous` when another render was queued. Two things were
+  wrong with it. It never fired (prestage ran on 100 of 100 renders across
+  both cadences; the skip's log line printed zero times — one
+  `yield_now()` cannot cover the Settled → app → next-`RenderRequest`
+  round trip). And firing would have *cost* time, not saved it: the
+  prestage write is already off the critical path thanks to A1 (#12), and
+  skipping it defers the same write into the next Fast flush, ahead of
+  `DisplayRefresh`, where the reader does wait —
+  `fast_plan_only_writes_previous_plane_when_not_prestaged` pins the
+  asymmetry. Worse, the skip is self-sustaining: each skipped turn leaves
+  the next unstaged, so a held button pays the write on-path every turn
+  instead of off-path once. Reverted with the reasoning left at the call
+  site. **Do not re-propose skipping the prestage.**
+- **Bench instrumentation split.** `bench: render` was printed *after* the
+  prestage while `Settled` goes out *before* it, so every reported page
+  turn carried ~24 ms of work the reader never waited for. That single
+  misplaced print is why A7 was ranked second overall. The render event
+  now fires at the settle and prestage has its own event; `report` reads
+  either shape, so pre-split logs still summarize — but their `page turn`
+  runs ~24 ms long by construction and **must not be compared against
+  newer runs**.
 - **A8 — dropped as superseded, PR #49 closed.** Its 4-way unrolling
   targeted exactly the portrait `blit_row` loop #50 removed from the glyph
   path. Only `fill_span` was left for it — menu furniture already at
@@ -52,27 +68,22 @@ layout" proposal.
 
 **Next queue (re-ranked 2026-07-27, after the baseline run):**
 
-1. **A7 rework — make the prestage skip actually fire** (issue 01). The
-   merged version never triggers; 24 ms sits on every single turn, which
-   is the largest remaining non-BUSY term in a 448 ms page turn. Small,
-   well-understood, and now the only display-path item with double-digit
-   milliseconds behind it.
-2. **B7 — Per-Config Section Caches & Orientation Toggle Acceleration**
+1. **B7 — Per-Config Section Caches & Orientation Toggle Acceleration**
    (issue 02). Still the largest user-facing wait in the system: 24–27 s
    replay on font-size changes and portrait↔landscape toggles, against
    13 ms of reading layout. This is now the top item by a wide margin.
-3. **B4 Rework — Progressive First Open for Reading** (issue 02). ~64 s
+2. **B4 Rework — Progressive First Open for Reading** (issue 02). ~64 s
    first open at current settings.
-4. **C2** — deep-sleep GPIO hold + sleep-current measurement (issue 03).
-5. **D4** — directed Wi-Fi join + strongest-AP join (issue 04).
-6. **Upload-ceiling investigation** (issue 04).
-7. **D5** — portal → station handoff (issue 04).
-8. **A11 — batch landscape glyph rows** (issue 01, new). Fallout from #50:
+3. **C2** — deep-sleep GPIO hold + sleep-current measurement (issue 03).
+4. **D4** — directed Wi-Fi join + strongest-AP join (issue 04).
+5. **Upload-ceiling investigation** (issue 04).
+6. **D5** — portal → station handoff (issue 04).
+7. **A11 — batch landscape glyph rows** (issue 01, new). Fallout from #50:
    landscape is now the *slower* frame per page (host 146 µs vs portrait's
    93 µs) because it still blits row-at-a-time with per-row setup. Size the
    win before building — expect single-digit ms against a 448 ms turn, and
    portrait is the default orientation.
-9. **A9 — Overlapped SPI DMA Band Transmits** (issue 01).
+8. **A9 — Overlapped SPI DMA Band Transmits** (issue 01).
 
 Tier 3 unchanged: A4, A5, C6, E4, F5, D6.
 
@@ -90,30 +101,54 @@ operator cadences. Logs: `target/bench/round4-deliberate.jsonl`,
 | Render flush | 408 ms / 435 p95 | **405 ms / 406 p95** (max 426) | 405 ms / 406 p95 |
 | Refresh busy | 379 ms | **379 ms** (min = max) | 379 ms |
 | Progress write | 41 ms | 42 ms / 45 p95 | 44 ms / 45 p95 |
-| Page turn | 354 ms / 476 p95 | **448 ms / 449 p95** (min 445, max 449) | 451 ms / 825 p95 (min 2, max 873) |
+| Page turn (as reported) | 354 ms / 476 p95 | 448 ms / 449 p95 (min 445, max 449) | 451 ms / 825 p95 (min 2, max 873) |
+| **Page turn (true press-to-settled)** | — | **~424 ms** | — |
 
-**Quote the deliberate-cadence column as the baseline.** An isolated
-portrait turn on main is 13 ms layout + 405 ms flush (379 ms of it panel
-BUSY) + 24 ms prestage = 448 ms press-to-settled, and the spread across
-50 turns is 4 ms.
+**Quote the deliberate-cadence column as the baseline, with one
+correction.** Every `page turn` number in the table above — including all
+the historical ones — was produced by firmware that printed the render
+event *after* the prestage, so each carries ~24 ms the reader never waited
+for (see "Bench instrumentation split" above). The real figure is
+**13 ms layout + ~405 ms flush (379 ms of it panel BUSY) = ~424 ms
+press-to-settled**, with a 24 ms prestage afterwards that gates the next
+command but not the reader. Spread across 50 turns was 4 ms. The next
+capture on split firmware will report ~424 directly.
 
 **A10's 2.5x is confirmed on main:** layout 33 → 13 ms median, unchanged
 by cadence, as expected for a term that does not depend on queue state.
 
-**Finding 1 — A7 (#48) is inert on the page-turn path. It should go back
-in the queue.** Prestage ran on **100 of 100 renders** across both
-cadences (values only {24} and {24, 25}), and the skip's own log line,
-`display: pending command queued, yielding prestage`, printed **zero**
-times. The burst run did reach real queue depth — it contains a render
-with no input preceding it — so the workload produced queued commands;
-the check simply never saw one. Cause: a single `embassy_futures::yield_now()`
-is not enough to get from "display task sends `Settled`" to "app task has
-received it, cleared `rendering`, and pushed the next `RenderRequest` into
-`DISPLAY_COMMANDS`" (`fw/src/tasks/app.rs:286`). The check runs before the
-app has replied, so the queue is always empty. Fixing it means either
-waiting for the app's next command with a bounded timeout, or moving the
-decision to where the next command actually arrives — not adding more
-yields.
+**Finding 1 — A7 (#48) is inert, and on investigation it was also
+backwards. Reverted; the item is closed.** Prestage ran on **100 of 100
+renders** across both cadences (values only {24} and {24, 25}), and the
+skip's own log line, `display: pending command queued, yielding prestage`,
+printed **zero** times. The burst run did reach real queue depth — it
+contains a render with no input preceding it — so the workload produced
+queued commands; the check simply never saw one. Cause: a single
+`embassy_futures::yield_now()` cannot cover the round trip from "display
+task sends `Settled`" to "app task received it, cleared `rendering`, and
+pushed the next `RenderRequest`" (`fw/src/tasks/app.rs:286`).
+
+The first draft of this section proposed fixing the trigger. That was
+wrong, and chasing it is what surfaced the real answer: **the skip should
+never fire.** The prestage write is already off the critical path — A1
+(#12) moved `Settled` ahead of it, so the glass is done and the app's
+render lock is clear before it starts. Skipping does not delete that
+write; it defers it into the next Fast flush, ahead of `DisplayRefresh`,
+where the reader *does* wait. The X3's own
+`fast_plan_only_writes_previous_plane_when_not_prestaged` pins the
+asymmetry (an unstaged Fast carries an extra WritePlane(Old, Previous) +
+DataStop), and the X4 writes RED from `prev_fb` for the same reason. The
+skip is self-sustaining too — each skipped turn leaves the next unstaged —
+so a held button would pay the write on-path every turn instead of
+off-path once. Reverted, with the reasoning left at the call site.
+
+**Finding 3 — the 28 ms that made A7 look valuable was never on the turn.**
+The bench printed the render event after the prestage while `Settled` went
+out before it, so `page turn` absorbed work the reader never waited for.
+One misplaced `println!` promoted a pessimization to second place in the
+queue. The instrumentation is now split (see above). The general lesson,
+alongside A10's: **before ranking an item by a measured cost, check that
+the measurement brackets what the user actually experiences.**
 
 **Finding 2 — the 354 ms figure was a measurement artifact, and
 `page turn` is not cadence-robust.** The hypothesis recorded in the first
@@ -380,6 +415,14 @@ Each workstream is one issue file under `issues/`, owns a distinct set of files,
   superseded before it merged (#49 closed).** #50 removed that loop from
   the glyph path and took 2.5x rather than A8's projected 20–30%. Only
   `fill_span` remains for it, which is menu furniture at 3–8 ms.
+- **A7 / skipping or deferring the RED-DTM1 prestage — measured backwards,
+  reverted 2026-07-27 (#48).** The prestage is what keeps the
+  previous-frame write *off* the page-turn path; skipping it moves the
+  same write into the next Fast flush ahead of `DisplayRefresh`, where the
+  reader waits, and each skip leaves the following turn unstaged so a
+  burst pays it every time. A1 (#12) already did the real optimization by
+  sending `Settled` first. Genuine overlap of prestage with panel BUSY or
+  SPI DMA is a different design and belongs to A9, not here.
 
 - **D2 (radio RX buffers 8/24 + AMPDU-RX + SD writes paced in 512-B slices
   with yields) — rejected on hardware measurement 2026-07-11.** Timed upload
