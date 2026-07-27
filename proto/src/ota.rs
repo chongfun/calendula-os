@@ -2199,6 +2199,19 @@ mod tests {
             "u1 anchor must be usable by u1 running image"
         );
         assert_eq!(dev.boot(), Boot::Acted(UpdateAction::BounceToAnchor));
+        assert_eq!(
+            dev.trigger,
+            Some("u1-image-2"),
+            "trigger survives the bounce"
+        );
+
+        // The anchor boots from slot 0, sees the trigger, writes slot 1, and selects it.
+        assert_eq!(dev.boot(), Boot::Acted(UpdateAction::WriteUpdateSlot));
+        assert_eq!(dev.slots[UPDATE_SLOT as usize], "u1-image-2");
+        assert_eq!(dev.trigger, None, "trigger is consumed by the anchor write");
+
+        // The device reboots and runs from slot 1 with the new image.
+        assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
     }
 
     #[test]
