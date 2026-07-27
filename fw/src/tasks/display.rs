@@ -821,9 +821,10 @@ async fn storage_command_while_free() -> StorageCommand {
 struct BackgroundBuild {
     book_id: u32,
     started: Instant,
-    /// Consecutive steps that never began. Reset by any step that actually
-    /// ran, so a card that hiccups once mid-build does not spend the budget a
-    /// later outage needs.
+    /// Consecutive steps that never began. Cleared by anything that proves the
+    /// card is answering — a step that actually ran, or a foreground open that
+    /// carried this walk through — so a hiccup does not go on slowing a build
+    /// the card has already come back for.
     attempts: u8,
 }
 
@@ -848,19 +849,28 @@ fn apply_build_outcome(
                 attempts: 0,
             })
         }
-        // The handle is normally already there. Adopting a missing one is the
-        // safety net for anything that drops the handle without ending the
-        // walk — a cache clear for another book, say — so a still-valid build
-        // is picked back up rather than stranded half-written.
-        reader_cache::BookBuildOutcome::Carried => {
-            if background_build.is_none() {
+        // The handle is normally already there, and what it needs is its retry
+        // budget cleared: reaching here means a foreground open just took an SD
+        // session, read this book's index and a section out of it, and came back
+        // with the walk still valid. That is direct evidence the card is
+        // answering again, so a walk sitting out a 30 s backoff should not wait
+        // the rest of it — the reader can cross the frontier inside that window.
+        //
+        // Adopting a *missing* handle is the separate safety net, for anything
+        // that drops it without ending the walk — a cache clear for another
+        // book, say — so a still-valid build is picked back up rather than
+        // stranded half-written. A handle naming another book is stale by the
+        // same reasoning, since `Carried` proves the resume belongs to this one.
+        reader_cache::BookBuildOutcome::Carried => match background_build {
+            Some(pending) if pending.book_id == book_id => pending.attempts = 0,
+            _ => {
                 *background_build = Some(BackgroundBuild {
                     book_id,
                     started: Instant::now(),
                     attempts: 0,
-                });
+                })
             }
-        }
+        },
     }
 }
 
