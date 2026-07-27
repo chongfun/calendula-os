@@ -248,7 +248,7 @@ Which slot is *executing* is a separate question, and `otadata` does not answer
 it: it records which slot the bootloader was *asked* to boot, not which one it
 did. ESP-IDF verifies the selected image and, if it fails, quietly boots the
 other app partition instead — leaving `otadata` pointing at the slot it
-rejected. A firmware that believed it could conclude it was running from slot 0,
+rejected. A firmware that trusted `otadata` could conclude it was running from slot 0,
 decide slot 1 was idle, and erase the very image it was executing, destroying
 the last bootable copy on the device. So the firmware asks the flash MMU which
 partition is mapped for execution, the way `esp_ota_get_running_partition()`
@@ -292,7 +292,7 @@ every time: builds from before the anchor carry the same hatch, and it points
 Confirm from the second-stage bootloader's own line, which prints before any app
 runs and so does not depend on which firmware is executing:
 
-```
+```text
 I boot: Loaded app from partition at offset 0x10000
 ```
 
@@ -305,7 +305,7 @@ above tells the two apart.
 Once you are running the new build, it prints the same pair itself on every boot,
 which is the more convenient check from then on:
 
-```
+```text
 ota: otadata requests slot Some(0), executing slot Some(0)
 ```
 

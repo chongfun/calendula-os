@@ -2159,38 +2159,39 @@ mod tests {
         );
     }
 
-    /// Lifecycle test: A u1 anchor attempting to install a u2 candidate must
-    /// be rejected by `staged_image_is_installable`, preventing a one-way
-    /// upgrade that leaves slot 1 unable to use the u1 anchor on future updates.
+    /// Asserts that candidate images with a different updater generation (such as `u2`)
+    /// are rejected directly by `staged_image_is_installable`, and proves that
+    /// same-generation updates succeed across the full multi-boot lifecycle.
     #[test]
-    fn u1_anchor_rejects_u2_installation_to_prevent_one_way_upgrade_deadlock() {
+    fn differing_generation_staged_image_is_rejected_and_same_generation_lifecycle_succeeds() {
         let u1_anchor_identity = descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)");
         let u2_candidate_identity = descriptor_field(b"CalendulaOS X4 u2 (MarigoldOS)");
 
         // 1. Starts with a u1 anchor (running u1).
         let running_identity = X4; // "CalendulaOS X4 u1 (MarigoldOS)"
 
-        // 2. Attempt to install u2: must be rejected.
+        // 2. Direct check: candidate with generation u2 must be rejected.
         assert!(
             !staged_image_is_installable(&u2_candidate_identity, running_identity),
             "u1 firmware must reject u2 staged image to avoid losing anchor compatibility"
         );
 
-        // Prove that same-generation (u1) updates succeed end-to-end:
+        // 3. Same-generation (u1) candidate is accepted.
         let u1_candidate_identity = descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)");
         assert!(staged_image_is_installable(
             &u1_candidate_identity,
             running_identity
         ));
 
+        // 4. Same-generation (u1) update lifecycle through Device:
         let mut dev = Device::new(ANCHOR_SLOT, ["u1-anchor", "old-fw"], true);
         dev.trigger = Some("u1-image");
         assert_eq!(dev.boot(), Boot::Acted(UpdateAction::WriteUpdateSlot));
 
-        // 3. Boots the resulting slot-1 image (running u1).
+        // Boots the resulting slot-1 image (running u1).
         assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
 
-        // 4. Stages another update while running from slot 1.
+        // Stages another update while running from slot 1.
         dev.trigger = Some("u1-image-2");
         let anchor_usable = anchor_can_apply_update(&u1_anchor_identity, running_identity);
         assert!(
