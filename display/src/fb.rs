@@ -360,6 +360,107 @@ impl Framebuffer {
         }
     }
 
+    /// Blit a packed MSB-first bitmap — a glyph — at frame (x, y):
+    /// `height` rows of `width` pixels, each row starting at a byte
+    /// boundary. Identical in output to one [`Self::blit_row`] per row,
+    /// which is exactly what the landscape frames do.
+    ///
+    /// Portrait takes a transposed path instead, and that is the point of
+    /// this entry: a frame row runs down a native *column*, so the
+    /// row-at-a-time loop can only place one pixel per read-modify-write.
+    /// Eight consecutive frame rows, though, land in eight bits of the
+    /// same native byte — transposing an 8x8 block of the glyph turns
+    /// those 64 masked writes into 8, and amortizes the per-row column
+    /// setup across the whole glyph. Reading pages are almost entirely
+    /// glyph blits, so this is the portrait page's rasterizer cost.
+    pub fn blit_bitmap(
+        &mut self,
+        x: i32,
+        y: i32,
+        bits: &[u8],
+        width: usize,
+        height: usize,
+        white: bool,
+    ) {
+        let row_bytes = width.div_ceil(8);
+        if row_bytes == 0 || height == 0 {
+            return;
+        }
+        if self.frame != FbFrame::Portrait {
+            for row in 0..height {
+                let start = (row * row_bytes).min(bits.len());
+                let end = ((row + 1) * row_bytes).min(bits.len());
+                self.blit_row(x, y + row as i32, &bits[start..end], width, white);
+            }
+            return;
+        }
+
+        // Portrait frame: x runs across the frame's width (the panel's
+        // HEIGHT), y down its height (the panel's WIDTH).
+        let col_start = if x < 0 { (-x) as usize } else { 0 };
+        let col_end = width.min((HEIGHT as i32 - x).max(0) as usize);
+        let row_start = if y < 0 { (-y) as usize } else { 0 };
+        let row_end = height.min((WIDTH as i32 - y).max(0) as usize);
+        if col_start >= col_end || row_start >= row_end {
+            return;
+        }
+
+        // Every frame column maps to one native row, walked at the column
+        // stride: descending memory on the X4's inverted scan, ascending
+        // on the X3's.
+        #[cfg(not(feature = "device-x3"))]
+        let stride = ROW_BYTES.wrapping_neg();
+        #[cfg(feature = "device-x3")]
+        let stride = ROW_BYTES;
+
+        let mut row = row_start;
+        while row < row_end {
+            let native_x = WIDTH - 1 - (y + row as i32) as usize;
+            let byte_x = Self::byte_x(native_x);
+            // Rows walk native x downward, so this group runs from bit
+            // `top_bit` down to bit 0 of one native byte.
+            let top_bit = native_x & 7;
+            let rows = (top_bit + 1).min(row_end - row);
+            // The transpose lands row j at bit 7-j; this group wants it at
+            // bit top_bit-j.
+            let shift = 7 - top_bit;
+
+            for byte_col in col_start / 8..col_end.div_ceil(8) {
+                let mut source = [0u8; 8];
+                let mut any = 0u8;
+                for (j, slot) in source.iter_mut().enumerate().take(rows) {
+                    *slot = bits
+                        .get((row + j) * row_bytes + byte_col)
+                        .copied()
+                        .unwrap_or(0);
+                    any |= *slot;
+                }
+                // Glyph bitmaps are mostly background; an empty 8x8 block
+                // is worth neither the transpose nor eight masked writes.
+                if any == 0 {
+                    continue;
+                }
+                let column_bytes = transpose8(source);
+
+                let first = (byte_col * 8).max(col_start);
+                let last = (byte_col * 8 + 8).min(col_end);
+                #[cfg(not(feature = "device-x3"))]
+                let native_y = HEIGHT - 1 - (x + first as i32) as usize;
+                #[cfg(feature = "device-x3")]
+                let native_y = (x + first as i32) as usize;
+                let mut index = native_y * ROW_BYTES + byte_x;
+                for column in first..last {
+                    let mask = column_bytes[column - byte_col * 8] >> shift;
+                    if mask != 0 {
+                        Self::apply_mask(&mut self.data[index], mask, white);
+                    }
+                    index = index.wrapping_add(stride);
+                }
+            }
+            row += rows;
+        }
+    }
+
     /// Merge one source byte whose MSB lands at native bit position
     /// `bit_x` (possibly negative or past the right edge; off-row bits
     /// drop) into the native row starting at byte index `base`.
@@ -428,6 +529,26 @@ impl Default for Framebuffer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Transpose an 8x8 bit block held MSB-first: `source[j]` is row `j` with
+/// bit 7 its leftmost pixel, and the result's byte `k` is column `k` with
+/// bit 7 its topmost pixel. Six shift-mask-or steps (Hacker's Delight
+/// 7-3) instead of the 64 bit tests the naive loop costs; the equivalence
+/// is pinned by `transpose8_matches_per_bit_reference`.
+#[inline]
+fn transpose8(source: [u8; 8]) -> [u8; 8] {
+    let mut x = u64::from_be_bytes(source);
+    x = (x & 0xAA55_AA55_AA55_AA55)
+        | ((x & 0x00AA_00AA_00AA_00AA) << 7)
+        | ((x >> 7) & 0x00AA_00AA_00AA_00AA);
+    x = (x & 0xCCCC_3333_CCCC_3333)
+        | ((x & 0x0000_CCCC_0000_CCCC) << 14)
+        | ((x >> 14) & 0x0000_CCCC_0000_CCCC);
+    x = (x & 0xF0F0_F0F0_0F0F_0F0F)
+        | ((x & 0x0000_0000_F0F0_F0F0) << 28)
+        | ((x >> 28) & 0x0000_0000_F0F0_F0F0);
+    x.to_be_bytes()
 }
 
 #[cfg(test)]
@@ -641,6 +762,93 @@ mod tests {
         fb.blit_row(3, 5, &[0b1100_0001], 8, true);
         for x in 0..16 {
             assert_eq!(fb.pixel(x, 5), matches!(x, 3 | 4 | 10), "x={x}");
+        }
+    }
+
+    /// The transposed portrait path is only allowed to be faster, never
+    /// different: whatever `blit_bitmap` writes, the row-at-a-time
+    /// `blit_row` loop it replaced must write too. `blit_row` is itself
+    /// pinned to the per-pixel reference above, so this chains to it.
+    #[test]
+    fn blit_bitmap_matches_row_at_a_time_in_every_frame() {
+        // Heights that straddle the 8-row group boundary and widths that
+        // leave padding bits set in the last byte of every row.
+        let glyphs: [(&[u8], usize, usize); 5] = [
+            (&[0b1011_0101], 8, 1),
+            (&[0b1011_0111, 0b0100_1011, 0b1111_1110], 5, 3),
+            (&[0xFF, 0xA5, 0x3C, 0x00, 0x81, 0x7E, 0x18, 0xDB], 8, 8),
+            (
+                &[
+                    0xFF, 0xA5, 0x12, 0x3C, 0x00, 0x40, 0x81, 0x7E, 0x08, 0x18, 0xDB, 0xC0, 0x5A,
+                    0x5A, 0x80, 0x01, 0x02, 0x03, 0xF0, 0x0F, 0xFF,
+                ],
+                17,
+                7,
+            ),
+            (&[0x01, 0x80, 0x00, 0x00, 0xFF, 0xFF], 16, 3),
+        ];
+        let positions = [
+            (-9i32, 3i32),
+            (-3, -2),
+            (0, 0),
+            (1, HEIGHT as i32 - 1),
+            (5, -1),
+            (7, 9),
+            (8, 16),
+            (12, 761),
+            (WIDTH as i32 - 3, 2),
+            (2, WIDTH as i32 - 3),
+            (HEIGHT as i32 - 2, 4),
+            (4, HEIGHT as i32),
+            (WIDTH as i32 + 2, 2),
+        ];
+        for frame in ALL_FRAMES {
+            for &(bits, width, height) in &glyphs {
+                let row_bytes = width.div_ceil(8);
+                for &(x, y) in &positions {
+                    for white in [false, true] {
+                        let mut fast = Framebuffer::new();
+                        let mut reference = Framebuffer::new();
+                        fast.clear(!white);
+                        reference.clear(!white);
+                        fast.set_frame(frame);
+                        reference.set_frame(frame);
+                        fast.blit_bitmap(x, y, bits, width, height, white);
+                        for row in 0..height {
+                            let start = (row * row_bytes).min(bits.len());
+                            let end = ((row + 1) * row_bytes).min(bits.len());
+                            reference.blit_row(x, y + row as i32, &bits[start..end], width, white);
+                        }
+                        assert_eq!(
+                            fast.bytes()[..],
+                            reference.bytes()[..],
+                            "frame {frame:?} bitmap {width}x{height} at ({x}, {y}) white={white}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transpose8_matches_per_bit_reference() {
+        let blocks: [[u8; 8]; 5] = [
+            [0; 8],
+            [0xFF; 8],
+            [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01],
+            [0xA5, 0x5A, 0x3C, 0xC3, 0x0F, 0xF0, 0x99, 0x66],
+            [0x01, 0x00, 0xFE, 0x13, 0x7F, 0x80, 0x24, 0xBD],
+        ];
+        for block in blocks {
+            let mut expected = [0u8; 8];
+            for (row, byte) in block.iter().enumerate() {
+                for (column, out) in expected.iter_mut().enumerate() {
+                    if byte & (0x80 >> column) != 0 {
+                        *out |= 0x80 >> row;
+                    }
+                }
+            }
+            assert_eq!(transpose8(block), expected, "block {block:?}");
         }
     }
 

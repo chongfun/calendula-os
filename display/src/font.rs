@@ -491,18 +491,16 @@ fn draw_glyph(
 
     let glyph_x = x + metric.x_offset as i16;
     let glyph_y = baseline_y + metric.y_offset as i16;
-    let row_bytes = (metric.width as usize).div_ceil(8);
-    for y in 0..metric.height as usize {
-        let start = (y * row_bytes).min(bitmap.len());
-        let end = ((y + 1) * row_bytes).min(bitmap.len());
-        fb.blit_row(
-            glyph_x as i32,
-            glyph_y as i32 + y as i32,
-            &bitmap[start..end],
-            metric.width as usize,
-            white,
-        );
-    }
+    // Whole-glyph blit, not row by row: portrait rasterizes a glyph's
+    // rows eight at a time, which it can only do with the block in hand.
+    fb.blit_bitmap(
+        glyph_x as i32,
+        glyph_y as i32,
+        bitmap,
+        metric.width as usize,
+        metric.height as usize,
+        white,
+    );
 
     (metric.advance_fp, drawn)
 }
