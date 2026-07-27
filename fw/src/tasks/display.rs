@@ -294,6 +294,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // Sleep queued by power_task after DisplaySettled waits behind it.
                     let (display_event, power_event) =
                         app_core::display_refresh_outcome(true, chapter_cursor);
+                    let settled_at_ms = Instant::now().as_millis();
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
                     // Emitted here, at the settle, and not after the prestage
@@ -309,7 +310,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         request.chapter,
                         layout_ms,
                         flush_ms,
-                        Instant::now().as_millis(),
+                        settled_at_ms,
                     );
                     let prestage_start = Instant::now();
                     // Unconditional, deliberately. Skipping this write when another

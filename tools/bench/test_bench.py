@@ -43,6 +43,15 @@ class BenchParserTests(unittest.TestCase):
         ]
         self.assertEqual(bench.prestage_values(events), [28, 27])
 
+    def test_prestage_values_combines_standalone_and_legacy_render_events(self) -> None:
+        """Log containing both firmware event shapes combines samples in ordering."""
+        events = [
+            {"event": "render", "view": "Reading", "prestage_ms": 28, "t_ms": 100},
+            {"event": "render", "view": "Reading", "layout_ms": 13, "t_ms": 200},
+            {"event": "prestage", "staged": True, "elapsed_ms": 24, "t_ms": 224},
+        ]
+        self.assertEqual(bench.prestage_values(events), [28, 24])
+
     def test_page_turn_duration_ends_at_the_render_event(self) -> None:
         """press-to-settled must not absorb the prestage that follows it."""
         events = [
@@ -262,6 +271,116 @@ class CaptureLinesTests(unittest.TestCase):
         self.assertEqual(lines, ["data\n"])
         mock_print.assert_any_call("port: capture window ended while the device was away", flush=True)
         mock_sleep.assert_not_called()
+
+
+class BenchCaptureLoopTests(unittest.TestCase):
+    def test_capture_waits_for_paired_prestage_across_intervening_log(self) -> None:
+        """Capture continues past unrelated logs until event=='prestage' arrives."""
+        lines = [
+            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 t_ms=100\n",
+            "[LOG_INF] Unrelated firmware message\n",
+            "bench: prestage staged=true elapsed_ms=24 t_ms=124\n",
+            "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 flush_ms=400 t_ms=200\n",
+        ]
+        written: list[dict] = []
+
+        def event_cb(e: dict) -> None:
+            written.append(e)
+
+        counts = bench.process_capture_stream(
+            lines,
+            "page-turn",
+            stop_target=("reading_render", 1),
+            print_lines=False,
+            event_callback=event_cb,
+        )
+
+        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("prestage"), 1)
+        self.assertEqual(len(written), 2)
+        self.assertEqual(written[0]["event"], "render")
+        self.assertEqual(written[1]["event"], "prestage")
+
+    def test_capture_stops_immediately_for_structured_combined_render(self) -> None:
+        """Structured combined render with prestage_ms stops without waiting for standalone prestage."""
+        lines = [
+            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 prestage_ms=15 t_ms=100\n",
+            "bench: prestage staged=true elapsed_ms=24 t_ms=124\n",
+        ]
+        written: list[dict] = []
+
+        def event_cb(e: dict) -> None:
+            written.append(e)
+
+        counts = bench.process_capture_stream(
+            lines,
+            "page-turn",
+            stop_target=("reading_render", 1),
+            print_lines=False,
+            event_callback=event_cb,
+        )
+
+        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("prestage", 0), 0)
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["event"], "render")
+
+    def test_capture_bounded_fallback_when_prestage_missing(self) -> None:
+        """Capture stops boundedly if prestage telemetry never arrives."""
+        lines = [
+            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 t_ms=100\n",
+        ] + [f"[LOG_INF] Intervening log {i}\n" for i in range(10)]
+        written: list[dict] = []
+
+        def event_cb(e: dict) -> None:
+            written.append(e)
+
+        counts = bench.process_capture_stream(
+            lines,
+            "page-turn",
+            stop_target=("reading_render", 1),
+            print_lines=False,
+            event_callback=event_cb,
+        )
+
+        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("prestage", 0), 0)
+        self.assertEqual(len(written), 1)
+
+    def test_capture_silent_device_fallback_when_prestage_missing(self) -> None:
+        """Capture stops when deadline expires even if serial stream is completely silent (no newlines)."""
+        import time
+
+        deadline_val: list[float] = []
+
+        def silent_lines():
+            yield "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 t_ms=100\n"
+            while True:
+                time.sleep(0.01)
+                if deadline_val and time.monotonic() >= deadline_val[0]:
+                    return
+
+        written: list[dict] = []
+
+        def event_cb(e: dict) -> None:
+            written.append(e)
+
+        started = time.monotonic()
+        counts = bench.process_capture_stream(
+            silent_lines(),
+            "page-turn",
+            stop_target=("reading_render", 1),
+            print_lines=False,
+            event_callback=event_cb,
+            pending_prestage_timeout_s=0.05,
+            on_deadline_set=lambda d: deadline_val.append(d),
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("prestage", 0), 0)
+        self.assertEqual(len(written), 1)
+        self.assertLess(elapsed, 1.0)
 
 
 if __name__ == "__main__":
