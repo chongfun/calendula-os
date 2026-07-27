@@ -1,8 +1,102 @@
 # PRD: CalendulaOS optimization roadmap
 
-Status: round 3 landed (A2-P, A3) — see "Status after round 3" below for the current queue
-Date: 2026-07-09 (status updated 2026-07-26)
+Status: round 4 landed (A10-as-shipped, A7) — see "Status after round 4" below for the current queue
+Date: 2026-07-09 (status updated 2026-07-27)
 Author: research pass over six parallel code-survey agents (display, book pipeline, power/boot, flash/RAM, storage/Wi-Fi, web emulator), each scoped to a mostly-disjoint code region so implementation can proceed in parallel.
+
+## Status after round 4 (2026-07-27)
+
+**WS-A is effectively finished.** The software budget around the panel is
+spent: an isolated portrait turn is now ~13 ms layout + ~405 ms flush
+(379 ms of it panel BUSY) + ~24 ms prestage. Nothing left in issue 01 is
+worth more than single-digit milliseconds except A4/A5, which are
+hardware-risk experiments. **The next real wins are in the book pipeline
+(B7, B4) and power (C2), not the render path.**
+
+**Landed on main since round 3:**
+
+- **A10 — shipped, but NOT as specified (#50).** The line-wrap-caching
+  premise was measured false; a portrait glyph-blit transpose shipped in
+  its place. **Portrait reading layout 33 ms → 13 ms median on X3
+  (2.5x).** Full detail and the disproof in issue 01; the short version is
+  below under "A10's premise was wrong".
+- **A7 — pipelined prestaging (#48).** Landed as a *conditional skip*
+  rather than an overlap: after a flush settles the display task yields
+  and, if another render is already queued, skips `prestage_previous`
+  entirely. Takes the 28 ms out of burst and held-button cadence; an
+  isolated single turn still pays it. True overlap with panel BUSY is
+  still unbuilt.
+- **A8 — dropped as superseded, PR #49 closed.** Its 4-way unrolling
+  targeted exactly the portrait `blit_row` loop #50 removed from the glyph
+  path. Only `fill_span` was left for it — menu furniture already at
+  3–8 ms.
+- Recovery-anchor boot hardening (#45) and an X3 web-emulator blit
+  Y-axis fix (#51), neither from this roadmap.
+
+**A10's premise was wrong, and it had been ranked #1 for three revisions.**
+It claimed ~16–31 ms of every turn went to re-wrapping paragraphs in
+`ui/src/reading.rs`. No wrapping happens at render time: the EPUB sink
+wraps at cache-build time and `push_line_block` stores each finished
+physical line as its own `BlockRecord` with `line_count: 1`, and
+`reader_page_at` is already an $O(1)$ index into `ReaderStore::pages`.
+Host measurement of one portrait page: **2.8 µs** of pagination against
+**194 µs** of drawing — layout is ~1.5% of the render. The lesson worth
+carrying: nobody measured the layout/rasterization split before ranking
+the item first. Measure that split before accepting any future "cache the
+layout" proposal.
+
+**Next queue (re-ranked 2026-07-27):**
+
+1. **Re-baseline on current main.** The bench table below is stitched from
+   two builds and has an unexplained number in it (see the note under the
+   table). One `page-turn` capture on today's main settles both.
+2. **B7 — Per-Config Section Caches & Orientation Toggle Acceleration**
+   (issue 02). Still the largest user-facing wait in the system: 24–27 s
+   replay on font-size changes and portrait↔landscape toggles, against
+   13 ms of reading layout. This is now the top item by a wide margin.
+3. **B4 Rework — Progressive First Open for Reading** (issue 02). ~64 s
+   first open at current settings.
+4. **C2** — deep-sleep GPIO hold + sleep-current measurement (issue 03).
+5. **D4** — directed Wi-Fi join + strongest-AP join (issue 04).
+6. **Upload-ceiling investigation** (issue 04).
+7. **D5** — portal → station handoff (issue 04).
+8. **A11 — batch landscape glyph rows** (issue 01, new). Fallout from #50:
+   landscape is now the *slower* frame per page (host 146 µs vs portrait's
+   93 µs) because it still blits row-at-a-time with per-row setup. Size the
+   win before building — expect single-digit ms against a 448 ms turn, and
+   portrait is the default orientation.
+9. **A9 — Overlapped SPI DMA Band Transmits** (issue 01).
+
+Tier 3 unchanged: A4, A5, C6, E4, F5, D6.
+
+**Bench session results (2026-07-27, X3, `page-turn --turns 50`, portrait,
+50 renders / 181 events / 0 warnings / Fast=50):**
+
+| Metric | 2026-07-26 | 2026-07-27 (A10-as-shipped) | |
+|---|---|---|---|
+| **Reading layout, portrait** | 33 ms median / 35 ms p95 | **13 ms median / 14 ms p95** (min 2, max 15) | **−20 ms, 2.5x** |
+| Prestage | 28 ms median | 24 ms median | pre-#48 build |
+| Render flush | 408 ms median / 435 ms p95 | 405 ms median / 406 ms p95 | |
+| Refresh busy | 379 ms | 379 ms | panel floor, unchanged |
+| Total page turn | 354 ms median / 476 ms p95 | 448 ms median / 449 ms p95 | **see below** |
+
+**Caveat — this capture was taken on the A10 branch before #48 merged, so
+it measures A10-as-shipped without A7. Treat the whole table as
+provisional until a re-baseline on current main.**
+
+**The 448 ms page-turn median is unexplained and is NOT a regression
+claim.** Nothing in #50 can raise it: layout only shrank, and it is an
+additive term. The new capture is internally consistent (13 layout + 405
+flush + 24 prestage = 442, vs 448 measured). It is the *prior* 354 ms
+median that does not reconcile with a 408 ms flush unless that capture
+overlapped prestage with the following turn — i.e. it was effectively
+measuring burst cadence, which is exactly what #48 now does deliberately.
+That is the leading hypothesis and it is testable: capture `page-turn` on
+current main (which has both #48 and #50) at the same book and position.
+If the 354-style median returns, the earlier number was burst cadence and
+#48 has made it the default; if it holds near 448, the earlier number
+needs its own explanation. **Do not quote either figure as the page-turn
+baseline until that run exists.**
 
 ## Status after round 3 (2026-07-26)
 
@@ -17,9 +111,13 @@ Author: research pass over six parallel code-survey agents (display, book pipeli
 - **Portrait is default orientation** (#5).
 - **Display SPI at datasheet 20 MHz on both panels** (#42).
 
-**Next queue (re-ranked 2026-07-26; strictly prioritized for the portrait reading experience):**
+**Next queue (2026-07-26) — superseded by "Status after round 4" above.**
+Of that queue: A10 shipped as something else entirely (its premise was
+measured false, #50), A7 merged (#48), A8 was dropped as superseded
+(#49 closed), and B7/B4/C2/D4/D5/upload-ceiling/A9 carry forward
+re-ranked. Kept below as written for the record:
 
-1. **A10 — Pre-computed Line-Wrap Caching for Reading View** (issues 01 & 02). Pre-calculates paragraph line-break offsets for adjacent pages while reading in Portrait mode. Reduces Portrait reading `layout_ms` from ~31 ms to **near-0 ms** ($O(1)$ lookup).
+1. **A10 — Pre-computed Line-Wrap Caching for Reading View** (issues 01 & 02). Pre-calculates paragraph line-break offsets for adjacent pages while reading in Portrait mode. Reduces Portrait reading `layout_ms` from ~31 ms to **near-0 ms** ($O(1)$ lookup). — **FALSE PREMISE, see round 4.**
 2. **A7 — Asynchronous / Pipelined Prestaging** (issue 01). Overlaps the previous-frame buffer prestaging (`DTM1`) with panel BUSY wait or SPI DMA transfers. Completely eliminates the **28 ms** prestage delay from the portrait page-turn latency path.
 3. **A8 — 32-Bit Word-Wide Strided Iteration for Portrait Blits** (issue 01). Unrolls `blit_row` column loops with 32-bit `u32` word pointers on RISC-V to process 4 native rows per iteration, further reducing Portrait blitting CPU cycle count by ~20–30%.
 4. **B7 — Per-Config Section Caches & Orientation Toggle Acceleration** (issue 02). Fast return to previously-built configs; avoids ~24 s replay on font size changes and portrait↔landscape toggles.
@@ -232,6 +330,19 @@ Each workstream is one issue file under `issues/`, owns a distinct set of files,
 - Power: bench-supervised runs with an external µA/mA meter (bench.py has no power channel today).
 
 ## Already considered / rejected — do NOT re-propose
+
+- **A10 as originally specified (pre-computed line-wrap caching for the
+  reading view) — disproven by measurement 2026-07-27.** There is no
+  wrapping in the render path to cache: the EPUB sink wraps at cache-build
+  time, `push_line_block` stores one physical line per `BlockRecord` with
+  `line_count: 1`, and the page record is already an $O(1)$ index. Layout
+  is 2.8 µs of a 197 µs portrait page render; the rest is rasterization.
+  Reading-view render time is moved by rasterizer work only. Full detail
+  in issue 01.
+- **A8 (4-way strided unrolling of the portrait `blit_row` column loop) —
+  superseded before it merged (#49 closed).** #50 removed that loop from
+  the glyph path and took 2.5x rather than A8's projected 20–30%. Only
+  `fill_span` remains for it, which is menu furniture at 3–8 ms.
 
 - **D2 (radio RX buffers 8/24 + AMPDU-RX + SD writes paced in 512-B slices
   with yields) — rejected on hardware measurement 2026-07-11.** Timed upload
