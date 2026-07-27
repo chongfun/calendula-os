@@ -172,8 +172,14 @@ Two mechanisms exist, both pioneered by CrossPoint:
 
 ## In-app update (the recovery net)
 
-Once *any* build of this firmware is running, it can update itself from the card
+Once a build of this firmware is running, it can update itself from the card
 with no computer — this is what keeps a locked unit from being a one-way trip:
+
+> [!IMPORTANT]
+> This is the path for updating *between* anchor builds. Moving an install from
+> before the anchor onto the first anchor build is a one-time migration, and it
+> has to go through a computer or the OEM updater — see
+> [Migrating an install from before the anchor](#migrating-an-install-from-before-the-anchor).
 
 1. Copy a new app image to the card root as **`FWUPDATE.BIN`** (the file
    `tools/build-release.sh` produces for X4; the `FWUPDATE.BIN` name
@@ -184,27 +190,145 @@ with no computer — this is what keeps a locked unit from being a one-way trip:
    other's image (they share a SoC, but not a display controller or battery
    gauge, so a cross-flash is a black screen).
 2. Reboot. At boot, before the reader starts, the firmware validates the image
-   (`proto::ota::validate_image`), discovers the **inactive** OTA slot from the
-   installed partition table, writes it there, deletes `FWUPDATE.BIN` so it can
-   run only once, flips `otadata` to select the new slot
-   (`proto::ota::plan_switch`), and resets into the new firmware.
+   (`proto::ota::validate_image`), locates the **update slot** in the installed
+   partition table, writes it there, deletes `FWUPDATE.BIN` so it can run only
+   once, flips `otadata` to select it (`proto::ota::plan_switch`), and resets
+   into the new firmware.
    On the first boot after any OTA-slot install (including CrossInk's
    Settings -> SD firmware update flow), Calendula marks the selected `otadata`
    entry valid before the reader starts, so rollback-enabled bootloaders do not
    return to the previous firmware on the next deep-sleep reset.
 
-Only the inactive slot and inactive `otadata` sector are written, so a bad or
+Only the update slot and inactive `otadata` sector are written, so a bad or
 half-copied image never harms the running firmware — the bootloader keeps
 booting the current slot until a complete, valid image flips `otadata`. This
 works on an unlocked unit too (espflash's bootloader is ESP-IDF and honours
 `otadata`), which is how to test it without a locked device.
 
-If an update lands you on a firmware that boots but misbehaves, hold **Back + Up**
-at reset: the recovery hatch repoints `otadata` back at slot 0 (the firmware
-first installed there) and reboots into it. It can't help a firmware that won't
-boot far enough to run the check — that would need a custom bootloader, which no
-app-level firmware provides — so treat it as a strong safety net, not a
-guarantee against every brick.
+### Slot 0 is an anchor, not half of an A/B pair
+
+In-app updates always land in **slot 1**. **Slot 0 is never written** by the
+updater: it keeps whatever was first installed there — by the web flasher,
+`esptool`, or the OEM SD updater, all of which target `0x10000` — so the
+recovery hatch below always has a known firmware to fall back to. This follows
+the FreeInk `RecoveryBoot` convention, where the recovery slot is deliberately
+never reflashed. Plain A/B alternation would eventually write an update over the
+very image the hatch returns to, and would leave the hatch a no-op on every boot
+that happened to be running from slot 0.
+
+The trade-off: an update staged while you are *already* running from slot 1
+can't be written in place, because that would erase the running firmware. That
+boot instead points `otadata` back at the anchor and resets **without** deleting
+`FWUPDATE.BIN`, so the anchor boot applies it into slot 1 on the next pass. You
+see two reboots instead of one; slot 0 still never gets written.
+
+Calendula only bounces into an anchor that could actually finish the job. Each
+build stamps a firmware identity into its app descriptor —
+`CalendulaOS <board> u<updater-generation> (MarigoldOS)` — and the anchor's must
+match exactly. That rules out four cases which would otherwise leave you on a
+firmware that ignores your trigger file, with no way back (the hatch is a no-op
+once you are *on* slot 0):
+
+- a **foreign** firmware, from a mixed install with CrossPoint or the stock app;
+- a build for the **other board**, which drives a different panel and looks for
+  the other trigger filename (`FWUPDATE.BIN` vs `FWUPDX3.BIN`);
+- a build from an **older updater generation**, which may not recognise this
+  trigger at all;
+- a **corrupt or half-written** image — an interrupted flash leaves slot 0's
+  first bytes intact and its tail missing, so the anchor is checked the same way
+  a staged update is: segment walk, checksum, and appended SHA-256.
+
+In any of those, the update is refused and slot 1 is left as it was. The trigger
+file is deleted on the way out — a refusal that left it in place would repeat on
+every boot — so it is no longer on the card. Copying it back would only refuse
+again for the same reason: the fix is to flash the image with a computer or the
+OEM updater, both of which write slot 0 and so restore a usable anchor.
+
+Which slot is *executing* is a separate question, and `otadata` does not answer
+it: it records which slot the bootloader was *asked* to boot, not which one it
+did. ESP-IDF verifies the selected image and, if it fails, quietly boots the
+other app partition instead — leaving `otadata` pointing at the slot it
+rejected. A firmware that trusted `otadata` could conclude it was running from slot 0,
+decide slot 1 was idle, and erase the very image it was executing, destroying
+the last bootable copy on the device. So the firmware asks the flash MMU which
+partition is mapped for execution, the way `esp_ota_get_running_partition()`
+does; if that lookup cannot resolve, the update is refused rather than guessed
+at. The anchor check above answers something else — whether a bounce could
+finish the job — and both boot log lines are printed on every boot.
+
+The image on the card is checked the same way before it is installed: it must be
+for **this board** and retain the current **updater generation** (such as `u1`).
+An in-app update must retain the current updater generation so that the permanent
+slot-0 anchor remains capable of servicing future updates for the installed
+firmware. Moving to a new updater generation requires first replacing or
+re-establishing the slot-0 anchor through the computer/OEM installation path.
+An image for the other board, a foreign image, or a build with a different updater
+generation is refused.
+
+### Migrating an install from before the anchor
+
+Builds from before the anchor stamp a product-only identity
+(`CalendulaOS (MarigoldOS)`, with no `<board> u<generation>`) and update by plain
+A/B alternation: they write whichever slot is inactive. So they cannot be relied
+on to put the first anchor build where it has to go, and whether the in-app path
+leaves you with a working recovery net is a coin flip you cannot see:
+
+- if the old build happened to be running from **slot 1**, its write lands in
+  slot 0, the anchor gets the new identity, and everything works from there;
+- if it happened to be running from **slot 0**, the write lands in slot 1 and
+  slot 0 keeps the old build. The new firmware boots and runs normally, but
+  every later in-app update is refused (`NoUsableAnchor`), because the anchor is
+  not an image it will hand off to — and nothing on the device can repair that,
+  since the updater never writes slot 0.
+
+**Install the first anchor build with a computer or the OEM updater.** The web
+flasher, `esptool` at `0x10000`, and `update.bin` on the card all write slot 0,
+which is what this migration needs. None of them touch `otadata`, so if it was
+selecting slot 1 the device still boots the *old* build sitting there — with the
+new one unused in slot 0. **Hold Back + Up at the first reset after the flash**,
+every time: builds from before the anchor carry the same hatch, and it points
+`otadata` at slot 0. If `otadata` already selected slot 0, the hold is a no-op.
+
+Confirm from the second-stage bootloader's own line, which prints before any app
+runs and so does not depend on which firmware is executing:
+
+```text
+I boot: Loaded app from partition at offset 0x10000
+```
+
+`0x10000` is the anchor. Any other offset means you are still on the update slot:
+either the hold did not register — try again — or the bootloader was asked for
+slot 0 and refused it, in which case the flash did not take and slot 0 needs
+writing again. `E boot: OTA app partition slot 0 is not bootable` immediately
+above tells the two apart.
+
+Once you are running the new build, it prints the same pair itself on every boot,
+which is the more convenient check from then on:
+
+```text
+ota: otadata requests slot Some(0), executing slot Some(0)
+```
+
+- **requests 0, executing 0** — done. The anchor is the new build.
+- **requests 1, executing 1** — `otadata` still selects the update slot. Hold
+  **Back + Up** at reset to switch over.
+- **requests 0, executing 1** — the bootloader was asked for slot 0, refused it,
+  and fell forward. **Back + Up will not help here**: it only moves `otadata`,
+  which already names slot 0. Write slot 0 again.
+
+If you already took the in-app path and updates are now being refused, the
+firmware itself is fine; reflashing to `0x10000` by either route restores the
+anchor. Release notes for the first anchor build should say so, rather than
+presenting it as an ordinary in-app update.
+
+### Backing out a bad update
+
+If an update lands you on a firmware that boots but misbehaves, hold
+**Back + Up** at reset: the recovery hatch confirms the hold across ~12 ms of
+continuous reads, repoints `otadata` back at the slot 0 anchor, and reboots into
+it. It can't help a firmware that won't boot far enough to run the check — that
+would need a custom bootloader, which no app-level firmware provides — so treat
+it as a strong safety net, not a guarantee against every brick.
 
 ## Status
 
@@ -222,7 +346,7 @@ Implemented and verified on host tooling:
 - [x] `cargo run` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
-      before any candidate `.bin` is written to the inactive slot. Streaming,
+      before any candidate `.bin` is written to the update slot. Streaming,
       no heap; host-tested against synthetic valid and corrupt images.
 - [x] **otadata layer** (`proto::ota`: `seq_crc`, `SelectEntry`, `plan_switch`,
       `active_app_slot`) — the OTA-slot select-entry format, the seq CRC
@@ -230,9 +354,12 @@ Implemented and verified on host tooling:
       on-device value: `seq_crc(1) == 0x4743989A`), and the slot-switch math.
       Host-tested.
 - [x] **Boot-time SD updater** (`fw::ota_update`) — on boot, `/FWUPDATE.BIN` is
-      validated, written with `esp-storage` to the inactive slot discovered
-      from the installed partition table, deleted, selected via `otadata`, and
-      the device resets into it. Only the inactive slot/sector are touched.
+      validated for structure and for descriptor identity, written with
+      `esp-storage` to the **update slot** (slot 1) located in the installed
+      partition table, deleted, selected via `otadata`, and the device resets
+      into it. A trigger found while already running from slot 1 bounces through
+      the anchor instead (see [Slot 0 is an anchor](#slot-0-is-an-anchor-not-half-of-an-ab-pair)).
+      Only the update slot and the inactive `otadata` sector are touched.
 - [x] **OTA rollback acknowledgement** (`fw::ota_update::mark_running_slot_valid`)
       — early boot rewrites an active `NEW`/`PENDING_VERIFY` select entry as
       `VALID`. This covers installs launched from CrossInk/CrossPoint's
@@ -259,6 +386,38 @@ Implemented and verified on host tooling:
       owns the ADC. Verified on device that it does **not** false-trigger on an
       idle boot; the band values are the same ones the input task uses daily, and
       the otadata switch is the mechanism the self-test already proved.
+      The combo must now read held on 4 consecutive polls 4 ms apart — 12 ms of
+      continuous hold, giving up after 28 ms on an idle boot — so a single
+      reading taken while the ADC settles can neither arm nor miss the switch.
+      (N readings span N-1 delays, so those windows are derived constants,
+      `CONFIRM_WINDOW_MS`/`MAX_WINDOW_MS`, asserted against a replay of the poll
+      loop rather than written down.)
+      Detection is derived from the input task's own ladder tables
+      (`app_core::buttons`), so a recalibrated band cannot move the hatch off the
+      buttons documented here. The confirm state machine
+      (`app_core::buttons::ComboConfirmer`) is sans-IO and host-tested: a steady
+      hold confirms, unsettled first readings still confirm, a transient blip
+      never does, and an idle boot always gives up inside the budget.
+
+- [x] **Slot 0 pinned as the recovery anchor** (`fw::ota_update`) — updates
+      always target slot 1, and nothing in the updater writes slot 0, so the
+      hatch's fallback image is the one first installed and cannot be consumed by
+      an update. An update staged while running from slot 1 bounces through the
+      anchor (one extra reboot, trigger file preserved) rather than erasing the
+      running firmware; an anchor that could not apply the update — foreign,
+      built for the other board, or from an older updater generation — is
+      detected by the app-descriptor firmware identity and refused. Descriptor
+      offset (`0x50`) and both boards' identities verified against built images.
+
+- [x] **Slot policy host-tested across reboots** (`proto::ota`) — the decisions
+      (`plan_update_action`, `plan_recovery_switch`, `project_name`) are sans-IO
+      and tested against a simulated device that carries real `otadata` sectors
+      through successive boots. Covered: an update staged from the anchor lands
+      in one reboot; one staged from the update slot bounces and then lands, with
+      the trigger surviving the first reset; a foreign anchor refuses without
+      stranding the user; the hand-off always terminates and bounces at most
+      once; four updates in a row never write slot 0; and the hatch still finds
+      an intact anchor after an update installed through the bounce.
 
 Not yet done:
 
@@ -268,6 +427,11 @@ Not yet done:
 - [ ] **Live recovery-combo press** — confirm a physical Back+Up hold detects and
       switches on device (detection reuses the input task's proven bands, so this
       is a formality). Optional on-panel progress during an update.
+- [ ] **Bounce-through-the-anchor run on hardware** — the decision and the
+      reboot sequencing are host-tested (above); what remains unproven on device
+      is the I/O around them, specifically that the trigger file really survives
+      the first reset on a physical card. Blocked on the same missing card reader
+      as the end-to-end run above.
 - [ ] **Locked-unit confirmation** — that our app-descriptor eFuse range
       satisfies the stock gate and the OEM SD updater accepts our `update.bin`.
       Needs a locked device; the author's is unlocked.

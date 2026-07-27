@@ -38,6 +38,37 @@ const fn desc_field<const N: usize>(s: &str) -> [u8; N] {
     out
 }
 
+/// The app descriptor's `project_name`, and the identity `ota_update` reads
+/// back out of flash to decide whether the slot-0 anchor can apply an update.
+///
+/// Format: `CalendulaOS <board> u<updater-generation> (MarigoldOS)`.
+///
+/// The product name alone is not enough to answer that question. The X4 and X3
+/// builds are the same product but take different OTA trigger filenames
+/// (`FWUPDATE.BIN` vs `FWUPDX3.BIN`) and drive different panels and battery
+/// gauges, so bouncing into an anchor built for the other board would boot
+/// firmware for the wrong hardware *and* strand the update, since that image
+/// never looks for this board's trigger. The board is therefore part of the
+/// identity. So is a generation digit, bumped whenever the trigger filename or
+/// the update hand-off changes, so an anchor too old to recognise this trigger
+/// is refused rather than booted into.
+///
+/// The strings themselves live in [`proto::ota`], beside the comparison that
+/// reads them back and the tests that pin them, so the firmware cannot stamp
+/// one identity while the updater expects another.
+#[cfg(not(feature = "device-x3"))]
+pub const PROJECT_NAME: &str = proto::ota::IDENTITY_X4;
+#[cfg(feature = "device-x3")]
+pub const PROJECT_NAME: &str = proto::ota::IDENTITY_X3;
+
+// The descriptor field is a fixed 32 bytes; `desc_field` would fail const
+// evaluation on an overlong identity, but with an index panic rather than a
+// reason.
+const _: () = assert!(
+    PROJECT_NAME.len() <= 32,
+    "PROJECT_NAME must fit the app descriptor's project_name field"
+);
+
 #[allow(unsafe_code)]
 #[link_section = ".rodata_desc"]
 #[used]
@@ -47,7 +78,7 @@ pub static _ESP_APP_DESC: EspAppDesc = EspAppDesc {
     secure_version: 0,
     reserv1: [0; 2],
     version: desc_field(env!("CARGO_PKG_VERSION")),
-    project_name: desc_field("CalendulaOS (MarigoldOS)"),
+    project_name: desc_field(PROJECT_NAME),
     time: *b"00:00:00\0\0\0\0\0\0\0\0",
     date: *b"2026-05-20\0\0\0\0\0\0",
     idf_ver: [0; 32],
@@ -65,6 +96,7 @@ pub static _ESP_APP_DESC: EspAppDesc = EspAppDesc {
 // loaned buffers.
 extern crate alloc;
 
+use app_core::buttons::{ComboConfirmer, ComboVerdict};
 pub use app_core::{
     AppView, Button, DisplayCommand, DisplayEvent, DisplayOrientation, InputEvent, LibraryEvent,
     PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, StorageCommand,
@@ -95,6 +127,7 @@ pub mod catalog;
 mod custom_font;
 mod display_flush;
 mod library_sd;
+mod mmu;
 mod ota_update;
 mod reader_cache;
 mod reader_cache_files;
@@ -211,7 +244,36 @@ where
             }
         };
     }
-    v[0].max(v[1]).min(v[0].min(v[1]).max(v[2]))
+    app_core::buttons::median3(v[0], v[1], v[2])
+}
+
+/// Poll both ladders until [`ComboConfirmer`] resolves. This is the ADC and the
+/// delay around it; the timing rules and what counts as a confirmed hold live
+/// in `app_core::buttons`, where they are host-tested.
+fn recovery_combo_confirmed(
+    adc: &mut BoardAdcDriver,
+    nav_pin: &mut AdcPin<esp_hal::peripherals::GPIO1<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
+    page_pin: &mut AdcPin<esp_hal::peripherals::GPIO2<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
+) -> bool {
+    let delay = esp_hal::delay::Delay::new();
+    let mut confirmer = ComboConfirmer::new();
+    loop {
+        let nav_mv = median3_adc(adc, nav_pin);
+        let page_mv = median3_adc(adc, page_pin);
+        match confirmer.push(nav_mv, page_mv) {
+            ComboVerdict::Confirmed => {
+                esp_println::println!(
+                    "recovery: Back+Up confirmed over {} polls (nav={} page={})",
+                    confirmer.consecutive(),
+                    nav_mv,
+                    page_mv
+                );
+                return true;
+            }
+            ComboVerdict::GaveUp => return false,
+            ComboVerdict::KeepPolling => delay.delay_millis(ComboConfirmer::POLL_MS),
+        }
+    }
 }
 
 #[esp_hal::main]
@@ -291,19 +353,14 @@ fn main() -> ! {
     };
 
     // RecoveryBoot escape hatch: holding Back + Up at reset repoints otadata at
-    // slot 0 and reboots into it — a way back if the far slot's firmware boots
-    // but misbehaves. Sampled here, the earliest point, before any task owns the
-    // ADC; the stock bootloader can't read buttons, so only the running firmware
-    // can honour the combo. Median-of-3 so a single noisy read can't trip it.
+    // the slot-0 anchor and reboots into it — a way back if the update slot's
+    // firmware boots but misbehaves. Sampled here, the earliest point, before
+    // any task owns the ADC; the stock bootloader can't read buttons, so only
+    // the running firmware can honour the combo.
+    if recovery_combo_confirmed(&mut adc1, &mut nav_adc, &mut page_adc)
+        && ota_update::recover_to_slot0()
     {
-        let nav_mv = median3_adc(&mut adc1, &mut nav_adc);
-        let page_mv = median3_adc(&mut adc1, &mut page_adc);
-        if ota_update::recovery_combo_held(nav_mv, page_mv) {
-            esp_println::println!("recovery: Back+Up held (nav={} page={})", nav_mv, page_mv);
-            if ota_update::recover_to_slot0() {
-                esp_hal::system::software_reset();
-            }
-        }
+        esp_hal::system::software_reset();
     }
 
     ota_update::mark_running_slot_valid();

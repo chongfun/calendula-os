@@ -1,4 +1,5 @@
 use crate::{Button, InputEvent, INPUT_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS};
+use app_core::buttons::{classify, HardwareButton, NAV, PAGE};
 use embassy_time::{Instant, Timer};
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
 use esp_hal::gpio::Input;
@@ -27,8 +28,6 @@ const DEBOUNCE_TICKS: u8 = 2;
 // ~480 ms between held-button repeats, matching the fast-refresh settle
 // cadence so one repeat advances one displayed page.
 const REPEAT_COOLDOWN_TICKS: u8 = 32;
-const NAV_BACK_MIN_MV: u16 = 2400;
-const NAV_BACK_MAX_MV: u16 = 2700;
 const RAW_LOG_TICKS: u8 = 67;
 // Battery moves over minutes, not ticks: sample the gauge/ADC once per
 // ~3 s instead of at the top of every 15 ms tick. On the X3 each sample
@@ -50,13 +49,6 @@ static CACHED_GAUGE: AtomicU32 = AtomicU32::new(100 << 16);
 /// `percent` occupies bits 16..24, so bit 24 is free.
 #[cfg(feature = "device-x3")]
 const GAUGE_VALID: u32 = 1 << 24;
-
-#[derive(Clone, Copy)]
-struct Band {
-    min: u16,
-    max: u16,
-    button: HardwareButton,
-}
 
 pub struct InputPins {
     /// Power button. Held as an `Option` because the deep-sleep path takes it:
@@ -89,16 +81,6 @@ struct StableButton {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HardwareButton {
-    Back,
-    Confirm,
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 enum FrontLayout {
     BackConfirmLeftRight,
@@ -114,45 +96,6 @@ enum SideLayout {
 
 const FRONT_LAYOUT: FrontLayout = FrontLayout::BackConfirmLeftRight;
 const SIDE_LAYOUT: SideLayout = SideLayout::PrevNext;
-
-const NAV: &[Band] = &[
-    // X4 front-button ladder on GPIO1. These bands scale Adafruit's current
-    // 16-bit CircuitPython X4 thresholds to the 12-bit esp-hal ADC reads.
-    Band {
-        min: NAV_BACK_MIN_MV,
-        max: NAV_BACK_MAX_MV,
-        button: HardwareButton::Back,
-    },
-    Band {
-        min: 1800,
-        max: 2150,
-        button: HardwareButton::Confirm,
-    },
-    Band {
-        min: 1000,
-        max: 1250,
-        button: HardwareButton::Left,
-    },
-    Band {
-        min: 0,
-        max: 100,
-        button: HardwareButton::Right,
-    },
-];
-
-const PAGE: &[Band] = &[
-    // X4 side-button ladder on GPIO2, scaled from Adafruit's thresholds.
-    Band {
-        min: 1500,
-        max: 1800,
-        button: HardwareButton::Up,
-    },
-    Band {
-        min: 0,
-        max: 100,
-        button: HardwareButton::Down,
-    },
-];
 
 #[embassy_executor::task]
 pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
@@ -446,15 +389,6 @@ fn debounce_active_low(raw_pressed: bool, ticks: &mut u8) -> bool {
         *ticks = ticks.saturating_sub(1);
     }
     *ticks == DEBOUNCE_TICKS
-}
-
-fn classify(value: u16, table: &[Band]) -> Option<HardwareButton> {
-    for band in table {
-        if value >= band.min && value <= band.max {
-            return Some(band.button);
-        }
-    }
-    None
 }
 
 fn map_hardware(button: HardwareButton) -> Button {
