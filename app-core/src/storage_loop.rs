@@ -292,6 +292,27 @@ pub const fn background_announce(finished: bool, reader_page: u32, advertised_be
     finished || reader_page.saturating_add(1) >= advertised_before
 }
 
+/// Whether a background step that stopped early still owes an announcement.
+///
+/// A step can grow the book and *then* fail — a refused index write leaves the
+/// resident index longer than the one the app knows about. The walk is over
+/// either way, but those extra pages are built, on the card, and reachable; the
+/// only thing keeping the reader off them is a page count nobody updated. That
+/// is the same dead next-page button [`background_announce`] exists to prevent,
+/// so it gets the same answer, with two conditions rather than one.
+///
+/// Growth is required because this is not the finish: with nothing new to say,
+/// a repaint would cost a full panel refresh to redraw the same number. And the
+/// caller must have established that the store is coherent — a step that could
+/// not put the reader's page back may not be repainted on at any page count.
+pub const fn stopped_announce(
+    advertised_before: u32,
+    advertised_now: u32,
+    reader_page: u32,
+) -> bool {
+    advertised_now > advertised_before && background_announce(false, reader_page, advertised_before)
+}
+
 /// What the book-open transaction wants next.
 ///
 /// The order is the design: the departing book's position is written while its
@@ -1325,6 +1346,28 @@ mod tests {
         assert!(background_announce(false, 399, 400));
         // One page short of the frontier still has somewhere to turn to.
         assert!(!background_announce(false, 398, 400));
+    }
+
+    // Invariant: the same dead next-page button, reached the other way. The
+    // step grew the book to 460 pages and then broke; if the walk simply
+    // vanishes at 400, the reader is pinned below pages that exist and are
+    // readable, with no input that can dislodge them short of leaving the book.
+    #[test]
+    fn a_stopped_step_that_grew_the_book_still_frees_the_frontier() {
+        assert!(stopped_announce(400, 460, 399));
+    }
+
+    #[test]
+    fn a_stopped_step_that_built_nothing_stays_silent() {
+        // Nothing new to say, and saying it costs a full panel refresh.
+        assert!(!stopped_announce(400, 400, 399));
+    }
+
+    #[test]
+    fn a_stopped_step_does_not_repaint_a_reader_mid_book() {
+        // Their next page was already built; the growth is theirs to discover
+        // by turning pages, not worth a refresh.
+        assert!(!stopped_announce(400, 460, 12));
     }
 
     #[test]

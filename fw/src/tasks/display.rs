@@ -236,16 +236,41 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // page on screen. Silence leaves the panel showing the frame it
                 // already has, and the next page turn issues an ordinary extend
                 // that reloads properly.
-                if step == reader_cache::BackgroundStep::Abandoned {
-                    esp_println::println!(
-                        "storage: background build abandoned book_id={}",
-                        pending.book_id
-                    );
-                } else if app_core::storage_loop::background_announce(
-                    finished,
-                    reader_page,
-                    advertised_before,
-                ) {
+                let announce = match step {
+                    reader_cache::BackgroundStep::Abandoned => {
+                        esp_println::println!(
+                            "storage: background build abandoned book_id={}",
+                            pending.book_id
+                        );
+                        false
+                    }
+                    // The walk is over, but it grew the book before it broke and
+                    // left the store whole. Those pages are on the card and the
+                    // resident index reaches them; only the app's page count is
+                    // behind, and at the frontier that count is what makes the
+                    // next-page button do nothing.
+                    reader_cache::BackgroundStep::Stopped => {
+                        esp_println::println!(
+                            "storage: background build stopped book_id={} pages={}",
+                            pending.book_id,
+                            sd_library.advertised_page_count()
+                        );
+                        app_core::storage_loop::stopped_announce(
+                            advertised_before,
+                            sd_library.advertised_page_count(),
+                            reader_page,
+                        )
+                    }
+                    reader_cache::BackgroundStep::Continued
+                    | reader_cache::BackgroundStep::Finished => {
+                        app_core::storage_loop::background_announce(
+                            finished,
+                            reader_page,
+                            advertised_before,
+                        )
+                    }
+                };
+                if announce {
                     // `position: None` — the book grew, the reader did not
                     // move, and adopting a page here would yank them.
                     send_loaded_library_event(&LibraryEvent::Loaded {

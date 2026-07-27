@@ -383,13 +383,35 @@ pub(crate) enum BackgroundStep {
     /// the reader's page is resident, so this is the one outcome worth
     /// announcing.
     Finished,
-    /// The walk stopped without finishing — a refused index write, a section
-    /// that would not read back, a catalog row that moved. Nothing may repaint
-    /// on it: the store may be mid-step, and the arena may still hold whatever
-    /// the builder touched last rather than the page on screen. The card keeps
-    /// a valid, shorter index, and its `resume_spine` marks it as a build that
+    /// The walk stopped without finishing, but the store came through it whole:
+    /// the reader's page is resident and the resident index is the one they turn
+    /// pages against. A step reaches here by growing the book and *then* failing
+    /// — a refused `BOOK.BIN` write, most often — which leaves pages that are
+    /// built, on the card, and reachable, behind a page count the app has not
+    /// been told about. Announcing is therefore safe, and at the frontier it is
+    /// necessary: see `app_core::storage_loop::stopped_announce`.
+    Stopped,
+    /// The walk stopped without finishing and the store did not come through it:
+    /// the arena may hold whatever the builder touched last rather than the page
+    /// on screen. Nothing may repaint on it at any page count. The card keeps a
+    /// valid, shorter index, and its `resume_spine` marks it as a build that
     /// never came back, so the next open rebuilds rather than trusting it.
     Abandoned,
+}
+
+/// Which of the two endings a broken step earned.
+///
+/// The question is not which error was raised but whether the store is still
+/// the reader's. [`restore_reader_page`] marks the window partial when it cannot
+/// put the reader's page back, and `covers_global_page` is the very predicate a
+/// page turn consults — so asking the store is both the accurate answer and the
+/// same one the rest of the system will act on.
+fn step_ending(library: &ReaderStore, index: usize, current_page: u32) -> BackgroundStep {
+    if library.covers_global_page(index, current_page) {
+        BackgroundStep::Stopped
+    } else {
+        BackgroundStep::Abandoned
+    }
 }
 
 /// One background step of a progressive build: re-open the EPUB, skip to the
@@ -483,17 +505,17 @@ pub(crate) fn continue_book_build(
         }
         // The step broke rather than finished. The card keeps a shorter but
         // valid index whose `resume_spine` says a build walked away from it, so
-        // the next open rebuilds; what must not happen now is a repaint over a
-        // store this step may have left mid-move.
+        // the next open rebuilds. Whether the *reader* can be told anything now
+        // is a separate question, and only the store can answer it.
         Ok(Err(err)) => {
             esp_println::println!("epub: build continue failed: {:?}", err);
             scratch.resume = None;
-            BackgroundStep::Abandoned
+            step_ending(library, resume.index as usize, current_page)
         }
         Err(err) => {
             esp_println::println!("epub: build continue session failed: {:?}", err);
             scratch.resume = None;
-            BackgroundStep::Abandoned
+            step_ending(library, resume.index as usize, current_page)
         }
     }
 }
