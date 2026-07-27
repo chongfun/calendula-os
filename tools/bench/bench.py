@@ -24,7 +24,7 @@ import termios
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, TextIO
 
 try:
     import tomllib
@@ -161,6 +161,70 @@ def print_suites() -> None:
     print("report          Summarize captured JSONL logs.")
 
 
+MAX_PENDING_PRESTAGE_LINES = 5
+DEFAULT_PENDING_PRESTAGE_TIMEOUT_S = 2.0
+
+
+def process_capture_stream(
+    lines: Iterable[str],
+    suite_name: str,
+    stop_target: tuple[str, int] | None,
+    out: TextIO | None = None,
+    print_lines: bool = True,
+    event_callback: Callable[[dict[str, Any]], None] | None = None,
+    pending_prestage_timeout_s: float = DEFAULT_PENDING_PRESTAGE_TIMEOUT_S,
+    on_deadline_set: Callable[[float], None] | None = None,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    pending_prestage = False
+    pending_prestage_deadline: float | None = None
+    pending_prestage_lines = 0
+
+    for line in lines:
+        if line != "":
+            if print_lines:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            parsed_events = parse_line(line, suite_name)
+            for event in parsed_events:
+                if out is not None:
+                    write_event(out, event)
+                if event_callback is not None:
+                    event_callback(event)
+                for counter in event_counters(event):
+                    counts[counter] = counts.get(counter, 0) + 1
+        else:
+            parsed_events = []
+
+        if pending_prestage:
+            has_prestage = any(e.get("event") == "prestage" for e in parsed_events)
+            has_new_turn_or_render = any(e.get("event") in {"render", "input"} for e in parsed_events)
+            if line != "":
+                pending_prestage_lines += 1
+            expired = pending_prestage_deadline is not None and time.monotonic() >= pending_prestage_deadline
+            if has_prestage or has_new_turn_or_render or pending_prestage_lines >= MAX_PENDING_PRESTAGE_LINES or expired:
+                break
+        elif stop_target and counts.get(stop_target[0], 0) >= stop_target[1]:
+            if stop_target[0] == "reading_render":
+                already_prestaged = any(
+                    e.get("event") == "render" and isinstance(e.get("prestage_ms"), int)
+                    for e in parsed_events
+                )
+                if not already_prestaged:
+                    pending_prestage = True
+                    deadline = time.monotonic() + pending_prestage_timeout_s
+                    pending_prestage_deadline = deadline
+                    if on_deadline_set is not None:
+                        on_deadline_set(deadline)
+                    pending_prestage_lines = 0
+                else:
+                    break
+            else:
+                break
+
+    return counts
+
+
 def run_capture(args: argparse.Namespace) -> int:
     suite = SUITES[args.command]
     seconds = capture_seconds(args)
@@ -193,24 +257,30 @@ def run_capture(args: argparse.Namespace) -> int:
     counts: dict[str, int] = {}
     started = time.monotonic()
     stop_at = started + seconds if seconds else None
-    stop = False
+    pending_deadline: float | None = None
+
+    def get_stop_at() -> float | None:
+        if stop_at is not None and pending_deadline is not None:
+            return min(stop_at, pending_deadline)
+        return pending_deadline if pending_deadline is not None else stop_at
+
+    def set_pending_deadline(deadline: float) -> None:
+        nonlocal pending_deadline
+        pending_deadline = deadline
 
     with args.out.open("a", encoding="utf-8") as out:
         write_event(out, metadata)
         try:
             if args.reset_before:
                 reset_device(args.espflash, args.port)
-            for line in capture_lines(args.port, stop_at=stop_at):
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                for event in parse_line(line, suite.name):
-                    write_event(out, event)
-                    for counter in event_counters(event):
-                        counts[counter] = counts.get(counter, 0) + 1
-                if stop_target and counts.get(stop_target[0], 0) >= stop_target[1]:
-                    stop = True
-                if stop:
-                    break
+            counts = process_capture_stream(
+                capture_lines(args.port, stop_at=stop_at, get_stop_at=get_stop_at),
+                suite.name,
+                stop_target,
+                out=out,
+                print_lines=True,
+                on_deadline_set=set_pending_deadline,
+            )
         except KeyboardInterrupt:
             print("\nbench: capture stopped")
         finally:
@@ -281,7 +351,11 @@ def stop_target_for(args: argparse.Namespace, suite: Suite) -> tuple[str, int] |
 PORT_LOST_ERRNOS = {errno.ENXIO, errno.EIO, errno.ENODEV, errno.ENOENT}
 
 
-def capture_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
+def capture_lines(
+    port: str,
+    stop_at: float | None = None,
+    get_stop_at: Callable[[], float | None] | None = None,
+) -> Iterable[str]:
     """`serial_lines`, surviving the device dropping off the bus.
 
     Deep sleep mid-capture is expected — an idle timeout or a
@@ -295,7 +369,8 @@ def capture_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
     reconnecting = False
     while True:
         if reconnecting:
-            if stop_at is not None and time.monotonic() >= stop_at:
+            effective_stop_at = get_stop_at() if get_stop_at is not None else stop_at
+            if effective_stop_at is not None and time.monotonic() >= effective_stop_at:
                 print("port: capture window ended while the device was away", flush=True)
                 return
             if not os.path.exists(port):
@@ -305,7 +380,7 @@ def capture_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
             time.sleep(0.5)
 
         try:
-            for line in serial_lines(port, stop_at=stop_at):
+            for line in serial_lines(port, stop_at=stop_at, get_stop_at=get_stop_at):
                 if line == "":
                     if reconnecting:
                         print("port: back; resuming capture", flush=True)
@@ -323,7 +398,11 @@ def capture_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
             return
 
 
-def serial_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
+def serial_lines(
+    port: str,
+    stop_at: float | None = None,
+    get_stop_at: Callable[[], float | None] | None = None,
+) -> Iterable[str]:
     if fcntl is None:
         raise RuntimeError("serial capture requires POSIX fcntl support")
     fd = os.open(port, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
@@ -339,9 +418,10 @@ def serial_lines(port: str, stop_at: float | None = None) -> Iterable[str]:
         yield ""
         buf = b""
         while True:
+            effective_stop_at = get_stop_at() if get_stop_at is not None else stop_at
             timeout = 0.2
-            if stop_at is not None:
-                remaining = stop_at - time.monotonic()
+            if effective_stop_at is not None:
+                remaining = effective_stop_at - time.monotonic()
                 if remaining <= 0:
                     return
                 timeout = min(timeout, remaining)
@@ -536,7 +616,7 @@ def summarize_paths(
     print_duration("reading layout", values(reading_renders, "layout_ms"))
     print_duration("page turn", page_turn_durations(events))
     print_duration("render flush", values(renders, "flush_ms"))
-    print_duration("prestage", values(renders, "prestage_ms"))
+    print_duration("prestage", prestage_values(events))
     print_duration("refresh busy", values(refreshes, "busy_ms"))
     print_duration(
         "storage open",
@@ -625,6 +705,26 @@ def print_duration(label: str, data: list[int]) -> None:
     print(f"{label:14} median={median:.0f}ms p95={p95:.0f}ms min={min(data)}ms max={max(data)}ms")
 
 
+def prestage_values(events: list[dict[str, Any]]) -> list[int]:
+    """Prestage durations, from either or both firmware event shapes.
+
+    Firmware from 2026-07-27 emits prestage as its own event, after the
+    render event that ends press-to-settled. Older firmware folded
+    `prestage_ms` into the render line, which is also why its `page turn`
+    figures run ~24 ms long — the render timestamp was printed after the
+    prestage rather than at the settle. Captures from before that change
+    still summarize, but do not compare their `page turn` against a newer
+    run's.
+    """
+    result: list[int] = []
+    for event in events:
+        if event.get("event") == "prestage" and isinstance(event.get("elapsed_ms"), int):
+            result.append(int(event["elapsed_ms"]))
+        elif event.get("event") == "render" and isinstance(event.get("prestage_ms"), int):
+            result.append(int(event["prestage_ms"]))
+    return result
+
+
 def page_turn_durations(events: list[dict[str, Any]]) -> list[int]:
     pending_inputs: list[int] = []
     durations: list[int] = []
@@ -681,11 +781,11 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             percentile(reading_layout, 95) if reading_layout else None,
             page_turn.get("reading_layout_warn_ms"),
         )
-        prestage_values = values(render_events, "prestage_ms")
+        prestage = prestage_values(events)
         warn_if_above(
             warnings,
             "prestage p95",
-            percentile(prestage_values, 95) if prestage_values else None,
+            percentile(prestage, 95) if prestage else None,
             page_turn.get("prestage_warn_ms"),
         )
         fast_busy = [

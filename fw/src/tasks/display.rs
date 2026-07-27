@@ -294,18 +294,47 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // Sleep queued by power_task after DisplaySettled waits behind it.
                     let (display_event, power_event) =
                         app_core::display_refresh_outcome(true, chapter_cursor);
+                    let settled_at_ms = Instant::now().as_millis();
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
-                    let prestage_start = Instant::now();
-                    prev_prestaged = display_flush::prestage_previous(&mut epd, fb).await.is_ok();
+                    // Emitted here, at the settle, and not after the prestage
+                    // below. This timestamp is what the bench pairs each input
+                    // against, so printing it later charged the reader for a
+                    // write they never waited on: `Settled` has already gone
+                    // out, and press-to-settled ends on this line.
                     esp_println::println!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} prestage_ms={} t_ms={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} t_ms={}",
                         request.view,
                         mode,
                         request.page,
                         request.chapter,
                         layout_ms,
                         flush_ms,
+                        settled_at_ms,
+                    );
+                    let prestage_start = Instant::now();
+                    // Unconditional, deliberately. Skipping this write when another
+                    // render is already queued reads like a saving and is the exact
+                    // opposite: it is off the critical path here — Settled has gone
+                    // out, the glass is done, nobody is waiting — while the write it
+                    // defers lands *inside* the next Fast flush, ahead of
+                    // DisplayRefresh, where the reader does wait.
+                    // `fast_plan_only_writes_previous_plane_when_not_prestaged`
+                    // (display/src/epd/uc8253.rs) pins the asymmetry: an unstaged
+                    // Fast carries an extra WritePlane(Old, Previous) + DataStop,
+                    // and the X4 writes RED from `prev_fb` for the same reason
+                    // (fw/src/display_flush/ssd1677.rs). The skip is also
+                    // self-sustaining — each skipped turn leaves the next unstaged —
+                    // so a held button would pay the write on-path every turn
+                    // instead of off-path once.
+                    prev_prestaged = display_flush::prestage_previous(&mut epd, fb).await.is_ok();
+                    // Its own event, after the render one above: prestage is
+                    // real work on this task and still gates the next command,
+                    // but it sits outside press-to-settled and is measured
+                    // separately so neither number can absorb the other.
+                    esp_println::println!(
+                        "bench: prestage staged={} elapsed_ms={} t_ms={}",
+                        prev_prestaged,
                         prestage_start.elapsed().as_millis(),
                         Instant::now().as_millis(),
                     );

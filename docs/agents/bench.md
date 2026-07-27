@@ -32,6 +32,19 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
 - `reader-soak` is a passive capture: the operator runs the described
   reading workflow on the device by hand while bench.py records. Menus
   idle-sleep after 3 minutes (Reading after 10), so keep interacting.
+- **`page-turn` is operator-driven too, and its `page turn` figure is not
+  cadence-robust.** bench.py only listens; a human presses Next until the
+  requested turn count lands. The statistic is input→next-render, so a
+  press arriving while a render is already in flight is credited with only
+  the remainder of that render — burst pressing yields durations as low as
+  2 ms and drags the median down without anything being faster. **Quote
+  `page turn` only from deliberate cadence: one press per fully settled
+  page.** `layout_ms`, `flush_ms`, `busy_ms`, and prestage are per-render
+  and safe to read from any cadence. This is not hypothetical: a 354 ms
+  median recorded this way went into the optimization roadmap as a
+  baseline, could never be reconciled with a 408 ms flush, and cost a
+  later change a phantom 94 ms "regression" before two same-build captures
+  at opposite cadences explained it.
 - Deep sleep drops the USB-JTAG serial port mid-capture; bench.py
   announces the loss and waits for the port to re-enumerate — wake the
   device to resume. The capture window keeps counting while it is away.
