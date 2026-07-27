@@ -494,9 +494,11 @@ impl WebEmulator {
     /// Convert the panel-mounted framebuffer (rows mirrored for the X4's
     /// upside-down panel) to viewer-oriented RGBA.
     fn blit(&mut self) {
+        let flip_y = !display::DEVICE_IS_X3;
         for y in 0..HEIGHT {
+            let src_y = if flip_y { HEIGHT - 1 - y } else { y };
             for x in 0..WIDTH {
-                let color = if self.fb.native_pixel(x, HEIGHT - 1 - y) { PAPER } else { INK };
+                let color = if self.fb.native_pixel(x, src_y) { PAPER } else { INK };
                 let offset = (y * WIDTH + x) * 4;
                 self.rgba[offset] = color[0];
                 self.rgba[offset + 1] = color[1];
