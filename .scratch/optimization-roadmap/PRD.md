@@ -6,12 +6,15 @@ Author: research pass over six parallel code-survey agents (display, book pipeli
 
 ## Status after round 4 (2026-07-27)
 
-**WS-A is effectively finished.** The software budget around the panel is
-spent: an isolated portrait turn is now ~13 ms layout + ~405 ms flush
-(379 ms of it panel BUSY) + ~24 ms prestage. Nothing left in issue 01 is
-worth more than single-digit milliseconds except A4/A5, which are
-hardware-risk experiments. **The next real wins are in the book pipeline
-(B7, B4) and power (C2), not the render path.**
+**WS-A is nearly finished, with one live item.** Measured on main: an
+isolated portrait turn is 13 ms layout + 405 ms flush (379 ms of it panel
+BUSY) + 24 ms prestage = 448 ms. Layout is done — 2.9% of the turn.
+Prestage is *not* done: A7 merged but never fires (see below), so its
+24 ms is still fully on the critical path and is the largest remaining
+non-BUSY term. After that, nothing in issue 01 is worth more than
+single-digit milliseconds except A4/A5, which are hardware-risk
+experiments, and **the next real wins are in the book pipeline (B7, B4)
+and power (C2)**, which are tens of seconds each.
 
 **Landed on main since round 3:**
 
@@ -20,12 +23,14 @@ hardware-risk experiments. **The next real wins are in the book pipeline
   its place. **Portrait reading layout 33 ms → 13 ms median on X3
   (2.5x).** Full detail and the disproof in issue 01; the short version is
   below under "A10's premise was wrong".
-- **A7 — pipelined prestaging (#48).** Landed as a *conditional skip*
-  rather than an overlap: after a flush settles the display task yields
-  and, if another render is already queued, skips `prestage_previous`
-  entirely. Takes the 28 ms out of burst and held-button cadence; an
-  isolated single turn still pays it. True overlap with panel BUSY is
-  still unbuilt.
+- **A7 — pipelined prestaging (#48) — MERGED BUT INERT, back in the
+  queue.** Landed as a *conditional skip* rather than an overlap: after a
+  flush settles the display task yields once and, if another render is
+  queued, skips `prestage_previous`. Measurement on main says the skip
+  **never fires** — prestage ran on 100 of 100 renders across both
+  cadences and the skip's log line printed zero times. See "Finding 1"
+  under the round-4 baseline below. The 28 ms is still fully on the
+  critical path.
 - **A8 — dropped as superseded, PR #49 closed.** Its 4-way unrolling
   targeted exactly the portrait `blit_row` loop #50 removed from the glyph
   path. Only `fill_span` was left for it — menu furniture already at
@@ -45,11 +50,13 @@ carrying: nobody measured the layout/rasterization split before ranking
 the item first. Measure that split before accepting any future "cache the
 layout" proposal.
 
-**Next queue (re-ranked 2026-07-27):**
+**Next queue (re-ranked 2026-07-27, after the baseline run):**
 
-1. **Re-baseline on current main.** The bench table below is stitched from
-   two builds and has an unexplained number in it (see the note under the
-   table). One `page-turn` capture on today's main settles both.
+1. **A7 rework — make the prestage skip actually fire** (issue 01). The
+   merged version never triggers; 24 ms sits on every single turn, which
+   is the largest remaining non-BUSY term in a 448 ms page turn. Small,
+   well-understood, and now the only display-path item with double-digit
+   milliseconds behind it.
 2. **B7 — Per-Config Section Caches & Orientation Toggle Acceleration**
    (issue 02). Still the largest user-facing wait in the system: 24–27 s
    replay on font-size changes and portrait↔landscape toggles, against
@@ -69,34 +76,64 @@ layout" proposal.
 
 Tier 3 unchanged: A4, A5, C6, E4, F5, D6.
 
-**Bench session results (2026-07-27, X3, `page-turn --turns 50`, portrait,
-50 renders / 181 events / 0 warnings / Fast=50):**
+### Round-4 baseline — MEASURED on current main, 2026-07-27
 
-| Metric | 2026-07-26 | 2026-07-27 (A10-as-shipped) | |
+X3, main `e9163b3` (A10-as-shipped #50 + A7 #48), portrait, same book and
+position, `page-turn --turns 50` run twice at two deliberately different
+operator cadences. Logs: `target/bench/round4-deliberate.jsonl`,
+`target/bench/round4-burst.jsonl`.
+
+| Metric | 2026-07-26 (pre-#50) | **Deliberate cadence** | Burst cadence |
 |---|---|---|---|
-| **Reading layout, portrait** | 33 ms median / 35 ms p95 | **13 ms median / 14 ms p95** (min 2, max 15) | **−20 ms, 2.5x** |
-| Prestage | 28 ms median | 24 ms median | pre-#48 build |
-| Render flush | 408 ms median / 435 ms p95 | 405 ms median / 406 ms p95 | |
-| Refresh busy | 379 ms | 379 ms | panel floor, unchanged |
-| Total page turn | 354 ms median / 476 ms p95 | 448 ms median / 449 ms p95 | **see below** |
+| **Reading layout, portrait** | 33 ms median / 35 p95 | **13 ms / 14 p95** (min 11, max 15) | 14 ms / 14 p95 |
+| Prestage | 28 ms median | **24 ms** (min 24, max 24) | 24 ms (min 24, max 25) |
+| Render flush | 408 ms / 435 p95 | **405 ms / 406 p95** (max 426) | 405 ms / 406 p95 |
+| Refresh busy | 379 ms | **379 ms** (min = max) | 379 ms |
+| Progress write | 41 ms | 42 ms / 45 p95 | 44 ms / 45 p95 |
+| Page turn | 354 ms / 476 p95 | **448 ms / 449 p95** (min 445, max 449) | 451 ms / 825 p95 (min 2, max 873) |
 
-**Caveat — this capture was taken on the A10 branch before #48 merged, so
-it measures A10-as-shipped without A7. Treat the whole table as
-provisional until a re-baseline on current main.**
+**Quote the deliberate-cadence column as the baseline.** An isolated
+portrait turn on main is 13 ms layout + 405 ms flush (379 ms of it panel
+BUSY) + 24 ms prestage = 448 ms press-to-settled, and the spread across
+50 turns is 4 ms.
 
-**The 448 ms page-turn median is unexplained and is NOT a regression
-claim.** Nothing in #50 can raise it: layout only shrank, and it is an
-additive term. The new capture is internally consistent (13 layout + 405
-flush + 24 prestage = 442, vs 448 measured). It is the *prior* 354 ms
-median that does not reconcile with a 408 ms flush unless that capture
-overlapped prestage with the following turn — i.e. it was effectively
-measuring burst cadence, which is exactly what #48 now does deliberately.
-That is the leading hypothesis and it is testable: capture `page-turn` on
-current main (which has both #48 and #50) at the same book and position.
-If the 354-style median returns, the earlier number was burst cadence and
-#48 has made it the default; if it holds near 448, the earlier number
-needs its own explanation. **Do not quote either figure as the page-turn
-baseline until that run exists.**
+**A10's 2.5x is confirmed on main:** layout 33 → 13 ms median, unchanged
+by cadence, as expected for a term that does not depend on queue state.
+
+**Finding 1 — A7 (#48) is inert on the page-turn path. It should go back
+in the queue.** Prestage ran on **100 of 100 renders** across both
+cadences (values only {24} and {24, 25}), and the skip's own log line,
+`display: pending command queued, yielding prestage`, printed **zero**
+times. The burst run did reach real queue depth — it contains a render
+with no input preceding it — so the workload produced queued commands;
+the check simply never saw one. Cause: a single `embassy_futures::yield_now()`
+is not enough to get from "display task sends `Settled`" to "app task has
+received it, cleared `rendering`, and pushed the next `RenderRequest` into
+`DISPLAY_COMMANDS`" (`fw/src/tasks/app.rs:286`). The check runs before the
+app has replied, so the queue is always empty. Fixing it means either
+waiting for the app's next command with a bounded timeout, or moving the
+decision to where the next command actually arrives — not adding more
+yields.
+
+**Finding 2 — the 354 ms figure was a measurement artifact, and
+`page turn` is not cadence-robust.** The hypothesis recorded in the first
+round-4 draft (that 354 was prestage overlapping the next turn) is
+**disconfirmed**: burst cadence does not reproduce it. Burst makes the
+median slightly *worse* (451 ms) and the tail far worse (825 ms p95,
+873 ms max). What burst does produce is near-zero durations — min 2 ms,
+and several turns under 50 ms — because the metric is input→next-render:
+a press landing while a render is already in flight is credited only with
+the remainder of that render. Press faster and the median falls without
+anything getting faster. That is almost certainly what produced 354 ms
+with a 408 ms flush, which is otherwise arithmetically impossible.
+
+**Protocol consequence — fold this into `docs/agents/bench.md`:**
+`page-turn` is operator-driven, and its `page turn` statistic is only
+meaningful at deliberate cadence (one press per settled page). Burst
+captures are valid for `layout_ms`, `flush_ms`, and `busy_ms`, which are
+per-render and cadence-independent, but their `page turn` median must not
+be compared against a deliberate one. Retire the 354 ms number; it is not
+a baseline this system ever hit.
 
 ## Status after round 3 (2026-07-26)
 
