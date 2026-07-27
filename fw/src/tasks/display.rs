@@ -998,9 +998,14 @@ fn handle_storage_command(
     }
     match command {
         StorageCommand::LoanSyncMemory => {
-            // The scratch the walk keeps its section records in is about to
-            // become radio heap, and the session only ends in a reset.
-            *background_build = None;
+            // The background handle is deliberately *not* dropped here. A loan
+            // that gets refused below returns with the scratch — and the walk's
+            // section records in it — completely intact, and dropping the only
+            // thing that schedules that walk would strand it: the loop's branch
+            // is gated on the handle, and a reader already at the frontier
+            // cannot issue the extend that would re-adopt it. It is cleared
+            // once the scratch is actually gone.
+            //
             // The session only ends in a reset, so any coalesced position
             // must reach the card before the scratch is dismantled.
             if !flush_pending_progress(
@@ -1022,6 +1027,10 @@ fn handle_storage_command(
                 let _ = crate::SYNC_LOANS.try_send(Err(app_core::SyncError::Storage));
                 return;
             };
+            // The scratch is out of the reader's hands now, taking the walk's
+            // section records with it. Past this point the loan is granted and
+            // the session ends in a reset, so there is nothing left to schedule.
+            *background_build = None;
             sync_session.loan_granted();
             let mut loan = reader_cache::dismantle_scratch(scratch);
             loan.wifi = reader_cache::load_wifi_credentials(epd, sd_cs).map(|record| {
@@ -1416,10 +1425,18 @@ fn handle_storage_command(
         } => {
             // Deleting a cache dir out from under a background build would
             // leave it writing an index for section files that no longer
-            // exist. Ended unconditionally: a walk is only ever an
-            // optimisation, and the row this command names is exactly the one
-            // that is hard to be sure about here.
+            // exist. Both halves of the walk go, not just the handle: leaving
+            // the resume in the scratch would let the next open of this row
+            // report `Carried` and schedule steps over a cache that is gone.
+            //
+            // Ended unconditionally, even though the clear may name a different
+            // book than the one building. A walk is only ever an optimisation —
+            // the worst case is one redundant rebuild — and "the handle and the
+            // resume die together" is an invariant worth more than that.
             *background_build = None;
+            if let Some(scratch) = epub_scratch.as_mut() {
+                reader_cache::clear_build_resume(scratch);
+            }
             // The row was picked against a catalog this task may since have
             // replaced, which would leave a different book sitting under it.
             // Refuse rather than guess: the user can pick again from the list
