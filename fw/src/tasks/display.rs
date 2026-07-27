@@ -296,15 +296,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         app_core::display_refresh_outcome(true, chapter_cursor);
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
-                    embassy_futures::yield_now().await;
                     let prestage_start = Instant::now();
-                    if crate::DISPLAY_COMMANDS.is_empty() {
-                        prev_prestaged =
-                            display_flush::prestage_previous(&mut epd, fb).await.is_ok();
-                    } else {
-                        prev_prestaged = false;
-                        esp_println::println!("display: pending command queued, yielding prestage");
-                    }
+                    prev_prestaged = display_flush::prestage_previous(&mut epd, fb).await.is_ok();
                     esp_println::println!(
                         "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} prestage_ms={} t_ms={}",
                         request.view,
