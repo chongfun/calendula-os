@@ -145,6 +145,20 @@ pub(crate) struct ReaderCacheScratch<'a> {
     book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     zip_inflate: ZipInflateScratch,
     /// The suspended progressive build that owns `book_sections`, if any.
+    ///
+    /// RAM (measured): 28 bytes, and the `Option` is free — `BookBuildResume`
+    /// is 28 bytes on its own, so the three `bool`s give the discriminant a
+    /// niche to live in rather than costing a tag word. This whole struct is
+    /// 43,340 bytes and lives in `EPUB_SCRATCH`, a `StaticCell` in `.bss`, so
+    /// the cost is 0.06% of a static that is already there — nothing is
+    /// charged to the ~43 KB stack the build's deep frames run in, which is
+    /// the budget that is actually tight.
+    ///
+    /// Kept here rather than beside the loop's scheduling handle because the
+    /// invariant is a colocation one: this is `Some` only while
+    /// `book_sections` holds that walk's records, and a field in the same
+    /// struct cannot drift from them the way a parallel copy in the display
+    /// task would.
     resume: Option<BookBuildResume>,
 }
 
