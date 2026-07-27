@@ -397,6 +397,23 @@ pub(crate) enum BackgroundStep {
     /// valid, shorter index, and its `resume_spine` marks it as a build that
     /// never came back, so the next open rebuilds rather than trusting it.
     Abandoned,
+    /// The step never began — the card would not open a session, a directory,
+    /// or the file — so not one record was touched and the walk is intact and
+    /// re-armed. Nothing was built, so there is nothing to announce, which is
+    /// exactly why the walk has to be kept: a reader already at the frontier
+    /// has no page turn that would provoke a rebuild. The caller bounds how
+    /// many times it comes back (`app_core::storage_loop::retry_unstarted_step`).
+    Retry,
+}
+
+/// What one attempt at a step did, as distinct from how it ended.
+enum StepAttempt {
+    /// The walk never began. `book_sections` is untouched, so the resume that
+    /// describes it is still true to the byte and can simply go back.
+    NeverBegan(ReaderCacheError),
+    /// The walk ran. Whatever it left behind, the resume the build itself set
+    /// or cleared is the authority now.
+    Ran(Result<(), ReaderCacheError>),
 }
 
 /// Which of the two endings a broken step earned.
@@ -463,7 +480,7 @@ pub(crate) fn continue_book_build(
                 Ok(books) => Some(books),
                 Err(err) => {
                     esp_println::println!("epub: build continue /books failed: {:?}", err);
-                    return Err(ReaderCacheError::MissingSpine);
+                    return StepAttempt::NeverBegan(ReaderCacheError::MissingSpine);
                 }
             }
         } else {
@@ -474,7 +491,7 @@ pub(crate) fn continue_book_build(
             None => root.open_file_in_dir(open_name.as_str(), Mode::ReadOnly),
         };
         match file {
-            Ok(file) => build_or_load_epub_cache_from_file(
+            Ok(file) => StepAttempt::Ran(build_or_load_epub_cache_from_file(
                 file,
                 root,
                 &display_name,
@@ -488,15 +505,15 @@ pub(crate) fn continue_book_build(
                 library,
                 scratch,
                 font_metrics,
-            ),
+            )),
             Err(err) => {
                 esp_println::println!("epub: build continue open failed: {:?}", err);
-                Err(ReaderCacheError::MissingSpine)
+                StepAttempt::NeverBegan(ReaderCacheError::MissingSpine)
             }
         }
     });
     match step {
-        Ok(Ok(())) => {
+        Ok(StepAttempt::Ran(Ok(()))) => {
             if scratch.resume.is_some() {
                 BackgroundStep::Continued
             } else {
@@ -507,15 +524,23 @@ pub(crate) fn continue_book_build(
         // valid index whose `resume_spine` says a build walked away from it, so
         // the next open rebuilds. Whether the *reader* can be told anything now
         // is a separate question, and only the store can answer it.
-        Ok(Err(err)) => {
+        Ok(StepAttempt::Ran(Err(err))) => {
             esp_println::println!("epub: build continue failed: {:?}", err);
             scratch.resume = None;
             step_ending(library, resume.index as usize, current_page)
         }
+        // Nothing ran, so nothing is lost by running it again — but the resume
+        // was taken on the way in and has to go back, or the walk it describes
+        // dies of the bookkeeping rather than the fault.
+        Ok(StepAttempt::NeverBegan(err)) => {
+            esp_println::println!("epub: build continue never began: {:?}", err);
+            scratch.resume = Some(resume);
+            BackgroundStep::Retry
+        }
         Err(err) => {
             esp_println::println!("epub: build continue session failed: {:?}", err);
-            scratch.resume = None;
-            step_ending(library, resume.index as usize, current_page)
+            scratch.resume = Some(resume);
+            BackgroundStep::Retry
         }
     }
 }

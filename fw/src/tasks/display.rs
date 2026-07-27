@@ -26,7 +26,7 @@ use display::fb::Framebuffer;
 use embassy_futures::select::{select, select5, Either, Either5};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_time::Instant;
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Output;
 use proto::nvm::AppStateRecord;
 use static_cell::ConstStaticCell;
@@ -35,6 +35,11 @@ use static_cell::ConstStaticCell;
 /// per this interval, with a guaranteed flush before display sleep. A
 /// battery pull can lose at most this many seconds of reading position.
 const PROGRESS_WRITE_MIN_SECS: u64 = 15;
+
+/// How long a background build waits before re-attempting a step that never
+/// began. Long enough for a card fault to clear, short enough that the whole
+/// retry budget costs under a second of build time.
+const BACKGROUND_RETRY_DELAY_MS: u64 = 250;
 
 static EPUB_TAIL: ConstStaticCell<[u8; READER_TAIL_SCRATCH]> =
     ConstStaticCell::new([0; READER_TAIL_SCRATCH]);
@@ -179,6 +184,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     && !sync_session.active()
                     && holder().storage_may_run()
                     && !sd_library.text_holds_toc(),
+                background_build.map_or(0, |pending| pending.attempts),
             ),
         )
         .await
@@ -214,8 +220,40 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     font_metrics,
                 );
                 let finished = step == reader_cache::BackgroundStep::Finished;
-                if step != reader_cache::BackgroundStep::Continued {
-                    background_build = None;
+                match step {
+                    reader_cache::BackgroundStep::Continued => {
+                        // A step that ran clears the budget: it is consecutive
+                        // failures to begin that mean the card is gone, not a
+                        // single one somewhere in a minute of building.
+                        background_build = Some(BackgroundBuild {
+                            attempts: 0,
+                            ..pending
+                        });
+                    }
+                    // Nothing was touched and the walk is re-armed, so the only
+                    // question is whether to come back for it. Giving up drops
+                    // the handle but deliberately leaves the resume: the walk's
+                    // records are intact, so the reader's next page turn is
+                    // answered by the fast path, reports `Carried`, and adopts
+                    // the walk again — a rebuild avoided for the price of a
+                    // handle nobody is holding.
+                    reader_cache::BackgroundStep::Retry => {
+                        let attempts = pending.attempts.saturating_add(1);
+                        if app_core::storage_loop::retry_unstarted_step(attempts) {
+                            background_build = Some(BackgroundBuild {
+                                attempts,
+                                ..pending
+                            });
+                        } else {
+                            esp_println::println!(
+                                "storage: background build gave up after {} attempts book_id={}",
+                                attempts,
+                                pending.book_id
+                            );
+                            background_build = None;
+                        }
+                    }
+                    _ => background_build = None,
                 }
                 if finished {
                     esp_println::println!(
@@ -261,6 +299,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                             reader_page,
                         )
                     }
+                    // Not one page was built, so there is nothing to say and a
+                    // repaint would only redraw the frontier the reader is
+                    // already looking at. The walk being kept is the answer
+                    // here, not the announcement.
+                    reader_cache::BackgroundStep::Retry => false,
                     reader_cache::BackgroundStep::Continued
                     | reader_cache::BackgroundStep::Finished => {
                         app_core::storage_loop::background_announce(
@@ -784,6 +827,10 @@ async fn storage_command_while_free() -> StorageCommand {
 struct BackgroundBuild {
     book_id: u32,
     started: Instant,
+    /// Consecutive steps that never began. Reset by any step that actually
+    /// ran, so a card that hiccups once mid-build does not spend the budget a
+    /// later outage needs.
+    attempts: u8,
 }
 
 /// Carry the loop's background-build handle across one open or extend.
@@ -804,6 +851,7 @@ fn apply_build_outcome(
             *background_build = Some(BackgroundBuild {
                 book_id,
                 started: Instant::now(),
+                attempts: 0,
             })
         }
         // The handle is normally already there. Adopting a missing one is the
@@ -815,6 +863,7 @@ fn apply_build_outcome(
                 *background_build = Some(BackgroundBuild {
                     book_id,
                     started: Instant::now(),
+                    attempts: 0,
                 });
             }
         }
@@ -842,9 +891,17 @@ fn apply_build_outcome(
 /// whole build. Yielding once means the loop re-polls with the four waiting
 /// branches ahead of it, so a render or command that arrived meanwhile is
 /// serviced first, and the other tasks have already had their turn.
-async fn background_build_step_due(pending: bool) {
+async fn background_build_step_due(pending: bool, attempts: u8) {
     if !pending {
         return core::future::pending::<()>().await;
+    }
+    if attempts > 0 {
+        // Retrying a step that never began, so this is not the yield's job any
+        // more: an immediate re-attempt would spend the whole budget inside a
+        // card fault too brief to have cleared. Waiting is also free — nothing
+        // was built, so there is no reader waiting on this slice — and the
+        // select's other four branches stay live throughout.
+        return Timer::after(Duration::from_millis(BACKGROUND_RETRY_DELAY_MS)).await;
     }
     embassy_futures::yield_now().await;
 }

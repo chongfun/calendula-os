@@ -313,6 +313,33 @@ pub const fn stopped_announce(
     advertised_now > advertised_before && background_announce(false, reader_page, advertised_before)
 }
 
+/// How many times a background step that never began is tried before the walk
+/// is let go.
+///
+/// Small on purpose. The branch that runs these steps is always ready, so a
+/// walk that is kept alive is retried as fast as the loop comes round; the
+/// budget is what stops a card that has genuinely gone away from spinning up a
+/// failing SD session forever. Three is enough to ride out a hiccup and cheap
+/// enough to be wrong about.
+pub const BACKGROUND_STEP_ATTEMPTS: u8 = 3;
+
+/// Whether a background step that failed before it began is worth trying again.
+///
+/// The distinction this rests on is not how bad the error was but how much of
+/// the walk it consumed. A step can fail before touching a single record — the
+/// card refuses a session, the EPUB will not open — and everything the walk
+/// needs is then exactly as it was.
+///
+/// Retrying matters because nothing else will. A step like that builds no
+/// pages, so [`stopped_announce`] has nothing to say, and a reader who has
+/// already caught up with the frontier has no page turn that could rebuild:
+/// the reducer clamps Next to the page they are on, so no command is issued
+/// and no recovery is provoked. Until they turn a page, the walk is the only
+/// thing that can still raise their page count.
+pub const fn retry_unstarted_step(attempts: u8) -> bool {
+    attempts < BACKGROUND_STEP_ATTEMPTS
+}
+
 /// What the book-open transaction wants next.
 ///
 /// The order is the design: the departing book's position is written while its
@@ -1357,10 +1384,31 @@ mod tests {
         assert!(stopped_announce(400, 460, 399));
     }
 
+    // A step that built nothing has nothing to announce — a same-count Loaded
+    // would spend a full panel refresh redrawing the same frontier. Which is
+    // why silence here is only correct if the walk itself is kept: see
+    // `a_step_that_never_began_is_kept_rather_than_announced` below.
     #[test]
     fn a_stopped_step_that_built_nothing_stays_silent() {
-        // Nothing new to say, and saying it costs a full panel refresh.
         assert!(!stopped_announce(400, 400, 399));
+    }
+
+    // Invariant: the reader pinned at the frontier is never left with both
+    // nothing announced and nothing running. Announcing is useless when no
+    // pages were built, so the walk is what has to survive — otherwise Next at
+    // the cap issues no command and nothing retries.
+    #[test]
+    fn a_step_that_never_began_is_kept_rather_than_announced() {
+        assert!(!stopped_announce(400, 400, 399));
+        assert!(retry_unstarted_step(0));
+    }
+
+    #[test]
+    fn a_walk_that_keeps_failing_to_begin_is_eventually_let_go() {
+        // The step branch is always ready, so an unbounded retry would spin up
+        // a failing SD session for as long as the book stayed open.
+        assert!(retry_unstarted_step(BACKGROUND_STEP_ATTEMPTS - 1));
+        assert!(!retry_unstarted_step(BACKGROUND_STEP_ATTEMPTS));
     }
 
     #[test]
