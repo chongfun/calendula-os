@@ -166,7 +166,12 @@ pub(crate) enum CacheLoadResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BookIndexLoadResult {
-    Hit,
+    Hit {
+        /// The index was published mid-build and a walk meant to come back for
+        /// the rest. Whether that walk still exists is the caller's to know;
+        /// see `app_core::storage_loop::partial_index_is_usable`.
+        unfinished: bool,
+    },
     Miss,
     Invalid,
 }
@@ -730,7 +735,9 @@ where
             header.partial,
             &sections[..header.section_count as usize],
         );
-        BookIndexLoadResult::Hit
+        BookIndexLoadResult::Hit {
+            unfinished: header.resume_spine != 0,
+        }
     })
     .unwrap_or(BookIndexLoadResult::Miss)
 }
@@ -1114,6 +1121,7 @@ where
         .any(|name| book.open_file_in_dir(*name, Mode::ReadOnly).is_ok())
 }
 
+#[expect(clippy::too_many_arguments)] // The index's own field set: identity, shape, and the resume cursor, all caller-owned
 pub(crate) fn write_v2_book_index<
     D,
     T,
@@ -1128,6 +1136,11 @@ pub(crate) fn write_v2_book_index<
     sections: &[BookV2SectionRecord],
     library: &ReaderStore,
     partial: bool,
+    // The spine item a suspended progressive build will walk next, or `0`
+    // when nothing is still building this index. See
+    // [`proto::cache::BookV2Header::resume_spine`] — it is what stops an
+    // abandoned build's index from capping the book forever.
+    resume_spine: u16,
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1172,6 +1185,7 @@ where
             ),
             custom_font_identity: library.custom_font_identity(),
             partial,
+            resume_spine,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {
@@ -1607,6 +1621,70 @@ where
             capture.file = Some(file);
         }
         capture
+    }
+
+    /// Re-open the `CONT.BIN` an earlier step of the same progressive build
+    /// left behind, positioned to append. `spine_count` is what that step
+    /// reported through [`Self::suspend`]; carrying it is what lets the final
+    /// step write an accurate header.
+    //
+    /// The header is deliberately not touched here. It has said
+    /// `complete = false` since [`Self::begin`] and stays that way until the
+    /// walk actually ends, so a build abandoned between steps — by sleep, by
+    /// the sync loan — leaves a file replay will refuse rather than a
+    /// truncated stream it would trust.
+    pub(crate) fn resume(
+        dir: Option<&'d Directory<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+        source_identity: (u32, u32),
+        stage: &'s mut [u8],
+        spine_count: u16,
+    ) -> Self {
+        let mut capture = Self {
+            file: None,
+            stage,
+            len: 0,
+            source_identity,
+            spine_count,
+        };
+        let Some(dir) = dir else {
+            return capture;
+        };
+        if let Ok(file) = dir.open_file_in_dir(CACHE_CONTENT_FILE, Mode::ReadWriteAppend) {
+            capture.file = Some(file);
+        }
+        capture
+    }
+
+    /// Flush what is staged and hand the file back to the next step of the
+    /// same build, reporting whether the capture is still healthy and how many
+    /// spine groups it has recorded.
+    //
+    /// A `false` here is not a build failure — CONT.BIN is only ever an
+    /// accelerator — but it is one-way: the next step starts
+    /// [`disabled`](Self::disabled) rather than appending to a file with a
+    /// hole in it, and the incomplete header keeps replay away from it.
+    pub(crate) fn suspend(mut self) -> (bool, u16) {
+        if let Some(file) = self.file.as_ref() {
+            if staged_flush(file, self.stage, &mut self.len).is_err() {
+                self.file = None;
+            }
+        }
+        let healthy = self.file.is_some();
+        drop(self.file.take());
+        (healthy, self.spine_count)
+    }
+
+    /// A capture that records nothing, for a continuation whose earlier step
+    /// already gave up on CONT.BIN. The build carries on unaffected; only the
+    /// next settings change pays a full rebuild instead of a replay.
+    pub(crate) fn disabled(stage: &'s mut [u8], source_identity: (u32, u32)) -> Self {
+        Self {
+            file: None,
+            stage,
+            len: 0,
+            source_identity,
+            spine_count: 0,
+        }
     }
 
     /// Record one `push_block` call. The text follows the fixed record

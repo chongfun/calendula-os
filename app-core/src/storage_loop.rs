@@ -204,6 +204,94 @@ impl SleepSequence {
     }
 }
 
+/// Which walk of an EPUB spine is running, and therefore where it may stop.
+///
+/// A cold build used to run the whole spine before the reader saw anything —
+/// 64 s on the measured 11.7 MB book. It does not have to: section files are
+/// written as the walk goes, so the book can be published the moment the
+/// requested page is covered and the rest finished in the background. That
+/// splits one walk into two kinds with different stopping rules, and this is
+/// the difference.
+///
+/// Stopping is only possible at a spine boundary. Suspending mid-item would
+/// mean persisting the XML tokenizer, the block parser, and the inflate window,
+/// which does not fit the RAM budget — so a step is always at least one spine
+/// item, and [`Self::Background`]'s budget decides how many more it batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildPhase {
+    /// The walk the reader is waiting on. It owes exactly one thing: the
+    /// section holding `requested_page`. Everything past that is the
+    /// background's problem.
+    FirstOpen { requested_page: u32 },
+    /// A background continuation. It owes nothing to any wait, so the only
+    /// question is how long the display task may stay inside it before a
+    /// queued render or page turn gets a turn.
+    Background { slice_ms: u64 },
+}
+
+impl BuildPhase {
+    /// Whether the walk should stop at the spine boundary it has just reached.
+    ///
+    /// `more_spine` is the whole reason this takes the walk's position rather
+    /// than just its counters: suspending with nothing left to build would
+    /// hand the caller a continuation that finds no work, publish the book
+    /// twice, and mark a complete cache partial.
+    pub const fn suspend_here(
+        &self,
+        total_pages: u32,
+        sections: usize,
+        elapsed_ms: u64,
+        more_spine: bool,
+    ) -> bool {
+        if !more_spine {
+            return false;
+        }
+        match *self {
+            // `>` not `>=`: pages are zero-based, so covering page N means
+            // having built N+1 of them.
+            Self::FirstOpen { requested_page } => sections > 0 && total_pages > requested_page,
+            Self::Background { slice_ms } => elapsed_ms >= slice_ms,
+        }
+    }
+}
+
+/// Whether a book index that stops short of the whole book may be read from.
+///
+/// A progressive open publishes an index spanning only what it has built, and
+/// that is safe *while the walk that published it is still running* — the walk
+/// keeps raising the page count, and the reader is never fenced in for long.
+///
+/// It is not safe on its own. The reducer clamps the page to the advertised
+/// count, so the reader cannot ask for the first missing page; there is no
+/// input that provokes a rebuild. An index left behind by a build that sleep or
+/// a reboot ended would therefore cap the book *permanently*, and the truncation
+/// would look exactly like the book simply being that short. So an unfinished
+/// index with nobody building it is refused, and the open rebuilds — which is
+/// itself progressive, so the first page still arrives in about a second.
+///
+/// `unfinished` must mean "a walk stopped here intending to return", not merely
+/// "pages are missing": a book clipped by the spine cap or the section cap is
+/// partial forever, and rebuilding it on every open would buy nothing.
+pub const fn partial_index_is_usable(unfinished: bool, walk_is_live: bool) -> bool {
+    !unfinished || walk_is_live
+}
+
+/// Whether a background build step must re-announce the book's shape.
+///
+/// Announcing is not free. Every `LibraryEvent::Loaded` marks the whole screen
+/// dirty, so a step-by-step denominator would buy a panel refresh per section —
+/// on the measured book, one every ~640 ms for a minute. Silence is the default
+/// and the finish is what publishes the real total.
+///
+/// The exception is the reader who has caught up with the frontier. The
+/// reducer clamps the page to the advertised count, so at `advertised - 1` the
+/// next-page button does nothing at all: no state change, no render, no
+/// command. That is indistinguishable from a broken device, and it is the one
+/// case where the repaint is worth its cost.
+pub const fn background_announce(finished: bool, reader_page: u32, advertised_before: u32) -> bool {
+    finished || reader_page.saturating_add(1) >= advertised_before
+}
+
 /// What the book-open transaction wants next.
 ///
 /// The order is the design: the departing book's position is written while its
@@ -1153,6 +1241,99 @@ mod tests {
             loop_arm(&StorageCommand::ReceiveUpload, SyncSession::Idle),
             LoopArm::RefusedUpload
         );
+    }
+
+    const FIRST_OPEN_AT: fn(u32) -> BuildPhase =
+        |requested_page| BuildPhase::FirstOpen { requested_page };
+    const BACKGROUND: BuildPhase = BuildPhase::Background { slice_ms: 400 };
+
+    // Invariant: the walk the reader waits on stops as soon as it owes nothing.
+    #[test]
+    fn a_first_open_suspends_once_the_requested_page_is_covered() {
+        // Opening at the start: one section of pages is already enough.
+        assert!(FIRST_OPEN_AT(0).suspend_here(12, 1, 0, true));
+        // Opening deep: page 900 is not covered by 400 pages, and no amount of
+        // elapsed time makes it so — the page only exists once it is laid out.
+        assert!(!FIRST_OPEN_AT(900).suspend_here(400, 40, 60_000, true));
+        assert!(FIRST_OPEN_AT(900).suspend_here(901, 90, 0, true));
+    }
+
+    #[test]
+    fn a_first_open_with_no_pages_yet_keeps_walking() {
+        // A spine item that contributed no section (navigation, empty body)
+        // leaves the counters at zero; suspending there would publish a book
+        // with nothing in it.
+        assert!(!FIRST_OPEN_AT(0).suspend_here(0, 0, 0, true));
+    }
+
+    #[test]
+    fn a_background_step_suspends_on_its_slice_budget_alone() {
+        assert!(!BACKGROUND.suspend_here(1200, 100, 399, true));
+        assert!(BACKGROUND.suspend_here(1200, 100, 400, true));
+        // The page counters say nothing to a background step: it owes no page.
+        assert!(BACKGROUND.suspend_here(0, 0, 400, true));
+    }
+
+    // Regression: suspending at the end of the spine would hand the caller a
+    // continuation with no work, republish the book, and leave a complete
+    // cache flagged partial.
+    #[test]
+    fn neither_phase_suspends_with_no_spine_left() {
+        assert!(!FIRST_OPEN_AT(0).suspend_here(12, 1, 0, false));
+        assert!(!BACKGROUND.suspend_here(1200, 100, 60_000, false));
+    }
+
+    #[test]
+    fn a_complete_index_is_usable_with_or_without_a_walk() {
+        assert!(partial_index_is_usable(false, false));
+        assert!(partial_index_is_usable(false, true));
+    }
+
+    #[test]
+    fn an_unfinished_index_is_usable_while_its_own_walk_runs() {
+        // The common case during a progressive open: every section crossing
+        // arrives as an extend and must not restart the build under itself.
+        assert!(partial_index_is_usable(true, true));
+    }
+
+    // Invariant: a book is never left capped at a page count nothing will
+    // raise. This is the sleep/reboot case — the walk is gone, and the reducer
+    // clamps the reader to the advertised count, so no input can provoke the
+    // rebuild that would fix it.
+    #[test]
+    fn an_unfinished_index_nobody_is_building_is_refused() {
+        assert!(!partial_index_is_usable(true, false));
+    }
+
+    #[test]
+    fn a_finished_background_build_always_announces() {
+        assert!(background_announce(true, 0, 1200));
+    }
+
+    #[test]
+    fn a_reader_far_behind_the_frontier_is_not_repainted() {
+        // The cost of announcing is a full panel refresh, and this reader
+        // gains nothing from it: their next page is already built.
+        assert!(!background_announce(false, 3, 400));
+    }
+
+    // Invariant: a reader who has caught up with the frontier is told the book
+    // grew. The reducer clamps the page to the advertised count, so without
+    // this the next-page button silently does nothing.
+    #[test]
+    fn a_reader_at_the_frontier_is_told_the_book_grew() {
+        assert!(background_announce(false, 399, 400));
+        // One page short of the frontier still has somewhere to turn to.
+        assert!(!background_announce(false, 398, 400));
+    }
+
+    #[test]
+    fn a_reader_past_a_shrinking_frontier_still_announces() {
+        // Not reachable today — the frontier only grows — but the comparison
+        // is a saturating one either way, so a page beyond the advertised
+        // count must not wrap into "far behind" and stay silent.
+        assert!(background_announce(false, 500, 400));
+        assert!(background_announce(false, u32::MAX, 400));
     }
 
     #[test]

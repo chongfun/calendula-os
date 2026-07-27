@@ -23,7 +23,7 @@ use core::cell::Cell;
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
-use embassy_futures::select::{select, select4, Either, Either4};
+use embassy_futures::select::{select, select5, Either, Either5};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::Instant;
@@ -69,6 +69,12 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     // Storage-command admission for the sync session lifecycle; the loan
     // transition and refusal rules live in app-core with the contracts.
     let mut sync_session = SyncSession::default();
+    // The book whose spine walk is still running in the background after a
+    // progressive open published it early, if any. The walk's own state lives
+    // beside the section records it owns, in the EPUB scratch; this is only
+    // what the loop needs to schedule the next step and to tell whether the
+    // reader is still on that book.
+    let mut background_build: Option<BackgroundBuild> = None;
     // On a deep-sleep (Power button) wake the panel still shows the sleep
     // screen: deep_sleep_wake is true only when the RTC wake cause is the
     // armed GPIO *and* the pre-sleep handshake recorded that the sleep frame
@@ -155,16 +161,105 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
         // acknowledgement, and it constrains nothing: rendering is what
         // produces acknowledgements, but it is also what releases the app to
         // drain them, so standing down would be waiting on itself.
-        match select4(
+        //
+        // The fifth is the only one that is not waiting for anything: it is
+        // work this task already owes itself, so it comes last on purpose and
+        // runs a slice of a suspended book build whenever the four above have
+        // nothing. It yields before claiming the loop, which is what keeps a
+        // ready branch from starving the others — and what gives every other
+        // task a scheduling point between slices, where a single unsliced
+        // build used to hold the executor for a minute.
+        match select5(
             DISPLAY_COMMANDS.receive(),
             storage_command_while_free(),
             place_held_library_event(),
             place_held_display_event(),
+            background_build_step_due(
+                background_build.is_some()
+                    && !sync_session.active()
+                    && holder().storage_may_run()
+                    && !sd_library.text_holds_toc(),
+            ),
         )
         .await
         {
-            Either4::Third(()) | Either4::Fourth(()) => {}
-            Either4::First(DisplayCommand::Render(request)) => {
+            Either5::Fifth(()) => {
+                let Some(pending) = background_build else {
+                    continue;
+                };
+                // Deliberately not gated on the latest reader request id.
+                // Reading normally through a background build issues extends
+                // and bumps that id constantly, and every one of them has
+                // already passed through `apply_build_outcome`, which is what
+                // decides whether the walk survived. The step itself re-checks
+                // the catalog row it is building against the card.
+                let advertised_before = sd_library.advertised_page_count();
+                // Where the reader is now, which is the page each step must
+                // leave resident. Only a Reading render carries a global page;
+                // from anywhere else fall back to the book's start, which any
+                // later page turn extends from.
+                let reader_page = refresh_planner
+                    .last_request()
+                    .filter(|request| {
+                        request.book_id == pending.book_id && request.view == AppView::Reading
+                    })
+                    .map_or(0, |request| request.page);
+                let scratch = ensure_epub_scratch(&mut epub_scratch);
+                let step = reader_cache::continue_book_build(
+                    &mut epd,
+                    &mut sd_cs,
+                    sd_library,
+                    reader_page,
+                    scratch,
+                    font_metrics,
+                );
+                let finished = step == reader_cache::BackgroundStep::Finished;
+                if step != reader_cache::BackgroundStep::Continued {
+                    background_build = None;
+                }
+                if finished {
+                    esp_println::println!(
+                        "storage: background build done book_id={} pages={}",
+                        pending.book_id,
+                        sd_library.advertised_page_count()
+                    );
+                    esp_println::println!(
+                        "bench: storage_background_build book_id={} pages={} elapsed_ms={}",
+                        pending.book_id,
+                        sd_library.advertised_page_count(),
+                        pending.started.elapsed().as_millis(),
+                    );
+                }
+                // Announcing forces a full repaint, so an abandoned step may
+                // never do it: its store may be mid-move and the arena may
+                // still hold whatever the builder touched last rather than the
+                // page on screen. Silence leaves the panel showing the frame it
+                // already has, and the next page turn issues an ordinary extend
+                // that reloads properly.
+                if step == reader_cache::BackgroundStep::Abandoned {
+                    esp_println::println!(
+                        "storage: background build abandoned book_id={}",
+                        pending.book_id
+                    );
+                } else if app_core::storage_loop::background_announce(
+                    finished,
+                    reader_page,
+                    advertised_before,
+                ) {
+                    // `position: None` — the book grew, the reader did not
+                    // move, and adopting a page here would yank them.
+                    send_loaded_library_event(&LibraryEvent::Loaded {
+                        book_id: pending.book_id,
+                        pages: sd_library.advertised_page_count(),
+                        chapters: sd_library.chapter_count_for_ui(),
+                        current_chapter: sd_library.current_chapter(),
+                        chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                        position: None,
+                    });
+                }
+            }
+            Either5::Third(()) | Either5::Fourth(()) => {}
+            Either5::First(DisplayCommand::Render(request)) => {
                 let content_context_changed = refresh_planner
                     .last_request()
                     .map(|last| (last.view, last.book_id))
@@ -324,13 +419,26 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     send_required_power_event(power_event).await;
                 }
             }
-            Either4::First(DisplayCommand::Sleep { generation }) => {
+            Either5::First(DisplayCommand::Sleep { generation }) => {
                 let sleep_start = Instant::now();
                 esp_println::println!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
                 );
+                // A background build is deliberately *not* dropped here. Sleep
+                // is terminal — waking is a fresh boot — so a walk that goes
+                // down needs no clearing, and the book it left behind is a
+                // valid partial cache whose frontier a later open rebuilds
+                // past. A sleep that is refused, or a handshake the user
+                // abandons, returns to the loop with the walk still standing,
+                // which is what should happen: nothing about it was finished.
+                //
+                // It also stays out of the pre-sleep drain by construction.
+                // The drain works the storage queue, and a background step is
+                // not a queued command — it is a branch of the loop's select —
+                // so it can never spend the drain's budget or delay the panel.
+                //
                 // Everything owed to the card, in order, before the panel goes
                 // down. The ordering rules live in `SleepSequence` so they can
                 // be driven from a host test; this arm only does what it is
@@ -365,6 +473,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                                         &mut pending_progress,
                                         &mut last_progress_write,
                                         &mut state_restored,
+                                        &mut background_build,
                                     );
                                     sleep.applied();
                                     may_keep_draining = holder().sleep_may_proceed();
@@ -521,7 +630,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     Instant::now().as_millis(),
                 );
             }
-            Either4::Second(command) => match loop_arm(&command, sync_session) {
+            Either5::Second(command) => match loop_arm(&command, sync_session) {
                 // The display task is the upload writer until Sleep or
                 // wireless Exit closes the session; a Sleep exit has
                 // already been re-queued on DISPLAY_COMMANDS.
@@ -596,6 +705,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         &mut pending_progress,
                         &mut last_progress_write,
                         &mut state_restored,
+                        &mut background_build,
                     );
                 }
             },
@@ -637,6 +747,81 @@ async fn storage_command_while_free() -> StorageCommand {
         return core::future::pending::<StorageCommand>().await;
     }
     STORAGE_COMMANDS.receive().await
+}
+
+/// A book whose spine walk is still running after a progressive open published
+/// it early.
+///
+/// This is not the build's state — that lives in the EPUB scratch, beside the
+/// section records it describes, so the two cannot drift. This is only what the
+/// loop needs: which book, and when the walk began, for the closing bench line.
+#[derive(Clone, Copy)]
+struct BackgroundBuild {
+    book_id: u32,
+    started: Instant,
+}
+
+/// Carry the loop's background-build handle across one open or extend.
+///
+/// The distinction that matters is `Carried`: a page turn crossing a section
+/// boundary arrives as an extend and is answered from the cache, which must
+/// not be read as "the build ended". Only the reader-cache layer can tell the
+/// difference — it knows whether the fast path answered — so this just follows
+/// its verdict.
+fn apply_build_outcome(
+    background_build: &mut Option<BackgroundBuild>,
+    outcome: reader_cache::BookBuildOutcome,
+    book_id: u32,
+) {
+    match outcome {
+        reader_cache::BookBuildOutcome::Settled => *background_build = None,
+        reader_cache::BookBuildOutcome::Started => {
+            *background_build = Some(BackgroundBuild {
+                book_id,
+                started: Instant::now(),
+            })
+        }
+        // The handle is normally already there. Adopting a missing one is the
+        // safety net for anything that drops the handle without ending the
+        // walk — a cache clear for another book, say — so a still-valid build
+        // is picked back up rather than stranded half-written.
+        reader_cache::BookBuildOutcome::Carried => {
+            if background_build.is_none() {
+                *background_build = Some(BackgroundBuild {
+                    book_id,
+                    started: Instant::now(),
+                });
+            }
+        }
+    }
+}
+
+/// Ready when the loop should spend a slice on a suspended book build.
+///
+/// The gate is the same one storage answers to, for the same reason: a step can
+/// produce a settling `Loaded`, and the holder has one slot. It also stands
+/// down for a sync session, whose loan takes the scratch the build is walking
+/// out of.
+///
+/// And it stands down for the Chapters overview. That screen borrows the same
+/// single text arena the build writes through, and says so with
+/// `text_holds_toc`; a slice would quietly take the arena back, and the
+/// overview only reloads its window while that flag is still set — so the
+/// chapter list would go stale with nothing to restore it until the reader
+/// left the screen. The walk simply waits, which costs nothing: leaving
+/// Chapters reloads the reading section anyway.
+///
+/// The yield is what makes an always-ready branch safe to sit in a `select`.
+/// Returning immediately would let this task run slice after slice without
+/// handing the executor back — every other task starved for the length of the
+/// whole build. Yielding once means the loop re-polls with the four waiting
+/// branches ahead of it, so a render or command that arrived meanwhile is
+/// serviced first, and the other tasks have already had their turn.
+async fn background_build_step_due(pending: bool) {
+    if !pending {
+        return core::future::pending::<()>().await;
+    }
+    embassy_futures::yield_now().await;
 }
 
 /// Holds the display task still from the moment the panel goes down until the
@@ -802,6 +987,7 @@ fn handle_storage_command(
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
+    background_build: &mut Option<BackgroundBuild>,
 ) {
     // The session decides what may run: progress writes stay alive during a
     // sync session (they are cheap and harmless); everything
@@ -812,6 +998,9 @@ fn handle_storage_command(
     }
     match command {
         StorageCommand::LoanSyncMemory => {
+            // The scratch the walk keeps its section records in is about to
+            // become radio heap, and the session only ends in a reset.
+            *background_build = None;
             // The session only ends in a reset, so any coalesced position
             // must reach the card before the scratch is dismantled.
             if !flush_pending_progress(
@@ -1020,7 +1209,11 @@ fn handle_storage_command(
                             );
                             sd_library.set_reader_status(BookLoadStatus::Loading);
                             let scratch = ensure_epub_scratch(epub_scratch);
-                            reader_cache::build_or_load_book_cache(
+                            // The transaction around this call is untouched by
+                            // a progressive publish: it moves positions, and
+                            // this book's position is real whether or not its
+                            // tail is indexed yet.
+                            let outcome = reader_cache::build_or_load_book_cache(
                                 epd,
                                 sd_cs,
                                 sd_library,
@@ -1030,6 +1223,7 @@ fn handle_storage_command(
                                 scratch,
                                 font_metrics,
                             );
+                            apply_build_outcome(background_build, outcome, book_id);
                         }
                         open.section_loaded();
                     }
@@ -1162,7 +1356,7 @@ fn handle_storage_command(
             );
             let target_page = sd_library.overview_page_at(chapter as usize);
             let scratch = ensure_epub_scratch(epub_scratch);
-            reader_cache::build_or_load_book_cache(
+            let outcome = reader_cache::build_or_load_book_cache(
                 epd,
                 sd_cs,
                 sd_library,
@@ -1172,6 +1366,7 @@ fn handle_storage_command(
                 scratch,
                 font_metrics,
             );
+            apply_build_outcome(background_build, outcome, book_id);
             // The page came from the on-disk TOC, not from the app, so it
             // rides with the load rather than following as a second event.
             send_loaded_library_event(&LibraryEvent::Loaded {
@@ -1219,6 +1414,12 @@ fn handle_storage_command(
             index,
             catalog_epoch,
         } => {
+            // Deleting a cache dir out from under a background build would
+            // leave it writing an index for section files that no longer
+            // exist. Ended unconditionally: a walk is only ever an
+            // optimisation, and the row this command names is exactly the one
+            // that is hard to be sure about here.
+            *background_build = None;
             // The row was picked against a catalog this task may since have
             // replaced, which would leave a different book sitting under it.
             // Refuse rather than guess: the user can pick again from the list
