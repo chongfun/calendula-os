@@ -313,31 +313,47 @@ pub const fn stopped_announce(
     advertised_now > advertised_before && background_announce(false, reader_page, advertised_before)
 }
 
-/// How many times a background step that never began is tried before the walk
-/// is let go.
-///
-/// Small on purpose. The branch that runs these steps is always ready, so a
-/// walk that is kept alive is retried as fast as the loop comes round; the
-/// budget is what stops a card that has genuinely gone away from spinning up a
-/// failing SD session forever. Three is enough to ride out a hiccup and cheap
-/// enough to be wrong about.
-pub const BACKGROUND_STEP_ATTEMPTS: u8 = 3;
+/// The longest a background build waits between attempts at a step that never
+/// began.
+pub const BACKGROUND_RETRY_CEILING_MS: u64 = 30_000;
 
-/// Whether a background step that failed before it began is worth trying again.
+/// How long to wait before re-attempting a step that never began, after
+/// `attempts` consecutive failures to begin.
 ///
 /// The distinction this rests on is not how bad the error was but how much of
 /// the walk it consumed. A step can fail before touching a single record — the
 /// card refuses a session, the EPUB will not open — and everything the walk
-/// needs is then exactly as it was.
+/// needs is then exactly as it was. Nothing is lost by coming back for it.
 ///
-/// Retrying matters because nothing else will. A step like that builds no
+/// Coming back matters because nothing else will. A step like that builds no
 /// pages, so [`stopped_announce`] has nothing to say, and a reader who has
-/// already caught up with the frontier has no page turn that could rebuild:
-/// the reducer clamps Next to the page they are on, so no command is issued
-/// and no recovery is provoked. Until they turn a page, the walk is the only
-/// thing that can still raise their page count.
-pub const fn retry_unstarted_step(attempts: u8) -> bool {
-    attempts < BACKGROUND_STEP_ATTEMPTS
+/// already caught up with the frontier has no page turn that could provoke a
+/// rebuild: the reducer clamps Next to the page they are on, so no command is
+/// issued at all. Until they turn a page some other way, the walk is the only
+/// thing that can still raise their page count — so the walk is not given up
+/// on, however long the card stays away.
+///
+/// The backoff is what makes never giving up affordable. It is also what
+/// replaced a hard attempt cap: the cap only existed because the step branch
+/// was always ready and a kept walk would spin as fast as the loop came round.
+/// Waiting on a timer removes that pressure entirely, and an outage measured in
+/// minutes then costs two SD session attempts a minute on a device that is
+/// otherwise idle.
+pub const fn background_retry_delay_ms(attempts: u8) -> u64 {
+    // 250 ms, 1 s, 4 s, 16 s, then the ceiling. Quadrupling covers a card
+    // fault of any length in five steps without polling through a long one.
+    if attempts == 0 {
+        return 0;
+    }
+    if attempts >= 5 {
+        return BACKGROUND_RETRY_CEILING_MS;
+    }
+    let ms = 250_u64 << (2 * (attempts as u32 - 1));
+    if ms > BACKGROUND_RETRY_CEILING_MS {
+        BACKGROUND_RETRY_CEILING_MS
+    } else {
+        ms
+    }
 }
 
 /// What the book-open transaction wants next.
@@ -1400,15 +1416,29 @@ mod tests {
     #[test]
     fn a_step_that_never_began_is_kept_rather_than_announced() {
         assert!(!stopped_announce(400, 400, 399));
-        assert!(retry_unstarted_step(0));
+        assert!(background_retry_delay_ms(1) > 0);
     }
 
     #[test]
-    fn a_walk_that_keeps_failing_to_begin_is_eventually_let_go() {
-        // The step branch is always ready, so an unbounded retry would spin up
-        // a failing SD session for as long as the book stayed open.
-        assert!(retry_unstarted_step(BACKGROUND_STEP_ATTEMPTS - 1));
-        assert!(!retry_unstarted_step(BACKGROUND_STEP_ATTEMPTS));
+    fn the_retry_backoff_quadruples_to_its_ceiling() {
+        assert_eq!(background_retry_delay_ms(1), 250);
+        assert_eq!(background_retry_delay_ms(2), 1_000);
+        assert_eq!(background_retry_delay_ms(3), 4_000);
+        assert_eq!(background_retry_delay_ms(4), 16_000);
+        assert_eq!(background_retry_delay_ms(5), BACKGROUND_RETRY_CEILING_MS);
+    }
+
+    // Invariant: the walk is never given up on, so the delay has to stay
+    // bounded and finite however long the card stays away. u8 saturation is
+    // reached after about a day of retrying.
+    #[test]
+    fn the_retry_backoff_never_runs_away() {
+        assert_eq!(
+            background_retry_delay_ms(u8::MAX),
+            BACKGROUND_RETRY_CEILING_MS
+        );
+        // A step that ran is not a retry and must not be made to wait.
+        assert_eq!(background_retry_delay_ms(0), 0);
     }
 
     #[test]

@@ -36,11 +36,6 @@ use static_cell::ConstStaticCell;
 /// battery pull can lose at most this many seconds of reading position.
 const PROGRESS_WRITE_MIN_SECS: u64 = 15;
 
-/// How long a background build waits before re-attempting a step that never
-/// began. Long enough for a card fault to clear, short enough that the whole
-/// retry budget costs under a second of build time.
-const BACKGROUND_RETRY_DELAY_MS: u64 = 250;
-
 static EPUB_TAIL: ConstStaticCell<[u8; READER_TAIL_SCRATCH]> =
     ConstStaticCell::new([0; READER_TAIL_SCRATCH]);
 static EPUB_HEADER: ConstStaticCell<[u8; READER_HEADER_SCRATCH]> =
@@ -230,28 +225,27 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                             ..pending
                         });
                     }
-                    // Nothing was touched and the walk is re-armed, so the only
-                    // question is whether to come back for it. Giving up drops
-                    // the handle but deliberately leaves the resume: the walk's
-                    // records are intact, so the reader's next page turn is
-                    // answered by the fast path, reports `Carried`, and adopts
-                    // the walk again — a rebuild avoided for the price of a
-                    // handle nobody is holding.
+                    // Nothing was touched and the walk is re-armed, so it is
+                    // simply kept — for as long as this book stays open, however
+                    // long the card is away. A reader at the frontier has no
+                    // page turn that would provoke a rebuild, which leaves this
+                    // walk as the only thing that can still raise their page
+                    // count; there is nothing to hand the job over to. The wait
+                    // before the next attempt is what makes holding on
+                    // affordable, and the walk still dies the moment the book
+                    // changes or its cache is cleared.
                     reader_cache::BackgroundStep::Retry => {
                         let attempts = pending.attempts.saturating_add(1);
-                        if app_core::storage_loop::retry_unstarted_step(attempts) {
-                            background_build = Some(BackgroundBuild {
-                                attempts,
-                                ..pending
-                            });
-                        } else {
-                            esp_println::println!(
-                                "storage: background build gave up after {} attempts book_id={}",
-                                attempts,
-                                pending.book_id
-                            );
-                            background_build = None;
-                        }
+                        esp_println::println!(
+                            "storage: background build retry {} in {} ms book_id={}",
+                            attempts,
+                            app_core::storage_loop::background_retry_delay_ms(attempts),
+                            pending.book_id
+                        );
+                        background_build = Some(BackgroundBuild {
+                            attempts,
+                            ..pending
+                        });
                     }
                     _ => background_build = None,
                 }
@@ -885,23 +879,33 @@ fn apply_build_outcome(
 /// left the screen. The walk simply waits, which costs nothing: leaving
 /// Chapters reloads the reading section anyway.
 ///
-/// The yield is what makes an always-ready branch safe to sit in a `select`.
-/// Returning immediately would let this task run slice after slice without
-/// handing the executor back — every other task starved for the length of the
-/// whole build. Yielding once means the loop re-polls with the four waiting
-/// branches ahead of it, so a render or command that arrived meanwhile is
-/// serviced first, and the other tasks have already had their turn.
+/// The yield is what makes an otherwise always-ready branch safe to sit in a
+/// `select`. Returning immediately would let this task run slice after slice
+/// without handing the executor back — every other task starved for the length
+/// of the whole build. Yielding once means the loop re-polls with the four
+/// waiting branches ahead of it, so a render or command that arrived meanwhile
+/// is serviced first, and the other tasks have already had their turn.
+///
+/// A walk that is only retrying waits on a timer instead. That is the one state
+/// in which this branch is not ready, and it is what lets a step that never
+/// began be kept indefinitely rather than given up on.
 async fn background_build_step_due(pending: bool, attempts: u8) {
     if !pending {
         return core::future::pending::<()>().await;
     }
     if attempts > 0 {
-        // Retrying a step that never began, so this is not the yield's job any
-        // more: an immediate re-attempt would spend the whole budget inside a
-        // card fault too brief to have cleared. Waiting is also free — nothing
-        // was built, so there is no reader waiting on this slice — and the
-        // select's other four branches stay live throughout.
-        return Timer::after(Duration::from_millis(BACKGROUND_RETRY_DELAY_MS)).await;
+        // Retrying a step that never began, where the yield is the wrong tool:
+        // it would re-attempt as fast as the loop comes round, inside a card
+        // fault that has had no time to clear. Waiting is what lets the walk be
+        // kept indefinitely instead of given up on, and it is free — nothing was
+        // built, so no reader is waiting on this slice. The timer is only ever a
+        // floor: it sits in the `select`, so a render, a command, or a held
+        // event still preempts it, and a page turn that re-adopts the walk
+        // through `Carried` resets the wait to nothing.
+        return Timer::after(Duration::from_millis(
+            app_core::storage_loop::background_retry_delay_ms(attempts),
+        ))
+        .await;
     }
     embassy_futures::yield_now().await;
 }
