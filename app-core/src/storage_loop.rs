@@ -253,6 +253,45 @@ impl BuildPhase {
             Self::Background { slice_ms } => elapsed_ms >= slice_ms,
         }
     }
+
+    /// Whether to stop *before* walking the next spine item, given what that
+    /// item will probably cost.
+    ///
+    /// [`Self::suspend_here`] runs after an item and so cannot bound a step: it
+    /// passes under budget, the next item runs for seconds, and the step
+    /// overshoots. Measured on device, steps were min 423, **median 1997**, max
+    /// 3464 ms against a 400 ms budget, and a page turn cannot preempt one --
+    /// page turns during the background phase measured up to 3451 ms against a
+    /// <550 ms target. Looking at the item's size before committing to it is
+    /// what turns the budget into an actual bound.
+    ///
+    /// `walked_this_step` is what guarantees forward progress: a step always
+    /// takes at least one item, however large, or a book whose every chapter
+    /// exceeds the budget would never advance. So this bounds a step to roughly
+    /// the budget *plus one item*, and a single item larger than the budget
+    /// still has to run somewhere -- mid-item suspension would mean persisting
+    /// the XML tokenizer, block parser and inflate window, which does not fit
+    /// the RAM budget.
+    ///
+    /// Only [`Self::Background`] answers true. A first open must reach the page
+    /// it was asked for however long that takes; stopping short of it would
+    /// publish a book that cannot show the page the reader opened.
+    pub const fn suspend_before(
+        &self,
+        elapsed_ms: u64,
+        next_item_bytes: u32,
+        walked_this_step: usize,
+    ) -> bool {
+        if walked_this_step == 0 {
+            return false;
+        }
+        match *self {
+            Self::FirstOpen { .. } => false,
+            Self::Background { slice_ms } => {
+                elapsed_ms + estimated_item_ms(next_item_bytes) > slice_ms
+            }
+        }
+    }
 }
 
 /// Whether a book index that stops short of the whole book may be read from.
@@ -312,6 +351,36 @@ pub const fn stopped_announce(
 ) -> bool {
     advertised_now > advertised_before && background_announce(false, reader_page, advertised_before)
 }
+
+/// How long a spine item of `bytes` uncompressed XHTML takes to lay out.
+///
+/// Fitted to the 2026-07-28 X3 capture, where item cost tracked uncompressed
+/// size closely across the range that matters: 24,401 B took 1130 ms, 37,437 B
+/// took ~1530 ms, 47,601 B took 2282 ms and 58,245 B took 2832 ms -- about
+/// 20 bytes per millisecond. It only has to be good enough to tell "this will
+/// blow the slice" from "this will not", so a coarse linear fit is the right
+/// amount of model; being wrong costs one overlong step, not correctness.
+const LAYOUT_BYTES_PER_MS: u32 = 20;
+
+const fn estimated_item_ms(bytes: u32) -> u64 {
+    (bytes / LAYOUT_BYTES_PER_MS) as u64
+}
+
+/// How long the loop waits after a background step before it may claim the
+/// display task again.
+///
+/// A step ends and the branch that runs it is ready again immediately, so a
+/// single `yield_now` handed the app task one poll and no more. Measured on
+/// device: 0.2 ms between one step ending and the next beginning, while a page
+/// turn pressed 86 ms *earlier* had still not been reduced into a render -- the
+/// reader then waited out a whole extra 2912 ms step for a page that was
+/// already available. This is the window in which the app can turn a button
+/// press into a render, which the loop services ahead of the next slice.
+///
+/// Small enough to be noise against a slice: 50 ms on a 400 ms budget is 12%
+/// of build throughput in the worst case and nothing at all when the reader is
+/// idle, because the branch only re-arms after a step that actually ran.
+pub const BACKGROUND_SETTLE_MS: u64 = 50;
 
 /// The longest a background build waits between attempts at a step that never
 /// began.
@@ -1404,6 +1473,37 @@ mod tests {
     // would spend a full panel refresh redrawing the same frontier. Which is
     // why silence here is only correct if the walk itself is kept: see
     // `a_step_that_never_began_is_kept_rather_than_announced` below.
+    // Invariant: a step always takes at least one item, however large. Without
+    // this a book whose every chapter exceeds the slice would never advance.
+    #[test]
+    fn a_step_always_walks_one_item_before_it_may_stop_short() {
+        assert!(!BACKGROUND.suspend_before(0, 5_000_000, 0));
+        assert!(!BACKGROUND.suspend_before(9_999, 5_000_000, 0));
+    }
+
+    // Invariant: the measured failure. Two small items leave the step under
+    // budget, then a 58 KB chapter -- ~2900 ms by the fitted rate -- would
+    // overshoot to 3300 ms with no way for a page turn to preempt it.
+    #[test]
+    fn a_chapter_that_would_blow_the_slice_waits_for_the_next_step() {
+        assert!(BACKGROUND.suspend_before(340, 58_245, 2));
+    }
+
+    #[test]
+    fn a_small_item_still_rides_the_current_step() {
+        // 606 B of front matter is ~30 ms; batching these is the whole point
+        // of a slice budget, since each suspend costs a zip and OPF re-parse.
+        assert!(!BACKGROUND.suspend_before(340, 606, 2));
+    }
+
+    // A first open must reach the page it was asked for. Stopping short would
+    // publish a book that cannot show the page the reader opened it on.
+    #[test]
+    fn a_first_open_never_stops_short_of_its_requested_page() {
+        let first = BuildPhase::FirstOpen { requested_page: 0 };
+        assert!(!first.suspend_before(10_000, 5_000_000, 9));
+    }
+
     #[test]
     fn a_stopped_step_that_built_nothing_stays_silent() {
         assert!(!stopped_announce(400, 400, 399));

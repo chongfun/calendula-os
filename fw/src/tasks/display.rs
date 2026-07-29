@@ -891,35 +891,32 @@ fn apply_build_outcome(
 /// left the screen. The walk simply waits, which costs nothing: leaving
 /// Chapters reloads the reading section anyway.
 ///
-/// The yield is what makes an otherwise always-ready branch safe to sit in a
+/// The wait is what makes an otherwise always-ready branch safe to sit in a
 /// `select`. Returning immediately would let this task run slice after slice
 /// without handing the executor back — every other task starved for the length
-/// of the whole build. Yielding once means the loop re-polls with the four
-/// waiting branches ahead of it, so a render or command that arrived meanwhile
-/// is serviced first, and the other tasks have already had their turn.
+/// of the whole build. A single yield was not enough either: measured on
+/// device, one step ended and the next began 0.2 ms later, with a page turn
+/// pressed 86 ms earlier still not reduced into a render, so the reader waited
+/// out another 2912 ms step for a page that already existed. Waiting
+/// `BACKGROUND_SETTLE_MS` gives the app room to produce that render, which the
+/// first branch then services ahead of the next slice.
 ///
-/// A walk that is only retrying waits on a timer instead. That is the one state
-/// in which this branch is not ready, and it is what lets a step that never
-/// began be kept indefinitely rather than given up on.
+/// A walk that is only retrying waits on its backoff instead, which is what
+/// lets a step that never began be kept indefinitely rather than given up on.
 async fn background_build_step_due(pending: bool, attempts: u8) {
     if !pending {
         return core::future::pending::<()>().await;
     }
-    if attempts > 0 {
-        // Retrying a step that never began, where the yield is the wrong tool:
-        // it would re-attempt as fast as the loop comes round, inside a card
-        // fault that has had no time to clear. Waiting is what lets the walk be
-        // kept indefinitely instead of given up on, and it is free — nothing was
-        // built, so no reader is waiting on this slice. The timer is only ever a
-        // floor: it sits in the `select`, so a render, a command, or a held
-        // event still preempts it, and a page turn that re-adopts the walk
-        // through `Carried` resets the wait to nothing.
-        return Timer::after(Duration::from_millis(
-            app_core::storage_loop::background_retry_delay_ms(attempts),
-        ))
-        .await;
-    }
-    embassy_futures::yield_now().await;
+    // Always a wait, never a bare yield. The two reasons differ but the failure
+    // of yielding is the same in both: this branch is ready again the instant a
+    // step ends, so a single poll is not enough for the app task to get its
+    // work in, and the loop commits to another multi-second slice ahead of it.
+    let wait = if attempts > 0 {
+        app_core::storage_loop::background_retry_delay_ms(attempts)
+    } else {
+        app_core::storage_loop::BACKGROUND_SETTLE_MS
+    };
+    Timer::after(Duration::from_millis(wait)).await;
 }
 
 /// Holds the display task still from the moment the panel goes down until the

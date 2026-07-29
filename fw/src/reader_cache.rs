@@ -1628,6 +1628,9 @@ where
         Some(state) => state.generate_toc_from_headings,
         None => library.toc_count() == 0,
     };
+    // Items this step has committed to. `suspend_before` uses it to guarantee a
+    // step always takes at least one item, however large.
+    let mut walked_this_step = 0usize;
     let phase = match resume {
         Some(_) => app_core::storage_loop::BuildPhase::Background {
             slice_ms: BACKGROUND_SLICE_MS,
@@ -1723,6 +1726,24 @@ where
                 xhtml_entry.uncompressed_size
             );
             let spine_u16 = spine_index.min(u16::MAX as usize) as u16;
+            // Stop *before* this item if it would overrun the slice. The check
+            // after an item cannot bound a step -- it passes under budget and
+            // the next item runs for seconds, which is what made page turns
+            // wait up to 3.4 s on device. Nothing has been written for this
+            // item yet, so the resume points *at* it rather than past it.
+            if phase.suspend_before(
+                open_started.elapsed().as_millis(),
+                xhtml_entry.uncompressed_size,
+                walked_this_step,
+            ) {
+                esp_println::println!(
+                    "epub: slice yields before spine {} ({} B)",
+                    spine_u16,
+                    xhtml_entry.uncompressed_size
+                );
+                return Ok(Some(spine_u16));
+            }
+            walked_this_step += 1;
             let mut sink = LibraryBlockSink::begin_spine(
                 &mut *library,
                 root,
