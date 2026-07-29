@@ -341,6 +341,15 @@ class TestStackFrames(unittest.TestCase):
         insns = [("add", ["sp", "sp", "a5"])]
         self.assertIsNone(frame_size(insns))
 
+    def test_tracked_add_sp_restores_frame(self) -> None:
+        insns = [
+            ("lui", ["t0", "5"]),
+            ("addi", ["t0", "t0", "1024"]),
+            ("sub", ["sp", "sp", "t0"]),
+            ("add", ["sp", "sp", "t0"]),
+        ]
+        self.assertEqual(frame_size(insns), 21504)
+
     # The tab-separated form is what llvm-objdump actually emits, so it is the
     # branch that runs against every real binary -- while the space-separated
     # cases below only reach the INSN_RE fallback. These three lines are copied
