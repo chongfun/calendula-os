@@ -1,4 +1,5 @@
 [toolchain]
 channel = "stable"
 targets = ["riscv32imc-unknown-none-elf"]
-components = ["rust-src", "clippy", "rustfmt"]
+# llvm-tools supplies the llvm-objdump/llvm-nm that tools/stack_frames.py reads.
+components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]

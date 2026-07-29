@@ -70,6 +70,18 @@ case "$COMMAND" in
         echo "Building firmware for X3..."
         tools/cargo.sh build -p fw --release --features device-x3
         ;;
+    stack-frames)
+        # Builds and checks one device at a time: both share a target dir, so
+        # the second build overwrites the first binary. See tools/stack_frames.py
+        # for what this catches and why the source diff never shows it.
+        echo "Checking firmware stack frames for X4..."
+        tools/cargo.sh build -p fw --release
+        python3 tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+        
+        echo "Checking firmware stack frames for X3..."
+        tools/cargo.sh build -p fw --release --features device-x3
+        python3 tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+        ;;
     fast)
         "$0" fmt
         "$0" clippy-host
@@ -82,7 +94,7 @@ case "$COMMAND" in
         ;;
     firmware)
         "$0" clippy-firmware
-        "$0" build-firmware
+        "$0" stack-frames
         ;;
     all)
         "$0" fast
@@ -90,7 +102,7 @@ case "$COMMAND" in
         "$0" firmware
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|golden-frames|test-emulator|build-firmware|fast|emulator|firmware|all}"
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|golden-frames|test-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
         echo "  'all' runs all required root/firmware verification."
         exit 1
         ;;

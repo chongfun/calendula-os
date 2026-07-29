@@ -96,5 +96,11 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add riscv32imc-unknown-none-elf --toolchain stable
-      - name: Build firmware (release)
-        run: tools/check.sh build-firmware
+          # llvm-objdump/llvm-nm for the stack-frame check below.
+          rustup component add llvm-tools --toolchain stable
+      # Builds both boards and checks the largest stack frame in each. The
+      # device has no stack guard page, so an overflow lands in .bss and
+      # surfaces as an unrelated panic; this is the only gate that would catch
+      # it before a flash. See tools/stack_frames.py.
+      - name: Build firmware (release) and check stack frames
+        run: tools/check.sh stack-frames
