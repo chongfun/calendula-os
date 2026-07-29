@@ -123,8 +123,8 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     bug.
 
     Returns `None` if any instruction writes to `sp` in a way that cannot be
-    resolved as a constant stack allocation, failing closed rather than
-    silently ignoring the stack modification.
+    resolved as a constant stack allocation, or uses an untracked register,
+    failing closed rather than silently ignoring the stack modification.
     """
     regs: dict[str, int] = {}
     cur = peak = 0
@@ -146,12 +146,9 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
                     return None
                 cur += regs[ops[2]]
             elif mnem == "add" and len(ops) == 3 and ops[1] == "sp":
-                if ops[2] in regs:
-                    cur -= regs[ops[2]]
-                else:
-                    # A deallocation of unknown size cannot raise the peak, so
-                    # clamping is safe where returning None would be noise.
-                    cur = max(0, cur)
+                if ops[2] not in regs:
+                    return None
+                cur -= regs[ops[2]]
             else:
                 # Any unmodeled instruction modifying sp (e.g. mv sp, t0, addi sp, s0, N)
                 # cannot be bounded as a frame constant: fail closed.
@@ -178,6 +175,11 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
                 regs[ops[0]] = regs[ops[1]]
             else:
                 regs.pop(ops[0], None)
+        else:
+            # Any unmodeled instruction that writes to a register invalidates
+            # any previously tracked constant for that register so a subsequent
+            # sp adjustment cannot consume a stale value.
+            regs.pop(ops[0], None)
         peak = max(peak, cur)
     return peak
 
@@ -325,6 +327,18 @@ class TestStackFrames(unittest.TestCase):
 
     def test_unknown_sp_write_fails_closed(self) -> None:
         insns = [("mv", ["sp", "t0"])]
+        self.assertIsNone(frame_size(insns))
+
+    def test_untracked_overwritten_register_fails_closed(self) -> None:
+        insns = [
+            ("lui", ["t0", "5"]),
+            ("lw", ["t0", "0(a0)"]),
+            ("sub", ["sp", "sp", "t0"]),
+        ]
+        self.assertIsNone(frame_size(insns))
+
+    def test_unknown_add_sp_fails_closed(self) -> None:
+        insns = [("add", ["sp", "sp", "a5"])]
         self.assertIsNone(frame_size(insns))
 
     # The tab-separated form is what llvm-objdump actually emits, so it is the
