@@ -1909,23 +1909,17 @@ fn ensure_epub_scratch<'a>(
             zip_ptr.write(proto::epub::ZipInflateScratch::new());
             &mut *zip_ptr
         };
-        let scratch_uninit = EPUB_SCRATCH.uninit();
-        let scratch_ptr = scratch_uninit.as_mut_ptr();
-        // SAFETY: EPUB_SCRATCH is a 'static allocation initialized once on demand.
-        unsafe {
-            scratch_ptr.write(ReaderCacheScratch::new(
-                EPUB_TAIL.take(),
-                EPUB_HEADER.take(),
-                EPUB_NAME.take(),
-                EPUB_COMPRESSED.take(),
-                EPUB_CONTAINER.take(),
-                EPUB_OPF.take(),
-                EPUB_XHTML.take(),
-                EPUB_BOOK_SECTIONS.take(),
-                zip_ref,
-            ));
-            *epub_scratch = Some(&mut *scratch_ptr);
-        }
+        *epub_scratch = Some(EPUB_SCRATCH.init(ReaderCacheScratch::new(
+            EPUB_TAIL.take(),
+            EPUB_HEADER.take(),
+            EPUB_NAME.take(),
+            EPUB_COMPRESSED.take(),
+            EPUB_CONTAINER.take(),
+            EPUB_OPF.take(),
+            EPUB_XHTML.take(),
+            EPUB_BOOK_SECTIONS.take(),
+            zip_ref,
+        )));
     }
     epub_scratch.as_deref_mut().unwrap()
 }

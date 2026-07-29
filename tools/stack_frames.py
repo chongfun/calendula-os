@@ -87,13 +87,24 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int:
             elif mnem == "addi" and len(ops) == 3:
                 if ops[0] == "sp" and ops[1] == "sp":
                     cur -= imm(ops[2])
+                elif ops[1] in regs:
+                    regs[ops[0]] = regs[ops[1]] + imm(ops[2])
                 else:
-                    regs[ops[0]] = regs.get(ops[1], 0) + imm(ops[2])
+                    regs.pop(ops[0], None)
             elif mnem in ("sub", "add") and len(ops) == 3 and ops[0] == "sp" and ops[1] == "sp":
-                delta = regs.get(ops[2], 0)
-                cur += delta if mnem == "sub" else -delta
+                if ops[2] in regs:
+                    delta = regs[ops[2]]
+                    cur += delta if mnem == "sub" else -delta
+                else:
+                    print(
+                        f"warning: unresolved stack adjustment by register {ops[2]}",
+                        file=sys.stderr,
+                    )
             elif mnem == "mv" and len(ops) == 2:
-                regs[ops[0]] = regs.get(ops[1], 0)
+                if ops[1] in regs:
+                    regs[ops[0]] = regs[ops[1]]
+                else:
+                    regs.pop(ops[0], None)
         except ValueError:
             # A relocation or symbolic operand; it cannot be a frame constant.
             continue
@@ -125,8 +136,10 @@ def stack_region(elf: str) -> int | None:
     """`_stack_start - _stack_end`, for context in the report."""
     nm = find_objdump().replace("llvm-objdump", "llvm-nm")
     try:
-        out = subprocess.run([nm, elf], capture_output=True, text=True, check=True).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        out = subprocess.run(
+            [nm, elf], capture_output=True, text=True, check=True, timeout=30
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return None
     marks = {}
     for line in out.splitlines():
@@ -141,7 +154,9 @@ def stack_region(elf: str) -> int | None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("binary", help="firmware ELF, or a pre-dumped llvm-objdump listing")
-    ap.add_argument("--budget", type=int, default=int(os.environ.get("STACK_FRAME_BUDGET", DEFAULT_BUDGET)))
+    ap.add_argument(
+        "--budget", type=int, default=int(os.environ.get("STACK_FRAME_BUDGET", DEFAULT_BUDGET))
+    )
     ap.add_argument("--top", type=int, default=5)
     args = ap.parse_args()
 
@@ -152,11 +167,12 @@ def main() -> int:
         objdump = find_objdump()
         try:
             disassembly = subprocess.run(
-                [objdump, "-d", args.binary], capture_output=True, text=True, check=True
+                [objdump, "-d", args.binary], capture_output=True, text=True, check=True, timeout=30
             ).stdout
-        except FileNotFoundError:
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as err:
             print(
-                f"error: {objdump} not found. Install it with:\n"
+                f"error: failed to run {objdump}: {err}\n"
+                "Install it with:\n"
                 "  rustup component add llvm-tools\n"
                 "or point LLVM_OBJDUMP at one.",
                 file=sys.stderr,
@@ -164,7 +180,7 @@ def main() -> int:
             return 2
         region = stack_region(args.binary)
     else:
-        with open(args.binary, "r") as handle:
+        with open(args.binary) as handle:
             disassembly = handle.read()
         region = None
 
@@ -174,7 +190,7 @@ def main() -> int:
         return 2
 
     ranked = sorted(frames.items(), key=lambda kv: kv[1], reverse=True)
-    label = "stack region {} B, ".format(region) if region else ""
+    label = f"stack region {region} B, " if region is not None else ""
     print(f"  {label}budget {args.budget} B, {len(frames)} functions")
     for name, size in ranked[: args.top]:
         print(f"  {size:>8} B  {name}")
@@ -192,6 +208,46 @@ def main() -> int:
         )
         return 1
     return 0
+
+
+import unittest
+
+
+class TestStackFrames(unittest.TestCase):
+    def test_direct_small_frame(self) -> None:
+        insns = [("addi", ["sp", "sp", "-32"])]
+        self.assertEqual(frame_size(insns), 32)
+
+    def test_large_frame_lui_addi_sub(self) -> None:
+        insns = [
+            ("lui", ["t0", "5"]),
+            ("addi", ["t0", "t0", "1024"]),
+            ("sub", ["sp", "sp", "t0"]),
+        ]
+        self.assertEqual(frame_size(insns), 21504)
+
+    def test_epilogue_does_not_increase_peak(self) -> None:
+        insns = [
+            ("addi", ["sp", "sp", "-64"]),
+            ("addi", ["sp", "sp", "64"]),
+        ]
+        self.assertEqual(frame_size(insns), 64)
+
+    def test_untracked_register_handling(self) -> None:
+        insns = [("sub", ["sp", "sp", "a5"])]
+        self.assertEqual(frame_size(insns), 0)
+
+    def test_parse_multiple_functions(self) -> None:
+        disasm = (
+            "00000000 <func_a>:\n"
+            "   0: 71 71       addi sp, sp, -16\n"
+            "00000004 <func_b>:\n"
+            "   4: 37 55 00 00 lui t0, 5\n"
+            "   8: 13 05 05 40 addi t0, t0, 1024\n"
+            "   c: 33 81 51 40 sub sp, sp, t0\n"
+        )
+        parsed = parse(disasm)
+        self.assertEqual(parsed, {"func_a": 16, "func_b": 21504})
 
 
 if __name__ == "__main__":
