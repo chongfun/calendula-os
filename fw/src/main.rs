@@ -123,16 +123,13 @@ use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
 use tasks::input::InputPins;
 
+mod book_build;
 pub mod catalog;
 mod custom_font;
 mod display_flush;
 mod library_sd;
 mod mmu;
 mod ota_update;
-mod reader_cache;
-mod reader_cache_files;
-mod reader_layout;
-mod reader_store;
 mod sd_session;
 mod sleep_marker;
 mod sync_mem;

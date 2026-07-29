@@ -1,11 +1,4 @@
 use crate::display_flush::Epd;
-use crate::reader_cache_files;
-use crate::reader_cache_files::{BookIndexLoadResult, CacheLoadResult};
-use crate::reader_layout;
-use crate::reader_store::{
-    source_hash, BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
-    MAX_READER_BLOCK_TEXT,
-};
 use crate::sd_session::{self, SdSessionError};
 use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
 use embassy_time::Instant;
@@ -21,17 +14,20 @@ use proto::epub::{
 };
 use proto::nvm::AppStateRecord;
 use proto::text::{TextAlign, TextRole};
+use reader_cache::files;
+use reader_cache::files::{BookIndexLoadResult, CacheLoadResult};
+use reader_cache::layout;
+use reader_cache::publish;
+use reader_cache::store::{
+    source_hash, BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
+    MAX_READER_BLOCK_TEXT,
+};
+use reader_cache::{
+    READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
+    READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
+};
 use ui::reading::StyledInkCursor;
 
-pub(crate) const READER_TAIL_SCRATCH: usize = 4096;
-pub(crate) const READER_HEADER_SCRATCH: usize = 46;
-// All zip reads stream through the shared inflate engine in bounded chunks,
-// so this only sets the fetch granularity; SD transfers are 2 KB ops either
-// way. Kept small so the freed static RAM widens the stack region.
-pub(crate) const READER_COMPRESSED_SCRATCH: usize = 8192;
-pub(crate) const READER_CONTAINER_SCRATCH: usize = 4096;
-pub(crate) const READER_OPF_SCRATCH: usize = 16_384;
-pub(crate) const READER_XHTML_SCRATCH: usize = 24_576;
 /// Per-call clamp on `read_at`. The FAT layer transfers single 512-byte
 /// blocks either way, so this only bounds how much one embedded-sdmmc call
 /// copies; matching the compressed scratch keeps an 8 KB inflate fetch to
@@ -50,25 +46,6 @@ const EPUB_OPEN_READ_BYTE_LIMIT: u32 = 64 * 1024 * 1024;
 /// page turns arbitrarily snappy; it just makes each step re-pay the card
 /// session, zip index, and OPF parse more often.
 const BACKGROUND_SLICE_MS: u64 = 400;
-
-/// How many newly built sections a background walk accumulates before it
-/// rewrites `BOOK.BIN`.
-///
-/// The index is rewritten whole every time — header, one record per section so
-/// far, the TOC block and the labels — so publishing on every slice makes a
-/// build's index traffic quadratic in its section count. On the measured
-/// 100-section book that is a hundred rewrites of a table that is only growing
-/// at the end.
-///
-/// Nothing reads that file mid-build. Page turns are served from the resident
-/// index in `ReaderStore`, which is still adopted every slice; the on-disk copy
-/// matters only to the *next* open, and while `resume_spine` is set that open
-/// rebuilds regardless of how far the file had got.
-///
-/// So the only cost of batching is work redone when a walk is abandoned: at
-/// most this many sections. The final publish always writes, so a book that
-/// finishes is never short-changed.
-const INDEX_PUBLISH_SECTIONS: usize = 16;
 
 /// Everything a suspended progressive build needs to pick the spine walk back
 /// up, minus the section records themselves — those stay in
@@ -110,7 +87,7 @@ pub(crate) struct BookBuildResume {
     content_ok: bool,
     content_spine_count: u16,
     /// Sections already written into the on-disk index. The walk's own frontier
-    /// runs ahead of this between publishes; see [`INDEX_PUBLISH_SECTIONS`].
+    /// runs ahead of this between publishes; see `publish::INDEX_PUBLISH_SECTIONS`.
     published_sections: u16,
 }
 
@@ -744,14 +721,9 @@ pub(crate) fn store_app_state(
         .and_then(|index| library.catalog_entry(index as usize))
         .map(|entry| proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size));
     sd_session::with_root(epd, sd_cs, |root| {
-        let state = reader_cache_files::write_state_file(root, record);
+        let state = files::write_state_file(root, record);
         let position = if let Some(key) = &book_key {
-            reader_cache_files::write_position_file(
-                root,
-                key.as_str(),
-                record.chapter,
-                record.screen,
-            )
+            files::write_position_file(root, key.as_str(), record.chapter, record.screen)
         } else {
             Ok(())
         };
@@ -794,7 +766,7 @@ pub(crate) fn store_book_position(
     };
     let key = proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size);
     sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::write_position_file(root, key.as_str(), record.chapter, record.screen)
+        files::write_position_file(root, key.as_str(), record.chapter, record.screen)
     })
     .ok()
     .is_some_and(|result| result.is_ok())
@@ -812,11 +784,9 @@ pub(crate) fn store_global_state(
     sd_cs: &mut Output<'static>,
     record: AppStateRecord,
 ) -> bool {
-    sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::write_state_file(root, record)
-    })
-    .ok()
-    .is_some_and(|result| result.is_ok())
+    sd_session::with_root(epd, sd_cs, |root| files::write_state_file(root, record))
+        .ok()
+        .is_some_and(|result| result.is_ok())
 }
 
 /// The saved per-book position for a catalog entry, if any.
@@ -831,7 +801,7 @@ pub(crate) fn load_position(
         .catalog_entry(index)
         .map(|entry| proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size))?;
     sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::read_position_file(root, key.as_str())
+        files::read_position_file(root, key.as_str())
     })
     .ok()
     .flatten()
@@ -854,15 +824,9 @@ pub(crate) fn load_chapters_into_store(
     let key = proto::cache::cache_key_for(entry.display_name.as_str(), source_identity.1);
     // Center the window on the selection so scrolling either way has slack
     // before the next reload.
-    let window_start = selection.saturating_sub(crate::reader_store::TOC_WINDOW_CAPACITY / 2);
+    let window_start = selection.saturating_sub(reader_cache::store::TOC_WINDOW_CAPACITY / 2);
     sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::load_v2_toc_into_text(
-            root,
-            key.as_str(),
-            source_identity,
-            library,
-            window_start,
-        )
+        files::load_v2_toc_into_text(root, key.as_str(), source_identity, library, window_start)
     })
     .unwrap_or(false)
 }
@@ -893,7 +857,7 @@ pub(crate) fn store_wifi_credentials(
     record: proto::nvm::WifiCredentialsRecord,
 ) -> bool {
     sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::write_wifi_file(root, record).is_ok()
+        files::write_wifi_file(root, record).is_ok()
     })
     .unwrap_or(false)
 }
@@ -901,10 +865,7 @@ pub(crate) fn store_wifi_credentials(
 #[inline(never)]
 pub(crate) fn forget_wifi_credentials(epd: &mut Epd, sd_cs: &mut Output<'static>) -> bool {
     #[allow(clippy::redundant_closure)]
-    sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::delete_wifi_file(root)
-    })
-    .unwrap_or(false)
+    sd_session::with_root(epd, sd_cs, |root| files::delete_wifi_file(root)).unwrap_or(false)
 }
 
 /// Delete one catalog row's rebuildable cache (sections, BOOK/TOC/COVER and
@@ -942,8 +903,8 @@ pub(crate) fn clear_book_cache(
     // BOOK.BIN and stall on a section, and the resident state has to be
     // dropped in that case as surely as in the clean one.
     let (attempted, cleared) = sd_session::with_root(epd, sd_cs, |root| {
-        match reader_cache_files::read_cache_header(root, cache_key.as_str()) {
-            reader_cache_files::CacheHeader::Present(header) => {
+        match files::read_cache_header(root, cache_key.as_str()) {
+            files::CacheHeader::Present(header) => {
                 if header.source_hash != source_hash || header.source_size != source_size {
                     // Whatever sits under this key is not this book's cache;
                     // refuse rather than delete another book's data.
@@ -954,12 +915,12 @@ pub(crate) fn clear_book_cache(
             // a key is 28 bits of hash — a collision is a case the format
             // admits. Fail closed: a corrupt or briefly unreadable BOOK.BIN
             // belonging to another book must not be answered by deleting it.
-            reader_cache_files::CacheHeader::Unreadable => return (false, false),
+            files::CacheHeader::Unreadable => return (false, false),
             // No index at all is different. Nothing usable is there for
             // anyone, so sweeping the shells a truncated pass left behind
             // costs the colliding book nothing it had not already lost — and
             // its position files are never swept regardless.
-            reader_cache_files::CacheHeader::Absent => {}
+            files::CacheHeader::Absent => {}
         }
         //
         // The delete reports on every file it was supposed to remove, not
@@ -967,13 +928,13 @@ pub(crate) fn clear_book_cache(
         // has freed no space and left a directory the sweep will keep
         // tripping over, and telling the user "cache cleared" for that is a
         // lie they cannot check.
-        let emptied = reader_cache_files::empty_cache_dir(root, cache_key.as_str());
+        let emptied = files::empty_cache_dir(root, cache_key.as_str());
         (
             true,
             emptied
                 && matches!(
-                    reader_cache_files::read_cache_header(root, cache_key.as_str()),
-                    reader_cache_files::CacheHeader::Absent
+                    files::read_cache_header(root, cache_key.as_str()),
+                    files::CacheHeader::Absent
                 ),
         )
     })
@@ -1006,7 +967,7 @@ pub(crate) fn load_wifi_credentials(
     sd_cs: &mut Output<'static>,
 ) -> Option<proto::nvm::WifiCredentialsRecord> {
     #[allow(clippy::redundant_closure)]
-    sd_session::with_root(epd, sd_cs, |root| reader_cache_files::read_wifi_file(root))
+    sd_session::with_root(epd, sd_cs, |root| files::read_wifi_file(root))
         .ok()
         .flatten()
 }
@@ -1016,7 +977,7 @@ pub(crate) fn load_wifi_credentials(
 pub(crate) fn load_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>) -> Option<AppStateRecord> {
     // Not point-free: the generic fn item fails the closure's HRTB check.
     #[allow(clippy::redundant_closure)]
-    sd_session::with_root(epd, sd_cs, |root| reader_cache_files::read_state_file(root))
+    sd_session::with_root(epd, sd_cs, |root| files::read_state_file(root))
         .ok()
         .flatten()
 }
@@ -1040,11 +1001,13 @@ pub(crate) fn load_custom_font_manifest(
         );
         return;
     }
-    let manifest = sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::read_custom_font_manifest(root)
-    })
-    .ok()
-    .flatten();
+    // The closure is not redundant: passing the function directly fixes its
+    // `Directory` lifetime to one specific region, and `with_root` needs a
+    // `for<'a>` caller. Clippy suggests a form that does not compile.
+    #[allow(clippy::redundant_closure)]
+    let manifest = sd_session::with_root(epd, sd_cs, |root| files::read_custom_font_manifest(root))
+        .ok()
+        .flatten();
     if let Some(manifest) = manifest {
         esp_println::println!(
             "font: custom '{}' identity={:016x}",
@@ -1108,7 +1071,7 @@ pub(crate) fn load_chapter_title(
     let _ = display_name.push_str(&entry.display_name);
     let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
     let found = sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::read_v2_toc_chapter_title(
+        files::read_v2_toc_chapter_title(
             root,
             cache_key.as_str(),
             source_identity,
@@ -1142,12 +1105,7 @@ pub(crate) fn restore_book_page_count(
     let _ = display_name.push_str(&entry.display_name);
     let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
     sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::read_v2_book_total_pages(
-            root,
-            cache_key.as_str(),
-            source_identity,
-            library,
-        )
+        files::read_v2_book_total_pages(root, cache_key.as_str(), source_identity, library)
     })
     .unwrap_or(0)
 }
@@ -1176,7 +1134,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    match reader_cache_files::load_v2_book_index(root, cache_key, source_identity, library) {
+    match files::load_v2_book_index(root, cache_key, source_identity, library) {
         BookIndexLoadResult::Hit { unfinished }
             if !app_core::storage_loop::partial_index_is_usable(unfinished, walk_is_live) =>
         {
@@ -1191,7 +1149,7 @@ where
             false
         }
         BookIndexLoadResult::Hit { .. } => {
-            match reader_cache_files::load_v2_section_by_global_page(
+            match files::load_v2_section_by_global_page(
                 root,
                 cache_key,
                 source_identity,
@@ -1199,15 +1157,15 @@ where
                 library,
             ) {
                 CacheLoadResult::Hit { pages, .. } => {
-                    reader_layout::rebuild_toc_page_targets(library);
-                    refresh_chapter_tracking(
+                    layout::rebuild_toc_page_targets(library);
+                    publish::refresh_chapter_tracking(
                         root,
                         cache_key,
                         source_identity,
                         requested_global_page,
                         library,
                     );
-                    let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
+                    let cover = files::load_v2_cover_cache(root, cache_key, library);
                     esp_println::println!(
                         "epub: v2 {label} book cache ready after {} ms (total={} section_pages={} toc={} cover={:?})",
                         started.elapsed().as_millis(),
@@ -1232,58 +1190,6 @@ where
             esp_println::println!("epub: v2 {label} book index miss");
             false
         }
-    }
-}
-
-/// Keep the resident current-chapter index and title pointed at the page just
-/// loaded. The per-section chapter marks are read from TOC.BIN once per book
-/// (or after a repaginating settings change); the title is a single 48-byte
-/// record re-read only when the chapter actually changes.
-fn refresh_chapter_tracking<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
-    source_identity: (u32, u32),
-    global_page: u32,
-    library: &mut ReaderStore,
-) where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let config = reader_layout::reader_layout_config(library.type_settings(), library.portrait());
-    let token = (
-        source_identity.0,
-        source_identity.1,
-        config,
-        library.custom_font_identity(),
-    );
-    if !library.chapter_start_ready || library.chapter_start_token != token {
-        if reader_cache_files::load_v2_toc_chapter_map(root, cache_key, source_identity, library) {
-            library.chapter_start_token = token;
-        } else {
-            return;
-        }
-    }
-    let current = library.current_chapter_for_page(global_page);
-    let needs_refresh =
-        current != library.current_chapter() || library.current_chapter_title().is_empty();
-    if needs_refresh
-        && !reader_cache_files::read_v2_toc_chapter_title(
-            root,
-            cache_key,
-            source_identity,
-            current,
-            library,
-        )
-    {
-        // No title on the card (or a short read): still advance the index so
-        // the cursor tracks; the colophon falls back to a numeral.
-        library.set_current_chapter(current, "", source_identity);
     }
 }
 
@@ -1356,6 +1262,62 @@ enum ReaderCacheError {
     /// was cleared because a truncated index serves no load path.
     IndexWrite,
     EntryNameTooLong,
+}
+
+/// Print what a completed publish did.
+///
+/// Reporting only: every argument is already-decided fact, including the cover,
+/// which the publish adopted into the store on its way through. This function
+/// deliberately touches neither the card nor the store — an earlier version
+/// loaded the cover here, which quietly made a *reporting* helper responsible
+/// for publication state, and the one publish path that does not report (the
+/// progressive first open) lost its cover as a result.
+#[expect(clippy::too_many_arguments)] // Telemetry glue: every argument is one field of one line.
+fn report_publish(
+    cache_key: &str,
+    label: &str,
+    open_started: Instant,
+    spine_started: Instant,
+    io_start: crate::sd_session::sd_stats::Snapshot,
+    section_write_micros: u64,
+    cover: Option<files::CoverLoadResult>,
+    sections: usize,
+    total_pages: u32,
+    book_partial: bool,
+) {
+    esp_println::println!("epub: stage PublishLoaded");
+    esp_println::println!(
+        "epub: {label} book cache ready after {} ms (total={} sections={} partial={} cover={:?} key {})",
+        open_started.elapsed().as_millis(),
+        total_pages,
+        sections,
+        book_partial,
+        cover,
+        cache_key
+    );
+    let io = crate::sd_session::sd_stats::snapshot().since(io_start);
+    esp_println::println!(
+        "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={}",
+        open_started.elapsed().as_millis(),
+        spine_started.elapsed().as_millis(),
+        section_write_micros / 1000,
+        sections,
+        total_pages,
+        io.read_calls,
+        io.read_blocks,
+        io.write_calls,
+        io.write_blocks,
+        cache_key
+    );
+}
+
+impl From<publish::PublishError> for ReaderCacheError {
+    fn from(error: publish::PublishError) -> Self {
+        match error {
+            publish::PublishError::IndexWrite => Self::IndexWrite,
+            publish::PublishError::SectionRead => Self::SectionRead,
+        }
+    }
 }
 
 impl From<proto::epub::ZipError> for ReaderCacheError {
@@ -1578,7 +1540,7 @@ where
         let toc_bytes = toc_record_count
             .saturating_mul(proto::cache::TOC_CHAPTER_RECORD_BYTES)
             .min(scratch.xhtml.len());
-        let wrote_toc = reader_cache_files::write_v2_toc_file(
+        let wrote_toc = files::write_v2_toc_file(
             root,
             cache_key,
             source_identity,
@@ -1655,7 +1617,7 @@ where
 
     // The whole cache tree is created here, once; the capture and the
     // sections walk below only open what already exists.
-    let cache_dirs_ok = reader_cache_files::ensure_v2_cache_dirs(root, cache_key).is_ok();
+    let cache_dirs_ok = files::ensure_v2_cache_dirs(root, cache_key).is_ok();
     if !cache_dirs_ok {
         esp_println::println!("cache: v2 ensure dirs failed key={}", cache_key);
     }
@@ -1665,7 +1627,7 @@ where
     // never fails the build. Its directory handle outlives the whole walk
     // because the capture's file handle borrows it.
     let content_dir = if cache_dirs_ok {
-        reader_cache_files::open_v2_book_dir(root, cache_key)
+        files::open_v2_book_dir(root, cache_key)
     } else {
         None
     };
@@ -1683,18 +1645,14 @@ where
     // stream it would trust. Once the capture has failed it stays failed —
     // resuming an append past a hole would corrupt the record framing.
     let mut content = match resume {
-        None => reader_cache_files::ContentCapture::begin(
-            content_dir.as_ref(),
-            source_identity,
-            stage_buf,
-        ),
-        Some(state) if state.content_ok => reader_cache_files::ContentCapture::resume(
+        None => files::ContentCapture::begin(content_dir.as_ref(), source_identity, stage_buf),
+        Some(state) if state.content_ok => files::ContentCapture::resume(
             content_dir.as_ref(),
             source_identity,
             stage_buf,
             state.content_spine_count,
         ),
-        Some(_) => reader_cache_files::ContentCapture::disabled(stage_buf, source_identity),
+        Some(_) => files::ContentCapture::disabled(stage_buf, source_identity),
     };
 
     // The SECTIONS directory stays open for the whole spine walk; every
@@ -1702,7 +1660,7 @@ where
     //
     // `Ok(Some(next_spine))` means the walk suspended and owes a continuation
     // from that spine item; `Ok(None)` means it reached the end of the book.
-    let walk = reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
+    let walk = files::with_v2_sections_dir(root, cache_key, |sections_dir| {
         for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
             *index >= start_spine_index
                 && *index >= resume_spine_index
@@ -1854,37 +1812,53 @@ where
             published_sections: 0,
         };
         return if resume.is_none() {
-            publish_first_open(
+            publish::publish_first_open(
                 root,
                 cache_key,
                 source_identity,
                 requested_global_page,
-                open_started,
-                spine_started,
-                io_start,
-                section_write_micros,
                 library,
                 &sections[..section_count],
                 total_pages,
                 next_spine,
             )
+            .map_err(ReaderCacheError::from)
+            .inspect(|()| {
+                esp_println::println!(
+                    "bench: storage_first_page elapsed_ms={} pages={} sections={} key={}",
+                    open_started.elapsed().as_millis(),
+                    total_pages,
+                    section_count,
+                    cache_key
+                );
+            })
             .map(|()| {
                 state.published_sections = state.section_count;
                 Some(state)
             })
         } else {
-            extend_background_index(
+            publish::extend_background_index(
                 root,
                 cache_key,
                 source_identity,
                 requested_global_page,
-                open_started,
                 next_spine,
                 resume.map_or(0, |previous| previous.published_sections),
                 library,
                 &sections[..section_count],
                 total_pages,
             )
+            .map_err(ReaderCacheError::from)
+            .inspect(|published| {
+                esp_println::println!(
+                    "epub: build continue next_spine={} sections={} published={} pages={} step_ms={}",
+                    next_spine,
+                    section_count,
+                    published,
+                    total_pages,
+                    open_started.elapsed().as_millis(),
+                );
+            })
             .map(|published| {
                 state.published_sections = published;
                 Some(state)
@@ -1907,16 +1881,11 @@ where
         // actually on, not the one the original open asked for — that page is
         // long since rendered and the reader has moved.
         let continuing = resume.is_some();
-        let published = publish_book_cache(
+        let published = publish::publish_book_cache(
             root,
             cache_key,
             source_identity,
             requested_global_page,
-            if continuing { "final" } else { "full" },
-            open_started,
-            spine_started,
-            io_start,
-            section_write_micros,
             library,
             &sections[..section_count],
             total_pages,
@@ -1925,24 +1894,40 @@ where
             // for more; any remaining `book_partial` is permanent.
             0,
         );
+        if published.outcome == publish::BookPublishOutcome::Ready {
+            report_publish(
+                cache_key,
+                if continuing { "final" } else { "full" },
+                open_started,
+                spine_started,
+                io_start,
+                section_write_micros,
+                published.cover,
+                section_count,
+                total_pages,
+                book_partial,
+            );
+        }
         if continuing {
             // The last step of a background walk publishes under a reader who
             // is already inside this book, on a page served from these very
             // files. That makes both failures mean something different here
             // than they do on an open, so they get their own tail rather than
             // the one below, which is written for a book nobody is holding.
-            return finish_background_walk(
+            return publish::finish_background_walk(
                 root,
                 cache_key,
                 source_identity,
                 requested_global_page,
-                published,
+                published.outcome,
                 library,
-            );
+            )
+            .map(|()| None)
+            .map_err(ReaderCacheError::from);
         }
-        match published {
-            BookPublishOutcome::Ready => Ok(None),
-            BookPublishOutcome::SectionReadFailed => {
+        match published.outcome {
+            publish::BookPublishOutcome::Ready => Ok(None),
+            publish::BookPublishOutcome::SectionReadFailed => {
                 // The build and index write succeeded; only the requested
                 // section failed to read back. Keep the freshly written
                 // cache — the next open retries the fast path against it —
@@ -1950,7 +1935,7 @@ where
                 // diagnosis.
                 Err(ReaderCacheError::SectionRead)
             }
-            BookPublishOutcome::IndexWriteFailed => {
+            publish::BookPublishOutcome::IndexWriteFailed => {
                 // The index write failed partway, so BOOK.BIN may be a
                 // truncated file that serves neither the fast path nor
                 // replay (the labels load bails on it). Clear the debris —
@@ -1958,7 +1943,7 @@ where
                 // the next open rebuilds from the EPUB cleanly. Safe only
                 // because this arm is the *open* path: the book never became
                 // readable, so nothing is holding these files.
-                let _ = reader_cache_files::empty_cache_dir(root, cache_key);
+                let _ = files::empty_cache_dir(root, cache_key);
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -1967,412 +1952,6 @@ where
     } else {
         Err(ReaderCacheError::MissingSpine)
     }
-}
-
-/// Publish the provisional book a suspended first open has built: the reader
-/// starts here, on an index that only spans the sections written so far.
-///
-/// `partial` is forced true, which is the honest description of what is on the
-/// card — and what makes an interrupted build safe, because a later open of a
-/// page beyond this frontier misses the index and rebuilds rather than running
-/// off the end of it.
-#[expect(clippy::too_many_arguments)] // The publish tail's borrow set, same shape as `publish_book_cache` itself
-fn publish_first_open<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
-    source_identity: (u32, u32),
-    requested_global_page: u32,
-    open_started: Instant,
-    spine_started: Instant,
-    io_start: crate::sd_session::sd_stats::Snapshot,
-    section_write_micros: u64,
-    library: &mut ReaderStore,
-    sections_slice: &[BookV2SectionRecord],
-    total_pages: u32,
-    next_spine: u16,
-) -> Result<(), ReaderCacheError>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let published = publish_book_cache(
-        root,
-        cache_key,
-        source_identity,
-        requested_global_page,
-        "first",
-        open_started,
-        spine_started,
-        io_start,
-        section_write_micros,
-        library,
-        sections_slice,
-        total_pages,
-        true,
-        // The cursor is the whole reason this index is safe to publish: it is
-        // what a later open reads to tell "still being built" from "this is
-        // all there is", so an abandoned build rebuilds instead of capping the
-        // book at whatever it reached.
-        next_spine,
-    );
-    match published {
-        BookPublishOutcome::Ready => {
-            esp_println::println!(
-                "bench: storage_first_page elapsed_ms={} pages={} sections={} key={}",
-                open_started.elapsed().as_millis(),
-                total_pages,
-                sections_slice.len(),
-                cache_key
-            );
-            Ok(())
-        }
-        // Both failures are the completed build's, verbatim: a provisional
-        // publish writes the same BOOK.BIN through the same path, so a
-        // truncated one is exactly as unusable and gets the same cleanup.
-        BookPublishOutcome::SectionReadFailed => Err(ReaderCacheError::SectionRead),
-        BookPublishOutcome::IndexWriteFailed => {
-            let _ = reader_cache_files::empty_cache_dir(root, cache_key);
-            Err(ReaderCacheError::IndexWrite)
-        }
-    }
-}
-
-/// Put the page the reader is looking at back into the single text arena a
-/// build step borrowed, and report whether it landed.
-///
-/// Every exit from a background step runs this, successes and failures alike.
-/// The step drives `LibraryBlockSink` through the same arena the reading view
-/// renders from, so between the sink's last write and this call the arena holds
-/// the *builder's* last section, not the reader's page. Nothing has awaited in
-/// that window, so no render has seen it — but the loop this returns to renders,
-/// and a render does not necessarily load a section first.
-///
-/// Clamped against the store, not against any freshly built total: a step whose
-/// index write was refused leaves the store on its previous, shorter index, and
-/// asking for a page past it would miss for a second reason.
-///
-/// A `false` marks the window unusable rather than leaving a half-loaded one
-/// that `covers_global_page` would accept. Every page turn issues an extend
-/// (`app_core::storage_loop`'s `storage_command_for_transition`), and a window
-/// that admits nothing is what makes that extend reload rather than answer from
-/// RAM.
-fn restore_reader_page<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
-    source_identity: (u32, u32),
-    reader_page: u32,
-    library: &mut ReaderStore,
-) -> bool
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let ceiling = library.advertised_page_count().saturating_sub(1);
-    let restored = matches!(
-        reader_cache_files::load_v2_section_by_global_page(
-            root,
-            cache_key,
-            source_identity,
-            reader_page.min(ceiling),
-            library,
-        ),
-        CacheLoadResult::Hit { .. }
-    );
-    if !restored {
-        library.set_section_partial(true);
-        esp_println::println!("epub: reader page {} could not be restored", reader_page);
-    }
-    restored
-}
-
-/// The tail of the step that finishes a background walk.
-///
-/// Separate from the open path's tail because the two failures mean different
-/// things once the book is already open. On an open, a refused index write
-/// leaves debris nobody is using and clearing it is the tidy answer. Here the
-/// reader is *reading* those section files, and deleting them would take their
-/// book away mid-page to save the next open a rebuild it can perfectly well
-/// discover for itself — the truncated `BOOK.BIN` is that signal, and CONT.BIN
-/// (complete by now) makes the rebuild a fast replay rather than a full one.
-fn finish_background_walk<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
-    source_identity: (u32, u32),
-    reader_page: u32,
-    published: BookPublishOutcome,
-    library: &mut ReaderStore,
-) -> Result<Option<BookBuildResume>, ReaderCacheError>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    // A clean publish already loaded the reader's page on its way through.
-    if published == BookPublishOutcome::Ready {
-        return Ok(None);
-    }
-    let restored = restore_reader_page(root, cache_key, source_identity, reader_page, library);
-    match published {
-        // The index never landed, so the book is not finished however the page
-        // read went. Report it and let the next open rebuild.
-        BookPublishOutcome::IndexWriteFailed => {
-            esp_println::println!("epub: final background publish index write failed");
-            Err(ReaderCacheError::IndexWrite)
-        }
-        // A section read that failed once and succeeded on the retry. The build
-        // itself is *done*: `publish_book_cache` had already written the
-        // complete index and adopted it into the store before that read, so the
-        // only casualty was the refresh it does afterwards. Reporting this as
-        // abandoned would throw away a finished book — no continuation left to
-        // announce the final page count, and a reader stuck against the old
-        // frontier until they reopen. Finish the job instead.
-        _ if restored => {
-            reader_layout::rebuild_toc_page_targets(library);
-            let page = reader_page.min(library.advertised_page_count().saturating_sub(1));
-            refresh_chapter_tracking(root, cache_key, source_identity, page, library);
-            esp_println::println!(
-                "epub: final background publish section read recovered on retry (pages={})",
-                library.advertised_page_count()
-            );
-            Ok(None)
-        }
-        _ => {
-            esp_println::println!("epub: final background publish section read failed");
-            Err(ReaderCacheError::SectionRead)
-        }
-    }
-}
-
-/// Adopt what a background step just built, then put the reader's page back in
-/// the text arena the step borrowed.
-///
-/// Returns the section count now standing in the on-disk index, which the next
-/// step carries forward to decide when the file is due another rewrite.
-///
-/// The resident index is adopted on *every* step; the file is not. The reader's
-/// page turns and `background_announce`'s frontier both read the resident copy,
-/// so it has to track the walk exactly. The file is only ever read by the next
-/// open, which rebuilds anyway while `resume_spine` is set — so rewriting it per
-/// slice would spend quadratic index traffic on a frontier nobody reads. See
-/// [`INDEX_PUBLISH_SECTIONS`].
-///
-/// An `Err` is how the caller learns the difference between a walk that ended
-/// and a walk that broke. Both stop, but only the first may be announced: an
-/// announcement forces a full repaint, and repainting over an arena this
-/// function could not restore would draw the builder's last section under a
-/// reader who never left their page.
-#[expect(clippy::too_many_arguments)] // Same borrow set as the publish tail it stands beside
-fn extend_background_index<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
-    source_identity: (u32, u32),
-    reader_page: u32,
-    step_started: Instant,
-    next_spine: u16,
-    published_sections: u16,
-    library: &mut ReaderStore,
-    sections_slice: &[BookV2SectionRecord],
-    total_pages: u32,
-) -> Result<u16, ReaderCacheError>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let grown = sections_slice
-        .len()
-        .saturating_sub(published_sections as usize);
-    let mut published_now = published_sections;
-    // The cursor rides in the index it describes, so a build that never comes
-    // back is recognisable as one on the next open instead of masquerading as
-    // a short book.
-    let wrote = if grown >= INDEX_PUBLISH_SECTIONS {
-        let ok = reader_cache_files::write_v2_book_index(
-            root,
-            cache_key,
-            source_identity,
-            total_pages,
-            sections_slice,
-            library,
-            true,
-            next_spine,
-        );
-        if ok {
-            published_now = sections_slice.len().min(u16::MAX as usize) as u16;
-        } else {
-            // Deliberately not `empty_cache_dir`, unlike the publish tails: the
-            // reader is reading out of this cache right now, and deleting it
-            // would take the section files out from under them. The truncated
-            // BOOK.BIN only costs the *next* open a rebuild, which it detects
-            // for itself.
-            esp_println::println!(
-                "epub: build continue index write failed, stopping background build"
-            );
-        }
-        ok
-    } else {
-        true
-    };
-
-    // Always, write or no write: this is the index the reader turns pages
-    // against, and the one the frontier announcement is measured from.
-    library.set_book_index(total_pages, true, sections_slice);
-    // Re-derive the chapter start pages over the grown index: a pure recompute
-    // against the resident TOC, no card reads. Without it the Chapters overview
-    // would show zeroes for every chapter past the frontier until the walk
-    // finished. The *current* chapter is deliberately not refreshed — that reads
-    // TOC.BIN, and the reader has not moved.
-    reader_layout::rebuild_toc_page_targets(library);
-
-    let restored = restore_reader_page(root, cache_key, source_identity, reader_page, library);
-    // Restore first, then report: the reader's page matters more than which
-    // failure gets named, and the index write is the earlier one.
-    if !wrote {
-        return Err(ReaderCacheError::IndexWrite);
-    }
-    if !restored {
-        return Err(ReaderCacheError::SectionRead);
-    }
-    esp_println::println!(
-        "epub: build continue next_spine={} sections={} published={} pages={} step_ms={}",
-        next_spine,
-        sections_slice.len(),
-        published_now,
-        total_pages,
-        step_started.elapsed().as_millis(),
-    );
-    Ok(published_now)
-}
-
-/// How the publish tail ended. The two failures need different cleanup:
-/// a failed index write leaves a truncated BOOK.BIN behind (created or
-/// truncated before the body writes), while a section read-back miss
-/// leaves a fully written, valid cache worth keeping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BookPublishOutcome {
-    Ready,
-    IndexWriteFailed,
-    SectionReadFailed,
-}
-
-/// The shared publish tail of a section-cache build: write BOOK.BIN, load
-/// the requested section, refresh chapter tracking and the cover, and print
-/// the ready/bench lines. Used by the full EPUB build (`label` "full") and
-/// the CONT.BIN replay path (`label` "replay").
-#[expect(clippy::too_many_arguments)] // Intentionally retained wide signature to pass borrow-checked references and telemetry stats directly without struct wrapping
-fn publish_book_cache<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
-    source_identity: (u32, u32),
-    requested_global_page: u32,
-    label: &str,
-    open_started: Instant,
-    spine_started: Instant,
-    io_start: crate::sd_session::sd_stats::Snapshot,
-    section_write_micros: u64,
-    library: &mut ReaderStore,
-    sections_slice: &[BookV2SectionRecord],
-    total_pages: u32,
-    book_partial: bool,
-    // Non-zero only for the provisional publish of a suspended walk. A
-    // completed book stamps `0`, which is what tells the next open that its
-    // missing pages — if any — are missing for good and no rebuild would find
-    // them.
-    resume_spine: u16,
-) -> BookPublishOutcome
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let wrote_index = reader_cache_files::write_v2_book_index(
-        root,
-        cache_key,
-        source_identity,
-        total_pages,
-        sections_slice,
-        library,
-        book_partial,
-        resume_spine,
-    );
-    if !wrote_index {
-        return BookPublishOutcome::IndexWriteFailed;
-    }
-    library.set_book_index(total_pages, book_partial, sections_slice);
-    let hit = matches!(
-        reader_cache_files::load_v2_section_by_global_page(
-            root,
-            cache_key,
-            source_identity,
-            requested_global_page.min(total_pages.saturating_sub(1)),
-            library,
-        ),
-        CacheLoadResult::Hit { .. }
-    );
-    if !hit {
-        return BookPublishOutcome::SectionReadFailed;
-    }
-    reader_layout::rebuild_toc_page_targets(library);
-    refresh_chapter_tracking(
-        root,
-        cache_key,
-        source_identity,
-        requested_global_page.min(total_pages.saturating_sub(1)),
-        library,
-    );
-    let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
-    esp_println::println!("epub: stage PublishLoaded");
-    esp_println::println!(
-        "epub: {label} book cache ready after {} ms (total={} sections={} partial={} cover={:?} key {})",
-        open_started.elapsed().as_millis(),
-        total_pages,
-        sections_slice.len(),
-        book_partial,
-        cover,
-        cache_key
-    );
-    let io = crate::sd_session::sd_stats::snapshot().since(io_start);
-    esp_println::println!(
-        "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={}",
-        open_started.elapsed().as_millis(),
-        spine_started.elapsed().as_millis(),
-        section_write_micros / 1000,
-        sections_slice.len(),
-        total_pages,
-        io.read_calls,
-        io.read_blocks,
-        io.write_calls,
-        io.write_blocks,
-        cache_key
-    );
-    BookPublishOutcome::Ready
 }
 
 /// Forwards `push_block` to the build sink while recording the exact call
@@ -2395,8 +1974,7 @@ struct CapturingBlockSink<
     T: TimeSource,
 {
     inner: &'w mut S,
-    capture:
-        &'w mut reader_cache_files::ContentCapture<'v, 's, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    capture: &'w mut files::ContentCapture<'v, 's, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     spine_index: u16,
 }
 
@@ -2468,12 +2046,12 @@ where
     let mut book_partial = false;
     let mut section_write_micros: u64 = 0;
 
-    let replayed = reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
+    let replayed = files::with_v2_sections_dir(root, cache_key, |sections_dir| {
         // One open serves both the header validation and the record
         // stream; the handle stays live for the whole replay.
-        reader_cache_files::with_v2_content_file(root, cache_key, Mode::ReadOnly, |file| {
+        files::with_v2_content_file(root, cache_key, Mode::ReadOnly, |file| {
             let mut header_bytes = [0u8; CONTENT_HEADER_BYTES];
-            if reader_cache_files::read_exact_file(file, &mut header_bytes).is_err() {
+            if files::read_exact_file(file, &mut header_bytes).is_err() {
                 return Err(ReplayFail::Corrupt);
             }
             let Ok(header) = proto::cache::decode_content_header(&header_bytes) else {
@@ -2491,12 +2069,7 @@ where
             // copy are settings-independent; carry them into the rewritten
             // index. Bail to the full build when they can't be recovered —
             // it re-parses them.
-            if !reader_cache_files::load_v2_book_labels_and_toc(
-                root,
-                cache_key,
-                source_identity,
-                library,
-            ) {
+            if !files::load_v2_book_labels_and_toc(root, cache_key, source_identity, library) {
                 return Err(ReplayFail::Bail);
             }
             library.clear_cover();
@@ -2530,26 +2103,21 @@ where
         Err(ReplayFail::Bail) => return false,
         Err(ReplayFail::Corrupt) => {
             esp_println::println!("epub: content replay failed, falling back to full build");
-            reader_cache_files::delete_v2_content_file(root, cache_key);
+            files::delete_v2_content_file(root, cache_key);
             return false;
         }
         Ok(()) if section_count == 0 || total_pages == 0 => {
             esp_println::println!("epub: content replay failed, falling back to full build");
-            reader_cache_files::delete_v2_content_file(root, cache_key);
+            files::delete_v2_content_file(root, cache_key);
             return false;
         }
         Ok(()) => {}
     }
-    let published = publish_book_cache(
+    let published = publish::publish_book_cache(
         root,
         cache_key,
         source_identity,
         requested_global_page,
-        "replay",
-        open_started,
-        spine_started,
-        io_start,
-        section_write_micros,
         library,
         &sections[..section_count],
         total_pages,
@@ -2557,12 +2125,26 @@ where
         // Replay is never progressive; it always publishes a whole book.
         0,
     );
-    if published != BookPublishOutcome::Ready {
+    if published.outcome == publish::BookPublishOutcome::Ready {
+        report_publish(
+            cache_key,
+            "replay",
+            open_started,
+            spine_started,
+            io_start,
+            section_write_micros,
+            published.cover,
+            section_count,
+            total_pages,
+            book_partial,
+        );
+    }
+    if published.outcome != publish::BookPublishOutcome::Ready {
         // Either failure leaves the replay's cache state unusable (a
         // truncated BOOK.BIN or an unreadable section); the full build
         // rewrites everything, so clear it all either way.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        let _ = reader_cache_files::empty_cache_dir(root, cache_key);
+        let _ = files::empty_cache_dir(root, cache_key);
         return false;
     }
     true
@@ -3215,7 +2797,7 @@ where
         let section_id = (*self.section_count).min(u16::MAX as usize) as u16;
         let write_started = Instant::now();
         let wrote = match self.sections_dir {
-            Some(sections) => reader_cache_files::write_v2_section_cache_in(
+            Some(sections) => files::write_v2_section_cache_in(
                 sections,
                 self.source_identity,
                 section_id,
@@ -3245,7 +2827,7 @@ where
                 // Full rebuild on the carry path: the carried blocks were
                 // rebased, so re-derive the page records and adopt the
                 // walk's cursor for the appends that follow.
-                let (cursor, overflowed) = reader_layout::rebuild_page_index(self.library);
+                let (cursor, overflowed) = layout::rebuild_page_index(self.library);
                 self.page_cursor = cursor;
                 self.page_overflowed = overflowed;
             }
@@ -3379,7 +2961,7 @@ fn push_styled_preview_fragment<
     let indent = if matches!(role, TextRole::Body)
         && matches!(align, TextAlign::Left | TextAlign::Justify)
     {
-        reader_layout::paragraph_indent(sink.library.type_settings().size)
+        layout::paragraph_indent(sink.library.type_settings().size)
     } else {
         0
     };
@@ -3433,9 +3015,7 @@ fn push_styled_preview_fragment<
                 .copied()
                 .unwrap_or(true);
         let x_eff = if opens_paragraph { x + indent } else { x };
-        if !line_was_empty
-            && sink.line_ink_width() + x_eff + reader_layout::READER_WRAP_SAFETY > max_x
-        {
+        if !line_was_empty && sink.line_ink_width() + x_eff + layout::READER_WRAP_SAFETY > max_x {
             sink.line.truncate(kept_len);
             sink.line_ink = kept_ink;
             flush_styled_preview_line(sink, false);
@@ -3487,9 +3067,8 @@ fn append_styled_word<const N: usize>(
 }
 
 fn append_style_marker<const N: usize>(line: &mut String<N>, style: FontStyle) -> Result<(), ()> {
-    line.push(reader_layout::STYLE_MARKER).map_err(|_| ())?;
-    line.push(reader_layout::style_marker_code(style))
-        .map_err(|_| ())
+    line.push(layout::STYLE_MARKER).map_err(|_| ())?;
+    line.push(layout::style_marker_code(style)).map_err(|_| ())
 }
 
 fn flush_styled_preview_line<
@@ -3523,7 +3102,7 @@ fn flush_styled_preview_line<
     let line = sink.line.clone();
     let role = sink.line_role;
     let align = sink.line_align;
-    let style = reader_layout::first_styled_line_style(line.as_str()).unwrap_or(FontStyle::Regular);
+    let style = layout::first_styled_line_style(line.as_str()).unwrap_or(FontStyle::Regular);
     if sink.generate_toc_from_headings
         && !sink.generated_toc_for_spine
         && matches!(
@@ -3597,7 +3176,7 @@ fn push_plain_styled_text<const N: usize>(styled: &str, out: &mut String<N>) {
             skip_style_code = false;
             continue;
         }
-        if ch == reader_layout::STYLE_MARKER {
+        if ch == layout::STYLE_MARKER {
             skip_style_code = true;
             continue;
         }

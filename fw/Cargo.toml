@@ -14,7 +14,7 @@ workspace = true
 ota-selftest = []
 # Build for the Xteink X3 (792x528 UC8253 panel, BQ27220 battery gauge).
 # Off = Xteink X4, the default. See docs/plans/2026-07-06-x3-support-plan.md.
-device-x3 = ["display/device-x3"]
+device-x3 = ["display/device-x3", "reader-cache/device-x3"]
 # Compile a generated custom typeface into firmware. Requires
 # display/src/custom_generated.rs, produced by tools/font_pack_to_rust.py.
 builtin-custom-font = ["display/builtin-custom-font"]
@@ -26,6 +26,7 @@ ui = { path = "../ui" }
 proto = { path = "../proto" }
 hal-ext = { path = "../hal-ext" }
 upload-store = { path = "../upload-store" }
+reader-cache = { path = "../reader-cache", features = ["esp-log"] }
 
 embassy-executor  = "0.10.0"
 embassy-time      = "0.5.1"

@@ -4,32 +4,32 @@
 //! and page-body drawing live in [`ui::reading`] behind the
 //! `ReadingBlocks` trait so firmware and host tools render one way.
 
-use crate::reader_store::ReaderStore;
-pub(crate) use display::font::{style_marker_code, STYLE_MARKER};
+use crate::store::ReaderStore;
+pub use display::font::{style_marker_code, STYLE_MARKER};
 use proto::cache::PageRecord;
 use ui::reading::{apply_block_placement, page_record_at, paginate_block_pages, PageIndexCursor};
-pub(crate) use ui::reading::{
+pub use ui::reading::{
     first_styled_line_style, paragraph_indent, reader_layout_config, READER_WRAP_SAFETY,
 };
 
-pub(crate) struct ReaderPagePlan {
+pub struct ReaderPagePlan {
     page_count: u32,
     page: PageRecord,
 }
 
 impl ReaderPagePlan {
-    pub(crate) fn new(sd_library: &ReaderStore, requested_page: u32) -> Self {
+    pub fn new(sd_library: &ReaderStore, requested_page: u32) -> Self {
         let page_count = reader_page_count(sd_library);
         let requested_page = sd_library.local_page_for_global(requested_page.min(page_count - 1));
         let page = reader_page_at(sd_library, requested_page);
         Self { page_count, page }
     }
 
-    pub(crate) fn page_count(&self) -> u32 {
+    pub fn page_count(&self) -> u32 {
         self.page_count
     }
 
-    pub(crate) fn page(&self) -> PageRecord {
+    pub fn page(&self) -> PageRecord {
         self.page
     }
 }
@@ -57,7 +57,7 @@ pub(crate) fn reader_page_at(sd_library: &ReaderStore, page_index: usize) -> Pag
 /// path cannot drift. Returns the finished cursor plus whether the page
 /// records overflowed their capacity, so a builder can adopt them and keep
 /// appending incrementally (the carry path does exactly that).
-pub(crate) fn rebuild_page_index(library: &mut ReaderStore) -> (PageIndexCursor, bool) {
+pub fn rebuild_page_index(library: &mut ReaderStore) -> (PageIndexCursor, bool) {
     library.page_count = 0;
     let mut cursor = PageIndexCursor::start(library.page_box());
     let mut overflowed = false;
@@ -77,7 +77,7 @@ pub(crate) fn rebuild_page_index(library: &mut ReaderStore) -> (PageIndexCursor,
     (cursor, overflowed)
 }
 
-pub(crate) fn rebuild_toc_page_targets(library: &mut ReaderStore) {
+pub fn rebuild_toc_page_targets(library: &mut ReaderStore) {
     for toc_index in 0..library.toc_count {
         let spine_index = library.toc[toc_index].spine_index;
         if spine_index < 0 {
