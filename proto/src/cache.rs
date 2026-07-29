@@ -22,6 +22,14 @@ pub const CACHE_VERSION: u16 = 1;
 // Bumped 25 -> 26 when custom font identity joined v2 book/section headers.
 // A custom pack replacement can keep the same FontFamily::Custom setting while
 // changing metrics, so the cache key needs the pack hash too.
+//
+// NOT bumped for `BookV2Header::resume_spine`, deliberately: it took a field
+// every v26 writer filled with an explicit zero, and zero is exactly what the
+// reader must conclude about an index written before the field meant anything
+// ("no build is coming back for this"). Bumping would have thrown away every
+// cache on every card to add a value they already carry correctly. Only do the
+// same for a field whose old bytes are a *provably* fixed constant, and pin it
+// with a test the way `book_v2_header` does.
 pub const CACHE_V2_VERSION: u16 = 26;
 const CACHE_V2_COMPAT_VERSION: u16 = 26;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
@@ -464,6 +472,23 @@ pub struct BookV2Header {
     pub font_config: u16,
     pub custom_font_identity: u64,
     pub partial: bool,
+    /// The spine item a progressive build was going to walk next when it
+    /// published this index early, or `0` for an index nothing is still
+    /// building — complete, or partial for a reason no further walking would
+    /// fix (a spine clipped at `MAX_SPINE_ITEMS`, sections at capacity).
+    ///
+    /// `partial` alone cannot carry this. It says "pages are missing", not
+    /// "someone is still coming for them", and the difference decides whether
+    /// a reader who opens this cache is fenced in behind a page count nothing
+    /// will ever raise. A build abandoned by sleep or a reboot leaves exactly
+    /// that, and the reader cannot ask for the first missing page to provoke a
+    /// rebuild, because the page count is what the request is clamped to.
+    ///
+    /// Written into a field that has always been an explicit zero, so an index
+    /// from before this existed reads as `0` — "nothing is building it" — which
+    /// is both true and the safe answer. No version bump, no migration.
+    /// A real cursor is never `0`: it is the index *after* a walked item.
+    pub resume_spine: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -799,7 +824,7 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u16(out, 20, header.section_count);
     write_u16(out, 22, header.spine_count);
     write_u16(out, 24, header.toc_count);
-    write_u16(out, 26, 0);
+    write_u16(out, 26, header.resume_spine);
     write_u16(out, 28, header.viewport_width);
     write_u16(out, 30, header.viewport_height);
     write_u16(out, 32, header.font_config);
@@ -834,6 +859,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         viewport_height: read_u16(input, 30)?,
         font_config: read_u16(input, 32)?,
         custom_font_identity: read_u64(input, 48)?,
+        resume_spine: read_u16(input, 26)?,
     })
 }
 
@@ -1703,6 +1729,7 @@ mod tests {
             font_config: 1,
             custom_font_identity: 0x8877_6655_4433_2211,
             partial: true,
+            resume_spine: 31,
         };
         let section = BookV2SectionRecord {
             section: 1,
@@ -1735,6 +1762,68 @@ mod tests {
             decode_book_v2_header(&header_bytes),
             Err(CacheError::BadVersion)
         );
+    }
+
+    // `resume_spine` went into a field every previous writer left as an
+    // explicit zero, which is what lets it ship without a version bump. If it
+    // ever moves onto a byte an older build wrote something else into, an
+    // existing cache would decode as "a build is still coming for this" and
+    // rebuild a book that was already complete.
+    #[test]
+    fn a_book_index_written_before_resume_spine_existed_reads_as_unbuilt_by_nobody() {
+        let header = BookV2Header {
+            source_hash: 1,
+            source_size: 2,
+            total_pages: 3,
+            section_count: 1,
+            spine_count: 1,
+            toc_count: 0,
+            toc_text_bytes: 0,
+            title_text_bytes: 0,
+            author_text_bytes: 0,
+            viewport_width: 800,
+            viewport_height: 480,
+            font_config: 1,
+            custom_font_identity: 0,
+            partial: false,
+            resume_spine: 0,
+        };
+        let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
+        encode_book_v2_header(header, &mut bytes).expect("header encodes");
+        // The two bytes an older writer zero-filled.
+        assert_eq!(&bytes[26..28], &[0, 0]);
+        assert_eq!(decode_book_v2_header(&bytes).unwrap().resume_spine, 0);
+    }
+
+    // A suspended build's cursor is the item *after* one it walked, so zero is
+    // free to mean "nobody is building this". Guarding the encoding both ways
+    // keeps that reading honest.
+    #[test]
+    fn a_suspended_builds_cursor_survives_the_round_trip() {
+        let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
+        for cursor in [1u16, 42, u16::MAX] {
+            let header = BookV2Header {
+                source_hash: 1,
+                source_size: 2,
+                total_pages: 3,
+                section_count: 1,
+                spine_count: 1,
+                toc_count: 0,
+                toc_text_bytes: 0,
+                title_text_bytes: 0,
+                author_text_bytes: 0,
+                viewport_width: 800,
+                viewport_height: 480,
+                font_config: 1,
+                custom_font_identity: 0,
+                partial: true,
+                resume_spine: cursor,
+            };
+            encode_book_v2_header(header, &mut bytes).expect("header encodes");
+            let decoded = decode_book_v2_header(&bytes).expect("header decodes");
+            assert_eq!(decoded.resume_spine, cursor);
+            assert!(decoded.partial);
+        }
     }
 
     #[test]

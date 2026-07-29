@@ -409,6 +409,7 @@ has no EPUBs.
 /XTEINK/CACHE2/E<hash>/BOOK.BIN
 /XTEINK/CACHE2/E<hash>/TOC.BIN
 /XTEINK/CACHE2/E<hash>/COVER.BIN
+/XTEINK/CACHE2/E<hash>/CONT.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
 /XTEINK/CATALOG.BIN
@@ -423,6 +424,27 @@ author, and TOC titles. Section files hold a `SectionV2Header`, page records,
 block records, per-block paragraph flags, and the UTF-8 text blob of that
 section's pre-wrapped lines. `TOC.BIN` is a per-book chapter-list sidecar for
 the Chapters overview, distinct from the TOC records inside `BOOK.BIN`.
+`CONT.BIN` records the build's `push_block` stream — the settings-independent
+half of the work — so a type-settings or orientation change replays it into the
+same sink instead of re-reading and re-parsing the EPUB. It is purely an
+accelerator: its header only says `complete` once a whole book has been
+captured, and any read or decode failure deletes it and falls back to the EPUB.
+
+A cold build does not run to the end before the reader sees the book. It
+publishes as soon as the section holding the requested page is written, marking
+`BOOK.BIN` partial, and finishes the spine in slices from an idle branch of the
+display task's loop — so the first page arrives in about a second rather than
+after the whole walk, and every other task keeps getting scheduled meanwhile.
+Only the pages built so far are addressable until the walk finishes, and the
+index says so in two separate ways: `partial` means pages are missing, while
+`resume_spine` names the spine item a walk meant to come back for. The second is
+what keeps a build interrupted by sleep from capping a book forever — the reader
+is clamped to the advertised page count and so can never ask for the first
+missing page, so an index nobody is still building is refused on the next open
+and rebuilt (progressively again, so the first page still arrives quickly). The
+suspend, announce, and partial-index policies are host-tested in
+`app-core::storage_loop`, beside the open and sleep sequences.
+
 The active firmware state keeps only loaded book
 metadata, the full section index, the active section's page/block records and
 text bytes, and small ZIP/XML scratch buffers. Spine XHTML members of any size

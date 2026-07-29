@@ -204,6 +204,227 @@ impl SleepSequence {
     }
 }
 
+/// Which walk of an EPUB spine is running, and therefore where it may stop.
+///
+/// A cold build used to run the whole spine before the reader saw anything —
+/// 64 s on the measured 11.7 MB book. It does not have to: section files are
+/// written as the walk goes, so the book can be published the moment the
+/// requested page is covered and the rest finished in the background. That
+/// splits one walk into two kinds with different stopping rules, and this is
+/// the difference.
+///
+/// Stopping is only possible at a spine boundary. Suspending mid-item would
+/// mean persisting the XML tokenizer, the block parser, and the inflate window,
+/// which does not fit the RAM budget — so a step is always at least one spine
+/// item, and [`Self::Background`]'s budget decides how many more it batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildPhase {
+    /// The walk the reader is waiting on. It owes exactly one thing: the
+    /// section holding `requested_page`. Everything past that is the
+    /// background's problem.
+    FirstOpen { requested_page: u32 },
+    /// A background continuation. It owes nothing to any wait, so the only
+    /// question is how long the display task may stay inside it before a
+    /// queued render or page turn gets a turn.
+    Background { slice_ms: u64 },
+}
+
+impl BuildPhase {
+    /// Whether the walk should stop at the spine boundary it has just reached.
+    ///
+    /// `more_spine` is the whole reason this takes the walk's position rather
+    /// than just its counters: suspending with nothing left to build would
+    /// hand the caller a continuation that finds no work, publish the book
+    /// twice, and mark a complete cache partial.
+    pub const fn suspend_here(
+        &self,
+        total_pages: u32,
+        sections: usize,
+        elapsed_ms: u64,
+        more_spine: bool,
+    ) -> bool {
+        if !more_spine {
+            return false;
+        }
+        match *self {
+            // `>` not `>=`: pages are zero-based, so covering page N means
+            // having built N+1 of them.
+            Self::FirstOpen { requested_page } => sections > 0 && total_pages > requested_page,
+            Self::Background { slice_ms } => elapsed_ms >= slice_ms,
+        }
+    }
+
+    /// Whether to stop *before* walking the next spine item, given what that
+    /// item will probably cost.
+    ///
+    /// [`Self::suspend_here`] runs after an item and so cannot bound a step: it
+    /// passes under budget, the next item runs for seconds, and the step
+    /// overshoots. Measured on device, steps were min 423, **median 1997**, max
+    /// 3464 ms against a 400 ms budget, and a page turn cannot preempt one --
+    /// page turns during the background phase measured up to 3451 ms against a
+    /// <550 ms target. Looking at the item's size before committing to it is
+    /// what turns the budget into an actual bound.
+    ///
+    /// `walked_this_step` is what guarantees forward progress: a step always
+    /// takes at least one item, however large, or a book whose every chapter
+    /// exceeds the budget would never advance. So this bounds a step to roughly
+    /// the budget *plus one item*, and a single item larger than the budget
+    /// still has to run somewhere -- mid-item suspension would mean persisting
+    /// the XML tokenizer, block parser and inflate window, which does not fit
+    /// the RAM budget.
+    ///
+    /// Only [`Self::Background`] answers true. A first open must reach the page
+    /// it was asked for however long that takes; stopping short of it would
+    /// publish a book that cannot show the page the reader opened.
+    pub const fn suspend_before(
+        &self,
+        elapsed_ms: u64,
+        next_item_bytes: u32,
+        walked_this_step: usize,
+    ) -> bool {
+        if walked_this_step == 0 {
+            return false;
+        }
+        match *self {
+            Self::FirstOpen { .. } => false,
+            Self::Background { slice_ms } => {
+                elapsed_ms + estimated_item_ms(next_item_bytes) > slice_ms
+            }
+        }
+    }
+}
+
+/// Whether a book index that stops short of the whole book may be read from.
+///
+/// A progressive open publishes an index spanning only what it has built, and
+/// that is safe *while the walk that published it is still running* — the walk
+/// keeps raising the page count, and the reader is never fenced in for long.
+///
+/// It is not safe on its own. The reducer clamps the page to the advertised
+/// count, so the reader cannot ask for the first missing page; there is no
+/// input that provokes a rebuild. An index left behind by a build that sleep or
+/// a reboot ended would therefore cap the book *permanently*, and the truncation
+/// would look exactly like the book simply being that short. So an unfinished
+/// index with nobody building it is refused, and the open rebuilds — which is
+/// itself progressive, so the first page still arrives in about a second.
+///
+/// `unfinished` must mean "a walk stopped here intending to return", not merely
+/// "pages are missing": a book clipped by the spine cap or the section cap is
+/// partial forever, and rebuilding it on every open would buy nothing.
+pub const fn partial_index_is_usable(unfinished: bool, walk_is_live: bool) -> bool {
+    !unfinished || walk_is_live
+}
+
+/// Whether a background build step must re-announce the book's shape.
+///
+/// Announcing is not free. Every `LibraryEvent::Loaded` marks the whole screen
+/// dirty, so a step-by-step denominator would buy a panel refresh per section —
+/// on the measured book, one every ~640 ms for a minute. Silence is the default
+/// and the finish is what publishes the real total.
+///
+/// The exception is the reader who has caught up with the frontier. The
+/// reducer clamps the page to the advertised count, so at `advertised - 1` the
+/// next-page button does nothing at all: no state change, no render, no
+/// command. That is indistinguishable from a broken device, and it is the one
+/// case where the repaint is worth its cost.
+pub const fn background_announce(finished: bool, reader_page: u32, advertised_before: u32) -> bool {
+    finished || reader_page.saturating_add(1) >= advertised_before
+}
+
+/// Whether a background step that stopped early still owes an announcement.
+///
+/// A step can grow the book and *then* fail — a refused index write leaves the
+/// resident index longer than the one the app knows about. The walk is over
+/// either way, but those extra pages are built, on the card, and reachable; the
+/// only thing keeping the reader off them is a page count nobody updated. That
+/// is the same dead next-page button [`background_announce`] exists to prevent,
+/// so it gets the same answer, with two conditions rather than one.
+///
+/// Growth is required because this is not the finish: with nothing new to say,
+/// a repaint would cost a full panel refresh to redraw the same number. And the
+/// caller must have established that the store is coherent — a step that could
+/// not put the reader's page back may not be repainted on at any page count.
+pub const fn stopped_announce(
+    advertised_before: u32,
+    advertised_now: u32,
+    reader_page: u32,
+) -> bool {
+    advertised_now > advertised_before && background_announce(false, reader_page, advertised_before)
+}
+
+/// How long a spine item of `bytes` uncompressed XHTML takes to lay out.
+///
+/// Fitted to the 2026-07-28 X3 capture, where item cost tracked uncompressed
+/// size closely across the range that matters: 24,401 B took 1130 ms, 37,437 B
+/// took ~1530 ms, 47,601 B took 2282 ms and 58,245 B took 2832 ms -- about
+/// 20 bytes per millisecond. It only has to be good enough to tell "this will
+/// blow the slice" from "this will not", so a coarse linear fit is the right
+/// amount of model; being wrong costs one overlong step, not correctness.
+const LAYOUT_BYTES_PER_MS: u32 = 20;
+
+const fn estimated_item_ms(bytes: u32) -> u64 {
+    (bytes / LAYOUT_BYTES_PER_MS) as u64
+}
+
+/// How long the loop waits after a background step before it may claim the
+/// display task again.
+///
+/// A step ends and the branch that runs it is ready again immediately, so a
+/// single `yield_now` handed the app task one poll and no more. Measured on
+/// device: 0.2 ms between one step ending and the next beginning, while a page
+/// turn pressed 86 ms *earlier* had still not been reduced into a render -- the
+/// reader then waited out a whole extra 2912 ms step for a page that was
+/// already available. This is the window in which the app can turn a button
+/// press into a render, which the loop services ahead of the next slice.
+///
+/// Small enough to be noise against a slice: 50 ms on a 400 ms budget is 12%
+/// of build throughput in the worst case and nothing at all when the reader is
+/// idle, because the branch only re-arms after a step that actually ran.
+pub const BACKGROUND_SETTLE_MS: u64 = 50;
+
+/// The longest a background build waits between attempts at a step that never
+/// began.
+pub const BACKGROUND_RETRY_CEILING_MS: u64 = 30_000;
+
+/// How long to wait before re-attempting a step that never began, after
+/// `attempts` consecutive failures to begin.
+///
+/// The distinction this rests on is not how bad the error was but how much of
+/// the walk it consumed. A step can fail before touching a single record — the
+/// card refuses a session, the EPUB will not open — and everything the walk
+/// needs is then exactly as it was. Nothing is lost by coming back for it.
+///
+/// Coming back matters because nothing else will. A step like that builds no
+/// pages, so [`stopped_announce`] has nothing to say, and a reader who has
+/// already caught up with the frontier has no page turn that could provoke a
+/// rebuild: the reducer clamps Next to the page they are on, so no command is
+/// issued at all. Until they turn a page some other way, the walk is the only
+/// thing that can still raise their page count — so the walk is not given up
+/// on, however long the card stays away.
+///
+/// The backoff is what makes never giving up affordable. It is also what
+/// replaced a hard attempt cap: the cap only existed because the step branch
+/// was always ready and a kept walk would spin as fast as the loop came round.
+/// Waiting on a timer removes that pressure entirely, and an outage measured in
+/// minutes then costs two SD session attempts a minute on a device that is
+/// otherwise idle.
+pub const fn background_retry_delay_ms(attempts: u8) -> u64 {
+    // 250 ms, 1 s, 4 s, 16 s, then the ceiling. Quadrupling covers a card
+    // fault of any length in five steps without polling through a long one.
+    if attempts == 0 {
+        return 0;
+    }
+    if attempts >= 5 {
+        return BACKGROUND_RETRY_CEILING_MS;
+    }
+    let ms = 250_u64 << (2 * (attempts as u32 - 1));
+    if ms > BACKGROUND_RETRY_CEILING_MS {
+        BACKGROUND_RETRY_CEILING_MS
+    } else {
+        ms
+    }
+}
+
 /// What the book-open transaction wants next.
 ///
 /// The order is the design: the departing book's position is written while its
@@ -1153,6 +1374,187 @@ mod tests {
             loop_arm(&StorageCommand::ReceiveUpload, SyncSession::Idle),
             LoopArm::RefusedUpload
         );
+    }
+
+    const FIRST_OPEN_AT: fn(u32) -> BuildPhase =
+        |requested_page| BuildPhase::FirstOpen { requested_page };
+    const BACKGROUND: BuildPhase = BuildPhase::Background { slice_ms: 400 };
+
+    // Invariant: the walk the reader waits on stops as soon as it owes nothing.
+    #[test]
+    fn a_first_open_suspends_once_the_requested_page_is_covered() {
+        // Opening at the start: one section of pages is already enough.
+        assert!(FIRST_OPEN_AT(0).suspend_here(12, 1, 0, true));
+        // Opening deep: page 900 is not covered by 400 pages, and no amount of
+        // elapsed time makes it so — the page only exists once it is laid out.
+        assert!(!FIRST_OPEN_AT(900).suspend_here(400, 40, 60_000, true));
+        assert!(FIRST_OPEN_AT(900).suspend_here(901, 90, 0, true));
+    }
+
+    #[test]
+    fn a_first_open_with_no_pages_yet_keeps_walking() {
+        // A spine item that contributed no section (navigation, empty body)
+        // leaves the counters at zero; suspending there would publish a book
+        // with nothing in it.
+        assert!(!FIRST_OPEN_AT(0).suspend_here(0, 0, 0, true));
+    }
+
+    #[test]
+    fn a_background_step_suspends_on_its_slice_budget_alone() {
+        assert!(!BACKGROUND.suspend_here(1200, 100, 399, true));
+        assert!(BACKGROUND.suspend_here(1200, 100, 400, true));
+        // The page counters say nothing to a background step: it owes no page.
+        assert!(BACKGROUND.suspend_here(0, 0, 400, true));
+    }
+
+    // Regression: suspending at the end of the spine would hand the caller a
+    // continuation with no work, republish the book, and leave a complete
+    // cache flagged partial.
+    #[test]
+    fn neither_phase_suspends_with_no_spine_left() {
+        assert!(!FIRST_OPEN_AT(0).suspend_here(12, 1, 0, false));
+        assert!(!BACKGROUND.suspend_here(1200, 100, 60_000, false));
+    }
+
+    #[test]
+    fn a_complete_index_is_usable_with_or_without_a_walk() {
+        assert!(partial_index_is_usable(false, false));
+        assert!(partial_index_is_usable(false, true));
+    }
+
+    #[test]
+    fn an_unfinished_index_is_usable_while_its_own_walk_runs() {
+        // The common case during a progressive open: every section crossing
+        // arrives as an extend and must not restart the build under itself.
+        assert!(partial_index_is_usable(true, true));
+    }
+
+    // Invariant: a book is never left capped at a page count nothing will
+    // raise. This is the sleep/reboot case — the walk is gone, and the reducer
+    // clamps the reader to the advertised count, so no input can provoke the
+    // rebuild that would fix it.
+    #[test]
+    fn an_unfinished_index_nobody_is_building_is_refused() {
+        assert!(!partial_index_is_usable(true, false));
+    }
+
+    #[test]
+    fn a_finished_background_build_always_announces() {
+        assert!(background_announce(true, 0, 1200));
+    }
+
+    #[test]
+    fn a_reader_far_behind_the_frontier_is_not_repainted() {
+        // The cost of announcing is a full panel refresh, and this reader
+        // gains nothing from it: their next page is already built.
+        assert!(!background_announce(false, 3, 400));
+    }
+
+    // Invariant: a reader who has caught up with the frontier is told the book
+    // grew. The reducer clamps the page to the advertised count, so without
+    // this the next-page button silently does nothing.
+    #[test]
+    fn a_reader_at_the_frontier_is_told_the_book_grew() {
+        assert!(background_announce(false, 399, 400));
+        // One page short of the frontier still has somewhere to turn to.
+        assert!(!background_announce(false, 398, 400));
+    }
+
+    // Invariant: the same dead next-page button, reached the other way. The
+    // step grew the book to 460 pages and then broke; if the walk simply
+    // vanishes at 400, the reader is pinned below pages that exist and are
+    // readable, with no input that can dislodge them short of leaving the book.
+    #[test]
+    fn a_stopped_step_that_grew_the_book_still_frees_the_frontier() {
+        assert!(stopped_announce(400, 460, 399));
+    }
+
+    // A step that built nothing has nothing to announce — a same-count Loaded
+    // would spend a full panel refresh redrawing the same frontier. Which is
+    // why silence here is only correct if the walk itself is kept: see
+    // `a_step_that_never_began_is_kept_rather_than_announced` below.
+    // Invariant: a step always takes at least one item, however large. Without
+    // this a book whose every chapter exceeds the slice would never advance.
+    #[test]
+    fn a_step_always_walks_one_item_before_it_may_stop_short() {
+        assert!(!BACKGROUND.suspend_before(0, 5_000_000, 0));
+        assert!(!BACKGROUND.suspend_before(9_999, 5_000_000, 0));
+    }
+
+    // Invariant: the measured failure. Two small items leave the step under
+    // budget, then a 58 KB chapter -- ~2900 ms by the fitted rate -- would
+    // overshoot to 3300 ms with no way for a page turn to preempt it.
+    #[test]
+    fn a_chapter_that_would_blow_the_slice_waits_for_the_next_step() {
+        assert!(BACKGROUND.suspend_before(340, 58_245, 2));
+    }
+
+    #[test]
+    fn a_small_item_still_rides_the_current_step() {
+        // 606 B of front matter is ~30 ms; batching these is the whole point
+        // of a slice budget, since each suspend costs a zip and OPF re-parse.
+        assert!(!BACKGROUND.suspend_before(340, 606, 2));
+    }
+
+    // A first open must reach the page it was asked for. Stopping short would
+    // publish a book that cannot show the page the reader opened it on.
+    #[test]
+    fn a_first_open_never_stops_short_of_its_requested_page() {
+        let first = BuildPhase::FirstOpen { requested_page: 0 };
+        assert!(!first.suspend_before(10_000, 5_000_000, 9));
+    }
+
+    #[test]
+    fn a_stopped_step_that_built_nothing_stays_silent() {
+        assert!(!stopped_announce(400, 400, 399));
+    }
+
+    // Invariant: the reader pinned at the frontier is never left with both
+    // nothing announced and nothing running. Announcing is useless when no
+    // pages were built, so the walk is what has to survive — otherwise Next at
+    // the cap issues no command and nothing retries.
+    #[test]
+    fn a_step_that_never_began_is_kept_rather_than_announced() {
+        assert!(!stopped_announce(400, 400, 399));
+        assert!(background_retry_delay_ms(1) > 0);
+    }
+
+    #[test]
+    fn the_retry_backoff_quadruples_to_its_ceiling() {
+        assert_eq!(background_retry_delay_ms(1), 250);
+        assert_eq!(background_retry_delay_ms(2), 1_000);
+        assert_eq!(background_retry_delay_ms(3), 4_000);
+        assert_eq!(background_retry_delay_ms(4), 16_000);
+        assert_eq!(background_retry_delay_ms(5), BACKGROUND_RETRY_CEILING_MS);
+    }
+
+    // Invariant: the walk is never given up on, so the delay has to stay
+    // bounded and finite however long the card stays away. u8 saturation is
+    // reached after about a day of retrying.
+    #[test]
+    fn the_retry_backoff_never_runs_away() {
+        assert_eq!(
+            background_retry_delay_ms(u8::MAX),
+            BACKGROUND_RETRY_CEILING_MS
+        );
+        // A step that ran is not a retry and must not be made to wait.
+        assert_eq!(background_retry_delay_ms(0), 0);
+    }
+
+    #[test]
+    fn a_stopped_step_does_not_repaint_a_reader_mid_book() {
+        // Their next page was already built; the growth is theirs to discover
+        // by turning pages, not worth a refresh.
+        assert!(!stopped_announce(400, 460, 12));
+    }
+
+    #[test]
+    fn a_reader_past_a_shrinking_frontier_still_announces() {
+        // Not reachable today — the frontier only grows — but the comparison
+        // is a saturating one either way, so a page beyond the advertised
+        // count must not wrap into "far behind" and stay silent.
+        assert!(background_announce(false, 500, 400));
+        assert!(background_announce(false, u32::MAX, 400));
     }
 
     #[test]
