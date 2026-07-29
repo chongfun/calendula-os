@@ -164,13 +164,17 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
         // produces acknowledgements, but it is also what releases the app to
         // drain them, so standing down would be waiting on itself.
         //
-        // The fifth is the only one that is not waiting for anything: it is
-        // work this task already owes itself, so it comes last on purpose and
-        // runs a slice of a suspended book build whenever the four above have
-        // nothing. It yields before claiming the loop, which is what keeps a
-        // ready branch from starving the others — and what gives every other
-        // task a scheduling point between slices, where a single unsliced
-        // build used to hold the executor for a minute.
+        // The fifth is the only one nobody else is waiting on: it is work this
+        // task already owes itself, so it comes last on purpose and runs a
+        // slice of a suspended book build whenever the four above have nothing.
+        // It waits before claiming the loop, which is what keeps a ready branch
+        // from starving the others — and what gives every other task a
+        // scheduling point between slices, where a single unsliced build used
+        // to hold the executor for a minute. A yield was not enough of a wait:
+        // it hands the app task one poll, which does not cover receiving a
+        // button, reducing it and sending the render, so the loop would commit
+        // to another multi-second slice ahead of a page turn already pressed.
+        // See `background_build_step_due`.
         match select5(
             DISPLAY_COMMANDS.receive(),
             storage_command_while_free(),
