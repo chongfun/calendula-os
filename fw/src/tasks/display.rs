@@ -52,6 +52,8 @@ static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
     ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
 static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; MAX_BOOK_SECTIONS]> =
     ConstStaticCell::new([EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS]);
+static EPUB_ZIP_INFLATE: static_cell::StaticCell<proto::epub::ZipInflateScratch> =
+    static_cell::StaticCell::new();
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
@@ -1885,14 +1887,32 @@ fn close_out_departing_book(
 /// Kept out of line: first-call initialization moves a multi-KB scratch
 /// value into the static; that spike must not sit at the base of the EPUB
 /// open call chain's frame.
+///
+/// The spike is real and measured — 20,960 bytes, because
+/// `ZipInflateScratch::new()` still returns its 32 KB window by value and
+/// miniz_oxide offers no alloc-free way to build one in place. That is half
+/// the X3's 42,136-byte stack, so this frame is the largest in the binary and
+/// `#[inline(never)]` is what keeps it transient rather than resident under the
+/// EPUB build. `tools/check.sh stack-frames` is the guard on it.
+#[allow(unsafe_code)]
 #[inline(never)]
 fn ensure_epub_scratch<'a>(
     epub_scratch: &'a mut Option<&'static mut ReaderCacheScratch<'static>>,
 ) -> &'a mut ReaderCacheScratch<'static> {
     if epub_scratch.is_none() {
         esp_println::println!("storage: init epub scratch");
-        *epub_scratch = Some(EPUB_SCRATCH.init_with(|| {
-            ReaderCacheScratch::new(
+        let zip_inflate_uninit = EPUB_ZIP_INFLATE.uninit();
+        let zip_ptr = zip_inflate_uninit.as_mut_ptr();
+        // SAFETY: EPUB_ZIP_INFLATE is a 'static allocation initialized once on demand.
+        let zip_ref = unsafe {
+            zip_ptr.write(proto::epub::ZipInflateScratch::new());
+            &mut *zip_ptr
+        };
+        let scratch_uninit = EPUB_SCRATCH.uninit();
+        let scratch_ptr = scratch_uninit.as_mut_ptr();
+        // SAFETY: EPUB_SCRATCH is a 'static allocation initialized once on demand.
+        unsafe {
+            scratch_ptr.write(ReaderCacheScratch::new(
                 EPUB_TAIL.take(),
                 EPUB_HEADER.take(),
                 EPUB_NAME.take(),
@@ -1901,8 +1921,10 @@ fn ensure_epub_scratch<'a>(
                 EPUB_OPF.take(),
                 EPUB_XHTML.take(),
                 EPUB_BOOK_SECTIONS.take(),
-            )
-        }));
+                zip_ref,
+            ));
+            *epub_scratch = Some(&mut *scratch_ptr);
+        }
     }
     epub_scratch.as_deref_mut().unwrap()
 }

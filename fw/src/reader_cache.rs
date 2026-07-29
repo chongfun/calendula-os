@@ -143,16 +143,26 @@ pub(crate) struct ReaderCacheScratch<'a> {
     opf: &'a mut [u8; READER_OPF_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
     book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
-    zip_inflate: ZipInflateScratch,
+    /// Borrowed, not embedded, and that is load-bearing. `ZipInflateScratch` is
+    /// 43,280 bytes, of which 32 KB is the LZ77 window. Holding it by value made
+    /// this struct 43,340 bytes, and `ZipInflateScratch::new()` returns by value
+    /// — so initialising the static depended entirely on LLVM forwarding the
+    /// `sret` slot into `.bss` instead of building a copy on the stack. It did,
+    /// until a 28-byte field pushed the struct past whatever threshold that
+    /// decision hangs on; the copy reappeared, `ensure_epub_scratch` allocated
+    /// 53,744 bytes on a 42,136-byte stack, and the overflow wrote through
+    /// `.bss` into esp-hal's clock singleton. The next `Clocks::get()` unwrapped
+    /// a `None`. Behind a reference the window can never be a stack temporary of
+    /// this struct at all, so the cliff is gone rather than merely uphill.
+    zip_inflate: &'a mut ZipInflateScratch,
     /// The suspended progressive build that owns `book_sections`, if any.
     ///
     /// RAM (measured): 28 bytes, and the `Option` is free — `BookBuildResume`
     /// is 28 bytes on its own, so the three `bool`s give the discriminant a
-    /// niche to live in rather than costing a tag word. This whole struct is
-    /// 43,340 bytes and lives in `EPUB_SCRATCH`, a `StaticCell` in `.bss`, so
-    /// the cost is 0.06% of a static that is already there — nothing is
-    /// charged to the ~43 KB stack the build's deep frames run in, which is
-    /// the budget that is actually tight.
+    /// niche to live in rather than costing a tag word. This struct is 64 bytes
+    /// now that the inflate window is borrowed, and lives in `EPUB_SCRATCH`, a
+    /// `StaticCell` in `.bss` — so nothing is charged to the ~43 KB stack the
+    /// build's deep frames run in, which is the budget that is actually tight.
     ///
     /// Kept here rather than beside the loop's scheduling handle because the
     /// invariant is a colocation one: this is `Some` only while
@@ -223,6 +233,7 @@ impl<'a> ReaderCacheScratch<'a> {
         opf: &'a mut [u8; READER_OPF_SCRATCH],
         xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
         book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
+        zip_inflate: &'a mut ZipInflateScratch,
     ) -> Self {
         Self {
             tail,
@@ -233,7 +244,7 @@ impl<'a> ReaderCacheScratch<'a> {
             opf,
             xhtml,
             book_sections,
-            zip_inflate: ZipInflateScratch::new(),
+            zip_inflate,
             resume: None,
         }
     }
@@ -261,11 +272,10 @@ pub(crate) fn dismantle_scratch(
     let container_ptr = scratch.container.as_mut_ptr();
     let tail_ptr = scratch.tail.as_mut_ptr();
 
-    // The struct's own storage becomes a heap region, dead references,
-    // padding, and all. Nothing reads it as a struct afterwards.
+    // The zip inflate static allocation becomes the wifi heap region.
     let struct_region = RawRegion {
-        ptr: (scratch as *mut ReaderCacheScratch<'static>).cast::<u8>(),
-        len: core::mem::size_of::<ReaderCacheScratch<'static>>(),
+        ptr: (scratch.zip_inflate as *mut ZipInflateScratch).cast::<u8>(),
+        len: core::mem::size_of::<ZipInflateScratch>(),
     };
 
     // Safety: each pointer addresses a distinct 'static allocation whose
@@ -1432,7 +1442,7 @@ where
             opf: scratch.opf,
             xhtml: scratch.xhtml,
             book_sections: scratch.book_sections,
-            zip_inflate: &mut scratch.zip_inflate,
+            zip_inflate: &mut *scratch.zip_inflate,
         },
     );
     // The one place the suspended build is stored, so it can never be set for
