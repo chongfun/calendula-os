@@ -74,6 +74,9 @@ case "$COMMAND" in
         # Builds and checks one device at a time: both share a target dir, so
         # the second build overwrites the first binary. See tools/stack_frames.py
         # for what this catches and why the source diff never shows it.
+        echo "Running stack frame analyzer unit tests..."
+        python3 -m unittest tools/stack_frames.py
+
         echo "Checking firmware stack frames for X4..."
         tools/cargo.sh build -p fw --release
         python3 tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw

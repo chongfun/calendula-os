@@ -42,7 +42,20 @@ import sys
 # whether the call chain beneath it still fits.
 DEFAULT_BUDGET = 24 * 1024
 
-FUNC_RE = re.compile(r"^[0-9a-f]+\s+<(?P<name>.+)>:\s*$")
+# Functions whose stack adjustment cannot be bounded at compile time by a static
+# constant analyzer:
+# - `_pre_default_start_trap`: Boot/exception trap handler in `esp-riscv-rt`
+#   that sets `sp` absolutely using `auipc sp, ...`.
+# - `ppCalTkipMic`, `ppTxFragmentProc`: Pre-compiled Espressif Wi-Fi SDK blobs
+#   in `libpp.a` that use dynamic variable-length stack allocations (VLAs) at
+#   runtime.
+EXEMPT_UNRESOLVED = {
+    "_pre_default_start_trap",
+    "ppCalTkipMic",
+    "ppTxFragmentProc",
+}
+
+FUNC_RE = re.compile(r"^[0-9a-f]+\s+<(?P<name>[^.\s<][^<>]*)>:\s*$")
 INSN_RE = re.compile(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)+\s*(?P<mnem>\S+)\s*(?P<ops>.*)$")
 IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
 
@@ -67,7 +80,7 @@ def imm(token: str) -> int:
     return -value if neg else value
 
 
-def frame_size(instructions: list[tuple[str, list[str]]]) -> int:
+def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     """Peak bytes this function subtracts from `sp`.
 
     Tracks `sp` through the straight-line instruction stream, following the
@@ -77,6 +90,9 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int:
     peak. Branches are ignored -- a frame this tool cares about is allocated in
     the prologue, and a loop that grew `sp` without bound would be a different
     bug.
+
+    Returns `None` if an instruction adjusts `sp` using an untracked register,
+    failing closed rather than silently treating the adjustment as zero.
     """
     regs: dict[str, int] = {}
     cur = peak = 0
@@ -96,10 +112,7 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int:
                     delta = regs[ops[2]]
                     cur += delta if mnem == "sub" else -delta
                 else:
-                    print(
-                        f"warning: unresolved stack adjustment by register {ops[2]}",
-                        file=sys.stderr,
-                    )
+                    return None
             elif mnem == "mv" and len(ops) == 2:
                 if ops[1] in regs:
                     regs[ops[0]] = regs[ops[1]]
@@ -112,8 +125,8 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int:
     return peak
 
 
-def parse(disassembly: str) -> dict[str, int]:
-    frames: dict[str, int] = {}
+def parse(disassembly: str) -> dict[str, int | None]:
+    frames: dict[str, int | None] = {}
     name: str | None = None
     body: list[tuple[str, list[str]]] = []
     for line in disassembly.splitlines():
@@ -189,9 +202,24 @@ def main() -> int:
         print(f"error: no functions found in {args.binary}", file=sys.stderr)
         return 2
 
-    ranked = sorted(frames.items(), key=lambda kv: kv[1], reverse=True)
+    unresolved = [
+        name for name, size in frames.items() if size is None and name not in EXEMPT_UNRESOLVED
+    ]
+    if unresolved:
+        print(
+            f"\nerror: could not resolve stack adjustment for {len(unresolved)} function(s):\n"
+            + "\n".join(f"  {name}" for name in unresolved[:10])
+            + ("\n  ..." if len(unresolved) > 10 else "")
+            + "\nAn instruction modified sp with an untracked register. Fail closed to prevent\n"
+            "uncaught stack overflows on device.",
+            file=sys.stderr,
+        )
+        return 1
+
+    valid_frames: dict[str, int] = {k: v for k, v in frames.items() if v is not None}
+    ranked = sorted(valid_frames.items(), key=lambda kv: kv[1], reverse=True)
     label = f"stack region {region} B, " if region is not None else ""
-    print(f"  {label}budget {args.budget} B, {len(frames)} functions")
+    print(f"  {label}budget {args.budget} B, {len(valid_frames)} functions")
     for name, size in ranked[: args.top]:
         print(f"  {size:>8} B  {name}")
 
@@ -233,9 +261,9 @@ class TestStackFrames(unittest.TestCase):
         ]
         self.assertEqual(frame_size(insns), 64)
 
-    def test_untracked_register_handling(self) -> None:
+    def test_untracked_register_fails_closed(self) -> None:
         insns = [("sub", ["sp", "sp", "a5"])]
-        self.assertEqual(frame_size(insns), 0)
+        self.assertIsNone(frame_size(insns))
 
     def test_parse_multiple_functions(self) -> None:
         disasm = (
