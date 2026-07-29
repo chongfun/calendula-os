@@ -42,17 +42,20 @@ import sys
 # whether the call chain beneath it still fits.
 DEFAULT_BUDGET = 24 * 1024
 
-# Functions whose stack adjustment cannot be bounded at compile time by a static
-# constant analyzer:
-# - `_pre_default_start_trap`: Boot/exception trap handler in `esp-riscv-rt`
-#   that sets `sp` absolutely using `auipc sp, ...`.
+# Non-Rust assembly entry points and pre-compiled vendor SDK blobs whose stack
+# adjustment cannot be bounded as a constant by static analysis:
+# - `_abs_start`, `_pre_default_start_trap`, `swint_handler_trampoline`:
+#   Low-level boot and exception trap handlers in `esp-riscv-rt` that manipulate
+#   `sp` using CSRs or absolute address loads (`auipc`).
 # - `ppCalTkipMic`, `ppTxFragmentProc`: Pre-compiled Espressif Wi-Fi SDK blobs
 #   in `libpp.a` that use dynamic variable-length stack allocations (VLAs) at
 #   runtime.
 EXEMPT_UNRESOLVED = {
+    "_abs_start",
     "_pre_default_start_trap",
     "ppCalTkipMic",
     "ppTxFragmentProc",
+    "swint_handler_trampoline",
 }
 
 FUNC_RE = re.compile(r"^[0-9a-f]+\s+<(?P<name>[^.\s<][^<>]*)>:\s*$")
@@ -70,6 +73,12 @@ def find_objdump() -> str:
     return "llvm-objdump"
 
 
+def find_nm() -> str:
+    if os.environ.get("LLVM_NM"):
+        return os.environ["LLVM_NM"]
+    return find_objdump().replace("llvm-objdump", "llvm-nm")
+
+
 def imm(token: str) -> int:
     token = token.strip().rstrip(",")
     if not IMM_RE.match(token):
@@ -78,6 +87,28 @@ def imm(token: str) -> int:
     body = token[1:] if neg else token
     value = int(body, 16) if body.startswith("0x") else int(body)
     return -value if neg else value
+
+
+def parse_insn_line(line: str) -> tuple[str, list[str]] | None:
+    if ":" not in line:
+        return None
+    colon_idx = line.find(":")
+    addr_part = line[:colon_idx].strip()
+    if not addr_part.isalnum():
+        return None
+    rest = line[colon_idx + 1 :]
+    if "\t" in rest:
+        parts = [p.strip() for p in rest.split("\t") if p.strip()]
+        if len(parts) >= 2:
+            mnem = parts[1]
+            ops_str = parts[2] if len(parts) > 2 else ""
+            ops = [p.strip() for p in ops_str.split(",") if p.strip()]
+            return mnem, ops
+    insn = INSN_RE.match(line)
+    if insn:
+        ops = [part.strip() for part in insn.group("ops").split(",") if part.strip()]
+        return insn.group("mnem"), ops
+    return None
 
 
 def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
@@ -91,28 +122,40 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     the prologue, and a loop that grew `sp` without bound would be a different
     bug.
 
-    Returns `None` if an instruction adjusts `sp` using an untracked register,
-    failing closed rather than silently treating the adjustment as zero.
+    Returns `None` if any instruction writes to `sp` in a way that cannot be
+    resolved as a constant stack allocation, failing closed rather than
+    silently ignoring the stack modification.
     """
     regs: dict[str, int] = {}
     cur = peak = 0
     for mnem, ops in instructions:
+        if not ops:
+            continue
         try:
-            if mnem == "lui" and len(ops) == 2:
+            if ops[0] == "sp":
+                if mnem == "addi" and len(ops) == 3 and ops[1] == "sp":
+                    cur -= imm(ops[2])
+                elif mnem == "sub" and len(ops) == 3 and ops[1] == "sp":
+                    if ops[2] in regs:
+                        cur += regs[ops[2]]
+                    else:
+                        return None
+                elif mnem == "add" and len(ops) == 3 and ops[1] == "sp":
+                    if ops[2] in regs:
+                        cur -= regs[ops[2]]
+                    else:
+                        cur = max(0, cur)
+                else:
+                    # Any unmodeled instruction modifying sp (e.g. mv sp, t0, addi sp, s0, N)
+                    # cannot be bounded as a frame constant: fail closed.
+                    return None
+            elif mnem == "lui" and len(ops) == 2:
                 regs[ops[0]] = imm(ops[1]) << 12
             elif mnem == "addi" and len(ops) == 3:
-                if ops[0] == "sp" and ops[1] == "sp":
-                    cur -= imm(ops[2])
-                elif ops[1] in regs:
+                if ops[1] in regs:
                     regs[ops[0]] = regs[ops[1]] + imm(ops[2])
                 else:
                     regs.pop(ops[0], None)
-            elif mnem in ("sub", "add") and len(ops) == 3 and ops[0] == "sp" and ops[1] == "sp":
-                if ops[2] in regs:
-                    delta = regs[ops[2]]
-                    cur += delta if mnem == "sub" else -delta
-                else:
-                    return None
             elif mnem == "mv" and len(ops) == 2:
                 if ops[1] in regs:
                     regs[ops[0]] = regs[ops[1]]
@@ -136,10 +179,9 @@ def parse(disassembly: str) -> dict[str, int | None]:
                 frames[name] = frame_size(body)
             name, body = header.group("name"), []
             continue
-        insn = INSN_RE.match(line)
+        insn = parse_insn_line(line)
         if insn and name is not None:
-            ops = [part.strip() for part in insn.group("ops").split(",") if part.strip()]
-            body.append((insn.group("mnem"), ops))
+            body.append(insn)
     if name is not None:
         frames[name] = frame_size(body)
     return frames
@@ -147,7 +189,7 @@ def parse(disassembly: str) -> dict[str, int | None]:
 
 def stack_region(elf: str) -> int | None:
     """`_stack_start - _stack_end`, for context in the report."""
-    nm = find_objdump().replace("llvm-objdump", "llvm-nm")
+    nm = find_nm()
     try:
         out = subprocess.run(
             [nm, elf], capture_output=True, text=True, check=True, timeout=30
@@ -210,16 +252,18 @@ def main() -> int:
             f"\nerror: could not resolve stack adjustment for {len(unresolved)} function(s):\n"
             + "\n".join(f"  {name}" for name in unresolved[:10])
             + ("\n  ..." if len(unresolved) > 10 else "")
-            + "\nAn instruction modified sp with an untracked register. Fail closed to prevent\n"
-            "uncaught stack overflows on device.",
+            + "\nAn instruction modified sp with an untracked register or unmodeled operation.\n"
+            "Fail closed to prevent uncaught stack overflows on device.",
             file=sys.stderr,
         )
         return 1
 
+    exempt = [name for name, size in frames.items() if size is None and name in EXEMPT_UNRESOLVED]
     valid_frames: dict[str, int] = {k: v for k, v in frames.items() if v is not None}
     ranked = sorted(valid_frames.items(), key=lambda kv: kv[1], reverse=True)
     label = f"stack region {region} B, " if region is not None else ""
-    print(f"  {label}budget {args.budget} B, {len(valid_frames)} functions")
+    exempt_label = f" ({len(exempt)} exempt unresolved)" if exempt else ""
+    print(f"  {label}budget {args.budget} B, {len(valid_frames)} functions{exempt_label}")
     for name, size in ranked[: args.top]:
         print(f"  {size:>8} B  {name}")
 
@@ -263,6 +307,10 @@ class TestStackFrames(unittest.TestCase):
 
     def test_untracked_register_fails_closed(self) -> None:
         insns = [("sub", ["sp", "sp", "a5"])]
+        self.assertIsNone(frame_size(insns))
+
+    def test_unknown_sp_write_fails_closed(self) -> None:
+        insns = [("mv", ["sp", "t0"])]
         self.assertIsNone(frame_size(insns))
 
     def test_parse_multiple_functions(self) -> None:
