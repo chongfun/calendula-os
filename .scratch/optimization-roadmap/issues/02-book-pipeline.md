@@ -1,6 +1,6 @@
 # WS-B: Book pipeline — cold builds, custom fonts, catalog scan, progressive open
 
-Status: B2+B3 DONE (#10). B6 DONE (#23; measured on X3 2026-07-25 — replay genuine but ~25 s, see its section). **B7 PROMOTED** — its trigger condition fired: replay is slow and orientation flips re-pay it (see its section; ranked #3 in the PRD queue). B1 OFF THE QUEUE (2026-07-25): its goal landed as upstream port #37 — 16-slot non-ASCII metric ring, run measurement through one open pack handle (`for_each_metric`), whole-glyph bitmap reads; the spec below stays as reference only if custom-font cold builds still measure slow (remaining levers: punctuation-run slots, a walk-held pack handle). **B4 REWORKED (2026-07-26), MEASURED ON DEVICE 2026-07-28 — DO NOT MERGE AS WRITTEN** on `opt/b4-progressive-open-rework`: six review rounds, a stack overflow that bricked the first flash, and two serial-captured runs showing it is a **net regression on time-to-first-content** (first pixel 60× faster, first readable page ~1.6× slower) and does nothing at all on a deep resume. The causes are measured and the fixes are ranked in its section. The old `origin/opt/b4-progressive-open` is superseded and should not be rebased. Note the upload write path belongs to the upload-store crate (#18).
+Status: B2+B3 DONE (#10). B6 DONE (#23; measured on X3 2026-07-25 — replay genuine but ~25 s, see its section). **B7 PROMOTED** — its trigger condition fired: replay is slow and orientation flips re-pay it (see its section; ranked #3 in the PRD queue). B1 OFF THE QUEUE (2026-07-25): its goal landed as upstream port #37 — 16-slot non-ASCII metric ring, run measurement through one open pack handle (`for_each_metric`), whole-glyph bitmap reads; the spec below stays as reference only if custom-font cold builds still measure slow (remaining levers: punctuation-run slots, a walk-held pack handle). **B4 REWORKED, MEASURED AND FIXED ON DEVICE 2026-07-28 — now worth keeping** on `opt/b4-progressive-open-rework`. It was a net regression when first measured (prologue at 45.3 s vs ~34 s for a plain build); two scheduling fixes took that to **32.6 s**, page-turn median from 1270 ms to **231 ms**, and the reader now runs 15.9 s ahead of the builder instead of 0.4 s behind. Still does nothing on a deep resume, which only a progress indicator can help. The section also records a **non-B4** finding worth more than B4: every page turn repaints twice. The old `origin/opt/b4-progressive-open` is superseded and should not be rebased. Note the upload write path belongs to the upload-store crate (#18).
 
 Owns: `fw/src/reader_cache*.rs`, `fw/src/custom_font.rs`, `fw/src/library_sd.rs`, `fw/src/reader_layout.rs`, `ui/src/reading.rs`, `proto/`.
 Do not touch: `fw/src/sd_session.rs` — SD chunk/clock/multi-block changes belong to WS-D (this workstream benefits automatically).
@@ -121,6 +121,31 @@ The 16 background steps did **28.4 s** of work (`step_ms` summed) in **44.3 s** 
 5. **Show progress.** With a cushion the pre-publish window is seconds rather than sub-second, so the reader has to be told. This is the `LibraryEvent::Loaded` unfinished-frontier field declined during review.
 
 **And the option that the data genuinely puts on the table: drop progressive open for cold builds.** If time-to-first-*content* is the metric, a plain 29 s build behind an honest progress indicator beats 45 s of stuttering pages. Progressive open only wins if items 1–3 make the reader able to outrun the builder; if they do not, it is complexity with a negative return. Decide that before spending more on the mechanism.
+
+**Post-fix run, 2026-07-28 (same book, same `target=0`, serial-captured).** Two scheduling fixes landed on the branch (`e73777e`): a `BACKGROUND_SETTLE_MS` wait replacing the single `yield_now` between steps, and `BuildPhase::suspend_before`, which reads the next spine item's uncompressed size out of the zip entry and refuses to start one that would overrun the slice.
+
+| | before | after |
+| --- | --- | --- |
+| first paint | 455 ms | 361 ms |
+| **time to prologue** | **45.3 s** | **32.6 s** |
+| reader vs builder | arrived 0.4 s *after* the walk finished | reading **15.9 s before** it finished |
+| step_ms median | 1997 ms | **463 ms** |
+| step_ms max | 3464 ms | 4081 ms |
+| **page-turn median** | **1270 ms** | **231 ms** |
+| page-turn max | 3451 ms | 2305 ms |
+| build work / wall clock | 28.4 s / 44.3 s | 28.6 s / 48.1 s |
+
+Page turns are now inside the <550 ms budget at the median. The qualitative change is the one that matters: the reader is no longer racing the builder. `slice yields before spine` fired five times, so both fixes are demonstrably active.
+
+The max step got slightly *worse*, and that is the design working as documented. The 4081 ms step was a **single item** — chapter004, 72,988 B, estimated 3649 ms against ~4020 ms actual, so the fit was 9% low but the look-ahead refused it correctly; `walked_this_step == 0` forced it through under the forward-progress guarantee. Only mid-item suspension would fix that, and it does not fit the RAM budget. The build also costs 3.8 s more wall clock — 26 steps rather than 16, each paying ~56 ms of zip/OPF re-parse plus the 50 ms settle — for 12.7 s off time-to-content. Good trade.
+
+**Ship verdict, on the numbers.** A plain build is ~28.6 s plus ~13 page turns to reach the prologue, call it ~34 s. Progressive open was 45.3 s (clearly worse) and is now 32.6 s, with the reading interactive throughout instead of a blank wait. **Keep it.** Note time-to-prologue is partly operator-paced and should be read as indicative; `step_ms` and page-turn latency are the pace-independent numbers and moved further.
+
+**The remaining overhead is not what this file previously blamed.** Build duty cycle is 60% — 28.6 s of work in 48.1 s. Measured over the background window: 31 `view=Reading` renders against **16** reader inputs, 38 panel refreshes totalling **14.4 s**, and 16 storage extends. The reader was at page 13 while the builder was past page 212, so `background_announce` cannot have been firing at all; throttling it would have changed nothing here.
+
+The real cost is that **every page turn renders twice**: once optimistically when the page changes, then again when storage answers with `LibraryEvent::Loaded`, which sets `dirty = Rect::FULL` unconditionally (`app-core/src/lib.rs`) regardless of whether anything about the book's shape changed. At ~405 ms of panel time each that is ~6.5 s of the window, and it is **not a B4 behaviour** — it is the ordinary reading path, present whenever a page turn issues an extend, and merely more visible while a build runs. `bench: storage_open` already reports `ram_hit=true` for the case where the extend loaded nothing, so the signal needed to suppress the second repaint exists. Care is required: the second render is genuinely necessary when the extend *did* load new section content, so the suppression must key off "nothing was loaded and no field changed", not off the event's fields alone.
+
+That reframes item 4 below: the target is the redundant post-extend repaint on the normal reading path, not the frontier announce. It is also worth more than B4 — it would take ~405 ms off every page turn in the book, cached or not.
 
 **The success metric was wrong, and that is the reusable lesson.** `bench: storage_first_page` hits 455 ms and describes nothing a reader experiences. Front matter is the book's own spine and cannot be skipped — page numbering is sequential — so the number to benchmark is **time-to-first-content-page**, and it must be compared against the plain build, not against zero.
 
