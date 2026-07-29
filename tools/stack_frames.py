@@ -131,39 +131,53 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     for mnem, ops in instructions:
         if not ops:
             continue
-        try:
-            if ops[0] == "sp":
-                if mnem == "addi" and len(ops) == 3 and ops[1] == "sp":
-                    cur -= imm(ops[2])
-                elif mnem == "sub" and len(ops) == 3 and ops[1] == "sp":
-                    if ops[2] in regs:
-                        cur += regs[ops[2]]
-                    else:
-                        return None
-                elif mnem == "add" and len(ops) == 3 and ops[1] == "sp":
-                    if ops[2] in regs:
-                        cur -= regs[ops[2]]
-                    else:
-                        cur = max(0, cur)
-                else:
-                    # Any unmodeled instruction modifying sp (e.g. mv sp, t0, addi sp, s0, N)
-                    # cannot be bounded as a frame constant: fail closed.
+        if ops[0] == "sp":
+            if mnem == "addi" and len(ops) == 3 and ops[1] == "sp":
+                try:
+                    delta = imm(ops[2])
+                except ValueError:
+                    # A relocation or symbolic operand on a write to sp. It
+                    # cannot be bounded, and skipping it would under-report the
+                    # frame -- the one direction this tool must never fail in.
                     return None
-            elif mnem == "lui" and len(ops) == 2:
+                cur -= delta
+            elif mnem == "sub" and len(ops) == 3 and ops[1] == "sp":
+                if ops[2] not in regs:
+                    return None
+                cur += regs[ops[2]]
+            elif mnem == "add" and len(ops) == 3 and ops[1] == "sp":
+                if ops[2] in regs:
+                    cur -= regs[ops[2]]
+                else:
+                    # A deallocation of unknown size cannot raise the peak, so
+                    # clamping is safe where returning None would be noise.
+                    cur = max(0, cur)
+            else:
+                # Any unmodeled instruction modifying sp (e.g. mv sp, t0, addi sp, s0, N)
+                # cannot be bounded as a frame constant: fail closed.
+                return None
+        elif mnem == "lui" and len(ops) == 2:
+            # An unresolvable immediate must *invalidate* the destination, not
+            # leave the previous constant in place: a later `sub sp, sp, rd`
+            # would otherwise consume a stale value and report a confidently
+            # wrong frame instead of failing closed.
+            try:
                 regs[ops[0]] = imm(ops[1]) << 12
-            elif mnem == "addi" and len(ops) == 3:
-                if ops[1] in regs:
+            except ValueError:
+                regs.pop(ops[0], None)
+        elif mnem == "addi" and len(ops) == 3:
+            if ops[1] in regs:
+                try:
                     regs[ops[0]] = regs[ops[1]] + imm(ops[2])
-                else:
+                except ValueError:
                     regs.pop(ops[0], None)
-            elif mnem == "mv" and len(ops) == 2:
-                if ops[1] in regs:
-                    regs[ops[0]] = regs[ops[1]]
-                else:
-                    regs.pop(ops[0], None)
-        except ValueError:
-            # A relocation or symbolic operand; it cannot be a frame constant.
-            continue
+            else:
+                regs.pop(ops[0], None)
+        elif mnem == "mv" and len(ops) == 2:
+            if ops[1] in regs:
+                regs[ops[0]] = regs[ops[1]]
+            else:
+                regs.pop(ops[0], None)
         peak = max(peak, cur)
     return peak
 
@@ -311,6 +325,57 @@ class TestStackFrames(unittest.TestCase):
 
     def test_unknown_sp_write_fails_closed(self) -> None:
         insns = [("mv", ["sp", "t0"])]
+        self.assertIsNone(frame_size(insns))
+
+    # The tab-separated form is what llvm-objdump actually emits, so it is the
+    # branch that runs against every real binary -- while the space-separated
+    # cases below only reach the INSN_RE fallback. These three lines are copied
+    # verbatim out of an `llvm-objdump -d` of the X3 release build.
+    def test_parse_real_objdump_line(self) -> None:
+        line = "40380190: 94410113     \taddi\tsp, sp, -0x6bc"
+        self.assertEqual(parse_insn_line(line), ("addi", ["sp", "sp", "-0x6bc"]))
+
+    def test_parse_real_objdump_register_operand(self) -> None:
+        line = "42316464: 40b10133     \tsub\tsp, sp, a1"
+        self.assertEqual(parse_insn_line(line), ("sub", ["sp", "sp", "a1"]))
+
+    def test_parse_real_compressed_line_without_operands(self) -> None:
+        # RVC, two bytes, no operand field at all.
+        self.assertEqual(parse_insn_line("40380698: 8082         \tret"), ("ret", []))
+
+    def test_parse_real_objdump_frame_round_trip(self) -> None:
+        # The two forms must agree end to end, since the whole tool rests on it.
+        lines = [
+            "4231644a: 7111         \taddi\tsp, sp, -0x100",
+            "4231645e: 6595         \tlui\ta1, 0x5",
+            "42316460: 0e058593     \taddi\ta1, a1, 0xe0",
+            "42316464: 40b10133     \tsub\tsp, sp, a1",
+        ]
+        insns = [parse_insn_line(line) for line in lines]
+        self.assertNotIn(None, insns)
+        self.assertEqual(frame_size(insns), 0x100 + 0x50E0)
+
+    def test_unresolvable_sp_immediate_fails_closed(self) -> None:
+        # Skipping this would under-report the frame, the one unsafe direction.
+        insns = [("addi", ["sp", "sp", "%lo(x)"])]
+        self.assertIsNone(frame_size(insns))
+
+    def test_unresolvable_lui_invalidates_stale_constant(self) -> None:
+        # Without the invalidation this reported 20480 -- a confidently wrong
+        # frame built from a register the failed `lui` was meant to overwrite.
+        insns = [
+            ("lui", ["t0", "0x5"]),
+            ("lui", ["t0", "%hi(x)"]),
+            ("sub", ["sp", "sp", "t0"]),
+        ]
+        self.assertIsNone(frame_size(insns))
+
+    def test_unresolvable_addi_invalidates_stale_constant(self) -> None:
+        insns = [
+            ("lui", ["t0", "0x5"]),
+            ("addi", ["t0", "t0", "%lo(x)"]),
+            ("sub", ["sp", "sp", "t0"]),
+        ]
         self.assertIsNone(frame_size(insns))
 
     def test_parse_multiple_functions(self) -> None:
