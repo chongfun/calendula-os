@@ -53,7 +53,18 @@ static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
     ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
 static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; MAX_BOOK_SECTIONS]> =
     ConstStaticCell::new([EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS]);
-static EPUB_ZIP_INFLATE: static_cell::StaticCell<proto::epub::ZipInflateScratch> =
+// Const-constructed like every other scratch above, which is the whole point
+// of `ZipInflateScratch`'s shape: it is ~40 KB against a 42 KB stack, so it
+// must reach `.bss` without ever being built as a value. A `StaticCell` here
+// meant writing one through a pointer, and that left a ~21 KB frame.
+static EPUB_ZIP_INFLATE: ConstStaticCell<proto::epub::ZipInflateScratch> =
+    ConstStaticCell::new(proto::epub::ZipInflateScratch::new());
+// Separate from the scratch above, and deliberately: miniz builds this ~10 KB
+// decoder only by value, so holding it *inside* the const scratch would make
+// that const no longer provably all-zero and push the whole 43 KB out of
+// `.bss` and into `.data` — 43 KB of flash, copied at every boot. An uninit
+// `StaticCell` stays in `.bss` and pays for the value once, here.
+static EPUB_DECOMPRESSOR: static_cell::StaticCell<proto::epub::DecompressorOxide> =
     static_cell::StaticCell::new();
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
@@ -1978,13 +1989,10 @@ fn ensure_epub_scratch<'a>(
 ) -> &'a mut ReaderCacheScratch<'static> {
     if epub_scratch.is_none() {
         esp_println::println!("storage: init epub scratch");
-        let zip_inflate_uninit = EPUB_ZIP_INFLATE.uninit();
-        let zip_ptr = zip_inflate_uninit.as_mut_ptr();
-        // SAFETY: EPUB_ZIP_INFLATE is a 'static allocation initialized once on demand.
-        let zip_ref = unsafe {
-            zip_ptr.write(proto::epub::ZipInflateScratch::new());
-            &mut *zip_ptr
-        };
+        let zip_ref = EPUB_ZIP_INFLATE.take();
+        // Build the decoder here rather than letting the first decode do it:
+        // this frame is shallow, the EPUB open chain's is not.
+        zip_ref.prepare(EPUB_DECOMPRESSOR.init(proto::epub::DecompressorOxide::new()));
         *epub_scratch = Some(EPUB_SCRATCH.init(ReaderCacheScratch::new(
             EPUB_TAIL.take(),
             EPUB_HEADER.take(),
