@@ -1,11 +1,5 @@
+use crate::book_build::{self, ReaderCacheScratch};
 use crate::display_flush::{self, Epd};
-use crate::reader_cache::{
-    self, ReaderCacheScratch, READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH,
-    READER_HEADER_SCRATCH, READER_OPF_SCRATCH, READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
-};
-use crate::reader_store::{
-    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
-};
 use crate::{
     DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
@@ -29,6 +23,13 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Output;
 use proto::nvm::AppStateRecord;
+use reader_cache::store::{
+    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
+};
+use reader_cache::{
+    READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
+    READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
+};
 use static_cell::ConstStaticCell;
 
 /// Same-book page-turn progress is coalesced: at most one durable state write
@@ -212,7 +213,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     })
                     .map_or(0, |request| request.page);
                 let scratch = ensure_epub_scratch(&mut epub_scratch);
-                let step = reader_cache::continue_book_build(
+                let step = book_build::continue_book_build(
                     &mut epd,
                     &mut sd_cs,
                     sd_library,
@@ -220,9 +221,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     scratch,
                     font_metrics,
                 );
-                let finished = step == reader_cache::BackgroundStep::Finished;
+                let finished = step == book_build::BackgroundStep::Finished;
                 match step {
-                    reader_cache::BackgroundStep::Continued => {
+                    book_build::BackgroundStep::Continued => {
                         // A step that ran clears the budget: it is consecutive
                         // failures to begin that mean the card is gone, not a
                         // single one somewhere in a minute of building.
@@ -240,7 +241,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // before the next attempt is what makes holding on
                     // affordable, and the walk still dies the moment the book
                     // changes or its cache is cleared.
-                    reader_cache::BackgroundStep::Retry => {
+                    book_build::BackgroundStep::Retry => {
                         let attempts = pending.attempts.saturating_add(1);
                         esp_println::println!(
                             "storage: background build retry {} in {} ms book_id={}",
@@ -275,7 +276,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // already has, and the next page turn issues an ordinary extend
                 // that reloads properly.
                 let announce = match step {
-                    reader_cache::BackgroundStep::Abandoned => {
+                    book_build::BackgroundStep::Abandoned => {
                         esp_println::println!(
                             "storage: background build abandoned book_id={}",
                             pending.book_id
@@ -287,7 +288,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // resident index reaches them; only the app's page count is
                     // behind, and at the frontier that count is what makes the
                     // next-page button do nothing.
-                    reader_cache::BackgroundStep::Stopped => {
+                    book_build::BackgroundStep::Stopped => {
                         esp_println::println!(
                             "storage: background build stopped book_id={} pages={}",
                             pending.book_id,
@@ -303,9 +304,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // repaint would only redraw the frontier the reader is
                     // already looking at. The walk being kept is the answer
                     // here, not the announcement.
-                    reader_cache::BackgroundStep::Retry => false,
-                    reader_cache::BackgroundStep::Continued
-                    | reader_cache::BackgroundStep::Finished => {
+                    book_build::BackgroundStep::Retry => false,
+                    book_build::BackgroundStep::Continued
+                    | book_build::BackgroundStep::Finished => {
                         app_core::storage_loop::background_announce(
                             finished,
                             reader_page,
@@ -321,7 +322,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         pages: sd_library.advertised_page_count(),
                         chapters: sd_library.chapter_count_for_ui(),
                         current_chapter: sd_library.current_chapter(),
-                        chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                        chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
                         position: None,
                     });
                 }
@@ -356,7 +357,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                             // Long TOCs are windowed like the catalog; slide
                             // the window over the rows this render will show.
                             if request.view == AppView::Chapters && sd_library.text_holds_toc() {
-                                reader_cache::ensure_toc_window(
+                                book_build::ensure_toc_window(
                                     &mut epd,
                                     &mut sd_cs,
                                     sd_library,
@@ -436,7 +437,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // clears the render lock, and one message is the only way to
                     // promise that (see DisplayEvent::Settled).
                     let chapter_cursor = if request.view == AppView::Reading {
-                        reader_cache::track_reading_chapter(
+                        book_build::track_reading_chapter(
                             &mut epd,
                             &mut sd_cs,
                             request.page,
@@ -872,12 +873,12 @@ struct BackgroundBuild {
 /// its verdict.
 fn apply_build_outcome(
     background_build: &mut Option<BackgroundBuild>,
-    outcome: reader_cache::BookBuildOutcome,
+    outcome: book_build::BookBuildOutcome,
     book_id: u32,
 ) {
     match outcome {
-        reader_cache::BookBuildOutcome::Settled => *background_build = None,
-        reader_cache::BookBuildOutcome::Started => {
+        book_build::BookBuildOutcome::Settled => *background_build = None,
+        book_build::BookBuildOutcome::Started => {
             *background_build = Some(BackgroundBuild {
                 book_id,
                 started: Instant::now(),
@@ -896,7 +897,7 @@ fn apply_build_outcome(
         // book, say — so a still-valid build is picked back up rather than
         // stranded half-written. A handle naming another book is stale by the
         // same reasoning, since `Carried` proves the resume belongs to this one.
-        reader_cache::BookBuildOutcome::Carried => match background_build {
+        book_build::BookBuildOutcome::Carried => match background_build {
             Some(pending) if pending.book_id == book_id => pending.attempts = 0,
             _ => {
                 *background_build = Some(BackgroundBuild {
@@ -1160,8 +1161,8 @@ fn handle_storage_command(
             // the session ends in a reset, so there is nothing left to schedule.
             *background_build = None;
             sync_session.loan_granted();
-            let mut loan = reader_cache::dismantle_scratch(scratch);
-            loan.wifi = reader_cache::load_wifi_credentials(epd, sd_cs).map(|record| {
+            let mut loan = book_build::dismantle_scratch(scratch);
+            loan.wifi = book_build::load_wifi_credentials(epd, sd_cs).map(|record| {
                 app_core::WifiCredentials {
                     ssid: record.ssid,
                     ssid_len: record.ssid_len,
@@ -1181,7 +1182,7 @@ fn handle_storage_command(
             // Boot-time probe: name the saved network so the Wireless
             // screen can offer connect/forget honestly. The command runs
             // once per boot, before any session can start.
-            if let Some(record) = reader_cache::load_wifi_credentials(epd, sd_cs) {
+            if let Some(record) = book_build::load_wifi_credentials(epd, sd_cs) {
                 let ssid = app_core::WifiSsid {
                     bytes: record.ssid,
                     len: record.ssid_len,
@@ -1191,7 +1192,7 @@ fn handle_storage_command(
             } else {
                 esp_println::println!("wifi: no saved network");
             }
-            reader_cache::load_custom_font_manifest(epd, sd_cs, sd_library);
+            book_build::load_custom_font_manifest(epd, sd_cs, sd_library);
             send_library_event(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
@@ -1210,7 +1211,7 @@ fn handle_storage_command(
             }
         }
         StorageCommand::RefreshCatalog => {
-            reader_cache::load_custom_font_manifest(epd, sd_cs, sd_library);
+            book_build::load_custom_font_manifest(epd, sd_cs, sd_library);
             send_library_event(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
@@ -1306,7 +1307,7 @@ fn handle_storage_command(
                     }
                     OpenAction::LoadSavedPosition { index } => {
                         let saved =
-                            reader_cache::load_position(epd, sd_cs, sd_library, index as usize);
+                            book_build::load_position(epd, sd_cs, sd_library, index as usize);
                         open.saved_position(saved);
                         if open.resumed() {
                             esp_println::println!(
@@ -1350,7 +1351,7 @@ fn handle_storage_command(
                             // a progressive publish: it moves positions, and
                             // this book's position is real whether or not its
                             // tail is indexed yet.
-                            let outcome = reader_cache::build_or_load_book_cache(
+                            let outcome = book_build::build_or_load_book_cache(
                                 epd,
                                 sd_cs,
                                 sd_library,
@@ -1366,7 +1367,7 @@ fn handle_storage_command(
                     }
                     OpenAction::StorePointer(state) => {
                         let record = record_for_persisted(sd_library, state);
-                        let stored = reader_cache::store_global_state(epd, sd_cs, record);
+                        let stored = book_build::store_global_state(epd, sd_cs, record);
                         if stored {
                             *pending_progress = None;
                             *last_progress_write = Some(Instant::now());
@@ -1400,7 +1401,7 @@ fn handle_storage_command(
                             pages: sd_library.advertised_page_count(),
                             chapters: sd_library.chapter_count_for_ui(),
                             current_chapter: sd_library.current_chapter(),
-                            chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                            chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
                             position,
                         });
                         open.announced();
@@ -1442,7 +1443,7 @@ fn handle_storage_command(
             crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
             // The overview opens with the cursor on the current chapter, so
             // center the first TOC window there.
-            let ok = reader_cache::load_chapters_into_store(
+            let ok = book_build::load_chapters_into_store(
                 epd,
                 sd_cs,
                 sd_library,
@@ -1463,7 +1464,7 @@ fn handle_storage_command(
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
-                chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
                 position: None,
             });
         }
@@ -1483,7 +1484,7 @@ fn handle_storage_command(
             // The TOC is still in the buffer; resolve the chapter's start page
             // before loading the section overwrites it. Re-ensure the window
             // covers the selection in case it slid since the overview render.
-            reader_cache::ensure_toc_window(
+            book_build::ensure_toc_window(
                 epd,
                 sd_cs,
                 sd_library,
@@ -1493,7 +1494,7 @@ fn handle_storage_command(
             );
             let target_page = sd_library.overview_page_at(chapter as usize);
             let scratch = ensure_epub_scratch(epub_scratch);
-            let outcome = reader_cache::build_or_load_book_cache(
+            let outcome = book_build::build_or_load_book_cache(
                 epd,
                 sd_cs,
                 sd_library,
@@ -1511,7 +1512,7 @@ fn handle_storage_command(
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
-                chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
                 position: Some(target_page as u32),
             });
         }
@@ -1526,14 +1527,14 @@ fn handle_storage_command(
                 password: credentials.password,
                 password_len: credentials.password_len,
             };
-            let written = reader_cache::store_wifi_credentials(epd, sd_cs, record);
+            let written = book_build::store_wifi_credentials(epd, sd_cs, record);
             // Reacquire the card and use the exact boot-time read path before
             // telling the portal it may show success. This proves the record
             // survived handle/volume closure, closing the race where the
             // portal's success page beat a write that never actually landed
             // and the session-ending reset lost the credentials.
             let confirmed = written
-                && reader_cache::load_wifi_credentials(epd, sd_cs)
+                && book_build::load_wifi_credentials(epd, sd_cs)
                     .is_some_and(|stored| stored == record);
             esp_println::println!(
                 "storage: wifi credentials written={} confirmed={}",
@@ -1543,7 +1544,7 @@ fn handle_storage_command(
             let _ = crate::WIFI_STORAGE_RESULTS.try_send(confirmed);
         }
         StorageCommand::ForgetWifiCredentials => {
-            let forgotten = reader_cache::forget_wifi_credentials(epd, sd_cs);
+            let forgotten = book_build::forget_wifi_credentials(epd, sd_cs);
             esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
         StorageCommand::ClearBookCache {
@@ -1563,14 +1564,14 @@ fn handle_storage_command(
             // resume die together" is an invariant worth more than that.
             *background_build = None;
             if let Some(scratch) = epub_scratch.as_mut() {
-                reader_cache::clear_build_resume(scratch);
+                book_build::clear_build_resume(scratch);
             }
             // The row was picked against a catalog this task may since have
             // replaced, which would leave a different book sitting under it.
             // Refuse rather than guess: the user can pick again from the list
             // they can actually see.
             let ok = if catalog_epoch == sd_library.catalog_epoch() {
-                reader_cache::clear_book_cache(epd, sd_cs, sd_library, index)
+                book_build::clear_book_cache(epd, sd_cs, sd_library, index)
             } else {
                 esp_println::println!(
                     "storage: clear cache index={} stale epoch={} now={}",
@@ -1626,7 +1627,7 @@ fn handle_storage_command(
             }
             if context_changed || due {
                 let progress_start = Instant::now();
-                let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
+                let stored = book_build::store_app_state(epd, sd_cs, sd_library, record);
                 if stored {
                     *pending_progress = None;
                     *last_progress_write = Some(Instant::now());
@@ -1893,7 +1894,7 @@ fn close_out_departing_book(
     }
     let record = record_for_persisted(sd_library, previous);
     let start = Instant::now();
-    let stored = reader_cache::store_book_position(epd, sd_cs, sd_library, record);
+    let stored = book_build::store_book_position(epd, sd_cs, sd_library, record);
     esp_println::println!(
         "bench: store_book_position ok={} book_id={} page={} elapsed_ms={} t_ms={}",
         stored,
@@ -2011,7 +2012,7 @@ fn book_position(
     index: u16,
     mirror: AppStateRecord,
 ) -> (u16, u32) {
-    match reader_cache::load_position(epd, sd_cs, library, usize::from(index)) {
+    match book_build::load_position(epd, sd_cs, library, usize::from(index)) {
         Some(position) => position,
         None => {
             esp_println::println!(
@@ -2037,7 +2038,7 @@ fn restore_saved_state(
         return;
     }
     *state_restored = true;
-    let Some(record) = reader_cache::load_app_state(epd, sd_cs) else {
+    let Some(record) = book_build::load_app_state(epd, sd_cs) else {
         esp_println::println!("restore: no usable durable state");
         return;
     };
@@ -2070,10 +2071,10 @@ fn restore_saved_state(
     // Resolve the chapter title now so wake-to-Home (rendered before the book
     // is opened) names the chapter; without this the colophon shows a numeral
     // until the book is first opened this session.
-    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
+    book_build::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
     // The book's total page count, so the Home progress bar has a denominator
     // on wake before the book is opened (read from the cache index header).
-    let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
+    let page_count = book_build::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
         chapter,
@@ -2100,7 +2101,7 @@ fn sleep_request_from_saved_state(
     // to the book's own position file.
     let (record, unflushed) = match *pending_progress {
         Some(record) => (record, true),
-        None => (reader_cache::load_app_state(epd, sd_cs)?, false),
+        None => (book_build::load_app_state(epd, sd_cs)?, false),
     };
     let hint = ReaderSource::from_book_id(record.book_id).sd_index();
     let index = crate::library_sd::find_index_by_identity(
@@ -2116,8 +2117,8 @@ fn sleep_request_from_saved_state(
     } else {
         book_position(epd, sd_cs, library, index, record)
     };
-    reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
-    let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
+    book_build::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
+    let page_count = book_build::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     Some(RenderRequest {
         kind: RenderKind::Page,
         view: AppView::Home,
@@ -2165,7 +2166,7 @@ fn flush_pending_progress(
 ) -> bool {
     if let Some(record) = *pending_progress {
         let start = Instant::now();
-        let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
+        let stored = book_build::store_app_state(epd, sd_cs, sd_library, record);
         if stored {
             *pending_progress = None;
             *last_progress_write = Some(Instant::now());

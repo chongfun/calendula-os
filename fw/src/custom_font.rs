@@ -7,7 +7,6 @@
 //! two traits over `embedded_sdmmc`, and the drawing that reads the glyph
 //! bitmaps they point at.
 
-use crate::reader_store::ReaderStore;
 use display::fb::Framebuffer;
 use display::font::{
     fixed_ceil, fixed_round, FontSize, FontStyle, FontWeight, GlyphMetric, STYLE_MARKER,
@@ -20,6 +19,7 @@ use proto::font_pack::{
     FONT_PACK_SIZE_MEDIUM, FONT_PACK_SIZE_SMALL,
 };
 use proto::text::TextAlign;
+use reader_cache::store::ReaderStore;
 use ui::custom_font::{MetricRecord, PackReader, PackSource};
 
 /// The metric cache is pure RAM bookkeeping, so it lives with the

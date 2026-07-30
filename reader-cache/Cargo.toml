@@ -1,0 +1,33 @@
+[package]
+name = "reader-cache"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[features]
+# Off by default so the crate builds and tests on the host. `fw` turns it on to
+# route cache_log! at esp-println; without it the macro expands to nothing.
+esp-log = ["dep:esp-println"]
+# Must be forwarded by any consumer that enables `display/device-x3`. The
+# geometry salt in files.rs is guarded by a compile-time assertion that only
+# holds on the X4, so a crate seeing X3 dimensions without this feature on
+# fails to build -- deliberately, rather than silently rejecting every POS.BIN.
+device-x3 = ["display/device-x3"]
+
+[dependencies]
+app-core = { path = "../app-core" }
+display = { path = "../display" }
+proto = { path = "../proto" }
+ui = { path = "../ui" }
+heapless = "0.9.0"
+# Same pin as fw's and upload-store's; see fw/Cargo.toml for why this exact rev.
+embedded-sdmmc = { git = "https://github.com/rust-embedded-community/embedded-sdmmc-rs.git", rev = "d26892f7405469eba95741763ab39bda2239d5ec", default-features = false }
+upload-store = { path = "../upload-store" }
+esp-println = { version = "0.17.0", features = ["esp32c3"], optional = true }
+
+[dev-dependencies]
+# Formats the in-memory FAT image the fault-injection tests run against, the
+# same way upload-store/tests/transaction.rs does.
+fatfs = "0.3.6"

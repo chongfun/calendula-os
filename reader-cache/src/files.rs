@@ -1,5 +1,5 @@
-use crate::reader_layout;
-use crate::reader_store::{
+use crate::layout;
+use crate::store::{
     ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS, MAX_SD_TOC_ITEMS,
     MAX_SD_TOC_TEXT_BYTES,
 };
@@ -149,15 +149,15 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CustomFontManifest {
-    pub(crate) name: heapless::String<{ crate::reader_store::MAX_CUSTOM_FONT_NAME }>,
-    pub(crate) identity: u64,
-    pub(crate) faces: [FontPackFaceRecord; crate::reader_store::MAX_CUSTOM_FONT_FACES],
-    pub(crate) face_count: usize,
+pub struct CustomFontManifest {
+    pub name: heapless::String<{ crate::store::MAX_CUSTOM_FONT_NAME }>,
+    pub identity: u64,
+    pub faces: [FontPackFaceRecord; crate::store::MAX_CUSTOM_FONT_FACES],
+    pub face_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CacheLoadResult {
+pub enum CacheLoadResult {
     Hit { pages: usize, repaginated: bool },
     Miss,
     Invalid,
@@ -165,7 +165,7 @@ pub(crate) enum CacheLoadResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BookIndexLoadResult {
+pub enum BookIndexLoadResult {
     Hit {
         /// The index was published mid-build and a walk meant to come back for
         /// the rest. Whether that walk still exists is the caller's to know;
@@ -177,13 +177,14 @@ pub(crate) enum BookIndexLoadResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CoverLoadResult {
+pub enum CoverLoadResult {
     Hit,
     Miss,
     Invalid,
 }
 
-pub(crate) fn ensure_v2_cache_dirs<
+#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
+pub fn ensure_v2_cache_dirs<
     D,
     T,
     const MAX_DIRS: usize,
@@ -238,7 +239,8 @@ fn decode_position(bytes: &[u8]) -> Option<(u16, u32)> {
 
 /// Per-book reading position beside the book's cache records, so
 /// switching books no longer abandons the previous one's place.
-pub(crate) fn write_position_file<
+#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
+pub fn write_position_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -265,7 +267,7 @@ where
     )
 }
 
-pub(crate) fn read_position_file<
+pub fn read_position_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -298,7 +300,8 @@ where
     decode_position(&bytes[..len])
 }
 
-pub(crate) fn write_state_file<
+#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
+pub fn write_state_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -328,7 +331,7 @@ const STATE_DURABLE_MAGIC: [u8; 4] = *b"MGST";
 /// Read the newest valid STATEA/STATEB generation, falling back to the
 /// legacy `/XTEINK/STATE.BIN`. Returns None when every copy is absent,
 /// short, or fails its checksum.
-pub(crate) fn read_state_file<
+pub fn read_state_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -355,7 +358,7 @@ where
     proto::nvm::AppStateRecord::decode(&bytes[..len])
 }
 
-pub(crate) fn read_custom_font_manifest<
+pub fn read_custom_font_manifest<
     D,
     T,
     const MAX_DIRS: usize,
@@ -381,8 +384,8 @@ where
     if file.length() != header.total_len {
         return None;
     }
-    let face_count = usize::from(header.face_count).min(crate::reader_store::MAX_CUSTOM_FONT_FACES);
-    let mut faces = [FontPackFaceRecord::EMPTY; crate::reader_store::MAX_CUSTOM_FONT_FACES];
+    let face_count = usize::from(header.face_count).min(crate::store::MAX_CUSTOM_FONT_FACES);
+    let mut faces = [FontPackFaceRecord::EMPTY; crate::store::MAX_CUSTOM_FONT_FACES];
     file.seek_from_start(header.face_table_offset).ok()?;
     let mut face_bytes = [0u8; FONT_PACK_FACE_RECORD_BYTES];
     for face in faces.iter_mut().take(face_count) {
@@ -413,7 +416,8 @@ const WIFI_GENERATIONS: [&str; 2] = ["WIFIA.BIN", "WIFIB.BIN"];
 const WIFI_DURABLE_MAGIC: [u8; 4] = *b"MGWF";
 
 /// Write the onboarding portal's credentials to alternating WIFIA/WIFIB.
-pub(crate) fn write_wifi_file<
+#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
+pub fn write_wifi_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -438,7 +442,7 @@ where
 
 /// Delete every stored credential copy (legacy WIFI.BIN and both
 /// generations); missing files count as success.
-pub(crate) fn delete_wifi_file<
+pub fn delete_wifi_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -464,7 +468,7 @@ where
 
 /// Read the newest WIFIA/WIFIB generation, falling back to legacy WIFI.BIN;
 /// None when every copy is missing, short, or corrupt.
-pub(crate) fn read_wifi_file<
+pub fn read_wifi_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -487,7 +491,7 @@ where
     proto::nvm::WifiCredentialsRecord::decode(&bytes[..len])
 }
 
-pub(crate) fn load_v2_cover_cache<
+pub fn load_v2_cover_cache<
     D,
     T,
     const MAX_DIRS: usize,
@@ -526,7 +530,7 @@ where
 /// without loading any section records. Used at boot restore so the Home
 /// progress bar has a denominator before the book is opened. Returns 0 if the
 /// index is missing, stale, or for another book.
-pub(crate) fn read_v2_book_total_pages<
+pub fn read_v2_book_total_pages<
     D,
     T,
     const MAX_DIRS: usize,
@@ -671,7 +675,7 @@ where
     true
 }
 
-pub(crate) fn load_v2_book_index<
+pub fn load_v2_book_index<
     D,
     T,
     const MAX_DIRS: usize,
@@ -698,7 +702,7 @@ where
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.font_config
-                != reader_layout::reader_layout_config(library.type_settings(), library.portrait())
+                != layout::reader_layout_config(library.type_settings(), library.portrait())
             || header.custom_font_identity != library.custom_font_identity()
             || header.section_count as usize > MAX_BOOK_SECTIONS
             || !v2_toc_label_bounds_ok(&header)
@@ -748,7 +752,7 @@ where
 /// with the title learned the last time the book was opened. Returns false
 /// (leaving `out` untouched) when there is no cache for the book, the cached
 /// identity doesn't match, or the cache holds no title.
-pub(crate) fn read_cached_book_title<
+pub fn read_cached_book_title<
     D,
     T,
     const MAX_DIRS: usize,
@@ -812,7 +816,7 @@ where
 /// `Unreadable` says there *is* an index and we could not tell whose it is,
 /// which is exactly when a caller about to delete has to stop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CacheHeader {
+pub enum CacheHeader {
     Present(BookV2Header),
     /// No BOOK.BIN at all.
     Absent,
@@ -825,7 +829,7 @@ pub(crate) enum CacheHeader {
 /// count. Used by the orphan sweep to decide whether a cache still belongs to
 /// a book on the card, and by the clear to prove a key names the book it was
 /// asked about.
-pub(crate) fn read_cache_header<
+pub fn read_cache_header<
     D,
     T,
     const MAX_DIRS: usize,
@@ -900,7 +904,7 @@ const SHORT_NAME_BYTES: usize = 12;
 /// rather than a header advertising sections that are no longer there.
 ///
 /// The global reading position in XTEINK/STATE.BIN is never touched.
-pub(crate) fn empty_cache_dir<
+pub fn empty_cache_dir<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1122,7 +1126,7 @@ where
 }
 
 #[expect(clippy::too_many_arguments)] // The index's own field set: identity, shape, and the resume cursor, all caller-owned
-pub(crate) fn write_v2_book_index<
+pub fn write_v2_book_index<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1179,10 +1183,7 @@ where
             author_text_bytes,
             viewport_width: 800,
             viewport_height: 480,
-            font_config: reader_layout::reader_layout_config(
-                library.type_settings(),
-                library.portrait(),
-            ),
+            font_config: layout::reader_layout_config(library.type_settings(), library.portrait()),
             custom_font_identity: library.custom_font_identity(),
             partial,
             resume_spine,
@@ -1251,7 +1252,7 @@ fn range_fits(offset: u32, len: u16, text_bytes: u32) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn load_v2_section_by_global_page<
+pub fn load_v2_section_by_global_page<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1347,7 +1348,7 @@ where
             return CacheLoadResult::Invalid;
         }
         let expected_config =
-            reader_layout::reader_layout_config(library.type_settings(), library.portrait());
+            layout::reader_layout_config(library.type_settings(), library.portrait());
         if header.custom_font_identity != library.custom_font_identity() {
             return CacheLoadResult::Invalid;
         }
@@ -1362,7 +1363,7 @@ where
             return CacheLoadResult::Invalid;
         }
         if !layout_matches {
-            reader_layout::rebuild_page_index(library);
+            layout::rebuild_page_index(library);
         }
         let pages = library.page_count;
         if pages < target_pages {
@@ -1395,7 +1396,7 @@ where
     T: TimeSource,
 {
     if ensure_v2_cache_dirs(root, key).is_err() {
-        esp_println::println!("cache: v2 ensure dirs failed key={}", key);
+        cache_log!("cache: v2 ensure dirs failed key={}", key);
         return false;
     }
     with_v2_section_file(
@@ -1406,7 +1407,7 @@ where
         |file| write_v2_section_body(file, source_identity, library.cached_spine, library),
     )
     .unwrap_or_else(|| {
-        esp_println::println!(
+        cache_log!(
             "cache: v2 open section failed key={} section={}",
             key,
             section
@@ -1420,7 +1421,7 @@ where
 /// cache chain per section. Directory creation failure passes `None`: the
 /// build still runs, every section write reports failure, and the book is
 /// marked partial — the same degraded path as before.
-pub(crate) fn with_v2_sections_dir<
+pub fn with_v2_sections_dir<
     R,
     D,
     T,
@@ -1453,7 +1454,7 @@ where
 /// Write one section file into an already-open SECTIONS directory — the
 /// per-section body of `write_v2_section_cache` without the per-call
 /// directory walk.
-pub(crate) fn write_v2_section_cache_in<
+pub fn write_v2_section_cache_in<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1474,7 +1475,7 @@ where
     match sections.open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate) {
         Ok(file) => write_v2_section_body(&file, source_identity, library.cached_spine, library),
         Err(_) => {
-            esp_println::println!("cache: v2 open section failed section={}", section);
+            cache_log!("cache: v2 open section failed section={}", section);
             false
         }
     }
@@ -1485,7 +1486,7 @@ where
 /// directory another walk also passes through is fine: this embedded-sdmmc
 /// rev allows duplicate directory opens (directories hold no cached
 /// state); only deleting an open directory errors.
-pub(crate) fn open_v2_book_dir<
+pub fn open_v2_book_dir<
     'v,
     D,
     T,
@@ -1508,7 +1509,7 @@ where
 
 /// Open the book's `CONT.BIN` (settings-independent content cache) and run
 /// `f` with it.
-pub(crate) fn with_v2_content_file<
+pub fn with_v2_content_file<
     R,
     D,
     T,
@@ -1533,7 +1534,7 @@ where
 /// Delete the book's `CONT.BIN`. Failures are ignored — a stale or corrupt
 /// content cache is only ever an accelerator, and the next full build
 /// recreates it.
-pub(crate) fn delete_v2_content_file<
+pub fn delete_v2_content_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1557,7 +1558,7 @@ pub(crate) fn delete_v2_content_file<
 /// EPUB. Failure is one-way and silent: the capture disables itself, and
 /// `finish` deletes the partial file — CONT.BIN is purely an accelerator, so
 /// the build itself never fails on its account.
-pub(crate) struct ContentCapture<
+pub struct ContentCapture<
     'd,
     's,
     D,
@@ -1587,7 +1588,7 @@ where
     /// and write its header with `complete = false`; the flag flips in
     /// `finish` only after the whole spine walk captured. Any failure — or
     /// `None` for the dir — returns a disabled capture.
-    pub(crate) fn begin(
+    pub fn begin(
         dir: Option<&'d Directory<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
         source_identity: (u32, u32),
         stage: &'s mut [u8],
@@ -1633,7 +1634,7 @@ where
     /// walk actually ends, so a build abandoned between steps — by sleep, by
     /// the sync loan — leaves a file replay will refuse rather than a
     /// truncated stream it would trust.
-    pub(crate) fn resume(
+    pub fn resume(
         dir: Option<&'d Directory<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
         source_identity: (u32, u32),
         stage: &'s mut [u8],
@@ -1663,7 +1664,7 @@ where
     /// accelerator — but it is one-way: the next step starts
     /// [`disabled`](Self::disabled) rather than appending to a file with a
     /// hole in it, and the incomplete header keeps replay away from it.
-    pub(crate) fn suspend(mut self) -> (bool, u16) {
+    pub fn suspend(mut self) -> (bool, u16) {
         if let Some(file) = self.file.as_ref() {
             if staged_flush(file, self.stage, &mut self.len).is_err() {
                 self.file = None;
@@ -1677,7 +1678,7 @@ where
     /// A capture that records nothing, for a continuation whose earlier step
     /// already gave up on CONT.BIN. The build carries on unaffected; only the
     /// next settings change pays a full rebuild instead of a replay.
-    pub(crate) fn disabled(stage: &'s mut [u8], source_identity: (u32, u32)) -> Self {
+    pub fn disabled(stage: &'s mut [u8], source_identity: (u32, u32)) -> Self {
         Self {
             file: None,
             stage,
@@ -1689,7 +1690,7 @@ where
 
     /// Record one `push_block` call. The text follows the fixed record
     /// header; see `proto::cache::ContentRecordHeader`.
-    pub(crate) fn push_block_record(
+    pub fn push_block_record(
         &mut self,
         spine_index: u16,
         text: &str,
@@ -1705,7 +1706,7 @@ where
             self.file = None;
             return;
         };
-        if text.len() > crate::reader_cache::READER_XHTML_SCRATCH {
+        if text.len() > crate::READER_XHTML_SCRATCH {
             self.file = None;
             return;
         }
@@ -1734,7 +1735,7 @@ where
 
     /// Record the end of one spine item, so replay knows where to finish
     /// the current section run.
-    pub(crate) fn spine_end(&mut self, spine_index: u16) {
+    pub fn spine_end(&mut self, spine_index: u16) {
         if self.file.is_none() {
             return;
         }
@@ -1776,7 +1777,7 @@ where
     /// walk captured cleanly), or delete the partial file through the same
     /// directory handle the capture was opened from. Returns whether a
     /// complete CONT.BIN was kept.
-    pub(crate) fn finish(
+    pub fn finish(
         mut self,
         dir: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
         keep: bool,
@@ -1821,7 +1822,7 @@ where
 /// the content replay path runs precisely when the index is layout-invalid,
 /// but its TOC and labels are settings-independent and must survive into
 /// the rewritten index. Deliberately does not touch the section index.
-pub(crate) fn load_v2_book_labels_and_toc<
+pub fn load_v2_book_labels_and_toc<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1942,7 +1943,7 @@ where
 /// Load the on-disk chapter list (TOC.BIN) into the store's text buffer for
 /// the Chapters overview. Reuses the section text buffer -- the reading
 /// section is reloaded on exit -- so no resident RAM is spent on the list.
-pub(crate) fn load_v2_toc_into_text<
+pub fn load_v2_toc_into_text<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1962,23 +1963,23 @@ where
     with_v2_toc_file(root, key, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
-            esp_println::println!("toc window: header read failed");
+            cache_log!("toc window: header read failed");
             return false;
         }
         let Ok(header) = decode_toc_file_header(&header_bytes) else {
-            esp_println::println!("toc window: header decode failed");
+            cache_log!("toc window: header decode failed");
             return false;
         };
         if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
-            esp_println::println!("toc window: identity mismatch");
+            cache_log!("toc window: identity mismatch");
             return false;
         }
         let total = header.chapter_count as usize;
         let start = window_start.min(total.saturating_sub(1));
-        let len = (total - start).min(crate::reader_store::TOC_WINDOW_CAPACITY);
+        let len = (total - start).min(crate::store::TOC_WINDOW_CAPACITY);
         let offset = TOC_FILE_HEADER_BYTES + start * TOC_CHAPTER_RECORD_BYTES;
         if file.seek_from_start(offset as u32).is_err() {
-            esp_println::println!("toc window: seek failed");
+            cache_log!("toc window: seek failed");
             return false;
         }
         let bytes = len.saturating_mul(TOC_CHAPTER_RECORD_BYTES);
@@ -1986,7 +1987,7 @@ where
             return false;
         };
         if read_exact_file(file, buf).is_err() {
-            esp_println::println!("toc window: body read failed");
+            cache_log!("toc window: body read failed");
             return false;
         }
         library.set_toc_window(start, len, total);
@@ -2000,7 +2001,7 @@ where
 /// whole book -- past the 128-entry resident/event caps and past chapter 255
 /// (the map is bounded by the section count, not the chapter count). The
 /// book index must already be loaded so spines resolve to sections.
-pub(crate) fn load_v2_toc_chapter_map<
+pub fn load_v2_toc_chapter_map<
     D,
     T,
     const MAX_DIRS: usize,
@@ -2056,7 +2057,7 @@ where
 /// Read one chapter's title straight from its TOC.BIN record (a single seek
 /// and 48-byte read) into the resident current-chapter slot, so the Home and
 /// sleep colophons can name a chapter the 128-entry resident list omits.
-pub(crate) fn read_v2_toc_chapter_title<
+pub fn read_v2_toc_chapter_title<
     D,
     T,
     const MAX_DIRS: usize,
@@ -2108,7 +2109,7 @@ where
 /// pre-encoded `TOC_CHAPTER_RECORD_BYTES` records (the caller assembles them
 /// in a scratch buffer during the TOC parse). Keeping the list on the card
 /// lets a long book's TOC stay out of the tight reader RAM.
-pub(crate) fn write_v2_toc_file<
+pub fn write_v2_toc_file<
     D,
     T,
     const MAX_DIRS: usize,
@@ -2259,10 +2260,7 @@ where
         text_bytes: library.text_len.min(u32::MAX as usize) as u32,
         viewport_width: 800,
         viewport_height: 480,
-        font_config: reader_layout::reader_layout_config(
-            library.type_settings(),
-            library.portrait(),
-        ),
+        font_config: layout::reader_layout_config(library.type_settings(), library.portrait()),
         custom_font_identity: library.custom_font_identity(),
         bytes_consumed: 0,
         total_bytes: 0,
@@ -2270,7 +2268,7 @@ where
     };
     let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
     if encode_section_v2_header(header, &mut bytes).is_err() || file.write(&bytes).is_err() {
-        esp_println::println!("cache: v2 write header failed");
+        cache_log!("cache: v2 write header failed");
         return false;
     }
     write_section_records(file, library)
@@ -2296,7 +2294,7 @@ where
         if encode_page(*page, &mut record[..PAGE_RECORD_BYTES]).is_err()
             || stage.push(&record[..PAGE_RECORD_BYTES]).is_err()
         {
-            esp_println::println!("cache: write page record failed");
+            cache_log!("cache: write page record failed");
             return false;
         }
     }
@@ -2304,7 +2302,7 @@ where
         if encode_block(*block, &mut record[..BLOCK_RECORD_BYTES]).is_err()
             || stage.push(&record[..BLOCK_RECORD_BYTES]).is_err()
         {
-            esp_println::println!("cache: write block record failed");
+            cache_log!("cache: write block record failed");
             return false;
         }
     }
@@ -2315,16 +2313,16 @@ where
         let start = library.block_paragraph_start[index];
         let flag = (end as u8) | ((start as u8) << 1);
         if stage.push(&[flag]).is_err() {
-            esp_println::println!("cache: write paragraph flag failed");
+            cache_log!("cache: write paragraph flag failed");
             return false;
         }
     }
     if stage.flush().is_err() {
-        esp_println::println!("cache: write staged records failed");
+        cache_log!("cache: write staged records failed");
         return false;
     }
     if file.write(&library.text[..library.text_len]).is_err() {
-        esp_println::println!("cache: write text failed");
+        cache_log!("cache: write text failed");
         return false;
     }
     true
@@ -2463,7 +2461,8 @@ where
     true
 }
 
-pub(crate) fn read_exact_file<
+#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
+pub fn read_exact_file<
     D,
     T,
     const MAX_DIRS: usize,

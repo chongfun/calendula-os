@@ -1,12 +1,12 @@
 use crate::display_flush::Epd;
-use crate::reader_store::{
-    derive_catalog_label, source_hash, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW,
-};
 use crate::sd_session;
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, LfnBuffer, Mode, TimeSource};
 use esp_hal::gpio::Output;
 use heapless::String;
+use reader_cache::store::{
+    derive_catalog_label, source_hash, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW,
+};
 
 const CATALOG_ROOT_DIR: &str = "XTEINK";
 const CATALOG_FILE: &str = "CATALOG.BIN";
@@ -34,7 +34,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         // an explicit refresh), never while a page render is reading the
         // arena, and the section window is invalidated below so a stale page
         // can't be served from clobbered text afterwards.
-        let scanned = write_catalog_streaming(root, &mut library.text);
+        let scanned = write_catalog_streaming(root, library.arena_as_scratch());
         let status = match scanned {
             Ok(0) => LibraryScanStatus::Empty,
             Ok(count) => {
@@ -52,7 +52,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
                     // Drop the cached data of books no longer on the card:
                     // this is the one moment the full book set is known and
                     // the catalog is proven fresh.
-                    sweep_orphan_caches(root, &mut library.text);
+                    sweep_orphan_caches(root, library.arena_as_scratch());
                     LibraryScanStatus::Ready
                 }
             }
@@ -62,7 +62,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         // the resident section (and any Chapters TOC window) so nothing
         // renders from it.
         library.clear_lines();
-        library.text_holds_toc = false;
+        library.set_text_holds_toc(false);
         status
     })
     .unwrap_or_else(|err| {
@@ -505,7 +505,7 @@ where
 {
     let key = proto::cache::cache_key_for(decoded.display_name.as_str(), decoded.byte_size);
     let mut raw_name = String::<64>::new();
-    if crate::reader_cache_files::read_cached_book_title(
+    if reader_cache::files::read_cached_book_title(
         root,
         key.as_str(),
         (decoded.source_hash, decoded.byte_size),
@@ -513,7 +513,7 @@ where
     ) {
         Some(title.as_str())
     } else if upload_store::read_upload_label(root, decoded.open_name.as_str(), &mut raw_name) {
-        crate::reader_store::derive_catalog_label(
+        reader_cache::store::derive_catalog_label(
             raw_name.as_str(),
             decoded.open_name.as_str(),
             title,
@@ -772,14 +772,14 @@ fn sweep_orphan_caches<
         // the sweep runs against a catalog it has just proven fresh, and a
         // cache it cannot match to any book on the card is garbage whoever
         // wrote it. Keeping it would strand the shells forever.
-        let live = match crate::reader_cache_files::read_cache_header(root, key.as_str()) {
-            crate::reader_cache_files::CacheHeader::Present(h) => {
+        let live = match reader_cache::files::read_cache_header(root, key.as_str()) {
+            reader_cache::files::CacheHeader::Present(h) => {
                 catalog_identity_staged(scratch, staged, h.source_hash, h.source_size)
                     || (truncated
                         && find_in_catalog(root, h.source_hash, h.source_size, None).is_some())
             }
-            crate::reader_cache_files::CacheHeader::Absent
-            | crate::reader_cache_files::CacheHeader::Unreadable => false,
+            reader_cache::files::CacheHeader::Absent
+            | reader_cache::files::CacheHeader::Unreadable => false,
         };
         if live {
             continue;
@@ -788,7 +788,7 @@ fn sweep_orphan_caches<
         // sweep: it named section files from the header's own count, so a
         // cache with no BOOK.BIN kept its sections forever. The delete lists
         // the directory now, so it needs nothing from the header.
-        let _ = crate::reader_cache_files::empty_cache_dir(root, key.as_str());
+        let _ = reader_cache::files::empty_cache_dir(root, key.as_str());
         swept += 1;
     }
     if swept > 0 {

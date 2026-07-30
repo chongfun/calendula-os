@@ -6,14 +6,14 @@ use proto::cache::{
     COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH, TOC_CHAPTER_RECORD_BYTES, TOC_CHAPTER_TITLE_BYTES,
 };
 use proto::text::{TextAlign, TextRole};
-pub(crate) use proto::upload::derive_catalog_label;
+pub use proto::upload::derive_catalog_label;
 
 /// Resident slice of the on-disk catalog kept for the Library list. The full
 /// catalog lives in CATALOG.BIN and is streamed a window at a time around the
 /// selection, so the book count is bounded by the card, not by RAM. Sized a
 /// little above `ui::render::library_visible_rows(true)` so ordinary scrolling stays
 /// inside one loaded window and only crossings re-read the card.
-pub(crate) const LIBRARY_WINDOW: usize = 16;
+pub const LIBRARY_WINDOW: usize = 16;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
 /// Longest current-chapter title kept resident for the Home/sleep colophon;
 /// read on demand from TOC.BIN as the chapter changes.
@@ -26,7 +26,7 @@ pub(crate) const MAX_CUSTOM_FONT_FACES: usize = 12;
 // (here and EPUB_BOOK_SECTIONS) live in static cells, not the stack; the
 // one stack-resident copy is on the shallow book-index load path, clear of
 // the deep EPUB-build watermark.
-pub(crate) const MAX_BOOK_SECTIONS: usize = 320;
+pub const MAX_BOOK_SECTIONS: usize = 320;
 const MAX_PUBLISHED_CHAPTER_EVENTS: usize = MAX_SD_CHAPTERS;
 // Titles only (hrefs/anchors are no longer stored), so 4 KB covers the full
 // 128-item TOC at ~32 bytes per title and the saved RAM widens the stack
@@ -38,8 +38,8 @@ pub(crate) const MAX_READER_TEXT_BYTES: usize = 16_384;
 /// TOC records the `text` buffer can hold at once for the Chapters overview;
 /// longer TOCs are windowed around the visible rows (HPMOR-sized lists fit
 /// whole, but e.g. a 322-entry trade-book TOC does not).
-pub(crate) const TOC_WINDOW_CAPACITY: usize = MAX_READER_TEXT_BYTES / TOC_CHAPTER_RECORD_BYTES;
-pub(crate) const MAX_READER_BLOCK_TEXT: usize = 768;
+pub const TOC_WINDOW_CAPACITY: usize = MAX_READER_TEXT_BYTES / TOC_CHAPTER_RECORD_BYTES;
+pub const MAX_READER_BLOCK_TEXT: usize = 768;
 pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     text_offset: 0,
     text_len: 0,
@@ -62,7 +62,7 @@ pub(crate) const EMPTY_TOC_RECORD: TocRecord = TocRecord {
     level: 0,
     spine_index: -1,
 };
-pub(crate) const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionRecord {
+pub const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionRecord {
     section: 0,
     spine: 0,
     start_page: 0,
@@ -102,7 +102,7 @@ const ZERO_TYPE_SETTINGS: TypeSettings = TypeSettings {
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LibraryScanStatus {
+pub enum LibraryScanStatus {
     NotScanned,
     Scanning,
     Ready,
@@ -111,24 +111,27 @@ pub(crate) enum LibraryScanStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BookLoadStatus {
+pub enum BookLoadStatus {
     Empty,
     Loading,
     Ready,
     Error,
 }
 
-pub(crate) struct LibraryBookEntry {
-    pub(crate) display_name: String<64>,
-    pub(crate) display_label: String<64>,
-    pub(crate) open_name: String<16>,
-    pub(crate) in_books_dir: bool,
-    pub(crate) byte_size: u32,
-    pub(crate) source_hash: u32,
+pub struct LibraryBookEntry {
+    pub display_name: String<64>,
+    pub display_label: String<64>,
+    pub open_name: String<16>,
+    pub in_books_dir: bool,
+    pub byte_size: u32,
+    pub source_hash: u32,
 }
 
 impl LibraryBookEntry {
-    pub(crate) const fn new() -> Self {
+    // No `Default`: it is only ever constructed as a const array element in
+    // the catalog window, which `Default` cannot do.
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
         Self {
             display_name: String::new(),
             display_label: String::new(),
@@ -140,22 +143,33 @@ impl LibraryBookEntry {
     }
 }
 
-pub(crate) struct ReaderCover<'a> {
-    pub(crate) width: u16,
-    pub(crate) height: u16,
-    pub(crate) stride: u16,
-    pub(crate) bits: &'a [u8; COVER_BYTES],
+pub struct ReaderCover<'a> {
+    pub width: u16,
+    pub height: u16,
+    pub stride: u16,
+    pub bits: &'a [u8; COVER_BYTES],
 }
 
-pub(crate) struct TocItem<'a> {
-    pub(crate) title: &'a str,
-    pub(crate) level: u8,
+pub struct TocItem<'a> {
+    pub title: &'a str,
+    pub level: u8,
     /// 1-based book page the chapter starts on; 0 when unknown.
-    pub(crate) page: u32,
+    pub page: u32,
 }
 
-pub(crate) struct ReaderStore {
-    pub(crate) status: LibraryScanStatus,
+/// The lengths a trim set aside, so they can only be put back as a set.
+///
+/// Opaque on purpose: `block_count`, `page_count` and `text_len` describe one
+/// arena and have to move together.
+#[derive(Clone, Copy)]
+pub struct TrimmedTail {
+    blocks: usize,
+    pages: usize,
+    text_len: usize,
+}
+
+pub struct ReaderStore {
+    pub status: LibraryScanStatus,
     /// Full book count across CATALOG.BIN (the source of truth), independent of
     /// what is resident.
     total: u16,
@@ -176,10 +190,10 @@ pub(crate) struct ReaderStore {
     active_entry: LibraryBookEntry,
     active_index: Option<usize>,
     pub(crate) current_index: Option<usize>,
-    pub(crate) loaded_index: Option<usize>,
+    pub loaded_index: Option<usize>,
     pub(crate) loaded_chapter: u16,
     pub(crate) reader_status: BookLoadStatus,
-    pub(crate) title: String<64>,
+    pub title: String<64>,
     pub(crate) author: String<64>,
     pub(crate) error: String<32>,
     pub(crate) cache_key: String<CACHE_KEY_BYTES>,
@@ -190,8 +204,8 @@ pub(crate) struct ReaderStore {
     pub(crate) cached_spine: u16,
     pub(crate) section_partial: bool,
     pub(crate) book_total_pages: u32,
-    pub(crate) current_section_start_page: u32,
-    pub(crate) current_section_page_count: u16,
+    pub current_section_start_page: u32,
+    pub current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
     pub(crate) book_section_count: usize,
@@ -245,7 +259,7 @@ pub(crate) struct ReaderStore {
     pub(crate) block_styles: [FontStyle; MAX_READER_BLOCKS],
     pub(crate) block_spine: [u16; MAX_READER_BLOCKS],
     pub(crate) block_page_break_before: [bool; MAX_READER_BLOCKS],
-    pub(crate) block_paragraph_end: [bool; MAX_READER_BLOCKS],
+    pub block_paragraph_end: [bool; MAX_READER_BLOCKS],
     /// True for a block that opens a paragraph (its opening line takes the
     /// first-line indent). Persisted rather than derived so a section that
     /// carries a half-finished paragraph in at its front keeps that
@@ -273,7 +287,11 @@ impl ReaderStore {
     /// costs a flash image copy of the full size plus a boot-time memcpy.
     /// [`Self::init_runtime_defaults`] restores the handful of non-zero
     /// defaults in place, immediately after the cell is taken.
-    pub(crate) const fn new() -> Self {
+    // No `Default`, deliberately: this struct is ~47 KB and lives in a static
+    // initialised in place. `ReaderStore::default()` would materialise it by
+    // value, which is the shape that overflowed the 42 KB stack during B4.
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
         Self {
             status: LibraryScanStatus::NotScanned,
             total: 0,
@@ -348,7 +366,7 @@ impl ReaderStore {
     /// default type settings, the -1 spine sentinel in unused TOC slots, the
     /// Justify align of unused blocks, and the paragraph-end default that
     /// `clear_lines` also maintains.
-    pub(crate) fn init_runtime_defaults(&mut self) {
+    pub fn init_runtime_defaults(&mut self) {
         self.cover_width = COVER_WIDTH as u16;
         self.cover_height = COVER_HEIGHT as u16;
         self.type_settings = TypeSettings::DEFAULT;
@@ -363,7 +381,7 @@ impl ReaderStore {
         }
     }
 
-    pub(crate) fn set_custom_font(
+    pub fn set_custom_font(
         &mut self,
         name: Option<&str>,
         identity: u64,
@@ -388,15 +406,15 @@ impl ReaderStore {
         }
     }
 
-    pub(crate) fn custom_font_available(&self) -> bool {
+    pub fn custom_font_available(&self) -> bool {
         self.custom_font_available
     }
 
-    pub(crate) fn custom_font_name(&self) -> &str {
+    pub fn custom_font_name(&self) -> &str {
         self.custom_font_name.as_str()
     }
 
-    pub(crate) fn custom_font_identity(&self) -> u64 {
+    pub fn custom_font_identity(&self) -> u64 {
         if self.custom_font_available {
             self.custom_font_identity
         } else {
@@ -404,7 +422,7 @@ impl ReaderStore {
         }
     }
 
-    pub(crate) fn custom_font_face(
+    pub fn custom_font_face(
         &self,
         size_px: u8,
         style: u8,
@@ -415,15 +433,15 @@ impl ReaderStore {
             .find(|face| face.size_px == size_px && face.style == style)
     }
 
-    pub(crate) fn type_settings(&self) -> TypeSettings {
+    pub fn type_settings(&self) -> TypeSettings {
         self.type_settings
     }
 
-    pub(crate) fn portrait(&self) -> bool {
+    pub fn portrait(&self) -> bool {
         self.portrait
     }
 
-    pub(crate) fn page_box(&self) -> ui::reading::PageBox {
+    pub fn page_box(&self) -> ui::reading::PageBox {
         ui::reading::PageBox::for_portrait(self.portrait)
     }
 
@@ -432,7 +450,7 @@ impl ReaderStore {
     /// open/extend reloads the section under the new layout (a size or
     /// orientation change rebuilds it from the EPUB) instead of serving
     /// pages paginated under the old one.
-    pub(crate) fn set_layout(&mut self, settings: TypeSettings, portrait: bool) {
+    pub fn set_layout(&mut self, settings: TypeSettings, portrait: bool) {
         if self.type_settings == settings && self.portrait == portrait {
             return;
         }
@@ -442,7 +460,7 @@ impl ReaderStore {
         self.current_section_page_count = 0;
     }
 
-    pub(crate) fn clear_catalog(&mut self) {
+    pub fn clear_catalog(&mut self) {
         self.total = 0;
         self.window_start = 0;
         self.window_len = 0;
@@ -455,50 +473,50 @@ impl ReaderStore {
     }
 
     /// The catalog generation the resident rows belong to.
-    pub(crate) fn catalog_epoch(&self) -> u32 {
+    pub fn catalog_epoch(&self) -> u32 {
         self.catalog_epoch
     }
 
-    pub(crate) fn catalog_count(&self) -> usize {
+    pub fn catalog_count(&self) -> usize {
         self.total as usize
     }
 
-    pub(crate) fn catalog_count_u16(&self) -> u16 {
+    pub fn catalog_count_u16(&self) -> u16 {
         self.total
     }
 
-    pub(crate) fn set_catalog_total(&mut self, total: u16) {
+    pub fn set_catalog_total(&mut self, total: u16) {
         self.total = total;
     }
 
-    pub(crate) fn catalog_is_empty(&self) -> bool {
+    pub fn catalog_is_empty(&self) -> bool {
         self.total == 0
     }
 
     /// The resident list window and its absolute start, for the Library view.
-    pub(crate) fn catalog_window(&self) -> &[LibraryBookEntry] {
+    pub fn catalog_window(&self) -> &[LibraryBookEntry] {
         &self.window[..self.window_len]
     }
 
-    pub(crate) fn catalog_window_start(&self) -> usize {
+    pub fn catalog_window_start(&self) -> usize {
         self.window_start
     }
 
     /// True when the loaded window already covers `[start, start+len)`, so the
     /// firmware can skip a re-read while scrolling inside it.
-    pub(crate) fn window_covers(&self, start: usize, len: usize) -> bool {
+    pub fn window_covers(&self, start: usize, len: usize) -> bool {
         self.window_len > 0
             && start >= self.window_start
             && start + len <= self.window_start + self.window_len
     }
 
     /// Begin filling a fresh window at `start`; `push_window_entry` appends.
-    pub(crate) fn begin_window(&mut self, start: usize) {
+    pub fn begin_window(&mut self, start: usize) {
         self.window_start = start;
         self.window_len = 0;
     }
 
-    pub(crate) fn push_window_entry(
+    pub fn push_window_entry(
         &mut self,
         display_name: &str,
         open_name: &str,
@@ -526,7 +544,7 @@ impl ReaderStore {
     /// Adopt `index` as the active book whose entry the reading path reads
     /// through `catalog_entry`. Read once from CATALOG.BIN at open/restore.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn set_active_entry(
+    pub fn set_active_entry(
         &mut self,
         index: usize,
         display_name: &str,
@@ -567,7 +585,7 @@ impl ReaderStore {
         }
     }
 
-    pub(crate) fn catalog_entry(&self, index: usize) -> Option<&LibraryBookEntry> {
+    pub fn catalog_entry(&self, index: usize) -> Option<&LibraryBookEntry> {
         if self.active_index == Some(index) {
             return Some(&self.active_entry);
         }
@@ -581,17 +599,17 @@ impl ReaderStore {
         None
     }
 
-    pub(crate) fn active_index(&self) -> Option<usize> {
+    pub fn active_index(&self) -> Option<usize> {
         self.active_index
     }
 
-    pub(crate) fn selected_book_index(book_id: u32) -> Option<usize> {
+    pub fn selected_book_index(book_id: u32) -> Option<usize> {
         ReaderSource::from_book_id(book_id)
             .sd_index()
             .map(|index| index as usize)
     }
 
-    pub(crate) fn source_identity(&self, book_id: u32) -> (u32, u32) {
+    pub fn source_identity(&self, book_id: u32) -> (u32, u32) {
         let Some(entry) =
             Self::selected_book_index(book_id).and_then(|index| self.catalog_entry(index))
         else {
@@ -600,7 +618,7 @@ impl ReaderStore {
         (entry.source_hash, entry.byte_size)
     }
 
-    pub(crate) fn clear_toc(&mut self) {
+    pub fn clear_toc(&mut self) {
         self.toc_text_len = 0;
         self.toc_count = 0;
         for (index, record) in self.toc.iter_mut().enumerate() {
@@ -609,7 +627,7 @@ impl ReaderStore {
         }
     }
 
-    pub(crate) fn clear_cover(&mut self) {
+    pub fn clear_cover(&mut self) {
         self.cover_ready = false;
         self.cover_width = COVER_WIDTH as u16;
         self.cover_height = COVER_HEIGHT as u16;
@@ -630,7 +648,7 @@ impl ReaderStore {
         self.cover_ready = true;
     }
 
-    pub(crate) fn clear_lines(&mut self) {
+    pub fn clear_lines(&mut self) {
         self.text_len = 0;
         self.block_count = 0;
         self.page_count = 0;
@@ -655,7 +673,7 @@ impl ReaderStore {
     /// section, instead of writing it as a short, half-empty page the reader
     /// stops on. `first_block` is that page's first block; callers guarantee
     /// `0 < first_block < block_count`.
-    pub(crate) fn carry_last_page(&mut self, first_block: usize) {
+    pub fn carry_last_page(&mut self, first_block: usize) {
         if first_block == 0 || first_block >= self.block_count {
             return;
         }
@@ -691,7 +709,7 @@ impl ReaderStore {
         }
     }
 
-    pub(crate) fn clear_book_index(&mut self) {
+    pub fn clear_book_index(&mut self) {
         self.book_total_pages = 0;
         self.current_section_start_page = 0;
         self.current_section_page_count = 0;
@@ -706,7 +724,7 @@ impl ReaderStore {
         self.chapter_start_ready = false;
     }
 
-    pub(crate) fn begin_book_load(&mut self) {
+    pub fn begin_book_load(&mut self) {
         self.loaded_index = None;
         self.reader_status = BookLoadStatus::Loading;
         self.title.clear();
@@ -717,7 +735,7 @@ impl ReaderStore {
         self.clear_book_index();
     }
 
-    pub(crate) fn finish_book_load(&mut self, index: usize, chapter: u16, status: BookLoadStatus) {
+    pub fn finish_book_load(&mut self, index: usize, chapter: u16, status: BookLoadStatus) {
         if matches!(status, BookLoadStatus::Ready) {
             self.set_current_index(index);
         }
@@ -734,30 +752,99 @@ impl ReaderStore {
         self.reader_status = status;
     }
 
-    pub(crate) fn set_reader_status(&mut self, status: BookLoadStatus) {
+    /// Trim the section under construction back to a whole-page boundary at
+    /// block `cut`, so the section written to the card ends on a page break.
+    ///
+    /// Returns what it set aside for [`Self::restore_trimmed`]. The three
+    /// lengths that describe the arena move as one here, because a caller
+    /// setting them separately is exactly how they come apart.
+    /// Pages in the section currently in the arena. Mirrors `block_count()`:
+    /// readable anywhere, writable only through the methods that keep it
+    /// consistent with the records it counts.
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    /// First block of `page` in the resident page index, or 0 if out of range.
+    pub fn page_first_block(&self, page: usize) -> usize {
+        self.pages
+            .get(page)
+            .map_or(0, |record| record.first_block as usize)
+    }
+
+    pub fn trim_to_page_boundary(&mut self, cut: usize, pages: usize) -> TrimmedTail {
+        let tail = TrimmedTail {
+            blocks: self.block_count,
+            pages: self.page_count,
+            text_len: self.text_len,
+        };
+        self.block_count = cut;
+        self.page_count = pages;
+        self.text_len = self.blocks[cut].text_offset as usize;
+        tail
+    }
+
+    /// Put back all three counters [`Self::trim_to_page_boundary`] set aside,
+    /// before the carried page is rebased.
+    ///
+    /// All three, not two: the trim reduces `page_count` as well, and leaving it
+    /// truncated here would expose a full arena behind a short page index. The
+    /// firmware happens to hide that by rebasing and rebuilding immediately
+    /// afterwards, but an early return or an added assertion between the two
+    /// would see it -- and relying on caller sequencing is the thing this API
+    /// exists to stop.
+    pub fn restore_trimmed(&mut self, tail: TrimmedTail) {
+        self.block_count = tail.blocks;
+        self.page_count = tail.pages;
+        self.text_len = tail.text_len;
+    }
+
+    /// The TOC flag is cleared by whoever takes the text arena back for a real
+    /// section; exposed as a setter so the flag cannot drift from the arena's
+    /// actual contents by direct assignment.
+    pub fn set_text_holds_toc(&mut self, holds: bool) {
+        self.text_holds_toc = holds;
+    }
+
+    /// Whether the chapter start-page map is valid for the resident index.
+    pub fn chapter_start_ready(&self) -> bool {
+        self.chapter_start_ready
+    }
+
+    /// The text arena, borrowed as a scratch buffer while no section is loaded.
+    ///
+    /// The catalog sweep needs a few KB and the arena is the only buffer that
+    /// size which is idle at that point. Named rather than reached through the
+    /// field so the aliasing is deliberate and searchable: any caller of this is
+    /// asserting no section is resident.
+    pub fn arena_as_scratch(&mut self) -> &mut [u8] {
+        &mut self.text
+    }
+
+    pub fn set_reader_status(&mut self, status: BookLoadStatus) {
         self.reader_status = status;
     }
 
-    pub(crate) fn set_reader_error(&mut self, message: &str) {
+    pub fn set_reader_error(&mut self, message: &str) {
         self.error.clear();
         let _ = self.error.push_str(message);
     }
 
-    pub(crate) fn set_cache_key(&mut self, key: &str) {
+    pub fn set_cache_key(&mut self, key: &str) {
         self.cache_key.clear();
         let _ = self.cache_key.push_str(key);
     }
 
-    pub(crate) fn set_book_labels(&mut self, title: &str, author: &str) {
+    pub fn set_book_labels(&mut self, title: &str, author: &str) {
         copy_string(&mut self.title, title);
         copy_string(&mut self.author, author);
     }
 
-    pub(crate) fn page_capacity(&self) -> usize {
+    pub fn page_capacity(&self) -> usize {
         self.pages.len()
     }
 
-    pub(crate) fn block_capacity(&self) -> usize {
+    pub fn block_capacity(&self) -> usize {
         self.blocks.len()
     }
 
@@ -767,11 +854,11 @@ impl ReaderStore {
     /// and `push_line_block` starts silently dropping the rest of the
     /// chapter (text is the tightest of the three section budgets, hit long
     /// before the page or block caps).
-    pub(crate) fn text_capacity_reached(&self) -> bool {
+    pub fn text_capacity_reached(&self) -> bool {
         self.text_len + MAX_READER_BLOCK_TEXT > self.text.len()
     }
 
-    pub(crate) fn block_count(&self) -> usize {
+    pub fn block_count(&self) -> usize {
         self.block_count
     }
 
@@ -833,7 +920,7 @@ impl ReaderStore {
         true
     }
 
-    pub(crate) fn mark_last_block_paragraph_end(&mut self) {
+    pub fn mark_last_block_paragraph_end(&mut self) {
         if self.block_count > 0 {
             self.block_paragraph_end[self.block_count - 1] = true;
         }
@@ -862,15 +949,15 @@ impl ReaderStore {
         self.current_section_page_count = page_count.min(u16::MAX as usize) as u16;
     }
 
-    pub(crate) fn set_section_partial(&mut self, partial: bool) {
+    pub fn set_section_partial(&mut self, partial: bool) {
         self.section_partial = partial;
     }
 
-    pub(crate) fn set_cached_spine(&mut self, spine: u16) {
+    pub fn set_cached_spine(&mut self, spine: u16) {
         self.cached_spine = spine;
     }
 
-    pub(crate) fn set_book_index(
+    pub fn set_book_index(
         &mut self,
         total_pages: u32,
         partial: bool,
@@ -912,7 +999,7 @@ impl ReaderStore {
     /// renderable from the loaded in-RAM section window, so an open or
     /// extend request needs no SD session at all. Partial sections keep
     /// going to SD so the bounded prefix can be regrown.
-    pub(crate) fn covers_global_page(&self, index: usize, global_page: u32) -> bool {
+    pub fn covers_global_page(&self, index: usize, global_page: u32) -> bool {
         self.loaded_index == Some(index)
             && matches!(self.reader_status, BookLoadStatus::Ready)
             && !self.text_holds_toc
@@ -958,7 +1045,7 @@ impl ReaderStore {
     /// than read a single section -- otherwise it resets mid-chapter at each
     /// chunk boundary. Returns None when there is no book index to aggregate
     /// (single in-RAM section), letting the caller fall back.
-    pub(crate) fn chapter_page_position(&self, global_page: u32) -> Option<(u32, u32)> {
+    pub fn chapter_page_position(&self, global_page: u32) -> Option<(u32, u32)> {
         let spine = self.section_for_global_page(global_page)?.spine;
         let mut start = u32::MAX;
         let mut total = 0u32;
@@ -1001,7 +1088,7 @@ impl ReaderStore {
             .unwrap_or(FontStyle::Regular)
     }
 
-    pub(crate) fn advertised_page_count(&self) -> u32 {
+    pub fn advertised_page_count(&self) -> u32 {
         self.book_total_pages.max(self.page_count.max(1) as u32)
     }
 
@@ -1014,11 +1101,11 @@ impl ReaderStore {
         core::str::from_utf8(self.toc_text.get(start..end).unwrap_or(&[])).unwrap_or("")
     }
 
-    pub(crate) fn toc_count(&self) -> usize {
+    pub fn toc_count(&self) -> usize {
         self.toc_count
     }
 
-    pub(crate) fn toc_item(&self, index: usize) -> Option<TocItem<'_>> {
+    pub fn toc_item(&self, index: usize) -> Option<TocItem<'_>> {
         if index >= self.toc_count {
             return None;
         }
@@ -1029,7 +1116,7 @@ impl ReaderStore {
         })
     }
 
-    pub(crate) fn push_toc_record(&mut self, title: &str, level: u8, spine_index: i16) -> bool {
+    pub fn push_toc_record(&mut self, title: &str, level: u8, spine_index: i16) -> bool {
         if self.toc_count >= self.toc.len() {
             return false;
         }
@@ -1068,17 +1155,17 @@ impl ReaderStore {
         self.text_holds_toc = true;
     }
 
-    pub(crate) fn text_holds_toc(&self) -> bool {
+    pub fn text_holds_toc(&self) -> bool {
         self.text_holds_toc
     }
 
-    pub(crate) fn toc_window_start(&self) -> usize {
+    pub fn toc_window_start(&self) -> usize {
         self.toc_window_start
     }
 
     /// Whether the resident TOC window covers `need` chapters from absolute
     /// index `start` (clamped to the on-disk total).
-    pub(crate) fn toc_window_covers(&self, start: usize, need: usize) -> bool {
+    pub fn toc_window_covers(&self, start: usize, need: usize) -> bool {
         let end = (start + need).min(self.toc_total);
         self.text_holds_toc
             && start >= self.toc_window_start
@@ -1101,7 +1188,7 @@ impl ReaderStore {
 
     /// Chapters to show in the overview: the full on-disk count when the TOC
     /// is loaded, else the resident count.
-    pub(crate) fn overview_chapter_count(&self) -> usize {
+    pub fn overview_chapter_count(&self) -> usize {
         if self.text_holds_toc {
             self.toc_total
         } else {
@@ -1111,7 +1198,7 @@ impl ReaderStore {
 
     /// Title of overview chapter `index` (absolute), read straight from the
     /// TOC records in `text` (borrowed, no copy).
-    pub(crate) fn overview_title_at(&self, index: usize) -> &str {
+    pub fn overview_title_at(&self, index: usize) -> &str {
         let Some(base) = self.toc_record_base(index) else {
             return "";
         };
@@ -1119,7 +1206,7 @@ impl ReaderStore {
         core::str::from_utf8(&self.text[base + 4..base + 4 + title_len]).unwrap_or("")
     }
 
-    pub(crate) fn overview_level_at(&self, index: usize) -> u8 {
+    pub fn overview_level_at(&self, index: usize) -> u8 {
         match self.toc_record_base(index) {
             Some(base) => self.text[base + 2],
             None => 1,
@@ -1144,7 +1231,7 @@ impl ReaderStore {
             .unwrap_or(0)
     }
 
-    pub(crate) fn overview_page_at(&self, index: usize) -> u16 {
+    pub fn overview_page_at(&self, index: usize) -> u16 {
         let spine = self.overview_spine_at(index);
         if spine < 0 {
             return 0;
@@ -1156,7 +1243,7 @@ impl ReaderStore {
     /// marks -- covers the whole on-disk TOC (chapter starts are section
     /// starts), so it keeps advancing past the 128-entry resident/event caps
     /// and past chapter 255.
-    pub(crate) fn current_chapter_for_page(&self, page: u32) -> u16 {
+    pub fn current_chapter_for_page(&self, page: u32) -> u16 {
         // Dropped marks (a cleared or rebuilt section table) must never pair
         // with the current sections, even if a caller skips the ready check.
         if !self.chapter_start_ready {
@@ -1170,7 +1257,7 @@ impl ReaderStore {
         )
     }
 
-    pub(crate) fn set_current_chapter(&mut self, chapter: u16, title: &str, source: (u32, u32)) {
+    pub fn set_current_chapter(&mut self, chapter: u16, title: &str, source: (u32, u32)) {
         self.current_chapter = chapter;
         self.current_chapter_source = source;
         self.current_chapter_title.clear();
@@ -1181,16 +1268,24 @@ impl ReaderStore {
         }
     }
 
-    pub(crate) fn current_chapter(&self) -> u16 {
+    /// The catalog row the reader is on, if any. Read-only from outside: the
+    /// only writer is [`Self::set_current_index`], which declines an index past
+    /// the catalog total, and bypassing that check is how `selected_cover` and
+    /// the Library window end up pointing at a row that does not exist.
+    pub fn current_index(&self) -> Option<usize> {
+        self.current_index
+    }
+
+    pub fn current_chapter(&self) -> u16 {
         self.current_chapter
     }
 
-    pub(crate) fn current_chapter_title(&self) -> &str {
+    pub fn current_chapter_title(&self) -> &str {
         self.current_chapter_title.as_str()
     }
 
     /// Source identity of the book `current_chapter_title` was resolved for.
-    pub(crate) fn current_chapter_source(&self) -> (u32, u32) {
+    pub fn current_chapter_source(&self) -> (u32, u32) {
         self.current_chapter_source
     }
 
@@ -1207,7 +1302,7 @@ impl ReaderStore {
         true
     }
 
-    pub(crate) fn active_book_labels<'a>(
+    pub fn active_book_labels<'a>(
         &'a self,
         book_id: u32,
         fallback_title: &'a str,
@@ -1237,7 +1332,7 @@ impl ReaderStore {
             .unwrap_or((fallback_title, fallback_author))
     }
 
-    pub(crate) fn selected_cover(&self, book_id: u32) -> Option<ReaderCover<'_>> {
+    pub fn selected_cover(&self, book_id: u32) -> Option<ReaderCover<'_>> {
         if !ReaderSource::from_book_id(book_id).is_sd()
             || self.current_index != Self::selected_book_index(book_id)
             || !self.cover_ready
@@ -1252,15 +1347,15 @@ impl ReaderStore {
         })
     }
 
-    pub(crate) fn reader_status(&self) -> BookLoadStatus {
+    pub fn reader_status(&self) -> BookLoadStatus {
         self.reader_status
     }
 
-    pub(crate) fn reader_error(&self) -> &str {
+    pub fn reader_error(&self) -> &str {
         self.error.as_str()
     }
 
-    pub(crate) fn chapter_count_for_ui(&self) -> u16 {
+    pub fn chapter_count_for_ui(&self) -> u16 {
         // The full on-disk count (when known) drives the overview's
         // selection range; it can run past the 128-entry resident/event
         // caps, so only the u16 message width bounds it.
@@ -1280,7 +1375,7 @@ impl ReaderStore {
         }
     }
 
-    pub(crate) fn push_line_block(
+    pub fn push_line_block(
         &mut self,
         line: &str,
         style: FontStyle,
@@ -1440,7 +1535,7 @@ impl ui::reading::ReadingBlocks for ReaderStore {
     }
 }
 
-pub(crate) fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
+pub fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
     let mut pages = [0u16; MAX_SD_CHAPTERS];
     if store.toc_count > 0 {
         let count = store
@@ -1462,11 +1557,47 @@ pub(crate) fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPT
     pages
 }
 
-pub(crate) fn source_hash(path: &str, byte_size: u32) -> u32 {
+pub fn source_hash(path: &str, byte_size: u32) -> u32 {
     let mut hash = 0x811c_9dc5u32;
     for byte in path.bytes().chain(byte_size.to_le_bytes()) {
         hash ^= byte as u32;
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use std::boxed::Box;
+
+    /// Invariant: a trim/restore round trip returns all three arena counters.
+    ///
+    /// A unit test rather than an integration one because the counters are
+    /// crate-private -- which is the point of them -- and this asserts the
+    /// property directly rather than through a caller that happens to rebuild
+    /// the page index straight afterwards and mask a partial restore.
+    #[test]
+    fn a_trim_and_restore_round_trip_returns_all_three_counters() {
+        let mut store = Box::new(ReaderStore::new());
+        store.block_count = 40;
+        store.page_count = 5;
+        store.text_len = 900;
+
+        let tail = store.trim_to_page_boundary(30, 4);
+        assert_eq!(store.block_count, 30, "the trim should cut the blocks");
+        assert_eq!(store.page_count, 4, "the trim should drop the partial page");
+        assert_eq!(
+            store.text_len, 0,
+            "the trim should follow the cut block's text offset"
+        );
+
+        store.restore_trimmed(tail);
+        assert_eq!(
+            (store.block_count, store.page_count, store.text_len),
+            (40, 5, 900),
+            "all three counters describe one arena and must come back together"
+        );
+    }
 }

@@ -1,5 +1,3 @@
-use crate::reader_layout;
-use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 use crate::{catalog, AppView, DisplayOrientation, ReaderSource, RenderRequest};
 use core::fmt::Write;
 use display::fb::Framebuffer;
@@ -7,6 +5,8 @@ use display::font::{draw_text, literata, measure_text, FontFamily, FontStyle};
 use display::render::{draw_ascii, fill_rect, stroke_rect};
 use display::Rect;
 use heapless::String;
+use reader_cache::layout;
+use reader_cache::store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 use ui::{
     app_render::{self, UiRenderModel},
     UiBook, UiCover, UiLibraryStatus, UiTocItem,
@@ -255,7 +255,7 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
             draw_sd_reader_error(fb, request, sd_library);
         }
         (BookLoadStatus::Ready, _) => {
-            let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
+            let plan = layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
             ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
             draw_reader_footer(fb, request, sd_library, page_count);
@@ -292,7 +292,7 @@ fn draw_sd_reader_page_with_custom_font(
             draw_sd_reader_error(fb, request, sd_library);
         }
         (BookLoadStatus::Ready, _) => {
-            let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
+            let plan = layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
             if !crate::custom_font::draw_reading_page_body(
                 root,
