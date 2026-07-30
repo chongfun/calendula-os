@@ -864,6 +864,8 @@ pub(crate) fn store_wifi_credentials(
 
 #[inline(never)]
 pub(crate) fn forget_wifi_credentials(epd: &mut Epd, sd_cs: &mut Output<'static>) -> bool {
+    // Not point-free: passing the function directly fixes its `Directory`
+    // lifetime to one region, and `with_root` needs a `for<'a>` caller.
     #[allow(clippy::redundant_closure)]
     sd_session::with_root(epd, sd_cs, |root| files::delete_wifi_file(root)).unwrap_or(false)
 }
@@ -966,6 +968,8 @@ pub(crate) fn load_wifi_credentials(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
 ) -> Option<proto::nvm::WifiCredentialsRecord> {
+    // Not point-free: passing the function directly fixes its `Directory`
+    // lifetime to one region, and `with_root` needs a `for<'a>` caller.
     #[allow(clippy::redundant_closure)]
     sd_session::with_root(epd, sd_cs, |root| files::read_wifi_file(root))
         .ok()
