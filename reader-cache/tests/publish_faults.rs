@@ -658,3 +658,79 @@ fn a_progressive_first_open_adopts_the_cover() {
         "the cover must be available before the background walk finishes"
     );
 }
+
+/// Invariant: once a background walk has grown past the batching threshold, the
+/// step that rewrites BOOK.BIN reports the new published frontier — and if that
+/// write fails, it still must not delete the cache the reader is reading from.
+///
+/// The other `extend_background_index` test stays under
+/// `INDEX_PUBLISH_SECTIONS`, so it only ever exercises the restore read and the
+/// index write never happens. This one crosses the threshold, which is the only
+/// way to reach the `published_now` advance and the refused-write branch beside
+/// it.
+#[test]
+fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // Enough sections that `grown` clears INDEX_PUBLISH_SECTIONS in one step.
+    let sections = 17;
+    let records = build_book(&root, &mut store, sections);
+    let pages = total_pages(&records);
+    let reader_page = records[1].start_page;
+
+    store.begin_book_load();
+    store.set_book_index(pages, false, &records);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+
+    // A clean step: the index lands, so the frontier advances to every section
+    // the walk has built.
+    let published = publish::extend_background_index(
+        &root,
+        KEY,
+        IDENTITY,
+        reader_page,
+        // The spine cursor the resume would carry.
+        sections as u16,
+        0,
+        &mut store,
+        &records,
+        pages,
+    );
+    assert_eq!(
+        published,
+        Ok(sections as u16),
+        "crossing the threshold must advance the published frontier to every built section"
+    );
+
+    // The same step with the index write refused. The reader is inside these
+    // files, so a truncated BOOK.BIN is the correct cost -- never a deleted
+    // cache.
+    disk.fault.fail_write_in.set(Some(0));
+    let refused = publish::extend_background_index(
+        &root,
+        KEY,
+        IDENTITY,
+        reader_page,
+        sections as u16,
+        0,
+        &mut store,
+        &records,
+        pages,
+    );
+    assert_eq!(
+        refused,
+        Err(PublishError::IndexWrite),
+        "a refused index write must be reported, not swallowed"
+    );
+    assert!(
+        sections_still_on_card(&root, sections),
+        "a refused index write must not take the reader's sections with it"
+    );
+    assert!(
+        store.covers_global_page(0, reader_page),
+        "the reader's page must still be resident after the refused write"
+    );
+}
