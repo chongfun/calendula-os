@@ -37,6 +37,11 @@ use proto::captive;
 
 // Measured first-association joins ran ~21 s; give them headroom.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
+/// A directed join talks to one AP on one channel and does no scanning, so
+/// it either associates quickly or the hint is wrong. Bounded well below
+/// [`JOIN_TIMEOUT`] so a stale hint costs seconds before the scan fallback,
+/// not most of the budget the fallback still needs.
+const DIRECTED_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
 /// The hotspot beacons the SSID the join QR names; `ui::join_qr` is the
 /// single source, so the QR a phone scans cannot drift from the AP.
@@ -125,6 +130,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
         http_a,
         http_b,
         wifi: stored_credentials,
+        wifi_hint,
         catalog_len,
         ..
     } = loan;
@@ -186,14 +192,17 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
     let mut session = Session {
         controller,
         stack,
-        started: false,
+        configured: None,
     };
+    // Compile-time credentials never came from a join this device made, so
+    // a stored hint cannot belong to them.
+    let hint = stored_credentials.and(wifi_hint);
 
     // First Start already consumed; later Starts are Confirm retries
     // from the error screen. A successful join falls through to the
     // book server, which runs until the session's reset.
     let ip = loop {
-        match session.attempt(creds.ssid(), creds.password()).await {
+        match session.attempt(creds.ssid(), creds.password(), hint).await {
             Ok(ip) => break ip,
             Err(error) => send_event(SyncEvent::Failed(error)),
         }
@@ -1069,17 +1078,59 @@ fn send_event(event: SyncEvent) {
     }
 }
 
+/// Which route a join attempt takes to the access point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinPlan {
+    /// Straight at one AP on one channel: no scan at all, which is the
+    /// whole saving. Only ever built from a hint the storage task has
+    /// already matched to this network.
+    Directed { bssid: [u8; 6], channel: u8 },
+    /// Sweep every channel and let the radio's always-on sort-by-signal
+    /// pick the strongest match. The default fast scan joins the first
+    /// BSSID that answers, which on multi-AP and mesh networks can be a
+    /// weak far node.
+    Scan,
+}
+
 struct Session {
     controller: WifiController<'static>,
     stack: Stack<'static>,
-    started: bool,
+    /// The plan the controller is currently configured for. Reconfiguring
+    /// restarts the radio, so it happens only when the plan actually
+    /// changes — which on a retry at the same plan is never.
+    configured: Option<JoinPlan>,
 }
 
 impl Session {
     /// One join attempt: associate, wait for DHCP, report the address.
-    async fn attempt(&mut self, ssid: &str, password: &str) -> Result<[u8; 4], SyncError> {
+    ///
+    /// A hint is tried first and the scan is the fallback, so a router that
+    /// moved channel or an AP that went away costs
+    /// [`DIRECTED_JOIN_TIMEOUT`] and then behaves exactly as it did before
+    /// hints existed.
+    async fn attempt(
+        &mut self,
+        ssid: &str,
+        password: &str,
+        hint: Option<app_core::WifiApHint>,
+    ) -> Result<[u8; 4], SyncError> {
         send_event(SyncEvent::Connecting);
-        self.join(ssid, password).await?;
+
+        let directed = hint.map(|hint| JoinPlan::Directed {
+            bssid: hint.bssid,
+            channel: hint.channel,
+        });
+        let mut joined = Err(SyncError::Join);
+        for plan in directed.into_iter().chain(core::iter::once(JoinPlan::Scan)) {
+            joined = self.join(ssid, password, plan).await;
+            if joined.is_ok() {
+                break;
+            }
+            if matches!(plan, JoinPlan::Directed { .. }) {
+                esp_println::println!("wifi: directed join missed; falling back to scan");
+            }
+        }
+        joined?;
 
         let config = with_timeout(DHCP_TIMEOUT, async {
             loop {
@@ -1098,34 +1149,41 @@ impl Session {
             esp_alloc::HEAP.used(),
             esp_alloc::HEAP.free()
         );
+        self.record_ap_hint(ssid, hint).await;
         send_event(SyncEvent::Connected(ip));
         Ok(ip)
     }
 
-    async fn join(&mut self, ssid: &str, password: &str) -> Result<(), SyncError> {
-        if !self.started {
-            let config = WifiConfig::Station(
-                StationConfig::default()
-                    .with_ssid(ssid)
-                    .with_password(password.into())
-                    // The default fast scan joins the first BSSID that answers,
-                    // which on multi-AP/mesh networks can be a weak far node.
-                    // All-channels makes the radio's always-on sort-by-signal
-                    // pick the strongest match, costing one full sweep (~1-2 s)
-                    // per join against JOIN_TIMEOUT's ~14 s of headroom.
-                    .with_scan_method(ScanMethod::AllChannels)
-                    .with_auth_method(if password.is_empty() {
-                        AuthenticationMethod::None
-                    } else {
-                        AuthenticationMethod::Wpa2Personal
-                    }),
-            );
+    async fn join(&mut self, ssid: &str, password: &str, plan: JoinPlan) -> Result<(), SyncError> {
+        if self.configured != Some(plan) {
+            let auth = if password.is_empty() {
+                AuthenticationMethod::None
+            } else {
+                AuthenticationMethod::Wpa2Personal
+            };
+            let station = StationConfig::default()
+                .with_ssid(ssid)
+                .with_password(password.into())
+                .with_auth_method(auth);
+            let station = match plan {
+                JoinPlan::Directed { bssid, channel } => station
+                    .with_bssid(bssid)
+                    .with_channel(channel)
+                    // Naming the BSSID and channel is the point; a sweep
+                    // would throw the saving away.
+                    .with_scan_method(ScanMethod::Fast),
+                JoinPlan::Scan => station.with_scan_method(ScanMethod::AllChannels),
+            };
             self.controller
-                .set_config(&config)
+                .set_config(&WifiConfig::Station(station))
                 .map_err(|_| SyncError::Join)?;
-            self.started = true;
+            self.configured = Some(plan);
         }
-        with_timeout(JOIN_TIMEOUT, self.controller.connect_async())
+        let timeout = match plan {
+            JoinPlan::Directed { .. } => DIRECTED_JOIN_TIMEOUT,
+            JoinPlan::Scan => JOIN_TIMEOUT,
+        };
+        with_timeout(timeout, self.controller.connect_async())
             .await
             .map_err(|_| SyncError::Join)?
             .map(|_| ())
@@ -1133,5 +1191,46 @@ impl Session {
                 esp_println::println!("wifi: join failed: {:?}", err);
                 SyncError::Join
             })
+    }
+
+    /// Persist the AP this session actually associated through, when it is
+    /// not already what the hint said.
+    ///
+    /// Read back from the radio rather than assumed from the plan, because
+    /// the scan path chooses an AP this task never names — that choice is
+    /// exactly what is worth remembering. Writing only on a change keeps a
+    /// repeat session from spending an SD write to store what is already
+    /// there.
+    async fn record_ap_hint(&mut self, ssid: &str, hint: Option<app_core::WifiApHint>) {
+        let Ok(info) = self.controller.ap_info() else {
+            return;
+        };
+        let learned = app_core::WifiApHint {
+            bssid: info.bssid,
+            channel: info.channel,
+        };
+        if hint == Some(learned) {
+            return;
+        }
+        // The storage side refuses a channel outside 1-14, so a radio that
+        // reports something else would only produce a record that never
+        // decodes. Drop it here instead.
+        if learned.channel == 0 || learned.channel > 14 {
+            return;
+        }
+        let Some(ssid) = app_core::WifiSsid::new(ssid) else {
+            return;
+        };
+        esp_println::println!(
+            "wifi: learned ap channel={} bssid={:02x?}",
+            learned.channel,
+            learned.bssid
+        );
+        STORAGE_COMMANDS
+            .send(StorageCommand::StoreWifiApHint {
+                ssid,
+                hint: learned,
+            })
+            .await;
     }
 }

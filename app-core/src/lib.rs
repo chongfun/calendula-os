@@ -432,6 +432,13 @@ pub enum StorageCommand {
     /// /XTEINK/WIFI.BIN. Allowed during a sync session: it is the portal
     /// that sends it.
     StoreWifiCredentials(WifiCredentials),
+    /// Record which AP a join actually landed on, keyed to the network it
+    /// was for. Fire-and-forget: nothing waits on it and a failed write
+    /// only costs the next session a scan.
+    StoreWifiApHint {
+        ssid: WifiSsid,
+        hint: WifiApHint,
+    },
     /// Delete /XTEINK/WIFI.BIN. Sent when the user confirms "forget" on
     /// the Wireless screen, which is only reachable before the radio
     /// starts, so it never runs during a sync session.
@@ -1033,6 +1040,9 @@ impl SyncSession {
                 command,
                 StorageCommand::StoreProgress(_)
                     | StorageCommand::StoreWifiCredentials(_)
+                    // Learned at the moment of joining, which is inside the
+                    // session; refusing it here would drop every hint.
+                    | StorageCommand::StoreWifiApHint { .. }
                     | StorageCommand::ReceiveUpload
             ),
         }
@@ -1093,6 +1103,21 @@ impl WifiCredentials {
             len: self.ssid_len,
         }
     }
+}
+
+/// Which access point the station last associated through, for a directed
+/// join that skips the all-channel sweep.
+///
+/// A hint and nothing more: the join falls back to a full scan whenever it
+/// is missing, stale, or simply does not answer. Keyed to an SSID on disk
+/// (see `proto::nvm::WifiApHintRecord`), but by the time one reaches here
+/// the storage task has already proven it belongs to the network being
+/// joined, so this carries only the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WifiApHint {
+    pub bssid: [u8; 6],
+    /// 1-14, never zero — the storage side refuses anything else.
+    pub channel: u8,
 }
 
 /// A network name alone, as a bounded Copy message: what the Wireless

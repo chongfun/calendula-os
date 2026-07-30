@@ -411,9 +411,13 @@ where
 
 const WIFI_FILE: &str = "WIFI.BIN";
 const WIFI_GENERATIONS: [&str; 2] = ["WIFIA.BIN", "WIFIB.BIN"];
+/// The AP hint's own generation pair, separate from the credentials' —
+/// see [`proto::nvm::WifiApHintRecord`] for why the two are not one record.
+const WIFI_HINT_GENERATIONS: [&str; 2] = ["WIFHA.BIN", "WIFHB.BIN"];
 /// MarigoldOS v0.4.x durable-credentials magic; byte-identical for card
 /// interchange.
 const WIFI_DURABLE_MAGIC: [u8; 4] = *b"MGWF";
+const WIFI_HINT_DURABLE_MAGIC: [u8; 4] = *b"CAWH";
 
 /// Write the onboarding portal's credentials to alternating WIFIA/WIFIB.
 #[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
@@ -459,11 +463,77 @@ where
         return true;
     };
     let mut ok = true;
-    for name in [WIFI_FILE, WIFI_GENERATIONS[0], WIFI_GENERATIONS[1]] {
+    for name in [
+        WIFI_FILE,
+        WIFI_GENERATIONS[0],
+        WIFI_GENERATIONS[1],
+        // Forgetting a network forgets which AP served it. Leaving the hint
+        // would steer the next join for a *different* network toward it —
+        // the SSID hash refuses that, but a hint for a network the user
+        // deliberately dropped has no reason to survive either.
+        WIFI_HINT_GENERATIONS[0],
+        WIFI_HINT_GENERATIONS[1],
+    ] {
         ok &= upload_store::remove_file_reclaiming_clusters(&xteink, name)
             != upload_store::RemoveStatus::Failed;
     }
     ok
+}
+
+/// Persist which AP the station last associated through, so the next session
+/// can join it directly instead of sweeping every channel.
+///
+/// Failure is ignored by callers by design: the hint is an accelerator, and a
+/// session that cannot write one simply scans next time.
+#[allow(clippy::result_unit_err)] // Same as the credentials writer above: the card gives no distinguishable reason, and the only caller branches on success.
+pub fn write_wifi_hint_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    record: proto::nvm::WifiApHintRecord,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    write_two_generation(
+        &xteink,
+        WIFI_HINT_GENERATIONS,
+        WIFI_HINT_DURABLE_MAGIC,
+        &record.encode(),
+    )
+}
+
+/// Read the stored AP hint. `None` for missing, torn, or nonsensical —
+/// every one of which just means the next join scans.
+pub fn read_wifi_hint_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<proto::nvm::WifiApHintRecord>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let mut bytes = [0u8; proto::nvm::WifiApHintRecord::ENCODED_LEN];
+    read_two_generation(
+        &xteink,
+        WIFI_HINT_GENERATIONS,
+        WIFI_HINT_DURABLE_MAGIC,
+        &mut bytes,
+    )
+    .then(|| proto::nvm::WifiApHintRecord::decode(&bytes))
+    .flatten()
 }
 
 /// Read the newest WIFIA/WIFIB generation, falling back to legacy WIFI.BIN;

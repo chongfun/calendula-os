@@ -1201,13 +1201,25 @@ fn handle_storage_command(
             *background_build = None;
             sync_session.loan_granted();
             let mut loan = book_build::dismantle_scratch(scratch);
-            loan.wifi = book_build::load_wifi_credentials(epd, sd_cs).map(|record| {
-                app_core::WifiCredentials {
-                    ssid: record.ssid,
-                    ssid_len: record.ssid_len,
-                    password: record.password,
-                    password_len: record.password_len,
-                }
+            let stored_wifi = book_build::load_wifi_credentials(epd, sd_cs);
+            // The hint is matched against the credentials here rather than in
+            // the wifi task, because this is the one place holding both
+            // records — and a hint for another network must never steer this
+            // join. A mismatch is not an error; it just means scan.
+            loan.wifi_hint = stored_wifi.as_ref().and_then(|creds| {
+                let ssid = &creds.ssid[..creds.ssid_len.min(32) as usize];
+                book_build::load_wifi_ap_hint(epd, sd_cs)
+                    .filter(|hint| hint.matches_ssid(ssid))
+                    .map(|hint| app_core::WifiApHint {
+                        bssid: hint.bssid,
+                        channel: hint.channel,
+                    })
+            });
+            loan.wifi = stored_wifi.map(|record| app_core::WifiCredentials {
+                ssid: record.ssid,
+                ssid_len: record.ssid_len,
+                password: record.password,
+                password_len: record.password_len,
             });
             loan.catalog_len = crate::library_sd::write_catalog_listing(epd, sd_cs, loan.http_b);
             if crate::SYNC_LOANS.try_send(Ok(loan)).is_err() {
@@ -1599,6 +1611,21 @@ fn handle_storage_command(
                 confirmed
             );
             let _ = crate::WIFI_STORAGE_RESULTS.try_send(confirmed);
+        }
+        StorageCommand::StoreWifiApHint { ssid, hint } => {
+            let record = proto::nvm::WifiApHintRecord {
+                ssid_hash: proto::nvm::WifiApHintRecord::hash_ssid(ssid.as_str().as_bytes()),
+                bssid: hint.bssid,
+                channel: hint.channel,
+            };
+            // No confirmation channel, unlike the credentials: nothing waits
+            // on this and a lost hint costs one scan.
+            let written = book_build::store_wifi_ap_hint(epd, sd_cs, record);
+            esp_println::println!(
+                "storage: wifi ap hint written={} channel={}",
+                written,
+                hint.channel
+            );
         }
         StorageCommand::ForgetWifiCredentials => {
             let forgotten = book_build::forget_wifi_credentials(epd, sd_cs);
