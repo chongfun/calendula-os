@@ -314,6 +314,10 @@ where
     }
     let restored = restore_reader_page(root, cache_key, source_identity, reader_page, library);
     match published {
+        // Handled by the early return above; named rather than left to a
+        // wildcard so a new outcome variant is a compile error here instead of
+        // silently falling into one of the failure paths below.
+        BookPublishOutcome::Ready => Ok(()),
         // The index never landed, so the book is not finished however the page
         // read went. Report it and let the next open rebuild.
         BookPublishOutcome::IndexWriteFailed => {
@@ -327,7 +331,7 @@ where
         // abandoned would throw away a finished book — no continuation left to
         // announce the final page count, and a reader stuck against the old
         // frontier until they reopen. Finish the job instead.
-        _ if restored => {
+        BookPublishOutcome::SectionReadFailed if restored => {
             layout::rebuild_toc_page_targets(library);
             let page = reader_page.min(library.advertised_page_count().saturating_sub(1));
             refresh_chapter_tracking(root, cache_key, source_identity, page, library);
@@ -337,7 +341,7 @@ where
             );
             Ok(())
         }
-        _ => {
+        BookPublishOutcome::SectionReadFailed => {
             cache_log!("epub: final background publish section read failed");
             Err(PublishError::SectionRead)
         }
