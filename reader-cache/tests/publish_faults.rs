@@ -11,8 +11,12 @@
 //! reach.
 //!
 //! So each test below arms a fault at a specific write or read and asserts what
-//! must survive it. The harness is `upload-store/tests/transaction.rs`'s,
-//! reused deliberately rather than reinvented.
+//! must survive it. The card model — `FaultyDisk`, `FaultPlan`, the MBR + FAT16
+//! image — is copied from `upload-store/tests/transaction.rs` rather than shared:
+//! integration tests cannot import each other, and exporting a harness from
+//! `upload-store`'s public API to avoid ~120 duplicated lines would put test
+//! scaffolding in a shipped crate. If a third crate ever needs it, that is the
+//! point to extract it into a dev-only crate of its own.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
