@@ -189,7 +189,7 @@ pub struct ReaderStore {
     /// happens to be scrolled; `catalog_entry` returns it for `active_index`.
     active_entry: LibraryBookEntry,
     active_index: Option<usize>,
-    pub current_index: Option<usize>,
+    pub(crate) current_index: Option<usize>,
     pub loaded_index: Option<usize>,
     pub(crate) loaded_chapter: u16,
     pub(crate) reader_status: BookLoadStatus,
@@ -214,7 +214,7 @@ pub struct ReaderStore {
     pub(crate) toc_text_len: usize,
     pub(crate) toc: [TocRecord; MAX_SD_TOC_ITEMS],
     pub(crate) toc_page: [u16; MAX_SD_TOC_ITEMS],
-    pub toc_count: usize,
+    pub(crate) toc_count: usize,
     /// Full chapter count from TOC.BIN (the on-disk list), which can exceed
     /// the resident `toc_count`. The Chapters overview reads the full list.
     pub(crate) toc_total: usize,
@@ -225,7 +225,7 @@ pub struct ReaderStore {
     /// for `i < toc_window_len`. Slid around the visible rows before each
     /// Chapters render, like the Library's catalog window.
     pub(crate) text_holds_toc: bool,
-    pub toc_window_start: usize,
+    pub(crate) toc_window_start: usize,
     pub(crate) toc_window_len: usize,
     /// Per-section chapter-start marks (`chapter + 1`, 0 = none), parallel to
     /// `book_sections` and filled once at open from TOC.BIN. Chapter start
@@ -246,13 +246,13 @@ pub struct ReaderStore {
     /// Current chapter and its title, resolved by the firmware from
     /// `chapter_start` + the reading page on each section load, for the
     /// Home/sleep colophon and the overview's starting selection.
-    pub current_chapter: u16,
-    pub current_chapter_title: String<MAX_CURRENT_CHAPTER_TITLE>,
+    pub(crate) current_chapter: u16,
+    pub(crate) current_chapter_title: String<MAX_CURRENT_CHAPTER_TITLE>,
     /// Source identity (hash, size) of the book `current_chapter_title` belongs
     /// to, so a colophon shows it only for that book -- the resolved title
     /// outlives a single load (it is also set on boot restore, before the book
     /// is opened, so wake-to-Home names the chapter without a full open).
-    pub current_chapter_source: (u32, u32),
+    pub(crate) current_chapter_source: (u32, u32),
     pub(crate) text: [u8; MAX_READER_TEXT_BYTES],
     pub(crate) text_len: usize,
     pub(crate) blocks: [BlockRecord; MAX_READER_BLOCKS],
@@ -1266,6 +1266,14 @@ impl ReaderStore {
                 break;
             }
         }
+    }
+
+    /// The catalog row the reader is on, if any. Read-only from outside: the
+    /// only writer is [`Self::set_current_index`], which declines an index past
+    /// the catalog total, and bypassing that check is how `selected_cover` and
+    /// the Library window end up pointing at a row that does not exist.
+    pub fn current_index(&self) -> Option<usize> {
+        self.current_index
     }
 
     pub fn current_chapter(&self) -> u16 {

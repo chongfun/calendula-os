@@ -955,7 +955,7 @@ pub(crate) fn clear_book_cache(
             library.set_text_holds_toc(false);
             library.set_reader_status(BookLoadStatus::Empty);
         }
-        if library.current_index == Some(index) {
+        if library.current_index() == Some(index) {
             // COVER.BIN is gone; the resident cover regenerates on rebuild.
             library.clear_cover();
         }
@@ -1560,7 +1560,7 @@ where
     esp_println::println!(
         "epub: toc parsed after {} ms ({} item(s))",
         open_started.elapsed().as_millis(),
-        library.toc_count
+        library.toc_count()
     );
     let css_rules = CssRules::new();
 
