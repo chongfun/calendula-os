@@ -157,6 +157,16 @@ pub struct TocItem<'a> {
     pub page: u32,
 }
 
+/// The lengths a trim set aside, so they can only be put back as a set.
+///
+/// Opaque on purpose: `block_count`, `page_count` and `text_len` describe one
+/// arena and have to move together.
+#[derive(Clone, Copy)]
+pub struct TrimmedTail {
+    blocks: usize,
+    text_len: usize,
+}
+
 pub struct ReaderStore {
     pub status: LibraryScanStatus,
     /// Full book count across CATALOG.BIN (the source of truth), independent of
@@ -181,7 +191,7 @@ pub struct ReaderStore {
     pub current_index: Option<usize>,
     pub loaded_index: Option<usize>,
     pub(crate) loaded_chapter: u16,
-    pub reader_status: BookLoadStatus,
+    pub(crate) reader_status: BookLoadStatus,
     pub title: String<64>,
     pub(crate) author: String<64>,
     pub(crate) error: String<32>,
@@ -213,7 +223,7 @@ pub struct ReaderStore {
     /// holds a window: `text` record `i` is chapter `toc_window_start + i`,
     /// for `i < toc_window_len`. Slid around the visible rows before each
     /// Chapters render, like the Library's catalog window.
-    pub text_holds_toc: bool,
+    pub(crate) text_holds_toc: bool,
     pub toc_window_start: usize,
     pub(crate) toc_window_len: usize,
     /// Per-section chapter-start marks (`chapter + 1`, 0 = none), parallel to
@@ -225,13 +235,13 @@ pub struct ReaderStore {
     pub(crate) chapter_start: [u16; MAX_BOOK_SECTIONS],
     /// Whether `chapter_start` holds the current book's marks; independent of
     /// the overview's `toc_total` so the map survives a Chapters visit.
-    pub chapter_start_ready: bool,
+    pub(crate) chapter_start_ready: bool,
     /// `(source_hash, source_size, font_config, custom_font_identity)` the
     /// `chapter_start` map was built for. The book index reloads every section
     /// crossing, so this token keeps the map from being re-read from disk
     /// except on a new book, a repaginating settings change, or a custom pack
     /// replacement.
-    pub chapter_start_token: (u32, u32, u16, u64),
+    pub(crate) chapter_start_token: (u32, u32, u16, u64),
     /// Current chapter and its title, resolved by the firmware from
     /// `chapter_start` + the reading page on each section load, for the
     /// Home/sleep colophon and the overview's starting selection.
@@ -242,11 +252,11 @@ pub struct ReaderStore {
     /// outlives a single load (it is also set on boot restore, before the book
     /// is opened, so wake-to-Home names the chapter without a full open).
     pub current_chapter_source: (u32, u32),
-    pub text: [u8; MAX_READER_TEXT_BYTES],
-    pub text_len: usize,
-    pub blocks: [BlockRecord; MAX_READER_BLOCKS],
+    pub(crate) text: [u8; MAX_READER_TEXT_BYTES],
+    pub(crate) text_len: usize,
+    pub(crate) blocks: [BlockRecord; MAX_READER_BLOCKS],
     pub(crate) block_styles: [FontStyle; MAX_READER_BLOCKS],
-    pub block_spine: [u16; MAX_READER_BLOCKS],
+    pub(crate) block_spine: [u16; MAX_READER_BLOCKS],
     pub(crate) block_page_break_before: [bool; MAX_READER_BLOCKS],
     pub block_paragraph_end: [bool; MAX_READER_BLOCKS],
     /// True for a block that opens a paragraph (its opening line takes the
@@ -254,10 +264,10 @@ pub struct ReaderStore {
     /// carries a half-finished paragraph in at its front keeps that
     /// continuation line flush left.
     pub(crate) block_paragraph_start: [bool; MAX_READER_BLOCKS],
-    pub block_count: usize,
-    pub pages: [PageRecord; MAX_READER_PAGES],
-    pub page_spine: [u16; MAX_READER_PAGES],
-    pub page_count: usize,
+    pub(crate) block_count: usize,
+    pub(crate) pages: [PageRecord; MAX_READER_PAGES],
+    pub(crate) page_spine: [u16; MAX_READER_PAGES],
+    pub(crate) page_count: usize,
     type_settings: TypeSettings,
     /// Whether the current layout paginates into the portrait page box.
     portrait: bool,
@@ -739,6 +749,66 @@ impl ReaderStore {
             self.note_loaded_title(index);
         }
         self.reader_status = status;
+    }
+
+    /// Trim the section under construction back to a whole-page boundary at
+    /// block `cut`, so the section written to the card ends on a page break.
+    ///
+    /// Returns what it set aside for [`Self::restore_trimmed`]. The three
+    /// lengths that describe the arena move as one here, because a caller
+    /// setting them separately is exactly how they come apart.
+    /// Pages in the section currently in the arena. Mirrors `block_count()`:
+    /// readable anywhere, writable only through the methods that keep it
+    /// consistent with the records it counts.
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    /// First block of `page` in the resident page index, or 0 if out of range.
+    pub fn page_first_block(&self, page: usize) -> usize {
+        self.pages
+            .get(page)
+            .map_or(0, |record| record.first_block as usize)
+    }
+
+    pub fn trim_to_page_boundary(&mut self, cut: usize, pages: usize) -> TrimmedTail {
+        let tail = TrimmedTail {
+            blocks: self.block_count,
+            text_len: self.text_len,
+        };
+        self.block_count = cut;
+        self.page_count = pages;
+        self.text_len = self.blocks[cut].text_offset as usize;
+        tail
+    }
+
+    /// Put back what [`Self::trim_to_page_boundary`] set aside, before the
+    /// carried page is rebased.
+    pub fn restore_trimmed(&mut self, tail: TrimmedTail) {
+        self.block_count = tail.blocks;
+        self.text_len = tail.text_len;
+    }
+
+    /// The TOC flag is cleared by whoever takes the text arena back for a real
+    /// section; exposed as a setter so the flag cannot drift from the arena's
+    /// actual contents by direct assignment.
+    pub fn set_text_holds_toc(&mut self, holds: bool) {
+        self.text_holds_toc = holds;
+    }
+
+    /// Whether the chapter start-page map is valid for the resident index.
+    pub fn chapter_start_ready(&self) -> bool {
+        self.chapter_start_ready
+    }
+
+    /// The text arena, borrowed as a scratch buffer while no section is loaded.
+    ///
+    /// The catalog sweep needs a few KB and the arena is the only buffer that
+    /// size which is idle at that point. Named rather than reached through the
+    /// field so the aliasing is deliberate and searchable: any caller of this is
+    /// asserting no section is resident.
+    pub fn arena_as_scratch(&mut self) -> &mut [u8] {
+        &mut self.text
     }
 
     pub fn set_reader_status(&mut self, status: BookLoadStatus) {

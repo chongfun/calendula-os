@@ -102,3 +102,56 @@ pub fn rebuild_toc_page_targets(library: &mut ReaderStore) {
         library.toc_page[toc_index] = page.min(u16::MAX as usize) as u16;
     }
 }
+
+/// Mirror the block just appended into the page index through the shared
+/// incremental cursor — O(1) per line, the streaming counterpart of
+/// [`rebuild_page_index`].
+///
+/// Exists so the three fields a placement touches (`pages`, `page_spine`,
+/// `page_count`) stay inside this crate: a caller that borrows all three at once
+/// can leave the index describing a different arena than the one it holds.
+/// Returns whether the page records overflowed their capacity.
+pub fn place_appended_block(
+    library: &mut ReaderStore,
+    cursor: &mut PageIndexCursor,
+    index: usize,
+) -> bool {
+    let placement = cursor.place_next_block(library, index);
+    let spine = library.block_spine.get(index).copied().unwrap_or(0);
+    let mut overflowed = false;
+    apply_block_placement(
+        placement,
+        index,
+        spine,
+        &mut library.pages,
+        &mut library.page_spine,
+        &mut library.page_count,
+        &mut overflowed,
+    );
+    overflowed
+}
+
+/// Re-place just the last block after `mark_last_block_paragraph_end` grew it,
+/// moving it to a fresh page when it no longer fits — the bounded fix-up a full
+/// rebuild would arrive at anyway. Returns whether the records overflowed.
+pub fn replace_last_block(
+    library: &mut ReaderStore,
+    cursor: &mut PageIndexCursor,
+    index: usize,
+) -> bool {
+    let placement = cursor.replace_last_block(library, index);
+    if placement != ui::reading::BlockPlacement::NewPage {
+        return false;
+    }
+    let spine = library.block_spine.get(index).copied().unwrap_or(0);
+    let mut overflowed = false;
+    ui::reading::apply_last_block_move(
+        index,
+        spine,
+        &mut library.pages,
+        &mut library.page_spine,
+        &mut library.page_count,
+        &mut overflowed,
+    );
+    overflowed
+}

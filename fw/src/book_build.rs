@@ -952,8 +952,8 @@ pub(crate) fn clear_book_cache(
             library.clear_book_index();
             library.clear_lines();
             library.clear_toc();
-            library.text_holds_toc = false;
-            library.reader_status = BookLoadStatus::Empty;
+            library.set_text_holds_toc(false);
+            library.set_reader_status(BookLoadStatus::Empty);
         }
         if library.current_index == Some(index) {
             // COVER.BIN is gone; the resident cover regenerates on rebuild.
@@ -1042,7 +1042,7 @@ pub(crate) fn track_reading_chapter(
     global_page: u32,
     library: &mut ReaderStore,
 ) -> Option<u16> {
-    if !library.chapter_start_ready {
+    if !library.chapter_start_ready() {
         return None;
     }
     let current = library.current_chapter_for_page(global_page);
@@ -2718,18 +2718,9 @@ where
     /// Mirror the block just appended (at `block_count - 1`) into the page
     /// index through the shared incremental cursor — O(1) per line.
     fn note_block_appended(&mut self) {
-        let index = self.library.block_count - 1;
-        let placement = self.page_cursor.place_next_block(self.library, index);
-        let spine = self.library.block_spine.get(index).copied().unwrap_or(0);
-        ui::reading::apply_block_placement(
-            placement,
-            index,
-            spine,
-            &mut self.library.pages,
-            &mut self.library.page_spine,
-            &mut self.library.page_count,
-            &mut self.page_overflowed,
-        );
+        let index = self.library.block_count() - 1;
+        self.page_overflowed |=
+            layout::place_appended_block(self.library, &mut self.page_cursor, index);
     }
 
     /// Bounded fix-up for `mark_last_block_paragraph_end`: the mark grows
@@ -2737,18 +2728,8 @@ where
     /// re-place just that block; when it no longer fits its page, move it
     /// to a fresh one, exactly as a full rebuild would.
     fn note_last_block_grew(&mut self, index: usize) {
-        let placement = self.page_cursor.replace_last_block(self.library, index);
-        if placement == ui::reading::BlockPlacement::NewPage {
-            let spine = self.library.block_spine.get(index).copied().unwrap_or(0);
-            ui::reading::apply_last_block_move(
-                index,
-                spine,
-                &mut self.library.pages,
-                &mut self.library.page_spine,
-                &mut self.library.page_count,
-                &mut self.page_overflowed,
-            );
-        }
+        self.page_overflowed |=
+            layout::replace_last_block(self.library, &mut self.page_cursor, index);
     }
 
     fn reset_page_cursor(&mut self) {
@@ -2762,7 +2743,7 @@ where
     }
 
     fn flush_section(&mut self, partial: bool, carry_incomplete: bool) -> bool {
-        if self.library.block_count() == 0 || self.library.page_count == 0 {
+        if self.library.block_count() == 0 || self.library.page_count() == 0 {
             self.library.clear_lines();
             self.reset_page_cursor();
             return true;
@@ -2782,19 +2763,15 @@ where
         // last section of a chapter (finish_spine) keeps its trailing page —
         // that is the genuine end of the text.
         let full_blocks = self.library.block_count();
-        let full_text = self.library.text_len;
-        let full_pages = self.library.page_count;
+        let full_pages = self.library.page_count();
         let carry_first = if carry_incomplete && full_pages > 1 {
-            let cut = self.library.pages[full_pages - 1].first_block as usize;
+            let cut = self.library.page_first_block(full_pages - 1);
             (cut > 0 && cut < full_blocks).then_some(cut)
         } else {
             None
         };
-        if let Some(cut) = carry_first {
-            self.library.block_count = cut;
-            self.library.page_count = full_pages - 1;
-            self.library.text_len = self.library.blocks[cut].text_offset as usize;
-        }
+        let trimmed =
+            carry_first.map(|cut| self.library.trim_to_page_boundary(cut, full_pages - 1));
 
         self.library.set_cached_spine(self.spine_index);
         self.library.set_section_partial(partial);
@@ -2817,16 +2794,17 @@ where
             section: section_id,
             spine: self.spine_index,
             start_page: *self.total_pages,
-            page_count: self.library.page_count.min(u16::MAX as usize) as u16,
+            page_count: self.library.page_count().min(u16::MAX as usize) as u16,
             partial,
         };
-        *self.total_pages = (*self.total_pages).saturating_add(self.library.page_count as u32);
+        *self.total_pages = (*self.total_pages).saturating_add(self.library.page_count() as u32);
         *self.section_count += 1;
 
         match carry_first {
             Some(cut) => {
-                self.library.block_count = full_blocks;
-                self.library.text_len = full_text;
+                if let Some(tail) = trimmed {
+                    self.library.restore_trimmed(tail);
+                }
                 self.library.carry_last_page(cut);
                 // Full rebuild on the carry path: the carried blocks were
                 // rebased, so re-derive the page records and adopt the
@@ -2844,7 +2822,7 @@ where
     }
 
     fn flush_if_full(&mut self) {
-        if self.library.page_count >= self.target_pages
+        if self.library.page_count() >= self.target_pages
             || self.library.block_count() >= self.library.block_capacity().saturating_sub(4)
             || self.library.text_capacity_reached()
         {
@@ -3011,11 +2989,11 @@ fn push_styled_preview_fragment<
         // flushed yet: the previous block still closes a paragraph. Once the
         // first line flushes (as a non-end block) this goes false and the
         // continuation lines wrap at the full width.
-        let opens_paragraph = sink.library.block_count == 0
+        let opens_paragraph = sink.library.block_count() == 0
             || sink
                 .library
                 .block_paragraph_end
-                .get(sink.library.block_count.wrapping_sub(1))
+                .get(sink.library.block_count().wrapping_sub(1))
                 .copied()
                 .unwrap_or(true);
         let x_eff = if opens_paragraph { x + indent } else { x };
@@ -3090,7 +3068,7 @@ fn flush_styled_preview_line<
 {
     if sink.line.is_empty() {
         if paragraph_end {
-            let count = sink.library.block_count;
+            let count = sink.library.block_count();
             let changed = count > 0 && !sink.library.block_paragraph_end[count - 1];
             sink.library.mark_last_block_paragraph_end();
             if changed {
@@ -3127,7 +3105,7 @@ fn flush_styled_preview_line<
             sink.generated_toc_for_spine = true;
         }
     }
-    let mut appended_from = sink.library.block_count;
+    let mut appended_from = sink.library.block_count();
     if !sink.library.push_line_block(
         line.as_str(),
         style,
@@ -3143,7 +3121,7 @@ fn flush_styled_preview_line<
         // refuses and sets book_partial; the line is then genuinely
         // dropped, which is the separate whole-book limit.)
         sink.flush_section(false, true);
-        appended_from = sink.library.block_count;
+        appended_from = sink.library.block_count();
         let _ = sink.library.push_line_block(
             line.as_str(),
             style,
@@ -3153,7 +3131,7 @@ fn flush_styled_preview_line<
             sink.spine_index,
         );
     }
-    if sink.library.block_count > appended_from {
+    if sink.library.block_count() > appended_from {
         // push_line_block can also no-op (empty trim, full block table), so
         // only an actual append advances the page cursor.
         sink.note_block_appended();

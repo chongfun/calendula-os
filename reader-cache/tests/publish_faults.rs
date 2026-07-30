@@ -237,7 +237,10 @@ fn fill_section(store: &mut ReaderStore, spine: u16, lines: usize) {
         );
     }
     layout::rebuild_page_index(store);
-    assert!(store.page_count > 0, "fixture must paginate to real pages");
+    assert!(
+        store.page_count() > 0,
+        "fixture must paginate to real pages"
+    );
 }
 
 /// Write one section file, returning the index record describing it.
@@ -254,7 +257,7 @@ fn write_section(
     // silently fails for every other — a fixture flaw a mutation check caught
     // only once a test reached past the first section.
     store.set_cached_spine(section);
-    let page_count = store.page_count.min(u16::MAX as usize) as u16;
+    let page_count = store.page_count().min(u16::MAX as usize) as u16;
     let wrote = files::with_v2_sections_dir(root, KEY, |sections| {
         let sections = sections.expect("sections dir should exist");
         files::write_v2_section_cache_in(sections, IDENTITY, section, store)

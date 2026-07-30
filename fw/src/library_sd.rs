@@ -34,7 +34,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         // an explicit refresh), never while a page render is reading the
         // arena, and the section window is invalidated below so a stale page
         // can't be served from clobbered text afterwards.
-        let scanned = write_catalog_streaming(root, &mut library.text);
+        let scanned = write_catalog_streaming(root, library.arena_as_scratch());
         let status = match scanned {
             Ok(0) => LibraryScanStatus::Empty,
             Ok(count) => {
@@ -52,7 +52,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
                     // Drop the cached data of books no longer on the card:
                     // this is the one moment the full book set is known and
                     // the catalog is proven fresh.
-                    sweep_orphan_caches(root, &mut library.text);
+                    sweep_orphan_caches(root, library.arena_as_scratch());
                     LibraryScanStatus::Ready
                 }
             }
@@ -62,7 +62,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         // the resident section (and any Chapters TOC window) so nothing
         // renders from it.
         library.clear_lines();
-        library.text_holds_toc = false;
+        library.set_text_holds_toc(false);
         status
     })
     .unwrap_or_else(|err| {
