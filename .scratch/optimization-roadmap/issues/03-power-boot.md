@@ -1,62 +1,101 @@
 # WS-C: Power & boot — standby current, wake latency, battery
 
-Status: C1+C3+C4+C5 DONE (#11; wake-cause gating logs 'main: deep_sleep_wake=', idle timeout tiered Reading 10 min / menus 3 min / Wireless 10 min). Next: C2 (device + µA meter). C6 still blocked on X3 display-path hardware verification. See PRD status for a once-observed X3 PON quirk. (items C1, C3, C4, C5 are code-verifiable; C2 and C6 need a device + meter for sign-off)
+Status (2026-07-30): C1, C3, C4, C5 are on `main`. **C2 is the highest-ranked
+open item in the whole roadmap after the double-repaint fix**, and it is
+blocked on a device and a µA meter, not on code. C6 is blocked on the X3
+display path being hardware-verified.
 
-Adjacent landings 2026-07-25: #36 put input at interrupt priority on both boards and moved the gauge to its own thread-executor task sampling every 30 s (extends C3 — the gauge is fully off the input tick now); #27 reworked the GPIO3 wake-button handoff (`InputPins.power` is an `Option` handed off cooperatively, replacing the steal-over-a-live-handle pattern C2 cites below).
+Owns: `fw/src/tasks/power.rs`, `fw/src/tasks/input.rs`, `hal-ext/src/rtc.rs`,
+`hal-ext/src/bq27220.rs`, the planner-seed surface of `app-core/src/lib.rs`,
+the boot-init region of `fw/src/tasks/display.rs`.
+Do not touch: the flush/prestage region of the display task (WS-A), the wifi
+task (WS-D).
 
-Owns: `fw/src/tasks/power.rs`, `fw/src/tasks/input.rs`, `hal-ext/src/rtc.rs`, `hal-ext/src/bq27220.rs`, planner-seed surface of `app-core/src/lib.rs`, boot-init region of `fw/src/tasks/display.rs`.
-Do not touch: flush/prestage region of the display task (WS-A), wifi task (WS-D).
+Baseline facts: deep sleep is terminal — a wake is a cold boot
+(`hal-ext/src/rtc.rs:22-27`); the radio is genuinely off until a session;
+160 MHz race-to-idle is an explicit decision (`fw/src/main.rs:156-159`).
 
-Baseline facts: deep sleep is terminal — wake is a cold boot (`hal-ext/src/rtc.rs:22-27`); radio genuinely off until a session (`fw/src/tasks/wifi.rs:62-107`); 160 MHz race-to-idle is an explicit decision (`fw/src/main.rs:156-159`); deep-sleep current claimed 10–15 µA but **never measured** (open checklist item 6, `docs/ARCHITECTURE.md:627`).
+## Open
 
-## C1 (Tier 1, S–M): Wake takes the 3.5 s Full waveform — the FastClean branch is dead code on hardware
+### C2 (S–M code + hardware sign-off): hold GPIO states in deep sleep, and measure sleep current at last
 
-`RefreshPlanner::mode_for` picks the ~1.5 s FastClean wake only when `panel_shows_sleep_screen` (`app-core/src/lib.rs:182-192`), which is set only by `record_sleep()` in a running session (`:234-239`). Deep sleep reboots the chip → fresh `RefreshPlanner::new()` (`fw/src/tasks/display.rs:66`) → flag false → every real wake pays `RefreshMode::Full` (~3.5 s). Nothing reads the wake cause (zero grep hits). ARCHITECTURE.md:606 promises 1.5 s — doc/code drift. Fix: read the RTC wakeup cause at boot; on deep-sleep GPIO wake, seed the planner with `panel_shows_sleep_screen = true` (the only deep-sleep entry path draws the sleep screen and waits for `DisplayAsleep`, `fw/src/tasks/power.rs:48-63` — panel content known by construction). Optionally skip the boot OTA pending-update SD probe (`display.rs:92-104`) on deep-sleep wake (updates stage via wifi session, which exits by software reset, never deep sleep).
+`enter_deep_sleep_button` arms GPIO3 and sleeps with **no GPIO hold or
+isolation**: SD CS (GPIO12), the shared SPI pins (GPIO8/10/7), and EPD
+CS/DC/RST (GPIO21/4/5) all float. The SD card is hardware-powered with no
+power switch, and a powered card with floating CS/CLK commonly leaks
+100 µA–1 mA; a floating RST can pop the panel out of its ~1 µA sleep.
 
-- Impact: wake-to-readable ~2 s faster; +100–300 ms if the OTA probe is skipped; less energy per wake.
-- Risk: if panel image was lost (battery pull, crash mid-sleep) FastClean can leave artifacts — gate strictly on the deep-sleep wake cause. X3's UC8253 analog exists but that path is hw-unverified.
-- Verify: `bench.py sleep-sync --cycles 10` — wake `bench: refresh mode=... busy_ms` 3500 → ~1500; extend app-core planner unit tests. Fix ARCHITECTURE.md:606 in the same PR.
+Fix: before `sleep_deep`, latch CS and RST high — RTC-domain pulls for
+GPIO0–5, GPIO hold for the digital pins — leaving GPIO3's wake configuration
+untouched. Then **measure**, which is the part that has never been done.
 
-## C2 (Tier 1, S–M code + hardware sign-off): Hold GPIO states in deep sleep; measure sleep current at last
+- Impact: potentially the largest standby win available. Deep-sleep current is
+  *claimed* 10–15 µA and has **never been measured** (open checklist item 6,
+  `docs/ARCHITECTURE.md`). The difference between ~15 µA and several hundred
+  is months versus a week or two of shelf life. It may already be fine —
+  nothing proves it either way, and that is the point.
+- Risk: wake reliability. Pin maps differ between boards (GPIO0 is the ADC
+  divider on X4 and I2C SCL to the BQ27220 on X3). The terminal-path pin
+  handling changed in #27: the wake button now arrives through a cooperative
+  `Option` handoff from the input task rather than a steal over a live handle
+  — latch the other pins inside that flow.
+- Verify: hardware only — meter plus `bench.py sleep-sync --cycles 20` with no
+  missed wakes. **X3 only**: the owner has no X4.
 
-`enter_deep_sleep_button` arms GPIO3 and sleeps (`hal-ext/src/rtc.rs:22-27`) with no GPIO hold/isolation: SD CS (GPIO12), shared SPI (GPIO8/10/7), EPD CS/DC/RST (GPIO21/4/5) float. The SD card is hardware-powered with no power switch — a powered card with floating CS/CLK commonly leaks 100 µA–1 mA; a floating RST can pop the panel out of its ~1 µA sleep. Fix: before `sleep_deep`, latch CS/RST high (RTC-domain pulls for GPIO0–5, GPIO hold for digital pins), leaving GPIO3's wake config untouched. Then measure (µA meter in series across `sleep-sync` cycles).
+### C6 (M; blocked on the X3 display path being hardware-verified): power off the UC8253 charge pump on static pages
 
-- Impact: potentially the largest standby win — the difference between ~15 µA and several hundred µA is months vs ~1–2 weeks of shelf life. High uncertainty until measured; may already be fine, but nothing proves it.
-- Risk: wake reliability — test both boards; pin maps differ (GPIO0 is ADC divider on X4, I2C SCL to BQ27220 on X3, `fw/src/main.rs:178-209`). The terminal-path pin handling changed in #27: the wake button now arrives via a coordinated `Option` handoff from the input task, not a steal — latch the other pins within that flow.
-- Verify: hardware only — meter + `bench.py sleep-sync --cycles 20` (no missed wakes).
+X3 leaves the booster on between turns (`SCREEN_POWERED` is cleared only by
+`sleep_panel`) — roughly 1–3 mA while a static page is displayed. E-ink holds
+an image at zero power, and `flush_plan` already models the powered-off state,
+so a POF is transparently recovered by the next flush's PowerOn (~30–100 ms).
+Add a ~20–30 s no-render timer in the display task's select loop that sends
+`CMD_POWER_OFF` after the prestage settles.
 
-## C3 (Tier 1, S): X3 battery gauge polled at 66 Hz over clock-stretching I2C
+- Risk: the whole UC8253 path is flagged UNVERIFIED on hardware
+  (`uc8253.rs:12-14`); PON/POF sequencing and the `prev_staged` interaction
+  must be preserved. X4 is unaffected — the SSD1677 threads `screen_on` per
+  refresh.
+- Verify: X3 `page-turn` (PON busy in the logs, latency budget), current on a
+  held page, `thermal-run`.
 
-`read_power` runs at the top of every 15 ms input tick (`fw/src/tasks/input.rs:148-157`). On X3 that's two BQ27220 `write_read`s (`hal-ext/src/bq27220.rs:55-59`), each clock-stretched "for milliseconds" (bus timeout raised to ~5 ms for it, `fw/src/main.rs:196-202`) — up to 20–40% of every tick, awaited *before* the nav/page ADC reads, adding input jitter. On X4 it's a wasted ADC oneshot per tick. Fix: decimate battery sampling to once per ~2–5 s (tick counter; keep the first-tick seed read feeding `battery_seeded`, `input.rs:178-186`); sample buttons every tick as today. UI already hysteresis-holds percent (`input.rs:261-269`).
+## Done
 
-- Impact: >99% gauge-traffic reduction on X3 (~0.5–2 mA + jitter removal); small-but-free on X4.
-- Verify: `page-turn --turns 50` (input→render latency unchanged/better), serial `bench: input` tick regularity on X3, ammeter idle delta.
-
-## C4 (Tier 1, S; land after C1): Shrink the 600 s fully-awake idle tail
-
-`IDLE_TIMEOUT` is a flat 10 min (`fw/src/tasks/power.rs:8`); until it fires the device idles at 160 MHz with 66 Hz polling (order 10–20 mA) — ~2–5 mAh per walk-away. Once C1 makes wake ~1.5 s straight into the restored book, an aggressive timeout is nearly free. Drop to 3–5 min, or tier per view (keep 10 min in `AppView::Reading` for slow readers; 2–3 min on Home/Library/Settings — view context rides on `PowerEvent::Activity`, `fw/src/tasks/app.rs:104`).
-
-- Impact: ~25–50 mAh/day for ~10 walk-aways — the biggest behavioral battery lever in the codebase.
-- Verify: `sleep-sync` idle-timeout path, `reader-soak --minutes 30` (no mid-reading surprise sleeps). Progress is already flushed before display sleep — no state-loss risk.
-
-## C5 (Tier 1, S): Redundant second `init_panel` on every boot's first render
-
-`init_panel` runs at display-task start (`fw/src/tasks/display.rs:84-86`) AND again via the wake-init guard `!screen_on() && last_request().is_none()` — also true at boot (`:172-177`). X4: redundant reset+init (~tens of ms); X3: reset + 50 ms settle + whitening both ~52 KB DTM planes (~100–300 ms, `fw/src/display_flush/uc8253.rs:36-62`). Fix: drop the task-start init and let the guard own first init, or add a `panel_initialized` flag. Keep the aborted-sleep re-init path working (Activity during sleep handshake, `power.rs:52-62` / `record_sleep` clears `last_request`).
-
-- Verify: serial timestamps between `display: init` and `display: wake init` lines in a `sleep-sync` run; X3 first-paint correctness.
-- Coordination: same file as WS-A's A1 but a different region (boot vs flush loop); rebase carefully.
-
-## C6 (Tier 3, M; blocked on X3 display path being hardware-verified): Power off the UC8253 charge pump on static pages
-
-X3 leaves the booster on between turns (`SCREEN_POWERED` cleared only by `sleep_panel`, `fw/src/display_flush/uc8253.rs:31-34,93-113`) — ~1–3 mA while a static page displays. E-ink holds images at zero power; `flush_plan` already models the powered-off state, so a POF is transparently recovered by the next flush's PowerOn (~30–100 ms). Add a ~20–30 s no-render timer in the display task select loop sending `CMD_POWER_OFF` after prestage settles.
-
-- Risk: whole UC8253 path is flagged UNVERIFIED on hardware (`uc8253.rs:12-14`); PON/POF sequencing and `prev_staged` interaction must be preserved. X4 unaffected (SSD1677 threads `screen_on` per refresh).
-- Verify: X3 `page-turn` (PON busy in logs, latency budget), current on a held page, `thermal-run`.
+- **C1** (#11) — the wake refresh took the ~3.5 s Full waveform on every real
+  wake, because deep sleep reboots the chip and `panel_shows_sleep_screen`
+  was only ever set by a running session. Boot now reads the RTC wake cause
+  plus an RTC-RAM marker the sleep handshake writes after the sleep frame
+  settles, and seeds the planner with the sleep screen it knows the panel
+  holds. A battery pull, crash, or a sleep whose final flush failed still pays
+  the full 3.5 s, correctly.
+- **C3** (#11, extended by #36) — the X3 battery gauge was polled at 66 Hz over
+  clock-stretching I2C, at the top of every 15 ms input tick and *before* the
+  nav ADC reads. #36 moved it to its own thread-executor task sampling every
+  30 s; the gauge is fully off the input tick, and input runs at interrupt
+  priority on both boards.
+- **C4** (#11) — the flat 600 s idle timeout is now tiered: 10 min in Reading,
+  3 min on menus, 10 min in Wireless. The biggest behavioural battery lever in
+  the codebase (~25–50 mAh/day for ~10 walk-aways), and nearly free once C1
+  made a wake fast.
+- **C5** (#11) — the redundant second `init_panel` on every boot's first
+  render is gone. On X3 that was a reset plus a 50 ms settle plus whitening
+  both ~52 KB DTM planes.
 
 ## Do not re-propose
 
-80 MHz clock (rejected — race-to-idle), slower input polling (15 ms was a deliberate latency trade; C3 decimates only the battery channel), radio-off work (already optimal), light sleep (dead helper `enter_light_sleep_timer` — plausible future tier but C4 first; also fix its stale doc mention).
+- **80 MHz CPU clock** — 160 MHz race-to-idle is an explicit decision.
+- **Slower input polling** — the 15 ms tick is a deliberate latency trade. C3
+  decimated only the battery channel, which is the part that was free.
+- **Radio-off work** — already optimal; the radio is genuinely off until a
+  session opens.
+- **Light sleep** — `enter_light_sleep_timer` is a dead helper with zero call
+  sites. A plausible future tier, but C4's tiering came first and took most of
+  the win. Either wire it up or delete it; do not leave it as documentation.
 
-Cross-cutting: bench.py has no power channel — C2/C3/C6 need an external meter; C1/C4/C5 verify from existing serial telemetry.
+Cross-cutting: `bench.py` has no power channel. C2 and C6 need an external
+meter; C1, C4 and C5 verified from existing serial telemetry.
 
-Suggested order: C2 (measure + hold) → C1 + C5 (wake latency) → C3 → C4 → C6.
+**Breadcrumb, observed once and never explained (2026-07-11):** an X3 PON busy
+wait hit its 1 s ceiling (`PON busy_low=false 1000ms`) during a sleep-entry
+Full refresh, then behaved normally afterwards. First suspect if X3 sleep
+entry ever misbehaves, and worth watching for while doing C2 or C6 — both
+touch that sequence.

@@ -1,103 +1,164 @@
 # WS-D: Storage & Wi-Fi throughput — SD bandwidth, upload speed, session setup, onboarding
 
-Status: D1 DONE (#14 — measured: cold build −5.4%, write_ms −9.5%, progress write −35%; NOT the hoped 2×). D2 REJECTED on measurement — see below. D3 DONE as per-session runtime PSK (#19). Next: D4, then upload-ceiling investigation, then D5. D6: read the evidence file below first.
+Status (2026-07-30): D1 and D3 are on `main`. **D2 was implemented, measured,
+and rejected** — read its entry under "Do not re-propose" before touching
+upload throughput. Open: D4, then the upload-ceiling investigation, then D5.
+D6 only if the counters still indict SD.
 
-Ground moved under this workstream 2026-07-25: WIFI.BIN is now a `proto::durable` two-generation A/B record (#29) — D4's new fields ride that framing, not a bare struct widening. D4 also absorbs strongest-AP join for duplicate SSIDs (crosspoint `e03aa163`, from the upstream sweep). #35 rewrote the portal surface D5 modifies (credentials verified by boot-path re-read after save + nearby-network scan list). #31 made the upload session interruptible via stop-request/stopped channels — new lifecycle context for the upload-ceiling investigation.
+Owns: `fw/src/sd_session.rs`, `fw/src/tasks/wifi.rs`, `fw/src/upload.rs`,
+`fw/src/sync_mem.rs`, the vendored/pinned `embedded-sdmmc`.
+Note: `sd_session.rs` changes speed up WS-B's reader path too. This
+workstream owns the file; WS-B must not modify it.
 
-Owns: `fw/src/sd_session.rs`, `fw/src/tasks/wifi.rs`, `fw/src/upload.rs`, `fw/src/sync_mem.rs`, vendored/pinned `embedded-sdmmc`.
-Note: `sd_session.rs` changes speed up WS-B's reader path too — this workstream owns the file; WS-B must not modify it.
+## Open
 
-Baseline: no measured upload MB/s exists — **first task is a baseline**: timed `curl --data-binary @book.epub "http://<ip>/upload?name=book.epub"` plus `sd_stats` counters. Station join ~21 s (`wifi.rs:36`). Cold cache build I/O share: 537 wr + 723 rd blocks.
+### D4 (M): directed station join — persist channel and BSSID
 
-## D1 (Tier 1, S): SD SPI tier — chunk 64→512 B, data clock 20→25 MHz
+`Session::join` sets only SSID, password and auth, so every join does a full
+all-channel scan: **~21 s**. The pinned esp-radio `StationConfig` supports
+`bssid`, `channel` and a scan method. After a successful join, record the
+channel (and optionally the BSSID) alongside the credentials in
+`/XTEINK/WIFI.BIN`; the next session does a directed join and falls back to a
+full scan on failure, through the retry loop that already exists.
 
-Every SD block moves through a 64-B bounce buffer, 8 DMA transactions + copies per 512-B block (`SD_SPI_CHUNK_BYTES`, `fw/src/sd_session.rs:132`; loops at `:186-236`). Raise to 512 (one block = one transaction); this also sizes the shared RX DMA buffer (`dma_buffers!` in `fw/src/main.rs:236`) — costs ~448 B DRAM against stack headroom (affordable; re-check the link ASSERT on X3). Separately bump `SD_DATA_FREQ_MHZ` 20→25 (`sd_session.rs:21`; SPI-mode spec ceiling).
+Folded in from the upstream sweep: **strongest-AP join for duplicate SSIDs**
+(crosspoint `e03aa163`) — when several APs advertise the saved SSID, pick the
+strongest rather than the first found. It shares this item's scan/join
+surface; bundle it rather than porting separately.
 
-- Impact: roughly 2× SD bandwidth on both reads and writes — benefits uploads, cold builds, catalog scans, reopens (50–85 → ~40–70 ms).
-- Risk: shared display/SD bus signal integrity at 25 MHz (X3 UC8253 restore handled per-panel at `sd_session.rs:22-26`); marginal cards — watch warm-retry counters for silent slowdowns.
-- Verify: `bench.py storage-cache --reset-before --strict` before/after (rd/wr call-to-block ratios prove chunking), `page-turn --turns 50` for reader regression, `sleep-sync` warm reuse, `reader-soak` for marginal-card stability, timed curl A/B.
+- Impact: repeat-session join ~21 s → ~3–6 s; better AP choice on mesh and
+  repeater networks.
+- Risk: a stale channel after a router change must degrade gracefully without
+  eating the 35 s JOIN_TIMEOUT twice.
+- Framing note: WIFI.BIN has been a `proto::durable` two-generation A/B record
+  since #29, so the new fields ride that framing with a version bump inside
+  it — not a bare struct widening. The durable layer already handles torn
+  writes and the legacy single-file fallback.
+- Verify: serial Start→Serving timestamps across repeated sessions;
+  deliberately change the router's channel and confirm the fallback;
+  `sleep-sync` lifecycle regression.
 
-## D2 (Tier 1, S): Restore radio RX buffering + AMPDU-RX; yield during SD writes
+### Upload-ceiling investigation (S–M) — instrument before fixing
 
-Radio is trimmed to 4 static RX / 8 dyn RX / 8 dyn TX, AMPDU off (`fw/src/tasks/wifi.rs:95-106`) for a "short kosync exchange" that **has since been removed** — the comment itself says revisit for the upload phase. Raise static RX 4→8–10 (~1.6 KB each), dynamic RX 8→16–32, enable `ampdu_rx_enable` (upload is RX-dominant; AMPDU-TX stays off). Budget against the loaned heap — measure first: heap used/free is already logged at join (`wifi.rs:817-821`); add a log after each upload, then spend observed slack.
+Upload throughput sits near **160 KB/s under every configuration tried**, and
+nobody knows why. Ruled out by measurement (2026-07-11/12): radio RX buffers,
+AMPDU-RX, SD write stalls, SPI chunking.
 
-Also: `write_one_book` (`fw/src/sd_session.rs:508-551`) calls fully blocking `file.write` on 4 KB (10–30 ms, no await) on the shared thread-mode executor, starving `net_task` → RX drops → TCP stalls. Slice writes 512 B at a time with `embassy_futures::yield_now().await` between slices. Optionally grow ping-pong buffers 4→8–16 KB from the loaned heap (`wifi.rs:281-283`) once yielding makes large chunks harmless.
+Remaining candidates, roughly in order of suspicion:
 
-- Impact: 2–4× radio RX throughput; +20–50% from yielding on top of D1 — combined plausibly 3–5× end-to-end upload.
+1. The 4 KB two-buffer ping-pong handshake between the wifi and storage tasks
+   — each chunk's channel round-trip serializes against the SD write it
+   triggers.
+2. esp-radio power-save mode during the session — check whether PS is disabled
+   while serving.
+3. Single-stream TCP dynamics — a small congestion window against a receiver
+   that reads in 4 KB bites.
+4. The HTTP server's read pattern in the upload handler.
 
-**POST-MORTEM (2026-07-11): implemented, measured, rejected.** Timed upload
-A/B (X3, 3.2 MB EPUB, same card/network): main 19.3 s median → D1+D2 21.1 s
-→ D1+buffers-only ~20.2 s. The 512-B slice + yield pacing cost ~1 s per
-upload (~6,300 yield/reschedule cycles); the buffers and AMPDU-RX bought
-nothing while spending ~6.6 KB of loaned heap at join (free 27,300 → 20,700).
-Throughput sits near 160 KB/s under every configuration, so neither radio RX
-nor SD write stalls is the limiter — main's blocking 4 KB writes do not stall
-TCP in practice. Only the per-upload heap log shipped (#14). Do not re-try
-either half without new evidence from the investigation below.
+Tools already in place: `upload: heap used/free` per upload, `sd_stats`
+counters, and the timed-upload A/B protocol that produced the D2 verdict —
+same book, card, network and reading position, three runs, compare medians:
 
-## D-NEW (investigation, S–M): find the ~160 KB/s upload ceiling
+```
+curl -sS -o /dev/null -H 'Expect:' --data-binary @book.epub \
+  "http://<ip>/upload?name=book.epub" \
+  -w '%{time_total}s %{speed_upload} B/s'
+```
 
-Everything ruled out so far: radio RX buffers, AMPDU-RX, SD write stalls, SPI
-chunking (all measured 2026-07-11/12). Remaining candidates, roughly in order
-of suspicion: (a) the 4 KB two-buffer ping-pong handshake between the wifi
-and storage tasks — each chunk's channel round-trip serializes against the SD
-write it triggers; (b) esp-radio power-save mode during the session (check
-whether PS is disabled while serving); (c) single-stream TCP dynamics — small
-congestion window against a receiver that reads in 4 KB bites; (d) the HTTP
-server's read pattern in the upload handler. Tools already in place: the
-timed-curl protocol (PRD status section), `upload: heap used/free` per
-upload, `sd_stats` counters. Instrument first — e.g. timestamp the ping-pong
-(fill-time vs write-time per chunk) to see which side starves — then fix only
-what the numbers indict. A believable outcome is 2–5× upload throughput;
-another believable outcome is that the radio/RF layer is the ceiling and
-uploads are already as fast as this hardware goes.
-- Risk: heap exhaustion inside the radio blob crashes the loaned-buffer session (only recovery is the reset) and AMPDU reorder buffers allocate under load — soak with 10+ book uploads while watching heap high-water.
-- Verify: timed curl A/B, heap logs, `bench channel-stress --host` (its charter is exactly this ping-pong), serial for TCP timeouts.
+**Instrument first** — e.g. timestamp the ping-pong, fill-time against
+write-time per chunk, to see which side starves — then fix only what the
+numbers indict.
 
-## D3 (Tier 1, S): WPA2-PSK the onboarding hotspot
+A believable outcome is 2–5× upload throughput. Another believable outcome is
+that the radio/RF layer is the ceiling and uploads are already as fast as this
+hardware goes. Both are useful answers; guessing is not.
 
-The portal AP is open (`AccessPointConfig::default().with_ssid(PORTAL_SSID)`, `wifi.rs:548`) and the home SSID+password POST to `/save` travels plaintext over RF. Users join via a build-time QR (`tools/generate_qr.py`) anyway — generate a random PSK at build time, bake it into both the QR payload (`WIFI:T:WPA;S:...;P:<psk>;;`) and a WPA2-Personal AP config, from a single build-time source so they can't drift.
+- Risk: heap exhaustion inside the radio blob crashes the loaned-buffer
+  session (the only recovery is the reset), and AMPDU reorder buffers allocate
+  under load. Soak with 10+ book uploads while watching the heap high-water
+  mark.
+- Verify: timed curl A/B, heap logs, `bench channel-stress --host` (its
+  charter is exactly this ping-pong), serial for TCP timeouts.
 
-- Impact: closes a real credential-disclosure hole; zero UX change. Secondary (lower priority): `/upload` and `/delete` are unauthenticated to the whole LAN (`wifi.rs:332-406`) — a per-session token in the served URL would close it cheaply.
-- Verify: phone QR-join + captive sheet still auto-raises + form submit, iOS and Android.
+### D5 (M): portal → station handoff in one session
 
-## D4 (Tier 2, M): Directed station join — persist channel/BSSID
+Today the portal captures credentials, the SAVED page says "press done, then
+run sync again", and the device resets, reboots, and makes the user re-enter
+Wireless for a fresh ~21 s join. Instead: after the portal captures
+credentials, tear down the portal servers, `set_config` the same
+`WifiController` to Station, build the STA embassy_net stack from the loaned
+heap as the AP path does, then fall through to the join loop and
+`upload_server`. The loan/reset lifecycle is unchanged — still exactly one
+reset at session end.
 
-`Session::join` (`wifi.rs:826-851`) sets only SSID/password/auth → full all-channel scan → ~21 s (docs flag "the 20 s join timeout deserves headroom or scan tuning"; considered, never done). The pinned esp-radio `StationConfig` supports `bssid`/`channel`/scan-method. After a successful join, record channel (+ optionally BSSID) alongside credentials in `/XTEINK/WIFI.BIN` (`hal_ext::nvm::WifiCredentialsRecord` via `StorageCommand::StoreWifiCredentials`); next session does a directed join, falling back to full scan on failure (retry loop at `wifi.rs:149-159` exists).
+- Impact: removes 3 user steps and a full reset/rejoin (~40–60 s). With D4,
+  the first-ever sync becomes one continuous flow.
+- Rebase note: #35 rewrote this surface. The portal now re-reads saved
+  credentials through the boot-path read before reporting success, and serves
+  a nearby-network list. The handoff must **preserve verify-after-save** — the
+  STA join is the stronger verification, but the storage read-back still
+  guards the post-reset boot.
+- Risk: AP→STA reconfiguration on a live controller is the least-exercised
+  esp-radio path and needs hardware validation; two `net_task`s must not both
+  run (swap runners or quiesce the AP stack first); the Wireless screen needs
+  a portal→connecting event sequence with no reboot.
+- Verify: phone onboarding end-to-end on hardware (this also covers the DNS
+  sign-in-sheet path, itself flagged untested); emulator scenario and goldens;
+  a reset still restores the reading position.
 
-Folded in (2026-07-25, from the upstream sweep): strongest-AP join for duplicate SSIDs (crosspoint `e03aa163`) — when multiple APs advertise the saved SSID, pick the strongest instead of first-found. It shares the scan/join surface this item already touches; bundle it rather than porting separately.
+### D6 (L, fork maintenance): multi-block CMD18/CMD25 in the pinned embedded-sdmmc
 
-- Impact: repeat-session join ~21 s → ~3–6 s; better AP choice on mesh/repeater networks.
-- Risk: stale channel after router change must degrade gracefully without eating the 35 s JOIN_TIMEOUT twice. WIFI.BIN gains fields — since #29 it is a `proto::durable` two-generation record, so add fields with a version bump inside that framing; the durable layer already handles torn writes and legacy single-file fallback.
-- Verify: serial Start→Serving timestamps across repeated sessions; deliberately change router channel and confirm fallback; `sleep-sync` lifecycle regression.
-
-## D5 (Tier 2, M): Portal → station handoff in one session
-
-Today: portal captures credentials → SAVED page says "press done, then run sync again" (`wifi.rs:523-532`) → reset → reboot → user re-enters Wireless → new session → ~21 s join. `run_portal` (`wifi.rs:538-587`) never returns. Instead: after `handle_portal_request` captures credentials (`wifi.rs:676-694`), tear down portal servers, `controller.set_config` to Station on the same `WifiController`, build the STA embassy_net stack from the loaned heap (as the AP path does, `wifi.rs:558-559`), fall through to the join loop and `upload_server`. Loan/reset lifecycle unchanged — still exactly one reset at session end.
-
-- Impact: removes 3 user steps + a full reset/rejoin (~40–60 s); with D4, first-ever sync becomes one continuous flow.
-- Rebase note (2026-07-25): #35 rewrote this surface — the portal now re-reads saved credentials through the boot-time read path before reporting success (WIFI_STORAGE_RESULTS channel) and serves a nearby-network list. The handoff design must preserve verify-after-save (the STA join itself becomes the stronger verification, but the storage read-back still guards the post-reset boot) and rebase on the new portal code; the wifi.rs line references above predate it.
-- Risk: AP→STA reconfig on a live controller is the least-exercised esp-radio path — hardware validation required; two net_tasks must not both run (swap runners or quiesce AP stack first); Wireless screen needs a portal→connecting SyncEvent sequence without reboot (`fixtures/` sync-*.toml scenarios + goldens).
-- Verify: phone onboarding end-to-end on hardware (also covers the DNS sign-in-sheet path, itself flagged untested); emulator scenario + goldens; reset still restores reading position.
-
-## D6 (Tier 3, L): Multi-block CMD18/CMD25 in the pinned embedded-sdmmc
-
-**Evidence file (2026-07-12, X3, 11.7 MB EPUB cold build):** `sd_stats`
-showed `write_calls == write_blocks` (1,944 each) and per-block write cost
-2.23 ms against ~0.16 ms of wire time at 25 MHz — i.e. ~2 ms/block is CMD24
+**Evidence (2026-07-12, X3, 11.7 MB EPUB cold build):** `sd_stats` showed
+`write_calls == write_blocks` (1,944 each) and a per-block write cost of
+2.23 ms against ~0.16 ms of wire time at 25 MHz. So ~2 ms per block is CMD24
 command/response/CRC overhead plus card programming latency, and only
-multi-block batching can amortize it. The build's total write time was
-4.34 s, so CMD25 could plausibly recover 2–3 s of every large cold build.
-Note #18 moved the upload write path into the `upload-store` crate; reader
-cache writes still go through fw's SD session. Weigh the fork-maintenance
-cost of patching the pinned embedded-sdmmc against those seconds.
+multi-block batching can amortize it. Total write time was 4.34 s, so CMD25
+could plausibly recover 2–3 s of every large cold build.
 
-Above the SPI layer, `embedded-sdmmc` `File::write` write-backs one 512-B block per call → every block is its own CMD24 with command/response/CRC + 1–3 ms card programming; reads are per-block CMD17. Its CMD25 path exists but is unreachable. Patch the pinned crate (`fw/Cargo.toml:39`) to batch cluster-contiguous whole-block runs, or write payload blocks directly using FAT only for allocation/metadata. Same for CMD18 on sequential reads (`SdFileReadAt::read_at` 8 KB chunks, `reader_cache.rs:1356`); IMPLEMENTATION_PLAN already names CMD18 as one of two "material wins". Do this only if post-D1/D2 profiling still shows SD-bound transfer (`write_calls == write_blocks` in bench counters answers it immediately).
+`embedded-sdmmc`'s `File::write` writes back one 512-B block per call, and its
+CMD25 path exists but is unreachable. Patch the pinned crate to batch
+cluster-contiguous whole-block runs, or write payload blocks directly using
+FAT only for allocation and metadata. Same for CMD18 on sequential reads.
 
-- Risk: fork maintenance; FAT correctness (byte-compare uploaded files); CS/timeout behavior on the shared bus.
+Weigh 2–3 s per cold build against the cost of maintaining a fork of a pinned
+dependency. `write_calls == write_blocks` in the bench counters answers
+immediately whether this is still worth it. Note #18 moved the upload write
+path into the `upload-store` crate; reader-cache writes still go through fw's
+SD session.
+
+- Risk: fork maintenance, FAT correctness (byte-compare uploaded files),
+  CS/timeout behaviour on the shared bus.
+
+## Done
+
+- **D1** (#14) — SD SPI tier: the 64-B bounce buffer became 512 B (one block,
+  one transaction) and the data clock went 20 → 25 MHz. **Measured: cold build
+  −5.4%, `write_ms` −9.5%, progress write −35%.** This is the honest number;
+  the PRD originally projected ~2× SD bandwidth and that framing was wrong.
+- **D3** (#19) — the onboarding hotspot was open, so the home SSID and
+  password crossed the air in plaintext. Shipped as a **per-session runtime
+  PSK** with on-device QR encoding, not the build-time PSK originally
+  proposed. Still open and lower priority: `/upload` and `/delete` are
+  unauthenticated to the whole LAN; a per-session token in the served URL
+  would close it cheaply.
 
 ## Do not re-propose
 
-kosync (removed on purpose); re-donating dram2 to the radio heap (removed to restore stack — don't win D2's heap back that way). The radio-trim revisit (D2) and join tuning (D4) are documented intentions, not rejections. Doc fix to fold in: ARCHITECTURE.md:131-133 still describes the removed 16 KB dram2 claim.
+- **D2 — radio RX buffers 8/24 + AMPDU-RX + SD writes paced in 512-B slices
+  with yields.** Implemented, measured on hardware 2026-07-11, rejected.
+  Timed upload A/B, X3, 3.2 MB EPUB, same card and network: main **19.3 s**
+  median, D1+D2 **21.1 s**, D1+buffers-only **~20.2 s**. The 512-B slice and
+  yield pacing cost ~1 s per upload (~6,300 yield/reschedule cycles); the
+  buffers and AMPDU-RX bought nothing while spending ~6.6 KB of loaned heap at
+  join (free 27,300 → 20,700). Throughput sits near 160 KB/s under every
+  configuration, so neither radio RX nor SD write stalls is the limiter —
+  main's blocking 4 KB writes demonstrably do not stall TCP. Only the
+  per-upload heap log shipped. Code comments at the radio config and the
+  upload write loop record the verdict. **Do not re-try either half without
+  new evidence from the investigation above.**
+- **kosync** — removed on purpose.
+- **Re-donating dram2 to the radio heap** — removed to restore stack. Do not
+  win D2's heap back this way.
 
-Suggested order: baseline measurement → D1 + D2 + D3 (one hardware A/B session covers all) → D4 → D5 → D6 only if counters still show SD-bound.
+The radio-trim revisit and join tuning are documented *intentions*, not
+rejections — that is D4 and the investigation above.

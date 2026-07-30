@@ -1,218 +1,177 @@
 # WS-B: Book pipeline — cold builds, custom fonts, catalog scan, progressive open
 
-Status: B2+B3 DONE (#10). B6 DONE (#23; measured on X3 2026-07-25 — replay genuine but ~25 s, see its section). **B7 PROMOTED** — its trigger condition fired: replay is slow and orientation flips re-pay it (see its section; ranked #3 in the PRD queue). B1 OFF THE QUEUE (2026-07-25): its goal landed as upstream port #37 — 16-slot non-ASCII metric ring, run measurement through one open pack handle (`for_each_metric`), whole-glyph bitmap reads; the spec below stays as reference only if custom-font cold builds still measure slow (remaining levers: punctuation-run slots, a walk-held pack handle). **B4 REWORKED, MEASURED AND FIXED ON DEVICE 2026-07-28 — now worth keeping** on `opt/b4-progressive-open-rework`. It was a net regression when first measured (prologue at 45.3 s vs ~34 s for a plain build); two scheduling fixes took that to **32.6 s**, page-turn median from 1270 ms to **231 ms**, and the reader now runs 15.9 s ahead of the builder instead of 0.4 s behind. Still does nothing on a deep resume, which only a progress indicator can help. The section also records a **non-B4** finding worth more than B4: every page turn repaints twice. **The reader-cache extraction is DONE (#55)**, so B7's stated precondition is met. The old `origin/opt/b4-progressive-open` is superseded and should not be rebased. Note the upload write path belongs to the upload-store crate (#18).
-
-Owns: `fw/src/reader_cache*.rs`, `fw/src/custom_font.rs`, `fw/src/library_sd.rs`, `fw/src/reader_layout.rs`, `ui/src/reading.rs`, `proto/`.
-Do not touch: `fw/src/sd_session.rs` — SD chunk/clock/multi-block changes belong to WS-D (this workstream benefits automatically).
-
-Baseline: cold V2 cache build 3.9 s for a 117-page EPUB (~70% CPU inflate+parse+measure, ~30% SD I/O; 537 wr + 723 rd blocks); HPMOR-scale extrapolates to ~2.5 min. Warm reopen 50–85 ms (fine). EPUB open chain must stay inside the 30–43 KB stack region; link-time ASSERT fails under 27 KB.
-
-## B1 (Tier 1, S–M): Custom-font metric cache for non-ASCII glyphs — CLOSED by upstream port #37
-
-**2026-07-25: #37 (ported from crosspoint `8da2d42`) covers this item's goal** — a 16-slot ring of decoded non-ASCII metrics keyed by (identity, face, codepoint), `measure_char` replaced by `for_each_metric` feeding whole styled runs through one open pack handle, and one seek+read per glyph bitmap on the draw path. The spec below survives as reference: if custom-font cold builds still measure slow, the remaining levers are (a) General-Punctuation slot runs and (c) holding the pack handle across the whole spine walk rather than per run.
-
-`MetricCache` (`fw/src/custom_font.rs:24-125`, 4 slots) covers only ASCII 0x20–0x7E. Every non-ASCII char — curly quotes U+2018/2019/201C/201D, em-dash U+2014, thousands of occurrences per novel — misses into `measure_char` (`custom_font.rs:197-229`): open `/XTEINK` dir → `FONTS` dir → pack file → seek → 12-B read, **per occurrence** (several FAT block reads per apostrophe). Fix, in combination: (a) extend slots with the General-Punctuation run the pack already indexes (~120–240 B/slot); (b) small direct-mapped LRU (16–32 entries, ~400 B) for arbitrary non-ASCII; (c) hold the pack file open across the spine walk (sink already holds `root`).
-
-- Impact: custom-font cold builds recover tens of seconds to minutes, back to near built-in speed. RAM: ~0.5–1.5 KB static, count against stack headroom.
-- Constraint: measurements must stay bit-identical (`READER_LAYOUT_VERSION` untouched) — a cache trivially preserves this.
-- Verify: `bench.py storage-cache --cold` with a custom pack vs built-in (`rd_calls`/`elapsed_ms`); host tests for cache correctness.
-- Coordination: WS-E item 13 shrinks the 12-B metric struct this cache stores — land 13 first or coordinate on `custom_font.rs`.
-- Prior art: `docs/plans/2026-07-08-custom-fonts-investigation.md:281` anticipates "a small metric cache".
-
-## B2 (Tier 2, M): Catalog scan — kill the O(walks×N) re-walks and O(C×N) orphan sweep
-
-`scan_books` (`fw/src/library_sd.rs:42`, runs on every boot/wake/refresh): (1) `write_catalog_streaming` (`:148`) walks the full FAT tree once to count plus once per 48-record batch; (2) `sweep_orphan_caches` (`:544`) streams the **entire catalog per cache dir** via `find_in_catalog` (`:321`) — O(C×N); (3) `read_catalog_window` (`:246`) does a dir-walk + BOOK.BIN title read per row on every Library window crossing (`cached_title_label`, `:424`). Fixes: (a) load catalog identities (8 B hash+size pairs) once into an idle scratch region (16 KB `ReaderStore.text` arena or 24 KB xhtml scratch — confirm not live during scans) → O(C+N); (b) stage records in that scratch instead of the 4.4 KB stack batch → ~2 walks total and a smaller stack frame; (c) persist the title into the catalog record (bump `CATALOG_VERSION` 4→5; version byte already forces clean rescan on mismatch, `:236`; refresh title on book open).
-
-- Impact: on a 100-book card with 50 caches, eliminates ~5,000 record reads + ~2 FAT walks per scan; visibly snappier Library scrolling. Measure first via the existing `bench: storage_catalog action=scan elapsed_ms=` line (`library_sd.rs:79`).
-- Verify: storage-cache suites, `storage_catalog` line with a many-book fixture card, emulator library-scroll goldens, `reader-soak` with Library visits.
-
-## B3 (Tier 2, S–M): Incremental pagination cursor during builds
-
-`flush_if_full` → `rebuild_pages_if_dirty` → full `rebuild_page_index` (`fw/src/reader_layout.rs:54`) once per flushed line → O(blocks²/2) per section (~74 k `block_height` calls at 384 blocks). Maintain the cursor (`y`, `first_block`, `page_count`) incrementally in `LibraryBlockSink` — O(1)/line — falling back to full rebuild on the carry path (`flush_section` `carry_last_page`, `reader_cache.rs:1683-1694`) and handling `mark_last_block_paragraph_end`'s retro gap change (`:1950-1954`) as a bounded one-block fix-up.
-
-- Impact: ~100–300 ms per build (3–8%), linear with book length.
-- **Invariant: exact agreement with `rebuild_page_index`** — page records persist into section files; divergence is silent cache corruption. Keep full rebuild as a debug assertion in host tests (copy the naive-reference harness pattern from `ui/src/reading.rs:1022-1200`).
-
-## B4 (Tier 3, L): Progressive first open — REWORKED, ran on device, needs a first-open redesign
-
-**Implemented 2026-07-26 on `opt/b4-progressive-open-rework`, now `d613707` + the round-3 fixes over main `563f0aa`** (originally written against `de1cc16`, then squashed and rebased — see the branch note in round 3). The stranded branch was used as a design reference only, per the note at the bottom of this section: its provisional-publish and continuation-slice ideas carried over, everything else was re-derived against #41's transaction-owned open. `OpenSequence` itself is untouched — progressive publishing is invisible to the position transaction, which is the point of #41's design.
-
-All host gates pass: fmt, host clippy, `clippy -p fw` on X4 and X3, host tests (13 new — 11 in `app-core::storage_loop`, 2 in `proto::cache`), release links on both boards, emulator goldens **unchanged** on both boards. **Three review rounds have found defects; all are fixed and recorded below.** The device measurements remain the only outstanding work.
-
-**Three decisions differ from the stranded branch, each deleting a failure mode it had to harden against:**
-
-1. **Background steps are a fifth branch of the display task's `select`, not a self-enqueued `StorageCommand::ContinueBookBuild`.** The branch is last, so display commands, storage commands, and both event holders win whenever ready; it `yield_now()`s before claiming the loop. That drops the stranded branch's safety-net re-enqueue for a full 4-slot channel, the new `Drained` verdict the pre-sleep drain would have needed, and the `tasks/app.rs` + `tools/emulator` arms. Side benefit worth naming: slicing gives *every* task a scheduling point every ~0.6 s, where an unsliced build held the single-threaded executor for the whole minute.
-2. **Resume state lives inside `ReaderCacheScratch`, beside the `book_sections` it describes.** One invariant — the field is `Some` only while those records belong to that walk — maintained by the fast-path split in `build_or_load_book_cache_from_root`. That replaces the stranded branch's atomic scratch-generation counter (three commits of hardening) with nothing.
-3. **Interrupt policy: the work is RAM-only, the *fact of it* is not.** An interrupted build leaves a partial BOOK.BIN stamped with `resume_spine`, and the next open rebuilds it progressively. The original design left that stamp out and was wrong — see the review round below.
-
-**The subtlety that decides correctness, and the trap for anyone revisiting this:** an ordinary page turn across a section boundary arrives as an `ExtendSection` and reaches `build_or_load_book_cache`. The fast path is the only route that does not touch the scratch's section records, so it — and only it — leaves a running walk standing. `BookBuildOutcome::{Settled, Started, Carried}` reports which happened. Without `Carried`, reading normally would kill the background build at the first section crossing, and the reader would then pay a full rebuild on reaching the frontier.
-
-**Review round, 2026-07-26 (three findings, all fixed in the second commit).** All shared one root: *a partially built index is safe to read only while the walk that published it is still coming back, and nothing on the card said so.*
-
-1. **An abandoned build capped the book permanently (P1).** The first design kept the resume state in RAM only, on the reasoning that "pages inside the frontier serve from cache, crossing it rebuilds". That second half was **false**: the reducer clamps the page to the advertised count (`app-core/src/lib.rs:1938`), so the reader can never *ask* for the first missing page, and nothing else provokes a rebuild. Sleep or a reboot mid-build therefore left a book truncated indefinitely — and indistinguishable from a book that was simply that short. This turned a rare pre-existing edge case (`partial` from spine/section caps) into the normal outcome of every interrupted first open. Fixed by persisting `BookV2Header::resume_spine` — the item a walk meant to resume at — and refusing an unfinished index that no live walk owns, which rebuilds progressively. `partial` cannot carry this: it means "pages are missing", not "someone is still fetching them", and a cap-clipped book is partial forever, so rebuilding it every open would buy nothing.
-   - **No `CACHE_V2_VERSION` bump**, deliberately: the field took two bytes every v26 writer filled with an explicit zero, and zero is the correct reading for an older index. Pinned by a proto test, because the shortcut is only sound while those bytes are provably constant. Anyone repeating this trick should add the same test.
-2. **Background steps clobbered the Chapters TOC arena (P1).** The overview borrows the same single text arena and marks it `text_holds_toc`, and it only reloads its window while that flag holds. A slice took the arena back and cleared the flag, leaving the chapter list stale with nothing to restore it until the reader left the screen. Fixed by standing the background branch down for Chapters — free, since leaving that screen reloads the reading section anyway.
-3. **A failed index write announced itself as a completed build (P2).** The step returned before restoring the reader's page, and the display task read the stop as completion: it announced, and an announcement forces a full repaint over an arena still holding whatever the builder touched last. Fixed by restoring on every path out of the step and adding `BackgroundStep::Abandoned`, so the loop can tell a walk that *ended* from one that *broke*. Only the former is announced.
-
-**Lesson worth carrying to B7:** the reducer's page clamp means the firmware's advertised page count is a hard ceiling on what the reader can request. Any cache state that advertises less than the whole book must also carry, on disk, whether something is coming back for the rest — otherwise it is a one-way trap, and it looks exactly like correct behaviour.
-
-**Round 3, 2026-07-26 (three more findings, all valid; fixed in the branch's third commit).** Every one was a variant of the same question — *is this suspended walk still the one that owns this cache?* — asked in a place that answered it too loosely, too late, or not at all.
-
-1. **A suspended walk was identified by catalog row alone (P1).** `walk_is_live` and the `BookBuildOutcome` check both tested only `state.index == index`. A rescan reorders rows, so a walk suspended on row *i* can find a different title there — and the row matching is exactly what licenses *that* title's own half-built index as "someone is still building it". Nobody is: the real walk belongs to a book that moved and abandons itself the moment `continue_book_build` checks the identity, which is too late to un-accept the cache. Row and source identity are now checked together through one `BookBuildResume::belongs_to`, so the fast path, the outcome check, and the continuation cannot drift apart. **The shared helper is the fix, not the extra field** — the bug was two predicates that had to agree and didn't.
-2. **A completed build was abandoned when its section read failed once and recovered (P1).** The final publish writes a complete `BOOK.BIN` and calls `set_book_index` *before* reading the section back. `finish_background_walk` retried that read through `restore_reader_page` and then discarded the result, always erroring. So a transient read fault threw away a genuinely finished book: no continuation left to announce the final page count, and a reader capped at the old frontier until reopening. The retry's answer is now taken — a recovered read runs the refresh the publish skipped and reports `Finished`; only `IndexWriteFailed` errors unconditionally.
-3. **`LoanSyncMemory` dropped the background handle before the flush that can refuse the loan (P2).** A refused loan returns with the scratch — and the walk's section records — fully intact, but with the only thing that schedules it gone. The loop's branch is gated on the handle, and a reader already at the frontier cannot issue the extend that would re-adopt it, so a refused wireless session could cap the book. The handle is now cleared once the scratch is actually taken.
-
-Two changes landed alongside, both requested rather than found:
-
-- **`BOOK.BIN` is no longer rewritten every slice.** It was rewritten whole each time — header, every section record, TOC block, labels — making a build's index traffic quadratic in its section count, for a file nothing reads mid-build. Page turns and `background_announce`'s frontier both read the *resident* index, which is still adopted every slice; the file now lands every `INDEX_PUBLISH_SECTIONS` (16), with the walk's true frontier carried in `BookBuildResume::published_sections`. The final publish always writes complete, so a book that finishes is unaffected. Cost: bounded redone work when a walk is abandoned.
-- **`ClearBookCache` now drops the resume as well as the handle** (`reader_cache::clear_build_resume`), so `Carried` cannot resurrect a walk over a deleted cache. Unconditional, even when the clear names a different book than the one building: a walk is only an optimisation, and "the handle and the resume die together" is worth one redundant rebuild.
-
-**Branch note:** the work was squashed to `4cb8d85` and rebased onto `563f0aa` outside the session that wrote it, so the round-3 fixes sit on `d613707` rather than on the three original commits. The pre-fix content was verified intact after the squash, and the stack numbers below were re-measured on the new base rather than carried over.
-
-**Stack after round 3:** X3 42,144 → **42,136 B** (8 bytes, the `published_sections` field), X4 51,240 B, against a 27 KB link ASSERT floor.
-
-**Six rounds, six sets of escaped defects, zero automated coverage** — all in the publish tail's cleanup ordering, all the kind a fault-injection harness catches on the first run. The blocker was structural: that layer lived in `fw`, which has no host tests.
-
-**DONE (#55, merged 2026-07-29).** `reader-cache` now holds the store, layout, file layer and the publish tail, generic over `embedded_sdmmc::BlockDevice` and building for the host. Eight tests: seven driving the publish tail against an in-memory FAT16 card that fails the Nth read or write, one unit test on the arena counters. Each was checked by reintroducing the defect it guards and confirming it fails.
-
-It paid for itself during the move, which is the part worth remembering. The extraction itself introduced a **live cover regression** — moving `load_v2_cover_cache` out of `publish_book_cache` into the firmware's reporting helper meant a progressive first open adopted no cover, and `selected_cover` gates the Library and sleep renders on it, so backing out of a progressively opened book rendered without a cover already sitting on the card. Review caught it; a test now pins it. Adopting the cover is publication, not telemetry.
-
-Three review rounds on the extraction all found the same thing, and it is a lesson about method rather than about this code: the visibility promotion was driven by compiling `fw` and promoting exactly what rustc named. That is the wrong rule for a boundary — **the compiler names what compiles, not what should be reachable.** It widened eighteen fields that only mean anything as a set (`text`/`text_len`, `blocks`/`block_count`, `pages`/`page_count`, the chapter and catalog cursors), and the rounds walked them back behind `trim_to_page_boundary`/`restore_trimmed`, `layout::place_appended_block`, and getters. One of those walkbacks exposed a real defect: the trim reduced three counters and the restore put back two.
-
-**Rounds 4–6, 2026-07-28 — and each was introduced by the fix for the round before it.** All four commits are on the branch.
-
-- *Round 4.* A step that grew the resident index and **then** failed reported `Abandoned`, which announces nothing. The store held pages the app had never been told about, so a reader at the frontier was pinned below pages that existed, on disk, reachable. Split into `Stopped` (store coherent, safe to announce) and `Abandoned` (arena may be mid-move, nothing may repaint), decided by asking `covers_global_page` — the same predicate a page turn consults — rather than by which error was raised.
-- *Round 5.* The same dead frontier reached from the other side: a step that failed **before** building anything. Nothing to announce, so the walk itself is what had to survive. `StepAttempt::NeverBegan` marks the routes where `book_sections` is provably untouched (session refused, /books or the EPUB would not open); those put the resume back and retry.
-- *Round 5b.* The three-attempt cap that arrived with the retry was itself the residual — a card away longer than three quick attempts still stranded the reader. Replaced with escalating backoff (250 ms → 1 s → 4 s → 16 s → 30 s ceiling) and **no giving up** while the book is open. The cap only ever existed because the step branch was always ready; putting it on a timer removed the reason for it.
-- *Round 6.* The backoff commit falsified its own doc comment. `Carried` reset the retry budget only when the handle was *missing* — which used to be the state after giving up. With the walk now kept indefinitely the handle is always present, so a foreground open that had just proved the card was answering left a 30 s delay standing.
-
-The lesson is the shape, not the four fixes: every one is a failure **after** the store was already updated, reported as though nothing had happened, in the same twenty lines of publish tail. A fault-injection harness would have found rounds 3–6 together on its first run. That is the deferred crate extraction, and it is now the single highest-value item in this workstream.
-
-**A stack overflow that no gate could see (2026-07-28).** The first flash froze opening an uncached EPUB, panicking inside esp-hal's clock singleton right after `sd: session enter`. The cause was one call earlier. `ZipInflateScratch` is 43,280 bytes (32 KB of it the LZ77 window) and `ReaderCacheScratch` held it **by value**; `ZipInflateScratch::new()` returns by value, so initialising the static was only ever affordable because LLVM forwarded the `sret` slot straight into `.bss`. That elision is not a guarantee, and B4's 28-byte `resume` field — which touches none of this code — took the struct from 43,312 to 43,340 bytes and it stopped happening. Measured frames for `ensure_epub_scratch`, release, X3: **main 20,976 B → 53,744 B → 20,960 B after the fix, against a 42,136 B stack.** The overflow ran 11,608 bytes past the bottom of the stack and through `.bss`.
-
-Fixed by borrowing the window from its own `EPUB_ZIP_INFLATE` static (`ReaderCacheScratch` is now 64 bytes). The remaining 20,960 B spike is `ZipInflateScratch::new()` itself and is **not** fixed — miniz_oxide 0.9.1's stream layer keeps a private 32 KB window and can only be built by value. The real fix is one layer down in the same crate: `inflate::core::decompress` takes the caller's buffer as the window, and `DecompressorOxide` (10,500 B) has an in-place `init()`, so nothing in the inflate path would be constructed by value at all. `.bss` comes out neutral (−43,280 + 10,500 + 32,768). It needs `inflate_chunks_to_sink`/`inflate_chunks_prefix` reworked around ring-buffer output semantics — **its own change, in `proto`, not folded into anything.**
-
-Every host gate passed on the binary that froze the device. So `tools/check.sh stack-frames` now disassembles the release build, computes each function's peak `sp` adjustment — following the `lui`/`addi`/`sub` sequence RISC-V uses above 2 KB, which is exactly where this hid, since the prologue showed only `addi sp, sp, -0x100` — and fails over 24 KB. Verified both ways: passes the current binary, fails the exact pre-fix binary at 53,744 B. Wired into the `build-firmware` CI job. Note it bounds one frame, not call depth.
-
-**First device runs, 2026-07-28 (X3), both captured on serial with host timestamps.** Two runs, and between them they say B4 as written is a **net regression on the metric that matters**. Do not ship it on the strength of `storage_first_page`.
-
-*Run A — resuming deep into a book (page 561 of 562).* B4 never fired: no `storage_first_page`, no `build continue`, `partial=false`, `storage_open elapsed_ms=24736`. A full 24.7 s cold build with zero progressive benefit. `FirstOpen::suspend_here` needs `total_pages > requested_page`, i.e. 562 > 561, which is only true once the whole spine is built — and by then there is no spine left to suspend on. **The benefit falls to zero as the resume position approaches the end of the book**, and "near the end of a book you are reading" is not an edge case. The risk register's "deep resumes benefit least" badly undersells this.
-
-*Run B — cold open at page 0 of a 609-page book.* The headline number is real and the outcome is still worse than not doing it:
-
-| event | t from open |
-| --- | --- |
-| first paint (`storage_first_page elapsed_ms=455`, `total=1 partial=true`) | **0.46 s** |
-| background walk finishes (`storage_background_build elapsed_ms=44285`) | **44.3 s** |
-| reader reaches the prologue (page 13, chapter 5) | **45.3 s** |
-
-The 16 background steps did **28.4 s** of work (`step_ms` summed) in **44.3 s** of wall clock — 36% lost to repaint and render backlog. The reader arrived at the prologue 0.4 s *after* the build finished, i.e. **never got ahead of the builder at any point**. A plain non-progressive build of this book takes ~29 s and would have put them on the prologue one page turn later. So B4 made first pixel ~60× faster and first *content* ~1.6× slower.
-
-**The dominant cause is not the frontier.** That was the first hypothesis and the capture refutes it: by 5.7 s the book already advertised 76 pages, far more runway than a reader consumes. What actually cost the time is that **a page turn cannot preempt an in-flight build step, and steps are long**:
-
-- `BACKGROUND_SLICE_MS` is 400, but measured steps are **min 423, median 1997, max 3464 ms**. Suspension is only possible at spine boundaries, so a long chapter is one unbreakable step. The register's "~0.6–1 s" estimate is 3× optimistic at the median.
-- Page-turn latency during the background phase measured **76–3451 ms**, several in the 2–3.5 s band, against the pre-existing <550 ms budget. That answers device-checklist item 3: it blows the budget by up to 6×.
-- **The task starts a new step while an input is already pending.** At 454533 a `Next` arrives; the in-flight step ends at 454620; the task begins a *fresh 2912 ms step* at 454672, and the reader's page does not appear until 457985. `background_build_step_due` yields exactly once, which is not enough for the app task to receive the button, reduce it and emit a `Render` — so the build wins the re-poll and commits the loop to another multi-second item. This is the single biggest contributor and the cheapest to fix.
-- After a long step the queued renders drain one at a time at ~380 ms each, so the panel visibly walks page 0 → 1 → 2 through pages the reader had already pressed past.
-- Every step re-opens the zip and re-parses OPF + TOC (~56 ms, ~0.9 s total). Minor, pure repetition.
-
-**Correction to an earlier claim in this file and in the branch's commit messages:** "Next at the cap produces no state change, no render, no command" is **wrong**. Renders fire every time — run A shows 62 consecutive full renders of `page=561` at the end of a book, each burning a 379 ms panel refresh to redraw identical pixels. Only the *storage command* is absent, which is what the recovery argument needed; the "silently does nothing" framing was not accurate, and the wasted refresh at a book's last page is its own small defect.
-
-**The fix, in the order the measurements rank it:**
-
-1. **Do not start a step when input is pending or recent.** Replace the single `yield_now()` with a real quiet-period gate, so the app has time to turn a button press into a render before the build claims the loop. Cheapest change, biggest measured win.
-2. **Do not start a *long* step during a reading burst.** Item sizes are known from the zip entry before the item is walked (`compressed=`/`uncompressed=` are already logged), so step admission can be size-aware: take small items freely, save the multi-second ones for an idle gap. This is what makes the unbreakable-step floor tolerable without needing mid-item resumability, which the RAM budget rules out.
-3. **Publish with runway, not with one page.** `suspend_here` stops at the first section covering the requested page — `total=1` on a page-0 open. Give the first publish a cushion so a reading burst cannot reach the frontier.
-4. **Stop announcing per slice.** It is most of the 36% overhead and it is what produces the queued-render replay.
-5. **Show progress.** With a cushion the pre-publish window is seconds rather than sub-second, so the reader has to be told. This is the `LibraryEvent::Loaded` unfinished-frontier field declined during review.
-
-**And the option that the data genuinely puts on the table: drop progressive open for cold builds.** If time-to-first-*content* is the metric, a plain 29 s build behind an honest progress indicator beats 45 s of stuttering pages. Progressive open only wins if items 1–3 make the reader able to outrun the builder; if they do not, it is complexity with a negative return. Decide that before spending more on the mechanism.
-
-**Post-fix run, 2026-07-28 (same book, same `target=0`, serial-captured).** Two scheduling fixes landed on the branch (`e73777e`): a `BACKGROUND_SETTLE_MS` wait replacing the single `yield_now` between steps, and `BuildPhase::suspend_before`, which reads the next spine item's uncompressed size out of the zip entry and refuses to start one that would overrun the slice.
-
-| | before | after |
-| --- | --- | --- |
-| first paint | 455 ms | 361 ms |
-| **time to prologue** | **45.3 s** | **32.6 s** |
-| reader vs builder | arrived 0.4 s *after* the walk finished | reading **15.9 s before** it finished |
-| step_ms median | 1997 ms | **463 ms** |
-| step_ms max | 3464 ms | 4081 ms |
-| **page-turn median** | **1270 ms** | **231 ms** |
-| page-turn max | 3451 ms | 2305 ms |
-| build work / wall clock | 28.4 s / 44.3 s | 28.6 s / 48.1 s |
-
-Page turns are now inside the <550 ms budget at the median. The qualitative change is the one that matters: the reader is no longer racing the builder. `slice yields before spine` fired five times, so both fixes are demonstrably active.
-
-The max step got slightly *worse*, and that is the design working as documented. The 4081 ms step was a **single item** — chapter004, 72,988 B, estimated 3649 ms against ~4020 ms actual, so the fit was 9% low but the look-ahead refused it correctly; `walked_this_step == 0` forced it through under the forward-progress guarantee. Only mid-item suspension would fix that, and it does not fit the RAM budget. The build also costs 3.8 s more wall clock — 26 steps rather than 16, each paying ~56 ms of zip/OPF re-parse plus the 50 ms settle — for 12.7 s off time-to-content. Good trade.
-
-**Ship verdict, on the numbers.** A plain build is ~28.6 s plus ~13 page turns to reach the prologue, call it ~34 s. Progressive open was 45.3 s (clearly worse) and is now 32.6 s, with the reading interactive throughout instead of a blank wait. **Keep it.** Note time-to-prologue is partly operator-paced and should be read as indicative; `step_ms` and page-turn latency are the pace-independent numbers and moved further.
-
-**The remaining overhead is not what this file previously blamed.** Build duty cycle is 60% — 28.6 s of work in 48.1 s. Measured over the background window: 31 `view=Reading` renders against **16** reader inputs, 38 panel refreshes totalling **14.4 s**, and 16 storage extends. The reader was at page 13 while the builder was past page 212, so `background_announce` cannot have been firing at all; throttling it would have changed nothing here.
-
-The real cost is that **every page turn renders twice**: once optimistically when the page changes, then again when storage answers with `LibraryEvent::Loaded`, which sets `dirty = Rect::FULL` unconditionally (`app-core/src/lib.rs`) regardless of whether anything about the book's shape changed. At ~405 ms of panel time each that is ~6.5 s of the window, and it is **not a B4 behaviour** — it is the ordinary reading path, present whenever a page turn issues an extend, and merely more visible while a build runs. `bench: storage_open` already reports `ram_hit=true` for the case where the extend loaded nothing, so the signal needed to suppress the second repaint exists. Care is required: the second render is genuinely necessary when the extend *did* load new section content, so the suppression must key off "nothing was loaded and no field changed", not off the event's fields alone.
-
-That reframes item 4 below: the target is the redundant post-extend repaint on the normal reading path, not the frontier announce. It is also worth more than B4 — it would take ~405 ms off every page turn in the book, cached or not.
-
-**The success metric was wrong, and that is the reusable lesson.** `bench: storage_first_page` hits 455 ms and describes nothing a reader experiences. Front matter is the book's own spine and cannot be skipped — page numbering is sequential — so the number to benchmark is **time-to-first-content-page**, and it must be compared against the plain build, not against zero.
-
-**The device checklist below is superseded** by the two runs above; re-derive it once the first-open behaviour is settled.
-
-**Measured cost:** 48 bytes of X3 stack region (headroom 42,192 → 42,144 B, against the 27 KB link ASSERT floor) — the `BookBuildResume` in the `EPUB_SCRATCH` static plus padding. Nothing added to the deep EPUB-open frames. X4 headroom 51,248 B.
-
-**Still to do: the on-device numbers.** New telemetry: `bench: storage_first_page elapsed_ms= pages= sections= key=` on the provisional publish (a separate line, so the existing `bench: storage_build` parse of a completed build is untouched) and `bench: storage_background_build book_id= pages= elapsed_ms=` at the end. Device checklist: (1) `storage_first_page` vs the 64.0 s portrait baseline; (2) `storage_background_build` total vs a cold build; (3) `page-turn` **during** the background phase — record the real worst case, since the pre-existing <550 ms budget assumes an idle task; (4) sleep mid-build, then reopen inside and past the frontier; (5) a Type Size change straight after a progressive open, proving the cross-step CONT.BIN capture still replays (B6 regression); (6) `reader-soak` with a build running; (7) `channel-stress --host`.
-
-### Original spec and risk register (kept; the rework's answers folded in)
-
-`build_or_load_epub_cache_from_zip` walks the entire spine before `BookLoadStatus::Ready`. Publish Ready once the section containing the requested page is flushed (`flush_section` already writes `S%03d.BIN` incrementally), record a provisional/partial `BOOK.BIN`, and continue the walk in slices so renders interleave. The `partial` flag, `start_page` bookkeeping, and `load_v2_section_by_global_page` already model "not fully indexed".
-
-- Impact: time-to-first-page 3.9 s → ~0.5–1 s. Against the 2026-07-25 baseline the target is **64.0 s → ~1 s** on the 11.7 MB portrait book. Total build time unchanged.
-- Risks, and how the rework answers them:
-  - *Growing page-total denominator mid-read* — every `Loaded` marks the screen dirty, so announcing per step would buy a panel refresh every ~640 ms. `app_core::storage_loop::background_announce` announces on finish, plus the one case that matters: a reader pinned at the frontier, where the next-page button would otherwise silently do nothing. `rebuild_toc_page_targets` runs per step so the Chapters overview tracks the growing index without re-reading TOC.BIN.
-  - *Interrupted-build resume policy* — RAM-only for the *work*, but **not** for the fact that work is outstanding: that had to go on disk as `resume_spine`, or an interrupted build traps the reader (see the review round above). An interrupted build redoes its prefix on the next open; time-to-first-page stays ~1 s, so the redo is background cost only.
-  - *Storage/render interleave, single-SPI-owner invariant* — unchanged: a step is one `sd_session::with_root` on the display task, exactly like any other storage command. Renders never overlap it; they wait for it.
-  - *Deep resumes benefit least* — finding page 900 of 1240 genuinely requires laying out pages 0..900, so only the tail is backgrounded. First opens save ~99% of the wait.
-  - *Page turns during the background phase* — bounded by one step (~0.6–1 s on the measured book) rather than ~410 ms. Suspension is only possible at spine boundaries: mid-item would mean persisting the XML tokenizer, block parser, and inflate window, which does not fit the RAM budget. So one section is the floor, and `BACKGROUND_SLICE_MS = 400` mostly decides whether *short* items get batched.
-  - *An abandoned build leaves an incomplete CONT.BIN* — replay refuses it (the header only says `complete` on the final step) and the next full build truncates it. Dead weight, not a correctness problem.
-- Not in scope, deliberately: the CONT.BIN replay path stays non-progressive. It runs the same sink and publish tail and would benefit, but B4 as written names the zip build, and the 24–27 s settings-change replay is B7's territory.
-- Prior art: named in IMPLEMENTATION_PLAN as a candidate next win.
-
-**Stranded-branch note (2026-07-25), kept for the record:** `origin/opt/b4-progressive-open` carried a complete implementation (provisional partial BOOK.BIN + self-enqueued `ContinueBookBuild` slices + guarded RAM-only resume state; all check.sh gates passed on 2026-07-12), but it stacked on B6's **pre-review** commit and was 19 commits behind main. #41 folded book-open into one storage-owned transaction and #29 changed reading-state persistence to durable two-generation files — both restructuring exactly what it modified. The publish tail was re-derived against `publish_book_cache`'s `BookPublishOutcome` (from B6's review), whose return the stranded branch's provisional publish ignored.
-
-## B5 (bundle only, S): word-loop micro-costs
-
-Per-word `String<768>` copy to satisfy borrows (`reader_cache.rs:1860-1862`), full line re-measure on wrap (`:1883-1885`), `sanitize_preview_block`'s ~15 scans + two LowerAscii copies (`:2133-2212`). Only while already in this file for B3/B4.
-
-## B6 (Tier 2, M): Settings-independent content cache — CONTENT.BIN — DONE (#23)
-
-Merged 2026-07-24 as CONT.BIN, with review hardening: `publish_book_cache` returns `BookPublishOutcome { Ready, IndexWriteFailed, SectionReadFailed }`, and a failed index write clears the cache dir instead of stranding a truncated BOOK.BIN.
-
-**Measured on X3 2026-07-25 (main 95f4bf2, 11.7 MB baseline book):** Type Size changes replayed in **24.7 s** (736 pages / 82 sections) and **27.1 s** (1240 pages / 100 sections) — ~280–300 ms per section. The replay path is proven genuine by read volume: 2.8–3.8 MB read per rebuild vs the 11.7 MB source zip a fallback would stream. **Ratio, measured the same evening at identical settings via the new Library cache-clear: full build 64.0 s portrait / 62.2 s landscape → replay is 2.4–2.6× faster, saving ~37 s per settings change.** So B6 earns its keep — but 24–27 s of user-facing wait remains, since nearly all remaining cost is downstream of the capture point (wrap + section writes), which the zip/inflate/XML skip cannot touch — **that is the "replay still slow" outcome, so B7 is promoted (below)**. Original design kept for reference:
-
-A Type Size/Weight/Family change flips wrap-relevant bits in `reader_layout_config`, so `load_v2_section_cache` rejects every section (`font_config & !0b11` check, `fw/src/reader_cache_files.rs:914`) and the open re-does the entire EPUB pass — zip read + inflate + XML parse + wrap + section rewrite, a full cold build (14.1 s on the measured 11.7 MB EPUB). Everything upstream of wrapping is settings-independent. Persist the `push_block` argument stream (text, role, style, align, paragraph_end, plus spine-boundary markers) to `XTEINK/CACHE2/<key>/CONTENT.BIN` during the full build; on a layout-config miss, replay it through the same `LibraryBlockSink` instead of re-parsing the EPUB.
-
-Design (folded in from the retired docs/OPTIMIZATION_PLAN.md item 4, audited against main 2026-07-12):
-
-- **Capture point:** the `XhtmlBlockSink::push_block` boundary — the exact argument stream `(text, role, style, align, paragraph_end)` per fragment, plus a spine-boundary marker between spine items (record `spine_index` and the `finish_spine` events). Capturing here (raw, pre-normalization) guarantees a replay produces byte-identical sections, because the replay literally calls the same `push_block`. `start_spine_index` and navigation-spine skipping (`spine_item_is_navigation`) run before `push_block`, so the captured stream already excludes them — replay must not re-filter.
-- **File and format:** `XTEINK/CACHE2/<key>/CONTENT.BIN`. Header: own magic + `CONTENT_VERSION` + `source_hash` + `source_size` + `complete` flag. Records: `spine_index: u16, role: u8, style: u8, align: u8, flags: u8 (paragraph_end, spine_end), text_len: u16, text bytes`. Constants and encode/decode helpers go in `proto/src/cache.rs` next to the existing section records, with unit tests there (host-buildable).
-- **Write during the full build:** wrap the sink so each `push_block` also appends one record, sequential append only, through a staging buffer loaned from `ReaderCacheScratch` — never a stack buffer (`scratch.xhtml` is busy during spine streaming; `scratch.opf`/`scratch.container` are idle after OPF parse — verify before reusing, and document the reuse where the field is declared, as `load_epub_toc` does for `xhtml`). If any write fails, delete the file and continue the build — CONTENT.BIN is purely an accelerator. Partial/stopped builds (`book_partial`, spine truncation) must record `complete = false`.
-- **Replay path:** in `build_or_load_book_cache_from_root`, when the section load misses on layout config (today that surfaces as `CacheLoadResult::Invalid` from the `font_config` check — plumb the distinction out, or simply try CONTENT.BIN before the EPUB whenever the index/section load misses): verify identity + version + `complete`, then stream the records into a `LibraryBlockSink` configured with no zip work — same `flush_if_full`/`flush_section`/`write_v2_book_index` flow, `generate_toc_from_headings = false`. Fall back to the full EPUB path on any read/decode error, after deleting the bad file. Replay only from a `complete` capture.
-- **TOC.BIN and COVER.BIN survive settings rebuilds:** their contents don't depend on type settings — only the page map does, and that is already recomputed per config (`refresh_chapter_tracking`, `chapter_page_token`). On replay, don't re-stream or rewrite TOC.BIN; populate the resident `library.toc*` fields from the old BOOK.BIN (load it before invalidating) or from TOC.BIN, so the rewritten BOOK.BIN keeps its TOC block.
-- **Invalidation:** keyed by source identity (hash + size) and `CONTENT_VERSION` only — never by layout config. Bump `CONTENT_VERSION` whenever XHTML-parser / entity-decode / sink-normalization semantics change (same bump-log discipline as `READER_LAYOUT_VERSION` in `ui/src/reading.rs`). Cache-dir eviction (`fw/src/reader_cache_files.rs:642` area) must learn to delete CONTENT.BIN too.
-- **Cost:** roughly the book's raw text on SD (typically well under a few MB) plus one extra sequential write on the first open — accepted; it buys every later settings change.
-- One simplification vs the original design: the forward-only build path (`ZipLocalStream`) has no firmware call site anymore — uploads store files (#18) and builds happen on first open — so capture only needs the `ZipStream` path; keep the sink generic but don't spend effort on forward-only capture.
-
-- Impact: settings-change reopen drops from a full cold build to sequential read + wrap + section writes — skips zip/inflate/XML, the bulk of the CPU-dominated build. First open pays one extra sequential write (~raw text size).
-- Verify: encode/decode round-trip tests in `proto` (host); on device: (1) a cold open writes CONTENT.BIN, (2) A/B a Type Size change on the 11.7 MB baseline book, (3) identical `total=` page counts from replay vs from-EPUB rebuild at the same settings, (4) hand-corrupt/truncate CONTENT.BIN → fallback still opens.
-- Coordination: same files as B4 (`reader_cache*.rs`, `reader_cache_files.rs`) — land B6 before starting B4.
-
-## B7 (PROMOTED 2026-07-25, S–M): Per-config section caches — trigger condition met
-
-**The condition fired twice in the 2026-07-25 bench session:** B6 replay costs 24.7–27.1 s per Type Size change, and an **orientation flip pays the same ~24 s replay** — the page box is wrap-relevant, so every portrait↔landscape toggle (now a first-class flow with portrait default) rebuilds all sections and overwrites the previous config's. Flipping back to any previously-used config re-pays the full replay.
-
-Keep caches per layout config instead of overwriting, so flipping back to a previously-built setting is an instant cache hit (folded in from the retired docs/OPTIMIZATION_PLAN.md item 5). The layout config is a small packed integer (`reader_layout_config`: `version<<6 | family<<5 | weight<<4 | size<<2 | spacing`); key the wrap-relevant nibble (family/weight/size, 4 bits) into the section file names (e.g. `S<cfg>_<n>` — mind the 8.3 name budget, `CACHE_SECTION_FILE_BYTES = 8`) and into per-config BOOK.BIN names. **Spec update from the session: the key must also carry the orientation/page-box axis** — `reader_layout_config` predates portrait, so add a page-box bit (portrait vs landscape wrap width) to the config key or the cache is still overwritten on every orientation flip, which is the flow that actually hurts. Costs: SD space multiplies per config used; eviction needs a policy (e.g. keep at most 2 configs per book, delete least recently used); `CACHE_V2_VERSION` bump if BOOK.BIN naming changes.
+Status (2026-07-30): B2+B3, B6, B4, and the reader-cache extraction are on
+`main`. **B7 is done** on `opt/b7-per-config-section-caches`, not yet merged.
+What is left is one non-B item that outranks everything else here, one gap B4
+left behind, and a `proto` stack item.
+
+Owns: `reader-cache/`, `fw/src/book_build.rs`, `fw/src/custom_font.rs`,
+`fw/src/library_sd.rs`, `ui/src/reading.rs`, `proto/`.
+Do not touch: `fw/src/sd_session.rs` — SD chunk/clock/multi-block changes
+belong to WS-D, and this workstream benefits automatically.
+
+## Open
+
+### 1. Single repaint per page turn — not a B item, and worth more than any of them
+
+Every page turn renders **twice**: once optimistically when the page changes,
+then again when storage answers with `LibraryEvent::Loaded`, which sets
+`dirty = Rect::FULL` unconditionally (`app-core/src/lib.rs`) whether or not
+anything about the book's shape changed. At ~405 ms of panel time each, that
+is ~405 ms off every page turn in every book, cached or not.
+
+Found while measuring B4, but it is not a B4 behaviour — it is the ordinary
+reading path, present whenever a page turn issues an extend, and merely more
+visible while a build runs (~6.5 s of a 48 s background window).
+
+`bench: storage_open` already reports `ram_hit=true` for the case where the
+extend loaded nothing, so the signal exists. **Care:** the second render is
+genuinely necessary when the extend *did* load new section content, so the
+suppression must key off "nothing was loaded and no field changed", not off
+the event's fields alone.
+
+Implemented on `opt/single-repaint-per-page-turn` (one commit over `main`);
+needs review and device numbers.
+
+### 2. First open on a deep resume
+
+B4 gives nothing when the resume position is near the end of the book.
+`FirstOpen::suspend_here` needs `total_pages > requested_page`, which for
+page 561 of 562 is only true once the whole spine is built — and by then
+there is nothing left to suspend on. Measured on device: a full 24.7 s cold
+build, no `storage_first_page`, no progressive benefit at all. "Near the end
+of a book you are reading" is not an edge case.
+
+Nothing in the progressive mechanism can fix this; the work genuinely has to
+happen. The answer is a **progress indicator** — the
+`LibraryEvent::Loaded` unfinished-frontier field declined during B4's review.
+
+### 3. `proto` inflate rework — 21 KB of stack that need not exist
+
+`ZipInflateScratch::new()` costs a 20,960 B frame (`ensure_epub_scratch`,
+release, X3) against `tools/check.sh stack-frames`' 24 KB gate, because
+miniz_oxide 0.9.1's stream layer keeps a private 32 KB window and can only be
+built by value. One layer down in the same crate, `inflate::core::decompress`
+takes the caller's buffer as the window and `DecompressorOxide` (10,500 B)
+has an in-place `init()`, so nothing on the inflate path would be constructed
+by value at all. `.bss` comes out neutral (−43,280 + 10,500 + 32,768).
+
+Needs `inflate_chunks_to_sink` / `inflate_chunks_prefix` reworked around
+ring-buffer output semantics. **Its own change, in `proto`, not folded into
+anything.**
+
+### B5 (S, bundle only): word-loop micro-costs
+
+Per-word `String<768>` copy to satisfy borrows, full line re-measure on wrap,
+and `sanitize_preview_block`'s ~15 scans plus two LowerAscii copies — all in
+`fw/src/book_build.rs` (`push_styled_preview_fragment` ~:2896,
+`sanitize_preview_block` ~:3298).
+
+Bundle-only by design, and it currently has no host. It was kept out of B4
+(the risk there was all in the suspend/resume seam) and out of B7 (which
+never touched these functions). Fold it into the next change that works
+`book_build.rs`'s sink; do not open a PR for it alone.
+
+### B1's remaining levers — only if custom-font cold builds still measure slow
+
+#37 covered this item's goal: a 16-slot ring of decoded non-ASCII metrics
+keyed by (identity, face, codepoint), `for_each_metric` feeding whole styled
+runs through one open pack handle, and one seek+read per glyph bitmap. If
+custom-font builds still measure slow, what is left is (a) General-Punctuation
+slot runs and (b) holding the pack handle across the whole spine walk rather
+than per run. Measure before building either.
+
+## Done
+
+- **B2+B3** (#10) — catalog scan O(C×N) → O(C+N), title persisted in the
+  catalog record; incremental pagination cursor (~100–300 ms per build).
+- **B6 — CONT.BIN settings-independent content cache** (#23). Captures the
+  build's `push_block` stream so a settings change replays it instead of
+  re-reading and re-parsing the EPUB. **Measured X3: replay 24.7 s (736 pp) /
+  27.1 s (1240 pp) against a 64.0 s full build — 2.4–2.6× faster, ~37 s saved
+  per settings change.** Proven genuine by read volume: 2.8–3.8 MB per rebuild
+  against the 11.7 MB source zip a fallback would stream. The remaining 24–27 s
+  is downstream of the capture point (wrap + section writes), which no
+  zip/inflate/XML skip can touch — that is what promoted B7.
+- **B4 — progressive first open** (#53). The walk stops at the first spine
+  boundary past the requested page, publishes a partial BOOK.BIN stamped with
+  `resume_spine`, and finishes in slices from a fifth branch of the display
+  task's select. **Time-to-prologue 45.3 → 32.6 s after two scheduling fixes
+  (a settle wait between steps, and size-aware step admission that refuses an
+  item which would overrun the slice); page-turn median during a build
+  1270 → 231 ms; the reader now finishes 15.9 s ahead of the builder instead
+  of 0.4 s behind.** Total build time is unchanged and slightly worse in wall
+  clock (26 steps rather than 16); that buys 12.7 s off time-to-content.
+- **Reader-cache crate extraction** (#55). The store, layout, file layer and
+  publish tail now live in `reader-cache`, generic over
+  `embedded_sdmmc::BlockDevice` and building for the host, with
+  fault-injection tests against an in-memory FAT16 card that can fail the Nth
+  read or write. B4 took six review rounds and every escaped defect was the
+  same shape — a write fails *after* the store has been updated and the
+  cleanup gets it wrong — in code that lived in a `#![no_main]` binary no test
+  could reach.
+- **B7 — per-config section caches** (`opt/b7-per-config-section-caches`,
+  committed, not merged). A book keeps a paginated copy per layout config
+  instead of overwriting the one it has, so flipping back to a type size or
+  orientation already read is a cache hit rather than the 24–27 s replay.
+  Sections are `SECTIONS/S<cfg><nnn>.BIN`, the index is `BK<cfg>.BIN`, and
+  `CFG.BIN` lists the resident configs most-recently-used first — driving both
+  eviction (2 slots, LRU) and the readers that need a book's
+  config-*independent* facts (source identity, title, TOC) to know which index
+  exists. Cost: +6,882 B flash, no static RAM, one extra paginated copy on the
+  card.
+
+  Two deliberate deviations from the spec below, both worth knowing:
+  - The spec said to **add** a page-box bit to the config key.
+    `READER_LAYOUT_VERSION` v18 already put one in bit 7, so the key only had
+    to include it. The wrap-relevant key is bits 2–7 (size, weight, family,
+    portrait) — six bits, two hex digits.
+  - The spec said to bump `CACHE_V2_VERSION` because the index name changed.
+    **Not done, deliberately:** nothing reads the old names, so a bump would
+    only invalidate CONT.BIN as well and turn the one-time upgrade from a
+    replay into a full EPUB re-parse. The first open that finds an unkeyed
+    `BOOK.BIN` deletes it and the unkeyed section files instead.
+
+  **Known follow-up:** `publish.rs`'s provisional-publish failure path still
+  calls `empty_cache_dir`, so a torn index write for one config now takes the
+  other config's good cache with it. Scoping it to the failing config is the
+  right fix; it changes a fault path with tests pinning it, and the current
+  behaviour degrades to a rebuild rather than to anything incorrect.
+
+## Constraints that bind anything here
+
+- **The EPUB-open chain must stay inside the ~42 KB X3 stack region**, against
+  a 27 KB link ASSERT floor, and no single frame may exceed
+  `tools/check.sh stack-frames`' 24 KB gate. B4's 28-byte `resume` field once
+  pushed `ReaderCacheScratch` past the point where LLVM would elide an `sret`
+  copy, and a 43 KB `ZipInflateScratch` landed on the stack — a 53,744 B frame
+  that ran 11,608 bytes past the bottom of the stack and through `.bss`, with
+  every host gate passing. That gate exists because of it.
+- **A partial index must say on disk that a walk is coming back for the rest.**
+  The reducer clamps the reader to the advertised page count
+  (`app-core/src/lib.rs`), so the reader can never *ask* for the first missing
+  page and nothing else provokes a rebuild. `partial` cannot carry this — it
+  means "pages are missing", not "someone is fetching them". That is what
+  `BookV2Header::resume_spine` is for.
+- **A page turn across a section boundary arrives as an `ExtendSection`** and
+  reaches `build_or_load_book_cache`. The fast path is the only route that
+  does not touch the scratch's section records, so it is the only one that can
+  leave a running background walk standing. Without that,
+  reading normally would kill the build at the first section crossing.
 
 ## Do not re-propose
 
-Already done in the July build-path work: write staging, held-open SECTIONS dir, dirty-gated rebuilds, 8 KB read_at clamp, warm SD session reuse, style-marker dedup, OPF span strings, streamed whole-spine XHTML, ZIP central-directory hash index. V1 cache migration is disabled by design. Page-turn latency and reopen path are not software targets.
-
-Suggested order: B6 ✓ → B4 rework ✓ (measured on device; scheduling fixed) → reader-cache extraction ✓ (#55) → **the double-repaint fix, which is not a B-item and outranks the rest** (see the B4 section: ~405 ms of panel time off every page turn in every book) → B7 (trigger met; instant config flips). B5 was not folded into the B4 rework: the word-loop micro-costs are in `push_styled_preview_fragment`, which the rework never touched, and bundling them would have muddied a diff whose whole risk is in the suspend/resume seam. Fold them into B7 instead — it works the same file. B1 closed by #37 unless custom-font builds still measure slow.
+- Already done in the July build-path work: write staging, held-open SECTIONS
+  dir, dirty-gated rebuilds, 8 KB `read_at` clamp, warm SD session reuse,
+  style-marker dedup, OPF span strings, streamed whole-spine XHTML, ZIP
+  central-directory hash index.
+- V1 cache migration is disabled by design.
+- Page-turn latency and the reopen path are not software targets — except for
+  the double-repaint item above, which is a redundant repaint rather than slow
+  code.
+- **Benchmarking progressive open on `storage_first_page`.** It hits 455 ms
+  and describes nothing a reader experiences: front matter is the book's own
+  spine and cannot be skipped, so the number is time-to-first-*content*,
+  compared against a plain build rather than against zero.
+- **The stranded `origin/opt/b4-progressive-open` branch.** Superseded; do not
+  rebase it.
