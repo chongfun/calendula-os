@@ -164,6 +164,7 @@ pub struct TocItem<'a> {
 #[derive(Clone, Copy)]
 pub struct TrimmedTail {
     blocks: usize,
+    pages: usize,
     text_len: usize,
 }
 
@@ -774,6 +775,7 @@ impl ReaderStore {
     pub fn trim_to_page_boundary(&mut self, cut: usize, pages: usize) -> TrimmedTail {
         let tail = TrimmedTail {
             blocks: self.block_count,
+            pages: self.page_count,
             text_len: self.text_len,
         };
         self.block_count = cut;
@@ -782,10 +784,18 @@ impl ReaderStore {
         tail
     }
 
-    /// Put back what [`Self::trim_to_page_boundary`] set aside, before the
-    /// carried page is rebased.
+    /// Put back all three counters [`Self::trim_to_page_boundary`] set aside,
+    /// before the carried page is rebased.
+    ///
+    /// All three, not two: the trim reduces `page_count` as well, and leaving it
+    /// truncated here would expose a full arena behind a short page index. The
+    /// firmware happens to hide that by rebasing and rebuilding immediately
+    /// afterwards, but an early return or an added assertion between the two
+    /// would see it -- and relying on caller sequencing is the thing this API
+    /// exists to stop.
     pub fn restore_trimmed(&mut self, tail: TrimmedTail) {
         self.block_count = tail.blocks;
+        self.page_count = tail.pages;
         self.text_len = tail.text_len;
     }
 
@@ -1546,4 +1556,40 @@ pub fn source_hash(path: &str, byte_size: u32) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use std::boxed::Box;
+
+    /// Invariant: a trim/restore round trip returns all three arena counters.
+    ///
+    /// A unit test rather than an integration one because the counters are
+    /// crate-private -- which is the point of them -- and this asserts the
+    /// property directly rather than through a caller that happens to rebuild
+    /// the page index straight afterwards and mask a partial restore.
+    #[test]
+    fn a_trim_and_restore_round_trip_returns_all_three_counters() {
+        let mut store = Box::new(ReaderStore::new());
+        store.block_count = 40;
+        store.page_count = 5;
+        store.text_len = 900;
+
+        let tail = store.trim_to_page_boundary(30, 4);
+        assert_eq!(store.block_count, 30, "the trim should cut the blocks");
+        assert_eq!(store.page_count, 4, "the trim should drop the partial page");
+        assert_eq!(
+            store.text_len, 0,
+            "the trim should follow the cut block's text offset"
+        );
+
+        store.restore_trimmed(tail);
+        assert_eq!(
+            (store.block_count, store.page_count, store.text_len),
+            (40, 5, 900),
+            "all three counters describe one arena and must come back together"
+        );
+    }
 }
