@@ -52,10 +52,15 @@ This is useful for boot, catalog-cache, and sleep/wake smoke runs because it
 does not rely on catching a manual button press at the right moment.
 
 `report --strict` exits non-zero when checked-in warning budgets are exceeded or
-when the selected suite did not capture its expected signal, such as storage
-telemetry for `storage-cache` or input-to-Reading-render timing for
-`page-turn`. Capture commands also accept `--strict`, applying the same gate to
-the log they just wrote.
+when the selected suite did not capture its expected signal: storage telemetry
+for `storage-cache`, a completed sleep for `sleep-sync`, a completed sleep and
+a wake after it for `reader-soak`, and for `page-turn` both input-to-Reading-
+render timing and the full turn count that was asked for. Capture commands also
+accept `--strict`, applying the same gate to the log they just wrote.
+
+`page-turn --turns N` stops on N *paired* turns — presses answered by a Reading
+render — not on N Reading renders, so a boot paint or a storage-driven repaint
+cannot consume one of them.
 
 Budgets and signal checks follow the *workflow* a capture ran, which for
 `thermal-run` is its `--suite` choice rather than `thermal-run` itself: a

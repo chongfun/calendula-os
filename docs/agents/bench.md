@@ -31,9 +31,15 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   enclosure, power, SD-card, or ambient-temperature investigations.
 - `reader-soak` is a passive capture: the operator runs the described
   reading workflow on the device by hand while bench.py records. Menus
-  idle-sleep after 3 minutes (Reading after 10), so keep interacting.
+  idle-sleep after 3 minutes (Reading after 10), so keep interacting. **Do
+  the sleep/wake cycle** — `--strict` now asks for a completed sleep and a
+  wake after it, because that path is the part of the workflow nothing else
+  exercises and a soak without it is a page-turn run wearing another name.
 - **`page-turn` is operator-driven too.** bench.py only listens; a human
-  presses Next until the requested turn count lands. **Still capture at
+  presses Next until the requested turn count lands. The count is *paired
+  turns*, not Reading renders: an unprompted repaint no longer eats one of
+  them, `run_start` records what you asked for, and `--strict` says so if
+  the capture came home short. **Still capture at
   deliberate cadence — one press per fully settled page** — but the
   statistic now defends itself, and the report tells you when it could not:
 

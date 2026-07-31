@@ -1632,11 +1632,145 @@ class CaptureLinesTests(unittest.TestCase):
         mock_sleep.assert_not_called()
 
 
+class PageTurnCounterTests(unittest.TestCase):
+    """The capture stops on turns, so an unprompted repaint is not one.
+
+    Counting Reading renders let the boot paint, or any storage-driven
+    repaint, consume one of the requested samples: `--turns 50` came home
+    with 49 and nothing downstream could tell, because the report pairs
+    properly and simply reported what it found.
+    """
+
+    PRESS_AND_TURN = [
+        "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=1000\n",
+        "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 "
+        "flush_ms=400 req_ms=1000 prestage_ms=15 t_ms=1430\n",
+    ]
+    # No press before it: the paint a boot or a storage re-render produces.
+    UNPROMPTED_RENDER = (
+        "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 "
+        "flush_ms=400 req_ms=100 prestage_ms=15 t_ms=530\n"
+    )
+
+    def _counts(self, lines: list[str], target: int) -> dict:
+        return bench.process_capture_stream(
+            lines,
+            "page-turn",
+            stop_target=("page_turn", target),
+            print_lines=False,
+        )
+
+    def test_an_unprompted_render_does_not_consume_a_requested_turn(self) -> None:
+        lines = [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN * 2
+        counts = self._counts(lines, 2)
+        self.assertEqual(counts.get("page_turn"), 2)
+        self.assertEqual(counts.get("reading_render"), 3)
+
+    def test_the_capture_runs_until_the_turns_are_paired(self) -> None:
+        """Two turns requested, one repaint in the middle: still two turns."""
+        lines = (
+            self.PRESS_AND_TURN + [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN
+        )
+        counts = self._counts(lines, 2)
+        self.assertEqual(counts.get("page_turn"), 2)
+
+    def test_the_live_counter_agrees_with_the_report(self) -> None:
+        """The stop rule and the reported figure must not drift apart."""
+        lines = [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN * 3 + [
+            # A press answered by a Home render is navigation, not a turn.
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
+            "bench: render view=Home mode=Fast page=0 chapter=0 layout_ms=10 "
+            "flush_ms=400 req_ms=9000 t_ms=9430\n",
+        ]
+        events = [event for line in lines for event in bench.parse_line(line, "page-turn")]
+        counter = bench.PageTurnCounter()
+        for event in events:
+            counter.observe(event)
+        self.assertEqual(
+            counter.turns, len(bench.page_turn_stats_over_epochs(events).durations)
+        )
+
+    def test_a_short_capture_is_reported_against_what_was_asked_for(self) -> None:
+        events = [
+            {"event": "run_start", "suite": "page-turn", "requested_page_turns": 50},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1430, "req_ms": 1000},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("1 of 50 requested page turns" in w for w in warnings), warnings
+        )
+
+    def test_a_complete_capture_is_not_faulted(self) -> None:
+        events: list[dict] = [
+            {"event": "run_start", "suite": "page-turn", "requested_page_turns": 2},
+        ]
+        for turn in range(2):
+            press = 1000 + turn * 5000
+            events.append({"event": "input", "button": "Next", "t_ms": press})
+            events.append(
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": press + 430,
+                    "req_ms": press,
+                }
+            )
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+
+class ReaderSoakSignalTests(unittest.TestCase):
+    """The soak's guidance promises a sleep/wake cycle; strict must ask for it."""
+
+    @staticmethod
+    def _reading(t_ms: int) -> list[dict]:
+        return [
+            {"event": "input", "button": "Next", "t_ms": t_ms},
+            {"event": "render", "view": "Reading", "t_ms": t_ms + 430, "req_ms": t_ms},
+        ]
+
+    def test_a_soak_that_never_slept_is_reported(self) -> None:
+        events = [{"event": "run_start", "suite": "reader-soak"}] + self._reading(1000)
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("no completed sleep captured" in w for w in warnings), warnings
+        )
+
+    def test_a_soak_that_slept_but_never_woke_is_reported(self) -> None:
+        events = (
+            [{"event": "run_start", "suite": "reader-soak"}]
+            + self._reading(1000)
+            + [{"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000}]
+        )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("no wake followed it" in w for w in warnings), warnings
+        )
+
+    def test_a_full_sleep_wake_cycle_passes(self) -> None:
+        events = (
+            [{"event": "run_start", "suite": "reader-soak"}]
+            + self._reading(1000)
+            + [
+                {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+                {
+                    "event": "boot",
+                    "deep_sleep_wake": True,
+                    "gpio": True,
+                    "sleep_image": True,
+                },
+            ]
+            + self._reading(600)
+        )
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+
 class BenchCaptureLoopTests(unittest.TestCase):
     def test_capture_waits_for_paired_prestage_across_intervening_log(self) -> None:
         """Capture continues past unrelated logs until event=='prestage' arrives."""
         lines = [
-            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 t_ms=100\n",
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
+            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n",
             "[LOG_INF] Unrelated firmware message\n",
             "bench: prestage staged=true elapsed_ms=24 t_ms=124\n",
             "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 flush_ms=400 t_ms=200\n",
@@ -1649,21 +1783,23 @@ class BenchCaptureLoopTests(unittest.TestCase):
         counts = bench.process_capture_stream(
             lines,
             "page-turn",
-            stop_target=("reading_render", 1),
+            stop_target=("page_turn", 1),
             print_lines=False,
             event_callback=event_cb,
         )
 
+        self.assertEqual(counts.get("page_turn"), 1)
         self.assertEqual(counts.get("reading_render"), 1)
         self.assertEqual(counts.get("prestage"), 1)
-        self.assertEqual(len(written), 2)
-        self.assertEqual(written[0]["event"], "render")
-        self.assertEqual(written[1]["event"], "prestage")
+        self.assertEqual(
+            [event["event"] for event in written], ["input", "render", "prestage"]
+        )
 
     def test_capture_stops_immediately_for_structured_combined_render(self) -> None:
         """Structured combined render with prestage_ms stops without waiting for standalone prestage."""
         lines = [
-            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 prestage_ms=15 t_ms=100\n",
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
+            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 prestage_ms=15 req_ms=50 t_ms=500\n",
             "bench: prestage staged=true elapsed_ms=24 t_ms=124\n",
         ]
         written: list[dict] = []
@@ -1674,20 +1810,21 @@ class BenchCaptureLoopTests(unittest.TestCase):
         counts = bench.process_capture_stream(
             lines,
             "page-turn",
-            stop_target=("reading_render", 1),
+            stop_target=("page_turn", 1),
             print_lines=False,
             event_callback=event_cb,
         )
 
+        self.assertEqual(counts.get("page_turn"), 1)
         self.assertEqual(counts.get("reading_render"), 1)
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual(len(written), 1)
-        self.assertEqual(written[0]["event"], "render")
+        self.assertEqual([event["event"] for event in written], ["input", "render"])
 
     def test_capture_bounded_fallback_when_prestage_missing(self) -> None:
         """Capture stops boundedly if prestage telemetry never arrives."""
         lines = [
-            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 t_ms=100\n",
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
+            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n",
         ] + [f"[LOG_INF] Intervening log {i}\n" for i in range(10)]
         written: list[dict] = []
 
@@ -1697,14 +1834,15 @@ class BenchCaptureLoopTests(unittest.TestCase):
         counts = bench.process_capture_stream(
             lines,
             "page-turn",
-            stop_target=("reading_render", 1),
+            stop_target=("page_turn", 1),
             print_lines=False,
             event_callback=event_cb,
         )
 
+        self.assertEqual(counts.get("page_turn"), 1)
         self.assertEqual(counts.get("reading_render"), 1)
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual(len(written), 1)
+        self.assertEqual([event["event"] for event in written], ["input", "render"])
 
     def test_capture_silent_device_fallback_when_prestage_missing(self) -> None:
         """Capture stops when deadline expires even if serial stream is completely silent (no newlines)."""
@@ -1713,7 +1851,8 @@ class BenchCaptureLoopTests(unittest.TestCase):
         deadline_val: list[float] = []
 
         def silent_lines():
-            yield "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 t_ms=100\n"
+            yield "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n"
+            yield "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n"
             while True:
                 time.sleep(0.01)
                 if deadline_val and time.monotonic() >= deadline_val[0]:
@@ -1728,7 +1867,7 @@ class BenchCaptureLoopTests(unittest.TestCase):
         counts = bench.process_capture_stream(
             silent_lines(),
             "page-turn",
-            stop_target=("reading_render", 1),
+            stop_target=("page_turn", 1),
             print_lines=False,
             event_callback=event_cb,
             pending_prestage_timeout_s=0.05,
@@ -1736,9 +1875,10 @@ class BenchCaptureLoopTests(unittest.TestCase):
         )
         elapsed = time.monotonic() - started
 
+        self.assertEqual(counts.get("page_turn"), 1)
         self.assertEqual(counts.get("reading_render"), 1)
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual(len(written), 1)
+        self.assertEqual([event["event"] for event in written], ["input", "render"])
         self.assertLess(elapsed, 1.0)
 
 

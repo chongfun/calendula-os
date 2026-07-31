@@ -90,7 +90,10 @@ SUITES = {
     "page-turn": Suite(
         "page-turn",
         "Open a warmed SD book, then press Next for the requested turn count.",
-        stop_event="reading_render",
+        # Turns, not Reading renders: the boot paint and any storage-driven
+        # repaint is a Reading render that answered no press, and counting
+        # those ended the capture one real sample short per repaint.
+        stop_event="page_turn",
         stop_count_arg="turns",
     ),
     "reader-soak": Suite(
@@ -197,6 +200,7 @@ def process_capture_stream(
     on_deadline_set: Callable[[float], None] | None = None,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
+    turns = PageTurnCounter()
     pending_prestage = False
     pending_prestage_deadline: float | None = None
     pending_prestage_lines = 0
@@ -214,6 +218,8 @@ def process_capture_stream(
                     event_callback(event)
                 for counter in event_counters(event):
                     counts[counter] = counts.get(counter, 0) + 1
+                turns.observe(event)
+                counts["page_turn"] = turns.turns
         else:
             parsed_events = []
 
@@ -226,7 +232,7 @@ def process_capture_stream(
             if has_prestage or has_new_turn_or_render or pending_prestage_lines >= MAX_PENDING_PRESTAGE_LINES or expired:
                 break
         elif stop_target and counts.get(stop_target[0], 0) >= stop_target[1]:
-            if stop_target[0] == "reading_render":
+            if stop_target[0] == "page_turn":
                 already_prestaged = any(
                     e.get("event") == "render" and isinstance(e.get("prestage_ms"), int)
                     for e in parsed_events
@@ -262,7 +268,7 @@ def run_capture(args: argparse.Namespace) -> int:
     if seconds:
         print(f"stop: after {seconds}s")
     elif stop_target:
-        print(f"stop: after {stop_target[1]} parsed {stop_target[0]} events")
+        print(f"stop: after {stop_target[1]} parsed {stop_target[0]}(s)")
     else:
         print("stop: Ctrl-C")
     if args.note:
@@ -280,6 +286,11 @@ def run_capture(args: argparse.Namespace) -> int:
         "book": getattr(args, "book", None),
         "reset_before": bool(args.reset_before),
     }
+    if stop_target and stop_target[0] == "page_turn":
+        # What the operator asked for, so the report can say whether they got
+        # it. A capture cut short — by `--seconds`, by Ctrl-C, or by a stop
+        # rule that miscounted — otherwise looks exactly like a complete one.
+        metadata["requested_page_turns"] = stop_target[1]
     counts: dict[str, int] = {}
     started = time.monotonic()
     stop_at = started + seconds if seconds else None
@@ -1070,6 +1081,46 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
     )
 
 
+class PageTurnCounter:
+    """Live count of presses answered by a Reading render.
+
+    The capture loop stops on this rather than on Reading renders, because a
+    render that answered no press is not a sample: the boot paint and any
+    storage-driven repaint are Reading renders, and each one used to end the
+    capture a real turn short of what the operator asked for. Nothing
+    downstream could notice — the report pairs properly, so it simply
+    reported 49 turns for `--turns 50` and no check said otherwise.
+
+    Applies the same rule as `page_turn_stats`, incrementally: a render
+    answers every pending press older than its request-freeze boundary and
+    yields at most one turn, and a press answered by a non-Reading render is
+    navigation. A test pairs the two implementations against the same stream
+    so they cannot drift. It works in arrival order rather than sorting by
+    `t_ms`, which is what a live stream can do; the harness already documents
+    that the two differ only by the odd millisecond of print inversion, which
+    cannot change whether a press was answered.
+    """
+
+    def __init__(self) -> None:
+        self.pending: list[int] = []
+        self.turns = 0
+
+    def observe(self, event: dict[str, Any]) -> None:
+        name = event.get("event")
+        t_ms = event.get("t_ms")
+        if name == "input" and event.get("button") in {"Next", "Previous"}:
+            if isinstance(t_ms, int):
+                self.pending.append(t_ms)
+        elif name == "render" and isinstance(t_ms, int):
+            begin = render_begin_ms(event)
+            answered = 0
+            while self.pending and self.pending[0] <= begin:
+                self.pending.pop(0)
+                answered += 1
+            if answered and event.get("view") == "Reading":
+                self.turns += 1
+
+
 def page_turn_stats_over_epochs(events: list[dict[str, Any]]) -> PageTurnStats:
     """Pair presses to renders within each device time epoch, then merge.
 
@@ -1605,6 +1656,16 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                     "is cadence, not firmware — recapture at one press per "
                     "settled page"
                 )
+            start = next(
+                (event for event in run.events if event.get("event") == "run_start"), {}
+            )
+            requested = start.get("requested_page_turns")
+            if isinstance(requested, int) and len(turn_stats.durations) < requested:
+                warnings.append(
+                    f"{label}: {len(turn_stats.durations)} of {requested} requested "
+                    "page turns captured; the run is short of the sample count it "
+                    "was asked for"
+                )
         elif workflow == "storage-cache":
             if not any(name.startswith("storage") for name in event_names):
                 warnings.append(f"{label}: no storage telemetry captured")
@@ -1619,6 +1680,20 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
         elif workflow == "reader-soak":
             if not {"render", "input"}.issubset(event_names):
                 warnings.append(f"{label}: expected both input and render telemetry")
+            # The suite's guidance promises a sleep/wake cycle, and the wake
+            # path is the part of the workflow nothing else exercises: a soak
+            # that only turned pages was a page-turn run wearing the soak's
+            # name, and passed strict as one.
+            if not any(is_terminal_sleep(event) for event in signal_events):
+                warnings.append(
+                    f"{label}: no completed sleep captured; the soak workflow "
+                    "includes a sleep/wake cycle"
+                )
+            elif not any(kind == "wake" for _segment, kind in boot_segments(run.events)[0]):
+                warnings.append(
+                    f"{label}: a sleep completed but no wake followed it; the "
+                    "soak workflow includes a sleep/wake cycle"
+                )
         elif workflow == "thermal-run":
             # No workflow recorded, so there is nothing to check beyond the
             # refresh timing above; say so rather than imply it was gated.
