@@ -773,6 +773,120 @@ class BudgetSuiteIsolationTests(unittest.TestCase):
         self.assertTrue(any("page-turn median" in w for w in warnings), warnings)
 
 
+class PerRunCoverageTests(unittest.TestCase):
+    """Pooling is for the statistic, never for "was anything measured?".
+
+    `--all` reports several runs at once. Coverage checked on the pooled list
+    lets a complete capture answer for an incomplete one: neither run holds
+    the signal set it owed, but between them every check finds a sample.
+    """
+
+    def test_a_sibling_run_does_not_cover_a_missing_budget_sample(self) -> None:
+        events = [
+            # A sleep-sync run that reached its sleep but recorded no Full
+            # refresh — the panel work the budget exists to bound.
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+            # A second one that refreshed but never slept.
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "refresh", "mode": "Full", "busy_ms": 3500},
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"sleep-sync": {"full_refresh_busy_min_ms": 3000}},
+        )
+        self.assertTrue(
+            any(
+                "full_refresh_busy_min_ms" in w
+                and "nothing was measured" in w
+                and "run 1 of 2" in w
+                for w in warnings
+            ),
+            warnings,
+        )
+
+    def test_a_run_with_its_own_samples_is_not_faulted(self) -> None:
+        events = [
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "refresh", "mode": "Full", "busy_ms": 3400},
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "refresh", "mode": "Full", "busy_ms": 3500},
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"sleep-sync": {"full_refresh_busy_min_ms": 3000}},
+        )
+        self.assertFalse(any("nothing was measured" in w for w in warnings), warnings)
+
+    def test_a_sibling_run_does_not_cover_a_missing_suite_signal(self) -> None:
+        events = [
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "refresh", "mode": "Full", "busy_ms": 3500},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("run 2 of 2: no sleep telemetry captured" in w for w in warnings),
+            warnings,
+        )
+
+    def test_the_pooled_statistic_still_spans_every_run(self) -> None:
+        """Coverage is per run; the median it protects is still the pool's."""
+        events = [
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1400, "req_ms": 1000},
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 3000, "req_ms": 1000},
+        ]
+        # Medians of 400 and 2000 pool to 1200, over the budget; neither run
+        # alone would be, and the pooled figure is the one being gated.
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"median_press_to_settled_ms": 550}},
+        )
+        self.assertTrue(
+            any("page-turn median 1200ms" in w for w in warnings), warnings
+        )
+
+
+class UnknownWorkflowTests(unittest.TestCase):
+    """Malformed workflow metadata must fail closed, not quietly pass."""
+
+    MISSPELLED = [
+        {"event": "run_start", "suite": "sleep-sync", "workflow": "sleep_sync"},
+        {"event": "refresh", "mode": "Full", "busy_ms": 3500},
+    ]
+
+    def test_an_unknown_workflow_has_no_budget_section_and_says_so(self) -> None:
+        warnings = bench.evaluate_budgets(
+            self.MISSPELLED,
+            {"sleep-sync": {"full_refresh_busy_min_ms": 3000}},
+        )
+        self.assertTrue(
+            any(
+                "sleep_sync has no budget section" in w
+                and "not a workflow this bench.py knows" in w
+                for w in warnings
+            ),
+            warnings,
+        )
+
+    def test_an_unknown_workflow_has_no_signal_requirements_and_says_so(self) -> None:
+        warnings = bench.evaluate_suite_signals(self.MISSPELLED)
+        self.assertTrue(
+            any("unrecognised workflow" in w for w in warnings), warnings
+        )
+
+    def test_an_unlabelled_run_says_nothing_was_checked(self) -> None:
+        warnings = bench.evaluate_suite_signals(
+            [{"event": "refresh", "mode": "Full", "busy_ms": 3500}]
+        )
+        self.assertTrue(any("no suite label" in w for w in warnings), warnings)
+
+
 class PooledFileTests(unittest.TestCase):
     """`report a.jsonl b.jsonl` concatenates streams; runs must not merge.
 
@@ -831,9 +945,19 @@ class PooledFileTests(unittest.TestCase):
                 )
 
     def test_the_verdict_does_not_depend_on_path_order(self) -> None:
-        forward = self._warnings(["labelled.jsonl", "legacy.jsonl"])
-        reverse = self._warnings(["legacy.jsonl", "labelled.jsonl"])
-        self.assertEqual(sorted(forward), sorted(reverse))
+        # A run's position in the pooled stream legitimately changes with the
+        # order, and warnings name it so an operator can find the capture.
+        # Everything else about the verdict must be identical.
+        def verdict(order: list[str]) -> list[str]:
+            return sorted(
+                re.sub(r" run \d+ of \d+", "", warning)
+                for warning in self._warnings(order)
+            )
+
+        self.assertEqual(
+            verdict(["labelled.jsonl", "legacy.jsonl"]),
+            verdict(["legacy.jsonl", "labelled.jsonl"]),
+        )
 
     def test_legacy_samples_do_not_contaminate_a_labelled_budget(self) -> None:
         for order in (

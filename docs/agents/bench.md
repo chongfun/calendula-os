@@ -78,6 +78,14 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   failure this harness exists to stop. Either capture the missing telemetry
   or delete the key. Only a section whose suite the log contains is checked,
   so a page-turn capture is never faulted for holding no storage telemetry.
+- **Coverage is judged per capture; the statistic is still pooled.** Under
+  `--all` a run that produced none of a budget's telemetry is not excused by
+  a sibling run that did — two sleep-sync captures, one holding only a Full
+  refresh and one only a completed sleep, used to satisfy every check
+  between them while neither was complete. The same goes for the signal
+  checks. Warnings name the run (`sleep-sync run 2 of 3`) so the incomplete
+  capture can be found. Medians and percentiles are still taken across every
+  run the section owns.
 - **Budgets measure only their own workflows.** A section is checked against
   the workflows that exercise it (`reader-soak` turns pages, so it answers to
   the page-turn budgets) and against nothing else, so pooling a file with
@@ -88,7 +96,10 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   decides both the budgets and the signal check: a `--suite sleep-sync`
   thermal run owes sleep telemetry and answers to the Full-refresh budgets.
   Captures made before this carry no `workflow` and are reported as ungated
-  rather than assumed to be page-turn runs.
+  rather than assumed to be page-turn runs. A workflow name this bench.py
+  does not know — a typo, or a log from a newer harness — is reported the
+  same way, on both the budget and the signal side: nothing knows what that
+  run owed, and silence would read as a pass.
 - **Report one log's paths at a time when they predate suite labels.**
   Pooled paths are concatenated, and a log that opens without a `run_start`
   gets a synthetic boundary so it cannot join the previous file's run. It

@@ -858,6 +858,17 @@ def values(events: list[dict[str, Any]], key: str) -> list[int]:
     return [int(event[key]) for event in events if isinstance(event.get(key), int)]
 
 
+def refresh_busy_values(events: list[dict[str, Any]], mode: str) -> list[int]:
+    return values(
+        [
+            event
+            for event in events
+            if event.get("event") == "refresh" and event.get("mode") == mode
+        ],
+        "busy_ms",
+    )
+
+
 def print_duration(label: str, data: list[int]) -> None:
     if not data:
         return
@@ -1069,17 +1080,32 @@ def page_turn_stats_over_epochs(events: list[dict[str, Any]]) -> PageTurnStats:
     reporting cross-epoch samples. Splitting by run *and* by boot segment is
     the same decomposition the boot report already computes.
     """
+    return merge_page_turn_stats(
+        [
+            page_turn_stats(segment)
+            for run in split_runs(events)
+            for segment, _kind in boot_segments(run)[0]
+        ]
+    )
+
+
+def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
+    """Sum independently paired populations into one.
+
+    Used both for the boot segments inside a run and for the runs inside a
+    pooled report: the counters add and the durations concatenate, so a
+    pooled figure is exactly its parts and coverage can be judged per part
+    without measuring anything twice.
+    """
     merged = PageTurnStats([], 0, 0, 0, 0)
-    for run in split_runs(events):
-        for segment, _kind in boot_segments(run)[0]:
-            stats = page_turn_stats(segment)
-            merged = PageTurnStats(
-                merged.durations + stats.durations,
-                merged.presses + stats.presses,
-                merged.reading_renders + stats.reading_renders,
-                merged.nav_answered + stats.nav_answered,
-                merged.coalesced_presses + stats.coalesced_presses,
-            )
+    for stats in parts:
+        merged = PageTurnStats(
+            merged.durations + stats.durations,
+            merged.presses + stats.presses,
+            merged.reading_renders + stats.reading_renders,
+            merged.nav_answered + stats.nav_answered,
+            merged.coalesced_presses + stats.coalesced_presses,
+        )
     return merged
 
 
@@ -1276,9 +1302,9 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
     in_play, warnings = budget_sections_in_play(events, budgets)
     page_turn = budgets.get("page-turn", {})
     if page_turn and "page-turn" in in_play:
-        scoped = section_events(events, "page-turn")
-        render_events = [event for event in scoped if event.get("event") == "render"]
-        turn_stats = page_turn_stats_over_epochs(scoped)
+        runs = section_runs(events, "page-turn")
+        per_run_turns = [page_turn_stats_over_epochs(run.events) for run in runs]
+        turn_stats = merge_page_turn_stats(per_run_turns)
         if turn_stats.durations and not turn_stats.median_trusted:
             # A gate over a cadence artifact is worse than no gate: refuse
             # to compare the median rather than pass or fail on noise.
@@ -1305,12 +1331,20 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             )
             for key in ("median_press_to_settled_ms", "median_press_to_settled_min_ms"):
                 warn_if_unobserved(
-                    warnings, "page-turn", page_turn, key,
-                    len(turn_stats.durations), "press-to-settled pairings",
+                    warnings, "page-turn", page_turn, key, runs,
+                    [stats.durations for stats in per_run_turns],
+                    "press-to-settled pairings",
                 )
-        reading_layout = values(
-            [event for event in render_events if event.get("view") == "Reading"],
-            "layout_ms",
+        per_run_layout, reading_layout = per_run_samples(
+            runs,
+            lambda run_events: values(
+                [
+                    event
+                    for event in run_events
+                    if event.get("event") == "render" and event.get("view") == "Reading"
+                ],
+                "layout_ms",
+            ),
         )
         warn_if_above(
             warnings,
@@ -1320,9 +1354,9 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         )
         warn_if_unobserved(
             warnings, "page-turn", page_turn, "reading_layout_warn_ms",
-            len(reading_layout), "Reading renders",
+            runs, per_run_layout, "Reading renders",
         )
-        prestage = prestage_values(scoped)
+        per_run_prestage, prestage = per_run_samples(runs, prestage_values)
         warn_if_above(
             warnings,
             "prestage p95",
@@ -1331,15 +1365,11 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         )
         warn_if_unobserved(
             warnings, "page-turn", page_turn, "prestage_warn_ms",
-            len(prestage), "prestage samples",
+            runs, per_run_prestage, "prestage samples",
         )
-        fast_busy = [
-            int(event["busy_ms"])
-            for event in scoped
-            if event.get("event") == "refresh"
-            and event.get("mode") == "Fast"
-            and isinstance(event.get("busy_ms"), int)
-        ]
+        per_run_fast, fast_busy = per_run_samples(
+            runs, lambda run_events: refresh_busy_values(run_events, "Fast")
+        )
         warn_if_above(
             warnings,
             "Fast refresh busy p95",
@@ -1348,19 +1378,15 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         )
         warn_if_unobserved(
             warnings, "page-turn", page_turn, "fast_refresh_busy_warn_ms",
-            len(fast_busy), "Fast refresh events",
+            runs, per_run_fast, "Fast refresh events",
         )
 
     sleep_sync = budgets.get("sleep-sync", {})
     if sleep_sync and "sleep-sync" in in_play:
-        scoped = section_events(events, "sleep-sync")
-        full_busy = [
-            int(event["busy_ms"])
-            for event in scoped
-            if event.get("event") == "refresh"
-            and event.get("mode") == "Full"
-            and isinstance(event.get("busy_ms"), int)
-        ]
+        runs = section_runs(events, "sleep-sync")
+        per_run_full, full_busy = per_run_samples(
+            runs, lambda run_events: refresh_busy_values(run_events, "Full")
+        )
         min_ms = sleep_sync.get("full_refresh_busy_min_ms")
         max_ms = sleep_sync.get("full_refresh_busy_max_ms")
         for busy in full_busy:
@@ -1370,7 +1396,8 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
                 warnings.append(f"Full refresh busy {busy}ms above budget ceiling {max_ms}ms")
         failed_sleeps = [
             event
-            for event in scoped
+            for run in runs
+            for event in run.events
             if event.get("event") == "sleep" and event.get("ok") is False
         ]
         if failed_sleeps:
@@ -1378,14 +1405,17 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         for key in ("full_refresh_busy_min_ms", "full_refresh_busy_max_ms"):
             warn_if_unobserved(
                 warnings, "sleep-sync", sleep_sync, key,
-                len(full_busy), "Full refresh events",
+                runs, per_run_full, "Full refresh events",
             )
     storage_cache = budgets.get("storage-cache", {})
     if storage_cache and "storage-cache" in in_play:
-        scoped = section_events(events, "storage-cache")
-        storage_open = values(
-            [event for event in scoped if event.get("event") == "storage_open"],
-            "elapsed_ms",
+        runs = section_runs(events, "storage-cache")
+        per_run_open, storage_open = per_run_samples(
+            runs,
+            lambda run_events: values(
+                [event for event in run_events if event.get("event") == "storage_open"],
+                "elapsed_ms",
+            ),
         )
         warn_if_above(
             warnings,
@@ -1395,15 +1425,19 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         )
         warn_if_unobserved(
             warnings, "storage-cache", storage_cache, "warm_book_open_warn_ms",
-            len(storage_open), "storage_open events",
+            runs, per_run_open, "storage_open events",
         )
-        catalog_load = values(
-            [
-                event
-                for event in scoped
-                if event.get("event") == "storage_catalog" and event.get("action") == "load"
-            ],
-            "elapsed_ms",
+        per_run_catalog, catalog_load = per_run_samples(
+            runs,
+            lambda run_events: values(
+                [
+                    event
+                    for event in run_events
+                    if event.get("event") == "storage_catalog"
+                    and event.get("action") == "load"
+                ],
+                "elapsed_ms",
+            ),
         )
         warn_if_above(
             warnings,
@@ -1413,7 +1447,7 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         )
         warn_if_unobserved(
             warnings, "storage-cache", storage_cache, "catalog_load_warn_ms",
-            len(catalog_load), "catalog load events",
+            runs, per_run_catalog, "catalog load events",
         )
     return warnings
 
@@ -1421,31 +1455,25 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
 def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
     """The telemetry each capture owes, checked against what it produced.
 
-    Grouped by workflow rather than by suite: a `thermal-run --suite
+    Resolved by workflow rather than by suite: a `thermal-run --suite
     sleep-sync` capture owes sleep telemetry, and asking it only for the
     refresh events every thermal run has is how a deliberately selected
     workflow passed `--strict` without its own signal ever being looked for.
-    Runs are named `suite/workflow` when the two differ, so a warning still
-    says which capture it came from.
+
+    Checked per run, not per workflow. Runs of one workflow used to be
+    concatenated before the check, so two sleep-sync captures — one holding
+    only a Full refresh, one only a completed sleep — answered for each other
+    and both passed while neither was a complete capture. Runs are named
+    `suite/workflow`, and by position when the log holds more than one, so a
+    warning says which capture it came from.
     """
     warnings: list[str] = []
-    by_workflow: dict[str, list[dict[str, Any]]] = {}
-    thermal: set[str] = set()
     for run in labelled_runs(events):
-        name = run.workflow or "unknown"
-        by_workflow.setdefault(name, []).extend(run.events)
-        if run.suite == "thermal-run":
-            thermal.add(name)
-
-    for workflow, workflow_events in sorted(by_workflow.items()):
-        label = (
-            f"thermal-run/{workflow}"
-            if workflow in thermal and workflow != "thermal-run"
-            else workflow
-        )
+        workflow = run.workflow
+        label = run.label
         signal_events = [
             event
-            for event in workflow_events
+            for event in run.events
             if event.get("event") not in {"run_start", "run_end"}
         ]
         if not signal_events:
@@ -1454,12 +1482,12 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
         event_names = {str(event.get("event")) for event in signal_events}
         if "warning" in event_names:
             warnings.append(f"{label}: warning events present")
-        if workflow in thermal and "refresh" not in event_names:
+        if run.suite == "thermal-run" and "refresh" not in event_names:
             # Ambient investigations live on refresh timing whatever workflow
             # they ran under.
             warnings.append(f"{label}: no refresh timing telemetry captured")
         if workflow == "page-turn":
-            turn_stats = page_turn_stats_over_epochs(workflow_events)
+            turn_stats = page_turn_stats_over_epochs(run.events)
             if not turn_stats.durations:
                 warnings.append(f"{label}: no input-to-Reading-render duration captured")
             elif not turn_stats.median_trusted:
@@ -1487,6 +1515,19 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                 f"{label}: no workflow recorded, so no workflow signal was "
                 "checked; recapture with a current bench.py"
             )
+        elif workflow is None:
+            warnings.append(
+                f"{label}: no suite label, so nothing workflow-specific was "
+                "checked; report this log on its own"
+            )
+        else:
+            # A misspelling, or a workflow newer than this bench.py. Either
+            # way nothing here knows what the run owed, and silence would
+            # read as a pass — the fail-closed direction is to say so.
+            warnings.append(
+                f"{label}: unrecognised workflow, so nothing workflow-specific "
+                f"was checked; known workflows are {', '.join(sorted(SUITES))}"
+            )
     return warnings
 
 
@@ -1495,7 +1536,8 @@ def warn_if_unobserved(
     section: str,
     budgets: dict[str, Any],
     key: str,
-    samples: int,
+    runs: list[LabelledRun],
+    per_run: list[list[int]],
     what: str,
 ) -> None:
     """Report a budget that is configured but had nothing to measure.
@@ -1507,16 +1549,26 @@ def warn_if_unobserved(
     anything" shape this harness exists to stop. A budget with zero samples
     is now a warning, so a non-strict report says so and `--strict` fails.
 
-    Callers only reach this for a section whose suite the log actually
-    contains, so a page-turn capture is never faulted for holding no
-    storage telemetry.
+    Checked per capture, not per pool. `--all` reports several runs together,
+    and a run that never produced the telemetry a budget covers is not
+    excused by a sibling that did: two sleep-sync captures, one holding only
+    a Full refresh and the other only a completed sleep, between them
+    satisfied every check while neither was a complete capture. Each run is
+    named so the incomplete one can be found.
+
+    Callers only reach this for a section whose workflow the log actually
+    contains, so a page-turn capture is never faulted for holding no storage
+    telemetry.
     """
-    if budgets.get(key) is None or samples > 0:
+    if budgets.get(key) is None:
         return
-    warnings.append(
-        f"[{section}] {key} is configured but nothing was measured against it: "
-        f"no {what} in this log"
-    )
+    for run, samples in zip(runs, per_run):
+        if samples:
+            continue
+        warnings.append(
+            f"[{section}] {key} is configured but nothing was measured against "
+            f"it: no {what} in {run.label}"
+        )
 
 
 # Which workflows produce the measurements each budget section gates. A
@@ -1542,6 +1594,10 @@ class LabelledRun:
     events: list[dict[str, Any]]
     suite: str | None
     workflow: str | None
+    # How a warning names this run. Carries its position in the log whenever
+    # there is more than one, because "no Fast refresh events" is only
+    # actionable if the operator can tell which capture is missing them.
+    label: str
 
 
 def labelled_runs(events: list[dict[str, Any]]) -> list[LabelledRun]:
@@ -1558,46 +1614,63 @@ def labelled_runs(events: list[dict[str, Any]]) -> list[LabelledRun]:
     `--suite sleep-sync` capture as if it were a page-turn run, which is the
     guess that made this worth fixing.
     """
+    split = split_runs(events)
     runs = []
-    for run in split_runs(events):
+    for index, run in enumerate(split):
         suite = next(
             (str(event["suite"]) for event in run if isinstance(event.get("suite"), str)),
             None,
         )
         start = next((event for event in run if event.get("event") == "run_start"), {})
         workflow = start.get("workflow")
-        runs.append(
-            LabelledRun(run, suite, str(workflow) if isinstance(workflow, str) else suite)
-        )
+        workflow = str(workflow) if isinstance(workflow, str) else suite
+        name = workflow or "unlabelled"
+        if suite is not None and suite != workflow:
+            name = f"{suite}/{name}"
+        label = name if len(split) == 1 else f"{name} run {index + 1} of {len(split)}"
+        runs.append(LabelledRun(run, suite, workflow, label))
     return runs
 
 
-def workflow_labels(events: list[dict[str, Any]]) -> list[str | None]:
-    """The workflow each event was captured under, positionally."""
-    return [run.workflow for run in labelled_runs(events) for _event in run.events]
-
-
-def section_events(events: list[dict[str, Any]], section: str) -> list[dict[str, Any]]:
-    """The events a budget section is allowed to measure.
+def section_runs(events: list[dict[str, Any]], section: str) -> list[LabelledRun]:
+    """The runs a budget section is allowed to measure.
 
     Choosing *which* sections to evaluate was never enough: the measurements
     themselves were taken from the whole pooled log, so a file holding a
     `page-turn` run next to a `storage-cache` or `sleep-sync` one had its
     strict verdict decided partly by samples from a workflow that budget does
     not describe — a false pass or a false failure, either way from the wrong
-    population. Capture order is preserved, `run_start` markers included, so
-    the per-run and per-boot splitting downstream still works.
+    population.
 
-    A log with no label anywhere keeps the old behaviour of measuring
-    everything: there is nothing better to go on. Once *any* run is labelled
-    the unlabelled ones are left out rather than folded in, and
-    `budget_sections_in_play` reports the mixture.
+    Returned as runs rather than a flat event list because coverage is a
+    property of each capture too: pool first and ask "were there any
+    samples?" afterwards, and one healthy run answers for a sibling that
+    produced nothing. Every caller pools for its statistic and checks
+    coverage per run — see `per_run_samples` and `warn_if_unobserved`.
+
+    A log with no label anywhere measures everything: there is nothing better
+    to go on. Once *any* run is labelled the unlabelled ones are left out
+    rather than folded in, and `budget_sections_in_play` reports the mixture.
     """
     workflows = BUDGET_SECTION_WORKFLOWS.get(section, {section})
-    labels = workflow_labels(events)
-    if all(label is None for label in labels):
-        return events
-    return [event for label, event in zip(labels, events) if label in workflows]
+    runs = labelled_runs(events)
+    if all(run.workflow is None for run in runs):
+        return runs
+    return [run for run in runs if run.workflow in workflows]
+
+
+def per_run_samples(
+    runs: list[LabelledRun],
+    extract: Callable[[list[dict[str, Any]]], list[int]],
+) -> tuple[list[list[int]], list[int]]:
+    """Each run's samples, and the pooled list built out of them.
+
+    Coverage reads the first, the percentile or median reads the second.
+    Deriving the pool from the parts rather than measuring the concatenated
+    stream keeps the two from ever disagreeing about what was sampled.
+    """
+    per_run = [extract(run.events) for run in runs]
+    return per_run, [sample for samples in per_run for sample in samples]
 
 
 def budget_sections_in_play(
@@ -1631,14 +1704,20 @@ def budget_sections_in_play(
         for name in budgets
         if labelled & BUDGET_SECTION_WORKFLOWS.get(name, {name})
     }
-    warnings = [
-        f"workflow {workflow} has no budget section to check it against"
-        for workflow in sorted(labelled & set(SUITES))
-        if not any(
+    warnings = []
+    for workflow in sorted(labelled):
+        if any(
             workflow in BUDGET_SECTION_WORKFLOWS.get(section, {section})
             for section in budgets
+        ):
+            continue
+        # Every unclaimed workflow, not only the ones this bench.py knows: a
+        # misspelled or newer name matches no section either, and skipping
+        # the warning for it let malformed metadata buy silence.
+        unknown = "" if workflow in SUITES else " (not a workflow this bench.py knows)"
+        warnings.append(
+            f"workflow {workflow} has no budget section to check it against{unknown}"
         )
-    ]
     unlabelled = sum(1 for label in per_run if label is None)
     if unlabelled:
         warnings.append(

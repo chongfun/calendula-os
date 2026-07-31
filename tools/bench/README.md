@@ -60,11 +60,19 @@ the log they just wrote.
 Budgets and signal checks follow the *workflow* a capture ran, which for
 `thermal-run` is its `--suite` choice rather than `thermal-run` itself: a
 `thermal-run --suite sleep-sync` run owes sleep telemetry and is held to the
-Full-refresh budgets. A run's samples are measured only against the sections
-its own workflow owns, so pooling several logs in one `report` cannot let one
-capture decide another's verdict. Logs that predate suite labels are reported
-on their own — pooled with a labelled one they stay outside every budget
-section, and `--strict` says so rather than guessing where they belong.
+Full-refresh budgets. A workflow name the harness does not recognize is
+reported as ungated rather than quietly skipped. A run's samples are measured
+only against the sections its own workflow owns, so pooling several logs in
+one `report` cannot let one capture decide another's verdict. Logs that
+predate suite labels are reported on their own — pooled with a labelled one
+they stay outside every budget section, and `--strict` says so rather than
+guessing where they belong.
+
+Whether a budget or a signal had anything to measure is decided **per run**,
+even when several are pooled: a capture that produced none of a budget's
+telemetry is not covered by a sibling run that did, and the warning names the
+run. The medians and percentiles those budgets gate are still computed across
+every run the section owns.
 
 **Budget checking needs Python >= 3.11 (`tomllib`) or the `tomli` package.**
 Capture and plain reporting run on any Python 3.9+, but `--strict` refuses to
