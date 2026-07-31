@@ -17,7 +17,11 @@ Coordinates with: WS-A, which owns the flush seam where A14's guard lives.
 
 ## Open
 
-Order: G1 → G2 (with A14) → G3 → G4 → G5.
+Order: G3 → G1 → A14 (WS-A, the general backstop) → G4 → G5.
+**G2 is done — see below.** A14 is still worth landing after it: it catches
+the same waste from *any* cause, not only a `Loaded` that changed nothing,
+and being below the reducer it cannot strand the reader the way an
+event-layer suppression can.
 
 ### G1 (S): strip the debug fields that defeat request equality
 
@@ -37,7 +41,35 @@ it.
 
 - Effort S. Risk none. Confidence high.
 
-### G2 (M): the `Loaded` repaint — the tracked #1 item, with its predicate
+### G2 — DONE (#56, merged 2026-07-30)
+
+**Shipped, and shipped at the right layer.** Storage now emits `Loaded`
+unconditionally so navigation bounds still update during background indexing,
+carrying a `text_replaced` flag for whether the card read actually changed the
+text buffer; the repaint decision moved into `app_core::loaded_repaints`,
+which skips the render in Reading when nothing was replaced and the visible
+page and chapter are unchanged. That is method rule 10 — suppress the render,
+never the event — and it means the reducer still learns a growing page count,
+so the frontier trap below cannot occur.
+
+Two adjacent defects were found and fixed on the way, neither of which the
+branch audit had spotted:
+
+- **The open gate could latch forever.** An open served from resident RAM
+  triggers no render cycle, so waiting on `Settled` to lift `opening_book`
+  input suppression left it stuck. Suppression now lifts on event arrival
+  when no repaint is owed.
+- **A failed refresh had no recovery.** `RefreshFailed` now queues a retry
+  repaint, budgeted at one per frame.
+
+The measured evidence that motivated it, kept because it is the clearest
+statement of the win: a device capture during a background build showed 31
+renders against 16 inputs, and the reference bench capture independently shows
+76 Reading renders against 41 presses — about 1.85 renders per press on
+ordinary reading. **The original design and the trap it had to avoid are kept
+below, because the reasoning is what generalises.**
+
+### The predicate, and the trap — kept as reference
 
 Every page change in Reading issues an `ExtendSection`
 (`app-core/src/lib.rs:799-801` — *every* change, not only section crossings).
@@ -83,8 +115,9 @@ chapter position from the store and the page count from the plan, so a finish
 announcement mid-book changes no drawn pixel), and the `LoadChapters` /
 `JumpChapter` `Loaded`s.
 
-**The branch implements this at the wrong layer and has a reachable defect.
-Do not land `opt/single-repaint-per-page-turn` as written.**
+**The branch originally implemented this at the wrong layer, and the defect
+below is why #56 does it differently. Kept because the failure mode is
+general: it is rule 4 reached through a door rule 4 does not name.**
 
 `announce_is_owed(extend, read_from_card, position)` gates the *send* of
 `LibraryEvent::Loaded` from the display task. But `Loaded` is the only thing

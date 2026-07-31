@@ -12,24 +12,25 @@ belong to WS-D, and this workstream benefits automatically.
 
 ## Open
 
-### 1. Single repaint per page turn — **moved to issue 07 (WS-G)**
+### 1. Single repaint per page turn — DONE (#56), and it was never a B item
 
-This was filed here because it was found while measuring B4, but it is an
-app-state item, not a book-pipeline one, and it now has a workstream that owns
-it. See `issues/07-app-render-invalidation.md` G2 for the mechanism, the safe
-predicate, and — importantly — **a reachable defect in the branch as written**
-(`opt/single-repaint-per-page-turn` suppresses the `Loaded` *event* rather
-than the render, which freezes the app's page count during a background build
-and strands the reader at the frontier: method rule 4 through a different
-door).
+Filed here because it was found while measuring B4. It is an app-state item;
+`issues/07-app-render-invalidation.md` G2 owns it and records what shipped.
 
-Two corrections to how this item was valued here. It fires on **every** page
-turn, not only section crossings — `storage_command_for_transition` issues an
-`ExtendSection` on every page change. And it does **not** take 405 ms off
-press-to-settled; the reader sees the page after the first render. It removes
-~405 ms of panel time *after* the page is readable, which is queueing delay
+Two corrections to how this file valued it, kept because both are the kind of
+error the method rules exist to catch. It fired on **every** page turn, not
+only section crossings — `storage_command_for_transition` issues an
+`ExtendSection` on every page change. And it did **not** take 405 ms off
+press-to-settled; the reader sees the page after the first render. What it
+removed is ~405 ms of panel time *after* the page is readable: queueing delay
 when reading faster than ~0.9 s/page, half the panel energy per turn, and half
 the refresh count.
+
+**It was also corrupting the bench harness**, which nobody suspected while it
+was open. Page-turn pairing was render-driven, so the second repaint of turn N
+consumed press N+1 and credited it with a near-zero duration — the source of
+the reference capture's 2 ms samples. Fixing the harness (Tier 0) and fixing
+the firmware were the same bug seen from two ends.
 
 ### 4. Write alignment — the pipeline pays ~1.75× the SD write transactions it needs
 

@@ -1,10 +1,13 @@
 # PRD: CalendulaOS optimization roadmap
 
-Status: **WS-A reopened**; a new WS-G owns app-state render invalidation, where
-the largest wins now live; the bench harness has an owner for the first time.
-Updated 2026-07-30 after a seven-region survey plus a branch audit. Started
-2026-07-09 from six parallel code-survey agents, one per workstream, scoped to
-mostly-disjoint code regions so work can proceed in parallel.
+Status: **WS-A reopened**; a new WS-G owns app-state render invalidation;
+the bench harness has an owner for the first time. **Tier 0 is implemented**
+(`opt/tier0-measurement-integrity`) and **the double repaint is merged**
+(#56), so the two largest items in the round are resolved within it.
+Updated 2026-07-30 after a seven-region survey, a branch audit, and a
+code-reviewed implementation of Tier 0. Started 2026-07-09 from six parallel
+code-survey agents, one per workstream, scoped to mostly-disjoint code regions
+so work can proceed in parallel.
 
 This document is kept to three things: **what is left**, **what has been
 done**, and **what not to do**. Round-by-round history has been dropped —
@@ -39,12 +42,48 @@ item:
 Nothing below this line can be honestly ranked until these land. Three rounds
 of misranking — A10, A7, the retired 354 ms baseline — came from this layer.
 
-| # | Item | WS | Why it ranks here | Effort |
-|---|---|---|---|---|
-| 0a | **`--strict` is a silent no-op on Python < 3.11** | F | `tomllib` is missing, `load_budgets` returns `{}`, nothing is checked, exit 0, no diagnostic. **Verified on the owner's machine** (`python3` is 3.9.6). A page-turn median 16.7× over budget passes clean. Anything previously signed off "with `--strict`" needs re-checking. | S |
-| 0b | **Read the telemetry that is already being captured** | F | `bench: storage_build` prints `spine_ms`/`write_ms`/`wr_blocks` on every build *and every replay*; `grep -c` in `bench.py` returns **0**. The 24–27 s replay split WS-B has guessed at for three rounds has been on disk for months. Same for boot-to-first-paint (the `t_ms` on the first `bench: render` of any boot) and for B4's own headline numbers. | S |
-| 0c | **`page turn` has an unbounded cadence error** | F | Presses pair to renders FIFO and unmatched presses never drain, so error grows with run length. Demonstrated: **500 ms vs 9190 ms reported median for identical 500 ms latency**. Stronger than the caveat in method rule 3 — report unmatched presses and give the budget a floor. | M |
-| 0d | **Gate serial logging** | C | Untethered there is no USB SOF, so every print falls back to blocking 115200-baud UART inside a critical section: **≈36 ms per page turn (8.6%)**, ~120 ms per boot. Both an optimization and the reason every baseline here is a *tethered* baseline. | S |
+**DONE, on `opt/tier0-measurement-integrity`** (1 commit over `main`, not
+merged; rebased onto #56, clippy clean on X4/X3 × ±default-features, 56 host
+tests on both interpreters). What each item turned out to be:
+
+| # | Item | Outcome |
+|---|---|---|
+| 0a | `--strict` silently checked nothing on Python < 3.11 | Fixed. It now refuses to run without a TOML parser, naming the version and `pip install tomli`; non-strict warns visibly. **Re-check anything previously signed off "with `--strict`"** — on this machine it verified nothing. |
+| 0b | Telemetry already captured, consumed by nothing | Fixed. `storage_build` / `storage_first_page` / `storage_background_build` are summarized, and boot-to-first-paint is reported **per boot kind**. Dead `section_extend_warn_ms` deleted, with a test that fails on any future dead key. |
+| 0c | `page turn` was a function of tapping rhythm | Fixed, and it was worse than diagnosed — see below. |
+| 0d | Serial logging blocks untethered | Seam built: default-on `serial-log`, inert by default. Scope is honest in the Cargo.toml comment — it does *not* yet cover the SD session's per-call lines or most of `book_build`'s chatter. The confirming device measurement is still untaken. |
+
+**0c's root cause was the double repaint, which makes it the most instructive
+result of the round.** Pairing was render-driven — each render popped a press
+off a FIFO — so the second repaint of turn N consumed press N+1 and credited
+it with a near-zero duration. **The #1 optimization item was corrupting the
+primary metric.** Pairing is now begin-time (`t_ms − layout_ms − flush_ms`),
+one duration per render from the newest press it answers, with superseded
+presses counted as `coalesced`; trust gates on `(coalesced + unmatched)`,
+because an unmatched-only gate is structurally blind whenever renders ≥
+presses — the normal shape of these captures.
+
+On the reference capture: **median 476 → 477 ms, p95 33,681 → 2,991 ms, min
+2 → 462 ms.** The median was always right and the tails were fiction. **So the
+~424 ms press-to-settled baseline stands** — it does not need retiring, which
+is the opposite of what was expected when this started.
+
+**Three things fell out of doing it:**
+
+1. **The first real split of a build.** Of a ~63 s full build: `build spine`
+   62,942 ms, `build write` 11,324 ms — section writes are ~18%, and the
+   spine walk is essentially the whole build. The fixture holds no *replay*
+   events, so this does not yet size the 24–27 s replay directly; but a replay
+   does the same writes while skipping zip/inflate/XML, which would put writes
+   near 40% of it and raise WS-B's write-alignment item.
+2. **`wr_calls == wr_blocks` (18,626) and `rd_calls == rd_blocks`** on fresh
+   data — D6's precondition, still holding.
+3. **A live gate is miscalibrated.** `[sleep-sync] full_refresh_busy_min_ms =
+   3000` against a measured X3 Full busy of **928–930 ms** — the same stale
+   "~3.5 s Full" figure this round retired, sitting in an enforced budget.
+   Now that `--strict` actually works, **every strict X3 sleep-sync run will
+   fail on it.** Left untouched deliberately: it is a real finding about the
+   budget, not about the harness.
 
 ### Tier 1 — large, cheap, high confidence
 
@@ -52,7 +91,7 @@ of misranking — A10, A7, the retired 354 ms baseline — came from this layer.
 |---|---|---|---|---|
 | 1 | **A13 — FastClean's 200 ms trailing settle** | A | Measured: `flush_ms` 686 against `busy_ms` 455, and the 204 ms tail is a `DelayMs(200)` whose only job is to precede the *next* RAM write — which already happens after `Settled`. Pure reordering. **−200 ms (−29%) on every view change, every wake, every menu step.** | S |
 | 2 | **A12 — the 136 ms that is not waveform drive** | A | `busy_ms = 136.0 + 12.79 × frames` fits three modes to under 1 ms. 136 ms is **36% of every Fast BUSY** and is controller interval, not drive. Prime suspect is a CDI nibble never varied since the reference driver. **One byte, one capture; potentially ~77–100 ms off every refresh = 18–24% of a page turn.** Test before building. | S to test |
-| 3 | **A14 + G2 — stop repainting identical frames** | A+G | Two surveys converged independently. Every page turn currently costs **two** full refreshes. G2 fixes it precisely in `app-core`; A14's `fb == prev_fb` guard at the flush seam is the general backstop and also catches the 62-refresh end-of-book case, the loading plate's duplicate flush and six no-op input sites. **Land both** — A14 fails safe where G2 fails dangerous. | S–M |
+| 3 | **A14 — frame-identity guard at the flush seam** | A | **G2 shipped as #56**, so the double repaint is gone. A14 remains worth landing: `fb == prev_fb` catches an identical frame from *any* cause — the 62-refresh end-of-book case, the loading plate's duplicate flush, six no-op input sites — and being below the reducer it cannot strand the reader the way an event-layer suppression can. Measure the hit rate first (`identical=<bool>` on `bench: render`); under ~2% outside the known cases, drop it. | S–M |
 | 4 | **C2** — measure sleep current with the fuel gauge, then hold GPIOs if it indicts them | C | **Unblocked 2026-07-30: the first-line experiment needs no meter and no disassembly.** The X3's BQ27220 sits on the battery and keeps integrating while the SoC is in deep sleep, so a charge-register read, a 24–72 h sleep, and a second read give average standby draw. Over 48 h, 15 µA is 0.72 mAh against 300 µA's 14.4 mAh — decisive even at 1 mAh resolution, and a null result *is* the answer. Cost is one register and one `println!`. The series meter drops to a follow-up for if it comes back high. | S |
 
 ### Tier 2 — gated on a Tier 0 measurement
@@ -69,11 +108,12 @@ All six sit on current `main`; none needs a rebase.
 
 | Branch | State | Residual |
 |---|---|---|
+| `opt/tier0-measurement-integrity` | **Ready**, reviewed and reworked. Rebased onto #56; 56 host tests on both interpreters; clippy clean on X4/X3 × ±default-features. | Merge. Device confirmation of 0d's ~36 ms is still owed but gates nothing — the feature is inert by default |
 | `opt/a11-landscape-glyph-batching` | **Ready.** Differential test against the code it replaces, on both board configs; all goldens pass **unblessed**. | Device measurement only — the author's own merge gate |
 | `opt/upload-session-token` | **Ready.** Complete, gate anchored not scanned, goldens re-blessed and visually verified on both boards. | Device check |
 | `opt/inflate-caller-owned-window` | **One-line fix.** Silently cuts the Wi-Fi session heap ~10,504 B (67,856 → 57,352) because `heap_a` is literally `size_of::<ZipInflateScratch>()` and the type shrank. `.data`/`.bss` are unchanged, so every gate stays green. | Donate the new decompressor as the third heap region, then a `sleep-sync` run |
 | `opt/d4-directed-wifi-join` | Complete, well-argued (see issue 04 — its separate-file design is better than this PRD's spec). | Four device checks |
-| `opt/single-repaint-per-page-turn` | **Defect — do not land as written.** Suppresses the `Loaded` *event*, not the render, so the app's page count freezes during a background build and the reader strands at the frontier. Method rule 4 through a different door, in the flow B4 just made normal. | Fix the predicate (issue 07 G2), add a test that models a growing page count |
+| ~~`opt/single-repaint-per-page-turn`~~ | **MERGED as #56**, reworked first. The audit found it suppressed the `Loaded` *event* rather than the render, freezing the app's page count during a background build and stranding the reader at the frontier — rule 4 through a door rule 4 does not name. #56 moved the decision into `app_core::loaded_repaints` and kept the event unconditional, and picked up an open-gate latch and a failed-refresh retry on the way. | — |
 | `opt/b7-per-config-section-caches` | **Three defects** (issue 02): `&str` byte-slicing that aborts on SD-derived filenames — reproduced end-to-end, reachable from the orphan sweep on every catalog write; a cross-config cache wipe at three sites, not the one admitted; `BookBuildResume` not keyed by layout config. Still the best-structured large change in the queue. | The three fixes, plus prune orphaned sections first |
 
 ### Tier 4 — worthwhile, unblocked, smaller
@@ -122,6 +162,7 @@ only as the honest home for prestage overlap.
 | B6 — settings-independent content cache (CONT.BIN) | #23 | Settings-change rebuild 2.4–2.6× faster than a full build (~37 s saved) |
 | B4 — progressive first open | #53 | **Time-to-prologue 45.3 → 32.6 s; page-turn median during a build 1270 → 231 ms.** Reader now runs 15.9 s ahead of the builder |
 | Reader-cache crate extraction | #55 | `reader-cache` host-testable; 7 fault-injection tests on an in-memory FAT16 card |
+| **Single repaint per page turn** | #56 | Storage emits `Loaded` unconditionally; the repaint decision moved into `app_core::loaded_repaints` with a `text_replaced` flag. **~405 ms of panel time off every page turn in every book** — half the panel duty cycle and half the refresh count. Also fixed an open gate that latched forever when an open was served from RAM, and added a retry when a refresh fails |
 | **B7 — per-config section caches** | *branch* `opt/b7-per-config-section-caches` | A book keeps a paginated copy per layout config, so flipping back to a size or orientation already read is a cache hit instead of the 24–27 s replay. +6.7 KB flash, no static RAM |
 | C1+C3+C4+C5 — wake refresh, gauge decimation, idle tiers, boot init | #11, #36 | Wake seeded from the deep-sleep cause; idle tiered 10 min Reading / 3 min menus |
 | D1 — SD SPI tier | #14 | Cold build −5.4%, write_ms −9.5%, progress write −35%. **Not** the hoped 2× |
