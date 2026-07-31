@@ -109,6 +109,7 @@ All six sit on current `main`; none needs a rebase.
 | Branch | State | Residual |
 |---|---|---|
 | `opt/tier0-measurement-integrity` | **Ready**, reviewed and reworked. Rebased onto #56; 56 host tests on both interpreters; clippy clean on X4/X3 × ±default-features. | Merge. Device confirmation of 0d's ~36 ms is still owed but gates nothing — the feature is inert by default |
+| `opt/prune-orphan-sections` | **Ready.** Deletes the section files a shrinking rebuild strands (~360 KB per type change, per book), gated on `resume_spine` so a suspended walk is never pruned against. Three fault-harness tests, each mutation-checked. | Merge — **before B7**, which multiplies the leak |
 | `opt/a11-landscape-glyph-batching` | **Ready.** Differential test against the code it replaces, on both board configs; all goldens pass **unblessed**. | Device measurement only — the author's own merge gate |
 | `opt/upload-session-token` | **Ready.** Complete, gate anchored not scanned, goldens re-blessed and visually verified on both boards. | Device check |
 | `opt/inflate-caller-owned-window` | **One-line fix.** Silently cuts the Wi-Fi session heap ~10,504 B (67,856 → 57,352) because `heap_a` is literally `size_of::<ZipInflateScratch>()` and the type shrank. `.data`/`.bss` are unchanged, so every gate stays green. | Donate the new decompressor as the third heap region, then a `sleep-sync` run |
@@ -121,13 +122,12 @@ All six sit on current `main`; none needs a rebase.
 | # | Item | WS | Why | Effort |
 |---|---|---|---|---|
 | 8 | **First open on a deep resume** | B | B4 gives nothing near the end of a book; only a progress indicator helps. | M |
-| 9 | **Prune orphaned section files** | B | ~360 KB of dead space per settings shrink, per book — **and B7 multiplies it**, so this lands first. | S |
-| 10 | **C8 — sleep entry's discarded second pass** | C | ~657 ms of the ~4.1 s sleep entry, thrown away by the next boot's `init_panel`. Refuting check is free (count `bench: refresh` per sleep in an existing capture). Risk gates it. | M + hw |
-| 11 | **C9 — recovery combo on every wake** | C | 28 ms + 48 ADC conversions that cannot succeed on a button wake. One-line gate. | S |
-| 12 | **F10/F11 — close two CI holes** | F | `tools/web-emulator` is built by **no PR gate** (a broken wasm merges green); the bench harness's own 25 tests run nowhere. Both cost ~0 CI wall clock. | S |
-| 13 | **D5** — portal → station handoff | D | ~40–60 s and 3 steps off first-time onboarding. | M |
-| 14 | **E7** — `sort_unstable_by_key` in the wifi scan | E | One stable sort of 20 elements costs a 4,128 B frame and 3.8 KB of flash; stability is irrelevant there. Cheapest item in the roadmap. | S |
-| 15 | **F5 re-scoped** | F | Merriweather is **42.9% of the wasm** and is not the default face: −41% on *every* first visit, not just a board switch. The old deferral reasoning was wrong. | L |
+| 9 | **C8 — sleep entry's discarded second pass** | C | ~657 ms of the ~4.1 s sleep entry, thrown away by the next boot's `init_panel`. Refuting check is free (count `bench: refresh` per sleep in an existing capture). Risk gates it. | M + hw |
+| 10 | **C9 — recovery combo on every wake** | C | 28 ms + 48 ADC conversions that cannot succeed on a button wake. One-line gate. | S |
+| 11 | **F10/F11 — close two CI holes** | F | `tools/web-emulator` is built by **no PR gate** (a broken wasm merges green); the bench harness's own 25 tests run nowhere. Both cost ~0 CI wall clock. | S |
+| 12 | **D5** — portal → station handoff | D | ~40–60 s and 3 steps off first-time onboarding. | M |
+| 13 | **E7** — `sort_unstable_by_key` in the wifi scan | E | One stable sort of 20 elements costs a 4,128 B frame and 3.8 KB of flash; stability is irrelevant there. Cheapest item in the roadmap. | S |
+| 14 | **F5 re-scoped** | F | Merriweather is **42.9% of the wasm** and is not the default face: −41% on *every* first visit, not just a board switch. The old deferral reasoning was wrong. | L |
 
 ### Unresolved — measure before ranking
 

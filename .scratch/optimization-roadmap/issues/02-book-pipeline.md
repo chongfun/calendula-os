@@ -79,7 +79,37 @@ build or replay. Counts are solid; seconds are not.
   write cost has never appeared in `write_ms`** and never will until this is
   fixed.
 
-### 5. Prune orphaned section files — **and do it before B7 merges**
+### 5. Prune orphaned section files — DONE (`opt/prune-orphan-sections`)
+
+Implemented 2026-07-30, one commit over `main`, not merged. **Land it before
+B7**, which multiplies the leak by keeping a copy per config.
+
+The publish tail prunes after `write_v2_book_index` succeeds, deleting section
+files whose ordinal is past the new count. Two things make it safe, and both
+are gates rather than comments: **`resume_spine` must be zero** — non-zero
+means a suspended walk is coming back and `sections_slice` is its provisional
+frontier, so pruning against it would delete sections that walk is about to
+need — and it runs **after** the index lands, so everything it deletes is
+already unreachable from the index on the card. Best effort: a refused delete
+leaves the rest and never turns a successful publish into a failed one.
+
+Deletion is by *parsed* ordinal, not by directory contents: `SECTIONS/` is on
+removable media, so a name this code did not write is left alone, including
+near-misses like a two-digit `S12.BIN`.
+
+Three tests on the FAT16 fault-injection harness, each verified by mutation
+(dropping the gate, weakening `>=` to `>`, and ignoring the name parse each
+fail the test that covers them). Gates: fmt, host clippy, `check.sh fast`,
+`clippy -p fw` on both boards.
+
+One thing worth carrying: the naming key had to be checked before the bound
+was correct. `BookV2SectionRecord` carries `section` *and* `spine`, and the
+writer's parameter is called `spine` in one helper and `section` in another —
+the file is keyed by the dense ordinal, so "delete past *n*" works. Had it
+been keyed by spine index, which is sparse because navigation items are
+skipped, that bound would have deleted live sections.
+
+### 5b. Original write-up, kept for the reasoning
 
 **New 2026-07-30.** A settings change that *shrinks* the section count orphans
 the tail forever. A build at Large produces 100 sections; dropping to Small
