@@ -53,10 +53,13 @@ does not rely on catching a manual button press at the right moment.
 
 `report --strict` exits non-zero when checked-in warning budgets are exceeded or
 when the selected suite did not capture its expected signal: storage telemetry
-for `storage-cache`, a completed sleep for `sleep-sync`, a completed sleep and
-a wake after it for `reader-soak`, and for `page-turn` both input-to-Reading-
-render timing and the full turn count that was asked for. Capture commands also
-accept `--strict`, applying the same gate to the log they just wrote.
+for `storage-cache`, a completed sleep for `sleep-sync`, a completed sleep with
+a wake *later in the same run* for `reader-soak` (waking the device to start the
+capture does not answer for a sleep at the end of it), and for `page-turn` both
+input-to-Reading-render timing and the full turn count that was asked for. Any
+`sleep` phase the firmware reported as failed fails both sleep suites, whether
+or not a later cycle succeeded. Capture commands also accept `--strict`,
+applying the same gate to the log they just wrote.
 
 `page-turn --turns N` stops on N *paired* turns — presses answered by a Reading
 render — not on N Reading renders, so a boot paint or a storage-driven repaint

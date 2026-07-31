@@ -1294,6 +1294,20 @@ def is_terminal_sleep(event: dict[str, Any]) -> bool:
     )
 
 
+def has_failed_sleep(events: list[dict[str, Any]]) -> bool:
+    """A sleep phase the firmware reported as failed.
+
+    Any phase counts, not just the terminal ones: `refresh`, `power_down_*`
+    and `power_off` each fail on their own, and the power task retries, so a
+    later completed cycle in the same capture does not make the failure go
+    away. The structured event is the only record of it — the parser drops
+    the duplicate unstructured "framebuffer flush failed" line on purpose.
+    """
+    return any(
+        event.get("event") == "sleep" and event.get("ok") is False for event in events
+    )
+
+
 # A t_ms decrease smaller than this is treated as clock skew, not a reboot.
 # `bench: input` is stamped and printed from the interrupt-priority executor
 # and can preempt the display task between its `Instant::now()` and its
@@ -1383,6 +1397,26 @@ def boot_segments(
             slept_at = t_ms if isinstance(t_ms, int) else None
         segments[-1][0].append(event)
     return [(segment, kind) for segment, kind in segments if segment], warnings
+
+
+def woke_after_sleep(run: list[dict[str, Any]]) -> bool:
+    """True when a wake in this run followed a sleep this run captured.
+
+    Asking the two halves separately - does a completed sleep appear, does
+    any segment read as a wake - passes a capture that was started while the
+    device was already asleep: the operator wakes it to begin, the leading
+    boot marker says `deep_sleep_wake=true`, and the sleep at the far end of
+    the run is never woken from. That is the ordinary way a soak is started,
+    and it left the wake path unexercised while reading as a full cycle. So
+    walk the segments in capture order and require the wake to come after.
+    """
+    slept = False
+    for segment, kind in boot_segments(run)[0]:
+        if slept and kind == "wake":
+            return True
+        if any(is_terminal_sleep(event) for event in segment):
+            slept = True
+    return False
 
 
 def boot_report(
@@ -1675,7 +1709,7 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                     f"{label}: no completed sleep captured; a requested or "
                     "part-way sleep does not show the panel slept"
                 )
-            if any(event.get("event") == "sleep" and event.get("ok") is False for event in signal_events):
+            if has_failed_sleep(signal_events):
                 warnings.append(f"{label}: failed sleep phase captured")
         elif workflow == "reader-soak":
             if not {"render", "input"}.issubset(event_names):
@@ -1689,11 +1723,13 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                     f"{label}: no completed sleep captured; the soak workflow "
                     "includes a sleep/wake cycle"
                 )
-            elif not any(kind == "wake" for _segment, kind in boot_segments(run.events)[0]):
+            elif not woke_after_sleep(run.events):
                 warnings.append(
                     f"{label}: a sleep completed but no wake followed it; the "
                     "soak workflow includes a sleep/wake cycle"
                 )
+            if has_failed_sleep(signal_events):
+                warnings.append(f"{label}: failed sleep phase captured")
         elif workflow == "thermal-run":
             # No workflow recorded, so there is nothing to check beyond the
             # refresh timing above; say so rather than imply it was gated.

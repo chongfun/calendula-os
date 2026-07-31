@@ -1764,6 +1764,112 @@ class ReaderSoakSignalTests(unittest.TestCase):
         )
         self.assertEqual(bench.evaluate_suite_signals(events), [])
 
+    def test_a_wake_before_the_sleep_does_not_satisfy_the_cycle(self) -> None:
+        """Started while asleep, woken to begin, and never woken again."""
+        events = (
+            [
+                {"event": "run_start", "suite": "reader-soak"},
+                {
+                    "event": "boot",
+                    "deep_sleep_wake": True,
+                    "gpio": True,
+                    "sleep_image": True,
+                },
+            ]
+            + self._reading(1000)
+            + [{"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000}]
+        )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(any("no wake followed it" in w for w in warnings), warnings)
+
+    def test_a_failed_sleep_phase_is_reported_despite_a_later_cycle(self) -> None:
+        events = (
+            [{"event": "run_start", "suite": "reader-soak"}]
+            + self._reading(1000)
+            + [
+                {"event": "sleep", "phase": "refresh", "ok": False, "t_ms": 20000},
+                {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+                {
+                    "event": "boot",
+                    "deep_sleep_wake": True,
+                    "gpio": True,
+                    "sleep_image": True,
+                },
+            ]
+            + self._reading(600)
+        )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertEqual(
+            [w for w in warnings if "failed sleep phase captured" in w],
+            ["reader-soak: failed sleep phase captured"],
+        )
+
+
+class WokeAfterSleepTests(unittest.TestCase):
+    """`woke_after_sleep` asks about order, not about presence."""
+
+    WAKE_BOOT = {
+        "event": "boot",
+        "deep_sleep_wake": True,
+        "gpio": True,
+        "sleep_image": True,
+    }
+
+    def test_sleep_then_wake_is_a_cycle(self) -> None:
+        run = [
+            {"event": "render", "view": "Reading", "t_ms": 1000},
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 2000},
+            self.WAKE_BOOT,
+            {"event": "render", "view": "Reading", "t_ms": 300},
+        ]
+        self.assertTrue(bench.woke_after_sleep(run))
+
+    def test_wake_then_sleep_is_not(self) -> None:
+        run = [
+            self.WAKE_BOOT,
+            {"event": "render", "view": "Reading", "t_ms": 300},
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 2000},
+        ]
+        self.assertFalse(bench.woke_after_sleep(run))
+
+    def test_a_cold_reboot_after_a_sleep_is_not_a_wake(self) -> None:
+        run = [
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 2000},
+            {"event": "boot", "deep_sleep_wake": False, "gpio": False},
+            {"event": "render", "view": "Reading", "t_ms": 300},
+        ]
+        self.assertFalse(bench.woke_after_sleep(run))
+
+    def test_a_second_sleep_wake_pair_still_counts(self) -> None:
+        run = [
+            self.WAKE_BOOT,
+            {"event": "render", "view": "Reading", "t_ms": 300},
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 2000},
+            self.WAKE_BOOT,
+            {"event": "render", "view": "Reading", "t_ms": 300},
+        ]
+        self.assertTrue(bench.woke_after_sleep(run))
+
+
+class HasFailedSleepTests(unittest.TestCase):
+    def test_any_failed_phase_counts(self) -> None:
+        self.assertTrue(
+            bench.has_failed_sleep(
+                [{"event": "sleep", "phase": "power_down_start", "ok": False}]
+            )
+        )
+
+    def test_a_successful_run_has_none(self) -> None:
+        self.assertFalse(
+            bench.has_failed_sleep(
+                [
+                    {"event": "sleep", "phase": "requested"},
+                    {"event": "sleep", "phase": "complete", "ok": True},
+                    {"event": "render", "ok": False},
+                ]
+            )
+        )
+
 
 class BenchCaptureLoopTests(unittest.TestCase):
     def test_capture_waits_for_paired_prestage_across_intervening_log(self) -> None:
