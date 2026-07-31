@@ -428,60 +428,44 @@ pub async fn run() {
                     .await;
                 }
                 DisplayEvent::Library(event) => {
-                    if !fold_library_event(
+                    if !handle_library_event(
                         ctx,
                         &mut state,
                         &mut opening_book,
                         &mut open_rollback,
-                        boot_render_pending,
-                        &event,
-                    ) {
-                        lift_settled_open_gate(
-                            rendering,
-                            opening_book,
-                            &mut suppress_input_until_open_settled,
-                            &mut block_confirm_until,
-                            &mut sleep_gate,
-                            &pending_storage,
-                        )
-                        .await;
-                        continue;
-                    }
-                    if rendering {
-                        render_pending = true;
-                    } else {
-                        send_render(first_render_kind(&mut boot_render_pending), &state).await;
-                        rendering = true;
-                        render_pending = false;
-                    }
-                }
-            },
-            Either4::Third(event) => {
-                if !fold_library_event(
-                    ctx,
-                    &mut state,
-                    &mut opening_book,
-                    &mut open_rollback,
-                    boot_render_pending,
-                    &event,
-                ) {
-                    lift_settled_open_gate(
-                        rendering,
-                        opening_book,
+                        &mut boot_render_pending,
+                        &mut rendering,
+                        &mut render_pending,
                         &mut suppress_input_until_open_settled,
                         &mut block_confirm_until,
                         &mut sleep_gate,
                         &pending_storage,
+                        &event,
                     )
-                    .await;
-                    continue;
+                    .await
+                    {
+                        continue;
+                    }
                 }
-                if rendering {
-                    render_pending = true;
-                } else {
-                    send_render(first_render_kind(&mut boot_render_pending), &state).await;
-                    rendering = true;
-                    render_pending = false;
+            },
+            Either4::Third(event) => {
+                if !handle_library_event(
+                    ctx,
+                    &mut state,
+                    &mut opening_book,
+                    &mut open_rollback,
+                    &mut boot_render_pending,
+                    &mut rendering,
+                    &mut render_pending,
+                    &mut suppress_input_until_open_settled,
+                    &mut block_confirm_until,
+                    &mut sleep_gate,
+                    &pending_storage,
+                    &event,
+                )
+                .await
+                {
+                    continue;
                 }
             }
             Either4::Fourth(event) => {
@@ -513,9 +497,8 @@ fn first_render_kind(boot_render_pending: &mut bool) -> RenderKind {
 }
 
 /// Folds a library event into reader state and reports whether it owes a
-/// render. Shared by the two arms that deliver library events — the display
-/// event channel and the direct library channel — which must treat them
-/// identically.
+/// render. Called by [`handle_library_event`], which owns the render-or-gate
+/// decision that follows.
 fn fold_library_event(
     ctx: ReducerContext,
     state: &mut ReaderState,
@@ -559,6 +542,58 @@ fn fold_library_event(
     };
     *state = folded;
     should_render
+}
+
+/// Folds a library event and either renders or lifts the open gate.
+///
+/// Returns `true` when the event was rendered (or pended), `false` when it owed
+/// no repaint — in which case the open gate was checked, and the caller should
+/// `continue` to the next loop iteration.
+///
+/// Shared by the two arms that deliver library events — `DisplayEvent::Library`
+/// and the direct `LIBRARY_EVENTS` channel — which must handle them identically.
+#[allow(clippy::too_many_arguments)]
+async fn handle_library_event(
+    ctx: ReducerContext,
+    state: &mut ReaderState,
+    opening_book: &mut Option<u32>,
+    open_rollback: &mut Option<BookOpenRollback>,
+    boot_render_pending: &mut bool,
+    rendering: &mut bool,
+    render_pending: &mut bool,
+    suppress_input_until_open_settled: &mut bool,
+    block_confirm_until: &mut Option<Instant>,
+    sleep_gate: &mut SleepGate,
+    parked: &ParkedStorage,
+    event: &crate::LibraryEvent,
+) -> bool {
+    if !fold_library_event(
+        ctx,
+        state,
+        opening_book,
+        open_rollback,
+        *boot_render_pending,
+        event,
+    ) {
+        lift_settled_open_gate(
+            *rendering,
+            *opening_book,
+            suppress_input_until_open_settled,
+            block_confirm_until,
+            sleep_gate,
+            parked,
+        )
+        .await;
+        return false;
+    }
+    if *rendering {
+        *render_pending = true;
+    } else {
+        send_render(first_render_kind(boot_render_pending), state).await;
+        *rendering = true;
+        *render_pending = false;
+    }
+    true
 }
 
 fn library_event_affects_view(
