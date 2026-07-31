@@ -57,6 +57,27 @@ telemetry for `storage-cache` or input-to-Reading-render timing for
 `page-turn`. Capture commands also accept `--strict`, applying the same gate to
 the log they just wrote.
 
+**Budget checking needs Python >= 3.11 (`tomllib`) or the `tomli` package.**
+Capture and plain reporting run on any Python 3.9+, but `--strict` refuses to
+run without a TOML parser — macOS system `python3` is 3.9, and a strict gate
+that silently checks nothing is how a 16.7x budget overrun once passed clean.
+Non-strict reports print a warning when budgets could not be loaded.
+
+The `page turn` statistic is guarded against operator cadence: the report
+prints a `page inputs:` line (presses / matched / unmatched), suppresses the
+median when more than 10% of presses went unrendered (burst pressing strands
+presses in the FIFO pairing and charges later renders to stale presses), and
+budgets give the median a plausibility floor as well as a ceiling. The report
+also warns when `t_ms` goes backwards without a completed deep sleep — an
+unexplained mid-capture reset interleaves two boot time bases.
+
+`report` additionally summarizes cache-build telemetry (`storage build` with
+its spine/write split and read/write block totals, `first page`, `bg build`)
+and, for captures that witnessed a boot (`--reset-before`, a wake, or a
+reset), `boot to paint` — the `t_ms` of the boot's first render, i.e.
+boot-to-first-paint — with per-stage medians when the firmware's stamped
+boot-stage lines are present.
+
 ## When to use
 
 - Use `channel-stress --host` during normal development when touching reader

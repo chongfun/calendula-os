@@ -330,6 +330,30 @@ pub struct RenderRequest {
     pub wifi_ssid: [u8; 32],
     pub wifi_ssid_len: u8,
     pub dirty: Rect,
+    /// Device uptime in milliseconds at the instant this request's state was
+    /// frozen, or 0 when nothing stamped it.
+    ///
+    /// `u64` to match `Instant::as_millis()` and every other timestamp in the
+    /// telemetry. A `u32` would have been four bytes cheaper and wrapped after
+    /// 49.7 days of unbroken uptime, which a reboot or deep sleep normally
+    /// resets long before -- but a long soak is exactly where durable
+    /// measurement telemetry should not carry an arbitrary horizon, and past
+    /// the wrap the pairing would silently stop answering presses.
+    ///
+    /// This is the boundary the bench pairs button presses against: a press
+    /// later than this cannot be reflected in the frame, so crediting it with
+    /// the frame's settle time reports a page turn that never happened. It
+    /// must be stamped by the *producer*, as the request is built. The display
+    /// task dequeues it an unbounded time later -- behind a flush, a prestage,
+    /// a storage command or a background build step -- and every press landing
+    /// in that window is already too late for this frame.
+    ///
+    /// `app-core` has no clock, so this stays 0 here and the firmware's single
+    /// send site fills it in. 0 reads as "unstamped" downstream; the only
+    /// request that could legitimately carry 0 is one frozen in the first
+    /// millisecond after boot, which is the boot paint and has no press to
+    /// pair with.
+    pub requested_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2479,6 +2503,8 @@ impl ReaderState {
             line_spacing: self.line_spacing,
             font_weight: self.font_weight,
             font_family: self.font_family,
+            // The producer stamps this at the send site; app-core has no clock.
+            requested_at_ms: 0,
             last_button: self.last_button,
             aux_raw: self.aux_raw,
             nav_raw: self.nav_raw,
@@ -3464,6 +3490,18 @@ mod tests {
         // therefore costs the four-deep command channel nothing at all — the
         // separate command it replaced was the same 100 bytes.
         assert_eq!(core::mem::size_of::<StorageCommand>(), 100);
+    }
+
+    #[test]
+    fn stamping_the_render_request_costs_one_word() {
+        // `requested_at_ms` is what lets the bench pair a press against the
+        // frame that could reflect it. It is a `u64` to match every other
+        // logged timestamp; measured, that is 108 -> 112 bytes with no
+        // alignment padding, so the four-deep DISPLAY_COMMANDS channel pays
+        // 16 bytes and the planner's stored request four. Recorded because
+        // `.bss` trades one-for-one against the main stack region on this
+        // target, so a struct in a channel is never free.
+        assert_eq!(core::mem::size_of::<RenderRequest>(), 112);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
             "the departing state has outgrown the credentials variant",

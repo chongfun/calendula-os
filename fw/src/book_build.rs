@@ -1300,7 +1300,7 @@ fn report_publish(
         cache_key
     );
     let io = crate::sd_session::sd_stats::snapshot().since(io_start);
-    esp_println::println!(
+    bench_log!(
         "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={}",
         open_started.elapsed().as_millis(),
         spine_started.elapsed().as_millis(),
@@ -1828,7 +1828,7 @@ where
             )
             .map_err(ReaderCacheError::from)
             .inspect(|()| {
-                esp_println::println!(
+                bench_log!(
                     "bench: storage_first_page elapsed_ms={} pages={} sections={} key={}",
                     open_started.elapsed().as_millis(),
                     total_pages,

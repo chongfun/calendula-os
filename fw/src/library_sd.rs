@@ -75,7 +75,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         status
     };
     esp_println::println!("sd: scan complete, {} epub(s)", library.catalog_count());
-    esp_println::println!(
+    bench_log!(
         "bench: storage_catalog action=scan status={:?} count={} elapsed_ms={} t_ms={}",
         library.status,
         library.catalog_count(),
@@ -114,7 +114,7 @@ pub(crate) fn load_catalog_cache(
     } else {
         esp_println::println!("sd: catalog cache unavailable");
     }
-    esp_println::println!(
+    bench_log!(
         "bench: storage_catalog action=load ok={} count={} elapsed_ms={} t_ms={}",
         loaded,
         library.catalog_count(),

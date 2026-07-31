@@ -1,10 +1,17 @@
-# Initial warning budgets for development bench summaries.
-# The CLI currently reports timings only; these values are the baseline for
-# turning reports into explicit pass/fail checks once several known-good X4/X3
-# runs have been captured.
+# Warning budgets enforced by `bench.py report --strict` (and by `--strict`
+# on capture commands, against the log just written). A non-strict report
+# prints violations without failing. Budget parsing needs Python >= 3.11
+# (tomllib) or the optional `tomli` package; `--strict` refuses to run
+# without one rather than silently checking nothing.
 
 [page-turn]
 median_press_to_settled_ms = 550
+# Floor for the same median: a genuine press-to-settled includes a full Fast
+# refresh (379-455 ms busy measured on X3), so a median anywhere near or
+# below this is presses paired against renders already in flight — operator
+# burst cadence, not a faster device. Kept well under the real turn time so
+# a legitimate optimization cannot trip it.
+median_press_to_settled_min_ms = 250
 fast_refresh_busy_warn_ms = 500
 reading_layout_warn_ms = 60
 prestage_warn_ms = 40
@@ -16,4 +23,6 @@ full_refresh_busy_max_ms = 4300
 [storage-cache]
 warm_book_open_warn_ms = 150
 catalog_load_warn_ms = 500
-section_extend_warn_ms = 150
+# section_extend_warn_ms was deleted 2026-07-30: no section-extend telemetry
+# exists for it to gate (extends surface as `storage_open` with ram_hit), and
+# a budget key that looks enforced but is read by nothing is worse than none.

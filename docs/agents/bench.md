@@ -32,19 +32,65 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
 - `reader-soak` is a passive capture: the operator runs the described
   reading workflow on the device by hand while bench.py records. Menus
   idle-sleep after 3 minutes (Reading after 10), so keep interacting.
-- **`page-turn` is operator-driven too, and its `page turn` figure is not
-  cadence-robust.** bench.py only listens; a human presses Next until the
-  requested turn count lands. The statistic is input→next-render, so a
-  press arriving while a render is already in flight is credited with only
-  the remainder of that render — burst pressing yields durations as low as
-  2 ms and drags the median down without anything being faster. **Quote
-  `page turn` only from deliberate cadence: one press per fully settled
-  page.** `layout_ms`, `flush_ms`, `busy_ms`, and prestage are per-render
-  and safe to read from any cadence. This is not hypothetical: a 354 ms
-  median recorded this way went into the optimization roadmap as a
-  baseline, could never be reconciled with a 408 ms flush, and cost a
-  later change a phantom 94 ms "regression" before two same-build captures
-  at opposite cadences explained it.
+- **`page-turn` is operator-driven too.** bench.py only listens; a human
+  presses Next until the requested turn count lands. **Still capture at
+  deliberate cadence — one press per fully settled page** — but the
+  statistic now defends itself, and the report tells you when it could not:
+
+  - Each press is credited with the first render whose request was frozen
+    after it — `req_ms`, stamped by the app as it builds the request, not
+    when the display task dequeues it. A render can wait in the channel
+    behind a flush, a prestage, a storage command or a background build
+    step, and a press arriving during that wait belongs to the next frame.
+    (`deq_ms` is the dequeue instant; `deq_ms - req_ms` is that queue wait,
+    reported for diagnosis and never used for pairing.) So a press landing
+    mid-render is no longer charged the remainder of a frame it did not
+    cause. This is what used to produce 2 ms
+    durations. Captures older than `req_ms` fall back to
+    `t_ms - layout_ms - flush_ms`, which runs *late* because it omits the
+    catalog and TOC reads before layout and the chapter-tracking read after
+    the flush; treat their page-turn minima as suspect.
+  - Pairing happens **within each run and each boot**, never across them.
+    `t_ms` is device uptime, so it restarts at every reboot and in every
+    capture; sorting a pooled log by it interleaves clocks and can measure
+    from one run's press to another run's render.
+  - A render yields at most one duration, from the newest press it answers.
+    Presses a newer press superseded before any render began are reported as
+    `coalesced` — the app coalesces input while a refresh is in flight, so
+    those presses never had a frame of their own.
+  - The `page inputs:` line accounts for every press: `page_turns`, `nav`,
+    `coalesced`, `unmatched`. When more than 10% produced no page turn the
+    median is **suppressed** rather than printed, and `--strict` fails
+    instead of gating on noise. A `median_press_to_settled_min_ms` floor
+    catches an implausibly fast median from the other side.
+
+  `layout_ms`, `flush_ms`, `busy_ms`, and prestage remain per-render and safe
+  to read from any cadence. The history is why this matters: a 354 ms median
+  recorded at burst cadence went into the optimization roadmap as a baseline,
+  could never be reconciled with a 408 ms flush, and cost a later change a
+  phantom 94 ms "regression". A subsequent capture reported a median of
+  477 ms alongside a 2 ms minimum and an 88,670 ms maximum, all marked
+  trusted — the median was right and the tails were fiction.
+- **A budget with nothing to measure is now a warning**, not a silent pass.
+  If a run does not produce the telemetry a configured budget covers — a
+  page-turn capture with no refresh events, say — the report says so and
+  `--strict` fails, because a budget that gates nothing is exactly the
+  failure this harness exists to stop. Either capture the missing telemetry
+  or delete the key. Only a section whose suite the log contains is checked,
+  so a page-turn capture is never faulted for holding no storage telemetry.
+- **Budgets need Python ≥ 3.11**, or the optional `tomli` package. macOS
+  system `python3` is 3.9, where `tomllib` does not exist. `--strict` now
+  refuses to run without a parser rather than passing everything silently;
+  a non-strict report prints a `budgets not checked` warning and carries on.
+  Any result previously signed off "with `--strict`" on an older interpreter
+  verified nothing.
+- **Boot and wake timings** come from the `t_ms` on a boot's first render, so
+  they only appear for boots the capture witnessed (`--reset-before`, a boot
+  marker, or a wake). They are reported **per kind** — `boot to paint (cold)`
+  and `boot to paint (wake)` are separate lines, because a cold boot pays the
+  full waveform and a wake does not, and a pooled median matches no boot that
+  ever happened. A wake that lost its sleep image counts as cold, since that
+  is what it costs.
 - Deep sleep drops the USB-JTAG serial port mid-capture; bench.py
   announces the loss and waits for the port to re-enumerate — wake the
   device to resume. The capture window keeps counting while it is away.
@@ -59,5 +105,11 @@ run — pass `--all` to pool the whole log.
 ```sh
 tools/bench/bench.py report target/bench/latest.jsonl
 ```
+
+The harness has host tests covering the parser, the report, and the trust
+rules; `tools/check.sh fast` runs them (`tools/check.sh test-bench` alone).
+They need no hardware, and a change to bench.py should come with one — the
+harness produces every device number this project has, so a defect here is
+indistinguishable from a firmware regression until someone re-derives it.
 
 Keep notable hardware findings in `.scratch/` issues or dated docs notes.

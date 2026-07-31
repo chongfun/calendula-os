@@ -85,11 +85,22 @@ case "$COMMAND" in
         tools/cargo.sh build -p fw --release --features device-x3
         python3 tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
         ;;
+    test-bench)
+        # The bench harness produces every device performance number this
+        # project has, and its own tests gated nothing until now. Runs under
+        # whatever `python3` is on PATH, which is the interpreter an operator
+        # would actually capture with -- that is the point, not an accident:
+        # a budget gate that only works on a newer python is a gate that is
+        # silently absent (see load_budgets).
+        echo "Running bench harness tests..."
+        python3 -m unittest discover -s tools/bench -p 'test_*.py'
+        ;;
     fast)
         "$0" fmt
         "$0" clippy-host
         "$0" test-host
         "$0" test-host-x3
+        "$0" test-bench
         ;;
     emulator)
         "$0" golden-frames

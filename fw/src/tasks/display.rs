@@ -60,7 +60,7 @@ static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
 
 #[embassy_executor::task]
 pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool) {
-    esp_println::println!("display: started");
+    esp_println::println!("display: started t_ms={}", Instant::now().as_millis());
 
     static FB: static_cell::StaticCell<Framebuffer> = static_cell::StaticCell::new();
     let fb = FB.init(Framebuffer::new());
@@ -262,7 +262,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         pending.book_id,
                         sd_library.advertised_page_count()
                     );
-                    esp_println::println!(
+                    bench_log!(
                         "bench: storage_background_build book_id={} pages={} elapsed_ms={}",
                         pending.book_id,
                         sd_library.advertised_page_count(),
@@ -333,6 +333,15 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
             }
             Either5::Third(()) | Either5::Fourth(()) => {}
             Either5::First(DisplayCommand::Render(request)) => {
+                // The dequeue instant. This is NOT the pairing boundary --
+                // `request.requested_at_ms` is, stamped by the app as it froze
+                // the state. A render can sit in the channel behind a flush, a
+                // prestage, a storage command or a background build step, so
+                // the two differ by however long this task was busy, and a
+                // press arriving in that gap belongs to the *next* frame.
+                // Reported as `deq_ms` purely so that queue wait is visible:
+                // `deq_ms - req_ms` is the delay, and it was invisible before.
+                let dequeued_at_ms = Instant::now().as_millis();
                 let content_context_changed = refresh_planner
                     .last_request()
                     .map(|last| (last.view, last.book_id))
@@ -470,14 +479,16 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // against, so printing it later charged the reader for a
                     // write they never waited on: `Settled` has already gone
                     // out, and press-to-settled ends on this line.
-                    esp_println::println!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} t_ms={}",
+                    bench_log!(
+                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={}",
                         request.view,
                         mode,
                         request.page,
                         request.chapter,
                         layout_ms,
                         flush_ms,
+                        request.requested_at_ms,
+                        dequeued_at_ms,
                         settled_at_ms,
                     );
                     let prestage_start = Instant::now();
@@ -500,7 +511,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     // real work on this task and still gates the next command,
                     // but it sits outside press-to-settled and is measured
                     // separately so neither number can absorb the other.
-                    esp_println::println!(
+                    bench_log!(
                         "bench: prestage staged={} elapsed_ms={} t_ms={}",
                         prev_prestaged,
                         prestage_start.elapsed().as_millis(),
@@ -523,7 +534,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
             }
             Either5::First(DisplayCommand::Sleep { generation }) => {
                 let sleep_start = Instant::now();
-                esp_println::println!(
+                bench_log!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
@@ -675,7 +686,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 .is_ok()
                 {
                     prev_fb.copy_from(fb);
-                    esp_println::println!(
+                    bench_log!(
                         "bench: sleep phase=refresh ok=true elapsed_ms={} t_ms={}",
                         sleep_start.elapsed().as_millis(),
                         Instant::now().as_millis(),
@@ -683,7 +694,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     true
                 } else {
                     esp_println::println!("display: sleep framebuffer flush failed");
-                    esp_println::println!(
+                    bench_log!(
                         "bench: sleep phase=refresh ok=false elapsed_ms={} t_ms={}",
                         sleep_start.elapsed().as_millis(),
                         Instant::now().as_millis(),
@@ -725,7 +736,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                 }
-                esp_println::println!(
+                bench_log!(
                     "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",
                     panel_slept,
                     sleep_start.elapsed().as_millis(),
@@ -1390,7 +1401,7 @@ fn handle_storage_command(
                             record.book_id,
                             record.screen,
                         );
-                        esp_println::println!(
+                        bench_log!(
                             "bench: store_global_state ok={} book_id={} page={} t_ms={}",
                             stored,
                             record.book_id,
@@ -1436,7 +1447,7 @@ fn handle_storage_command(
                         sd_library.chapter_count_for_ui()
                     );
                 }
-                esp_println::println!(
+                bench_log!(
                     "bench: storage_open request={} book_id={} index={} ram_hit={} elapsed_ms={} status={:?} pages={} chapters={}",
                     request_id,
                     book_id,
@@ -1656,7 +1667,7 @@ fn handle_storage_command(
                 } else {
                     *pending_progress = Some(record);
                 }
-                esp_println::println!(
+                bench_log!(
                     "bench: storage_progress action=write ok={} book_id={} page={} elapsed_ms={} t_ms={}",
                     stored,
                     record.book_id,
@@ -1666,7 +1677,7 @@ fn handle_storage_command(
                 );
             } else {
                 *pending_progress = Some(record);
-                esp_println::println!(
+                bench_log!(
                     "bench: storage_progress action=coalesce book_id={} page={} t_ms={}",
                     record.book_id,
                     record.screen,
@@ -1917,7 +1928,7 @@ fn close_out_departing_book(
     let record = record_for_persisted(sd_library, previous);
     let start = Instant::now();
     let stored = book_build::store_book_position(epd, sd_cs, sd_library, record);
-    esp_println::println!(
+    bench_log!(
         "bench: store_book_position ok={} book_id={} page={} elapsed_ms={} t_ms={}",
         stored,
         record.book_id,
@@ -2143,6 +2154,8 @@ fn sleep_request_from_saved_state(
     let page_count = book_build::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     Some(RenderRequest {
         kind: RenderKind::Page,
+        // The sleep frame is not queued and answers no press.
+        requested_at_ms: 0,
         view: AppView::Home,
         page: screen,
         page_count,
@@ -2193,7 +2206,7 @@ fn flush_pending_progress(
             *pending_progress = None;
             *last_progress_write = Some(Instant::now());
         }
-        esp_println::println!(
+        bench_log!(
             "bench: storage_progress action=flush ok={} book_id={} page={} elapsed_ms={} t_ms={}",
             stored,
             record.book_id,
