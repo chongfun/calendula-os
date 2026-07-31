@@ -298,19 +298,31 @@ fn total_pages(records: &[BookV2SectionRecord]) -> u32 {
 /// the question the round-2 finding turned on: a failing publish must not take
 /// the files out from under a reader who is reading them.
 fn sections_still_on_card(root: &Dir<'_>, count: usize) -> bool {
-    (0..count).all(|n| {
-        files::with_v2_sections_dir(root, KEY, |sections| {
-            let Some(sections) = sections else {
-                return false;
-            };
-            let mut name = heapless::String::<8>::new();
-            use core::fmt::Write;
-            let _ = write!(&mut name, "S{n:03}.BIN");
-            sections
-                .open_file_in_dir(name.as_str(), embedded_sdmmc::Mode::ReadOnly)
-                .is_ok()
-        })
+    (0..count).all(|n| file_in_sections_dir(root, &format!("S{n:03}.BIN")))
+}
+
+/// Whether one named file exists in the book's `SECTIONS/` directory.
+fn file_in_sections_dir(root: &Dir<'_>, name: &str) -> bool {
+    files::with_v2_sections_dir(root, KEY, |sections| {
+        let Some(sections) = sections else {
+            return false;
+        };
+        sections
+            .open_file_in_dir(name, embedded_sdmmc::Mode::ReadOnly)
+            .is_ok()
     })
+}
+
+/// Put a file that is not one of ours into `SECTIONS/`, to prove the prune
+/// deletes by parsed ordinal rather than by "everything that is here".
+fn write_stray_file(root: &Dir<'_>, name: &str) {
+    files::with_v2_sections_dir(root, KEY, |sections| {
+        let sections = sections.expect("sections dir should exist");
+        let file = sections
+            .open_file_in_dir(name, embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+            .expect("stray file should create");
+        file.write(b"not a section").expect("stray write");
+    });
 }
 
 /// Lay down a valid COVER.BIN for the book, the way a completed build does.
@@ -615,6 +627,148 @@ fn a_clean_publish_leaves_the_requested_page_resident() {
     assert!(
         sections_still_on_card(&root, 3),
         "a clean publish must not delete anything"
+    );
+}
+
+/// Invariant: a rebuild that produces fewer sections than the one before it
+/// takes the stranded tail with it.
+///
+/// Section files are keyed by a dense section ordinal, so a rebuild producing
+/// fewer of them rewrites `S000..S(new-1)` and leaves `S(new)..S(old-1)` on the
+/// card referenced by nothing — `load_v2_section_by_global_page` indexes off
+/// BOOK.BIN. Type-size and orientation changes do not cause this (sections are
+/// content-bounded; see `prune_orphan_sections_in`), so the shrink is
+/// constructed here rather than driven through a setting.
+#[test]
+fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let wide = build_book(&root, &mut store, 5);
+    store.begin_book_load();
+    let outcome = publish::publish_book_cache(
+        &root,
+        KEY,
+        IDENTITY,
+        0,
+        &mut store,
+        &wide,
+        total_pages(&wide),
+        false,
+        0,
+    );
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert!(sections_still_on_card(&root, 5));
+
+    // The same book at a larger type size: the walk produces three sections
+    // and rewrites S000..S002, leaving S003 and S004 behind.
+    let narrow = &wide[..3];
+    store.begin_book_load();
+    let outcome = publish::publish_book_cache(
+        &root,
+        KEY,
+        IDENTITY,
+        0,
+        &mut store,
+        narrow,
+        total_pages(narrow),
+        false,
+        0,
+    );
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+
+    assert!(
+        sections_still_on_card(&root, 3),
+        "the sections the new index names must survive"
+    );
+    assert!(
+        !file_in_sections_dir(&root, "S003.BIN") && !file_in_sections_dir(&root, "S004.BIN"),
+        "the sections the new index no longer names must be gone"
+    );
+}
+
+/// Invariant: a suspended walk is never pruned against.
+///
+/// This is the one that makes the prune safe to have at all. A progressive
+/// first open publishes a provisional index spanning only the sections written
+/// so far, then keeps walking. Pruning against that frontier would delete the
+/// sections the walk is about to need — turning a cheap continuation into a
+/// full rebuild, and doing it to a reader who is mid-book. `resume_spine` is
+/// the gate: non-zero means someone is coming back.
+#[test]
+fn a_suspended_walk_keeps_the_sections_past_its_frontier() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let all = build_book(&root, &mut store, 5);
+    let frontier = &all[..2];
+
+    store.begin_book_load();
+    let outcome = publish::publish_book_cache(
+        &root,
+        KEY,
+        IDENTITY,
+        0,
+        &mut store,
+        frontier,
+        total_pages(frontier),
+        true,
+        // Non-zero: this walk is suspended at spine 2 and will resume.
+        2,
+    );
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+
+    assert!(
+        sections_still_on_card(&root, 5),
+        "a provisional publish must leave every section the walk will resume into"
+    );
+}
+
+/// Invariant: the prune deletes by parsed section ordinal, not by "whatever is
+/// in the directory". `SECTIONS/` lives on removable media, so anything whose
+/// name is not one of ours is somebody else's problem and must be left alone.
+#[test]
+fn the_prune_leaves_names_it_does_not_recognise() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let wide = build_book(&root, &mut store, 4);
+    write_stray_file(&root, "NOTES.TXT");
+    // Two digits, so not a name this code ever writes.
+    write_stray_file(&root, "S12.BIN");
+
+    let narrow = &wide[..1];
+    store.begin_book_load();
+    let outcome = publish::publish_book_cache(
+        &root,
+        KEY,
+        IDENTITY,
+        0,
+        &mut store,
+        narrow,
+        total_pages(narrow),
+        false,
+        0,
+    );
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+
+    assert!(
+        !file_in_sections_dir(&root, "S001.BIN"),
+        "the orphaned section should still go"
+    );
+    assert!(
+        file_in_sections_dir(&root, "NOTES.TXT") && file_in_sections_dir(&root, "S12.BIN"),
+        "names this code does not write must be left alone"
     );
 }
 

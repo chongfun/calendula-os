@@ -137,6 +137,26 @@ where
             cover: None,
         };
     }
+    // The index naming this section set is now on the card, so any section
+    // file past its end is unreachable from it — safe to delete, and nothing
+    // a reader could be holding. Order matters: pruning before the index
+    // landed would delete sections the *old* index still names.
+    //
+    // `resume_spine` is the gate. Non-zero means a suspended walk is coming
+    // back to write more sections, and `sections_slice` is its provisional
+    // frontier rather than the book's real length; pruning against it would
+    // delete the sections that walk is about to need. Only a completed
+    // build — which stamps zero — knows the final count.
+    if resume_spine == 0 {
+        let pruned = files::prune_orphan_sections(
+            root,
+            cache_key,
+            sections_slice.len().min(u16::MAX as usize) as u16,
+        );
+        if pruned > 0 {
+            cache_log!("cache: pruned {} orphaned section files", pruned);
+        }
+    }
     library.set_book_index(total_pages, book_partial, sections_slice);
     let hit = matches!(
         files::load_v2_section_by_global_page(
