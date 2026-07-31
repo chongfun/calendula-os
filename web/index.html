@@ -25,7 +25,7 @@
 // makes the preload's request mode match the fetch() the module script
 // issues, so the browser reuses this download instead of starting a second.
 (function () {
-  var board = new URLSearchParams(location.search).get("board") === "x3" ? "x3" : "x4";
+  var board = new URLSearchParams(location.search).get("board") === "x4" ? "x4" : "x3";
   var link = document.createElement("link");
   link.rel = "preload";
   link.as = "fetch";
@@ -528,7 +528,7 @@
 </div>
 
 <div class="hints">
-  <span class="boardswitch">board: <a id="sw-x4" href="?board=x4">X4</a> <a id="sw-x3" href="?board=x3">X3</a></span>
+  <span class="boardswitch">board: <a id="sw-x3" href="?board=x3">X3</a> <a id="sw-x4" href="?board=x4">X4</a></span>
   <span class="kbonly"><kbd>←</kbd> <kbd>→</kbd> turn pages</span>
   <span class="kbonly"><kbd>Enter</kbd> confirm</span>
   <span class="kbonly"><kbd>Esc</kbd> back</span>
@@ -549,20 +549,20 @@
     <div class="stage">
       <p class="stitle"><span class="no">1</span>Choose your device</p>
       <div class="devs">
-        <button class="dev on" data-dev="x4"><b>Xteink X4</b><span>480 × 800 · USB-C</span></button>
-        <button class="dev" data-dev="x3"><b>Xteink X3</b><span>528 × 792 · pogo pins</span></button>
+        <button type="button" class="dev on" data-dev="x3"><b>Xteink X3</b><span>528 × 792 · pogo pins</span></button>
+        <button type="button" class="dev" data-dev="x4"><b>Xteink X4</b><span>480 × 800 · USB-C</span></button>
       </div>
     </div>
     <div class="stage">
       <p class="stitle"><span class="no">2</span>Flash over USB</p>
       <div class="asset">
         <div><span class="k">Version</span><b>v0.5.0</b></div>
-        <div><span class="k">Image</span><b id="img">firmware-x4.bin</b></div>
+        <div><span class="k">Image</span><b id="img">firmware-x3.bin</b></div>
         <div><span class="k">Size</span><b>~3.5 MB</b></div>
       </div>
       <div class="status" id="status"><span class="dot"></span><span id="st">Ready. You’ll choose the USB port when you flash.</span></div>
       <div class="acts">
-        <esp-web-install-button id="flasher" manifest="manifest-x4.json"><button slot="activate" class="flashbtn" id="flash">Flash</button><span slot="unsupported" class="ewt-note"></span><span slot="not-allowed" class="ewt-note">Web flashing needs a secure (https) connection.</span></esp-web-install-button>
+        <esp-web-install-button id="flasher" manifest="manifest-x3.json"><button type="button" slot="activate" class="flashbtn" id="flash">Flash</button><span slot="unsupported" class="ewt-note"></span><span slot="not-allowed" class="ewt-note">Web flashing needs a secure (https) connection.</span></esp-web-install-button>
         <a class="ghost" href="#" id="dl">Download .bin</a>
       </div>
       <p class="req">Uses WebSerial, in Chrome or Edge on the desktop. Wake the reader to its home screen and connect it; after flashing, replug USB to boot.</p>
@@ -579,15 +579,15 @@
       <li><span class="n">3</span> Power on holding <b>Power + Up</b> to flash.</li>
     </ul>
     <a class="dl2" href="#" id="sd">Download SD image &#8595;</a>
-    <p class="txt">Already running Calendula? Use <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> on X4 or <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDX3.BIN">FWUPDX3.BIN</a> on X3 and reboot normally.</p>
+    <p class="txt">Already running Calendula? Use <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDX3.BIN">FWUPDX3.BIN</a> on X3 or <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> on X4 and reboot normally.</p>
   </div>
 
   <p class="rel"><a href="https://github.com/chongfun/calendula-os/releases/latest">v0.5.0 release notes &#8599;</a></p>
 </section>
 
 <div class="colophon">
-  <div class="row"><span>panel</span><span id="panel-spec">GDEQ0426T82 · 800 × 480 · 1-bit</span></div>
-  <div class="row"><span>page turn</span><span>~473 ms measured, 421 ms panel busy</span></div>
+  <div class="row"><span>panel</span><span id="panel-spec">UC8253 · 792 × 528 · 1-bit</span></div>
+  <div class="row"><span>page turn</span><span id="page-turn-spec">~424 ms measured, 379 ms panel busy</span></div>
   <div class="row"><span>firmware</span><span>Rust · esp-hal · no_std on device</span></div>
   <div class="row"><span>this page</span><span>same crates, wasm32 · no framework</span></div>
 </div>
@@ -598,18 +598,17 @@
 
 <script>
 (async function () {
-  // Board is selected at page load via ?board=x3 (default x4); the geometry
-  // is compile-time in the firmware, so each board is a separate wasm build
-  // (build the X3 wasm with `--features device-x3` and serve it as
-  // x3_web_emulator.wasm).
+  // Board via ?board=x4 (default x3). Each board is a separate wasm build.
   const BOARDS = {
     x4: { name: "Xteink X4", short: "X4", w: 800, h: 480,
-          wasm: "x4_web_emulator.wasm", panel: "GDEQ0426T82 · 800 × 480 · 1-bit", res: "800 × 480" },
+          wasm: "x4_web_emulator.wasm", panel: "GDEQ0426T82 · 800 × 480 · 1-bit", res: "800 × 480",
+          pageTurn: "~473 ms measured, 421 ms panel busy", busyMs: 421 },
     x3: { name: "Xteink X3", short: "X3", w: 792, h: 528,
-          wasm: "x3_web_emulator.wasm", panel: "UC8253 · 792 × 528 · 1-bit", res: "792 × 528" },
+          wasm: "x3_web_emulator.wasm", panel: "UC8253 · 792 × 528 · 1-bit", res: "792 × 528",
+          pageTurn: "~424 ms measured, 379 ms panel busy", busyMs: 379 },
   };
   const boardParam = new URLSearchParams(location.search).get("board");
-  const board = BOARDS[boardParam] ? boardParam : "x4";
+  const board = BOARDS[boardParam] ? boardParam : "x3";
   const cfg = BOARDS[board];
   const WIDTH = cfg.w, HEIGHT = cfg.h;
   const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
@@ -626,6 +625,7 @@
 
   // Reflect the selected board in the page chrome.
   document.getElementById("panel-spec").textContent = cfg.panel;
+  document.getElementById("page-turn-spec").textContent = cfg.pageTurn;
   document.getElementById("device").setAttribute("aria-label", "Simulated " + cfg.name + " e-reader");
   document.getElementById("sw-" + board).classList.add("active");
   device.classList.add(board);
@@ -799,7 +799,7 @@
   let queued = null;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // mode: 1 full (~3.5 s real; abridged here), 2 fast (421 ms), 3 fast-clean.
+  // mode: 1 full (~3.5 s real; abridged here), 2 fast (board-specific BUSY time), 3 fast-clean.
   async function refresh(mode) {
     // Copy the frame out of wasm memory before the first await: a book
     // delivered mid-refresh calls x4_book_alloc, which can grow (and so
@@ -814,12 +814,12 @@
       } else if (mode === 2) {
         // A fast update does not flash: changed pixels just redraw, and a
         // faint imprint of the outgoing page stays behind until a cleaning
-        // refresh. The panel is still busy for the rated 421 ms.
+        // refresh. The panel is still busy for the rated time.
         workCtx.drawImage(page, 0, 0);
         ghostCtx.drawImage(work, 0, 0);
         ghosting = true;
         putFinal(pixels);
-        await sleep(420);
+        await sleep(cfg.busyMs);
       } else {
         // FastClean is the panel's one-flicker cleaning waveform; full runs
         // several inversion passes.
@@ -923,7 +923,13 @@
   btns.forEach(b=>b.addEventListener("click",()=>{
     btns.forEach(x=>x.classList.remove("on")); b.classList.add("on"); set(b.dataset.dev);
   }));
-  set("x4");
+  const qBoard = new URLSearchParams(window.location.search).get("board");
+  const selectedBoard = qBoard === "x4" ? "x4" : "x3";
+  btns.forEach(b=>{
+    if(b.dataset.dev === selectedBoard) b.classList.add("on");
+    else b.classList.remove("on");
+  });
+  set(selectedBoard);
 
   // Web Serial support gate: no serial API -> steer to Download / SD instead.
   if(!("serial" in navigator)){

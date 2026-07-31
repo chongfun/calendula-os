@@ -6,7 +6,7 @@ readers: ESP32-C3, monochrome e-paper panels, no PSRAM.
 The design goal is not to imitate a desktop OS. It is a small data pipeline:
 
 ```text
-buttons -> app state -> display command -> framebuffer -> SSD1677 RAM -> refresh -> sleep
+buttons -> app state -> display command -> framebuffer -> EPD panel RAM -> refresh -> sleep
 ```
 
 ## Current architecture diagram
@@ -21,12 +21,12 @@ flowchart TD
     wifi_task["wifi_task<br/>sync session + browser shelf"]
 
     app_core["app-core<br/>Copy message contracts<br/>ReaderState reducer<br/>RefreshPlanner"]
-    display_crate["display<br/>1 bpp framebuffer<br/>drawing + fonts<br/>SSD1677 transforms"]
+    display_crate["display<br/>1 bpp framebuffer<br/>drawing + fonts<br/>EPD transforms"]
     proto["proto<br/>bounded book/storage/text/cache models<br/>ZIP/EPUB/XHTML parser pieces"]
     hal_ext["hal-ext<br/>SPI DMA, RTC, NVM helpers"]
     ui["ui<br/>bounded layout/render helpers"]
 
-    epd["SSD1677 e-ink panel<br/>800x480 BW/RED RAM"]
+    epd["EPD panel (X4: SSD1677, X3: UC8253)<br/>framebuffer / previous-frame RAM"]
     sd["microSD FAT<br/>/BOOKS + card root EPUBs<br/>/XTEINK cache + catalog + state"]
     sleep["ESP32-C3 deep sleep"]
 
@@ -38,7 +38,7 @@ flowchart TD
     input_task -->|"InputEvent"| app_task
     app_task -->|"DisplayCommand::Render / Sleep"| display_task
     app_task -->|"StorageCommand"| display_task
-    display_task -->|"DisplayEvent::Settled / Asleep<br/>LibraryEvent"| app_task
+    display_task -->|"DisplayEvent::Settled / Asleep / Failed<br/>LibraryEvent"| app_task
     app_task -->|"PowerEvent::Activity"| power_task
     display_task -->|"PowerEvent::DisplaySettled / DisplayAsleep"| power_task
     power_task -->|"DisplayCommand::Sleep"| display_task
@@ -75,14 +75,14 @@ flowchart TD
 - Messages are small `Copy` values. Bulk bytes stay in caller-owned buffers.
 - Power requests display sleep through `display_task`; it never touches SPI.
 - Hardware assumptions live in one of two places:
-  - X4 board wiring in `fw/src/main.rs` and `fw/src/tasks/input.rs`.
-  - SSD1677 protocol in `display/src/epd.rs`.
+  - Board wiring in `fw/src/main.rs` and `fw/src/tasks/input.rs`.
+  - Controller protocol in `display/src/epd/`.
 
 ## Workspace
 
 ```text
 app-core/ app state reducer and Copy message contracts shared by firmware/tools
-display/   framebuffer, drawing primitives, SSD1677 constants and address math
+display/   framebuffer, drawing primitives, EPD controller constants and address math
 hal-ext/   thin async wrappers over ESP HAL peripherals
 fw/        boot, Embassy executor, task wiring, board-owned peripherals
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
@@ -106,8 +106,8 @@ board_io/display task
   owns EpdBus, SD CS, ReaderStore, and Framebuffer
   DisplayCommand::Render -> pure framebuffer render from the current ReaderStore snapshot
   StorageCommand::* -> serialized SD/FAT/catalog/cache work on the shared SPI bus
-  DisplayCommand::Sleep -> sleep screen full refresh -> SSD1677 deep sleep -> PowerEvent::DisplayAsleep
-  sends DisplayEvent::Settled to app_task when render completes
+  DisplayCommand::Sleep -> sleep screen full refresh -> EPD controller deep sleep -> PowerEvent::DisplayAsleep
+  sends DisplayEvent::Settled (or RefreshFailed) to app_task when render completes
 
 input_task
   polls GPIO3 and ADC ladders
@@ -117,7 +117,7 @@ input_task
 
 power_task
   observes activity and display-settled events
-  asks display_task to sleep the SSD1677, then enters ESP32-C3 deep sleep
+  asks display_task to sleep the EPD controller, then enters ESP32-C3 deep sleep
   takes GPIO3 off input_task before arming it as the wake source, so the pin
   has a single owner when it is re-materialised
 
@@ -214,21 +214,21 @@ DHCP/DNS/HTTP codecs under host tests; the wifi task only owns sockets.
 Embassy is used for cooperative waits: ADC retry delays, button polling, SPI DMA
 transfers, BUSY waits, and sleep windows all yield instead of spinning. The real
 battery win comes after display settle: the power task asks the display task to
-draw a visible sleep screen, power down the SSD1677, then move the ESP32-C3 into
+draw a visible sleep screen, power down the EPD controller, then move the ESP32-C3 into
 deep sleep. The power button also requests this same sleep path instead of being
 treated as ordinary navigation input.
 
 Input/render backpressure is intentionally coalesced. The app keeps at most one
 display render in flight. While the display is refreshing, new button events
 still update `ReaderState`, but they set a single pending-render flag instead of
-queuing stale framebuffer renders. When `DisplayEvent::Settled` arrives, the app
-renders the latest state once.
+queuing stale framebuffer renders. When `DisplayEvent::Settled` or
+`RefreshFailed` arrives, the app renders the latest state once.
 
 Storage is also explicit. Files/Home/Reading transitions enqueue
 `StorageCommand`s after the visible render settles; render commands never scan
 FAT, open EPUBs, build caches, or write progress. Open/extend requests whose
-page already sits inside the loaded section window are answered from RAM
-without an SD session, and reading-progress writes are coalesced (at most one
+page already sits inside the loaded section window are answered from RAM without
+an SD session or a redundant display render, and reading-progress writes are coalesced (at most one
 alternating STATEA/STATEB generation per 15 s, flushed before display
 sleep, with sleep deferred if the flush fails). The board I/O task is still
 the single SPI owner, so display refresh and SD transactions cannot overlap, but
@@ -245,35 +245,51 @@ volume. Deep sleep resets the chip and clears that state.
 ## Display model
 
 `display::fb::Framebuffer` is the source of truth. White is bit `1`, black is
-bit `0`, row-major, 100 bytes per row.
+bit `0`, row-major.
 
-The SSD1677 path writes the current framebuffer to BW RAM (`0x24`). The first
-refresh after boot also writes the current framebuffer to RED RAM (`0x26`) and
-runs the multi-flash full waveform (~3.5 s), the only mode that reliably clears
-unknown pixels. Normal page turns use a second retained framebuffer as the RED
-RAM previous-frame source, then trigger the SSD1677 fast waveform (~421 ms).
+Geometry and fast-refresh timing depend on the board:
 
-Between those sits `RefreshMode::FastClean`, the one-flicker clean: the
-display-mode-1 waveform run with the temperature register overridden to 90 C,
-selecting the hotter (shorter) OTP LUT — ghost cleanup in ~1.5 s at a small
-contrast cost. Waking from the sleep screen and view/context changes use it
-instead of the full waveform, since the panel's contents are known. After a
-FastClean settles, the update sequence reloads the sensed temperature so later
-fast refreshes return to sensor-accurate timing.
+- **X4**: SSD1677, 100-byte rows, ~421 ms fast waveform.
+- **X3**: UC8253, 99-byte rows, ~379 ms fast waveform.
 
-The user-facing `RefreshPolicy` in Settings selects between `FastOnly`,
-`FullOnWake` (the default), and `FullEveryTen`, which inserts a FastClean
-cleanup after every ten fast refreshes.
+The full refresh (the only mode that reliably clears unknown pixels) and normal
+page turns differ by controller:
 
-`display::epd` contains three transform constants currently validated during bring-up:
-`MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`. The logical
-framebuffer API stays upright while firmware and host tools remap bytes/bits
-before panel-RAM writes. This fixes the X4 panel's observed horizontal byte
-order and bit order without leaking hardware orientation into app rendering.
-`MIRROR_Y=true` was tested and rejected because it made glyphs vertically
-mirrored/upside down.
+- **X4 (SSD1677)**: The first refresh writes the current frame to both BW and
+  RED RAM, then runs the multi-flash full waveform (~3.5 s). Normal turns write
+  the current frame to BW RAM with the retained previous frame in RED RAM, then
+  trigger the fast waveform.
+- **X3 (UC8253)**: The full plan writes white to DTM1 and the current frame to
+  DTM2, runs the full refresh, then stages the current frame into DTM1 and runs
+  a fast settle pass. Normal turns write the current frame to DTM2; the previous
+  frame is only written to DTM1 if it was not already staged.
 
-Physical orientation is an app/layout concern, not an SSD1677 streaming concern.
+`RefreshMode::FastClean` sits between those — a one-flicker clean:
+
+- **X4 (SSD1677)**: Runs display-mode-1 with the temperature register forced to
+  90 °C, selecting the hotter OTP LUT (~1.5 s, small contrast cost). The sensed
+  temperature is restored afterward.
+- **X3 (UC8253)**: Uploads the firmware-defined `HALF` LUT bank in absolute CDI
+  mode — a similar short clean without temperature overrides.
+
+Waking from the sleep screen and view/context changes use `FastClean`
+instead of the full waveform, since the panel's contents are known.
+
+`RefreshPolicy` in Settings: `FastOnly`, `FullOnWake` (default), or
+`FullEveryTen` (legacy name — actually every eight fast refreshes).
+
+`display::epd` contains transform constants validated during bring-up:
+
+- **X4 (SSD1677)**: `MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`.
+  (`MIRROR_Y = true` was tested and rejected because it made glyphs vertically
+  mirrored/upside down.)
+- **X3 (UC8253)**: `MIRROR_X = true`, `MIRROR_Y = true`, and `REVERSE_BITS = true`.
+
+The logical framebuffer API stays upright; firmware and host tools remap
+bytes/bits before panel-RAM writes, fixing the observed byte and bit order
+without leaking hardware orientation into rendering.
+
+Physical orientation is an app/layout concern, not a hardware streaming concern.
 The current readable build places logical top on the physical button side. The
 reader state already carries a complete orientation enum:
 
@@ -289,13 +305,18 @@ enum DisplayOrientation {
 Default reader mode is `PortraitButtonsLeft`, but the low-level display
 transform above should stay fixed unless corruption returns.
 
-Addressing follows the OpenX4 community SDK behavior:
+Addressing handles the hardware specifics of each controller:
 
-- SPI mode 0, 20 MHz (the SSD1677 write-mode datasheet maximum; the OpenX4
-  SDK's 40 MHz worked only on margin).
-- BUSY is active high.
-- X window is pixel-addressed, `0..799`.
-- Y gate scan is reversed, so the full Y window is `479..0`.
+- **X4 (SSD1677)**:
+  - SPI mode 0, 20 MHz (the write-mode datasheet maximum; the OpenX4 SDK's 40 MHz worked only on margin).
+  - BUSY is active high.
+  - X window is pixel-addressed, `0..799`.
+  - Y gate scan is reversed, so the full Y window is `479..0`.
+- **X3 (UC8253)**:
+  - SPI mode 0, 20 MHz.
+  - BUSY is active low.
+  - Streams 792×528 visible pixels in direct row order; the controller is
+    configured for 792×600 gates (extra gates fall outside the panel).
 
 ## Data-oriented design
 
@@ -662,7 +683,7 @@ flash/NVM fallback remains separate from the record format.
 
 | | |
 |---|---|
-| Page turn | 473 ms end-to-end; 421 ms of that is the panel's rated fast waveform |
+| Page turn | ~424 ms press-to-settled on X3 (379 ms panel BUSY) |
 | Wake from sleep | one flicker, ~1.5 s (deep-sleep Power-button wake only: the boot reads the RTC wake cause plus an RTC-RAM marker the sleep handshake writes after the sleep frame settles, and seeds the refresh planner with the sleep screen it knows the panel holds; a battery pull, crash, or a sleep whose final flush failed boots with unknown panel contents and pays the full 3.5 s) |
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |
@@ -676,8 +697,10 @@ flash/NVM fallback remains separate from the record format.
 2. Measure BUSY on GPIO6 during reset and refresh.
 3. Confirm full refresh timing.
 4. Confirm `TL`, `TR`, `BL`, and `BR` are readable and map consistently.
-   Current readable transform: `MIRROR_X=true`, `MIRROR_Y=false`,
-   `REVERSE_BITS=true`. Logical top currently appears on the physical button
+   Current readable transforms depend on the board:
+   - **X4**: `MIRROR_X=true`, `MIRROR_Y=false`, `REVERSE_BITS=true`
+   - **X3**: `MIRROR_X=true`, `MIRROR_Y=true`, `REVERSE_BITS=true`
+   Logical top currently appears on the physical button
    side; handle this later through `DisplayOrientation`.
 5. Validate the Adafruit-scaled ADC ladder bands against this physical unit.
    Current calibrated bands are GPIO1 Back `2400..2700`, Confirm `1800..2150`,
