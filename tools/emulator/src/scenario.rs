@@ -336,6 +336,10 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             // jump, where the storage task picks where the reader lands;
             // otherwise the scripted state's own page stands.
             position: step.page,
+            // A scripted load stands for one that read a section: scenarios are
+            // written to put a frame on the panel, and the RAM-hit answer is
+            // the one that deliberately does not.
+            text_replaced: true,
         }),
         "ChapterPage" | "chapter-page" | "chapter_page" => Ok(LibraryEvent::ChapterPage {
             book_id: step.book_id.unwrap_or(2),

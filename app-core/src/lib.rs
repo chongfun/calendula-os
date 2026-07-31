@@ -656,6 +656,120 @@ impl SleepGate {
     }
 }
 
+/// Whether a `Loaded` is worth the panel refresh that folding it would cost.
+///
+/// Every `Loaded` the app renders on costs a full refresh — measured at ~405 ms
+/// of panel time on the X3. A page turn used to pay two of them: one when the
+/// page changes and the app renders optimistically, and one when storage
+/// answers the extend. Measured on device: 31 `view=Reading` renders for 16 page
+/// turns, 14.4 s of refresh in a 48.5 s window.
+///
+/// The second is redundant when the event moves nothing the reader can see. In
+/// Reading that is a short list, because the page counter is chapter-relative
+/// and drawn from the storage task's own store at render time, not from the
+/// numbers in here: the text and the page. `pages`, `chapters`, `chapter_pages`
+/// and `current_chapter` are navigation bounds and persistence state — the
+/// reducer clamps against them and the chapter overview lists them, and it
+/// reloads that list on entry.
+///
+/// `chapter` is not a visible input to the SD Reading compositor. The firmware
+/// selects the body using `request.page`, and the footer derives its
+/// chapter-relative counter from `sd_library.chapter_page_position(request.page)`;
+/// the SD path bypasses the generic UI model entirely. The
+/// [`ReaderState::apply_chapter_cursor`] contract says the same thing:
+/// correcting `ReaderState::chapter` is silent because Reading does not display
+/// that value. Home, the sleep screen, Chapters, and the persisted position
+/// pick the corrected value up when next used.
+///
+/// The event is *always folded*, and that is the load-bearing half. The
+/// background index walk raises the store's page count as it goes and stays
+/// deliberately silent about it while the reader is behind its frontier, so the
+/// count the app holds is only as fresh as the last event it was handed. Skip
+/// the fold and the reader walks to their stale last page, where Next clamps to
+/// a no-op: no state change, no command, no repaint, and a walk that will not
+/// announce because by its own test the reader is nowhere near *its* frontier.
+/// A dead button until the build finishes. So nothing is withheld from the app,
+/// and only the repaint is optional.
+///
+/// Outside Reading the answer is always yes. The saving is a reading-path one,
+/// and the other views draw enough of the store (Home's colophon, the chapter
+/// overview) that the cost of reasoning about each is worth more than the
+/// refresh it would save.
+pub const fn loaded_repaints(reading: bool, text_replaced: bool, page_moved: bool) -> bool {
+    !reading || text_replaced || page_moved
+}
+
+/// Whether the input gate an open took may be lifted now.
+///
+/// A dispatched `OpenBook` shuts input off until the open has both *answered*
+/// and *landed on the panel*, so a press cannot be read against a screen that
+/// still shows the book being left. Two things therefore have to be true, and
+/// the gate is lifted by whichever of them finishes last:
+///
+/// - the open answered — `Loaded` or `BookOpenFailed` cleared `opening_book`;
+/// - no frame is in flight for it.
+///
+/// Reading the second one as "a render cycle just ended" is the trap. It holds
+/// for every open that repaints, which is nearly all of them, and it is how the
+/// gate was lifted for a long time — but `loaded_repaints` can answer an open
+/// with no repaint at all (re-entering Reading on the resident book, at the page
+/// it was already on), and that event ends no cycle. Nothing else is coming: the
+/// open is over, the panel is already correct, and a gate waiting on a frame
+/// nobody owes stays shut for good — every press ignored, sleep deferred, until
+/// the battery goes. So the test is whether a frame is *in flight*, which an
+/// event arriving between cycles can answer as well as a cycle ending can.
+pub const fn open_gate_may_lift(gated: bool, open_unresolved: bool, frame_in_flight: bool) -> bool {
+    gated && !open_unresolved && !frame_in_flight
+}
+
+/// One repaint owed to the reader after a panel transition that failed.
+///
+/// A failed flush may have run partially, so the panel is showing the old page,
+/// a torn one, or nothing — while the app has moved on regardless: the press was
+/// reduced, the page advanced, and the progress record went to the card. The
+/// display task answers a failure by forgetting its model of the panel so that
+/// the *next* render re-inits and takes the full waveform. This is what makes
+/// sure there is a next render: without it the next one is whatever the reader
+/// presses, and that press advances the page again — so the page they never saw
+/// looks like one the device skipped.
+///
+/// Until the page-turn announce was suppressed, the extend's `Loaded` arrived
+/// just behind the failure and re-rendered. That was recovery by accident of
+/// event order, and only for turns storage answered with an event; the repaint
+/// is owed either way, so the app asks for it here rather than depending on
+/// there.
+///
+/// Bounded at one per frame that reaches the panel. A panel that fails its retry
+/// is not coming back this cycle, and repainting into it on every failure would
+/// spend the display task and the battery on a reader who can still press their
+/// way out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepaintRetry {
+    spent: bool,
+}
+
+impl RepaintRetry {
+    pub const fn new() -> Self {
+        Self { spent: false }
+    }
+
+    /// A panel transition failed. Returns whether the app repaints current
+    /// state now; only ever true once until a frame settles.
+    pub fn failed(&mut self) -> bool {
+        if self.spent {
+            return false;
+        }
+        self.spent = true;
+        true
+    }
+
+    /// A frame reached the panel. The next failure is a fresh one, so it gets
+    /// its own retry.
+    pub fn settled(&mut self) {
+        self.spent = false;
+    }
+}
+
 /// Where the reader sits before a book-open transaction, so an abort can put
 /// it back. Held by the app task, which is the only place that still knows.
 ///
@@ -1140,6 +1254,22 @@ pub enum LibraryEvent {
         /// every load would rubber-band the reader back onto an in-flight
         /// request during quick page turns.
         position: Option<u32>,
+        /// Whether this load put different text under the reader.
+        ///
+        /// The one thing in here the app cannot work out for itself. Every
+        /// other field it can compare against what it already holds, but the
+        /// text is drawn straight from the storage task's own buffer at render
+        /// time, so a load that replaced it leaves the panel showing a frame
+        /// that no state of the app's disagrees with. `false` is the page turn
+        /// answered out of the resident section window: no card session, no new
+        /// text, and — when nothing else moved either — no repaint.
+        ///
+        /// Note what this is deliberately *not*: "the announced fields
+        /// changed". A section really read from the card can leave every field
+        /// identical and still have replaced the text, which is what a chapter
+        /// spanning two cache sections does — both halves report the same
+        /// chapter. See [`loaded_repaints`].
+        text_replaced: bool,
     },
     /// A book-open transaction refused to complete, so the book was never
     /// opened and the reader must go back to the one it was reading.
@@ -2147,6 +2277,10 @@ impl ReaderState {
                 current_chapter,
                 chapter_pages,
                 position,
+                // Routing only: whether the panel owes a repaint is the app
+                // task's question (see `loaded_repaints`), and every one of
+                // these is folded either way.
+                text_replaced: _,
             } => {
                 if self.book_id == book_id {
                     self.sd_page_count = pages.max(1);
@@ -2722,6 +2856,23 @@ mod tests {
             current_chapter: 3,
             chapter_pages: [0; MAX_SD_CHAPTERS],
             position,
+            text_replaced: true,
+        }
+    }
+
+    /// What a page turn served out of the resident section window answers with:
+    /// no new text, no landing position, and whatever shape the store has
+    /// reached by now — which a background index walk may have grown since the
+    /// app was last told anything.
+    fn extend_answered_from_ram(book_id: u32, pages: u32, current_chapter: u16) -> LibraryEvent {
+        LibraryEvent::Loaded {
+            book_id,
+            pages,
+            chapters: 20,
+            current_chapter,
+            chapter_pages: [0; MAX_SD_CHAPTERS],
+            position: None,
+            text_replaced: false,
         }
     }
 
@@ -2833,6 +2984,180 @@ mod tests {
         assert!(gate.release(NOTHING_OWED));
         assert!(!gate.release(NOTHING_OWED));
         assert!(!gate.release(OPEN_UNRESOLVED));
+    }
+
+    /// The ordering that strands the reader if the gate waits on a render
+    /// cycle. The open is dispatched with its optimistic render; the display
+    /// task takes render commands ahead of storage work, so that render settles
+    /// while the open is still queued -- too early to lift anything. The open is
+    /// then answered out of the resident window at the page the reader was
+    /// already on, which repaints nothing and ends no cycle. If that event does
+    /// not lift the gate, nothing ever will.
+    #[test]
+    fn an_open_answered_between_cycles_still_lifts_the_gate() {
+        // The optimistic render settles first: the open has not answered, so
+        // there is nothing to lift yet.
+        assert!(!open_gate_may_lift(true, true, false));
+
+        // Its `Loaded` arrives with no repaint owed and no frame in flight.
+        assert!(open_gate_may_lift(true, false, false));
+    }
+
+    #[test]
+    fn a_frame_in_flight_keeps_the_gate_shut() {
+        // The open answered while its render was still on the panel's way. That
+        // frame's own acknowledgement lifts the gate; lifting it here would let
+        // a press -- or a deferred sleep -- overtake the frame it is waiting on.
+        assert!(!open_gate_may_lift(true, false, true));
+    }
+
+    #[test]
+    fn an_ungated_app_lifts_nothing() {
+        // Every library event reaches this test, and all but an open's are
+        // arriving with the gate already open.
+        assert!(!open_gate_may_lift(false, false, false));
+    }
+
+    /// The regression this was written for. A book is opened while its index is
+    /// still being built: the app is told the shape reached so far, the walk
+    /// keeps growing the store, and it stays silent about that growth because
+    /// by its own test the reader is nowhere near *its* frontier. Every page
+    /// turn in between is answered out of the resident window.
+    ///
+    /// The reader walks to the last page the app knows about. If those answers
+    /// were withheld to save the refresh, this is where the device looks
+    /// broken: Next clamps to a no-op, so no state changes, no command goes
+    /// out, and nothing repaints -- until the whole build finishes.
+    #[test]
+    fn a_book_growing_in_the_background_never_traps_the_reader() {
+        let mut state = reading(0, 0, 0);
+        let book_id = state.book_id;
+        // What the first publish told the app: one section's worth of pages.
+        state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Loaded {
+                book_id,
+                pages: 20,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: true,
+            },
+        );
+        assert_eq!(state.sd_page_count, 20);
+
+        // Read to the last page the app knows about. Every turn is a RAM hit,
+        // and the walk has been growing the book the whole way.
+        let mut grown = 20;
+        while state.page < 19 {
+            let before = state.page;
+            state = press(state, Button::Next);
+            assert_eq!(state.page, before + 1, "the turn moves inside the window");
+            grown += 40;
+            state = state
+                .apply_library_event(CTX, extend_answered_from_ram(book_id, grown, state.chapter));
+        }
+
+        assert_eq!(state.sd_page_count, grown, "the bound tracks the store");
+
+        let next = press(state, Button::Next);
+        assert_eq!(next.page, 20, "Next still moves at the old frontier");
+    }
+
+    /// The saving, at the same time: those answers cost no panel refresh. The
+    /// counter on screen is chapter-relative and drawn from the store, so a
+    /// grown page count moves nothing the reader can see.
+    #[test]
+    fn a_page_turn_answered_from_ram_does_not_repaint_twice() {
+        let state = reading(0, 3, 120);
+        let folded =
+            state.apply_library_event(CTX, extend_answered_from_ram(state.book_id, 900, 3));
+
+        assert_ne!(folded.sd_page_count, state.sd_page_count, "the bound moved");
+        assert!(
+            !loaded_repaints(
+                state.view == AppView::Reading,
+                false,
+                folded.page != state.page,
+            ),
+            "nothing the reader can see changed"
+        );
+    }
+
+    /// A section really read from the card replaced the text under the reader,
+    /// and can leave every announced field identical while doing it -- a chapter
+    /// spanning two cache sections reports the same chapter from both halves.
+    #[test]
+    fn a_section_read_from_the_card_always_repaints() {
+        assert!(loaded_repaints(true, true, false));
+    }
+
+    /// A landing position the storage task resolved moves the reader; that is
+    /// on screen.
+    #[test]
+    fn a_load_that_moves_the_page_repaints() {
+        assert!(loaded_repaints(true, false, true));
+    }
+
+    /// A chapter-only correction is invisible in Reading — the compositor
+    /// derives its chapter-relative counter from the store, not from
+    /// `ReaderState::chapter` — so it owes no refresh. The corrected chapter
+    /// is still folded for persistence, Home, sleep, and the chapter list.
+    #[test]
+    fn a_chapter_only_correction_does_not_repaint() {
+        assert!(!loaded_repaints(true, false, false));
+    }
+
+    /// Outside Reading the saving is not claimed: the other views draw enough of
+    /// the store that reasoning about each costs more than the refresh saves.
+    #[test]
+    fn a_load_outside_reading_always_repaints() {
+        assert!(loaded_repaints(false, false, false));
+    }
+
+    /// The sequence this exists for: a page turn is reduced and rendered, the
+    /// flush fails, and the extend behind it is answered from RAM -- which since
+    /// `announce_is_owed` sends no `Loaded`, so no event repaints the frame. The
+    /// repaint has to come from the failure itself, with no second press.
+    #[test]
+    fn a_failed_page_turn_repaints_without_another_press() {
+        let mut retry = RepaintRetry::new();
+        // The turn before it settled normally, which is the ordinary state a
+        // reader arrives in.
+        retry.settled();
+
+        assert!(
+            retry.failed(),
+            "the reader is looking at the page before this one; nothing else redraws it"
+        );
+    }
+
+    #[test]
+    fn a_failed_repaint_is_not_retried_again() {
+        // A panel that fails the retry is not coming back this cycle. Repainting
+        // into it on every failure would spend the display task and the battery
+        // in a loop the reader cannot interrupt.
+        let mut retry = RepaintRetry::new();
+        assert!(retry.failed());
+        assert!(!retry.failed());
+        assert!(!retry.failed());
+    }
+
+    #[test]
+    fn a_frame_that_reaches_the_panel_restores_the_retry() {
+        // The budget is per display cycle, not per boot: a failure a hundred
+        // page turns later is a fresh one and owes the reader the same repaint.
+        let mut retry = RepaintRetry::new();
+        assert!(retry.failed());
+        assert!(!retry.failed());
+
+        retry.settled();
+
+        assert!(
+            retry.failed(),
+            "the next cycle's failure gets its own retry"
+        );
     }
 
     #[test]
@@ -3628,6 +3953,7 @@ mod tests {
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
                 position: None,
+                text_replaced: true,
             },
             LibraryEvent::Restored {
                 book_id: 2,

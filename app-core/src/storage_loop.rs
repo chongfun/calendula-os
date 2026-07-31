@@ -462,6 +462,11 @@ pub enum OpenAction {
     StorePointer(PersistedAppState),
     /// Announce the open as one event, carrying the landing position when the
     /// open resolved one. Report through [`OpenSequence::announced`].
+    ///
+    /// Every transaction reaches here, and every one of them sends: the app
+    /// clamps its navigation against the counts the event carries and clears
+    /// its open lock on the event itself. Whether the frame is worth repainting
+    /// is decided by the app, in `app_core::loaded_repaints`.
     Announce { book_id: u32, position: Option<u32> },
     /// Nothing left to do.
     Done,
@@ -779,6 +784,14 @@ mod tests {
         }
     }
 
+    fn book_id_of(command: &StorageCommand) -> u32 {
+        match *command {
+            StorageCommand::OpenBook { book_id, .. }
+            | StorageCommand::ExtendSection { book_id, .. } => book_id,
+            _ => unreachable!("only open transactions are driven here"),
+        }
+    }
+
     fn extend(book_id: u32, chapter: u16, page: u16) -> StorageCommand {
         StorageCommand::ExtendSection {
             request_id: 7,
@@ -837,9 +850,24 @@ mod tests {
         CloseOut(u32),
         Stage(u16),
         LoadSaved(u16),
-        LoadSection { chapter: u16, page: u16 },
-        StorePointer { book_id: u32, screen: u32 },
-        Announce { book_id: u32, position: Option<u32> },
+        LoadSection {
+            chapter: u16,
+            page: u16,
+        },
+        StorePointer {
+            book_id: u32,
+            screen: u32,
+        },
+        Announce {
+            book_id: u32,
+            position: Option<u32>,
+        },
+        /// The `Loaded` event leaving the storage task, and what it says about
+        /// the text. Separate from `Announce`, which is only the phase running.
+        Loaded {
+            book_id: u32,
+            text_replaced: bool,
+        },
         Refuse(u32),
     }
 
@@ -875,11 +903,26 @@ mod tests {
     }
 
     /// Runs a whole book-open transaction against the card model, exactly as the
-    /// display task drives it. `ram_hit` stands in for the loaded section window
-    /// already covering the target page: it changes how the firmware makes the
-    /// page resident, not the transaction around it, so the model just accepts.
+    /// display task drives it, with the loaded section window not covering the
+    /// target page. [`run_open_covering`] takes the other half.
     fn run_open(card: &mut Card, command: &StorageCommand, latest_request_id: u32) -> Trace {
+        run_open_covering(card, command, latest_request_id, false)
+    }
+
+    /// `ram_hit` stands in for the loaded section window already covering the
+    /// target page: it changes how the firmware makes the page resident, not the
+    /// transaction around it, so the model just accepts — and it is what the
+    /// closing event reports about the text, which the trace records.
+    fn run_open_covering(
+        card: &mut Card,
+        command: &StorageCommand,
+        latest_request_id: u32,
+        ram_hit: bool,
+    ) -> Trace {
         let mut trace = Trace::default();
+        // As in the firmware: `None` until a section load is reached at all, so
+        // a refused transaction never claims to have read from RAM.
+        let mut section_loaded = None;
         let Some(mut sequence) = OpenSequence::begin(command, latest_request_id) else {
             return trace;
         };
@@ -905,6 +948,7 @@ mod tests {
                 }
                 OpenAction::LoadSection { chapter, page, .. } => {
                     trace.push(Step::LoadSection { chapter, page });
+                    section_loaded = Some(ram_hit);
                     sequence.section_loaded();
                 }
                 OpenAction::StorePointer(record) => {
@@ -917,6 +961,12 @@ mod tests {
                 }
                 OpenAction::Announce { book_id, position } => {
                     trace.push(Step::Announce { book_id, position });
+                    // Unconditional, as in the firmware. `ram_hit` decides what
+                    // the event says about the text, never whether it is sent.
+                    trace.push(Step::Loaded {
+                        book_id,
+                        text_replaced: !matches!(section_loaded, Some(true)),
+                    });
                     sequence.announced();
                 }
                 OpenAction::Done => return trace,
@@ -942,6 +992,46 @@ mod tests {
             .position_of(|step| matches!(step, Step::StorePointer { .. }))
             .is_none());
         assert!(card.global.is_none());
+    }
+
+    // Invariant: every transaction answers the app, RAM hit or not, extend or
+    // open. The app clamps its navigation against the counts the event carries
+    // and clears its open lock on the event itself, so a transaction that goes
+    // quiet is not a saved refresh -- it is a page turn walking into a stale
+    // bound, or an open lock nothing will ever lift. What the load did to the
+    // text rides in the event instead, and the app spends the refresh or not.
+    #[test]
+    fn every_transaction_answers_the_app() {
+        for (name, command, ram_hit) in [
+            // Re-entering Reading on the book still resident: `previous: None`,
+            // no relocation, nothing read -- the exact shape of a page turn.
+            ("resident reopen", open(2, 3, 40, None), true),
+            ("bare reopen", open(2, 0, 0, None), true),
+            (
+                "switch from RAM",
+                open(3, 5, 12, Some(persisted(2, 4, 90))),
+                true,
+            ),
+            (
+                "switch from the card",
+                open(3, 5, 12, Some(persisted(2, 4, 90))),
+                false,
+            ),
+            ("page turn from RAM", extend(2, 3, 41), true),
+            ("page turn from the card", extend(2, 3, 41), false),
+        ] {
+            let mut card = Card::default();
+            let book_id = book_id_of(&command);
+            let trace = run_open_covering(&mut card, &command, 7, ram_hit);
+            assert!(
+                trace.contains(Step::Loaded {
+                    book_id,
+                    // A RAM hit is the only load that leaves the text alone.
+                    text_replaced: !ram_hit,
+                }),
+                "{name} must answer: {trace:?}"
+            );
+        }
     }
 
     // Invariant: switching away preserves the previous book's position.
