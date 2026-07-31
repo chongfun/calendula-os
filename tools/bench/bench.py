@@ -533,8 +533,14 @@ def parse_line(line: str, suite: str = "unknown") -> list[dict[str, Any]]:
 
     if text == "display: sleep deep":
         return [{"suite": suite, "event": "sleep", "phase": "deep", "legacy": True}]
-    if text == "display: sleep framebuffer flush failed":
-        return [{"suite": suite, "event": "sleep", "phase": "refresh", "ok": False}]
+    # `display: sleep framebuffer flush failed` is deliberately NOT parsed.
+    # The firmware prints it beside `bench: sleep phase=refresh ok=false`, and
+    # has since both were added, so parsing it recorded every failed flush
+    # twice and the report said "2 failed sleep phase(s)" for one failure. The
+    # println stays in the firmware because it is an error path, and error
+    # paths are unconditional there (see fw::log) — it is the only word a
+    # `--no-default-features` build says about a failed sleep. Its sibling
+    # `display: sleep transition failed` was never parsed either.
     if "queue full" in text or "panicked at" in text or "watchdog" in text.lower():
         return [{"suite": suite, "event": "warning", "line": text}]
 
@@ -710,12 +716,8 @@ def summarize_paths(
     turn_stats = pool.every
     for label, stats in pool.untrusted:
         print(
-            f"page turn      UNTRUSTED in {label}: {stats.untrusted_presses}/"
-            f"{stats.presses} presses produced no page turn "
-            f"({stats.coalesced_presses} coalesced, "
-            f"{stats.unmatched_presses} unanswered; over "
-            f"{PAGE_TURN_UNTRUSTED_MAX_FRACTION:.0%}) — that run's samples are "
-            "operator cadence, not firmware latency, and are left out below"
+            f"page turn      EXCLUDED {label}: {page_turn_exclusion(stats)} — "
+            "left out of the page turn figure below"
         )
     if pool.trusted.durations:
         print_duration("page turn", pool.trusted.durations)
@@ -1127,11 +1129,36 @@ class PageTurnPool:
 
     @property
     def untrusted(self) -> list[tuple[str, PageTurnStats]]:
+        """Runs whose presses gave the median nothing it could use.
+
+        A run that produced no pairing at all belongs here as much as a
+        cadence-corrupted one: `trusted` drops both, so reporting only the
+        second meant a pooled report printed the healthy run's median with no
+        sign that a whole capture had contributed nothing. Runs with no
+        presses are silent because nothing was attempted in them.
+        """
         return [
             (label, stats)
             for label, stats in self.per_run
-            if stats.durations and not stats.median_trusted
+            if stats.presses and not stats.median_trusted
         ]
+
+
+def page_turn_exclusion(stats: PageTurnStats) -> str:
+    """Why a run's presses are not in the pooled median.
+
+    One wording for both the report and the budget warning, so the two
+    cannot drift into disagreeing about what was left out.
+    """
+    if not stats.durations:
+        return f"{stats.presses} presses and no input-to-Reading-render sample"
+    return (
+        f"{stats.untrusted_presses}/{stats.presses} presses produced no page "
+        f"turn ({stats.coalesced_presses} coalesced, "
+        f"{stats.unmatched_presses} unanswered; over "
+        f"{PAGE_TURN_UNTRUSTED_MAX_FRACTION:.0%}), so its samples are operator "
+        "cadence, not firmware latency"
+    )
 
 
 def page_turn_pool(runs: list[LabelledRun]) -> PageTurnPool:
@@ -1181,7 +1208,7 @@ def event_sort_key(event: dict[str, Any]) -> tuple[int, float]:
 # reset, and it matters because `event_sort_key` orders events by t_ms while
 # `split_runs` splits only on host-side run_start markers: the two boots'
 # time bases interleave and press/render pairings straddle the reset.
-_SLEEP_TERMINAL_PHASES = {"deep", "deep_sleep", "complete"}
+_SLEEP_TERMINAL_PHASES = {"deep_sleep", "complete"}
 
 
 def is_terminal_sleep(event: dict[str, Any]) -> bool:
@@ -1195,11 +1222,19 @@ def is_terminal_sleep(event: dict[str, Any]) -> bool:
 
     The terminal markers are `complete`, printed by the display task on both
     devices once the panel acknowledged, and `deep_sleep`, printed by the X3
-    panel driver after the deep-sleep command — the only terminal marker in
-    captures predating the `complete ok=true` line, whose absence on the
-    success path was itself a defect. `phase=complete` prints on both
+    panel driver *after* its deep-sleep command returned — the only terminal
+    marker in captures predating the `complete ok=true` line, whose absence
+    on the success path was itself a defect. `phase=complete` prints on both
     outcomes and carries the result in `ok`; absent (older captures) is
     treated as success.
+
+    The X4's `display: sleep deep` (parsed as `phase=deep`) is deliberately
+    not one of them, despite the name: ssd1677 prints it after the power-down
+    handshake and *before* sending its deep-sleep command, which can still
+    fail. It also carries no `t_ms`, so a boot segment latched by it could
+    never be un-latched by the later `complete ok=false` and a reset was
+    filed as a wake. An X4 capture with no `complete ok=true` cannot prove a
+    sleep finished, and now fails closed instead of claiming one.
     """
     return (
         event.get("event") == "sleep"
@@ -1380,10 +1415,8 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         # averaged into the pool it would otherwise corrupt.
         for label, stats in pool.untrusted:
             warnings.append(
-                f"page-turn median untrusted in {label}: "
-                f"{stats.untrusted_presses}/{stats.presses} presses produced no "
-                f"page turn (over {PAGE_TURN_UNTRUSTED_MAX_FRACTION:.0%}); that "
-                "run is left out of the median"
+                f"page-turn median excludes {label}: "
+                f"{page_turn_exclusion(stats)}"
             )
         if pool.trusted.durations:
             turn_median = statistics.median(pool.trusted.durations)

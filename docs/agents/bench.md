@@ -64,11 +64,12 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
     instead of gating on noise. A `median_press_to_settled_min_ms` floor
     catches an implausibly fast median from the other side.
   - Trust is judged **per capture, before the runs are pooled**. A pooled
-    report names any run whose cadence failed the test and leaves that run
-    out of the median; it does not average it into the others, where a
-    1-turn, 50%-untrusted run disappears behind a clean 20-turn one. If no
-    run is left, the median is suppressed. The `page inputs:` line still
-    counts every press, including the excluded run's.
+    report names every run it left out of the median — one whose cadence
+    failed the test, or one whose presses produced no pairing at all — and
+    does not average it into the others, where a 1-turn, 50%-untrusted run
+    disappears behind a clean 20-turn one. If no run is left, the median is
+    suppressed. The `page inputs:` line still counts every press, including
+    the excluded runs'.
 
   `layout_ms`, `flush_ms`, `busy_ms`, and prestage remain per-render and safe
   to read from any cadence. The history is why this matters: a 354 ms median

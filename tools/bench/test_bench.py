@@ -63,6 +63,24 @@ class BenchParserTests(unittest.TestCase):
         ]
         self.assertEqual(bench.page_turn_durations(events), [424])
 
+    def test_a_failed_sleep_flush_parses_to_one_record(self) -> None:
+        """The firmware prints a human line beside the structured one.
+
+        Parsing both recorded one failure twice, so a single failed flush was
+        reported as two failed sleep phases. The error println stays in the
+        firmware — error paths are unconditional there — so the parser is the
+        side that has to ignore it.
+        """
+        lines = [
+            "display: sleep framebuffer flush failed",
+            "bench: sleep phase=refresh ok=false elapsed_ms=4200 t_ms=61000",
+        ]
+        events = [event for line in lines for event in bench.parse_line(line, "sleep-sync")]
+        self.assertEqual(
+            [(event["event"], event.get("phase"), event.get("ok")) for event in events],
+            [("sleep", "refresh", False)],
+        )
+
     def test_parse_legacy_render(self) -> None:
         event = bench.parse_line(
             "bench: render Reading Fast page=12 ch=5 layout=24ms flush=438ms prestage=16ms t=93958",
@@ -402,7 +420,9 @@ class PageTurnTrustTests(unittest.TestCase):
             self._burst_events(),
             {"page-turn": {"median_press_to_settled_ms": 550}},
         )
-        self.assertTrue(any("untrusted" in warning for warning in warnings))
+        self.assertTrue(
+            any("median excludes" in warning for warning in warnings), warnings
+        )
         self.assertFalse(any("above warning budget" in warning for warning in warnings))
 
     def test_budget_floor_warns_on_suspiciously_fast_median(self) -> None:
@@ -432,7 +452,8 @@ class PageTurnTrustTests(unittest.TestCase):
             )
             bench.summarize_paths([path], None)
         printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
-        self.assertIn("UNTRUSTED", printed)
+        self.assertIn("EXCLUDED", printed)
+        self.assertIn("median suppressed", printed)
         self.assertNotIn("page turn      median=", printed)
         self.assertIn("presses=3 page_turns=1", printed)
         self.assertIn("coalesced=1", printed)
@@ -889,7 +910,13 @@ class TerminalSleepTests(unittest.TestCase):
                 warnings = bench.summarize_paths(
                     [path], bench.DEFAULT_BUDGETS, validate_suites=True
                 )
-        self.assertTrue(warnings, "strict report passed a sleep that never completed")
+        # The specific warning, not merely a non-empty list: any other budget
+        # or coverage complaint would otherwise pass this test for the wrong
+        # reason and leave the sleep gate itself uncovered end to end.
+        self.assertTrue(
+            any("no completed sleep captured" in w for w in warnings),
+            f"strict report passed a sleep that never completed: {warnings}",
+        )
 
     def test_a_completed_sleep_satisfies_the_check(self) -> None:
         events = self.REQUESTED_ONLY + [
@@ -897,6 +924,34 @@ class TerminalSleepTests(unittest.TestCase):
         ]
         warnings = bench.evaluate_suite_signals(events)
         self.assertFalse(any("completed sleep" in w for w in warnings), warnings)
+
+    def test_the_x4_pre_command_marker_is_not_a_completed_sleep(self) -> None:
+        """`display: sleep deep` is printed *before* the deep-sleep command.
+
+        ssd1677 prints it once the power-down handshake returns, and the
+        command after it can still fail. Accepting it let a capture truncated
+        at that line pass `--strict`, and — since the parsed event carries no
+        `t_ms` — latched a boot segment that a later `complete ok=false`
+        could not clear, so a reset was filed as a wake.
+        """
+        parsed = bench.parse_line("display: sleep deep", "sleep-sync")[0]
+        self.assertFalse(bench.is_terminal_sleep(parsed))
+        warnings = bench.evaluate_suite_signals(self.REQUESTED_ONLY + [parsed])
+        self.assertTrue(
+            any("no completed sleep captured" in w for w in warnings), warnings
+        )
+
+    def test_a_reset_after_an_x4_pre_command_marker_is_not_a_wake(self) -> None:
+        run = [
+            {"event": "sleep", "phase": "deep", "legacy": True},
+            {"event": "sleep", "phase": "complete", "ok": False, "t_ms": 44000},
+            {"event": "render", "view": "Reading", "t_ms": 60000},
+            # Uptime restarts: an unexplained reboot, not a wake.
+            {"event": "render", "view": "Home", "t_ms": 3200},
+        ]
+        segments, warnings = bench.boot_segments(run)
+        self.assertEqual([kind for _, kind in segments], ["attach", "reset"])
+        self.assertEqual(len(warnings), 1)
 
     def test_the_x3_panel_marker_counts_for_captures_without_complete(self) -> None:
         """`phase=deep_sleep` is printed after the deep-sleep command lands.
@@ -976,7 +1031,7 @@ class PageTurnTrustPoolTests(unittest.TestCase):
         printed = "\n".join(
             str(call.args[0]) for call in mock_print.call_args_list if call.args
         )
-        self.assertIn("UNTRUSTED in page-turn run 1 of 2", printed)
+        self.assertIn("EXCLUDED page-turn run 1 of 2", printed)
         # A min of 10ms would be the cadence run's sample leaking in.
         self.assertIn("page turn      median=400ms p95=400ms min=400ms", printed)
         # The input accounting still covers every press, including that run's.
@@ -996,11 +1051,56 @@ class PageTurnTrustPoolTests(unittest.TestCase):
             },
         )
         self.assertTrue(
-            any("untrusted in page-turn run 1 of 2" in w for w in warnings), warnings
+            any("excludes page-turn run 1 of 2" in w for w in warnings), warnings
         )
         self.assertFalse(
             any("below plausibility floor" in w for w in warnings), warnings
         )
+
+    def test_a_run_that_paired_nothing_is_named_too(self) -> None:
+        """Presses but no answering render: excluded, so it must be reported.
+
+        `trusted` drops it either way; reporting only the cadence case meant a
+        pooled report printed the healthy run's median with no sign that a
+        whole capture had produced nothing.
+        """
+        stranded = [
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "input", "button": "Next", "t_ms": 2000},
+        ]
+        events = stranded + self.clean_run(20, 400)
+        pool = self._pool(events)
+        self.assertEqual(
+            [label for label, _stats in pool.untrusted], ["page-turn run 1 of 2"]
+        )
+        self.assertEqual(pool.trusted.durations, [400] * 20)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            with patch("builtins.print") as mock_print:
+                bench.summarize_paths([path], None, latest_only=False)
+        printed = "\n".join(
+            str(call.args[0]) for call in mock_print.call_args_list if call.args
+        )
+        self.assertIn(
+            "EXCLUDED page-turn run 1 of 2: 2 presses and no "
+            "input-to-Reading-render sample",
+            printed,
+        )
+
+    def test_a_run_with_no_presses_at_all_is_not_reported(self) -> None:
+        """Nothing was attempted in it, so there is nothing to report."""
+        idle = [
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "refresh", "mode": "Fast", "busy_ms": 410},
+        ]
+        pool = self._pool(idle + self.clean_run(3, 400))
+        self.assertEqual(pool.untrusted, [])
 
     def test_every_run_untrusted_suppresses_the_budget_check(self) -> None:
         warnings = bench.evaluate_budgets(
@@ -1312,6 +1412,44 @@ class BootSegmentTests(unittest.TestCase):
             {"event": "render", "view": "Home", "t_ms": 3200},
         ]
         segments, _ = bench.boot_segments(run)
+        self.assertEqual([kind for _, kind in segments], ["attach", "cold"])
+
+    def test_a_marker_without_the_combined_field_uses_its_two_halves(self) -> None:
+        """`deep_sleep_wake` is `gpio && sleep_image`; older markers say only
+        the halves, and the same rule has to be spelled out from them."""
+        cases = [
+            ({"gpio": True, "sleep_image": True}, "wake"),
+            # Absent rather than false: nothing contradicts the wake pin.
+            ({"gpio": True}, "wake"),
+            ({"gpio": True, "sleep_image": False}, "cold"),
+            ({"gpio": False, "sleep_image": True}, "cold"),
+        ]
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                run = [
+                    {"event": "render", "view": "Reading", "t_ms": 60000},
+                    dict({"event": "boot"}, **fields),
+                    {"event": "render", "view": "Home", "t_ms": 3200},
+                ]
+                segments, _ = bench.boot_segments(run)
+                self.assertEqual([kind for _, kind in segments], ["attach", expected])
+
+    def test_a_marker_with_no_fields_falls_back_to_the_sleep_latch(self) -> None:
+        """Nothing in the line to go on, so a preceding sleep is the evidence."""
+        after_sleep = [
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+            {"event": "boot"},
+            {"event": "render", "view": "Home", "t_ms": 3200},
+        ]
+        segments, _ = bench.boot_segments(after_sleep)
+        self.assertEqual([kind for _, kind in segments], ["attach", "wake"])
+
+        without_sleep = [
+            {"event": "render", "view": "Reading", "t_ms": 60000},
+            {"event": "boot"},
+            {"event": "render", "view": "Home", "t_ms": 3200},
+        ]
+        segments, _ = bench.boot_segments(without_sleep)
         self.assertEqual([kind for _, kind in segments], ["attach", "cold"])
 
     def test_a_reset_after_a_completed_sleep_is_not_a_wake(self) -> None:
