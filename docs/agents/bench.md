@@ -78,6 +78,12 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   failure this harness exists to stop. Either capture the missing telemetry
   or delete the key. Only a section whose suite the log contains is checked,
   so a page-turn capture is never faulted for holding no storage telemetry.
+- **Budgets measure only their own suites.** A section is checked against the
+  suites that exercise it (`reader-soak` and `thermal-run` turn pages, so
+  they answer to the page-turn budgets) and against nothing else, so pooling
+  a file with `--all` cannot let one suite's samples decide another's
+  verdict. A labelled suite no section claims is reported rather than passed
+  over silently.
 - **Budgets need Python ≥ 3.11**, or the optional `tomli` package. macOS
   system `python3` is 3.9, where `tomllib` does not exist. `--strict` now
   refuses to run without a parser rather than passing everything silently;

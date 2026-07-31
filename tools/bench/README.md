@@ -64,12 +64,18 @@ that silently checks nothing is how a 16.7x budget overrun once passed clean.
 Non-strict reports print a warning when budgets could not be loaded.
 
 The `page turn` statistic is guarded against operator cadence: the report
-prints a `page inputs:` line (presses / matched / unmatched), suppresses the
-median when more than 10% of presses went unrendered (burst pressing strands
-presses in the FIFO pairing and charges later renders to stale presses), and
-budgets give the median a plausibility floor as well as a ceiling. The report
-also warns when `t_ms` goes backwards without a completed deep sleep — an
-unexplained mid-capture reset interleaves two boot time bases.
+prints a `page inputs:` line accounting for every press (`presses`,
+`page_turns`, `nav`, `coalesced`, `unmatched`, `reading_renders`), suppresses
+the median when more than 10% of presses produced no page turn, and budgets
+give the median a plausibility floor as well as a ceiling. Each press is
+credited to the first render whose request was *frozen* after it — `req_ms`,
+stamped by the app as the reader state stops being able to change — so a
+press landing while a render is already in flight waits for the next frame
+instead of being charged the remainder of this one, and presses the app
+coalesced into one frame are reported as `coalesced` rather than each given a
+duration of their own. The report also warns when `t_ms` goes backwards
+without a completed deep sleep — an unexplained mid-capture reset interleaves
+two boot time bases.
 
 `report` additionally summarizes cache-build telemetry (`storage build` with
 its spine/write split and read/write block totals, `first page`, `bg build`)

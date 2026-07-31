@@ -28,6 +28,17 @@ case "$COMMAND" in
         
         echo "Running firmware clippy for X3..."
         tools/cargo.sh clippy -p fw --features device-x3 -- -D warnings
+
+        # The shipped untethered build: `serial-log` off, so every bench_log!
+        # takes its disabled expansion. That path is invisible to both runs
+        # above, and a telemetry line that only compiles with the chatter on
+        # is a build break nobody sees until release day. Both devices,
+        # because the two panel drivers carry their own bench_log! sites.
+        echo "Running firmware clippy with serial-log disabled for X4..."
+        tools/cargo.sh clippy -p fw --no-default-features -- -D warnings
+
+        echo "Running firmware clippy with serial-log disabled for X3..."
+        tools/cargo.sh clippy -p fw --no-default-features --features device-x3 -- -D warnings
         ;;
     test-host)
         echo "Running host tests..."
@@ -116,7 +127,7 @@ case "$COMMAND" in
         "$0" firmware
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|golden-frames|test-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|golden-frames|test-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
         echo "  'all' runs all required root/firmware verification."
         exit 1
         ;;

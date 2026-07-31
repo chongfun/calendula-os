@@ -19,13 +19,22 @@ macro_rules! bench_log {
     ($($arg:tt)*) => { esp_println::println!($($arg)*) };
 }
 
-// Same shape as reader-cache's cache_log!: a no-op at runtime, but the
-// tokens still go through `core::format_args!`, so a wrong placeholder count
-// or a non-Display argument fails the build in both feature states rather
-// than only when the chatter is compiled in.
+// Same type-checking trick as reader-cache's cache_log!: the tokens still go
+// through `core::format_args!`, so a wrong placeholder count or a non-Display
+// argument fails the build in both feature states rather than only when the
+// chatter is compiled in.
+//
+// The `if false` is what makes "no-op" true. Call sites pass expressions --
+// `Instant::now()`, `.elapsed()`, an SD read -- and `format_args!` borrows
+// its operands, so evaluating it evaluates them: without the dead branch a
+// telemetry-free build still pays for every timer read behind a line it
+// never prints. A `false` condition is folded away before codegen while the
+// body is still type-checked.
 #[cfg(not(feature = "serial-log"))]
 macro_rules! bench_log {
     ($($arg:tt)*) => {{
-        let _ = core::format_args!($($arg)*);
+        if false {
+            let _ = core::format_args!($($arg)*);
+        }
     }};
 }

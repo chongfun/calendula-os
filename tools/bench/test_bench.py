@@ -499,8 +499,10 @@ class PageTurnEpochTests(unittest.TestCase):
 class RenderBeginTests(unittest.TestCase):
     """`req_ms` is the boundary; the subtraction is only a fallback.
 
-    The firmware stamps `req_ms` as it dequeues the render command, before any
-    preparation. Inferring the start as `t_ms - layout_ms - flush_ms` omits
+    The app stamps `req_ms` as it freezes the request, which is when the state
+    the frame shows stopped being able to change; the firmware's dequeue of
+    that request is the separate, later `deq_ms`, reported but never paired
+    on. Inferring the start as `t_ms - layout_ms - flush_ms` omits
     the work outside those two intervals — catalog and TOC reads ahead of
     layout, and after the flush a framebuffer copy plus a chapter-tracking
     read that touches the card at chapter boundaries. Every omission pushes
@@ -636,6 +638,100 @@ class BudgetCoverageTests(unittest.TestCase):
             },
         )
         self.assertFalse(any("catalog_load_warn_ms" in w for w in warnings), warnings)
+
+    def test_a_workflow_suite_is_gated_by_the_budgets_it_exercises(self) -> None:
+        """`reader-soak` turns pages, so the page-turn budgets apply to it.
+
+        Sections are named after the suite that owns them, but resolving the
+        name literally left every reader-soak and thermal-run capture with no
+        section in play and therefore nothing enforced.
+        """
+        events = [
+            {"event": "run_start", "suite": "reader-soak"},
+            {"event": "refresh", "mode": "Fast", "busy_ms": 900},
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"fast_refresh_busy_warn_ms": 500}},
+        )
+        self.assertTrue(
+            any("Fast refresh busy" in w and "above warning budget" in w for w in warnings),
+            warnings,
+        )
+
+
+class BudgetSuiteIsolationTests(unittest.TestCase):
+    """Pooled runs (`--all`) must not decide each other's verdicts."""
+
+    def test_another_suites_page_turns_do_not_move_the_median(self) -> None:
+        events = [
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1400, "req_ms": 1000},
+            {"event": "input", "button": "Next", "t_ms": 2000},
+            {"event": "render", "view": "Reading", "t_ms": 2400, "req_ms": 2000},
+            # A sleep-sync run in the same file: its turns straddle the idle
+            # timeout and the wake, so pooling them puts the page-turn median
+            # at 2200 ms and fails a suite that was well inside its budget.
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 5000, "req_ms": 1000},
+            {"event": "input", "button": "Next", "t_ms": 6000},
+            {"event": "render", "view": "Reading", "t_ms": 10000, "req_ms": 6000},
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"median_press_to_settled_ms": 550}},
+        )
+        self.assertFalse(any("page-turn median" in w for w in warnings), warnings)
+
+    def test_another_suites_storage_samples_do_not_fail_the_catalog_budget(self) -> None:
+        events = [
+            {"event": "run_start", "suite": "storage-cache"},
+            {
+                "event": "storage_catalog",
+                "action": "load",
+                "elapsed_ms": 100,
+            },
+            {"event": "run_start", "suite": "reader-soak"},
+            # A cold catalog read inside a soak: real, but not what the
+            # storage-cache budget describes.
+            {
+                "event": "storage_catalog",
+                "action": "load",
+                "elapsed_ms": 4000,
+            },
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"storage-cache": {"catalog_load_warn_ms": 500}},
+        )
+        self.assertFalse(any("catalog load" in w for w in warnings), warnings)
+
+    def test_a_suite_no_budget_section_claims_is_reported(self) -> None:
+        events = [
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "refresh", "mode": "Full", "busy_ms": 3500},
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"fast_refresh_busy_warn_ms": 500}},
+        )
+        self.assertTrue(
+            any("sleep-sync has no budget section" in w for w in warnings), warnings
+        )
+
+    def test_an_unlabelled_log_still_measures_everything(self) -> None:
+        """Hand-built fixtures and captures predating suite tagging."""
+        events = [
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 2000, "req_ms": 1000},
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"median_press_to_settled_ms": 550}},
+        )
+        self.assertTrue(any("page-turn median" in w for w in warnings), warnings)
 
 
 class StorageBuildReportTests(unittest.TestCase):
@@ -774,7 +870,29 @@ class BootSegmentTests(unittest.TestCase):
         """
         run = [
             {"event": "render", "view": "Reading", "t_ms": 60000},
-            {"event": "boot", "deep_sleep_wake": True, "gpio": True, "sleep_image": False},
+            {"event": "boot", "deep_sleep_wake": False, "gpio": True, "sleep_image": False},
+            {"event": "render", "view": "Home", "t_ms": 3200},
+        ]
+        segments, _ = bench.boot_segments(run)
+        self.assertEqual([kind for _, kind in segments], ["attach", "cold"])
+
+    def test_a_reset_after_a_completed_sleep_is_not_a_wake(self) -> None:
+        """The boot marker's own verdict outranks the preceding sleep.
+
+        A device that browns out or resets instead of waking through the
+        Power button prints `deep_sleep_wake=false` (no GPIO wake cause),
+        and it pays the full cold waveform. Reading the earlier successful
+        sleep as proof of a wake filed that boot in the fast cluster and
+        pulled its median up with a cold sample.
+        """
+        run = [
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+            {
+                "event": "boot",
+                "deep_sleep_wake": False,
+                "gpio": False,
+                "sleep_image": True,
+            },
             {"event": "render", "view": "Home", "t_ms": 3200},
         ]
         segments, _ = bench.boot_segments(run)

@@ -719,6 +719,18 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                 // it false so that boot falls back to the full waveform.
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
                 if panel_slept {
+                    // Emitted before the acknowledgement, not after the park:
+                    // `DisplayAsleep` releases the power task to cut power, and
+                    // deep sleep is terminal, so a line printed past that point
+                    // only ever reaches the capture on an abandoned handshake.
+                    // That left `phase=complete ok=true` absent from every
+                    // successful sleep — the marker `sleep-sync` counts cycles
+                    // by and the report reads as a terminal sleep.
+                    bench_log!(
+                        "bench: sleep phase=complete ok=true elapsed_ms={} t_ms={}",
+                        sleep_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                     send_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
                     park_until_resumed(generation).await;
@@ -735,13 +747,14 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     esp_println::println!("display: sleep transition failed");
                     send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
+                    // The failing path stays awake, so this one can be stamped
+                    // where the phase actually ends.
+                    bench_log!(
+                        "bench: sleep phase=complete ok=false elapsed_ms={} t_ms={}",
+                        sleep_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                 }
-                bench_log!(
-                    "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",
-                    panel_slept,
-                    sleep_start.elapsed().as_millis(),
-                    Instant::now().as_millis(),
-                );
             }
             Either5::Second(command) => match loop_arm(&command, sync_session) {
                 // The display task is the upload writer until Sleep or

@@ -921,8 +921,10 @@ def render_begin_ms(event: dict[str, Any]) -> int:
     """When the reader state this render displays stopped being able to change.
 
     A press later than this cannot be reflected in the frame, so it must not
-    be credited to it. `req_ms` is that boundary, stamped by the firmware as
-    it dequeues the render command and before any preparation.
+    be credited to it. `req_ms` is that boundary, stamped by the app as it
+    freezes the request. `deq_ms`, when present, is the later instant the
+    display task dequeued that request; it is reported for diagnosis and
+    never used for pairing.
 
     Older captures have no `req_ms` and fall back to `t_ms - layout_ms -
     flush_ms`. That estimate is deliberately *not* trusted where the real
@@ -1091,10 +1093,10 @@ def boot_segments(
     Returns ``([(segment, kind)], warnings)``. The leading segment's kind is
     "attach" (capture joined an already-running device; its t_ms values do
     not date from a witnessed boot). Later segments start at a reboot:
-    "wake" when a completed deep sleep preceded it or a parsed boot marker
-    says the wake pin fired, "cold" when a boot marker says it did not, and
-    "reset" for a bare t_ms regression - an unexplained reboot, which is
-    also returned as a warning.
+    "wake" when the boot marker reports a real deep-sleep wake (or, with no
+    marker at all, a completed deep sleep preceded it), "cold" when the
+    marker says otherwise, and "reset" for a bare t_ms regression - an
+    unexplained reboot, which is also returned as a warning.
     """
     segments: list[list[Any]] = [[[], "attach"]]
     warnings: list[str] = []
@@ -1104,14 +1106,28 @@ def boot_segments(
     for event in run:
         name = str(event.get("event", ""))
         if name == "boot":
-            # Explicit marker line: the first print of a new boot. A wake pin
-            # that fired is only half the story — a wake whose sleep image was
-            # not retained pays the full waveform, so its first paint belongs
-            # with the cold cluster, not the fast one.
-            if slept or event.get("gpio") is True:
-                boot_kind = "cold" if event.get("sleep_image") is False else "wake"
+            # Explicit marker line: the first print of a new boot. The
+            # firmware already decided this — `deep_sleep_wake` is
+            # `gpio && sleep_image`, because a wake pin that fired is only
+            # half the story: a wake whose sleep image was not retained pays
+            # the full waveform, so its first paint belongs with the cold
+            # cluster. Take that verdict as given. A preceding sleep must not
+            # overrule it: a device that browns out or resets after a
+            # completed sleep reports false here, and reading it as a wake
+            # files a full cold boot in the fast cluster. The heuristic is
+            # kept only for markers too old to carry the fields.
+            wake = event.get("deep_sleep_wake")
+            gpio = event.get("gpio")
+            if not isinstance(wake, bool) and isinstance(gpio, bool):
+                # A marker printed before the combined field existed: the
+                # same rule, spelled out from its two halves.
+                wake = gpio and event.get("sleep_image") is not False
+            if isinstance(wake, bool):
+                boot_kind = "wake" if wake else "cold"
             else:
-                boot_kind = "cold"
+                # No marker fields at all — only then is a preceding sleep
+                # the best evidence available.
+                boot_kind = "wake" if slept else "cold"
             if segments[-1][0]:
                 segments.append([[], boot_kind])
             else:
@@ -1225,12 +1241,12 @@ def load_budgets(path: Path | None) -> tuple[dict[str, Any], str | None]:
 
 
 def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> list[str]:
-    warnings: list[str] = []
-    in_play = budget_sections_in_play(events, budgets)
+    in_play, warnings = budget_sections_in_play(events, budgets)
     page_turn = budgets.get("page-turn", {})
     if page_turn and "page-turn" in in_play:
-        render_events = [event for event in events if event.get("event") == "render"]
-        turn_stats = page_turn_stats_over_epochs(events)
+        scoped = section_events(events, "page-turn")
+        render_events = [event for event in scoped if event.get("event") == "render"]
+        turn_stats = page_turn_stats_over_epochs(scoped)
         if turn_stats.durations and not turn_stats.median_trusted:
             # A gate over a cadence artifact is worse than no gate: refuse
             # to compare the median rather than pass or fail on noise.
@@ -1274,7 +1290,7 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             warnings, "page-turn", page_turn, "reading_layout_warn_ms",
             len(reading_layout), "Reading renders",
         )
-        prestage = prestage_values(events)
+        prestage = prestage_values(scoped)
         warn_if_above(
             warnings,
             "prestage p95",
@@ -1287,7 +1303,7 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         )
         fast_busy = [
             int(event["busy_ms"])
-            for event in events
+            for event in scoped
             if event.get("event") == "refresh"
             and event.get("mode") == "Fast"
             and isinstance(event.get("busy_ms"), int)
@@ -1305,9 +1321,10 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
 
     sleep_sync = budgets.get("sleep-sync", {})
     if sleep_sync and "sleep-sync" in in_play:
+        scoped = section_events(events, "sleep-sync")
         full_busy = [
             int(event["busy_ms"])
-            for event in events
+            for event in scoped
             if event.get("event") == "refresh"
             and event.get("mode") == "Full"
             and isinstance(event.get("busy_ms"), int)
@@ -1321,7 +1338,7 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
                 warnings.append(f"Full refresh busy {busy}ms above budget ceiling {max_ms}ms")
         failed_sleeps = [
             event
-            for event in events
+            for event in scoped
             if event.get("event") == "sleep" and event.get("ok") is False
         ]
         if failed_sleeps:
@@ -1333,8 +1350,9 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             )
     storage_cache = budgets.get("storage-cache", {})
     if storage_cache and "storage-cache" in in_play:
+        scoped = section_events(events, "storage-cache")
         storage_open = values(
-            [event for event in events if event.get("event") == "storage_open"],
+            [event for event in scoped if event.get("event") == "storage_open"],
             "elapsed_ms",
         )
         warn_if_above(
@@ -1350,7 +1368,7 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         catalog_load = values(
             [
                 event
-                for event in events
+                for event in scoped
                 if event.get("event") == "storage_catalog" and event.get("action") == "load"
             ],
             "elapsed_ms",
@@ -1444,8 +1462,68 @@ def warn_if_unobserved(
     )
 
 
-def budget_sections_in_play(events: list[dict[str, Any]], budgets: dict[str, Any]) -> set[str]:
-    """Budget sections whose suite this log actually contains.
+# Which capture suites produce the measurements each budget section gates.
+# A section is named after the suite that owns it, but a workflow suite
+# exercises more than one path: `reader-soak` is page turns plus navigation,
+# and `thermal-run` is one of the other workflows run under ambient load —
+# both of its choices turn pages first, so both feed the page-turn section.
+# Nothing else is folded in: `reader-soak` sleeps once and `thermal-run` may
+# not sleep at all, so pointing them at `sleep-sync` would fault a healthy
+# capture for a Full refresh it never owed. The map is also the isolation
+# boundary — a section measures only the suites listed for it, so pooling
+# with `--all` cannot let one suite's samples decide another's verdict.
+BUDGET_SECTION_SUITES: dict[str, set[str]] = {
+    "page-turn": {"page-turn", "reader-soak", "thermal-run"},
+    "sleep-sync": {"sleep-sync"},
+    "storage-cache": {"storage-cache"},
+}
+
+
+def suite_labels(events: list[dict[str, Any]]) -> list[str | None]:
+    """The capturing suite for each event, positionally.
+
+    An event parsed by this harness carries its own `suite`, but the label is
+    really a property of the run: hand-built fixtures and older captures put
+    it only on `run_start`. An unlabelled event therefore inherits its run's
+    label rather than being dropped from every section.
+    """
+    labels: list[str | None] = []
+    for run in split_runs(events):
+        run_suite = next(
+            (str(event["suite"]) for event in run if isinstance(event.get("suite"), str)),
+            None,
+        )
+        for event in run:
+            suite = event.get("suite")
+            labels.append(str(suite) if isinstance(suite, str) else run_suite)
+    return labels
+
+
+def section_events(events: list[dict[str, Any]], section: str) -> list[dict[str, Any]]:
+    """The events a budget section is allowed to measure.
+
+    Choosing *which* sections to evaluate was never enough: the measurements
+    themselves were taken from the whole pooled log, so a file holding a
+    `page-turn` run next to a `storage-cache` or `sleep-sync` one had its
+    strict verdict decided partly by samples from a suite that budget does
+    not describe — a false pass or a false failure, either way from the wrong
+    population. Capture order is preserved, `run_start` markers included, so
+    the per-run and per-boot splitting downstream still works.
+
+    A log with no suite label anywhere keeps the old behaviour of measuring
+    everything: there is nothing better to go on.
+    """
+    suites = BUDGET_SECTION_SUITES.get(section, {section})
+    labels = suite_labels(events)
+    if all(label is None for label in labels):
+        return events
+    return [event for label, event in zip(labels, events) if label in suites]
+
+
+def budget_sections_in_play(
+    events: list[dict[str, Any]], budgets: dict[str, Any]
+) -> tuple[set[str], list[str]]:
+    """Budget sections whose suite this log actually contains, plus warnings.
 
     Every section used to be evaluated against every log, which was harmless
     while an absent metric silently skipped its check and is not once that
@@ -1453,13 +1531,30 @@ def budget_sections_in_play(events: list[dict[str, Any]], budgets: dict[str, Any
     hand-built fixtures, and any capture predating suite tagging — keep the
     old behaviour of evaluating everything, since there is nothing better to
     go on.
+
+    A known suite that no configured section claims is reported rather than
+    passed over: it means a capture ran and nothing gated it, which is the
+    silently-unenforced shape this file exists to prevent.
     """
-    labelled = {
-        str(event["suite"]) for event in events if isinstance(event.get("suite"), str)
-    }
+    if not budgets:
+        # Budgets deliberately disabled, or unloadable — reported elsewhere.
+        return set(), []
+    labelled = {label for label in suite_labels(events) if label is not None}
     if not labelled:
-        return set(budgets)
-    return {name for name in budgets if name in labelled}
+        return set(budgets), []
+    sections = {
+        name
+        for name in budgets
+        if labelled & BUDGET_SECTION_SUITES.get(name, {name})
+    }
+    warnings = [
+        f"suite {suite} has no budget section to check it against"
+        for suite in sorted(labelled & set(SUITES))
+        if not any(
+            suite in BUDGET_SECTION_SUITES.get(section, {section}) for section in budgets
+        )
+    ]
+    return sections, warnings
 
 
 def warn_if_above(
