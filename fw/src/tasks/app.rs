@@ -6,8 +6,8 @@ use crate::{
 };
 use app_core::{
     extend_section_command, library_action_command_for_transition, storage_command_for_transition,
-    AppView, BookOpenRollback, ParkedStorage, ReaderState, ReducerContext, SleepBlockers,
-    SleepGate, StorageDispatch, SyncStatus,
+    AppView, BookOpenRollback, ParkedStorage, ReaderState, ReducerContext, RepaintRetry,
+    SleepBlockers, SleepGate, StorageDispatch, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select, select4, Either, Either4};
@@ -42,6 +42,9 @@ pub async fn run() {
     let mut open_rollback: Option<BookOpenRollback> = None;
     // A Power press arriving while the app still owes the storage task work.
     let mut sleep_gate = SleepGate::new();
+    // The one repaint a failed panel transition is owed, so the reader is not
+    // left looking at the page before the one the app has already moved to.
+    let mut repaint_retry = RepaintRetry::new();
     let mut suppress_input_until_open_settled = false;
     let mut block_confirm_until: Option<Instant> = None;
     // Defer the first paint. ReaderState::boot() defaults to the built-in guide
@@ -291,6 +294,9 @@ pub async fn run() {
                         state = state.apply_chapter_cursor(cursor);
                     }
                     rendering = false;
+                    // The panel took a frame, so a later failure is a fresh one
+                    // and gets its own retry.
+                    repaint_retry.settled();
                     if !catalog_refresh_requested {
                         catalog_refresh_requested = true;
                         if STORAGE_COMMANDS
@@ -310,7 +316,11 @@ pub async fn run() {
                         send_render(RenderKind::Page, &state).await;
                         rendering = true;
                         render_pending = false;
-                    } else if suppress_input_until_open_settled && opening_book.is_none() {
+                    } else if app_core::open_gate_may_lift(
+                        suppress_input_until_open_settled,
+                        opening_book.is_some(),
+                        false,
+                    ) {
                         suppress_input_until_open_settled = false;
                         block_confirm_until = Some(
                             Instant::now() + Duration::from_millis(POST_OPEN_CONFIRM_BLOCK_MS),
@@ -351,10 +361,11 @@ pub async fn run() {
                 }
                 DisplayEvent::RefreshFailed => {
                     // The frame never reached the panel. Clear the render
-                    // lock so the next input re-renders instead of queueing
-                    // behind an acknowledgement that will never arrive, but
-                    // drop the coalesced pending render: it described a
-                    // frame for a panel state that no longer holds.
+                    // lock so the repaint below is not queued behind an
+                    // acknowledgement that will never arrive, and drop the
+                    // coalesced pending render: it described a frame for a
+                    // panel state that no longer holds, and the repaint draws
+                    // current state anyway, which is at least as fresh.
                     esp_println::println!("app: display refresh failed");
                     rendering = false;
                     render_pending = false;
@@ -369,19 +380,45 @@ pub async fn run() {
                         &mut suppress_input_until_open_settled,
                     )
                     .await;
-                    // Loaded may already have cleared opening_book before
-                    // this failure discarded its render; without Settled
-                    // ever arriving, the suppression flag must be released
-                    // here or input stays ignored for good.
-                    if suppress_input_until_open_settled && opening_book.is_none() {
+                    // The panel is showing the page before the one the app is
+                    // on -- or half of it -- and nothing else will correct
+                    // that: the reader's next press would advance the page
+                    // again and render *that*, so the frame they never saw
+                    // reads as a page the device skipped. Storage used to
+                    // paper over this by accident, because a page turn's
+                    // extend answered with Loaded just behind the failure and
+                    // any Loaded repaints; the RAM-hit turn no longer sends
+                    // one. Ask for the repaint instead of depending on it, and
+                    // spend it at most once per settled frame (RepaintRetry).
+                    //
+                    // Ordered exactly as the Settled arm: a render going out
+                    // now leaves the open suppression for that render's own
+                    // acknowledgement to lift, and only a cycle that ends here
+                    // for good lifts it here.
+                    if repaint_retry.failed() {
+                        send_render(RenderKind::Page, &state).await;
+                        rendering = true;
+                    } else if app_core::open_gate_may_lift(
+                        suppress_input_until_open_settled,
+                        opening_book.is_some(),
+                        false,
+                    ) {
+                        // Loaded may already have cleared opening_book before
+                        // this failure discarded its render; without Settled
+                        // ever arriving, the suppression flag must be released
+                        // here or input stays ignored for good.
                         suppress_input_until_open_settled = false;
                         block_confirm_until = Some(
                             Instant::now() + Duration::from_millis(POST_OPEN_CONFIRM_BLOCK_MS),
                         );
                     }
-                    // After the flag, as in Settled: the repaint this press was
-                    // waiting on is not coming, so honour it now rather than
-                    // stranding it until the idle timer.
+                    // After the flag, as in Settled. A retry still in flight
+                    // holds a deferred press only when an open is riding on it
+                    // -- that is the frame the press must not overtake. A plain
+                    // failed page turn releases, and the retry is already ahead
+                    // of the Sleep command in the display queue, so the sleep
+                    // screen is drawn from the repaired frame rather than the
+                    // torn one.
                     release_deferred_sleep(
                         &mut sleep_gate,
                         opening_book,
@@ -399,6 +436,15 @@ pub async fn run() {
                         boot_render_pending,
                         &event,
                     ) {
+                        lift_settled_open_gate(
+                            rendering,
+                            opening_book,
+                            &mut suppress_input_until_open_settled,
+                            &mut block_confirm_until,
+                            &mut sleep_gate,
+                            &pending_storage,
+                        )
+                        .await;
                         continue;
                     }
                     if rendering {
@@ -419,6 +465,15 @@ pub async fn run() {
                     boot_render_pending,
                     &event,
                 ) {
+                    lift_settled_open_gate(
+                        rendering,
+                        opening_book,
+                        &mut suppress_input_until_open_settled,
+                        &mut block_confirm_until,
+                        &mut sleep_gate,
+                        &pending_storage,
+                    )
+                    .await;
                     continue;
                 }
                 if rendering {
@@ -492,16 +547,25 @@ fn fold_library_event(
             *open_rollback = None;
         }
     }
+    // Folded first, and unconditionally: `Loaded` carries the navigation bounds
+    // the reducer clamps against, and a fold skipped to save a refresh is a
+    // bound left stale (see `loaded_repaints`). The repaint is then decided by
+    // comparing what the fold actually moved.
+    let folded = state.apply_library_event(ctx, *event);
     let should_render = if boot_render_pending {
         library_event_allows_first_render(event)
     } else {
-        library_event_affects_view(state, event)
+        library_event_affects_view(state, &folded, event)
     };
-    *state = state.apply_library_event(ctx, *event);
+    *state = folded;
     should_render
 }
 
-fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) -> bool {
+fn library_event_affects_view(
+    state: &ReaderState,
+    folded: &ReaderState,
+    event: &crate::LibraryEvent,
+) -> bool {
     match *event {
         // A scan replaces the catalog wholesale. Even at an unchanged count
         // the rows may have been reordered, and the reducer acts on that:
@@ -524,7 +588,16 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
             current_chapter: _,
             chapter_pages: _,
             position: _,
-        } => state.book_id == book_id,
+            text_replaced,
+        } => {
+            state.book_id == book_id
+                && app_core::loaded_repaints(
+                    state.view == AppView::Reading,
+                    text_replaced,
+                    folded.page != state.page,
+                    folded.chapter != state.chapter,
+                )
+        }
         // Handled before the reducer; never reaches here.
         crate::LibraryEvent::BookOpenFailed { .. } => true,
         crate::LibraryEvent::ChapterPage {
@@ -577,11 +650,53 @@ fn dispatch_storage(parked: &mut ParkedStorage, command: StorageCommand) -> Stor
     outcome
 }
 
+/// Lifts the open's input gate on an event that owed no repaint.
+///
+/// The gate is normally lifted where a display cycle ends, because for an open
+/// that repaints the cycle *is* the open landing on the panel. An open answered
+/// out of the resident section window at the page the reader was already on
+/// moves nothing on screen, so `loaded_repaints` sends no render and no cycle
+/// ends — and this event is the last thing that open produces. Left here, the
+/// gate never opens again: input ignored, sleep deferred, until the battery
+/// goes.
+///
+/// A frame still in flight is left alone: its own acknowledgement lifts the
+/// gate, and it is the frame a deferred press must not overtake.
+async fn lift_settled_open_gate(
+    rendering: bool,
+    opening_book: Option<u32>,
+    suppress_input_until_open_settled: &mut bool,
+    block_confirm_until: &mut Option<Instant>,
+    sleep_gate: &mut SleepGate,
+    parked: &ParkedStorage,
+) {
+    if !app_core::open_gate_may_lift(
+        *suppress_input_until_open_settled,
+        opening_book.is_some(),
+        rendering,
+    ) {
+        return;
+    }
+    *suppress_input_until_open_settled = false;
+    // The same debounce the acknowledgement path applies: the press that opened
+    // the book must not carry through into the page now on screen.
+    *block_confirm_until = Some(Instant::now() + Duration::from_millis(POST_OPEN_CONFIRM_BLOCK_MS));
+    // After the flag, as everywhere else, so the blockers it feeds are current.
+    release_deferred_sleep(
+        sleep_gate,
+        opening_book,
+        parked,
+        *suppress_input_until_open_settled,
+    )
+    .await;
+}
+
 /// Sends a Power press that was held back, once the app owes nothing — neither
 /// storage work nor the frame that resolves an open.
 ///
-/// Called only from the two points that end a display cycle, and in both of
-/// them *after* the open suppression is lifted, so the press cannot overtake
+/// Called from the two points that end a display cycle and from
+/// [`lift_settled_open_gate`], which is the case where no cycle ends. In all
+/// three *after* the open suppression is lifted, so the press cannot overtake
 /// the frame it is waiting for.
 async fn release_deferred_sleep(
     gate: &mut SleepGate,

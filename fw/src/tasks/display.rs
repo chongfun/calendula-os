@@ -324,6 +324,10 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                         current_chapter: sd_library.current_chapter(),
                         chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
                         position: None,
+                        // The step reloaded the reader's section on its way
+                        // out, and this announce is only reached when the
+                        // repaint is the point of it (`background_announce`).
+                        text_replaced: true,
                     });
                 }
             }
@@ -1396,6 +1400,18 @@ fn handle_storage_command(
                         open.pointer_stored(stored);
                     }
                     OpenAction::Announce { book_id, position } => {
+                        // The one thing only this task knows: whether the load
+                        // put different text under the reader. `None` means no
+                        // section load was reached at all (a refused
+                        // transaction), which is not a RAM hit; only a
+                        // confirmed one read nothing from the card.
+                        //
+                        // Sent unconditionally. The app clamps navigation
+                        // against the counts in here and clears its open lock
+                        // on the event itself, so withholding it is never a
+                        // saved refresh — it decides the repaint for itself in
+                        // `loaded_repaints`.
+                        let text_replaced = !matches!(section_loaded, Some(true));
                         send_loaded_library_event(&LibraryEvent::Loaded {
                             book_id,
                             pages: sd_library.advertised_page_count(),
@@ -1403,6 +1419,7 @@ fn handle_storage_command(
                             current_chapter: sd_library.current_chapter(),
                             chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
                             position,
+                            text_replaced,
                         });
                         open.announced();
                     }
@@ -1466,6 +1483,9 @@ fn handle_storage_command(
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
                 position: None,
+                // The full list replaced the reading section in the buffer,
+                // and the overview is holding its frame for this event.
+                text_replaced: true,
             });
         }
         StorageCommand::JumpChapter {
@@ -1514,6 +1534,8 @@ fn handle_storage_command(
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
                 position: Some(target_page as u32),
+                // A jump lands the reader on another chapter's text.
+                text_replaced: true,
             });
         }
         StorageCommand::ReceiveUpload => {

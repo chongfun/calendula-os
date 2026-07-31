@@ -303,6 +303,9 @@ impl WebEmulator {
             // The browser build restores position from localStorage through
             // its own path, so a load never relocates the reader.
             position: None,
+            // Only called where the browser build has just made a book's text
+            // resident; it folds the event directly and always redraws.
+            text_replaced: true,
         };
         self.state = self.state.apply_library_event(self.ctx, event);
     }
