@@ -595,7 +595,6 @@ fn library_event_affects_view(
                     state.view == AppView::Reading,
                     text_replaced,
                     folded.page != state.page,
-                    folded.chapter != state.chapter,
                 )
         }
         // Handled before the reducer; never reaches here.

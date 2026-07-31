@@ -667,9 +667,19 @@ impl SleepGate {
 /// The second is redundant when the event moves nothing the reader can see. In
 /// Reading that is a short list, because the page counter is chapter-relative
 /// and drawn from the storage task's own store at render time, not from the
-/// numbers in here: the text, the page, and the chapter. `pages`, `chapters` and
-/// `chapter_pages` are navigation bounds — the reducer clamps against them and
-/// the chapter overview lists them, and it reloads that list on entry.
+/// numbers in here: the text and the page. `pages`, `chapters`, `chapter_pages`
+/// and `current_chapter` are navigation bounds and persistence state — the
+/// reducer clamps against them and the chapter overview lists them, and it
+/// reloads that list on entry.
+///
+/// `chapter` is not a visible input to the SD Reading compositor. The firmware
+/// selects the body using `request.page`, and the footer derives its
+/// chapter-relative counter from `sd_library.chapter_page_position(request.page)`;
+/// the SD path bypasses the generic UI model entirely. The
+/// [`ReaderState::apply_chapter_cursor`] contract says the same thing:
+/// correcting `ReaderState::chapter` is silent because Reading does not display
+/// that value. Home, the sleep screen, Chapters, and the persisted position
+/// pick the corrected value up when next used.
 ///
 /// The event is *always folded*, and that is the load-bearing half. The
 /// background index walk raises the store's page count as it goes and stays
@@ -685,13 +695,8 @@ impl SleepGate {
 /// and the other views draw enough of the store (Home's colophon, the chapter
 /// overview) that the cost of reasoning about each is worth more than the
 /// refresh it would save.
-pub const fn loaded_repaints(
-    reading: bool,
-    text_replaced: bool,
-    page_moved: bool,
-    chapter_moved: bool,
-) -> bool {
-    !reading || text_replaced || page_moved || chapter_moved
+pub const fn loaded_repaints(reading: bool, text_replaced: bool, page_moved: bool) -> bool {
+    !reading || text_replaced || page_moved
 }
 
 /// Whether the input gate an open took may be lifted now.
@@ -3075,7 +3080,6 @@ mod tests {
                 state.view == AppView::Reading,
                 false,
                 folded.page != state.page,
-                folded.chapter != state.chapter,
             ),
             "nothing the reader can see changed"
         );
@@ -3086,22 +3090,30 @@ mod tests {
     /// spanning two cache sections reports the same chapter from both halves.
     #[test]
     fn a_section_read_from_the_card_always_repaints() {
-        assert!(loaded_repaints(true, true, false, false));
+        assert!(loaded_repaints(true, true, false));
     }
 
-    /// A landing position the storage task resolved moves the reader, and a
-    /// chapter crossing moves the colophon; both are on screen.
+    /// A landing position the storage task resolved moves the reader; that is
+    /// on screen.
     #[test]
-    fn a_load_that_moves_the_reader_repaints() {
-        assert!(loaded_repaints(true, false, true, false));
-        assert!(loaded_repaints(true, false, false, true));
+    fn a_load_that_moves_the_page_repaints() {
+        assert!(loaded_repaints(true, false, true));
+    }
+
+    /// A chapter-only correction is invisible in Reading — the compositor
+    /// derives its chapter-relative counter from the store, not from
+    /// `ReaderState::chapter` — so it owes no refresh. The corrected chapter
+    /// is still folded for persistence, Home, sleep, and the chapter list.
+    #[test]
+    fn a_chapter_only_correction_does_not_repaint() {
+        assert!(!loaded_repaints(true, false, false));
     }
 
     /// Outside Reading the saving is not claimed: the other views draw enough of
     /// the store that reasoning about each costs more than the refresh saves.
     #[test]
     fn a_load_outside_reading_always_repaints() {
-        assert!(loaded_repaints(false, false, false, false));
+        assert!(loaded_repaints(false, false, false));
     }
 
     /// The sequence this exists for: a page turn is reduced and rendered, the
