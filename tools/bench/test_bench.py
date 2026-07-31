@@ -827,7 +827,7 @@ class PerRunCoverageTests(unittest.TestCase):
         ]
         warnings = bench.evaluate_suite_signals(events)
         self.assertTrue(
-            any("run 2 of 2: no sleep telemetry captured" in w for w in warnings),
+            any("run 2 of 2: no completed sleep captured" in w for w in warnings),
             warnings,
         )
 
@@ -850,6 +850,172 @@ class PerRunCoverageTests(unittest.TestCase):
         self.assertTrue(
             any("page-turn median 1200ms" in w for w in warnings), warnings
         )
+
+
+class TerminalSleepTests(unittest.TestCase):
+    """Asking for a sleep is not sleeping.
+
+    `phase=requested` opens the transition and `refresh`/`power_down_*` are
+    steps inside it that a failed handshake reaches too. Accepting any `sleep`
+    event let a sleep-sync capture that never put the panel down pass
+    `--strict` with its Full-refresh budget satisfied and no failed phase to
+    report.
+    """
+
+    REQUESTED_ONLY = [
+        {"event": "run_start", "suite": "sleep-sync"},
+        {"event": "refresh", "mode": "Full", "busy_ms": 3500},
+        {"event": "sleep", "phase": "requested", "screen_on": True, "t_ms": 40000},
+    ]
+
+    def test_a_requested_sleep_is_not_a_completed_one(self) -> None:
+        warnings = bench.evaluate_suite_signals(self.REQUESTED_ONLY)
+        self.assertTrue(
+            any("no completed sleep captured" in w for w in warnings), warnings
+        )
+
+    def test_a_strict_report_fails_on_a_sleep_that_never_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in self.REQUESTED_ONLY) + "\n",
+                encoding="utf-8",
+            )
+            with patch("builtins.print"), patch.object(
+                bench,
+                "load_budgets",
+                return_value=({"sleep-sync": {"full_refresh_busy_min_ms": 3000}}, None),
+            ):
+                warnings = bench.summarize_paths(
+                    [path], bench.DEFAULT_BUDGETS, validate_suites=True
+                )
+        self.assertTrue(warnings, "strict report passed a sleep that never completed")
+
+    def test_a_completed_sleep_satisfies_the_check(self) -> None:
+        events = self.REQUESTED_ONLY + [
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 44000},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertFalse(any("completed sleep" in w for w in warnings), warnings)
+
+    def test_the_x3_panel_marker_counts_for_captures_without_complete(self) -> None:
+        """`phase=deep_sleep` is printed after the deep-sleep command lands.
+
+        It is the only terminal marker in logs from before `complete ok=true`
+        was printed on the success path at all.
+        """
+        events = self.REQUESTED_ONLY + [
+            {"event": "sleep", "phase": "deep_sleep", "elapsed_ms": 40, "t_ms": 44000},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertFalse(any("completed sleep" in w for w in warnings), warnings)
+
+    def test_a_failed_completion_is_not_a_completed_sleep(self) -> None:
+        events = self.REQUESTED_ONLY + [
+            {"event": "sleep", "phase": "complete", "ok": False, "t_ms": 44000},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("no completed sleep captured" in w for w in warnings), warnings
+        )
+        self.assertTrue(
+            any("failed sleep phase captured" in w for w in warnings), warnings
+        )
+
+
+class PageTurnTrustPoolTests(unittest.TestCase):
+    """Trust is decided per capture, before the runs are added together."""
+
+    # 1 turn and 1 press that produced nothing: 50% untrusted on its own.
+    CADENCE_RUN = [
+        {"event": "run_start", "suite": "page-turn"},
+        {"event": "input", "button": "Next", "t_ms": 1000},
+        {"event": "input", "button": "Next", "t_ms": 1100},
+        {"event": "render", "view": "Reading", "t_ms": 1010, "req_ms": 1000},
+    ]
+
+    @staticmethod
+    def clean_run(turns: int, duration: int) -> list[dict]:
+        events: list[dict] = [{"event": "run_start", "suite": "page-turn"}]
+        for turn in range(turns):
+            press = 1000 + turn * 10000
+            events.append({"event": "input", "button": "Next", "t_ms": press})
+            events.append(
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": press + duration,
+                    "req_ms": press,
+                }
+            )
+        return events
+
+    def _pool(self, events: list[dict]) -> bench.PageTurnPool:
+        return bench.page_turn_pool(bench.labelled_runs(events))
+
+    def test_a_clean_sibling_does_not_launder_a_cadence_run(self) -> None:
+        pool = self._pool(self.CADENCE_RUN + self.clean_run(20, 400))
+        # Pooled, 1 unanswered press in 22 is under the 10% threshold, so the
+        # merged population reads as trusted and its median is published.
+        self.assertTrue(pool.every.median_trusted)
+        self.assertEqual([label for label, _stats in pool.untrusted], ["page-turn run 1 of 2"])
+        self.assertNotIn(10, pool.trusted.durations)
+        self.assertEqual(pool.trusted.durations, [400] * 20)
+
+    def test_the_printed_median_leaves_the_cadence_run_out(self) -> None:
+        """The non-strict `report --all` path publishes this number."""
+        events = self.CADENCE_RUN + self.clean_run(20, 400)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            with patch("builtins.print") as mock_print:
+                bench.summarize_paths([path], None, latest_only=False)
+        printed = "\n".join(
+            str(call.args[0]) for call in mock_print.call_args_list if call.args
+        )
+        self.assertIn("UNTRUSTED in page-turn run 1 of 2", printed)
+        # A min of 10ms would be the cadence run's sample leaking in.
+        self.assertIn("page turn      median=400ms p95=400ms min=400ms", printed)
+        # The input accounting still covers every press, including that run's.
+        self.assertIn("presses=22", printed)
+
+    def test_the_budget_gate_leaves_the_cadence_run_out(self) -> None:
+        events = self.CADENCE_RUN + self.clean_run(20, 400)
+        # The 10 ms sample is what an untrusted run contributes; the budget
+        # floor exists to catch exactly that.
+        warnings = bench.evaluate_budgets(
+            events,
+            {
+                "page-turn": {
+                    "median_press_to_settled_ms": 550,
+                    "median_press_to_settled_min_ms": 250,
+                }
+            },
+        )
+        self.assertTrue(
+            any("untrusted in page-turn run 1 of 2" in w for w in warnings), warnings
+        )
+        self.assertFalse(
+            any("below plausibility floor" in w for w in warnings), warnings
+        )
+
+    def test_every_run_untrusted_suppresses_the_budget_check(self) -> None:
+        warnings = bench.evaluate_budgets(
+            self.CADENCE_RUN,
+            {"page-turn": {"median_press_to_settled_ms": 550}},
+        )
+        self.assertTrue(
+            any("budget not checked" in w for w in warnings), warnings
+        )
+
+    def test_a_pool_of_trusted_runs_is_still_pooled(self) -> None:
+        events = self.clean_run(3, 400) + self.clean_run(3, 2000)
+        pool = self._pool(events)
+        self.assertEqual(pool.untrusted, [])
+        self.assertEqual(sorted(pool.trusted.durations), [400] * 3 + [2000] * 3)
 
 
 class UnknownWorkflowTests(unittest.TestCase):

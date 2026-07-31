@@ -84,7 +84,10 @@ The `page turn` statistic is guarded against operator cadence: the report
 prints a `page inputs:` line accounting for every press (`presses`,
 `page_turns`, `nav`, `coalesced`, `unmatched`, `reading_renders`), suppresses
 the median when more than 10% of presses produced no page turn, and budgets
-give the median a plausibility floor as well as a ceiling. Each press is
+give the median a plausibility floor as well as a ceiling. That test is
+applied to each capture before the runs are pooled — a pooled report names an
+untrusted run and leaves it out of the median rather than diluting it in the
+clean ones, and suppresses the median entirely when no run survives. Each press is
 credited to the first render whose request was *frozen* after it — `req_ms`,
 stamped by the app as the reader state stops being able to change — so a
 press landing while a render is already in flight waits for the next frame

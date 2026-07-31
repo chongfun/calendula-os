@@ -706,17 +706,23 @@ def summarize_paths(
     print(f"sleeps:        {len(sleeps)}")
     print(f"warnings:      {len(warnings)}")
     print_duration("reading layout", values(reading_renders, "layout_ms"))
-    turn_stats = page_turn_stats_over_epochs(events)
-    if turn_stats.median_trusted or not turn_stats.durations:
-        print_duration("page turn", turn_stats.durations)
-    else:
+    pool = page_turn_pool(labelled_runs(events))
+    turn_stats = pool.every
+    for label, stats in pool.untrusted:
         print(
-            f"page turn      UNTRUSTED: {turn_stats.untrusted_presses}/"
-            f"{turn_stats.presses} presses produced no page turn "
-            f"({turn_stats.coalesced_presses} coalesced, "
-            f"{turn_stats.unmatched_presses} unanswered; over "
-            f"{PAGE_TURN_UNTRUSTED_MAX_FRACTION:.0%}); median suppressed — "
-            "the distribution is operator cadence, not firmware latency"
+            f"page turn      UNTRUSTED in {label}: {stats.untrusted_presses}/"
+            f"{stats.presses} presses produced no page turn "
+            f"({stats.coalesced_presses} coalesced, "
+            f"{stats.unmatched_presses} unanswered; over "
+            f"{PAGE_TURN_UNTRUSTED_MAX_FRACTION:.0%}) — that run's samples are "
+            "operator cadence, not firmware latency, and are left out below"
+        )
+    if pool.trusted.durations:
+        print_duration("page turn", pool.trusted.durations)
+    elif turn_stats.durations:
+        print(
+            "page turn      no run paired at a trustworthy cadence; median "
+            "suppressed"
         )
     if turn_stats.presses:
         print(
@@ -1089,6 +1095,52 @@ def page_turn_stats_over_epochs(events: list[dict[str, Any]]) -> PageTurnStats:
     )
 
 
+@dataclass(frozen=True)
+class PageTurnPool:
+    """One page-turn population per run, and the two ways of adding them up.
+
+    Trust is a property of how a capture was *performed*, so it has to be
+    decided before the runs are added together. Merging first hides the bad
+    one in the good ones: a run of 1 turn and 1 unanswered press is 50%
+    untrusted on its own, and pooled with a clean 20-turn run it becomes 1 in
+    22 and passes the 10% threshold. The report then prints, and `--strict`
+    gates on, a median partly drawn from a capture this same tool would
+    refuse to report on its own.
+
+    `every` accounts for every press and is what the `page inputs:` line
+    reports. `trusted` is the population the median comes from: runs that
+    paired at a cadence worth believing. `untrusted` is what was left out,
+    named, so the operator knows which capture to redo.
+    """
+
+    per_run: list[tuple[str, PageTurnStats]]
+
+    @property
+    def every(self) -> PageTurnStats:
+        return merge_page_turn_stats([stats for _label, stats in self.per_run])
+
+    @property
+    def trusted(self) -> PageTurnStats:
+        return merge_page_turn_stats(
+            [stats for _label, stats in self.per_run if stats.median_trusted]
+        )
+
+    @property
+    def untrusted(self) -> list[tuple[str, PageTurnStats]]:
+        return [
+            (label, stats)
+            for label, stats in self.per_run
+            if stats.durations and not stats.median_trusted
+        ]
+
+
+def page_turn_pool(runs: list[LabelledRun]) -> PageTurnPool:
+    """Pair presses to renders inside each run, keeping the runs apart."""
+    return PageTurnPool(
+        [(run.label, page_turn_stats_over_epochs(run.events)) for run in runs]
+    )
+
+
 def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
     """Sum independently paired populations into one.
 
@@ -1130,6 +1182,31 @@ def event_sort_key(event: dict[str, Any]) -> tuple[int, float]:
 # `split_runs` splits only on host-side run_start markers: the two boots'
 # time bases interleave and press/render pairings straddle the reset.
 _SLEEP_TERMINAL_PHASES = {"deep", "deep_sleep", "complete"}
+
+
+def is_terminal_sleep(event: dict[str, Any]) -> bool:
+    """A sleep line that says the device actually went to sleep.
+
+    Most `sleep` lines say no such thing: `phase=requested` opens the
+    transition, and `refresh`, `power_down_start`, `power_down_done` and
+    `power_off` are steps inside it that a failed handshake reaches too.
+    Counting any of them as a sleep let a `sleep-sync --strict` capture pass
+    having only *asked* for one.
+
+    The terminal markers are `complete`, printed by the display task on both
+    devices once the panel acknowledged, and `deep_sleep`, printed by the X3
+    panel driver after the deep-sleep command — the only terminal marker in
+    captures predating the `complete ok=true` line, whose absence on the
+    success path was itself a defect. `phase=complete` prints on both
+    outcomes and carries the result in `ok`; absent (older captures) is
+    treated as success.
+    """
+    return (
+        event.get("event") == "sleep"
+        and event.get("phase") in _SLEEP_TERMINAL_PHASES
+        and event.get("ok") is not False
+    )
+
 
 # A t_ms decrease smaller than this is treated as clock skew, not a reboot.
 # `bench: input` is stamped and printed from the interrupt-priority executor
@@ -1215,13 +1292,7 @@ def boot_segments(
                 slept = False
                 slept_at = None
             last_t = t_ms
-        if (
-            name == "sleep"
-            and event.get("phase") in _SLEEP_TERMINAL_PHASES
-            # `phase=complete` is printed on both outcomes, carrying the
-            # result in `ok`. Absent (older captures) is treated as success.
-            and event.get("ok") is not False
-        ):
+        if is_terminal_sleep(event):
             slept = True
             slept_at = t_ms if isinstance(t_ms, int) else None
         segments[-1][0].append(event)
@@ -1303,20 +1374,19 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
     page_turn = budgets.get("page-turn", {})
     if page_turn and "page-turn" in in_play:
         runs = section_runs(events, "page-turn")
-        per_run_turns = [page_turn_stats_over_epochs(run.events) for run in runs]
-        turn_stats = merge_page_turn_stats(per_run_turns)
-        if turn_stats.durations and not turn_stats.median_trusted:
-            # A gate over a cadence artifact is worse than no gate: refuse
-            # to compare the median rather than pass or fail on noise.
+        pool = page_turn_pool(runs)
+        # A gate over a cadence artifact is worse than no gate, and trust is
+        # per capture: an untrusted run is named and dropped rather than
+        # averaged into the pool it would otherwise corrupt.
+        for label, stats in pool.untrusted:
             warnings.append(
-                f"page-turn median untrusted: {turn_stats.untrusted_presses}/"
-                f"{turn_stats.presses} presses produced no page turn (over "
-                f"{PAGE_TURN_UNTRUSTED_MAX_FRACTION:.0%}); budget not checked"
+                f"page-turn median untrusted in {label}: "
+                f"{stats.untrusted_presses}/{stats.presses} presses produced no "
+                f"page turn (over {PAGE_TURN_UNTRUSTED_MAX_FRACTION:.0%}); that "
+                "run is left out of the median"
             )
-        else:
-            turn_median = (
-                statistics.median(turn_stats.durations) if turn_stats.durations else None
-            )
+        if pool.trusted.durations:
+            turn_median = statistics.median(pool.trusted.durations)
             warn_if_above(
                 warnings,
                 "page-turn median",
@@ -1329,12 +1399,17 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
                 turn_median,
                 page_turn.get("median_press_to_settled_min_ms"),
             )
-            for key in ("median_press_to_settled_ms", "median_press_to_settled_min_ms"):
-                warn_if_unobserved(
-                    warnings, "page-turn", page_turn, key, runs,
-                    [stats.durations for stats in per_run_turns],
-                    "press-to-settled pairings",
-                )
+        elif pool.every.durations:
+            warnings.append(
+                "page-turn median: no run paired at a trustworthy cadence; "
+                "budget not checked"
+            )
+        for key in ("median_press_to_settled_ms", "median_press_to_settled_min_ms"):
+            warn_if_unobserved(
+                warnings, "page-turn", page_turn, key, runs,
+                [stats.durations for _label, stats in pool.per_run],
+                "press-to-settled pairings",
+            )
         per_run_layout, reading_layout = per_run_samples(
             runs,
             lambda run_events: values(
@@ -1501,8 +1576,11 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
             if not any(name.startswith("storage") for name in event_names):
                 warnings.append(f"{label}: no storage telemetry captured")
         elif workflow == "sleep-sync":
-            if not any(event.get("event") == "sleep" for event in signal_events):
-                warnings.append(f"{label}: no sleep telemetry captured")
+            if not any(is_terminal_sleep(event) for event in signal_events):
+                warnings.append(
+                    f"{label}: no completed sleep captured; a requested or "
+                    "part-way sleep does not show the panel slept"
+                )
             if any(event.get("event") == "sleep" and event.get("ok") is False for event in signal_events):
                 warnings.append(f"{label}: failed sleep phase captured")
         elif workflow == "reader-soak":

@@ -63,6 +63,12 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
     median is **suppressed** rather than printed, and `--strict` fails
     instead of gating on noise. A `median_press_to_settled_min_ms` floor
     catches an implausibly fast median from the other side.
+  - Trust is judged **per capture, before the runs are pooled**. A pooled
+    report names any run whose cadence failed the test and leaves that run
+    out of the median; it does not average it into the others, where a
+    1-turn, 50%-untrusted run disappears behind a clean 20-turn one. If no
+    run is left, the median is suppressed. The `page inputs:` line still
+    counts every press, including the excluded run's.
 
   `layout_ms`, `flush_ms`, `busy_ms`, and prestage remain per-render and safe
   to read from any cadence. The history is why this matters: a 354 ms median
@@ -86,6 +92,12 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   checks. Warnings name the run (`sleep-sync run 2 of 3`) so the incomplete
   capture can be found. Medians and percentiles are still taken across every
   run the section owns.
+- **A sleep-sync capture owes a *completed* sleep.** `phase=requested` opens
+  the transition and `refresh`/`power_down_*` are steps inside it that a
+  failed handshake reaches too; only `phase=complete ok=true` (or, in logs
+  old enough to predate it, the X3 driver's `phase=deep_sleep`) says the
+  panel went down. A capture holding only a request now fails `--strict`
+  instead of satisfying the check with its Full refresh.
 - **Budgets measure only their own workflows.** A section is checked against
   the workflows that exercise it (`reader-soak` turns pages, so it answers to
   the page-turn budgets) and against nothing else, so pooling a file with
