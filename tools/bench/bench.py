@@ -252,7 +252,11 @@ def run_capture(args: argparse.Namespace) -> int:
     stop_target = stop_target_for(args, suite)
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
+    workflow = capture_workflow(args, suite)
     print(f"bench {suite.name}: {suite.guidance}")
+    if workflow != suite.name:
+        # What the report will hold this run to, said before it starts.
+        print(f"workflow: {workflow} (budgets and signal checks follow it)")
     print(f"port: {args.port}")
     print(f"out:  {args.out}")
     if seconds:
@@ -268,6 +272,7 @@ def run_capture(args: argparse.Namespace) -> int:
 
     metadata = {
         "suite": suite.name,
+        "workflow": workflow,
         "event": "run_start",
         "host_time": time.time(),
         "port": args.port,
@@ -321,6 +326,20 @@ def run_capture(args: argparse.Namespace) -> int:
         validate_suites=args.strict,
     )
     return 1 if args.strict and report_warnings else 0
+
+
+def capture_workflow(args: argparse.Namespace, suite: Suite) -> str:
+    """The workflow a capture actually ran, which is not always its suite.
+
+    `thermal-run` is a condition, not a workload: `--suite` picks which of the
+    other workflows runs under it. That choice decided what telemetry the run
+    would produce and was then thrown away, so every thermal run looked alike
+    to the report — a `--suite sleep-sync` capture was gated by the page-turn
+    budgets and never asked for a sleep at all, which is the "selected and
+    unchecked" shape this harness exists to catch.
+    """
+    underlying = getattr(args, "suite", None)
+    return str(underlying) if isinstance(underlying, str) else suite.name
 
 
 def reset_device(espflash: str, port: str) -> None:
@@ -630,7 +649,18 @@ def summarize_paths(
 ) -> list[str]:
     events: list[dict[str, Any]] = []
     for path in paths:
-        events.extend(read_events(path))
+        file_events = read_events(path)
+        if events and file_events and file_events[0].get("event") != "run_start":
+            # Two files are two captures, but the event stream was simply
+            # concatenated, so a log that opens without a `run_start` — every
+            # capture predating the marker, and every hand-built one — had no
+            # boundary and was swallowed by whichever run preceded it. Its
+            # samples then inherited that run's suite and its device time base,
+            # both wrong, and both decided by the order of the paths on the
+            # command line. The marker is synthesized in memory only; it
+            # carries no suite, so the run stays unlabelled and says so.
+            events.append({"event": "run_start", "file_boundary": str(path)})
+        events.extend(file_events)
 
     # `validate_suites` is the --strict flag. A strict gate that cannot load
     # its budgets must fail loudly: exiting 0 with the checks silently absent
@@ -668,7 +698,9 @@ def summarize_paths(
     storage = [event for event in events if str(event.get("event", "")).startswith("storage")]
 
     print("\nbench report")
-    print(f"events:        {len(events)}")
+    # Synthesized file boundaries are structure, not telemetry; counting them
+    # would report more events than the logs hold.
+    print(f"events:        {sum(1 for e in events if 'file_boundary' not in e)}")
     print(f"renders:       {len(renders)}")
     print(f"storage:       {len(storage)}")
     print(f"sleeps:        {len(sleeps)}")
@@ -1387,49 +1419,74 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
 
 
 def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
-    warnings: list[str] = []
-    by_suite: dict[str, list[dict[str, Any]]] = {}
-    for event in events:
-        suite = str(event.get("suite", "unknown"))
-        by_suite.setdefault(suite, []).append(event)
+    """The telemetry each capture owes, checked against what it produced.
 
-    for suite, suite_events in sorted(by_suite.items()):
+    Grouped by workflow rather than by suite: a `thermal-run --suite
+    sleep-sync` capture owes sleep telemetry, and asking it only for the
+    refresh events every thermal run has is how a deliberately selected
+    workflow passed `--strict` without its own signal ever being looked for.
+    Runs are named `suite/workflow` when the two differ, so a warning still
+    says which capture it came from.
+    """
+    warnings: list[str] = []
+    by_workflow: dict[str, list[dict[str, Any]]] = {}
+    thermal: set[str] = set()
+    for run in labelled_runs(events):
+        name = run.workflow or "unknown"
+        by_workflow.setdefault(name, []).extend(run.events)
+        if run.suite == "thermal-run":
+            thermal.add(name)
+
+    for workflow, workflow_events in sorted(by_workflow.items()):
+        label = (
+            f"thermal-run/{workflow}"
+            if workflow in thermal and workflow != "thermal-run"
+            else workflow
+        )
         signal_events = [
             event
-            for event in suite_events
+            for event in workflow_events
             if event.get("event") not in {"run_start", "run_end"}
         ]
         if not signal_events:
-            warnings.append(f"{suite}: no parsed bench telemetry")
+            warnings.append(f"{label}: no parsed bench telemetry")
             continue
         event_names = {str(event.get("event")) for event in signal_events}
         if "warning" in event_names:
-            warnings.append(f"{suite}: warning events present")
-        if suite == "page-turn":
-            turn_stats = page_turn_stats_over_epochs(suite_events)
+            warnings.append(f"{label}: warning events present")
+        if workflow in thermal and "refresh" not in event_names:
+            # Ambient investigations live on refresh timing whatever workflow
+            # they ran under.
+            warnings.append(f"{label}: no refresh timing telemetry captured")
+        if workflow == "page-turn":
+            turn_stats = page_turn_stats_over_epochs(workflow_events)
             if not turn_stats.durations:
-                warnings.append("page-turn: no input-to-Reading-render duration captured")
+                warnings.append(f"{label}: no input-to-Reading-render duration captured")
             elif not turn_stats.median_trusted:
                 warnings.append(
-                    f"page-turn: {turn_stats.untrusted_presses}/{turn_stats.presses} "
+                    f"{label}: {turn_stats.untrusted_presses}/{turn_stats.presses} "
                     "presses produced no page turn; the press-to-settled figure "
                     "is cadence, not firmware — recapture at one press per "
                     "settled page"
                 )
-        elif suite == "storage-cache":
+        elif workflow == "storage-cache":
             if not any(name.startswith("storage") for name in event_names):
-                warnings.append("storage-cache: no storage telemetry captured")
-        elif suite == "sleep-sync":
+                warnings.append(f"{label}: no storage telemetry captured")
+        elif workflow == "sleep-sync":
             if not any(event.get("event") == "sleep" for event in signal_events):
-                warnings.append("sleep-sync: no sleep telemetry captured")
+                warnings.append(f"{label}: no sleep telemetry captured")
             if any(event.get("event") == "sleep" and event.get("ok") is False for event in signal_events):
-                warnings.append("sleep-sync: failed sleep phase captured")
-        elif suite == "reader-soak":
+                warnings.append(f"{label}: failed sleep phase captured")
+        elif workflow == "reader-soak":
             if not {"render", "input"}.issubset(event_names):
-                warnings.append("reader-soak: expected both input and render telemetry")
-        elif suite == "thermal-run":
-            if "refresh" not in event_names:
-                warnings.append("thermal-run: no refresh timing telemetry captured")
+                warnings.append(f"{label}: expected both input and render telemetry")
+        elif workflow == "thermal-run":
+            # No workflow recorded, so there is nothing to check beyond the
+            # refresh timing above; say so rather than imply it was gated.
+            warnings.append(
+                f"{label}: no workflow recorded, so no workflow signal was "
+                "checked; recapture with a current bench.py"
+            )
     return warnings
 
 
@@ -1462,41 +1519,62 @@ def warn_if_unobserved(
     )
 
 
-# Which capture suites produce the measurements each budget section gates.
-# A section is named after the suite that owns it, but a workflow suite
-# exercises more than one path: `reader-soak` is page turns plus navigation,
-# and `thermal-run` is one of the other workflows run under ambient load —
-# both of its choices turn pages first, so both feed the page-turn section.
-# Nothing else is folded in: `reader-soak` sleeps once and `thermal-run` may
-# not sleep at all, so pointing them at `sleep-sync` would fault a healthy
-# capture for a Full refresh it never owed. The map is also the isolation
-# boundary — a section measures only the suites listed for it, so pooling
-# with `--all` cannot let one suite's samples decide another's verdict.
-BUDGET_SECTION_SUITES: dict[str, set[str]] = {
-    "page-turn": {"page-turn", "reader-soak", "thermal-run"},
+# Which workflows produce the measurements each budget section gates. A
+# section is named after the workflow that owns it, but `reader-soak` is page
+# turns plus navigation, so it answers to the page-turn budgets too. Nothing
+# else is folded in: reader-soak sleeps once, so pointing it at `sleep-sync`
+# would fault a healthy capture for a Full refresh it never owed.
+#
+# Keyed on workflow rather than suite so `thermal-run --suite sleep-sync`
+# resolves to the sleep-sync budgets, which is the whole point of the flag.
+# The map is also the isolation boundary — a section measures only the
+# workflows listed for it, so pooling with `--all` cannot let one capture's
+# samples decide another's verdict.
+BUDGET_SECTION_WORKFLOWS: dict[str, set[str]] = {
+    "page-turn": {"page-turn", "reader-soak"},
     "sleep-sync": {"sleep-sync"},
     "storage-cache": {"storage-cache"},
 }
 
 
-def suite_labels(events: list[dict[str, Any]]) -> list[str | None]:
-    """The capturing suite for each event, positionally.
+@dataclass(frozen=True)
+class LabelledRun:
+    events: list[dict[str, Any]]
+    suite: str | None
+    workflow: str | None
 
-    An event parsed by this harness carries its own `suite`, but the label is
-    really a property of the run: hand-built fixtures and older captures put
-    it only on `run_start`. An unlabelled event therefore inherits its run's
-    label rather than being dropped from every section.
+
+def labelled_runs(events: list[dict[str, Any]]) -> list[LabelledRun]:
+    """Each run with the suite and workflow it was captured under.
+
+    Both are properties of the run, not of the event: `run_start` is the only
+    line that carries `workflow`, and hand-built fixtures and older captures
+    put even `suite` only there. Every event therefore takes its run's labels
+    rather than being dropped from every section for want of its own.
+
+    A run with no recorded `workflow` falls back to its suite name. For
+    `thermal-run` that resolves to nothing a budget section claims, and is
+    reported — the alternative is assuming the argparse default and gating a
+    `--suite sleep-sync` capture as if it were a page-turn run, which is the
+    guess that made this worth fixing.
     """
-    labels: list[str | None] = []
+    runs = []
     for run in split_runs(events):
-        run_suite = next(
+        suite = next(
             (str(event["suite"]) for event in run if isinstance(event.get("suite"), str)),
             None,
         )
-        for event in run:
-            suite = event.get("suite")
-            labels.append(str(suite) if isinstance(suite, str) else run_suite)
-    return labels
+        start = next((event for event in run if event.get("event") == "run_start"), {})
+        workflow = start.get("workflow")
+        runs.append(
+            LabelledRun(run, suite, str(workflow) if isinstance(workflow, str) else suite)
+        )
+    return runs
+
+
+def workflow_labels(events: list[dict[str, Any]]) -> list[str | None]:
+    """The workflow each event was captured under, positionally."""
+    return [run.workflow for run in labelled_runs(events) for _event in run.events]
 
 
 def section_events(events: list[dict[str, Any]], section: str) -> list[dict[str, Any]]:
@@ -1505,55 +1583,68 @@ def section_events(events: list[dict[str, Any]], section: str) -> list[dict[str,
     Choosing *which* sections to evaluate was never enough: the measurements
     themselves were taken from the whole pooled log, so a file holding a
     `page-turn` run next to a `storage-cache` or `sleep-sync` one had its
-    strict verdict decided partly by samples from a suite that budget does
+    strict verdict decided partly by samples from a workflow that budget does
     not describe — a false pass or a false failure, either way from the wrong
     population. Capture order is preserved, `run_start` markers included, so
     the per-run and per-boot splitting downstream still works.
 
-    A log with no suite label anywhere keeps the old behaviour of measuring
-    everything: there is nothing better to go on.
+    A log with no label anywhere keeps the old behaviour of measuring
+    everything: there is nothing better to go on. Once *any* run is labelled
+    the unlabelled ones are left out rather than folded in, and
+    `budget_sections_in_play` reports the mixture.
     """
-    suites = BUDGET_SECTION_SUITES.get(section, {section})
-    labels = suite_labels(events)
+    workflows = BUDGET_SECTION_WORKFLOWS.get(section, {section})
+    labels = workflow_labels(events)
     if all(label is None for label in labels):
         return events
-    return [event for label, event in zip(labels, events) if label in suites]
+    return [event for label, event in zip(labels, events) if label in workflows]
 
 
 def budget_sections_in_play(
     events: list[dict[str, Any]], budgets: dict[str, Any]
 ) -> tuple[set[str], list[str]]:
-    """Budget sections whose suite this log actually contains, plus warnings.
+    """Budget sections whose workflow this log actually contains, plus warnings.
 
     Every section used to be evaluated against every log, which was harmless
     while an absent metric silently skipped its check and is not once that
-    absence is a warning. Logs whose events carry no suite label at all —
-    hand-built fixtures, and any capture predating suite tagging — keep the
-    old behaviour of evaluating everything, since there is nothing better to
-    go on.
+    absence is a warning. Logs whose runs carry no label at all — hand-built
+    fixtures, and any capture predating suite tagging — keep the old
+    behaviour of evaluating everything, since there is nothing better to go
+    on.
 
-    A known suite that no configured section claims is reported rather than
-    passed over: it means a capture ran and nothing gated it, which is the
-    silently-unenforced shape this file exists to prevent.
+    Two things are reported rather than passed over, because both mean a
+    capture ran and nothing gated it, which is the silently-unenforced shape
+    this file exists to prevent: a known workflow no configured section
+    claims, and an unlabelled run pooled with labelled ones — the latter is
+    excluded from every section, and reading it into whichever run happened
+    to precede it in the file list would be worse than saying so.
     """
     if not budgets:
         # Budgets deliberately disabled, or unloadable — reported elsewhere.
         return set(), []
-    labelled = {label for label in suite_labels(events) if label is not None}
+    per_run = [run.workflow for run in labelled_runs(events)]
+    labelled = {label for label in per_run if label is not None}
     if not labelled:
         return set(budgets), []
     sections = {
         name
         for name in budgets
-        if labelled & BUDGET_SECTION_SUITES.get(name, {name})
+        if labelled & BUDGET_SECTION_WORKFLOWS.get(name, {name})
     }
     warnings = [
-        f"suite {suite} has no budget section to check it against"
-        for suite in sorted(labelled & set(SUITES))
+        f"workflow {workflow} has no budget section to check it against"
+        for workflow in sorted(labelled & set(SUITES))
         if not any(
-            suite in BUDGET_SECTION_SUITES.get(section, {section}) for section in budgets
+            workflow in BUDGET_SECTION_WORKFLOWS.get(section, {section})
+            for section in budgets
         )
     ]
+    unlabelled = sum(1 for label in per_run if label is None)
+    if unlabelled:
+        warnings.append(
+            f"{unlabelled} of {len(per_run)} runs carry no suite label and are "
+            "outside every budget section; report those logs on their own"
+        )
     return sections, warnings
 
 

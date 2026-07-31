@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import re
 import tempfile
@@ -708,6 +709,44 @@ class BudgetSuiteIsolationTests(unittest.TestCase):
         )
         self.assertFalse(any("catalog load" in w for w in warnings), warnings)
 
+    def test_a_thermal_run_is_gated_by_the_workflow_it_selected(self) -> None:
+        """`--suite sleep-sync` must bring the sleep-sync budgets with it.
+
+        The flag chose the workload and was then discarded, so every thermal
+        run resolved to page-turn: a sleep-cycle capture could hold no sleep,
+        no wake and no Full refresh and still pass `--strict`, which is the
+        selected-but-unchecked shape the branch exists to remove.
+        """
+        events = [
+            {"event": "run_start", "suite": "thermal-run", "workflow": "sleep-sync"},
+            {"event": "refresh", "mode": "Full", "busy_ms": 5000},
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"sleep-sync": {"full_refresh_busy_max_ms": 4300}},
+        )
+        self.assertTrue(
+            any("above budget ceiling" in w for w in warnings), warnings
+        )
+
+    def test_a_thermal_run_with_no_recorded_workflow_is_reported(self) -> None:
+        """Captured before the workflow was recorded: guessing it is worse.
+
+        The argparse default is `page-turn`, so assuming it would gate a
+        sleep-cycle capture against page-turn budgets and call that enforced.
+        """
+        events = [
+            {"event": "run_start", "suite": "thermal-run"},
+            {"event": "refresh", "mode": "Fast", "busy_ms": 400},
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"fast_refresh_busy_warn_ms": 500}},
+        )
+        self.assertTrue(
+            any("thermal-run has no budget section" in w for w in warnings), warnings
+        )
+
     def test_a_suite_no_budget_section_claims_is_reported(self) -> None:
         events = [
             {"event": "run_start", "suite": "sleep-sync"},
@@ -732,6 +771,115 @@ class BudgetSuiteIsolationTests(unittest.TestCase):
             {"page-turn": {"median_press_to_settled_ms": 550}},
         )
         self.assertTrue(any("page-turn median" in w for w in warnings), warnings)
+
+
+class PooledFileTests(unittest.TestCase):
+    """`report a.jsonl b.jsonl` concatenates streams; runs must not merge.
+
+    A legacy log opens with telemetry rather than a `run_start`, so it had no
+    boundary of its own and joined whichever run preceded it. Whether its
+    samples contaminated a labelled suite's budgets or were dropped from every
+    section depended only on the order of the paths, and neither outcome was
+    reported.
+    """
+
+    def _write(self, directory: str, name: str, events: list[dict]) -> Path:
+        path = Path(directory) / name
+        path.write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
+        )
+        return path
+
+    LABELLED = [
+        {"suite": "page-turn", "event": "run_start"},
+        {"suite": "page-turn", "event": "input", "button": "Next", "t_ms": 1000},
+        {
+            "suite": "page-turn",
+            "event": "render",
+            "view": "Reading",
+            "t_ms": 1400,
+            "req_ms": 1000,
+        },
+    ]
+    # Turns four times the budget: pooled into the labelled run they take its
+    # median from 400 ms to 4000 ms.
+    LEGACY = [
+        {"event": "input", "button": "Next", "t_ms": 1000},
+        {"event": "render", "view": "Reading", "t_ms": 5000, "req_ms": 1000},
+        {"event": "input", "button": "Next", "t_ms": 6000},
+        {"event": "render", "view": "Reading", "t_ms": 11000, "req_ms": 6000},
+    ]
+
+    # Supplied directly rather than read from benches.toml: this exercises
+    # pooling, and on Python 3.9 there is no tomllib for --strict to load
+    # with, which would make the check disappear on the interpreter most
+    # likely to run it.
+    BUDGETS = ({"page-turn": {"median_press_to_settled_ms": 550}}, None)
+
+    def _warnings(self, order: list[str]) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, "labelled.jsonl", self.LABELLED)
+            self._write(tmp, "legacy.jsonl", self.LEGACY)
+            with patch("builtins.print"), patch.object(
+                bench, "load_budgets", return_value=self.BUDGETS
+            ):
+                return bench.summarize_paths(
+                    [Path(tmp) / name for name in order],
+                    bench.DEFAULT_BUDGETS,
+                    validate_suites=True,
+                    latest_only=False,
+                )
+
+    def test_the_verdict_does_not_depend_on_path_order(self) -> None:
+        forward = self._warnings(["labelled.jsonl", "legacy.jsonl"])
+        reverse = self._warnings(["legacy.jsonl", "labelled.jsonl"])
+        self.assertEqual(sorted(forward), sorted(reverse))
+
+    def test_legacy_samples_do_not_contaminate_a_labelled_budget(self) -> None:
+        for order in (
+            ["labelled.jsonl", "legacy.jsonl"],
+            ["legacy.jsonl", "labelled.jsonl"],
+        ):
+            with self.subTest(order=order):
+                warnings = self._warnings(order)
+                self.assertFalse(
+                    any("page-turn median" in w for w in warnings), warnings
+                )
+
+    def test_an_unlabelled_run_in_a_pool_is_reported(self) -> None:
+        warnings = self._warnings(["labelled.jsonl", "legacy.jsonl"])
+        self.assertTrue(
+            any("carry no suite label" in w for w in warnings), warnings
+        )
+
+    def test_a_lone_legacy_log_is_still_measured(self) -> None:
+        """Nothing to be ambiguous about, so the old behaviour stands."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "legacy.jsonl", self.LEGACY)
+            with patch("builtins.print"), patch.object(
+                bench, "load_budgets", return_value=self.BUDGETS
+            ):
+                warnings = bench.summarize_paths(
+                    [path], bench.DEFAULT_BUDGETS, latest_only=False
+                )
+        self.assertTrue(any("page-turn median" in w for w in warnings), warnings)
+        self.assertFalse(any("carry no suite label" in w for w in warnings), warnings)
+
+
+class CaptureWorkflowTests(unittest.TestCase):
+    """`run_start` has to carry the workflow for anything downstream to use it."""
+
+    def test_thermal_run_records_its_underlying_workflow(self) -> None:
+        args = argparse.Namespace(suite="sleep-sync")
+        self.assertEqual(
+            bench.capture_workflow(args, bench.SUITES["thermal-run"]), "sleep-sync"
+        )
+
+    def test_every_other_suite_is_its_own_workflow(self) -> None:
+        args = argparse.Namespace()
+        for name, suite in bench.SUITES.items():
+            with self.subTest(suite=name):
+                self.assertEqual(bench.capture_workflow(args, suite), name)
 
 
 class StorageBuildReportTests(unittest.TestCase):

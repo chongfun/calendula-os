@@ -78,12 +78,23 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   failure this harness exists to stop. Either capture the missing telemetry
   or delete the key. Only a section whose suite the log contains is checked,
   so a page-turn capture is never faulted for holding no storage telemetry.
-- **Budgets measure only their own suites.** A section is checked against the
-  suites that exercise it (`reader-soak` and `thermal-run` turn pages, so
-  they answer to the page-turn budgets) and against nothing else, so pooling
-  a file with `--all` cannot let one suite's samples decide another's
-  verdict. A labelled suite no section claims is reported rather than passed
-  over silently.
+- **Budgets measure only their own workflows.** A section is checked against
+  the workflows that exercise it (`reader-soak` turns pages, so it answers to
+  the page-turn budgets) and against nothing else, so pooling a file with
+  `--all` cannot let one capture's samples decide another's verdict. A
+  workflow no section claims is reported rather than passed over silently.
+- **`thermal-run` records the workflow it ran.** `--suite` picks the
+  underlying workload, and that choice is now stored in `run_start` and
+  decides both the budgets and the signal check: a `--suite sleep-sync`
+  thermal run owes sleep telemetry and answers to the Full-refresh budgets.
+  Captures made before this carry no `workflow` and are reported as ungated
+  rather than assumed to be page-turn runs.
+- **Report one log's paths at a time when they predate suite labels.**
+  Pooled paths are concatenated, and a log that opens without a `run_start`
+  gets a synthetic boundary so it cannot join the previous file's run. It
+  stays unlabelled, sits outside every budget section, and `--strict` says
+  so — labelled and unlabelled captures in one report is not something the
+  harness will guess about.
 - **Budgets need Python ≥ 3.11**, or the optional `tomli` package. macOS
   system `python3` is 3.9, where `tomllib` does not exist. `--strict` now
   refuses to run without a parser rather than passing everything silently;

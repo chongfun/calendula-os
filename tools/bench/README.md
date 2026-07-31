@@ -57,6 +57,15 @@ telemetry for `storage-cache` or input-to-Reading-render timing for
 `page-turn`. Capture commands also accept `--strict`, applying the same gate to
 the log they just wrote.
 
+Budgets and signal checks follow the *workflow* a capture ran, which for
+`thermal-run` is its `--suite` choice rather than `thermal-run` itself: a
+`thermal-run --suite sleep-sync` run owes sleep telemetry and is held to the
+Full-refresh budgets. A run's samples are measured only against the sections
+its own workflow owns, so pooling several logs in one `report` cannot let one
+capture decide another's verdict. Logs that predate suite labels are reported
+on their own — pooled with a labelled one they stay outside every budget
+section, and `--strict` says so rather than guessing where they belong.
+
 **Budget checking needs Python >= 3.11 (`tomllib`) or the `tomli` package.**
 Capture and plain reporting run on any Python 3.9+, but `--strict` refuses to
 run without a TOML parser — macOS system `python3` is 3.9, and a strict gate
