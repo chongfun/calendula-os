@@ -38,22 +38,86 @@ surface; bundle it rather than porting separately.
   deliberately change the router's channel and confirm the fallback;
   `sleep-sync` lifecycle regression.
 
+**Implemented on `opt/d4-directed-wifi-join`, complete, needs only the device
+run.** Audited 2026-07-30: fully wired (read + SSID-hash match in the storage
+task, loan carries it, learn-and-write fire-and-forget), and `decode` rejects
+short buffers, bad magic/version/checksum, channel 0, channel > 14 and an
+all-zero BSSID before any of it reaches the radio.
+
+One design improvement over the spec above, and the branch is right: it does
+**not** widen `WifiCredentialsRecord`. `reader-cache`'s record reader compares
+`file.length() as usize != total` **exactly**, so a widened record would read
+as *absent* to older firmware and lose the saved password. The hint instead
+gets its own `WIFHA`/`WIFHB.BIN` durable pair with a distinct magic, deleted
+alongside the credentials on forget.
+
+Two things for the reviewer: the worst case is a real regression bound — `hint`
+is bound once outside the retry loop and never cleared after a miss, so a stale
+hint costs 10 s on *every* retry and a single attempt's ceiling becomes
+10 + 35 = **45 s against main's 35 s** (it self-heals after one successful
+fallback join, so exposure is one failed-session sequence). And the SSID hash
+input is spelled differently on the read and write sides — identical for valid
+UTF-8, but make it one expression.
+
 ### Upload-ceiling investigation (S–M) — instrument before fixing
 
 Upload throughput sits near **160 KB/s under every configuration tried**, and
 nobody knows why. Ruled out by measurement (2026-07-11/12): radio RX buffers,
 AMPDU-RX, SD write stalls, SPI chunking.
 
-Remaining candidates, roughly in order of suspicion:
+**Correction, 2026-07-30 — D2's post-mortem has been misread for three
+rounds.** It says "neither radio RX nor SD write *stalls* is the limiter",
+which is true as written: D2 tested executor **starvation** (yield pacing) and
+radio **buffering**. It never tested SD write **bandwidth**, and that has been
+read as "SD is ruled out". It is not.
 
-1. The 4 KB two-buffer ping-pong handshake between the wifi and storage tasks
-   — each chunk's channel round-trip serializes against the SD write it
-   triggers.
-2. esp-radio power-save mode during the session — check whether PS is disabled
-   while serving.
-3. Single-stream TCP dynamics — a small congestion window against a receiver
-   that reads in 4 KB bites.
-4. The HTTP server's read pattern in the upload handler.
+The arithmetic, from this roadmap's own measured numbers: 3.2 MB / 19.3 s =
+166 KB/s = **3.08 ms of budget per 512-byte block**, against a measured
+**2.23 ms per block write**. That is **~72% of upload wall time in single-block
+SD writes**, and the pure SD ceiling (512 B / 2.23 ms = 229 KB/s) sits only
+**1.4×** above the observed throughput. *Load-bearing caveat: the 2.23 ms was
+measured on the cold-build workload (scattered small cache writes), not on
+sequential 4 KB appends, and could be materially lower here. That single
+unknown decides the whole workstream — which is why the first task is
+instrumentation, not a fix.*
+
+**Two candidates are now dead from source, no hardware needed:**
+
+- **Power save (candidate 2) — REFUTED.** `WifiController::new` already calls
+  `set_power_saving(PowerSaveMode::default())` and that `#[default]` is
+  `None`, with the upstream comment "the blob default is not the best for
+  bandwidth". PS is off for the entire session. Delete this suspect.
+- **The HTTP read pattern (candidate 4) — no waste found.** `stream_book`'s
+  inner loop reads directly into the staging buffer with a correctly clamped
+  window, one copy, no intermediate buffering; the leftover-body handling is
+  correct and copies once.
+
+**Radio-blob starvation is refuted structurally, and it explains D2's null
+result.** `esp-rtos` runs the radio driver's tasks as preemptive RTOS threads,
+so a blocking SD write blocks only the embassy thread-mode executor
+(`net_task` + the wifi task), never packet reception. That is why D2's yield
+pacing bought nothing — and it means the *only* thing a blocking write costs is
+socket drain and ACK generation.
+
+**Candidate 1 survives, but not for the stated reason.** It is not that the
+channel round-trip serializes against the write. With `UPLOAD_CHUNKS` and
+`UPLOAD_RETURNS` both at capacity 2 and a two-buffer pool, the producer fills
+and sends A, then fills and sends B — both `send`s complete on first poll — so
+the writer finds B *already queued* and runs **two 4 KB writes back to back
+with no yield point between them**: a ~36 ms executor blackout against a 16 KB
+socket RX buffer, which is the receive window (smoltcp has no window scaling).
+16 KB is ~26 ms of headroom at 600 KB/s, so the window closes and costs an RTT
+to reopen. Fitting: 8192 B / (2 × 17.8 ms + X) = 166 KB/s → X = 15.6 ms, a very
+plausible zero-window reopen. **The fix is a yield at the chunk boundary — 780
+yields per 3.2 MB, not D2's rejected 512-B pacing at ~6,250 — so this is a
+different change from the one that was measured and rejected.**
+
+**Free window headroom, if it comes to that:** `dismantle_scratch` gives the
+24 KB region to the radio heap and the 16 KB region to `tcp_rx`. Swapping them
+yields a 24 KB receive window for 8 KB of loaned heap — **no new memory, just a
+different assignment of already-loaned regions**, so it does not repeat D2's
+mistake of *spending* heap. Rank it below the yield fix (same target, more
+risk), and watch the per-upload heap log.
 
 Tools already in place: `upload: heap used/free` per upload, `sd_stats`
 counters, and the timed-upload A/B protocol that produced the D2 verdict —
@@ -65,13 +129,67 @@ curl -sS -o /dev/null -H 'Expect:' --data-binary @book.epub \
   -w '%{time_total}s %{speed_upload} B/s'
 ```
 
-**Instrument first** — e.g. timestamp the ping-pong, fill-time against
-write-time per chunk, to see which side starves — then fix only what the
-numbers indict.
+**Instrument first** — and the instrumentation is now specified, ~25 lines in
+two files, copying the `write_micros` accumulator pattern that already exists
+in `book_build.rs`. Three accumulators plus the `sd_stats` delta, printed next
+to the existing per-upload heap log:
+
+- `sd_write_us` around `pending.write` in `write_one_book` → **SD-bound**
+- `wait_buffer_us` around the `UPLOAD_RETURNS.receive()` arm → **writer-bound**
+- `socket_read_us` around the `socket.read` arm → **network-bound**
+
+```
+upload: bytes=N wall_ms=W sd_write_ms=S wait_buf_ms=B sock_read_ms=R
+        wr_calls=.. wr_blocks=.. rd_calls=.. rd_blocks=..
+```
+
+**One flash, one `curl`, one capture, and the decision table resolves it:**
+
+| Result | Verdict |
+|---|---|
+| `sd_write_ms / wall_ms` ≳ 0.65 | SD write bandwidth is the ceiling. **Promote D6.** The ping-pong and window items are second-order. |
+| `sd_write_ms` ≈ 0.3–0.5 **and** `sock_read_ms` large | Window/RTT bound. Do the chunk-boundary yield first, then the buffer swap. D6 stays deferred. |
+| `sd_write_ms` ≲ 0.3, `sock_read_ms` dominant, window never closing | RF layer is the ceiling. **Close this investigation** — uploads are as fast as this hardware goes. |
+| `wr_blocks` ≫ `ceil(bytes/512)` | The FAT tax below is real; size it before forking. |
 
 A believable outcome is 2–5× upload throughput. Another believable outcome is
 that the radio/RF layer is the ceiling and uploads are already as fast as this
-hardware goes. Both are useful answers; guessing is not.
+hardware goes. Both are useful answers; guessing is not. **Do this before
+writing any fix — it is the only thing standing between this workstream and a
+second D2.**
+
+**Two adjacent costs the same capture sizes for free:**
+
+- **FAT mirror writes.** Every cluster allocation issues `update_fat` twice,
+  each writing back to *both* FATs — **four random-region CMD24s per cluster
+  crossing**, plus 2–3 FAT block reads, interleaved into an otherwise
+  sequential stream (and each one breaks the card's sequential-write streak).
+  At 32 KB clusters that is +6% writes; at 8 KB clusters, common on smaller
+  cards, **+25%**. Free to quantify: `wr_blocks` for a 3.2 MB upload should be
+  6,250 with no FAT overhead; the excess *is* the tax. Fixing it (preallocating
+  the chain, or deferring mirror writes to close) needs the D6 fork and touches
+  FAT consistency — high risk, measure before considering.
+- **`with_sd_bounce` memsets 512 bytes for every one-byte SPI transaction.**
+  Every command byte, response poll and busy poll is a full
+  `SdSpiDevice::transaction` that unconditionally fills the whole
+  `SD_SPI_CHUNK_BYTES` bounce buffer, though only `..len` needs the 0xFF idle
+  pattern (and `write_chunked` needs no fill at all, since `copy_from_slice`
+  overwrites it). **D1 made this 8× worse** by taking the chunk 64 → 512 at the
+  same time it made the bulk path 8× cheaper — a concrete candidate for why D1
+  delivered −5.4% instead of the hoped 2×. ~0.8–1.3 µs per transaction at
+  160 MHz, times an uncounted multiplier of ~13 sub-16-byte transactions per
+  block write plus N busy polls. Fix is ~10 lines (thread the length through);
+  **count the transactions before quoting a percentage** — add an `SPI_TXNS`
+  counter beside `sd_stats` and one `storage-cache` run. Under ~20 per block
+  write, the win is <1% and it should be dropped.
+
+**Also cheap, unrelated to throughput:** the loan path opens **three
+back-to-back `with_root` sessions** (`flush_pending_progress`,
+`load_wifi_credentials`, `write_catalog_listing`), each paying two
+`apply_config` reconfigures, a 400 kHz wake sequence, `open_volume` and
+`open_root_dir`. Merging them to one saves ~80–140 ms of pre-join latency
+against the 40–70 ms warm-reopen figure. Each session also emits six serial
+lines — see WS-C's C7 for why that is not free.
 
 - Risk: heap exhaustion inside the radio blob crashes the loaned-buffer
   session (the only recovery is the reset), and AMPDU reorder buffers allocate
@@ -120,9 +238,27 @@ CMD25 path exists but is unreachable. Patch the pinned crate to batch
 cluster-contiguous whole-block runs, or write payload blocks directly using
 FAT only for allocation and metadata. Same for CMD18 on sequential reads.
 
-Weigh 2–3 s per cold build against the cost of maintaining a fork of a pinned
-dependency. `write_calls == write_blocks` in the bench counters answers
-immediately whether this is still worth it. Note #18 moved the upload write
+**Status change 2026-07-30: this item's own stated precondition was satisfied
+in July and it stayed deferred anyway.** "`write_calls == write_blocks` in the
+bench counters answers immediately whether this is worth it" — they were equal,
+1,944 each, on 2026-07-12. Combined with the upload arithmetic above (~72% of
+upload wall time in single-block writes, ceiling only 1.4× above observed),
+this is now the largest identified lever in the workstream rather than a
+tier-3 maybe. Confirmed by reading the pinned crate: `VolumeManager::write`
+loops per block calling `block_cache.write_back()`, always a 1-block device
+write; the CMD25 branch beside it already does `ACMD23` pre-erase and drops
+CMD24 + CMD13 per block, and is unreachable only because the caller never
+passes more than one block.
+
+If per-block cost falls to a typical 0.6–0.9 ms, a 3.2 MB upload goes 19.3 s →
+**~10–12 s** (network then binds) and the 4.34 s of cold-build write time →
+~1.5 s. *Estimate: the current per-block cost is measured, the post-CMD25 cost
+is not.* Note `upload-store` is `#![forbid(unsafe_code)]`, so reinterpreting a
+4 KB chunk as `[Block; 8]` has to happen on the fw side.
+
+**Still gate it on the instrumentation above** — if `sd_write_ms` comes in
+under ~35% of upload wall time, do not fork. Weigh 2–3 s per cold build against
+the cost of maintaining a fork of a pinned dependency. Note #18 moved the upload write
 path into the `upload-store` crate; reader-cache writes still go through fw's
 SD session.
 

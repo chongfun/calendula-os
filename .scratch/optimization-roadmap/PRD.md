@@ -1,9 +1,10 @@
 # PRD: CalendulaOS optimization roadmap
 
-Status: WS-A finished, WS-B's queue down to one non-B item plus leftovers.
-Updated 2026-07-30 (B7 done, on a branch). Started 2026-07-09 from six parallel
-code-survey agents, one per workstream, scoped to mostly-disjoint code
-regions so work can proceed in parallel.
+Status: **WS-A reopened**; a new WS-G owns app-state render invalidation, where
+the largest wins now live; the bench harness has an owner for the first time.
+Updated 2026-07-30 after a seven-region survey plus a branch audit. Started
+2026-07-09 from six parallel code-survey agents, one per workstream, scoped to
+mostly-disjoint code regions so work can proceed in parallel.
 
 This document is kept to three things: **what is left**, **what has been
 done**, and **what not to do**. Round-by-round history has been dropped —
@@ -17,32 +18,96 @@ firmware and web emulator. Every item cites a measured baseline, not a guess.
 
 ## The queue
 
-Ranked by measured user-facing cost. Items 1–2 are worth more than
-everything below them combined.
+**Re-ranked 2026-07-30** after a seven-region survey and an audit of the six
+in-flight branches. Three things moved the ranking more than any single new
+item:
+
+- **The measurement layer is partly broken and largely unread**, and every
+  ranking in this document is downstream of it. Tier 0 exists for that reason
+  and comes first.
+- **"Stop optimizing the render path" was wrong**, and wrong for a specific
+  reason worth remembering: the reasoning behind it was an **X4** statement
+  applied to the **X3**. See WS-A's reopened status.
+- **Six branches are already written and none needs a rebase** — all six sit
+  on the current tip of `main` and all 15 pairs merge cleanly, so landing
+  order is unconstrained by conflicts. Rank on correctness and residual work,
+  not on cost-to-build. Three are much closer to done than their old queue
+  positions implied; two have defects that must be fixed first.
+
+### Tier 0 — measurement integrity (do first; hours, not days)
+
+Nothing below this line can be honestly ranked until these land. Three rounds
+of misranking — A10, A7, the retired 354 ms baseline — came from this layer.
 
 | # | Item | WS | Why it ranks here | Effort |
 |---|---|---|---|---|
-| 1 | **Single repaint per page turn** | — | ~405 ms of panel time off *every* page turn, cached or not, in every book. Not a lettered item; found while measuring B4. Implemented on `opt/single-repaint-per-page-turn` (1 commit over main), not merged. | S |
-| 2 | **C2** — deep-sleep GPIO hold + first sleep-current measurement | C | Sleep current has never been measured. If pins are leaking, this is the difference between months and ~2 weeks of shelf life. Needs a device and a µA meter. | S–M + hw |
-| 3 | **First open on a deep resume** | B | B4 does nothing when the resume position is near the end of the book: `suspend_here` needs `total_pages > requested_page`, so resuming at page 561/562 pays a full 24.7 s build with zero progressive benefit. Only a progress indicator helps. | M |
-| 4 | **`proto` inflate rework** | B | `ZipInflateScratch::new()` still costs a 20,960 B stack frame against a 24 KB gate, because miniz_oxide's stream layer keeps a private 32 KB window and can only be built by value. `inflate::core::decompress` takes the caller's buffer instead. Not a speed item — headroom. | M |
-| 5 | **D4** — directed Wi-Fi join + strongest-AP | D | Repeat-session join ~21 s → ~3–6 s. | M |
-| 6 | **Upload-ceiling investigation** | D | ~160 KB/s and nobody knows why. Instrument before fixing. | S–M |
-| 7 | **D5** — portal → station handoff | D | ~40–60 s and 3 steps off first-time onboarding. | M |
-| 8 | **A11** — batch landscape glyph rows | A | Landscape is now the slower frame (146 µs vs portrait's 93 µs host) after #50. Size it first — expect single-digit ms against a 424 ms turn, and portrait is the default. | M |
-| 9 | **A9** — overlapped SPI DMA band transmits | A | Last render-path item with real headroom. | L |
+| 0a | **`--strict` is a silent no-op on Python < 3.11** | F | `tomllib` is missing, `load_budgets` returns `{}`, nothing is checked, exit 0, no diagnostic. **Verified on the owner's machine** (`python3` is 3.9.6). A page-turn median 16.7× over budget passes clean. Anything previously signed off "with `--strict`" needs re-checking. | S |
+| 0b | **Read the telemetry that is already being captured** | F | `bench: storage_build` prints `spine_ms`/`write_ms`/`wr_blocks` on every build *and every replay*; `grep -c` in `bench.py` returns **0**. The 24–27 s replay split WS-B has guessed at for three rounds has been on disk for months. Same for boot-to-first-paint (the `t_ms` on the first `bench: render` of any boot) and for B4's own headline numbers. | S |
+| 0c | **`page turn` has an unbounded cadence error** | F | Presses pair to renders FIFO and unmatched presses never drain, so error grows with run length. Demonstrated: **500 ms vs 9190 ms reported median for identical 500 ms latency**. Stronger than the caveat in method rule 3 — report unmatched presses and give the budget a floor. | M |
+| 0d | **Gate serial logging** | C | Untethered there is no USB SOF, so every print falls back to blocking 115200-baud UART inside a critical section: **≈36 ms per page turn (8.6%)**, ~120 ms per boot. Both an optimization and the reason every baseline here is a *tethered* baseline. | S |
 
-Unscheduled, deliberately: **A4, A5** (hardware-risk display experiments),
-**C6** (blocked on the X3 display path being hardware-verified), **D6**
-(embedded-sdmmc fork maintenance), **E4** (only when flash headroom is
-wanted), **F5** (only if board-switching matters), **B5** (micro-costs,
-bundle-only — see issue 02 for why it has no host right now), **B1's
-remaining levers** (only if custom-font cold builds still measure slow).
+### Tier 1 — large, cheap, high confidence
 
-**Stop optimizing the render path.** WS-A is done: a portrait turn is 13 ms
-of layout against ~405 ms of flush, 379 ms of which is panel BUSY. Nothing
-left there is worth more than single-digit milliseconds except the two
-hardware experiments.
+| # | Item | WS | Why it ranks here | Effort |
+|---|---|---|---|---|
+| 1 | **A13 — FastClean's 200 ms trailing settle** | A | Measured: `flush_ms` 686 against `busy_ms` 455, and the 204 ms tail is a `DelayMs(200)` whose only job is to precede the *next* RAM write — which already happens after `Settled`. Pure reordering. **−200 ms (−29%) on every view change, every wake, every menu step.** | S |
+| 2 | **A12 — the 136 ms that is not waveform drive** | A | `busy_ms = 136.0 + 12.79 × frames` fits three modes to under 1 ms. 136 ms is **36% of every Fast BUSY** and is controller interval, not drive. Prime suspect is a CDI nibble never varied since the reference driver. **One byte, one capture; potentially ~77–100 ms off every refresh = 18–24% of a page turn.** Test before building. | S to test |
+| 3 | **A14 + G2 — stop repainting identical frames** | A+G | Two surveys converged independently. Every page turn currently costs **two** full refreshes. G2 fixes it precisely in `app-core`; A14's `fb == prev_fb` guard at the flush seam is the general backstop and also catches the 62-refresh end-of-book case, the loading plate's duplicate flush and six no-op input sites. **Land both** — A14 fails safe where G2 fails dangerous. | S–M |
+| 4 | **C2** — measure sleep current with the fuel gauge, then hold GPIOs if it indicts them | C | **Unblocked 2026-07-30: the first-line experiment needs no meter and no disassembly.** The X3's BQ27220 sits on the battery and keeps integrating while the SoC is in deep sleep, so a charge-register read, a 24–72 h sleep, and a second read give average standby draw. Over 48 h, 15 µA is 0.72 mAh against 300 µA's 14.4 mAh — decisive even at 1 mAh resolution, and a null result *is* the answer. Cost is one register and one `println!`. The series meter drops to a follow-up for if it comes back high. | S |
+
+### Tier 2 — gated on a Tier 0 measurement
+
+| # | Item | WS | Why it ranks here | Effort |
+|---|---|---|---|---|
+| 5 | **Upload instrumentation, then D6** | D | The D2 post-mortem has been misread: it tested write *stalls*, never write *bandwidth*. Arithmetic says **~72% of upload wall time is single-block SD writes** and the ceiling is 1.4× above observed. D6's own precondition was met in July and it stayed deferred. ~25 lines of instrumentation resolve it in one capture. | S–M then L |
+| 6 | **Cache write alignment** | B | Nothing arranges block-aligned writes, so CONT.BIN pays **2 writes + 1 read per 512 B**. Modelled at ~1.75× write amplification, cross-checked against the 2026-07-09 537-block measurement. No format change, no version bump. | S–M |
+| 7 | **E5 + E6 — halve the peak stack chain** | E | `CssRules` ~6.9 KB and `parse_opf`'s duplicated manifest+spine 5,896 B, both on the peak reader chain (26,768 B of 42,136). Two mechanical changes take it to ~14.8 KB. | S–M, M |
+
+### Tier 3 — in-flight branches, ranked by residual work
+
+All six sit on current `main`; none needs a rebase.
+
+| Branch | State | Residual |
+|---|---|---|
+| `opt/a11-landscape-glyph-batching` | **Ready.** Differential test against the code it replaces, on both board configs; all goldens pass **unblessed**. | Device measurement only — the author's own merge gate |
+| `opt/upload-session-token` | **Ready.** Complete, gate anchored not scanned, goldens re-blessed and visually verified on both boards. | Device check |
+| `opt/inflate-caller-owned-window` | **One-line fix.** Silently cuts the Wi-Fi session heap ~10,504 B (67,856 → 57,352) because `heap_a` is literally `size_of::<ZipInflateScratch>()` and the type shrank. `.data`/`.bss` are unchanged, so every gate stays green. | Donate the new decompressor as the third heap region, then a `sleep-sync` run |
+| `opt/d4-directed-wifi-join` | Complete, well-argued (see issue 04 — its separate-file design is better than this PRD's spec). | Four device checks |
+| `opt/single-repaint-per-page-turn` | **Defect — do not land as written.** Suppresses the `Loaded` *event*, not the render, so the app's page count freezes during a background build and the reader strands at the frontier. Method rule 4 through a different door, in the flow B4 just made normal. | Fix the predicate (issue 07 G2), add a test that models a growing page count |
+| `opt/b7-per-config-section-caches` | **Three defects** (issue 02): `&str` byte-slicing that aborts on SD-derived filenames — reproduced end-to-end, reachable from the orphan sweep on every catalog write; a cross-config cache wipe at three sites, not the one admitted; `BookBuildResume` not keyed by layout config. Still the best-structured large change in the queue. | The three fixes, plus prune orphaned sections first |
+
+### Tier 4 — worthwhile, unblocked, smaller
+
+| # | Item | WS | Why | Effort |
+|---|---|---|---|---|
+| 8 | **First open on a deep resume** | B | B4 gives nothing near the end of a book; only a progress indicator helps. | M |
+| 9 | **Prune orphaned section files** | B | ~360 KB of dead space per settings shrink, per book — **and B7 multiplies it**, so this lands first. | S |
+| 10 | **C8 — sleep entry's discarded second pass** | C | ~657 ms of the ~4.1 s sleep entry, thrown away by the next boot's `init_panel`. Refuting check is free (count `bench: refresh` per sleep in an existing capture). Risk gates it. | M + hw |
+| 11 | **C9 — recovery combo on every wake** | C | 28 ms + 48 ADC conversions that cannot succeed on a button wake. One-line gate. | S |
+| 12 | **F10/F11 — close two CI holes** | F | `tools/web-emulator` is built by **no PR gate** (a broken wasm merges green); the bench harness's own 25 tests run nowhere. Both cost ~0 CI wall clock. | S |
+| 13 | **D5** — portal → station handoff | D | ~40–60 s and 3 steps off first-time onboarding. | M |
+| 14 | **E7** — `sort_unstable_by_key` in the wifi scan | E | One stable sort of 20 elements costs a 4,128 B frame and 3.8 KB of flash; stability is irrelevant there. Cheapest item in the roadmap. | S |
+| 15 | **F5 re-scoped** | F | Merriweather is **42.9% of the wasm** and is not the default face: −41% on *every* first visit, not just a board switch. The old deferral reasoning was wrong. | L |
+
+### Unresolved — measure before ranking
+
+**A15 — `fill_plane`'s 528 single-row transfers.** Two surveys costed it and
+disagree by an order of magnitude (~87–139 ms vs ~10 ms), and neither
+reconciles a third data point. The per-transaction model is not identified.
+~20 minutes on device settles it; nobody should write code against it first.
+
+Unscheduled, deliberately: **A4, A5** (hardware-risk display experiments, and
+A5 is X4-only — the owner has no X4), **C6** and **C10** (both gated on C2's
+meter reading), **E4** (flash is 57% used, 2.69 MB spare — less urgent than
+recorded), **B5** (bundle-only; and its cost is stack, not time — see issue
+02), **B1's remaining levers** (only if custom-font cold builds still measure
+slow), **A9** (see below).
+
+**A9 is effectively dead as a bandwidth item.** A plane write is ~26 ms of
+which ~20.9 ms is wire time at the datasheet-ceiling 20 MHz, so the entire
+addressable overhead is ~5 ms and A9 has at most ~3 ms to win — while
+re-spending the 8 KB `TX_BAND` that A3 freed, on the tight board. It survives
+only as the honest home for prestage overlap.
 
 ## Landed
 
@@ -91,7 +156,24 @@ Quote these, not anything older.
 | Progressive first open → prologue | 32.6 s, interactive throughout |
 | Warm reopen (RAM hit) | 13–15 ms |
 
-**Never measured:** deep-sleep current (C2), upload throughput ceiling cause.
+**Two figures retired 2026-07-30, both of which items were sized against:**
+
+- **Fast BUSY is 379 ms, not 421 ms.** The 421 figure is a June 10 2026
+  capture on an unnamed board and is superseded.
+- **Full BUSY on the X3 is 928 ms, not "~3.5 s".** Measured, n=16, in the
+  bench log on disk. C1's "~2 s off every wake" was sized against the 3.5 s
+  figure; the real saving is Full 928 → FastClean 455, about 474 ms. Anything
+  still ranked against 3.5 s needs re-sizing.
+
+**Every latency figure in this document is a *tethered* baseline.** All of
+them were captured with a USB monitor attached, and with a monitor attached
+`esp-println` writes into a USB FIFO. Untethered there is no SOF and the same
+prints take a blocking UART path — see Tier 0d. The numbers are not wrong;
+they describe a device plugged into a laptop, which is not the shipped one.
+
+**Never measured:** deep-sleep current or any other power figure at any
+operating point (C2); the upload throughput ceiling's cause; boot- and
+wake-to-first-paint, though the data is already in every capture on disk.
 **Permanently unavailable: the owner has no X4.** Every "verify on both
 boards" step is X4 compile/clippy/goldens only; on-device X4 validation
 happens if a contributor with hardware appears. C2's wake-reliability step
@@ -122,6 +204,28 @@ is X3-only for this reason.
 6. **Host gates cannot see a stack overflow.** `tools/check.sh stack-frames`
    now disassembles the release build and fails over 24 KB per frame. It
    bounds one frame, not call depth.
+7. **Check whether the answer is already being printed.** Added 2026-07-30,
+   and it is the round's most expensive lesson. The replay split WS-B guessed
+   at for three rounds, boot-to-first-paint, and B4's own headline numbers are
+   all emitted by the firmware on every run and consumed by nothing. Before
+   designing an experiment, `grep` the firmware for what it already prints and
+   `grep` `bench.py` for what it actually reads — they are not the same set.
+8. **A verification gate that can be silently absent is worse than none.**
+   `report --strict` checks nothing on Python < 3.11 and exits 0 without a
+   diagnostic, which is the interpreter `#!/usr/bin/env python3` selects on
+   macOS. Any gate this project relies on should fail loudly when its
+   preconditions are missing.
+9. **Do not carry a conclusion across boards.** "The BUSY floor is OTP and
+   cannot be touched" is true of the X4's SSD1677 and false of the X3's
+   UC8253, which uploads its own LUTs and sets its own frame timing. That one
+   conflation hid 136 ms of every X3 refresh for four rounds, and it is why
+   WS-A is reopened. When a number and a mechanism come from different boards,
+   at least one of them is wrong.
+10. **Suppress the render, never the event.** An event that carries state the
+   reducer needs must always be applied; only the repaint may be skipped.
+   Suppressing the event instead is how the top-ranked branch reintroduced
+   rule 4's one-way trap. A guard placed *below* the reducer — at the flush
+   seam — is structurally immune to this and is the safer default.
 
 ## Workstreams
 
@@ -129,7 +233,8 @@ One issue file each, owning a distinct set of files.
 
 - **WS-A — Display render path** (`issues/01-display-render-path.md`).
   `display/`, `fw/src/display_flush/`, flush/prestage region of
-  `fw/src/tasks/display.rs`, `hal-ext/src/spi_dma.rs`. **Finished.**
+  `fw/src/tasks/display.rs`, `hal-ext/src/spi_dma.rs`. **Reopened
+  2026-07-30** — the panel's own timing is software-set on the X3.
 - **WS-B — Book pipeline** (`issues/02-book-pipeline.md`). `reader-cache/`,
   `fw/src/book_build.rs`, `fw/src/custom_font.rs`, `fw/src/library_sd.rs`,
   `ui/src/reading.rs`, `proto/`.
@@ -142,9 +247,19 @@ One issue file each, owning a distinct set of files.
 - **WS-E — Flash & RAM budget** (`issues/05-flash-ram-budget.md`).
   `.cargo/config.toml`, `display/src/font.rs` (struct only), generated font
   tables.
-- **WS-F — Web emulator & CI** (`issues/06-web-emulator-ci.md`). `web/`,
-  `tools/web-emulator/`, `tools/build-web.sh`, `.github/workflows/`. Fully
-  disjoint from firmware work.
+- **WS-F — Web emulator, CI & the bench harness**
+  (`issues/06-web-emulator-ci.md`). `web/`, `tools/web-emulator/`,
+  `tools/build-web.sh`, **`tools/bench/`**, `.github/workflows/`. Disjoint
+  from firmware work. **Scope widened 2026-07-30** to give the measurement
+  harness an owner — it produces every device number in this roadmap and had
+  none.
+- **WS-G — App state & render invalidation**
+  (`issues/07-app-render-invalidation.md`). `app-core/`, `ui/`, and
+  `fw/src/tasks/app.rs` as the seam. **New 2026-07-30.** The top-ranked item
+  was previously filed under no workstream because this region had no owner.
+  One avoided panel refresh is worth ~405 ms against a 13 ms total layout
+  budget, so the only thing worth ranking here is a render that should not
+  happen — never a CPU micro-optimization.
 
 ### Coordination hazards
 
@@ -157,8 +272,11 @@ One issue file each, owning a distinct set of files.
 3. **Golden frames** gate anything touching a render path:
    `fixtures/golden` + `tools/emulator/tests/reading_golden.rs`, per
    `docs/agents/visual-verification.md`.
-4. **Hardware sign-off** is required for C2, C6, A4, A5 — and C2 needs a µA
-   meter. An agent can prepare the code; the verdict is a measurement.
+4. **Hardware sign-off** is required for C2, C6, A4, A5. An agent can prepare
+   the code; the verdict is a measurement. C2's first-line experiment now
+   needs only a device and patience (the fuel gauge integrates over a long
+   sleep), not an instrument; C6 and A4/A5 still need a meter or a careful
+   visual soak, and A5 needs an X4 nobody has.
 5. **`fw/src/sd_session.rs` is WS-D's.** WS-B benefits from its changes but
    must not modify it.
 
@@ -167,13 +285,31 @@ One issue file each, owning a distinct set of files.
 - Firmware timing: `tools/bench/bench.py` suites (`page-turn`,
   `storage-cache`, `sleep-sync`, `channel-stress --host`, `reader-soak`) per
   `docs/agents/bench.md`. Budgets in `tools/bench/benches.toml`.
+  **Run it under Python ≥ 3.11 until Tier 0a lands** — on 3.9 the `--strict`
+  budget check silently passes everything (`tomllib` is absent, and macOS
+  system `python3` is 3.9.6).
+- **Fold the protocol rules into `docs/agents/bench.md`.** Method rules 3, 7
+  and 8 live only in this scratch document, and `docs/agents/bench.md` — which
+  `AGENTS.md` routes every bench user to — says nothing about cadence,
+  unmatched presses, or the required interpreter. The rule that was learned by
+  losing a round should not be discoverable only by reading the roadmap.
+  Likewise `AGENTS.md`'s verification entry points do not mention
+  `tools/check.sh stack-frames`.
 - Visual: emulator goldens on both boards per
   `docs/agents/visual-verification.md`.
 - Size/stack: `llvm-size -A`, `llvm-nm` on `_stack_start`/`_stack_end`, the
   link-time ASSERT, and `tools/check.sh stack-frames`.
 - Upload: timed `curl --data-binary @book.epub` A/B plus `sd_stats` counters
   (`write_calls` vs `write_blocks` proves batching).
-- Power: external µA/mA meter. bench.py has no power channel.
+- Power: **first line is the X3's BQ27220 as an integrating coulomb counter**
+  over a long deep sleep — no meter, no disassembly, and it stays powered
+  while the SoC does not (issue 03, C2). Do **not** meter the 4-pin pogo
+  cable: it is USB, so it sits on the wrong side of the charger and plugging
+  it in changes the state under test. A series meter on the *battery lead* is
+  the follow-up if the gauge indicts something, and it wants a PPK2-class
+  instrument rather than a DMM — burden voltage on a µA range can brown the
+  device out on a wake spike, and the span needed is ~15 µA to ~100 mA.
+  `bench.py` has no power channel either way.
 
 ## Do not re-propose
 
@@ -215,6 +351,25 @@ matters — without it the idea comes back.
 - **Dependency-dedup and panic/fmt shrinking** — <25 KB combined, poor ROI.
 - **`.eh_frame`** — non-alloc, not in the flash image. Nothing to reclaim.
 - **Optimizing the golden runner** — measured fast (24 scenarios in 0.52 s).
+- **esp-radio power-save during an upload session** — already off.
+  `WifiController::new` calls `set_power_saving(PowerSaveMode::default())` and
+  that default is `None`, with an upstream comment saying the blob default is
+  bad for bandwidth. Refuted from source 2026-07-30; it was suspect 2 in the
+  upload-ceiling list and is now deleted from it.
+- **Decimating the 15 ms input tick** — now has a number, not just a
+  principle. One tick is ~150–250 µs of CPU (~1.0–1.7% duty) and the rest is
+  already WFI, so decimating to 60 ms saves ~**0.06 mA of ~15–20 mA** while
+  costing 4× the press latency. The standing rejection is correct.
+- **A9 as a bandwidth item on the X3** — a plane write is ~26 ms of which
+  ~20.9 ms is wire time at the datasheet-ceiling 20 MHz, so there is at most
+  ~3 ms to win, and double-buffering re-spends the 8 KB `TX_BAND` that A3
+  freed on the tight board. A9 survives only as the home for prestage overlap.
+- **Moving a large stack temporary into a static to "save stack".**
+  `_stack_end` is exactly `ADDR(.bss) + SIZEOF(.bss)` on both boards —
+  verified by address arithmetic and by a natural experiment — so every
+  `.bss` byte trades **1:1** against the main stack. Hoisting is neutral at
+  best and a net loss when the temporary was not on the peak call chain. Only
+  deleting `.bss`, or shrinking a frame on the peak chain, buys margin.
 
 ## Doc drift to fold into whichever PR touches the area
 
