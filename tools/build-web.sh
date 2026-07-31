@@ -5,7 +5,7 @@
 # The panel geometry is compile-time in the firmware, so each board is a
 # separate wasm build. The crate always emits x4_web_emulator.wasm, so each
 # board is built in turn and copied under a per-board name; index.html loads
-# the right one from the ?board= query parameter (default x4).
+# the right one from the ?board= query parameter (default x3).
 #
 # Usage: tools/build-web.sh [OUT_DIR]     (default: _site)
 set -euo pipefail

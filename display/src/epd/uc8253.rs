@@ -13,10 +13,8 @@
 //! (differential 0x29 vs absolute 0xA9). Grayscale is intentionally not
 //! ported: this firmware has no grayscale reader path.
 //!
-//! HARDWARE-UNVERIFIED until an X3 is on the bench (see the plan, Phase 6):
-//! the orientation flags below and the init/resolution bytes come straight
-//! from the reference, but mirrored or offset output is the expected first
-//! symptom to chase here.
+//! The orientation flags, init/resolution bytes, BUSY behavior, waveforms,
+//! and SPI clock are all hardware-verified on the X3.
 
 use super::{RefreshMode, SpiOp};
 

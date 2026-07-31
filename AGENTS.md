@@ -13,9 +13,10 @@ Do not declare a task complete until you have:
 
 1. Run the checks applicable to the changed code.
 2. Fixed failures introduced by your change.
-3. Reviewed the final diff for accidental files, formatting churn, generated artifacts, and unrelated edits.
-4. Reported every verification command you ran and whether it passed.
-5. Explicitly reported any applicable check you could not run and the reason.
+3. Updated documentation to match your code. If your work changes the architecture, display model, storage assumptions, or performance characteristics, update `docs/ARCHITECTURE.md` and `README.md` accordingly.
+4. Reviewed the final diff for accidental files, formatting churn, generated artifacts, and unrelated edits.
+5. Reported every verification command you ran and whether it passed.
+6. Explicitly reported any applicable check you could not run and the reason.
 
 Never say that tests, lint, builds, or visual checks pass unless you actually ran them.
 

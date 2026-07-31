@@ -9,9 +9,8 @@
 //! critical path, so the next `Fast` finds its diff base already loaded —
 //! `flush`'s `prev_staged` says whether that happened.
 //!
-//! UNVERIFIED on hardware (plan Phase 6): the two-phase BUSY timing, panel
-//! orientation, and whether the ported waveforms hold at the chosen SPI
-//! clock are all first-boot iteration points.
+//! The two-phase BUSY timing, panel orientation, ported waveforms,
+//! and SPI clock are hardware-verified on the X3.
 
 use super::{Epd, PanelError};
 use display::epd::uc8253::{

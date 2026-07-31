@@ -16,8 +16,9 @@ X3) and try to flash (`cargo run` or the web flasher). If the device never
 appears as a serial port even after trying another cable/port/browser, assume
 it's locked.
 
-The author's own X4 is unlocked, so the locked-device path still needs a real
-locked-unit confirmation — see [Status](#status).
+Both the original author's X4 and the current maintainer's X3 are unlocked, so
+the locked-device path still needs a real locked-unit confirmation — see
+[Status](#status).
 
 ## The Calendula/CrossPoint layout
 
@@ -99,14 +100,12 @@ same X4 app image under Calendula's in-app updater trigger name.
 
 ## Xteink X3
 
-The X3 is the X4's sibling: same ESP32-C3 and 16 MB flash, but stock X3 units
-may retain a different dual-OTA partition table (`ota_1` at `0x780000`, with
-7.44 MB slots) from the Calendula/CrossPoint layout (`ota_1` at `0x650000`,
-with 6.25 MB slots). It uses a smaller 792×528 UC8253 panel with a BQ27220
-battery gauge instead of the X4's ADC divider. Support lives behind the
-`device-x3` feature; the default build is unchanged for the X4. X3 support has
-now been validated on hardware, so the web flasher and release pipeline publish
-first-class X3 images alongside X4 images.
+The X3 is the X4's sibling: same ESP32-C3 and 16 MB flash, but a smaller
+792×528 UC8253 panel with a BQ27220 battery gauge instead of the X4's ADC
+divider. Stock X3 units may retain a different dual-OTA partition table
+(`ota_1` at `0x780000`, 7.44 MB slots) from the Calendula/CrossPoint layout
+(`ota_1` at `0x650000`, 6.25 MB slots). Support lives behind the `device-x3`
+feature; the web flasher and release pipeline publish first-class X3 images.
 
 Build the X3 images:
 
@@ -114,23 +113,20 @@ Build the X3 images:
 tools/build-release.sh x3
 ```
 
-Produces, in `target/release-images/`: **`firmware-x3.bin`** (flash to
-`0x10000`), **`update-x3.bin`** (rename to `update.bin` for the stock X3 OEM
+Produces in `target/release-images/`: **`firmware-x3.bin`** (flash to
+`0x10000`), **`update-x3.bin`** (rename to `update.bin` for the stock OEM
 updater), **`FWUPDX3.BIN`** (Calendula's X3 one-shot trigger), and
-**`full-flash-x3.bin`** (local whole-flash image for unlocked bench units only).
-Some X3 stock variants also recognize `FWUPDX3.BIN`; publishing both app-image
-aliases covers both bootloader conventions without ever mixing in the X4
-image. The app-only flash paths are otherwise the same as the X4 below.
+**`full-flash-x3.bin`** (unlocked bench units only). Both app-image aliases
+are published to cover both bootloader conventions.
 
 > [!NOTE]
 > The X3 charges and flashes through a **4-pin magnetic pogo connector**, not
 > USB-C. The 2-pin variant of that cable is charge-only and will not enumerate
 > as a serial port. Serial is behind the same native USB-Serial-JTAG as the X4.
 
-When testing, **capture the serial log** (`cargo run` monitors it, or
-`espflash monitor`): panel init, the `X3` BUSY-wait completions, per-refresh
-timings, and `input: bq27220` battery reads are what pin down which bring-up
-value (BUSY timing → orientation → waveforms → battery) needs adjustment.
+When testing, **capture the serial log** (`cargo run` or `espflash monitor`):
+panel init, BUSY-wait completions, per-refresh timings, and `bq27220` battery
+reads are the key bring-up signals.
 
 ## Flashing an unlocked unit
 
@@ -151,9 +147,10 @@ esptool.py --chip esp32c3 write_flash 0x0 target/release-images/full-flash.bin
 > [!WARNING]
 > On a locked unit, USB flashing is the recovery path of last resort and it's
 > disabled. If you install a firmware that has **no over-the-air / SD update
-> path of its own**, and USB re-locks, there is no way back. This firmware does
-> not yet ship that recovery path (see [Status](#status)), so **do not install
-> it on a locked unit you can't afford to brick.**
+> path of its own**, and USB re-locks, there is no way back. This firmware
+> fully implements the SD updater and recovery anchor, but the flow has not
+> yet been validated on a genuinely locked production unit (see [Status](#status)).
+> Do not install it on a locked unit you cannot afford to brick.
 
 Two mechanisms exist, both pioneered by CrossPoint:
 
@@ -377,7 +374,7 @@ Implemented and verified on host tooling:
       The SD read path is separately confirmed from normal boot logs, and
       `validate_image` is host-tested — so every constituent of the SD updater
       is now exercised even though a full `FWUPDATE.BIN` run awaits a card
-      reader (the author's machine has none).
+      reader (the maintainer's machine has none).
 
 - [x] **Boot-time recovery combo** (`fw::ota_update::recover_to_slot0`) — holding
       **Back + Up** at reset repoints `otadata` at slot 0 and reboots into it,
@@ -434,7 +431,7 @@ Not yet done:
       as the end-to-end run above.
 - [ ] **Locked-unit confirmation** — that our app-descriptor eFuse range
       satisfies the stock gate and the OEM SD updater accepts our `update.bin`.
-      Needs a locked device; the author's is unlocked.
+      Needs a locked device; the maintainer's is unlocked.
 - [x] **Xteink X3 bring-up** — the `device-x3` build now has hardware-verified
       UC8253 panel and BQ27220 gauge support, and release tooling publishes X3
       app/SD images beside the X4 images.
