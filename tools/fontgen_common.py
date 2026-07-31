@@ -5,6 +5,9 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 ADVANCE_SCALE = 16
+# Only `generate_mockup_fonts.py` still antialiases and cuts at a threshold.
+# The shipped faces rasterize monochrome (see `rasterize_glyph`), where there
+# is no grey to threshold and `TEXT_RENDER_THRESHOLD` has no effect.
 DEFAULT_THRESHOLD = 128
 MIN_KERNING_ADJUST_FP = 8
 MAX_KERNING_ENTRIES = 1024
@@ -38,15 +41,33 @@ def rasterize_glyph(font, code: int):
     height = max(0, bottom - top)
     if width == 0 or height == 0:
         return (0, 0, left, top, advance, [])
-    image = Image.new("L", (width, height), 0)
+    # Rasterize straight to 1 bit rather than antialiasing to 8 and cutting at
+    # a threshold. A "1"-mode canvas makes Pillow ask FreeType for its
+    # monochrome target, which selects the hinting algorithm built for a
+    # bilevel grid and applies dropout control; `FT_LOAD_MONOCHROME` on its
+    # own does not change hinting, and neither does thresholding after the
+    # fact. Thresholding an antialiased bitmap is what produced asymmetric
+    # bowls and stems that changed width partway down a stroke: a stem landing
+    # half-covered across two pixel columns rounds to one column or two
+    # depending only on where it happens to fall.
+    #
+    # The glyph box stays the one `getbbox` reported, which is the point. The
+    # metrics it feeds -- advance, left/top bearing, width, height -- are what
+    # `text_ink_width` and the wrap use, so pinning the box keeps layout
+    # byte-identical and no cached book repaginates. Measured over 8,469 glyph
+    # renders (3 Literata styles x 19/22/26 px x the full shipped coverage),
+    # 81 of them -- 37 codepoints, all diacritics, fractions or guillemets,
+    # and `_` the only ASCII one -- have mono ink a pixel outside that box and
+    # are clipped to it. Everything else is unchanged in size and position.
+    image = Image.new("1", (width, height), 0)
     draw = ImageDraw.Draw(image)
-    draw.text((-left, -top), ch, font=font, fill=255, anchor="ls")
+    draw.text((-left, -top), ch, font=font, fill=1, anchor="ls")
     rows = []
     for y in range(height):
         byte = 0
         bits = 0
         for x in range(width):
-            if image.getpixel((x, y)) >= THRESHOLD:
+            if image.getpixel((x, y)):
                 byte |= 0x80 >> bits
             bits += 1
             if bits == 8:

@@ -1047,6 +1047,48 @@ pub fn draw_justified_wrapped_literata(
     baseline_y
 }
 
+/// Hands out the pixels of a justified line's slack that do not divide evenly
+/// between its gaps, one gap at a time.
+///
+/// Spending them on the first gaps -- which is what `remainder > 0 { gap += 1 }`
+/// does -- makes every justified line left-heavy: ten gaps with six spare
+/// pixels gave the first six gaps an extra pixel and the last four none, on
+/// every line of every page. Carrying the shortfall the way a Bresenham line
+/// carries its error spreads the wider gaps evenly instead.
+///
+/// The total is unchanged: `next` returns 1 exactly `remainder` times across
+/// `gap_count` calls, because `carry` gains `remainder` per call and sheds
+/// `gap_count` per carry, so the line still ends where it did.
+struct GapSlack {
+    remainder: i16,
+    gap_count: i16,
+    carry: i16,
+}
+
+impl GapSlack {
+    fn new(extra: i16, gap_count: usize) -> Self {
+        let gap_count = gap_count.min(i16::MAX as usize) as i16;
+        Self {
+            remainder: if gap_count > 0 { extra % gap_count } else { 0 },
+            gap_count,
+            carry: 0,
+        }
+    }
+
+    fn next(&mut self) -> i16 {
+        if self.gap_count <= 0 {
+            return 0;
+        }
+        self.carry += self.remainder;
+        if self.carry >= self.gap_count {
+            self.carry -= self.gap_count;
+            1
+        } else {
+            0
+        }
+    }
+}
+
 fn draw_justified_line(
     fb: &mut Framebuffer,
     font: &'static BitmapFont,
@@ -1069,7 +1111,15 @@ fn draw_justified_line(
     let text_width = text_ink_width(font, line);
     let extra = (max_x - x - READER_WRAP_SAFETY - text_width).max(0);
     let extra_per_gap = extra / gap_count as i16;
-    let mut remainder = extra % gap_count as i16;
+    // The pixels that do not divide evenly, spread across the line instead of
+    // spent on the first gaps. Handing the remainder out front-to-back made
+    // every justified line left-heavy: with ten gaps and six spare pixels the
+    // first six gaps were a pixel wider than the last four, on every line of
+    // every page, which reads as a slight leftward crowding. This carries the
+    // shortfall the way a Bresenham line carries its error, so the wider gaps
+    // land evenly. The total is identical either way -- exactly `remainder`
+    // gaps get the extra pixel, so the line still ends where it did.
+    let mut slack = GapSlack::new(extra, gap_count);
     let mut cursor_x = x;
     let mut word_start = None;
 
@@ -1079,11 +1129,7 @@ fn draw_justified_line(
                 let word = &line[start..index];
                 cursor_x = draw_text(fb, font, word, cursor_x, baseline_y, false);
             }
-            let mut gap = measure_text(font, " ") as i16 + extra_per_gap;
-            if remainder > 0 {
-                gap += 1;
-                remainder -= 1;
-            }
+            let gap = measure_text(font, " ") as i16 + extra_per_gap + slack.next();
             cursor_x += gap;
         } else if word_start.is_none() {
             word_start = Some(index);
@@ -1097,6 +1143,42 @@ fn draw_justified_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slack a justified line cannot divide evenly must be spread across
+    /// it, not spent on the first gaps.
+    #[test]
+    fn justified_slack_is_spread_not_front_loaded() {
+        // Ten gaps, six spare pixels. Front-loading gave 1,1,1,1,1,1,0,0,0,0.
+        let mut slack = GapSlack::new(26, 10);
+        let handed: heapless::Vec<i16, 10> = (0..10).map(|_| slack.next()).collect();
+        assert_eq!(
+            handed.iter().sum::<i16>(),
+            6,
+            "total slack must be preserved"
+        );
+        // No run of extra pixels longer than the ratio demands: with 6 of 10
+        // the widest run is two, and the first four gaps are not all wider.
+        assert!(
+            handed[..4].iter().sum::<i16>() < 4,
+            "the leading gaps must not absorb the whole remainder: {handed:?}"
+        );
+        assert_eq!(handed.iter().filter(|v| **v == 1).count(), 6);
+    }
+
+    #[test]
+    fn justified_slack_that_divides_evenly_hands_out_nothing() {
+        let mut slack = GapSlack::new(20, 10);
+        assert_eq!((0..10).map(|_| slack.next()).sum::<i16>(), 0);
+    }
+
+    #[test]
+    fn justified_slack_survives_a_line_with_no_gaps() {
+        // `draw_justified_line` returns early here, but the type must not
+        // divide by zero if that guard ever moves.
+        let mut slack = GapSlack::new(7, 0);
+        assert_eq!(slack.next(), 0);
+    }
+
     use display::font::{style_marker_code, FontFamily, FontWeight};
 
     /// Minimal blocks for exercising the indent predicate: roles, aligns, and
