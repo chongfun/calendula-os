@@ -109,6 +109,7 @@ All six sit on current `main`; none needs a rebase.
 | Branch | State | Residual |
 |---|---|---|
 | `opt/tier0-measurement-integrity` | **Ready**, reviewed and reworked. Rebased onto #56; 56 host tests on both interpreters; clippy clean on X4/X3 × ±default-features. | Merge. Device confirmation of 0d's ~36 ms is still owed but gates nothing — the feature is inert by default |
+| `opt/font-mono-raster` | **Ready.** Rasterizes the shipped faces through FreeType's monochrome target instead of thresholding antialiased output, and spreads justified slack evenly instead of front-loading it. Zero device cost; **zero `GlyphMetric` changes**, so no cache invalidation. Goldens re-blessed on both boards. | Merge; a device photograph would confirm the visual win but gates nothing |
 | `opt/prune-orphan-sections` | **Ready.** Deletes the section files a shrinking rebuild strands (~360 KB per type change, per book), gated on `resume_spine` so a suspended walk is never pruned against. Three fault-harness tests, each mutation-checked. | Merge — **before B7**, which multiplies the leak |
 | `opt/a11-landscape-glyph-batching` | **Ready.** Differential test against the code it replaces, on both board configs; all goldens pass **unblessed**. | Device measurement only — the author's own merge gate |
 | `opt/upload-session-token` | **Ready.** Complete, gate anchored not scanned, goldens re-blessed and visually verified on both boards. | Device check |
@@ -294,6 +295,13 @@ One issue file each, owning a distinct set of files.
   from firmware work. **Scope widened 2026-07-30** to give the measurement
   harness an owner — it produces every device number in this roadmap and had
   none.
+- **WS-H — Typography & text rendering quality**
+  (`issues/08-typography.md`). `tools/fontgen_common.py` and the font
+  generators, the generated `display/src/*_generated.rs` tables, and the text
+  layout in `ui/src/reading.rs`. **New 2026-07-30.** Text quality had no owner
+  because it spans three regions. Note the economics invert here: glyph
+  rasterization runs on the *host*, so quality costs the device nothing and
+  the binding constraint is cache invalidation rather than speed.
 - **WS-G — App state & render invalidation**
   (`issues/07-app-render-invalidation.md`). `app-core/`, `ui/`, and
   `fw/src/tasks/app.rs` as the seam. **New 2026-07-30.** The top-ranked item
