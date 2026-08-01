@@ -3,6 +3,12 @@
 # prints violations without failing. Budget parsing needs Python >= 3.11
 # (tomllib) or the optional `tomli` package; `--strict` refuses to run
 # without one rather than silently checking nothing.
+#
+# Sections and keys are validated against `BUDGET_SCHEMA` in bench.py before
+# any capture is read: an unknown section, a misspelled key, a non-integer
+# value, or an empty section is a load failure, not something to skip past.
+# A key that reads as enforced and is enforced by nothing is the failure this
+# file exists to prevent, so adding a budget here means adding it there too.
 
 [page-turn]
 median_press_to_settled_ms = 550
@@ -21,6 +27,14 @@ full_refresh_busy_min_ms = 3000
 full_refresh_busy_max_ms = 4300
 
 [storage-cache]
+# Warm book opens only: `storage_open` with `ram_hit=false` and no cache build
+# inside the same transaction, which is the path that loads an already-built
+# cache. Measured 57-95 ms across this repo's captures. Until 2026-07-31 this
+# was computed over every `storage_open`, pooling three populations that do
+# not overlap — RAM hits at 0-15 ms and cold builds at 14-64 *seconds* — so a
+# deliberately cold open failed the warm ceiling and a RAM hit pulled the
+# percentile back under it. Cold opens are book-size dependent by
+# construction; the report prints them per path and gates none of them.
 warm_book_open_warn_ms = 150
 catalog_load_warn_ms = 500
 # section_extend_warn_ms was deleted 2026-07-30: no section-extend telemetry

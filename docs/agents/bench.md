@@ -29,6 +29,26 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
 
 - Run `thermal-run` only for targeted refresh, ghosting, sleep-screen,
   enclosure, power, SD-card, or ambient-temperature investigations.
+- **A capture is held to what you asked it for.** `run_start` records the
+  request — seconds, turns, cycles, storage modes — and `run_end` records how
+  the capture ended (`stop_reason`) and whether that was a stop condition
+  anyone asked for (`completed`). `--strict` checks the run against its own
+  request, so a `--cycles 10` run interrupted after one cycle, a `--minutes
+  30` soak stopped at 95 seconds, and a log truncated before its `run_end` all
+  fail instead of passing on the strength of having produced *some* expected
+  telemetry. Ctrl-C completes a capture that asked for no other stop condition
+  and cuts short one that did. Captures predating this carry no completion
+  status and are reported as unverified rather than assumed complete.
+- **Durations and counts must be positive.** `--seconds 0`, `--minutes 0`,
+  `--turns 0` and `--cycles 0` are rejected at the command line; zero used to
+  disable the deadline and capture forever. Omit the flag to capture without
+  that limit.
+- **`--reset-before` is setup, not telemetry.** The capture window opens once
+  the reset has returned, so `--reset-before --seconds 20` collects twenty
+  seconds of telemetry rather than twenty seconds minus espflash and device
+  re-enumeration. `run_end` carries both: `elapsed_s` is the telemetry window
+  a requested duration is checked against, `command_elapsed_s` the whole
+  command.
 - `reader-soak` is a passive capture: the operator runs the described
   reading workflow on the device by hand while bench.py records. Menus
   idle-sleep after 3 minutes (Reading after 10), so keep interacting. **Do
@@ -87,6 +107,34 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   phantom 94 ms "regression". A subsequent capture reported a median of
   477 ms alongside a 2 ms minimum and an 88,670 ms maximum, all marked
   trusted — the median was right and the tails were fiction.
+- **`storage-cache --cold` and `--warm` are checked, not decorative.**
+  bench.py only listens, so the flags cannot steer the device; they declare
+  which paths the run will exercise, get recorded in `run_start`, and
+  `--strict` fails if the capture never took one of them. Cold is shown by a
+  book open that had to build its cache or by a catalog scan; warm by an open
+  served from an already-built cache or from the loaded RAM window, or by a
+  catalog loaded from its snapshot. Passing neither flag is an unrestricted
+  operator-guided capture and requires no particular path. Until 2026-07-31
+  the flags were read once by argparse and never written down or checked, so
+  `--cold --warm --strict` passed without proving either path.
+- **A book open is reported per path, never pooled.** `storage open (ram)`,
+  `(warm)` and `(cold)` are three different pieces of work — 0-15 ms, 57-95 ms
+  and 14-64 *seconds* on this repo's captures — so a pooled percentile
+  describes none of them. `warm_book_open_warn_ms` measures the warm
+  population alone: an open that read the card with no cache build inside the
+  same transaction. It used to be computed over every `storage_open`, where a
+  deliberately cold open failed the *warm* ceiling and a RAM hit pulled the
+  percentile back under it. Cold opens scale with book size by construction
+  and are reported without a budget.
+- **A malformed budget file is a configuration error.** Sections, key
+  spelling, and value types are validated against `BUDGET_SCHEMA` in bench.py
+  before any capture is read, so a typo like `median_press_to_settledd_ms`
+  fails the load instead of silently leaving page-turn with no operative
+  latency threshold. Empty sections, unknown keys, strings and booleans are
+  rejected the same way (`isinstance(True, int)` holds in Python, so a bool
+  would otherwise have reached the comparison as 1). `--strict` refuses to
+  run; a non-strict report says the budgets were not checked. Adding a budget
+  to `benches.toml` means adding it to the schema and reading it somewhere.
 - **A budget with nothing to measure is now a warning**, not a silent pass.
   If a run does not produce the telemetry a configured budget covers — a
   page-turn capture with no refresh events, say — the report says so and
@@ -107,7 +155,12 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   failed handshake reaches too; only `phase=complete ok=true` (or, in logs
   old enough to predate it, the X3 driver's `phase=deep_sleep`) says the
   panel went down. A capture holding only a request now fails `--strict`
-  instead of satisfying the check with its Full refresh.
+  instead of satisfying the check with its Full refresh. *Counting* cycles for
+  `--cycles N` is narrower still: only `phase=complete` with `ok` not false,
+  which is both what ends the capture and what the report checks it against.
+  A failed completion no longer ends the capture as though a cycle landed, and
+  the X3's `phase=deep_sleep` — printed beside `complete` on that device — is
+  not counted a second time.
 - **Budgets measure only their own workflows.** A section is checked against
   the workflows that exercise it (`reader-soak` turns pages, so it answers to
   the page-turn budgets) and against nothing else, so pooling a file with

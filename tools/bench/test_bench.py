@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import io
 import json
 import re
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1986,6 +1988,710 @@ class BenchCaptureLoopTests(unittest.TestCase):
         self.assertEqual(counts.get("prestage", 0), 0)
         self.assertEqual([event["event"] for event in written], ["input", "render"])
         self.assertLess(elapsed, 1.0)
+
+
+class PositiveIntTests(unittest.TestCase):
+    """Zero is a request for nothing, not a request for no limit."""
+
+    def test_a_positive_value_passes_through(self) -> None:
+        self.assertEqual(bench.positive_int("30"), 30)
+
+    def test_zero_is_rejected(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            bench.positive_int("0")
+
+    def test_a_negative_value_is_rejected(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            bench.positive_int("-5")
+
+    def test_a_non_integer_is_rejected(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            bench.positive_int("20s")
+
+    def test_every_duration_and_count_flag_uses_it(self) -> None:
+        """`--seconds 0` used to disable the deadline and run forever.
+
+        The same hole reached `reader-soak --minutes 0`, `thermal-run
+        --minutes 0`, `--turns 0` and `--cycles 0`, because the capture loop
+        asked `if seconds:` and could not tell an explicit zero from an
+        unspecified duration.
+        """
+        parser = argparse.ArgumentParser(prog="bench")
+        sub = parser.add_subparsers(dest="command", required=True)
+        for name in bench.SUITES:
+            bench.add_capture_parser(sub, name)
+        for argv in (
+            ["page-turn", "--seconds", "0"],
+            ["page-turn", "--turns", "0"],
+            ["reader-soak", "--minutes", "0"],
+            ["sleep-sync", "--cycles", "0"],
+            ["thermal-run", "--minutes", "0"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(SystemExit):
+                    with patch("sys.stderr"):
+                        parser.parse_args(argv)
+
+
+class StopReasonTests(unittest.TestCase):
+    def test_reaching_the_count_completes_the_capture(self) -> None:
+        self.assertEqual(
+            bench.observed_stop_reason({"page_turn": 50}, ("page_turn", 50), None),
+            "count",
+        )
+
+    def test_an_expired_deadline_completes_the_capture(self) -> None:
+        self.assertEqual(
+            bench.observed_stop_reason({}, None, time.monotonic() - 1), "duration"
+        )
+
+    def test_a_stream_that_simply_ended_did_not_complete(self) -> None:
+        """The device stopped talking; nobody asked for that."""
+        reason = bench.observed_stop_reason(
+            {"page_turn": 3}, ("page_turn", 50), time.monotonic() + 600
+        )
+        self.assertEqual(reason, "stream-ended")
+        self.assertNotIn(reason, bench.COMPLETED_STOP_REASONS)
+
+    def test_a_short_count_does_not_complete_on_its_deadline_alone(self) -> None:
+        """`--turns 50 --seconds 60` that ran out of time is still short."""
+        self.assertEqual(
+            bench.observed_stop_reason(
+                {"page_turn": 3}, ("page_turn", 50), time.monotonic() - 1
+            ),
+            "duration",
+        )
+
+
+class CaptureContractTests(unittest.TestCase):
+    """What the operator asked for is written down, and checked afterwards."""
+
+    TURN = [
+        "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=1000\n",
+        "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 "
+        "flush_ms=400 req_ms=1000 prestage_ms=15 t_ms=1430\n",
+    ]
+
+    def _capture(
+        self,
+        command: str,
+        lines: list,
+        *,
+        interrupt: bool = False,
+        reset_before: bool = False,
+        on_reset=None,
+        seen: dict = None,
+        seconds: int = None,
+        **extra,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "log.jsonl"
+            args = argparse.Namespace(
+                command=command,
+                port="/dev/bench-test",
+                out=out,
+                seconds=seconds,
+                reset_before=reset_before,
+                espflash="espflash",
+                strict=False,
+                note=[],
+                book=None,
+                **extra,
+            )
+
+            def fake_capture_lines(port, stop_at=None, get_stop_at=None):
+                if seen is not None:
+                    seen["stop_at"] = stop_at
+                if interrupt:
+                    raise KeyboardInterrupt
+                return iter(lines)
+
+            patches = [
+                patch.object(bench, "capture_lines", fake_capture_lines),
+                patch.object(bench, "summarize_paths", return_value=[]),
+                patch("builtins.print"),
+                # The capture echoes the serial stream with sys.stdout.write.
+                patch("sys.stdout", io.StringIO()),
+            ]
+            if on_reset is not None:
+                patches.append(patch.object(bench, "reset_device", on_reset))
+            for entered in patches:
+                entered.start()
+            try:
+                bench.run_capture(args)
+            finally:
+                for entered in reversed(patches):
+                    entered.stop()
+            return [
+                json.loads(line)
+                for line in out.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+    @staticmethod
+    def _marker(events: list, name: str) -> dict:
+        return next(event for event in events if event["event"] == name)
+
+    def test_every_suite_records_what_it_was_asked_for(self) -> None:
+        """Only the page-turn count used to be written down."""
+        cases = [
+            ("page-turn", {"turns": 7}, {"page_turns": 7}),
+            ("sleep-sync", {"cycles": 4}, {"sleep_cycles": 4}),
+            ("reader-soak", {"minutes": 30}, {"seconds": 1800}),
+            (
+                "thermal-run",
+                {"minutes": 45, "suite": "sleep-sync"},
+                {"seconds": 2700},
+            ),
+            (
+                "storage-cache",
+                {"cold": True, "warm": True},
+                {"storage_modes": ["cold", "warm"]},
+            ),
+        ]
+        for command, extra, expected in cases:
+            with self.subTest(command=command):
+                events = self._capture(command, [], **extra)
+                self.assertEqual(
+                    self._marker(events, "run_start")["requested"], expected
+                )
+
+    def test_an_unrequested_mode_is_not_recorded(self) -> None:
+        events = self._capture("storage-cache", [], cold=True, warm=False)
+        self.assertEqual(
+            self._marker(events, "run_start")["requested"], {"storage_modes": ["cold"]}
+        )
+
+    def test_reaching_the_requested_count_records_a_complete_run(self) -> None:
+        events = self._capture("page-turn", self.TURN, turns=1)
+        end = self._marker(events, "run_end")
+        self.assertEqual(end["stop_reason"], "count")
+        self.assertTrue(end["completed"])
+
+    def test_an_interrupted_capture_is_recorded_as_incomplete(self) -> None:
+        """Ctrl-C used to write the same run_end a finished capture wrote."""
+        events = self._capture("page-turn", [], turns=50, interrupt=True)
+        end = self._marker(events, "run_end")
+        self.assertEqual(end["stop_reason"], "interrupt")
+        self.assertFalse(end["completed"])
+
+    def test_ctrl_c_completes_a_capture_that_asked_for_no_stop_condition(self) -> None:
+        """`storage-cache` with no --seconds stops on Ctrl-C by design."""
+        events = self._capture(
+            "storage-cache", [], cold=False, warm=False, interrupt=True
+        )
+        end = self._marker(events, "run_end")
+        self.assertEqual(end["stop_reason"], "operator")
+        self.assertTrue(end["completed"])
+
+    def test_the_capture_window_starts_after_the_reset(self) -> None:
+        """`--reset-before --seconds 20` must collect twenty seconds.
+
+        The deadline was set before the reset, so espflash and the device's
+        re-enumeration ate part of the requested window: the capture collected
+        materially less than it asked for while reporting about 20s elapsed.
+        """
+        seen: dict = {}
+
+        def slow_reset(espflash, port):
+            time.sleep(0.05)
+            seen["reset_done"] = time.monotonic()
+
+        events = self._capture(
+            "storage-cache",
+            [],
+            cold=False,
+            warm=False,
+            reset_before=True,
+            on_reset=slow_reset,
+            seen=seen,
+            seconds=20,
+        )
+        self.assertGreaterEqual(seen["stop_at"] - seen["reset_done"], 20 - 0.001)
+        end = self._marker(events, "run_end")
+        self.assertGreater(end["command_elapsed_s"], end["elapsed_s"])
+
+
+class CaptureCompletionReportTests(unittest.TestCase):
+    """`--strict` must not certify a capture that did not run its course."""
+
+    @staticmethod
+    def _start(suite: str, requested: dict) -> dict:
+        return {
+            "event": "run_start",
+            "suite": suite,
+            "workflow": suite,
+            "host_time": 1785015654.8,
+            "requested": requested,
+        }
+
+    @staticmethod
+    def _end(**fields) -> dict:
+        return {"event": "run_end", "elapsed_s": 1800.0, "completed": True, **fields}
+
+    @staticmethod
+    def _reading(t_ms: int) -> list:
+        return [
+            {"event": "input", "button": "Next", "t_ms": t_ms},
+            {"event": "render", "view": "Reading", "t_ms": t_ms + 430, "req_ms": t_ms},
+        ]
+
+    def _soak(self, requested: dict, end: dict) -> list:
+        return (
+            [self._start("reader-soak", requested)]
+            + self._reading(1000)
+            + [
+                {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+                {
+                    "event": "boot",
+                    "deep_sleep_wake": True,
+                    "gpio": True,
+                    "sleep_image": True,
+                },
+            ]
+            + self._reading(600)
+            + [end]
+        )
+
+    def test_a_complete_capture_is_not_faulted(self) -> None:
+        events = self._soak({"seconds": 1800}, self._end())
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_truncated_log_is_reported(self) -> None:
+        """run_start with no run_end: killed, or the file was cut."""
+        events = self._soak({"seconds": 1800}, {"event": "boot_stage", "stage": "x"})
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(any("recorded no run_end" in w for w in warnings), warnings)
+
+    def test_an_interrupted_soak_is_reported(self) -> None:
+        events = self._soak(
+            {"seconds": 1800},
+            self._end(elapsed_s=42.0, completed=False, stop_reason="interrupt"),
+        )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("did not complete (stopped by interrupt)" in w for w in warnings),
+            warnings,
+        )
+
+    def test_a_soak_short_of_its_window_is_reported(self) -> None:
+        """The minimum valid input/render/sleep/wake sequence is not 30 minutes."""
+        events = self._soak({"seconds": 1800}, self._end(elapsed_s=95.0))
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("95s of the 1800s requested" in w for w in warnings), warnings
+        )
+
+    def test_a_capture_predating_the_contract_is_reported_not_assumed(self) -> None:
+        """An old real capture cannot prove it finished; say so."""
+        events = self._soak({}, {"event": "run_end", "elapsed_s": 1800.0})
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("recorded no completion status" in w for w in warnings), warnings
+        )
+
+    def test_a_hand_built_log_is_not_asked_for_a_run_end(self) -> None:
+        """Fixtures and hand-assembled logs carry no host_time and no run_end."""
+        events = (
+            [{"event": "run_start", "suite": "reader-soak"}]
+            + self._reading(1000)
+            + [
+                {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+                {
+                    "event": "boot",
+                    "deep_sleep_wake": True,
+                    "gpio": True,
+                    "sleep_image": True,
+                },
+            ]
+            + self._reading(600)
+        )
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_sleep_sync_run_short_of_its_cycles_is_reported(self) -> None:
+        """Interrupted after one valid cycle, `--cycles 10` used to pass."""
+        events = [
+            self._start("sleep-sync", {"sleep_cycles": 10}),
+            {"event": "refresh", "mode": "Full", "busy_ms": 3500},
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+            self._end(elapsed_s=61.0),
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("1 of 10 requested sleep cycles" in w for w in warnings), warnings
+        )
+
+    def test_a_sleep_sync_run_that_completed_its_cycles_passes(self) -> None:
+        events = [self._start("sleep-sync", {"sleep_cycles": 2})]
+        for cycle in range(2):
+            events.append(
+                {
+                    "event": "sleep",
+                    "phase": "complete",
+                    "ok": True,
+                    "t_ms": 40000 + cycle * 1000,
+                }
+            )
+        events.append(self._end())
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_failed_completion_is_not_a_cycle(self) -> None:
+        """`phase=complete` prints on both outcomes and carries the result."""
+        events = [
+            self._start("sleep-sync", {"sleep_cycles": 1}),
+            {"event": "sleep", "phase": "complete", "ok": False, "t_ms": 40000},
+            self._end(),
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("0 of 1 requested sleep cycles" in w for w in warnings), warnings
+        )
+
+    def test_the_x3_panel_marker_does_not_double_count_a_cycle(self) -> None:
+        """uc8253 prints phase=deep_sleep beside the display task's complete."""
+        events = [
+            {"event": "sleep", "phase": "deep_sleep", "elapsed_ms": 20, "t_ms": 39990},
+            {"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000},
+        ]
+        self.assertEqual(bench.completed_sleep_cycles(events), 1)
+
+    def test_the_live_stop_rule_and_the_report_count_the_same_cycles(self) -> None:
+        lines = [
+            "bench: sleep phase=requested screen_on=true t_ms=39000\n",
+            "bench: sleep phase=deep_sleep elapsed_ms=20 t_ms=39990\n",
+            "bench: sleep phase=complete ok=true elapsed_ms=30 t_ms=40000\n",
+            "bench: sleep phase=complete ok=false elapsed_ms=30 t_ms=50000\n",
+        ]
+        counts = bench.process_capture_stream(
+            lines, "sleep-sync", stop_target=None, print_lines=False
+        )
+        events = [e for line in lines for e in bench.parse_line(line, "sleep-sync")]
+        self.assertEqual(counts.get("sleep_complete"), 1)
+        self.assertEqual(bench.completed_sleep_cycles(events), 1)
+
+    def test_a_failed_completion_does_not_end_the_capture(self) -> None:
+        """The stop rule counted a failed sleep as a delivered cycle."""
+        lines = [
+            "bench: sleep phase=complete ok=false elapsed_ms=30 t_ms=40000\n",
+            "bench: sleep phase=complete ok=true elapsed_ms=30 t_ms=50000\n",
+        ]
+        counts = bench.process_capture_stream(
+            lines, "sleep-sync", stop_target=("sleep_complete", 1), print_lines=False
+        )
+        self.assertEqual(counts.get("sleep_complete"), 1)
+
+    def test_a_page_turn_run_short_of_its_turns_is_still_reported(self) -> None:
+        events = [
+            self._start("page-turn", {"page_turns": 50}),
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1430, "req_ms": 1000},
+            self._end(),
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("1 of 50 requested page turns" in w for w in warnings), warnings
+        )
+
+
+class StorageModeTests(unittest.TestCase):
+    """`--cold` and `--warm` select a path, so the capture must show it."""
+
+    @staticmethod
+    def _start(modes: list) -> dict:
+        return {
+            "event": "run_start",
+            "suite": "storage-cache",
+            "workflow": "storage-cache",
+            "host_time": 1785015654.8,
+            "requested": {"storage_modes": modes},
+        }
+
+    END = {"event": "run_end", "elapsed_s": 20.0, "completed": True}
+
+    WARM_OPEN = {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72}
+    COLD_BUILD = {"event": "storage_build", "elapsed_ms": 14948}
+    COLD_OPEN = {"event": "storage_open", "ram_hit": False, "elapsed_ms": 15034}
+
+    def test_a_warm_only_capture_fails_the_cold_request(self) -> None:
+        events = [self._start(["cold", "warm"]), self.WARM_OPEN, self.END]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("--cold was requested" in w for w in warnings), warnings
+        )
+        self.assertFalse(any("--warm was requested" in w for w in warnings), warnings)
+
+    def test_a_capture_showing_both_paths_passes(self) -> None:
+        events = [
+            self._start(["cold", "warm"]),
+            self.COLD_BUILD,
+            self.COLD_OPEN,
+            self.WARM_OPEN,
+            self.END,
+        ]
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_catalog_scan_is_cold_evidence(self) -> None:
+        events = [
+            self._start(["cold"]),
+            {"event": "storage_catalog", "action": "scan", "elapsed_ms": 900},
+            self.END,
+        ]
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_catalog_load_is_warm_evidence(self) -> None:
+        events = [
+            self._start(["warm"]),
+            {"event": "storage_catalog", "action": "load", "ok": True, "elapsed_ms": 31},
+            self.END,
+        ]
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_ram_hit_is_warm_evidence(self) -> None:
+        events = [
+            self._start(["warm"]),
+            {"event": "storage_open", "ram_hit": True, "elapsed_ms": 0},
+            self.END,
+        ]
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_capture_with_no_storage_telemetry_fails_both(self) -> None:
+        events = [
+            self._start(["cold", "warm"]),
+            {"event": "render", "view": "Reading", "t_ms": 500},
+            self.END,
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(any("--cold was requested" in w for w in warnings), warnings)
+        self.assertTrue(any("--warm was requested" in w for w in warnings), warnings)
+
+    def test_an_unrecognised_mode_fails_closed(self) -> None:
+        events = [self._start(["tepid"]), self.WARM_OPEN, self.END]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("unrecognised storage mode tepid" in w for w in warnings), warnings
+        )
+
+
+class StorageOpenPopulationTests(unittest.TestCase):
+    """A RAM hit, a cache load and a cache build are three different things.
+
+    Measured on this repo's own captures: 0-15 ms, 57-95 ms, and 14-64
+    *seconds*. Pooling them produced a percentile describing none of them.
+    """
+
+    RUN = [
+        {"event": "storage_catalog", "action": "load", "elapsed_ms": 32},
+        {"event": "storage_build", "elapsed_ms": 14948},
+        # The legacy `storage: open complete` line, printed just before the
+        # structured event and carrying no ram_hit or elapsed_ms.
+        {"event": "storage_open", "status": "Ready", "pages": 441, "legacy": True},
+        {"event": "storage_open", "ram_hit": False, "elapsed_ms": 15034},
+        {"event": "storage_open", "ram_hit": True, "elapsed_ms": 15},
+        {"event": "storage_open", "ram_hit": False, "elapsed_ms": 89},
+    ]
+
+    def test_opens_are_split_by_the_work_they_did(self) -> None:
+        kinds = bench.storage_open_kinds(self.RUN)
+        self.assertEqual(bench.values(kinds["cold"], "elapsed_ms"), [15034])
+        self.assertEqual(bench.values(kinds["ram"], "elapsed_ms"), [15])
+        self.assertEqual(bench.values(kinds["warm"], "elapsed_ms"), [89])
+
+    def test_the_legacy_line_does_not_swallow_the_build(self) -> None:
+        """It parses to a storage_open too, and precedes the structured one."""
+        self.assertEqual(len(bench.storage_open_kinds(self.RUN)["cold"]), 1)
+
+    def test_a_build_does_not_cross_a_run_boundary(self) -> None:
+        """`--all` concatenates captures; a pending build must not follow."""
+        events = [
+            {"event": "storage_build", "elapsed_ms": 14948},
+            {"event": "run_start", "suite": "storage-cache"},
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72},
+        ]
+        kinds = bench.storage_open_kinds(events)
+        self.assertEqual(bench.values(kinds["warm"], "elapsed_ms"), [72])
+        self.assertEqual(kinds["cold"], [])
+
+    def test_a_build_does_not_cross_a_reboot(self) -> None:
+        events = [
+            {"event": "storage_build", "elapsed_ms": 14948},
+            {"event": "boot", "deep_sleep_wake": False},
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72},
+        ]
+        self.assertEqual(bench.storage_open_kinds(events)["cold"], [])
+
+    def test_an_open_with_no_ram_hit_belongs_to_no_population(self) -> None:
+        kinds = bench.storage_open_kinds(self.RUN)
+        self.assertEqual(sum(len(events) for events in kinds.values()), 3)
+
+    def test_a_cold_build_does_not_fail_the_warm_budget(self) -> None:
+        events = [
+            {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"}
+        ] + self.RUN
+        warnings = bench.evaluate_budgets(
+            events, {"storage-cache": {"warm_book_open_warn_ms": 150}}
+        )
+        self.assertEqual(warnings, [])
+
+    def test_a_slow_warm_open_still_fails_the_warm_budget(self) -> None:
+        events = [
+            {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 900},
+        ]
+        warnings = bench.evaluate_budgets(
+            events, {"storage-cache": {"warm_book_open_warn_ms": 150}}
+        )
+        self.assertTrue(
+            any("warm book open p95 900ms above" in w for w in warnings), warnings
+        )
+
+    def test_a_capture_with_only_cold_opens_has_nothing_to_gate(self) -> None:
+        """Fail closed: the budget covered no sample in this run."""
+        events = [
+            {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
+            {"event": "storage_build", "elapsed_ms": 14948},
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 15034},
+        ]
+        warnings = bench.evaluate_budgets(
+            events, {"storage-cache": {"warm_book_open_warn_ms": 150}}
+        )
+        self.assertTrue(
+            any("no warm storage_open events" in w for w in warnings), warnings
+        )
+
+    @patch("builtins.print")
+    def test_the_report_prints_one_line_per_path(self, mock_print) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(dict(event, suite="storage-cache")) for event in self.RUN
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bench.summarize_paths([path], None)
+        printed = "\n".join(
+            str(call.args[0]) for call in mock_print.call_args_list if call.args
+        )
+        self.assertIn("storage open (ram)", printed)
+        self.assertIn("storage open (warm)", printed)
+        self.assertIn("storage open (cold)", printed)
+        # Never a pooled median across the three, as with boot-to-paint.
+        self.assertNotRegex(printed, r"(?m)^storage open\s+median")
+
+
+class BudgetSchemaTests(unittest.TestCase):
+    """A malformed budget file is a configuration error, not a silent pass."""
+
+    def test_a_valid_document_has_no_problems(self) -> None:
+        self.assertEqual(
+            bench.budget_schema_problems(
+                {"page-turn": {"median_press_to_settled_ms": 550}}
+            ),
+            [],
+        )
+
+    def test_a_misspelled_key_is_rejected(self) -> None:
+        """This left page-turn with no operative latency threshold at all."""
+        problems = bench.budget_schema_problems(
+            {"page-turn": {"median_press_to_settledd_ms": 550}}
+        )
+        self.assertTrue(
+            any("unknown key median_press_to_settledd_ms" in p for p in problems),
+            problems,
+        )
+
+    def test_an_unknown_section_is_rejected(self) -> None:
+        problems = bench.budget_schema_problems({"page-turns": {"prestage_warn_ms": 40}})
+        self.assertTrue(any("unknown section [page-turns]" in p for p in problems))
+
+    def test_a_string_threshold_is_rejected(self) -> None:
+        problems = bench.budget_schema_problems(
+            {"page-turn": {"median_press_to_settled_ms": "550"}}
+        )
+        self.assertTrue(any("must be an integer" in p for p in problems), problems)
+
+    def test_a_boolean_threshold_is_rejected(self) -> None:
+        """`isinstance(True, int)` holds, so a bool reached the comparison."""
+        problems = bench.budget_schema_problems(
+            {"page-turn": {"median_press_to_settled_ms": True}}
+        )
+        self.assertTrue(any("must be an integer" in p for p in problems), problems)
+
+    def test_an_empty_section_is_rejected(self) -> None:
+        """It names a workflow, survives section selection, and gates nothing."""
+        problems = bench.budget_schema_problems({"page-turn": {}})
+        self.assertTrue(any("configures no budget" in p for p in problems), problems)
+
+    def test_a_section_that_is_not_a_table_is_rejected(self) -> None:
+        problems = bench.budget_schema_problems({"page-turn": 550})
+        self.assertTrue(any("is not a table" in p for p in problems), problems)
+
+    def _fake_parser(self, document: dict):
+        class FakeParser:
+            @staticmethod
+            def load(handle) -> dict:
+                return document
+
+        return FakeParser()
+
+    def test_load_budgets_reports_a_malformed_document(self) -> None:
+        with patch.object(
+            bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})
+        ):
+            budgets, problem = bench.load_budgets(bench.DEFAULT_BUDGETS)
+        self.assertEqual(budgets, {})
+        self.assertIn("unknown key typo_ms", problem)
+
+    def test_strict_refuses_to_run_against_a_malformed_budget_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log.jsonl"
+            log.write_text(
+                json.dumps(
+                    {"suite": "page-turn", "event": "render", "view": "Reading", "t_ms": 1}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(
+                bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    bench.summarize_paths([log], Path("budgets.toml"), validate_suites=True)
+        self.assertIn("--strict cannot enforce budgets", str(ctx.exception))
+
+    def test_the_checked_in_budgets_satisfy_the_schema(self) -> None:
+        """The file this repo ships must load, or --strict fails everywhere."""
+        text = bench.DEFAULT_BUDGETS.read_text(encoding="utf-8")
+        section = None
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("["):
+                section = line.strip("[]")
+                self.assertIn(section, bench.BUDGET_SCHEMA, f"unknown section {section}")
+                continue
+            key, _, value = (part.strip() for part in line.partition("="))
+            self.assertIn(
+                key, bench.BUDGET_SCHEMA[section], f"{key} is not in BUDGET_SCHEMA"
+            )
+            self.assertRegex(value, r"^-?\d+$", f"{key} is not an integer")
+
+    def test_every_schema_key_is_read_by_bench(self) -> None:
+        """A key in the schema that nothing looks up is a dead budget.
+
+        The registry makes a misspelling in benches.toml impossible; this
+        keeps the registry itself from growing a key no code enforces.
+        """
+        source = Path(bench.__file__).read_text(encoding="utf-8")
+        for section, keys in bench.BUDGET_SCHEMA.items():
+            for key in keys:
+                # The definition in BUDGET_SCHEMA, plus at least one read.
+                self.assertGreaterEqual(
+                    source.count(f'"{key}"'), 2, f"budget key {key} is read by nothing"
+                )
+            self.assertIn(f'"{section}"', source, f"budget section {section} is unused")
 
 
 if __name__ == "__main__":
