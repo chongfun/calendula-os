@@ -69,6 +69,14 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         esp_println::println!("sd: session failed: {:?}", err);
         LibraryScanStatus::Error
     });
+    // The scan's own verdict, captured before the fallback below can replace
+    // it. That fallback keeps the UI on an older in-memory catalog when a
+    // scan fails with books already listed, which is right for the reader and
+    // wrong for telemetry: `library.status` then reads `Ready` for a scan that
+    // did not happen, and a bench capture asked to exercise the cold path
+    // could evidence it with a failure. `Empty` is a scan that succeeded and
+    // found nothing.
+    let scan_ok = status != LibraryScanStatus::Error;
     library.status = if status == LibraryScanStatus::Error && !library.catalog_is_empty() {
         LibraryScanStatus::Ready
     } else {
@@ -76,7 +84,8 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
     };
     esp_println::println!("sd: scan complete, {} epub(s)", library.catalog_count());
     bench_log!(
-        "bench: storage_catalog action=scan status={:?} count={} elapsed_ms={} t_ms={}",
+        "bench: storage_catalog action=scan ok={} status={:?} count={} elapsed_ms={} t_ms={}",
+        scan_ok,
         library.status,
         library.catalog_count(),
         start.elapsed().as_millis(),

@@ -298,10 +298,23 @@ def run_capture(args: argparse.Namespace) -> int:
         print(f"workflow: {workflow} (budgets and signal checks follow it)")
     print(f"port: {args.port}")
     print(f"out:  {args.out}")
-    if seconds is not None:
-        print(f"stop: after {seconds}s")
+    if stop_target and seconds is not None:
+        # Both stop the capture, so say both. Printing only the duration —
+        # the count message sat behind an `elif` — left the operator to
+        # discover the count was still in force when the report faulted the
+        # run for missing it.
+        print(
+            f"stop: after {stop_target[1]} parsed {stop_target[0]}(s) or {seconds}s, "
+            "whichever comes first"
+        )
+        print(
+            f"note: {stop_target[1]} {stop_target[0]}(s) is the contract; --seconds is "
+            "a ceiling, and a capture it cuts short is reported as short"
+        )
     elif stop_target:
         print(f"stop: after {stop_target[1]} parsed {stop_target[0]}(s)")
+    elif seconds is not None:
+        print(f"stop: after {seconds}s")
     else:
         print("stop: Ctrl-C")
     modes = requested.get("storage_modes")
@@ -426,14 +439,31 @@ def capture_request(
     *some* expected telemetry occurred rather than that the requested capture
     happened. `--cold`/`--warm` were worse: read once by argparse, never
     written down, never checked.
+
+    A count and a duration are not both minimums. `--seconds` is offered by
+    every capture command, and `page-turn` and `sleep-sync` always carry a
+    count target (50 turns, 10 cycles) whether or not the operator named one,
+    so recording both made `page-turn --seconds 60` a contract nothing could
+    satisfy: the capture stops at whichever lands first, and then the report
+    faulted it for the other. It passed only if the fiftieth turn happened to
+    land inside the duration tolerance.
+
+    So for a suite that counts, the count is the contract and `--seconds` is
+    a ceiling — an unattended capture's way out, not a window it owes. A
+    deadline that fires early still fails `--strict`, through the count
+    shortfall, which is the honest complaint: the run is short of its
+    samples. Suites with no count (`reader-soak`, `thermal-run`,
+    `storage-cache`) keep the duration as their contract, which is the only
+    one they have.
     """
     request: dict[str, Any] = {}
-    if seconds is not None:
+    count_key = (
+        STOP_EVENT_REQUEST_KEYS.get(stop_target[0]) if stop_target is not None else None
+    )
+    if count_key is not None:
+        request[count_key] = stop_target[1]
+    elif seconds is not None:
         request["seconds"] = seconds
-    if stop_target is not None:
-        key = STOP_EVENT_REQUEST_KEYS.get(stop_target[0])
-        if key is not None:
-            request[key] = stop_target[1]
     modes = [mode for mode in STORAGE_MODES if getattr(args, mode, False)]
     if modes:
         request["storage_modes"] = modes
@@ -872,28 +902,14 @@ def summarize_paths(
     opens = storage_open_kinds(events)
     for kind in STORAGE_OPEN_KINDS:
         print_duration(f"storage open ({kind})", values(opens[kind], "elapsed_ms"))
-    print_duration(
-        "catalog load",
-        values(
-            [
-                event
-                for event in events
-                if event.get("event") == "storage_catalog" and event.get("action") == "load"
-            ],
-            "elapsed_ms",
-        ),
-    )
-    print_duration(
-        "catalog scan",
-        values(
-            [
-                event
-                for event in events
-                if event.get("event") == "storage_catalog" and event.get("action") == "scan"
-            ],
-            "elapsed_ms",
-        ),
-    )
+    # Successful operations only, as the budgets measure: a failed scan or
+    # load returns early and describes the card refusing, not the path.
+    print_duration("catalog load", values(catalog_ops(events, "load"), "elapsed_ms"))
+    print_duration("catalog scan", values(catalog_ops(events, "scan"), "elapsed_ms"))
+    for action in ("load", "scan"):
+        failed = catalog_ops(events, action, succeeded=False)
+        if failed:
+            print(f"catalog {action}:  {len(failed)} failed, left out of the figures above")
     print_duration(
         "progress write",
         values(
@@ -1040,16 +1056,28 @@ def storage_open_kinds(events: list[dict[str, Any]]) -> dict[str, list[dict[str,
     figure; leaving them out keeps a budget from being quietly satisfied by an
     event that measured nothing.
 
-    A pending build does not survive a run boundary or a reboot, for the same
-    reason page-turn pairing does not: `--all` concatenates captures, and a
-    build at the end of one run would otherwise be charged to the first open
-    of the next, filing a warm open as cold.
+    Not every build belongs to an open. A background walk's last step
+    publishes through the same `report_publish`, so it emits `storage_build`
+    with no open in flight, and the display task announces it as
+    `storage_background_build` immediately afterwards. That pairing is
+    reliable — `report_publish` only fires on a `Ready` outcome, which is
+    exactly the case where `finish_background_walk` returns `Ok(())` and the
+    step becomes `Finished` — so the announcement consumes the pending build.
+    Without that, the next ordinary card-backed open, possibly minutes later,
+    was filed as cold: a genuine warm sample lost to the budget, a requested
+    `--warm` path reported missing, and a 72 ms open described as a
+    14-64 second transaction.
+
+    A pending build does not survive a run boundary or a reboot either, for
+    the same reason page-turn pairing does not: `--all` concatenates
+    captures, and a build at the end of one run would otherwise be charged to
+    the first open of the next.
     """
     kinds: dict[str, list[dict[str, Any]]] = {kind: [] for kind in STORAGE_OPEN_KINDS}
     built = False
     for event in events:
         name = event.get("event")
-        if name in {"run_start", "boot"}:
+        if name in {"run_start", "boot", "storage_background_build"}:
             built = False
         elif name == "storage_build":
             built = True
@@ -1075,7 +1103,7 @@ def storage_open_values(events: list[dict[str, Any]], kind: str) -> list[int]:
 STORAGE_MODES = ("cold", "warm")
 
 STORAGE_MODE_EVIDENCE = {
-    "cold": "a book open that had to build its cache, or a catalog scan",
+    "cold": "a book open that had to build its cache, or a catalog scan that succeeded",
     "warm": (
         "a book open served from an already-built cache or from the loaded "
         "RAM window, or a catalog loaded from its snapshot"
@@ -1083,19 +1111,49 @@ STORAGE_MODE_EVIDENCE = {
 }
 
 
+def catalog_ops(
+    events: list[dict[str, Any]], action: str, *, succeeded: bool = True
+) -> list[dict[str, Any]]:
+    """Catalog operations of one kind, by default only the ones that worked.
+
+    A failed operation is not evidence that its path was exercised, and its
+    duration does not belong in a budget: a scan that dies in the SD session
+    and a load that finds no file both stop early, so pooling them with the
+    real thing measures how fast the card said no.
+
+    `ok` absent means a capture predating the field. Scans only gained one
+    when it turned out `status` could not carry the answer — the firmware
+    replaces a failed scan's `Error` with `Ready` when an older in-memory
+    catalog is still listed, so the reader keeps its library, and the marker
+    read as a success. Such a capture cannot evidence the failure either way,
+    so it is treated as it always was rather than retroactively faulted.
+    """
+    return [
+        event
+        for event in events
+        if event.get("event") == "storage_catalog"
+        and event.get("action") == action
+        and ((event.get("ok") is not False) == succeeded)
+    ]
+
+
+def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Storage operations the firmware reported as failed."""
+    return [
+        event
+        for event in events
+        if str(event.get("event", "")).startswith("storage")
+        and event.get("ok") is False
+    ]
+
+
 def storage_mode_exercised(events: list[dict[str, Any]], mode: str) -> bool:
     """Did this capture actually take the storage path it was asked to?"""
     opens = storage_open_kinds(events)
-    catalog = [event for event in events if event.get("event") == "storage_catalog"]
     if mode == "cold":
-        return bool(opens["cold"]) or any(
-            event.get("action") == "scan" for event in catalog
-        )
+        return bool(opens["cold"]) or bool(catalog_ops(events, "scan"))
     if mode == "warm":
-        return bool(opens["warm"] or opens["ram"]) or any(
-            event.get("action") == "load" and event.get("ok") is not False
-            for event in catalog
-        )
+        return bool(opens["warm"] or opens["ram"]) or bool(catalog_ops(events, "load"))
     return False
 
 
@@ -1757,6 +1815,15 @@ BUDGET_SCHEMA: dict[str, set[str]] = {
     },
 }
 
+# Budget keys that bound the same measurement from both sides, as
+# (floor, ceiling). A floor above its ceiling admits no sample at all, so it
+# is a budget guaranteed to fire or guaranteed never to — either way it is not
+# measuring anything, which is what this validation exists to catch.
+BUDGET_BOUND_PAIRS: dict[str, list[tuple[str, str]]] = {
+    "page-turn": [("median_press_to_settled_min_ms", "median_press_to_settled_ms")],
+    "sleep-sync": [("full_refresh_busy_min_ms", "full_refresh_busy_max_ms")],
+}
+
 
 def budget_schema_problems(budgets: dict[str, Any]) -> list[str]:
     """Everything wrong with a budget document, before any capture is read.
@@ -1776,7 +1843,11 @@ def budget_schema_problems(budgets: dict[str, Any]) -> list[str]:
     reached the comparison as 1.
 
     An empty section is rejected for the same reason: it names a workflow,
-    survives `budget_sections_in_play`, and gates nothing.
+    survives `budget_sections_in_play`, and gates nothing. So is a negative
+    threshold, which is the type check's blind spot: `-1` is a perfectly good
+    `int` and, as a floor, is a budget no measurement can fall below — the
+    same silently-disabled gate a misspelling produces, spelled differently.
+    And so is a floor above its own ceiling, which no sample can satisfy.
 
     Reported as a load failure, so `--strict` refuses to run and a non-strict
     report says the budgets were not checked, rather than either one
@@ -1808,6 +1879,32 @@ def budget_schema_problems(budgets: dict[str, Any]) -> list[str]:
                     f"[{section}] {key} must be an integer number of "
                     f"milliseconds, not {value!r}"
                 )
+            elif value < 0:
+                problems.append(
+                    f"[{section}] {key} is {value}; a millisecond budget "
+                    "cannot be negative, and as a bound it would gate nothing"
+                )
+        problems.extend(budget_bound_problems(section, entries))
+    return problems
+
+
+def budget_bound_problems(section: str, entries: dict[str, Any]) -> list[str]:
+    """Floors that sit above their own ceilings."""
+    problems = []
+    for floor_key, ceiling_key in BUDGET_BOUND_PAIRS.get(section, []):
+        floor = entries.get(floor_key)
+        ceiling = entries.get(ceiling_key)
+        if (
+            isinstance(floor, int)
+            and isinstance(ceiling, int)
+            and not isinstance(floor, bool)
+            and not isinstance(ceiling, bool)
+            and floor > ceiling
+        ):
+            problems.append(
+                f"[{section}] {floor_key} ({floor}ms) is above {ceiling_key} "
+                f"({ceiling}ms), so no measurement can satisfy both"
+            )
     return problems
 
 
@@ -1944,17 +2041,13 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             warnings, "storage-cache", storage_cache, "warm_book_open_warn_ms",
             runs, per_run_open, "warm storage_open events",
         )
+        # Successful loads only: a load that found no catalog file returns in
+        # a fraction of the time a real one takes, so pooling it measured how
+        # fast the card said no and pulled the percentile away from the path
+        # the budget is about.
         per_run_catalog, catalog_load = per_run_samples(
             runs,
-            lambda run_events: values(
-                [
-                    event
-                    for event in run_events
-                    if event.get("event") == "storage_catalog"
-                    and event.get("action") == "load"
-                ],
-                "elapsed_ms",
-            ),
+            lambda run_events: values(catalog_ops(run_events, "load"), "elapsed_ms"),
         )
         warn_if_above(
             warnings,
@@ -2018,6 +2111,23 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
         elif workflow == "storage-cache":
             if not any(name.startswith("storage") for name in event_names):
                 warnings.append(f"{label}: no storage telemetry captured")
+            # The same rule as a failed sleep phase in a sleep suite: the
+            # workflow that owns this telemetry is the one that has to answer
+            # for it, and a later success does not undo the failure. The
+            # unstructured `sd: session failed` line is deliberately not
+            # parsed, so the structured `ok=false` is the only record.
+            failed = failed_storage_ops(signal_events)
+            if failed:
+                actions = sorted(
+                    {
+                        f"{event.get('event')} {event.get('action')}".strip()
+                        for event in failed
+                    }
+                )
+                warnings.append(
+                    f"{label}: {len(failed)} failed storage operation(s) "
+                    f"captured ({', '.join(actions)})"
+                )
         elif workflow == "sleep-sync":
             if not any(is_terminal_sleep(event) for event in signal_events):
                 warnings.append(

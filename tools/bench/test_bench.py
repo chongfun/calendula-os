@@ -2082,6 +2082,7 @@ class CaptureContractTests(unittest.TestCase):
         on_reset=None,
         seen: dict = None,
         seconds: int = None,
+        printed: list = None,
         **extra,
     ):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2106,10 +2107,14 @@ class CaptureContractTests(unittest.TestCase):
                     raise KeyboardInterrupt
                 return iter(lines)
 
+            def record(*parts, **_kwargs):
+                if printed is not None:
+                    printed.append(" ".join(str(part) for part in parts))
+
             patches = [
                 patch.object(bench, "capture_lines", fake_capture_lines),
                 patch.object(bench, "summarize_paths", return_value=[]),
-                patch("builtins.print"),
+                patch("builtins.print", record),
                 # The capture echoes the serial stream with sys.stdout.write.
                 patch("sys.stdout", io.StringIO()),
             ]
@@ -2676,7 +2681,9 @@ class BudgetSchemaTests(unittest.TestCase):
             self.assertIn(
                 key, bench.BUDGET_SCHEMA[section], f"{key} is not in BUDGET_SCHEMA"
             )
-            self.assertRegex(value, r"^-?\d+$", f"{key} is not an integer")
+            # No leading minus: a negative millisecond budget is a bound no
+            # measurement can cross, which is a gate that is silently off.
+            self.assertRegex(value, r"^\d+$", f"{key} is not a non-negative integer")
 
     def test_every_schema_key_is_read_by_bench(self) -> None:
         """A key in the schema that nothing looks up is a dead budget.
@@ -2692,6 +2699,362 @@ class BudgetSchemaTests(unittest.TestCase):
                     source.count(f'"{key}"'), 2, f"budget key {key} is read by nothing"
                 )
             self.assertIn(f'"{section}"', source, f"budget section {section} is unused")
+
+
+class CountAndDurationContractTests(unittest.TestCase):
+    """A count and a duration are not both minimums.
+
+    `--seconds` is offered by every capture command and `page-turn` and
+    `sleep-sync` always carry a count target, so recording both made
+    `page-turn --seconds 60` unsatisfiable: the capture stops at whichever
+    lands first and the report then faulted it for the other.
+    """
+
+    def _request(self, command: str, seconds, **extra) -> dict:
+        args = argparse.Namespace(command=command, seconds=seconds, **extra)
+        suite = bench.SUITES[command]
+        return bench.capture_request(
+            args, bench.capture_seconds(args), bench.stop_target_for(args, suite)
+        )
+
+    def test_a_counting_suite_records_only_its_count(self) -> None:
+        self.assertEqual(
+            self._request("page-turn", 60, turns=50), {"page_turns": 50}
+        )
+        self.assertEqual(
+            self._request("sleep-sync", 60, cycles=10), {"sleep_cycles": 10}
+        )
+
+    def test_a_counting_suite_without_seconds_is_unchanged(self) -> None:
+        self.assertEqual(self._request("page-turn", None, turns=50), {"page_turns": 50})
+
+    def test_a_duration_suite_records_its_duration(self) -> None:
+        self.assertEqual(
+            self._request("storage-cache", 20, cold=False, warm=False),
+            {"seconds": 20},
+        )
+        self.assertEqual(
+            self._request("reader-soak", None, minutes=30), {"seconds": 1800}
+        )
+        self.assertEqual(
+            self._request("thermal-run", None, minutes=45, suite="page-turn"),
+            {"seconds": 2700},
+        )
+
+    @staticmethod
+    def _page_turn_run(turns: int, requested: int, elapsed_s: float, stop: str) -> list:
+        events = [
+            {
+                "event": "run_start",
+                "suite": "page-turn",
+                "workflow": "page-turn",
+                "host_time": 1.0,
+                "requested": {"page_turns": requested},
+            }
+        ]
+        for index in range(turns):
+            press = 1000 + index * 3000
+            events.append({"event": "input", "button": "Next", "t_ms": press})
+            events.append(
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": press + 470,
+                    "req_ms": press,
+                }
+            )
+        events.append(
+            {
+                "event": "run_end",
+                "elapsed_s": elapsed_s,
+                "stop_reason": stop,
+                "completed": True,
+            }
+        )
+        return events
+
+    def test_the_count_landing_first_is_a_clean_pass(self) -> None:
+        """`--turns 3 --seconds 600`, done in twelve seconds."""
+        events = self._page_turn_run(3, 3, 12.0, "count")
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_the_deadline_landing_first_is_reported_as_short(self) -> None:
+        """`--turns 50 --seconds 60`, cut off at two turns.
+
+        One complaint, and it is the true one: the run is short of its
+        samples. It must not also be faulted for a duration it never owed.
+        """
+        events = self._page_turn_run(2, 50, 60.0, "duration")
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertEqual(
+            warnings,
+            [
+                "page-turn: 2 of 50 requested page turns captured; the run is "
+                "short of the sample count it was asked for"
+            ],
+        )
+
+    def test_the_startup_banner_names_both_stop_conditions(self) -> None:
+        """The count message used to sit behind an `elif` and never print.
+
+        The operator was shown only the duration, then had the report fault
+        the run for a count nothing had told them was still in force.
+        """
+        printed: list = []
+        CaptureContractTests()._capture(
+            "page-turn", [], turns=50, seconds=60, printed=printed
+        )
+        banner = "\n".join(printed)
+        self.assertIn("50 parsed page_turn(s) or 60s, whichever comes first", banner)
+        self.assertIn("--seconds is a ceiling", banner)
+
+    def test_a_count_only_capture_names_just_the_count(self) -> None:
+        printed: list = []
+        CaptureContractTests()._capture("page-turn", [], turns=50, printed=printed)
+        banner = "\n".join(printed)
+        self.assertIn("stop: after 50 parsed page_turn(s)", banner)
+        self.assertNotIn("ceiling", banner)
+
+
+class BackgroundBuildTests(unittest.TestCase):
+    """A background walk's build belongs to no open."""
+
+    def test_a_background_build_does_not_make_the_next_open_cold(self) -> None:
+        """The exact lifecycle: build, announcement, then an ordinary open."""
+        events = [
+            {"event": "storage_build", "elapsed_ms": 14948},
+            {"event": "storage_background_build", "book_id": 2, "elapsed_ms": 61000},
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72},
+        ]
+        kinds = bench.storage_open_kinds(events)
+        self.assertEqual(bench.values(kinds["warm"], "elapsed_ms"), [72])
+        self.assertEqual(kinds["cold"], [])
+
+    def test_a_foreground_build_still_makes_its_open_cold(self) -> None:
+        events = [
+            {"event": "storage_build", "elapsed_ms": 14948},
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 15034},
+        ]
+        self.assertEqual(
+            bench.values(bench.storage_open_kinds(events)["cold"], "elapsed_ms"),
+            [15034],
+        )
+
+    def test_the_warm_sample_survives_into_the_budget(self) -> None:
+        events = [
+            {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
+            {"event": "storage_build", "elapsed_ms": 14948},
+            {"event": "storage_background_build", "book_id": 2, "elapsed_ms": 61000},
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 900},
+        ]
+        warnings = bench.evaluate_budgets(
+            events, {"storage-cache": {"warm_book_open_warn_ms": 150}}
+        )
+        self.assertTrue(
+            any("warm book open p95 900ms above" in w for w in warnings), warnings
+        )
+
+    def test_a_requested_warm_path_is_not_lost_to_a_background_build(self) -> None:
+        events = [
+            {
+                "event": "run_start",
+                "suite": "storage-cache",
+                "workflow": "storage-cache",
+                "host_time": 1.0,
+                "requested": {"storage_modes": ["warm"]},
+            },
+            {"event": "storage_build", "elapsed_ms": 14948},
+            {"event": "storage_background_build", "book_id": 2, "elapsed_ms": 61000},
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72},
+            {"event": "run_end", "elapsed_s": 90.0, "completed": True},
+        ]
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+
+class CatalogResultTests(unittest.TestCase):
+    """A failed catalog operation is not evidence, and not a sample."""
+
+    def test_the_scan_line_carries_its_own_result(self) -> None:
+        event = bench.parse_line(
+            "bench: storage_catalog action=scan ok=false status=Ready count=7 "
+            "elapsed_ms=900 t_ms=4200",
+            "storage-cache",
+        )[0]
+        self.assertEqual(event["action"], "scan")
+        self.assertFalse(event["ok"])
+        # The firmware keeps the reader on its older in-memory catalog, so the
+        # status says Ready for a scan that did not happen.
+        self.assertEqual(event["status"], "Ready")
+
+    @staticmethod
+    def _run(catalog: dict, modes: list) -> list:
+        return [
+            {
+                "event": "run_start",
+                "suite": "storage-cache",
+                "workflow": "storage-cache",
+                "host_time": 1.0,
+                "requested": {"storage_modes": modes},
+            },
+            dict(catalog, event="storage_catalog"),
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72},
+            {"event": "run_end", "elapsed_s": 20.0, "completed": True},
+        ]
+
+    def test_a_failed_scan_is_not_cold_evidence(self) -> None:
+        events = self._run(
+            {"action": "scan", "ok": False, "status": "Ready", "elapsed_ms": 900},
+            ["cold"],
+        )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(any("--cold was requested" in w for w in warnings), warnings)
+
+    def test_a_successful_scan_is_cold_evidence(self) -> None:
+        events = self._run(
+            {"action": "scan", "ok": True, "status": "Ready", "elapsed_ms": 900},
+            ["cold"],
+        )
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(events) if "--cold" in w], []
+        )
+
+    def test_a_scan_predating_the_field_is_still_cold_evidence(self) -> None:
+        """It cannot evidence the failure either way; do not fault it now."""
+        events = self._run(
+            {"action": "scan", "status": "Ready", "count": 7, "elapsed_ms": 900},
+            ["cold"],
+        )
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(events) if "--cold" in w], []
+        )
+
+    def test_a_failed_scan_is_reported_even_when_nothing_was_requested(self) -> None:
+        events = [
+            {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
+            {"event": "storage_catalog", "action": "scan", "ok": False, "elapsed_ms": 900},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("failed storage operation(s)" in w for w in warnings), warnings
+        )
+
+    def test_a_failed_load_is_not_in_the_catalog_budget(self) -> None:
+        events = [
+            {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
+            {"event": "storage_catalog", "action": "load", "ok": True, "elapsed_ms": 31},
+            {"event": "storage_catalog", "action": "load", "ok": False, "elapsed_ms": 4000},
+        ]
+        warnings = bench.evaluate_budgets(
+            events, {"storage-cache": {"catalog_load_warn_ms": 500}}
+        )
+        self.assertEqual(
+            [w for w in warnings if "catalog load p95" in w], [], warnings
+        )
+
+    def test_a_failed_load_is_not_warm_evidence(self) -> None:
+        events = [
+            {
+                "event": "run_start",
+                "suite": "storage-cache",
+                "workflow": "storage-cache",
+                "host_time": 1.0,
+                "requested": {"storage_modes": ["warm"]},
+            },
+            {"event": "storage_catalog", "action": "load", "ok": False, "elapsed_ms": 4},
+            {"event": "run_end", "elapsed_s": 20.0, "completed": True},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(any("--warm was requested" in w for w in warnings), warnings)
+
+    @patch("builtins.print")
+    def test_the_report_names_the_failed_operations(self, mock_print) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(event)
+                    for event in [
+                        {"suite": "storage-cache", "event": "run_start"},
+                        {
+                            "suite": "storage-cache",
+                            "event": "storage_catalog",
+                            "action": "scan",
+                            "ok": False,
+                            "elapsed_ms": 900,
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bench.summarize_paths([path], None)
+        printed = "\n".join(
+            str(call.args[0]) for call in mock_print.call_args_list if call.args
+        )
+        self.assertIn("catalog scan:  1 failed", printed)
+
+
+class BudgetValueTests(unittest.TestCase):
+    """An integer is not automatically a usable threshold."""
+
+    def test_a_negative_threshold_is_rejected(self) -> None:
+        """`-1` as a floor is a gate no measurement can fall below."""
+        problems = bench.budget_schema_problems(
+            {"page-turn": {"median_press_to_settled_min_ms": -1}}
+        )
+        self.assertTrue(any("cannot be negative" in p for p in problems), problems)
+
+    def test_zero_is_allowed(self) -> None:
+        """A zero ceiling is degenerate but honest: everything exceeds it."""
+        self.assertEqual(
+            bench.budget_schema_problems({"page-turn": {"prestage_warn_ms": 0}}), []
+        )
+
+    def test_a_floor_above_its_ceiling_is_rejected(self) -> None:
+        problems = bench.budget_schema_problems(
+            {"sleep-sync": {"full_refresh_busy_min_ms": 4300, "full_refresh_busy_max_ms": 3000}}
+        )
+        self.assertTrue(
+            any("no measurement can satisfy both" in p for p in problems), problems
+        )
+
+    def test_the_page_turn_median_pair_is_checked_too(self) -> None:
+        problems = bench.budget_schema_problems(
+            {
+                "page-turn": {
+                    "median_press_to_settled_min_ms": 900,
+                    "median_press_to_settled_ms": 550,
+                }
+            }
+        )
+        self.assertTrue(
+            any("no measurement can satisfy both" in p for p in problems), problems
+        )
+
+    def test_a_well_ordered_pair_passes(self) -> None:
+        self.assertEqual(
+            bench.budget_schema_problems(
+                {
+                    "sleep-sync": {
+                        "full_refresh_busy_min_ms": 3000,
+                        "full_refresh_busy_max_ms": 4300,
+                    }
+                }
+            ),
+            [],
+        )
+
+    def test_one_half_of_a_pair_alone_is_fine(self) -> None:
+        self.assertEqual(
+            bench.budget_schema_problems({"sleep-sync": {"full_refresh_busy_max_ms": 4300}}),
+            [],
+        )
+
+    def test_every_bound_pair_is_a_real_schema_key(self) -> None:
+        for section, pairs in bench.BUDGET_BOUND_PAIRS.items():
+            self.assertIn(section, bench.BUDGET_SCHEMA)
+            for key in (key for pair in pairs for key in pair):
+                self.assertIn(key, bench.BUDGET_SCHEMA[section])
 
 
 if __name__ == "__main__":
