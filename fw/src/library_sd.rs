@@ -104,10 +104,20 @@ pub(crate) fn load_catalog_cache(
     library.clear_catalog();
     // A valid header (even an empty catalog) counts as loaded; a missing or
     // wrong-version file returns false so the caller runs a fresh scan.
-    let loaded = sd_session::with_root(epd, sd_cs, |root| {
+    let outcome = sd_session::with_root(epd, sd_cs, |root| {
         read_catalog_window(root, library, 0).is_ok()
-    })
-    .unwrap_or(false);
+    });
+    // Three outcomes `ok` alone cannot tell apart, and the difference decides
+    // whether a bench capture is looking at a fault or at the ordinary cold
+    // path: a `miss` is what makes the caller queue `RefreshCatalog`, so a
+    // card with no snapshot yet prints one immediately before the scan that
+    // builds it. Reading that as a failure faults a healthy cold boot.
+    let result = match &outcome {
+        Ok(true) => "hit",
+        Ok(false) => "miss",
+        Err(_) => "error",
+    };
+    let loaded = outcome.unwrap_or(false);
     library.status = if !loaded {
         LibraryScanStatus::NotScanned
     } else if library.catalog_is_empty() {
@@ -123,9 +133,12 @@ pub(crate) fn load_catalog_cache(
     } else {
         esp_println::println!("sd: catalog cache unavailable");
     }
+    // `ok` keeps its original meaning — the snapshot loaded — so captures
+    // that predate `result` still read the same way.
     bench_log!(
-        "bench: storage_catalog action=load ok={} count={} elapsed_ms={} t_ms={}",
+        "bench: storage_catalog action=load ok={} result={} count={} elapsed_ms={} t_ms={}",
         loaded,
+        result,
         library.catalog_count(),
         start.elapsed().as_millis(),
         Instant::now().as_millis(),

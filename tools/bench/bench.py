@@ -902,14 +902,28 @@ def summarize_paths(
     opens = storage_open_kinds(events)
     for kind in STORAGE_OPEN_KINDS:
         print_duration(f"storage open ({kind})", values(opens[kind], "elapsed_ms"))
-    # Successful operations only, as the budgets measure: a failed scan or
-    # load returns early and describes the card refusing, not the path.
-    print_duration("catalog load", values(catalog_ops(events, "load"), "elapsed_ms"))
-    print_duration("catalog scan", values(catalog_ops(events, "scan"), "elapsed_ms"))
+    # The same population the budgets measure, so the printed figure and the
+    # gated one cannot disagree about what was sampled. What is left out is
+    # named below rather than hidden.
+    print_duration("catalog load", values(catalog_samples(events, "load"), "elapsed_ms"))
+    print_duration("catalog scan", values(catalog_samples(events, "scan"), "elapsed_ms"))
     for action in ("load", "scan"):
-        failed = catalog_ops(events, action, succeeded=False)
-        if failed:
-            print(f"catalog {action}:  {len(failed)} failed, left out of the figures above")
+        excluded = [
+            event
+            for event in catalog_events(events, action)
+            if not catalog_succeeded(event) and not unverifiable_catalog_op(event)
+        ]
+        if not excluded:
+            continue
+        errors = sum(1 for event in excluded if catalog_load_error(event))
+        reasons = []
+        if action == "load" and errors < len(excluded):
+            reasons.append(f"{len(excluded) - errors} found no snapshot (normal cold path)")
+        if errors:
+            reasons.append(f"{errors} card error")
+        if action == "scan":
+            reasons = [f"{len(excluded)} failed"]
+        print(f"catalog {action}:  " + ", ".join(reasons) + ", left out of the figure above")
     print_duration(
         "progress write",
         values(
@@ -1111,50 +1125,148 @@ STORAGE_MODE_EVIDENCE = {
 }
 
 
-def catalog_ops(
-    events: list[dict[str, Any]], action: str, *, succeeded: bool = True
-) -> list[dict[str, Any]]:
-    """Catalog operations of one kind, by default only the ones that worked.
-
-    A failed operation is not evidence that its path was exercised, and its
-    duration does not belong in a budget: a scan that dies in the SD session
-    and a load that finds no file both stop early, so pooling them with the
-    real thing measures how fast the card said no.
-
-    `ok` absent means a capture predating the field. Scans only gained one
-    when it turned out `status` could not carry the answer — the firmware
-    replaces a failed scan's `Error` with `Ready` when an older in-memory
-    catalog is still listed, so the reader keeps its library, and the marker
-    read as a success. Such a capture cannot evidence the failure either way,
-    so it is treated as it always was rather than retroactively faulted.
-    """
+def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, Any]]:
     return [
         event
         for event in events
-        if event.get("event") == "storage_catalog"
-        and event.get("action") == action
-        and ((event.get("ok") is not False) == succeeded)
+        if event.get("event") == "storage_catalog" and event.get("action") == action
+    ]
+
+
+# A catalog load reports three outcomes its original `ok` could not tell
+# apart, and the difference decides whether a capture is looking at a fault or
+# at the ordinary cold path.
+#
+#   hit    the snapshot loaded.
+#   miss   there was no valid snapshot to load. This is *normal*: it is what
+#          makes the firmware queue `RefreshCatalog`, so a card whose catalog
+#          has not been built yet prints one immediately before the scan that
+#          builds it. Reading it as a failure faulted a healthy cold boot,
+#          which `--reset-before` makes the common case.
+#   error  the card refused the session.
+CATALOG_LOAD_RESULTS = {"hit", "miss", "error"}
+
+
+def catalog_load_hit(event: dict[str, Any]) -> bool:
+    """The snapshot loaded — the only load that evidences the warm path."""
+    result = event.get("result")
+    if isinstance(result, str):
+        return result == "hit"
+    return event.get("ok") is True
+
+
+def catalog_load_error(event: dict[str, Any]) -> bool:
+    """The card refused, as opposed to having nothing to hand over.
+
+    Only ever asserted from `result`. A pre-`result` capture's `ok=false`
+    covers both that and an ordinary miss, and the miss is overwhelmingly the
+    common one, so it is not called a failure on that evidence.
+    """
+    return event.get("result") == "error"
+
+
+def unverifiable_catalog_op(event: dict[str, Any]) -> bool:
+    """A catalog line that does not say how the operation went.
+
+    Loads have carried `ok` since the harness was written, so in practice this
+    is a scan from firmware older than the `ok` the scan line now carries —
+    which is every capture predating it, because `status` could not answer the
+    question: the firmware replaces a failed scan's `Error` with `Ready` when
+    an older in-memory catalog is still listed, so the marker read as success.
+    """
+    if isinstance(event.get("result"), str) or isinstance(event.get("ok"), bool):
+        return False
+    return event.get("event") == "storage_catalog"
+
+
+def catalog_succeeded(event: dict[str, Any]) -> bool:
+    """Confirmed success, which is what strict evidence is allowed to rest on."""
+    if event.get("action") == "load":
+        return catalog_load_hit(event)
+    return event.get("ok") is True
+
+
+def catalog_samples(events: list[dict[str, Any]], action: str) -> list[dict[str, Any]]:
+    """The operations whose duration describes the path a budget is about.
+
+    Confirmed successes, plus lines too old to say — a deliberate
+    compatibility policy, and the one place it is applied. A budget asks how
+    long the working path took, and for a legacy line the harness assumes what
+    it always assumed rather than blanking the figure for every capture made
+    before the result fields existed. Strict *evidence* takes the opposite
+    view and demands proof (see `storage_mode_evidence`), because proving a
+    requested path ran is a claim, not a measurement.
+
+    Confirmed non-successes are excluded either way: a miss and a refused
+    session both return in a fraction of the time the real thing takes, so
+    pooling them measures how fast the card said no.
+    """
+    return [
+        event
+        for event in catalog_events(events, action)
+        if catalog_succeeded(event) or unverifiable_catalog_op(event)
     ]
 
 
 def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Storage operations the firmware reported as failed."""
-    return [
-        event
-        for event in events
-        if str(event.get("event", "")).startswith("storage")
-        and event.get("ok") is False
-    ]
+    """Storage operations the firmware reported as genuinely failed.
+
+    A catalog load is judged on `result` alone, because its `ok=false` is the
+    normal cold path — no snapshot yet — far more often than it is a fault.
+    Everything else storage-side (`storage_progress` writes and flushes) means
+    what `ok=false` says.
+    """
+    failed = []
+    for event in events:
+        if not str(event.get("event", "")).startswith("storage"):
+            continue
+        if event.get("event") == "storage_catalog" and event.get("action") == "load":
+            if catalog_load_error(event):
+                failed.append(event)
+        elif event.get("ok") is False:
+            failed.append(event)
+    return failed
 
 
-def storage_mode_exercised(events: list[dict[str, Any]], mode: str) -> bool:
-    """Did this capture actually take the storage path it was asked to?"""
+# What `storage_mode_evidence` found, worst-case first: a mode the capture
+# never took, and a mode whose only witness is telemetry too old to say
+# whether it worked, both fail `--strict` — but they are different problems
+# and the operator fixes them differently (capture it, or reflash).
+STORAGE_MODE_ABSENT = "absent"
+STORAGE_MODE_UNVERIFIED = "unverified"
+STORAGE_MODE_CONFIRMED = "confirmed"
+
+
+def storage_mode_evidence(events: list[dict[str, Any]], mode: str) -> str:
+    """How well this capture proves it took the storage path it was asked to.
+
+    Strict evidence rests only on confirmed success. This check is new, so
+    nothing regresses by demanding it: a capture whose firmware predates the
+    result fields never had its requested mode verified at all, and now says
+    so instead of passing on a line that cannot support the claim. That is the
+    case that matters most, because the *host* tool records
+    `requested.storage_modes` regardless of which firmware is on the device.
+    """
     opens = storage_open_kinds(events)
     if mode == "cold":
-        return bool(opens["cold"]) or bool(catalog_ops(events, "scan"))
-    if mode == "warm":
-        return bool(opens["warm"] or opens["ram"]) or bool(catalog_ops(events, "load"))
-    return False
+        confirming = bool(opens["cold"]) or any(
+            catalog_succeeded(event) for event in catalog_events(events, "scan")
+        )
+        unverifiable = any(
+            unverifiable_catalog_op(event) for event in catalog_events(events, "scan")
+        )
+    elif mode == "warm":
+        confirming = bool(opens["warm"] or opens["ram"]) or any(
+            catalog_load_hit(event) for event in catalog_events(events, "load")
+        )
+        unverifiable = any(
+            unverifiable_catalog_op(event) for event in catalog_events(events, "load")
+        )
+    else:
+        return STORAGE_MODE_ABSENT
+    if confirming:
+        return STORAGE_MODE_CONFIRMED
+    return STORAGE_MODE_UNVERIFIED if unverifiable else STORAGE_MODE_ABSENT
 
 
 def print_duration(label: str, data: list[int]) -> None:
@@ -2041,13 +2153,13 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             warnings, "storage-cache", storage_cache, "warm_book_open_warn_ms",
             runs, per_run_open, "warm storage_open events",
         )
-        # Successful loads only: a load that found no catalog file returns in
-        # a fraction of the time a real one takes, so pooling it measured how
-        # fast the card said no and pulled the percentile away from the path
-        # the budget is about.
+        # Loads that actually loaded: a miss (no snapshot on the card yet) and
+        # a refused session both return in a fraction of the time a real load
+        # takes, so pooling them measured how fast the card said no and pulled
+        # the percentile away from the path the budget is about.
         per_run_catalog, catalog_load = per_run_samples(
             runs,
-            lambda run_events: values(catalog_ops(run_events, "load"), "elapsed_ms"),
+            lambda run_events: values(catalog_samples(run_events, "load"), "elapsed_ms"),
         )
         warn_if_above(
             warnings,
@@ -2308,11 +2420,20 @@ def request_shortfall_warnings(
                     f"{run.label}: unrecognised storage mode {name}, so "
                     "nothing checked that it was exercised"
                 )
-            elif not storage_mode_exercised(run.events, name):
+                continue
+            verdict = storage_mode_evidence(run.events, name)
+            if verdict == STORAGE_MODE_ABSENT:
                 warnings.append(
                     f"{run.label}: --{name} was requested but the capture "
                     f"shows no {name} storage path ("
                     f"{STORAGE_MODE_EVIDENCE[name]})"
+                )
+            elif verdict == STORAGE_MODE_UNVERIFIED:
+                warnings.append(
+                    f"{run.label}: --{name} cannot be verified from this "
+                    "capture: its catalog telemetry predates the result field "
+                    "that says whether the operation succeeded, so nothing "
+                    "here proves the path ran — reflash and recapture"
                 )
     return warnings
 

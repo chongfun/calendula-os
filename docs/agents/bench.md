@@ -131,11 +131,30 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   replace a failed scan's `Error` status with `Ready` — that fallback keeps
   the reader on an older in-memory catalog, which is right for the reader and
   made the marker read as a success, so a failed scan could evidence the cold
-  path. Failed scans and loads are excluded from mode evidence and from the
+  path. Failed operations are excluded from mode evidence and from the
   `catalog_load_warn_ms` population, counted on their own report line, and a
   `storage-cache` run containing one fails `--strict` the way a failed sleep
-  phase fails a sleep suite. A capture predating the scan's `ok` field cannot
-  evidence the failure either way and is read as it always was.
+  phase fails a sleep suite.
+- **A missing snapshot is the cold path, not a failure.** The catalog load
+  reports `result=hit|miss|error`, because its `ok` could not tell a card that
+  refused from a card with nothing to hand over — and the second is *normal*:
+  `load_catalog_cache` returning false is what queues the scan, so a card
+  whose catalog has not been built yet prints `load ok=false result=miss`
+  immediately before the scan that builds it. `--reset-before` makes that the
+  common case. Only `result=error` is a failed operation. A miss is still kept
+  out of the `catalog_load_warn_ms` population, where it would otherwise
+  measure how fast the card said no.
+- **Strict evidence needs confirmed success; the figures tolerate old logs.**
+  A requested `--cold`/`--warm` path is proven only by an operation that says
+  it succeeded. Telemetry too old to carry a result gets `cannot be verified
+  from this capture` rather than a silent pass — the host tool records the
+  requested modes whatever firmware is on the device, so without this a
+  current bench.py against an older build would certify a path from a line
+  that cannot support the claim. Nothing regresses: such a capture never had
+  its mode verified at all. The duration figures and budgets take the opposite
+  policy on purpose and still include result-less legacy lines, because a
+  budget asks how long the working path took rather than making a claim about
+  what ran; that is the single place the compatibility assumption is applied.
 - **Not every cache build belongs to an open.** A background walk's last step
   publishes through the same path, emitting `storage_build` with no open in
   flight, and is announced as `storage_background_build` immediately after.

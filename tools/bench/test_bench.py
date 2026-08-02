@@ -2435,10 +2435,10 @@ class StorageModeTests(unittest.TestCase):
         ]
         self.assertEqual(bench.evaluate_suite_signals(events), [])
 
-    def test_a_catalog_scan_is_cold_evidence(self) -> None:
+    def test_a_successful_catalog_scan_is_cold_evidence(self) -> None:
         events = [
             self._start(["cold"]),
-            {"event": "storage_catalog", "action": "scan", "elapsed_ms": 900},
+            {"event": "storage_catalog", "action": "scan", "ok": True, "elapsed_ms": 900},
             self.END,
         ]
         self.assertEqual(bench.evaluate_suite_signals(events), [])
@@ -2918,14 +2918,51 @@ class CatalogResultTests(unittest.TestCase):
             [w for w in bench.evaluate_suite_signals(events) if "--cold" in w], []
         )
 
-    def test_a_scan_predating_the_field_is_still_cold_evidence(self) -> None:
-        """It cannot evidence the failure either way; do not fault it now."""
+    def test_a_scan_predating_the_field_cannot_prove_the_cold_path(self) -> None:
+        """Strict evidence is a claim, so it rests only on confirmed success.
+
+        The host tool records `requested.storage_modes` whatever firmware is
+        on the device, so a current bench.py against an older build would
+        otherwise certify a requested path from a line that cannot say whether
+        the scan worked. Nothing regresses by refusing: such a capture never
+        had its mode verified in the first place.
+        """
         events = self._run(
             {"action": "scan", "status": "Ready", "count": 7, "elapsed_ms": 900},
             ["cold"],
         )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("--cold cannot be verified from this capture" in w for w in warnings),
+            warnings,
+        )
+
+    def test_an_unverified_mode_is_distinguished_from_a_missing_one(self) -> None:
+        """Both fail --strict, but the operator fixes them differently."""
         self.assertEqual(
-            [w for w in bench.evaluate_suite_signals(events) if "--cold" in w], []
+            bench.storage_mode_evidence(
+                [{"event": "storage_catalog", "action": "scan", "elapsed_ms": 900}],
+                "cold",
+            ),
+            bench.STORAGE_MODE_UNVERIFIED,
+        )
+        self.assertEqual(
+            bench.storage_mode_evidence([{"event": "render"}], "cold"),
+            bench.STORAGE_MODE_ABSENT,
+        )
+        self.assertEqual(
+            bench.storage_mode_evidence(
+                [
+                    {
+                        "event": "storage_catalog",
+                        "action": "scan",
+                        "ok": True,
+                        "elapsed_ms": 900,
+                    }
+                ],
+                "cold",
+            ),
+            bench.STORAGE_MODE_CONFIRMED,
         )
 
     def test_a_failed_scan_is_reported_even_when_nothing_was_requested(self) -> None:
@@ -2992,6 +3029,132 @@ class CatalogResultTests(unittest.TestCase):
             str(call.args[0]) for call in mock_print.call_args_list if call.args
         )
         self.assertIn("catalog scan:  1 failed", printed)
+
+
+class ColdCatalogFallbackTests(unittest.TestCase):
+    """A snapshot that was not there yet is the cold path, not a fault.
+
+    `load_catalog_cache` returning false is what queues `RefreshCatalog`, so
+    the healthy telemetry for a card whose catalog has not been built is a
+    failed-looking load immediately followed by the scan that builds it.
+    `--reset-before` makes it the common case.
+    """
+
+    MISS = {
+        "event": "storage_catalog",
+        "action": "load",
+        "ok": False,
+        "result": "miss",
+        "elapsed_ms": 4,
+    }
+    SCAN = {
+        "event": "storage_catalog",
+        "action": "scan",
+        "ok": True,
+        "status": "Ready",
+        "count": 7,
+        "elapsed_ms": 900,
+    }
+    ERROR = {
+        "event": "storage_catalog",
+        "action": "load",
+        "ok": False,
+        "result": "error",
+        "elapsed_ms": 12,
+    }
+
+    def _run(self, catalog: list, modes: list) -> list:
+        return (
+            [
+                {
+                    "event": "run_start",
+                    "suite": "storage-cache",
+                    "workflow": "storage-cache",
+                    "host_time": 1.0,
+                    "reset_before": True,
+                    "requested": {"storage_modes": modes},
+                }
+            ]
+            + catalog
+            + [{"event": "run_end", "elapsed_s": 20.0, "completed": True}]
+        )
+
+    def test_the_healthy_cold_boot_sequence_passes(self) -> None:
+        events = self._run([self.MISS, self.SCAN], ["cold"])
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_miss_is_not_a_failed_storage_operation(self) -> None:
+        self.assertEqual(bench.failed_storage_ops([self.MISS]), [])
+
+    def test_a_card_error_still_is(self) -> None:
+        self.assertEqual(bench.failed_storage_ops([self.ERROR]), [self.ERROR])
+
+    def test_a_card_error_fails_strict(self) -> None:
+        events = self._run([self.ERROR, self.SCAN], ["cold"])
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("failed storage operation(s)" in w for w in warnings), warnings
+        )
+
+    def test_a_progress_write_failure_is_still_a_failure(self) -> None:
+        """Only the catalog load's ok=false is ambiguous; nothing else's is."""
+        failed = {"event": "storage_progress", "action": "write", "ok": False}
+        self.assertEqual(bench.failed_storage_ops([failed]), [failed])
+
+    def test_a_miss_is_not_warm_evidence(self) -> None:
+        events = self._run([self.MISS, self.SCAN], ["warm"])
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(any("--warm" in w for w in warnings), warnings)
+
+    def test_a_miss_is_not_in_the_catalog_budget(self) -> None:
+        """It returns in milliseconds; a real load does not."""
+        events = [
+            {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
+            {
+                "event": "storage_catalog",
+                "action": "load",
+                "ok": True,
+                "result": "hit",
+                "elapsed_ms": 31,
+            },
+            self.MISS,
+        ]
+        self.assertEqual(
+            bench.values(bench.catalog_samples(events, "load"), "elapsed_ms"), [31]
+        )
+
+    def test_the_load_line_carries_its_result(self) -> None:
+        event = bench.parse_line(
+            "bench: storage_catalog action=load ok=false result=miss count=0 "
+            "elapsed_ms=4 t_ms=1200",
+            "storage-cache",
+        )[0]
+        self.assertEqual(event["result"], "miss")
+        self.assertFalse(event["ok"])
+
+    def test_a_legacy_load_keeps_its_original_meaning(self) -> None:
+        """`ok` has been on this line since the harness was written."""
+        loaded = {"event": "storage_catalog", "action": "load", "ok": True, "elapsed_ms": 31}
+        self.assertTrue(bench.catalog_load_hit(loaded))
+        self.assertFalse(bench.unverifiable_catalog_op(loaded))
+
+    @patch("builtins.print")
+    def test_the_report_names_a_miss_as_normal(self, mock_print) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(dict(event, suite="storage-cache"))
+                    for event in [{"event": "run_start"}, self.MISS, self.SCAN]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bench.summarize_paths([path], None)
+        printed = "\n".join(
+            str(call.args[0]) for call in mock_print.call_args_list if call.args
+        )
+        self.assertIn("1 found no snapshot (normal cold path)", printed)
 
 
 class BudgetValueTests(unittest.TestCase):
