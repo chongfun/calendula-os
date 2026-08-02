@@ -135,15 +135,21 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   `catalog_load_warn_ms` population, counted on their own report line, and a
   `storage-cache` run containing one fails `--strict` the way a failed sleep
   phase fails a sleep suite.
-- **A missing snapshot is the cold path, not a failure.** The catalog load
-  reports `result=hit|miss|error`, because its `ok` could not tell a card that
-  refused from a card with nothing to hand over — and the second is *normal*:
-  `load_catalog_cache` returning false is what queues the scan, so a card
-  whose catalog has not been built yet prints `load ok=false result=miss`
-  immediately before the scan that builds it. `--reset-before` makes that the
-  common case. Only `result=error` is a failed operation. A miss is still kept
-  out of the `catalog_load_warn_ms` population, where it would otherwise
-  measure how fast the card said no.
+- **A missing snapshot is the cold path; anything else is a fault.** The
+  catalog load reports `result=hit|miss|invalid|error`, because its `ok` could
+  not tell a card with nothing to hand over from a card that failed — and only
+  the first is *normal*: `load_catalog_cache` returning false is what queues
+  the scan, so a card whose catalog has not been built yet prints `load
+  ok=false result=miss` immediately before the scan that builds it, and
+  `--reset-before` makes that the common case. `miss` is deliberately the
+  narrowest of the four: it means no catalog directory or no file in it.
+  A header this build cannot decode, a length disagreeing with that header, or
+  a record that ended early is `invalid`; a refused open, seek or read is
+  `error`. Both fail `--strict` even when a later scan succeeds, because the
+  firmware used to reduce the whole read to a bool *inside* the SD session and
+  every one of those faults surfaced as the benign miss. None of the three
+  non-hit results enters the `catalog_load_warn_ms` population, where they
+  would measure how fast the card said no.
 - **Strict evidence needs confirmed success; the figures tolerate old logs.**
   A requested `--cold`/`--warm` path is proven only by an operation that says
   it succeeded. Telemetry too old to carry a result gets `cannot be verified

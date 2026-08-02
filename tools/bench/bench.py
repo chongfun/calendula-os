@@ -915,14 +915,18 @@ def summarize_paths(
         ]
         if not excluded:
             continue
-        errors = sum(1 for event in excluded if catalog_load_error(event))
-        reasons = []
-        if action == "load" and errors < len(excluded):
-            reasons.append(f"{len(excluded) - errors} found no snapshot (normal cold path)")
-        if errors:
-            reasons.append(f"{errors} card error")
         if action == "scan":
             reasons = [f"{len(excluded)} failed"]
+        else:
+            faults: dict[str, int] = {}
+            for event in excluded:
+                faults[str(event.get("result", "not loaded"))] = (
+                    faults.get(str(event.get("result", "not loaded")), 0) + 1
+                )
+            reasons = [
+                f"{count} {CATALOG_LOAD_REASONS.get(result, result)}"
+                for result, count in sorted(faults.items())
+            ]
         print(f"catalog {action}:  " + ", ".join(reasons) + ", left out of the figure above")
     print_duration(
         "progress write",
@@ -1137,14 +1141,36 @@ def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, 
 # apart, and the difference decides whether a capture is looking at a fault or
 # at the ordinary cold path.
 #
-#   hit    the snapshot loaded.
-#   miss   there was no valid snapshot to load. This is *normal*: it is what
-#          makes the firmware queue `RefreshCatalog`, so a card whose catalog
-#          has not been built yet prints one immediately before the scan that
-#          builds it. Reading it as a failure faulted a healthy cold boot,
-#          which `--reset-before` makes the common case.
-#   error  the card refused the session.
-CATALOG_LOAD_RESULTS = {"hit", "miss", "error"}
+#   hit      the snapshot loaded.
+#   miss     there was nothing to load — no catalog directory, or no file in
+#            it. This is *normal*: it is what makes the firmware queue
+#            `RefreshCatalog`, so a card whose catalog has not been built yet
+#            prints one immediately before the scan that builds it. Reading it
+#            as a failure faulted a healthy cold boot, which `--reset-before`
+#            makes the common case.
+#   invalid  the file was there and did not check out: a header this build
+#            does not understand, a length disagreeing with that header, or a
+#            record that ended early. The card answered and what it held was
+#            unusable, which is a finding, not a cold path.
+#   error    the card refused an open, a seek, or a read.
+#
+# `miss` is deliberately the *narrowest* of the four. The firmware used to
+# reduce the whole read to a bool inside the SD session, so a refused read, a
+# failed seek or a torn file all surfaced as the benign one — the precise
+# false pass this taxonomy exists to close.
+CATALOG_LOAD_RESULTS = {"hit", "miss", "invalid", "error"}
+
+# The results that mean something went wrong, as opposed to there being
+# nothing there yet.
+CATALOG_LOAD_FAULTS = {"invalid", "error"}
+
+# How the report names each one, so a miss does not read as a fault.
+CATALOG_LOAD_REASONS = {
+    "miss": "found no snapshot (normal cold path)",
+    "invalid": "found an unusable snapshot",
+    "error": "card error",
+    "not loaded": "did not load (older firmware: reason not recorded)",
+}
 
 
 def catalog_load_hit(event: dict[str, Any]) -> bool:
@@ -1156,13 +1182,13 @@ def catalog_load_hit(event: dict[str, Any]) -> bool:
 
 
 def catalog_load_error(event: dict[str, Any]) -> bool:
-    """The card refused, as opposed to having nothing to hand over.
+    """The read went wrong, as opposed to there being nothing to hand over.
 
     Only ever asserted from `result`. A pre-`result` capture's `ok=false`
-    covers both that and an ordinary miss, and the miss is overwhelmingly the
-    common one, so it is not called a failure on that evidence.
+    covers every outcome at once, and the miss is overwhelmingly the common
+    one, so it is not called a failure on that evidence.
     """
-    return event.get("result") == "error"
+    return event.get("result") in CATALOG_LOAD_FAULTS
 
 
 def unverifiable_catalog_op(event: dict[str, Any]) -> bool:

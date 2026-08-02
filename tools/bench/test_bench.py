@@ -3123,6 +3123,51 @@ class ColdCatalogFallbackTests(unittest.TestCase):
             bench.values(bench.catalog_samples(events, "load"), "elapsed_ms"), [31]
         )
 
+    INVALID = {
+        "event": "storage_catalog",
+        "action": "load",
+        "ok": False,
+        "result": "invalid",
+        "elapsed_ms": 9,
+    }
+
+    def test_an_unusable_snapshot_is_not_a_miss(self) -> None:
+        """A header that did not decode, or a record that ended early.
+
+        The card answered and what it held was unusable, which is a finding,
+        not the cold path.
+        """
+        self.assertEqual(bench.failed_storage_ops([self.INVALID]), [self.INVALID])
+
+    def test_a_read_fault_fails_strict_even_though_the_scan_worked(self) -> None:
+        """The false pass the firmware taxonomy was widened to close.
+
+        The whole catalog read used to be reduced to a bool inside the SD
+        session, so a refused read, a failed seek or a torn file all surfaced
+        as `miss` — which the host ignores — and a later successful scan then
+        carried the capture to a clean --strict pass.
+        """
+        for fault in (self.INVALID, self.ERROR):
+            with self.subTest(result=fault["result"]):
+                events = self._run([fault, self.SCAN], ["cold"])
+                warnings = bench.evaluate_suite_signals(events)
+                self.assertTrue(
+                    any("failed storage operation(s)" in w for w in warnings), warnings
+                )
+
+    def test_every_firmware_result_token_is_known_to_the_host(self) -> None:
+        """The two sides agree on the vocabulary, or a token means nothing."""
+        source = Path(bench.__file__).read_text(encoding="utf-8")
+        firmware = Path(__file__).resolve().parents[2] / "fw" / "src" / "library_sd.rs"
+        emitted = set(
+            re.findall(r'Self::\w+ => "(\w+)"', firmware.read_text(encoding="utf-8"))
+        )
+        self.assertTrue(emitted, "no result tokens found -- the scan is broken")
+        # "hit" is produced by the caller rather than the fault enum.
+        self.assertEqual(emitted | {"hit"}, bench.CATALOG_LOAD_RESULTS)
+        for token in emitted | {"hit"}:
+            self.assertIn(f'"{token}"', source)
+
     def test_the_load_line_carries_its_result(self) -> None:
         event = bench.parse_line(
             "bench: storage_catalog action=load ok=false result=miss count=0 "
