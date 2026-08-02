@@ -16,7 +16,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT / "target" / "fonts" / "CUSTOM.FNT"
 
@@ -171,6 +170,7 @@ def codepoints_from_ranges(ranges: list[tuple[int, int]]) -> list[int]:
 def build_face(source: SourceFace, size_px: int, line_height: int, baseline: int, cps: list[int]) -> BuiltFace:
     try:
         from PIL import ImageFont
+
         from fontgen_common import kerning_entries, rasterize_glyph
     except ModuleNotFoundError as exc:
         raise RuntimeError("Pillow is required. Use .venv-font/bin/python or install pillow.") from exc
@@ -322,7 +322,7 @@ def summarize_pack(path: Path, data: bytes | None = None) -> dict[str, object]:
         face_table_offset,
         codepoints_offset,
         name_offset,
-        data_offset,
+        _data_offset,
     ) = struct.unpack_from("<HHIQHHHHIIII", data, 4)
     if version != VERSION:
         raise ValueError(f"unsupported X4FT version {version}")
@@ -422,7 +422,7 @@ def main() -> None:
         print_summary(summary, args.json, verb)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

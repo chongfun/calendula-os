@@ -106,12 +106,32 @@ case "$COMMAND" in
         echo "Running bench harness tests..."
         python3 -m unittest discover -s tools/bench -p 'test_*.py'
         ;;
+    ruff)
+        # Python lint, configured in ruff.toml at the repo root. Refuses to
+        # run rather than skipping when ruff is missing, for the same reason
+        # --strict refuses without a TOML parser: a linter that quietly does
+        # nothing is worse than none, because the green tick still appears.
+        echo "Running Python lint..."
+        if command -v ruff >/dev/null 2>&1; then
+            RUFF=(ruff)
+        elif python3 -c "import ruff" >/dev/null 2>&1; then
+            RUFF=(python3 -m ruff)
+        else
+            echo "Error: ruff not found. Install it with one of:" >&2
+            echo "  pipx install ruff        (or) uv tool install ruff" >&2
+            echo "  python3 -m pip install ruff" >&2
+            echo "  brew install ruff" >&2
+            exit 1
+        fi
+        "${RUFF[@]}" check .
+        ;;
     fast)
         "$0" fmt
         "$0" clippy-host
         "$0" test-host
         "$0" test-host-x3
         "$0" test-bench
+        "$0" ruff
         ;;
     emulator)
         "$0" golden-frames
@@ -127,7 +147,7 @@ case "$COMMAND" in
         "$0" firmware
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|golden-frames|test-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|ruff|golden-frames|test-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
         echo "  'all' runs all required root/firmware verification."
         exit 1
         ;;

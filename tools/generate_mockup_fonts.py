@@ -51,7 +51,7 @@ def codepoints():
 def glyph(font, code):
     ch = chr(code)
     bbox = font.getbbox(ch, anchor="ls")
-    advance = max(int(round(font.getlength(ch) * ADVANCE_SCALE)), ADVANCE_SCALE)
+    advance = max(round(font.getlength(ch) * ADVANCE_SCALE), ADVANCE_SCALE)
     if bbox is None:
         return (0, 0, 0, 0, max(advance, 1), [])
     left, top, right, bottom = bbox

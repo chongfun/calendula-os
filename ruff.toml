@@ -1,0 +1,53 @@
+# Lint config for the repository's Python: the bench harness, the stack-frame
+# analyser, and the font/asset generators. Run by `tools/check.sh ruff`, which
+# `fast` and `all` both include.
+#
+# `target-version` is the floor the tools actually run on, not an aspiration:
+# `check.sh` invokes whatever `python3` is on PATH, which on macOS is 3.9, and
+# a lint that assumed newer syntax would pass here and fail on the interpreter
+# an operator captures with.
+target-version = "py39"
+line-length = 100
+
+[lint]
+# Pinned explicitly rather than left to ruff's default, which has widened
+# across releases: a gate whose rule set moves when the tool is upgraded
+# reports different things on two machines, and this repo's whole argument
+# about budgets is that a check nobody can predict is a check nobody trusts.
+select = [
+    "B",    # bugbear: mutable defaults, `raise` without `from`, silent bugs
+    "C4",   # comprehensions
+    "E4",   # imports
+    "E7",   # statement-level pycodestyle (ambiguous names, comparisons)
+    "E9",   # syntax/IO errors
+    "F",    # pyflakes: undefined and unused names
+    "I",    # import ordering
+    "ISC",  # implicit string concatenation
+    "PIE",  # misc. lints
+    "RET",  # return-path simplifications
+    "RUF",  # ruff's own, including RUF012 mutable class defaults
+    "SIM",  # simplifications
+    "UP",   # pyupgrade, bounded by target-version above
+]
+
+ignore = [
+    # The prose in this repo uses em dashes, en dashes and typographic quotes
+    # deliberately, in comments, docstrings and the warning strings the bench
+    # report prints. Flagging them as "ambiguous unicode" is noise against a
+    # house style, not a finding.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # `a + [b]` over `[*a, b]`. The test fixtures read as "this run, plus this
+    # event", and the unpacking form obscures that for no benefit.
+    "RUF005",
+]
+
+[lint.per-file-ignores]
+# The generators are run by hand (`uv run --with fonttools ...`), print as
+# they go, and are not imported by anything.
+"tools/generate_*.py" = ["T201"]
+"tools/build_font_pack.py" = ["T201"]
+
+[lint.isort]
+known-first-party = ["bench", "fontgen_common"]

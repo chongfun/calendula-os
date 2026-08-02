@@ -22,9 +22,10 @@ import subprocess
 import sys
 import termios
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, TextIO
+from typing import Any, Callable, TextIO
 
 try:
     import tomllib
@@ -1936,7 +1937,7 @@ def load_budgets(path: Path | None) -> tuple[dict[str, Any], str | None]:
     if path is None:
         return {}, None
     if tomllib is None:
-        version = "%d.%d.%d" % sys.version_info[:3]
+        version = ".".join(str(part) for part in sys.version_info[:3])
         return {}, (
             f"cannot parse {path}: tomllib needs Python >= 3.11 (this is "
             f"{version}); re-run under a newer python3 or `pip install tomli`"

@@ -31,6 +31,24 @@ jobs:
       - name: Check fmt
         run: tools/check.sh fmt
 
+  python:
+    name: Lint and Test Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      # The bench harness produces every device performance number this
+      # project has, and neither its lint nor its own tests ran here until
+      # now -- a gate that exists only on whoever remembers to run it locally
+      # is the shape this repo keeps arguing against.
+      - name: Install ruff
+        run: pipx install ruff
+      - name: Lint Python
+        run: tools/check.sh ruff
+      - name: Test bench harness
+        run: tools/check.sh test-bench
+
   clippy-firmware:
     runs-on: ubuntu-latest
     steps:

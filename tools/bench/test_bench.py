@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import contextlib
 import io
@@ -8,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import bench
@@ -265,9 +268,8 @@ class BudgetLoadingTests(unittest.TestCase):
             log = self._write_minimal_log(tmp)
             budgets = Path(tmp) / "benches.toml"
             budgets.write_text("[page-turn]\n", encoding="utf-8")
-            with patch.object(bench, "tomllib", None):
-                with self.assertRaises(SystemExit) as ctx:
-                    bench.summarize_paths([log], budgets, validate_suites=True)
+            with patch.object(bench, "tomllib", None), self.assertRaises(SystemExit) as ctx:
+                bench.summarize_paths([log], budgets, validate_suites=True)
         self.assertIn("--strict cannot enforce budgets", str(ctx.exception))
 
     @patch("builtins.print")
@@ -886,7 +888,7 @@ class TerminalSleepTests(unittest.TestCase):
     report.
     """
 
-    REQUESTED_ONLY = [
+    REQUESTED_ONLY: ClassVar[list[dict[str, Any]]] = [
         {"event": "run_start", "suite": "sleep-sync"},
         {"event": "refresh", "mode": "Full", "busy_ms": 3500},
         {"event": "sleep", "phase": "requested", "screen_on": True, "t_ms": 40000},
@@ -985,7 +987,7 @@ class PageTurnTrustPoolTests(unittest.TestCase):
     """Trust is decided per capture, before the runs are added together."""
 
     # 1 turn and 1 press that produced nothing: 50% untrusted on its own.
-    CADENCE_RUN = [
+    CADENCE_RUN: ClassVar[list[dict[str, Any]]] = [
         {"event": "run_start", "suite": "page-turn"},
         {"event": "input", "button": "Next", "t_ms": 1000},
         {"event": "input", "button": "Next", "t_ms": 1100},
@@ -1124,7 +1126,7 @@ class PageTurnTrustPoolTests(unittest.TestCase):
 class UnknownWorkflowTests(unittest.TestCase):
     """Malformed workflow metadata must fail closed, not quietly pass."""
 
-    MISSPELLED = [
+    MISSPELLED: ClassVar[list[dict[str, Any]]] = [
         {"event": "run_start", "suite": "sleep-sync", "workflow": "sleep_sync"},
         {"event": "refresh", "mode": "Full", "busy_ms": 3500},
     ]
@@ -1173,7 +1175,7 @@ class PooledFileTests(unittest.TestCase):
         )
         return path
 
-    LABELLED = [
+    LABELLED: ClassVar[list[dict[str, Any]]] = [
         {"suite": "page-turn", "event": "run_start"},
         {"suite": "page-turn", "event": "input", "button": "Next", "t_ms": 1000},
         {
@@ -1186,7 +1188,7 @@ class PooledFileTests(unittest.TestCase):
     ]
     # Turns four times the budget: pooled into the labelled run they take its
     # median from 400 ms to 4000 ms.
-    LEGACY = [
+    LEGACY: ClassVar[list[dict[str, Any]]] = [
         {"event": "input", "button": "Next", "t_ms": 1000},
         {"event": "render", "view": "Reading", "t_ms": 5000, "req_ms": 1000},
         {"event": "input", "button": "Next", "t_ms": 6000},
@@ -1644,10 +1646,12 @@ class PageTurnCounterTests(unittest.TestCase):
     properly and simply reported what it found.
     """
 
-    PRESS_AND_TURN = [
+    PRESS_AND_TURN: ClassVar[list[str]] = [
         "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=1000\n",
-        "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 "
-        "flush_ms=400 req_ms=1000 prestage_ms=15 t_ms=1430\n",
+        (
+            "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 "
+            "flush_ms=400 req_ms=1000 prestage_ms=15 t_ms=1430\n"
+        ),
     ]
     # No press before it: the paint a boot or a storage re-render produces.
     UNPROMPTED_RENDER = (
@@ -1682,8 +1686,10 @@ class PageTurnCounterTests(unittest.TestCase):
         lines = [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN * 3 + [
             # A press answered by a Home render is navigation, not a turn.
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
-            "bench: render view=Home mode=Fast page=0 chapter=0 layout_ms=10 "
-            "flush_ms=400 req_ms=9000 t_ms=9430\n",
+            (
+                "bench: render view=Home mode=Fast page=0 chapter=0 layout_ms=10 "
+                "flush_ms=400 req_ms=9000 t_ms=9430\n"
+            ),
         ]
         events = [event for line in lines for event in bench.parse_line(line, "page-turn")]
         counter = bench.PageTurnCounter()
@@ -1811,7 +1817,7 @@ class ReaderSoakSignalTests(unittest.TestCase):
 class WokeAfterSleepTests(unittest.TestCase):
     """`woke_after_sleep` asks about order, not about presence."""
 
-    WAKE_BOOT = {
+    WAKE_BOOT: ClassVar[dict[str, Any]] = {
         "event": "boot",
         "deep_sleep_wake": True,
         "gpio": True,
@@ -2028,10 +2034,8 @@ class PositiveIntTests(unittest.TestCase):
             ["sleep-sync", "--cycles", "0"],
             ["thermal-run", "--minutes", "0"],
         ):
-            with self.subTest(argv=argv):
-                with self.assertRaises(SystemExit):
-                    with patch("sys.stderr"):
-                        parser.parse_args(argv)
+            with self.subTest(argv=argv), self.assertRaises(SystemExit), patch("sys.stderr"):
+                parser.parse_args(argv)
 
 
 class StopReasonTests(unittest.TestCase):
@@ -2074,10 +2078,12 @@ class StopReasonTests(unittest.TestCase):
 class CaptureContractTests(unittest.TestCase):
     """What the operator asked for is written down, and checked afterwards."""
 
-    TURN = [
+    TURN: ClassVar[list[str]] = [
         "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=1000\n",
-        "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 "
-        "flush_ms=400 req_ms=1000 prestage_ms=15 t_ms=1430\n",
+        (
+            "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 "
+            "flush_ms=400 req_ms=1000 prestage_ms=15 t_ms=1430\n"
+        ),
     ]
 
     @staticmethod
@@ -2088,9 +2094,9 @@ class CaptureContractTests(unittest.TestCase):
         interrupt: bool = False,
         reset_before: bool = False,
         on_reset=None,
-        seen: dict = None,
-        seconds: int = None,
-        printed: list = None,
+        seen: dict[str, Any] | None = None,
+        seconds: int | None = None,
+        printed: list[str] | None = None,
         **extra,
     ):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2420,11 +2426,11 @@ class StorageModeTests(unittest.TestCase):
             "requested": {"storage_modes": modes},
         }
 
-    END = {"event": "run_end", "elapsed_s": 20.0, "completed": True}
+    END: ClassVar[dict[str, Any]] = {"event": "run_end", "elapsed_s": 20.0, "completed": True}
 
-    WARM_OPEN = {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72}
-    COLD_BUILD = {"event": "storage_build", "elapsed_ms": 14948}
-    COLD_OPEN = {"event": "storage_open", "ram_hit": False, "elapsed_ms": 15034}
+    WARM_OPEN: ClassVar[dict[str, Any]] = {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72}
+    COLD_BUILD: ClassVar[dict[str, Any]] = {"event": "storage_build", "elapsed_ms": 14948}
+    COLD_OPEN: ClassVar[dict[str, Any]] = {"event": "storage_open", "ram_hit": False, "elapsed_ms": 15034}
 
     def test_a_warm_only_capture_fails_the_cold_request(self) -> None:
         events = [self._start(["cold", "warm"]), self.WARM_OPEN, self.END]
@@ -2493,7 +2499,7 @@ class StorageOpenPopulationTests(unittest.TestCase):
     *seconds*. Pooling them produced a percentile describing none of them.
     """
 
-    RUN = [
+    RUN: ClassVar[list[dict[str, Any]]] = [
         {"event": "storage_catalog", "action": "load", "elapsed_ms": 32},
         {"event": "storage_build", "elapsed_ms": 14948},
         # The legacy `storage: open complete` line, printed just before the
@@ -2668,9 +2674,9 @@ class BudgetSchemaTests(unittest.TestCase):
             )
             budgets = Path(tmp) / "empty.toml"
             budgets.write_text("# nothing configured\n", encoding="utf-8")
-            with patch.object(bench, "tomllib", self._fake_parser({})):
-                with self.assertRaises(SystemExit) as ctx:
-                    bench.summarize_paths([log], budgets, validate_suites=True)
+            empty = self._fake_parser({})
+            with patch.object(bench, "tomllib", empty), self.assertRaises(SystemExit) as ctx:
+                bench.summarize_paths([log], budgets, validate_suites=True)
         self.assertIn("configures no budget sections", str(ctx.exception))
 
     def test_an_empty_section_is_rejected(self) -> None:
@@ -2735,9 +2741,9 @@ class BudgetSchemaTests(unittest.TestCase):
             )
             not_a_file = Path(tmp) / "budgets.toml"
             not_a_file.mkdir()
-            with patch.object(bench, "tomllib", self._fake_parser({})):
-                with self.assertRaises(SystemExit) as ctx:
-                    bench.summarize_paths([log], not_a_file, validate_suites=True)
+            empty = self._fake_parser({})
+            with patch.object(bench, "tomllib", empty), self.assertRaises(SystemExit) as ctx:
+                bench.summarize_paths([log], not_a_file, validate_suites=True)
         self.assertIn("--strict cannot enforce budgets", str(ctx.exception))
         self.assertIn("cannot read", str(ctx.exception))
 
@@ -2764,11 +2770,9 @@ class BudgetSchemaTests(unittest.TestCase):
             # test is about -- is never reached.
             budgets = Path(tmp) / "budgets.toml"
             budgets.write_text("[page-turn]\ntypo_ms = 1\n", encoding="utf-8")
-            with patch.object(
-                bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})
-            ):
-                with self.assertRaises(SystemExit) as ctx:
-                    bench.summarize_paths([log], budgets, validate_suites=True)
+            typo = self._fake_parser({"page-turn": {"typo_ms": 1}})
+            with patch.object(bench, "tomllib", typo), self.assertRaises(SystemExit) as ctx:
+                bench.summarize_paths([log], budgets, validate_suites=True)
         message = str(ctx.exception)
         self.assertIn("--strict cannot enforce budgets", message)
         self.assertIn("unknown key typo_ms", message)
@@ -2962,8 +2966,10 @@ class CountAndDurationContractTests(unittest.TestCase):
         self.assertEqual(
             warnings,
             [
-                "page-turn: 2 of 50 requested page turns captured; the run is "
-                "short of the sample count it was asked for"
+                (
+                    "page-turn: 2 of 50 requested page turns captured; the run "
+                    "is short of the sample count it was asked for"
+                )
             ],
         )
 
@@ -3213,14 +3219,14 @@ class ColdCatalogFallbackTests(unittest.TestCase):
     `--reset-before` makes it the common case.
     """
 
-    MISS = {
+    MISS: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "load",
         "ok": False,
         "result": "miss",
         "elapsed_ms": 4,
     }
-    SCAN = {
+    SCAN: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "scan",
         "ok": True,
@@ -3228,7 +3234,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
         "count": 7,
         "elapsed_ms": 900,
     }
-    ERROR = {
+    ERROR: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "load",
         "ok": False,
@@ -3296,7 +3302,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
             bench.values(bench.catalog_samples(events, "load"), "elapsed_ms"), [31]
         )
 
-    INVALID = {
+    INVALID: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "load",
         "ok": False,
@@ -3304,7 +3310,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
         "elapsed_ms": 9,
     }
 
-    STALE = {
+    STALE: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "load",
         "ok": False,
@@ -3354,14 +3360,14 @@ class ColdCatalogFallbackTests(unittest.TestCase):
                     any("failed storage operation(s)" in w for w in warnings), warnings
                 )
 
-    UNKNOWN = {
+    UNKNOWN: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "load",
         "ok": False,
         "result": "timeout",
         "elapsed_ms": 5000,
     }
-    HIT = {
+    HIT: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "load",
         "ok": True,
@@ -3393,13 +3399,13 @@ class ColdCatalogFallbackTests(unittest.TestCase):
             any("does not know ('timeout')" in w for w in warnings), warnings
         )
 
-    NULL_OK = {
+    NULL_OK: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "load",
         "ok": True,
         "result": None,
     }
-    NULL_NOT_OK = {
+    NULL_NOT_OK: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
         "action": "load",
         "ok": False,

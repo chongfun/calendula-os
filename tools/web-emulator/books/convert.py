@@ -6,6 +6,7 @@ paragraphs. Normalizes typography the 1-bit Literata bitmaps may lack.
 
 import re
 import sys
+from pathlib import Path
 
 OUT = sys.argv[2] if len(sys.argv) > 2 else "."
 SRC = sys.argv[1] if len(sys.argv) > 1 else "."
@@ -50,7 +51,7 @@ def normalize(text: str) -> str:
 
 
 def body(path: str) -> list[str]:
-    raw = open(path, encoding="utf-8").read()
+    raw = Path(path).read_text(encoding="utf-8")
     raw = raw.split("***", 2)[2]          # after START sentinel
     raw = raw.rsplit("*** END", 1)[0]
     return normalize(raw).splitlines()
@@ -102,7 +103,7 @@ def alice() -> None:
     flush(par, out)
     text = "\n".join(out)
     text = text.split("# One.", 1)[1]
-    open(f"{OUT}/alice.txt", "w").write("# One." + text.rstrip() + "\n")
+    Path(f"{OUT}/alice.txt").write_text("# One." + text.rstrip() + "\n", encoding="utf-8")
 
 
 def carol() -> None:
@@ -125,7 +126,7 @@ def carol() -> None:
     flush(par, out)
     text = "\n".join(out)
     text = "# Stave" + text.split("# Stave", 1)[1]
-    open(f"{OUT}/carol.txt", "w").write(text.rstrip() + "\n")
+    Path(f"{OUT}/carol.txt").write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
 def aesop(count: int = 40) -> None:
@@ -165,7 +166,7 @@ def aesop(count: int = 40) -> None:
             else:
                 par.append(stripped)
     flush(par, out)
-    open(f"{OUT}/aesop.txt", "w").write("\n".join(out).rstrip() + "\n")
+    Path(f"{OUT}/aesop.txt").write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
     print(f"aesop: {fables} fables")
 
 
@@ -248,7 +249,7 @@ def marker_book(name: str, marker: "re.Pattern", book_re) -> None:
     flush(par, out)
     text = "\n".join(out)
     text = "# " + text.split("# ", 1)[1]      # drop front matter/TOC
-    open(f"{OUT}/{name}.txt", "w").write(text.rstrip() + "\n")
+    Path(f"{OUT}/{name}.txt").write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
 def pegana() -> None:
@@ -258,7 +259,7 @@ def pegana() -> None:
     out: list[str] = []
     par: list[str] = []
     started = False
-    i = next(k for k, l in enumerate(lines) if l.strip() == "PREFACE")
+    i = next(k for k, line in enumerate(lines) if line.strip() == "PREFACE")
     while i < len(lines):
         stripped = lines[i].strip()
         is_head = (
@@ -288,7 +289,7 @@ def pegana() -> None:
     flush(par, out)
     text = "\n".join(out)
     text = "# " + text.split("# ", 1)[1]
-    open(f"{OUT}/pegana.txt", "w").write(text.rstrip() + "\n")
+    Path(f"{OUT}/pegana.txt").write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
 def lastmen() -> None:
@@ -305,7 +306,7 @@ def lastmen() -> None:
     intro = re.compile(r"^ {4,}Introduction\s*$")
     out: list[str] = []
     par: list[str] = []
-    i = next(k for k, l in enumerate(lines) if intro.match(l))
+    i = next(k for k, line in enumerate(lines) if intro.match(line))
     emit_heading(out, "Introduction")
     i += 1
     while i < len(lines):
@@ -336,7 +337,7 @@ def lastmen() -> None:
     flush(par, out)
     text = "\n".join(out)
     text = "# " + text.split("# ", 1)[1]
-    open(f"{OUT}/lastmen.txt", "w").write(text.rstrip() + "\n")
+    Path(f"{OUT}/lastmen.txt").write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
 ROMAN_LINE = re.compile(r"^\s*[IVXLC]+\.\s*$")            # ' I.'  'II.'
@@ -352,6 +353,6 @@ marker_book("warworlds", ROMAN_LINE, BOOK_LINE)
 marker_book("mars", CHAPTER_LINE, None)
 lastmen()
 for name in ["alice", "carol", "aesop", "pegana", "timemachine", "warworlds", "mars", "lastmen"]:
-    text = open(f"{OUT}/{name}.txt").read()
+    text = Path(f"{OUT}/{name}.txt").read_text(encoding="utf-8")
     chapters = text.count("\n# ") + text.startswith("# ")
     print(name, len(text), "bytes,", chapters, "chapters")

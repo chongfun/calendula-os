@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import unittest
 
 # Bytes. The largest legitimate frame today is ensure_epub_scratch at 20,960 --
 # the inflate state that miniz_oxide can only build by value. This sits far
@@ -296,9 +297,6 @@ def main() -> int:
         )
         return 1
     return 0
-
-
-import unittest
 
 
 class TestStackFrames(unittest.TestCase):
