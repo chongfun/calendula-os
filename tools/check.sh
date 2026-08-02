@@ -22,7 +22,11 @@ fi
 require_python() {
     [ -n "${PYTHON_CHECKED:-}" ] && return 0
     PYTHON_VERSION="$(tr -d '[:space:]' < "$(dirname "$0")/../.python-version")"
-    PYTHON_SERIES="${PYTHON_VERSION%.*}"
+    PYTHON_SERIES="$(printf '%s' "$PYTHON_VERSION" | cut -d. -f1,2)"
+    # However many components the pin names is how many are compared, so
+    # `3.14` is a series contract and `3.14.6` would be an exact one, without
+    # this needing to know which was chosen.
+    PYTHON_PARTS="$(printf '%s' "$PYTHON_VERSION" | awk -F. '{print NF}')"
     if [ -n "${PYTHON:-}" ]; then
         :
     elif command -v "python${PYTHON_SERIES}" >/dev/null 2>&1; then
@@ -30,10 +34,7 @@ require_python() {
     else
         PYTHON="python3"
     fi
-    # All three components: `.python-version` names one interpreter, and CI
-    # installs exactly it, so accepting any 3.14.x locally would mean the
-    # thing being verified is not the thing that was pinned.
-    FOUND="$("$PYTHON" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)" || FOUND=""
+    FOUND="$("$PYTHON" -c "import sys; print('.'.join(str(p) for p in sys.version_info[:$PYTHON_PARTS]))" 2>/dev/null)" || FOUND=""
     if [ "$FOUND" != "$PYTHON_VERSION" ]; then
         echo "Error: this repo needs Python $PYTHON_VERSION (.python-version)." >&2
         echo "  '$PYTHON' is ${FOUND:-not runnable}." >&2

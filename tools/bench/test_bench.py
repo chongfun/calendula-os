@@ -2777,29 +2777,53 @@ class BudgetSchemaTests(unittest.TestCase):
 class PinnedInterpreterTests(unittest.TestCase):
     """A capture runs off the shebang, so it checks its own interpreter.
 
-    `python3.14` names a series; `.python-version` names one release. Without
-    this, local capture and verification were looser than the CI that was
-    exactly pinned.
+    It never passes through `tools/check.sh`, and the checks below are written
+    against whatever precision `.python-version` names rather than a version
+    spelled out here, so re-pinning the file stays a one-line change.
     """
 
-    def test_the_pinned_version_passes(self) -> None:
-        pinned = (
-            (Path(bench.__file__).resolve().parents[2] / ".python-version")
-            .read_text(encoding="utf-8")
-            .strip()
-        )
-        with patch.object(
-            sys, "version_info", tuple(int(p) for p in pinned.split(".")) + ("final", 0)
-        ):
+    PINNED: ClassVar[str] = (
+        (Path(bench.__file__).resolve().parents[2] / ".python-version")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+
+    @classmethod
+    def _version(cls, *, bump: int | None = None, pad: int = 9) -> tuple:
+        """A `sys.version_info` for the pin, optionally off by one component."""
+        parts = [int(part) for part in cls.PINNED.split(".")]
+        if bump is not None:
+            parts[bump] += 1
+        while len(parts) < 3:
+            parts.append(pad)
+        return (*parts[:3], "final", 0)
+
+    def test_the_pinned_series_passes(self) -> None:
+        with patch.object(sys, "version_info", self._version()):
             bench.require_pinned_python()
 
-    def test_another_patch_release_is_refused_by_version(self) -> None:
-        version = (3, 14, 0, "final", 0)
+    def test_a_release_outside_the_pin_is_refused(self) -> None:
+        """Bumping the last component the pin names must not satisfy it."""
+        version = self._version(bump=len(self.PINNED.split(".")) - 1)
         with patch.object(sys, "version_info", version), self.assertRaises(SystemExit) as ctx:
             bench.require_pinned_python()
         message = str(ctx.exception)
-        self.assertIn("3.14.0", message)
+        self.assertIn(self.PINNED, message)
         self.assertIn(".python-version", message)
+
+    def test_a_patch_release_within_the_series_passes(self) -> None:
+        """`3.14` is a series contract: 3.14.0 and 3.14.9 both satisfy it.
+
+        Fails if the pin is ever made fully specific, which is the right time
+        to be told that the contract changed.
+        """
+        self.assertEqual(len(self.PINNED.split(".")), 2, self.PINNED)
+        major, minor = (int(part) for part in self.PINNED.split("."))
+        for patch_level in (0, 9):
+            with self.subTest(patch=patch_level):
+                version = (major, minor, patch_level, "final", 0)
+                with patch.object(sys, "version_info", version):
+                    bench.require_pinned_python()
 
     def test_a_copy_outside_the_repo_checks_nothing(self) -> None:
         """Nothing to compare against, so it must not invent a failure."""

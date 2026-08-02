@@ -82,7 +82,7 @@ telemetry is not covered by a sibling run that did, and the warning names the
 run. The medians and percentiles those budgets gate are still computed across
 every run the section owns.
 
-**Runs on the Python in `.python-version`** (3.14.6), which
+**Runs on the Python series in `.python-version`** (3.14), which
 `tools/check.sh` resolves — macOS ships 3.9 as `python3`, so do not assume
 that name. Budgets parse with `tomllib`, which that interpreter always has;
 when the parser was optional, `--strict` could silently check nothing, and

@@ -236,9 +236,10 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   stays unlabelled, sits outside every budget section, and `--strict` says
   so — labelled and unlabelled captures in one report is not something the
   harness will guess about.
-- **One interpreter, named in `.python-version`** (3.14.6). macOS ships 3.9
-  as `python3`, so `tools/check.sh` prefers `python3.14` and fails with
-  instructions if it cannot find it; `PYTHON=...` overrides. The harness
+- **One interpreter series, named in `.python-version`** (3.14). macOS ships
+  3.9 as `python3`, so `tools/check.sh` prefers `python3.14` and fails with
+  instructions if it cannot find it; `PYTHON=...` overrides. A capture run off
+  the shebang checks itself the same way. The harness
   imports `tomllib` directly rather than degrading, so a budget cannot be
   enforced in CI and silently skipped on the bench -- which is what happened
   when the parser was optional: any result signed off "with `--strict`" on an
