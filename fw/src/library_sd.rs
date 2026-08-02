@@ -20,13 +20,11 @@ use proto::catalog::{
 
 /// Why a catalog read did not hand back a catalog.
 ///
-/// The four are one `Err(())` as far as every caller that only wants to know
-/// whether it worked is concerned, and they are kept apart for the one caller
-/// that reports: `load_catalog_cache` prints this, and a bench capture
-/// distinguishes the ordinary cold path from a fault on it. Collapsing them —
-/// which `read_catalog_window(..).is_ok()` did — let a card that failed a
-/// record read be reported as a card that simply had no catalog yet, which is
-/// the one storage failure the harness must never wave through.
+/// All four are one `Err(())` to any caller that only wants to know whether
+/// it worked. They are kept apart for the one that reports: a bench capture
+/// has to tell the ordinary cold path from a fault on it, and collapsing them
+/// — which `read_catalog_window(..).is_ok()` did — reported a failed record
+/// read as a card that simply had no catalog yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatalogFault {
     /// Nothing to load: no `XTEINK` directory, or no `CATALOG.BIN` in it.
@@ -35,9 +33,9 @@ enum CatalogFault {
     Missing,
     /// A catalog written by firmware of another version. Bumping
     /// `CATALOG_VERSION` is how this format migrates — the old snapshot stops
-    /// loading and the scan below rebuilds it — so this is the designed path
-    /// on the first boot after an upgrade, and reporting it as a fault failed
-    /// a strict capture for behaving exactly as intended.
+    /// loading and the scan rebuilds it — so this is the designed first boot
+    /// after an upgrade, and calling it a fault failed a strict capture for
+    /// behaving as intended.
     Stale,
     /// The file is there and does not check out: wrong magic, the version-0
     /// placeholder an interrupted scan leaves behind, a length disagreeing
@@ -119,13 +117,11 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         esp_println::println!("sd: session failed: {:?}", err);
         LibraryScanStatus::Error
     });
-    // The scan's own verdict, captured before the fallback below can replace
-    // it. That fallback keeps the UI on an older in-memory catalog when a
-    // scan fails with books already listed, which is right for the reader and
-    // wrong for telemetry: `library.status` then reads `Ready` for a scan that
-    // did not happen, and a bench capture asked to exercise the cold path
-    // could evidence it with a failure. `Empty` is a scan that succeeded and
-    // found nothing.
+    // The scan's own verdict, taken before the fallback below can replace it.
+    // That fallback keeps the UI on an older in-memory catalog when a scan
+    // fails with books already listed — right for the reader, wrong for
+    // telemetry, since `library.status` then reads `Ready` for a scan that
+    // did not happen. `Empty` is a scan that succeeded and found nothing.
     let scan_ok = status != LibraryScanStatus::Error;
     library.status = if status == LibraryScanStatus::Error && !library.catalog_is_empty() {
         LibraryScanStatus::Ready
@@ -152,17 +148,14 @@ pub(crate) fn load_catalog_cache(
     let start = Instant::now();
     esp_println::println!("sd: catalog cache load start");
     library.clear_catalog();
-    // A valid header (even an empty catalog) counts as loaded; a missing or
-    // wrong-version file returns false so the caller runs a fresh scan.
-    // The *reason* is carried out of the session, not flattened to a bool
-    // inside it. Five outcomes the original `ok` could not tell apart, and the
-    // difference decides whether a bench capture is looking at a fault or at
-    // the ordinary cold path: a `miss` is what makes the caller queue
-    // `RefreshCatalog`, so a card with no snapshot yet prints one immediately
-    // before the scan that builds it, and reading that as a failure faults a
-    // healthy cold boot. `.is_ok()` here used to report every one of them —
-    // a refused read, a bad seek, a torn file — as that same benign miss,
-    // which is exactly the fault this telemetry exists to surface.
+    // A valid header (even an empty catalog) counts as loaded; anything else
+    // returns false so the caller runs a fresh scan. The *reason* is carried
+    // out of the session rather than flattened to a bool inside it, because
+    // it decides whether a bench capture is looking at a fault or at the
+    // ordinary cold path: a `miss` is what queues `RefreshCatalog`, so a card
+    // with no snapshot prints one right before the scan that builds it.
+    // `.is_ok()` here reported every outcome — refused read, bad seek, torn
+    // file — as that same benign miss.
     let outcome = sd_session::with_root(epd, sd_cs, |root| read_catalog_window(root, library, 0));
     let result = match outcome {
         Ok(Ok(())) => "hit",
@@ -404,7 +397,7 @@ where
     let mut header = [0u8; CATALOG_HEADER_BYTES];
     read_exact_file(&file, &mut header)?;
     // An older format is the migration doing its job; only a header that is
-    // not a catalog at all, or the placeholder a torn scan leaves, is a fault.
+    // not a catalog, or the placeholder a torn scan leaves, is a fault.
     let count = proto::catalog::classify_catalog_header(&header).map_err(|fault| match fault {
         proto::catalog::CatalogHeaderFault::Stale => CatalogFault::Stale,
         proto::catalog::CatalogHeaderFault::Invalid => CatalogFault::Invalid,

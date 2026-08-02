@@ -158,12 +158,10 @@ def main() -> int:
 def positive_int(text: str) -> int:
     """An argparse type for durations and counts, where zero is not "no limit".
 
-    `--seconds 0` used to disable the deadline instead of rejecting the
-    command, because the capture loop asked `if seconds:` and could not tell
-    an explicit zero from an unspecified duration. `reader-soak --minutes 0`
-    and `thermal-run --minutes 0` inherited the same hole and ran forever.
-    A duration or a count the operator typed is a request; the only way to
-    ask for no limit is to leave it off.
+    The capture loop asked `if seconds:`, so `--seconds 0` disabled the
+    deadline and ran forever instead of being rejected; `--minutes 0` and
+    `--cycles 0` inherited it. The only way to ask for no limit is to leave
+    the flag off.
     """
     try:
         value = int(text)
@@ -425,9 +423,9 @@ def run_capture(args: argparse.Namespace) -> int:
     return 1 if args.strict and report_warnings else 0
 
 
-# Which stop conditions mean the capture collected what it was told to. The
-# rest — an interrupt of a capture that had a stop condition, a stream that
-# simply ended — leave a partial run that `--strict` must not certify.
+# Stop conditions that mean the capture collected what it was told to. The
+# rest — an interrupted capture that had one, a stream that simply ended —
+# leave a partial run `--strict` must not certify.
 COMPLETED_STOP_REASONS = {"count", "duration", "operator"}
 
 # Stop events and the request key that names what the operator asked for.
@@ -445,27 +443,17 @@ def capture_request(
     """The contract a capture is held to: everything the operator asked for.
 
     Only the page-turn count was ever recorded, so `sleep-sync --cycles 10`,
-    `reader-soak --minutes 30` and `thermal-run --minutes 45` could stop after
-    the first valid signal and still satisfy `--strict`, which proved that
-    *some* expected telemetry occurred rather than that the requested capture
-    happened. `--cold`/`--warm` were worse: read once by argparse, never
-    written down, never checked.
+    `reader-soak --minutes 30` and `thermal-run --minutes 45` could stop at
+    the first valid signal and still satisfy `--strict` — proof that *some*
+    expected telemetry occurred, not that the requested capture happened.
+    `--cold`/`--warm` were worse: read once by argparse and never checked.
 
-    A count and a duration are not both minimums. `--seconds` is offered by
-    every capture command, and `page-turn` and `sleep-sync` always carry a
-    count target (50 turns, 10 cycles) whether or not the operator named one,
-    so recording both made `page-turn --seconds 60` a contract nothing could
-    satisfy: the capture stops at whichever lands first, and then the report
-    faulted it for the other. It passed only if the fiftieth turn happened to
-    land inside the duration tolerance.
-
-    So for a suite that counts, the count is the contract and `--seconds` is
-    a ceiling — an unattended capture's way out, not a window it owes. A
-    deadline that fires early still fails `--strict`, through the count
-    shortfall, which is the honest complaint: the run is short of its
-    samples. Suites with no count (`reader-soak`, `thermal-run`,
-    `storage-cache`) keep the duration as their contract, which is the only
-    one they have.
+    A count and a duration are not both minimums. Whichever the operator
+    typed is the contract (`stop_target_for` drops a defaulted count when a
+    duration was named); with both named the count wins and `--seconds` is a
+    ceiling. Recording both made `page-turn --seconds 60` unsatisfiable — the
+    capture stops at whichever lands first, and the report faulted it for the
+    other.
     """
     request: dict[str, Any] = {}
     count_key = (
@@ -546,15 +534,14 @@ def capture_seconds(args: argparse.Namespace) -> int | None:
 
 
 def stop_target_for(args: argparse.Namespace, suite: Suite) -> tuple[str, int] | None:
-    """The count this capture stops on, if a count is what it is bounded by.
+    """The count this capture stops on, if a count is what bounds it.
 
-    A count the operator typed is theirs, and `--seconds` is a ceiling over it
-    (see `capture_request`). A count they did not type is only this suite's
-    default, and must not outrank a duration they *did* type: holding
-    `page-turn --seconds 60` to 50 turns reported almost every time-boxed
-    capture as short of a sample count nobody had asked for. So a named
-    duration with no named count leaves the count out of both the stopping
-    rule and the contract.
+    A count the operator typed is theirs, and `--seconds` is a ceiling over
+    it. A count they did not type is only this suite's default and must not
+    outrank a duration they did: holding `page-turn --seconds 60` to 50 turns
+    reported almost every time-boxed capture as short of a sample count nobody
+    asked for. So a named duration with no named count drops the count from
+    both the stopping rule and the contract.
     """
     if suite.stop_event is None or suite.stop_count_arg is None:
         return None
@@ -1094,33 +1081,21 @@ def storage_open_kinds(events: list[dict[str, Any]]) -> dict[str, list[dict[str,
 
     Cold is decided positionally, because `storage_build` carries no request
     id or `t_ms` to join on: the firmware prints it from inside the open's
-    `LoadSection` step, so a build seen since the previous open belongs to
-    this one. Only events carrying a boolean `ram_hit` close an open — the
-    legacy `storage: open complete` line parses to a `storage_open` too and
-    would otherwise consume the build that belongs to the structured event
-    printed right after it.
+    `LoadSection` step, so a build seen since the previous open belongs to it.
+    Only events carrying a boolean `ram_hit` close an open — the legacy
+    `storage: open complete` line parses to a `storage_open` too and would
+    otherwise consume the build belonging to the structured event right after
+    it. Those legacy lines land in no kind; they carry no `elapsed_ms` either,
+    so no budget can be satisfied by an event that measured nothing.
 
-    Opens with no `ram_hit` at all (that legacy line) are classified into no
-    kind. They carry no `elapsed_ms` either, so they contribute nothing to any
-    figure; leaving them out keeps a budget from being quietly satisfied by an
-    event that measured nothing.
-
-    Not every build belongs to an open. A background walk's last step
-    publishes through the same `report_publish`, so it emits `storage_build`
-    with no open in flight, and the display task announces it as
-    `storage_background_build` immediately afterwards. That pairing is
-    reliable — `report_publish` only fires on a `Ready` outcome, which is
-    exactly the case where `finish_background_walk` returns `Ok(())` and the
-    step becomes `Finished` — so the announcement consumes the pending build.
-    Without that, the next ordinary card-backed open, possibly minutes later,
-    was filed as cold: a genuine warm sample lost to the budget, a requested
-    `--warm` path reported missing, and a 72 ms open described as a
-    14-64 second transaction.
-
-    A pending build does not survive a run boundary or a reboot either, for
-    the same reason page-turn pairing does not: `--all` concatenates
-    captures, and a build at the end of one run would otherwise be charged to
-    the first open of the next.
+    Three things clear a pending build. `storage_background_build`, because a
+    background walk's last step publishes through the same `report_publish`
+    with no open in flight — reliably paired, since `report_publish` fires
+    only on the `Ready` outcome that makes the step `Finished`. And
+    `run_start`/`boot`, because `--all` concatenates captures and a build at
+    the end of one run would be charged to the first open of the next. The
+    cost is the same either way: a real warm sample filed as a 14-64 second
+    cold one, out of the budget and out of `--warm` evidence.
     """
     kinds: dict[str, list[dict[str, Any]]] = {kind: [] for kind in STORAGE_OPEN_KINDS}
     built = False
@@ -1189,16 +1164,14 @@ def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, 
 #            card answered and what it held was unusable, which is a finding.
 #   error    the card refused an open, a seek, or a read.
 #
-# `miss` is deliberately the *narrowest* of the five. The firmware used to
+# `miss` is deliberately the narrowest of the five: the firmware used to
 # reduce the whole read to a bool inside the SD session, so a refused read, a
-# failed seek or a torn file all surfaced as the benign one — the precise
-# false pass this taxonomy exists to close.
+# failed seek and a torn file all surfaced as that benign one.
 CATALOG_LOAD_RESULTS = {"hit", "miss", "stale", "invalid", "error"}
 
-# The results that mean something went wrong. `miss` and `stale` are the two
-# that do not: one is a card whose catalog has not been built, the other a
-# card whose catalog the running firmware has outgrown, and both are answered
-# by the same scan.
+# The results that mean something went wrong. `miss` and `stale` do not: a
+# catalog not built yet and one the firmware has outgrown, both answered by
+# the same scan.
 CATALOG_LOAD_FAULTS = {"invalid", "error"}
 
 # How the report names each one, so a miss does not read as a fault.
@@ -1214,11 +1187,10 @@ CATALOG_LOAD_REASONS = {
 def catalog_load_hit(event: dict[str, Any]) -> bool:
     """The snapshot loaded — the only load that evidences the warm path.
 
-    Decided on whether the field is *present*, not on whether its value is a
-    string. Falling back to `ok` for any non-string made an explicit
-    `{"ok": true, "result": null}` read as a confirmed hit and enter the load
-    budget; only a line carrying no `result` at all is old enough for `ok` to
-    be the whole story.
+    Keyed on the field being *present*, not on its value being a string:
+    falling back to `ok` for any non-string made `{"ok": true, "result": null}`
+    read as a confirmed hit. Only a line with no `result` at all is old enough
+    for `ok` to be the whole story.
     """
     if "result" in event:
         return event["result"] == "hit"
@@ -1228,9 +1200,8 @@ def catalog_load_hit(event: dict[str, Any]) -> bool:
 def catalog_load_error(event: dict[str, Any]) -> bool:
     """The read went wrong, as opposed to there being nothing to hand over.
 
-    Only ever asserted from `result`. A pre-`result` capture's `ok=false`
-    covers every outcome at once, and the miss is overwhelmingly the common
-    one, so it is not called a failure on that evidence.
+    Asserted only from `result`: a pre-`result` capture's `ok=false` covers
+    every outcome at once, and the miss is by far the common one.
     """
     return event.get("result") in CATALOG_LOAD_FAULTS
 
@@ -1238,16 +1209,11 @@ def catalog_load_error(event: dict[str, Any]) -> bool:
 def unknown_catalog_result(event: dict[str, Any]) -> bool:
     """A `result=` this bench.py has no meaning for.
 
-    A typo, a value some future firmware adds, or a token that did not parse
-    as a string at all. It is not a hit, so it evidences nothing and enters no
-    budget; it is not a recognised fault, so `failed_storage_ops` passes over
-    it; and it is not result-less, so it does not read as legacy telemetry
-    either. Every predicate answering "no" is exactly how it used to slip
-    through `--strict` in silence, next to a valid `hit` in the same run.
-
-    Reported rather than guessed at, the same way an unrecognised workflow is:
-    nothing here knows what the firmware was saying, and silence reads as a
-    pass.
+    A typo, a token some future firmware adds, or a value that did not parse
+    as a string. Not a hit, not a recognised fault, and not result-less, so
+    every other predicate answered "no" about it — which is how it slipped
+    through `--strict` in silence beside a valid `hit` in the same run.
+    Reported rather than guessed at, as an unrecognised workflow is.
     """
     if event.get("event") != "storage_catalog" or "result" not in event:
         return False
@@ -1258,18 +1224,16 @@ def unknown_catalog_result(event: dict[str, Any]) -> bool:
 def unverifiable_catalog_op(event: dict[str, Any]) -> bool:
     """A catalog line that does not say how the operation went.
 
-    Loads have carried `ok` since the harness was written, so in practice this
-    is a scan from firmware older than the `ok` the scan line now carries —
-    which is every capture predating it, because `status` could not answer the
-    question: the firmware replaces a failed scan's `Error` with `Ready` when
-    an older in-memory catalog is still listed, so the marker read as success.
+    In practice a scan from firmware older than the scan line's `ok`, which is
+    every capture predating it: `status` could not answer the question,
+    because the firmware replaces a failed scan's `Error` with `Ready` while
+    an older in-memory catalog is still listed.
     """
     if event.get("event") != "storage_catalog":
         return False
-    # Either field being *present* means the line said something about how the
-    # operation went. Whether what it said is readable is
-    # `unknown_catalog_result`'s business, and a line it cannot read must not
-    # be pooled here as though it were merely old.
+    # Either field *present* means the line said something. Whether it is
+    # readable is `unknown_catalog_result`'s business, not grounds to pool the
+    # line here as though it were merely old.
     return "result" not in event and not isinstance(event.get("ok"), bool)
 
 
@@ -1283,17 +1247,13 @@ def catalog_succeeded(event: dict[str, Any]) -> bool:
 def catalog_samples(events: list[dict[str, Any]], action: str) -> list[dict[str, Any]]:
     """The operations whose duration describes the path a budget is about.
 
-    Confirmed successes, plus lines too old to say — a deliberate
-    compatibility policy, and the one place it is applied. A budget asks how
-    long the working path took, and for a legacy line the harness assumes what
-    it always assumed rather than blanking the figure for every capture made
-    before the result fields existed. Strict *evidence* takes the opposite
-    view and demands proof (see `storage_mode_evidence`), because proving a
-    requested path ran is a claim, not a measurement.
-
-    Confirmed non-successes are excluded either way: a miss and a refused
-    session both return in a fraction of the time the real thing takes, so
-    pooling them measures how fast the card said no.
+    Confirmed successes, plus lines too old to say — the one place that
+    compatibility assumption is applied. A budget asks how long the working
+    path took, so a legacy line is read as it always was; strict *evidence*
+    demands proof instead (`storage_mode_evidence`), because proving a path
+    ran is a claim rather than a measurement. Confirmed non-successes are out
+    of both: a miss and a refused session return in a fraction of the time,
+    so pooling them measures how fast the card said no.
     """
     return [
         event
@@ -1305,10 +1265,9 @@ def catalog_samples(events: list[dict[str, Any]], action: str) -> list[dict[str,
 def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Storage operations the firmware reported as genuinely failed.
 
-    A catalog load is judged on `result` alone, because its `ok=false` is the
-    normal cold path — no snapshot yet — far more often than it is a fault.
-    Everything else storage-side (`storage_progress` writes and flushes) means
-    what `ok=false` says.
+    A catalog load is judged on `result` alone: its `ok=false` is the normal
+    cold path — no snapshot yet — far more often than it is a fault.
+    Everything else storage-side means what `ok=false` says.
     """
     failed = []
     for event in events:
@@ -1322,10 +1281,9 @@ def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return failed
 
 
-# What `storage_mode_evidence` found, worst-case first: a mode the capture
-# never took, and a mode whose only witness is telemetry too old to say
-# whether it worked, both fail `--strict` — but they are different problems
-# and the operator fixes them differently (capture it, or reflash).
+# What `storage_mode_evidence` found. A mode never taken and one witnessed
+# only by telemetry too old to say both fail `--strict`, but the operator
+# fixes them differently: capture it, or reflash.
 STORAGE_MODE_ABSENT = "absent"
 STORAGE_MODE_UNVERIFIED = "unverified"
 STORAGE_MODE_CONFIRMED = "confirmed"
@@ -1334,12 +1292,11 @@ STORAGE_MODE_CONFIRMED = "confirmed"
 def storage_mode_evidence(events: list[dict[str, Any]], mode: str) -> str:
     """How well this capture proves it took the storage path it was asked to.
 
-    Strict evidence rests only on confirmed success. This check is new, so
-    nothing regresses by demanding it: a capture whose firmware predates the
-    result fields never had its requested mode verified at all, and now says
-    so instead of passing on a line that cannot support the claim. That is the
-    case that matters most, because the *host* tool records
-    `requested.storage_modes` regardless of which firmware is on the device.
+    Strict evidence rests only on confirmed success. Nothing regresses by
+    demanding it — a capture whose firmware predates the result fields never
+    had its mode verified anyway — and it is the case that matters, since the
+    *host* records `requested.storage_modes` whatever firmware is on the
+    device.
     """
     opens = storage_open_kinds(events)
     if mode == "cold":
@@ -1772,22 +1729,17 @@ def is_terminal_sleep(event: dict[str, Any]) -> bool:
 def is_completed_sleep_cycle(event: dict[str, Any]) -> bool:
     """One sleep cycle the panel finished, counted exactly once.
 
-    `sleep-sync --cycles N` stops on this and the report checks the capture
-    against the same predicate, so the two cannot disagree about whether the
-    operator got the cycles they asked for.
-
-    Narrower than `is_terminal_sleep` on both sides, deliberately:
+    `sleep-sync --cycles N` stops on this and the report checks against the
+    same predicate, so the two cannot disagree. Narrower than
+    `is_terminal_sleep` on both sides, deliberately:
 
     - `ok` must not be false. `phase=complete` prints on both outcomes, and
-      counting a failed completion ended the capture as though a cycle had
-      landed — the one case where the stop rule and the failed-sleep check
-      contradicted each other.
-    - `phase=deep_sleep` is not counted. It is the X3 panel driver's marker
-      and prints *beside* the display task's `phase=complete` on that device,
-      so admitting it counted every X3 cycle twice and a `--cycles 10` run
-      would have stopped at five. `is_terminal_sleep` still accepts it, since
-      asking "did this device ever sleep?" of a capture too old to carry
-      `phase=complete` is a different question from counting cycles.
+      counting a failed one ended the capture as though a cycle had landed.
+    - `phase=deep_sleep` is not counted: the X3 panel driver prints it
+      *beside* the display task's `phase=complete`, so admitting it counted
+      every X3 cycle twice and `--cycles 10` would have stopped at five.
+      `is_terminal_sleep` still accepts it — "did this device ever sleep?" of
+      a pre-`complete` capture is a different question.
     """
     return (
         event.get("event") == "sleep"
@@ -1991,17 +1943,12 @@ def load_budgets(path: Path | None) -> tuple[dict[str, Any], str | None]:
         )
     if not path.exists():
         return {}, f"budgets file {path} does not exist"
-    # A budget file that is not valid TOML is the same class of failure as one
-    # this parser cannot be loaded for, and owes the same answer: every
-    # involuntary empty result carries its reason, so `--strict` exits on it
-    # and a plain report says budgets were not checked. Letting the decode
-    # error propagate instead broke that contract with a traceback.
-    # `TOMLDecodeError` is resolved off whichever parser is bound (stdlib,
-    # `tomli`, or a test double) and subclasses `ValueError` in both real ones.
-    # `path.exists()` above is satisfied by a directory and by a file this
-    # process may not read, so the open itself still has to be guarded:
-    # otherwise `--budgets` pointed at a directory raises `IsADirectoryError`
-    # straight through the contract this function exists to keep.
+    # Unreadable and unparseable both owe the same answer as a missing parser:
+    # every involuntary empty result carries its reason, so `--strict` exits
+    # on it and a plain report warns. Letting either raise broke that with a
+    # traceback — `path.exists()` is satisfied by a directory, and a decode
+    # error propagated straight out. `TOMLDecodeError` is resolved off
+    # whichever parser is bound, so a test double without one still works.
     decode_error = getattr(tomllib, "TOMLDecodeError", ValueError)
     try:
         with path.open("rb") as handle:
@@ -2051,36 +1998,21 @@ BUDGET_BOUND_PAIRS: dict[str, list[tuple[str, str]]] = {
 def budget_schema_problems(budgets: dict[str, Any]) -> list[str]:
     """Everything wrong with a budget document, before any capture is read.
 
-    Budgets were consumed without a schema, and every consumer failed open:
-    `warn_if_above` and `warn_if_below` return silently unless the threshold
-    is an `int`, and an unknown key is simply never looked up. So
+    Every consumer fails open: `warn_if_above`/`warn_if_below` return silently
+    unless the threshold is an `int`, and an unknown key is never looked up.
+    So `median_press_to_settledd_ms = 550` left page-turn with no operative
+    threshold while `--strict` still exited 0 — a file that reads as enforced
+    and enforces nothing. A string did the same, and so did `true`, since
+    `isinstance(True, int)` holds and a bool arrives at the comparison as 1.
 
-        [page-turn]
-        median_press_to_settledd_ms = 550
+    Rejected for the same reason, each being a gate that cannot fire: an empty
+    section, a negative threshold, a floor above its own ceiling, and a
+    document with no sections at all — that last separately, because the loop
+    below has nothing to iterate and `budget_sections_in_play` cannot tell
+    `{}` from budgets deliberately disabled.
 
-    left the page-turn section with no operative latency threshold at all, and
-    `--strict` still exited 0 once the signal checks passed — a budget file
-    that reads as enforced and enforces nothing, which is the exact failure
-    this harness exists to stop. A string value did the same. So did `true`,
-    since `isinstance(True, int)` holds in Python and a bool would have
-    reached the comparison as 1.
-
-    An empty section is rejected for the same reason: it names a workflow,
-    survives `budget_sections_in_play`, and gates nothing. So is a negative
-    threshold, which is the type check's blind spot: `-1` is a perfectly good
-    `int` and, as a floor, is a budget no measurement can fall below — the
-    same silently-disabled gate a misspelling produces, spelled differently.
-    And so is a floor above its own ceiling, which no sample can satisfy.
-
-    Reported as a load failure, so `--strict` refuses to run and a non-strict
-    report says the budgets were not checked, rather than either one
-    proceeding against a file it could not honour.
-
-    A document with no sections at all is rejected for the same reason as an
-    empty one, and needs saying separately because the loop below has nothing
-    to iterate: an empty or comments-only file parsed to `{}`, which
-    `budget_sections_in_play` cannot tell from budgets deliberately disabled,
-    so `--strict` reported success having enforced not one threshold.
+    Reported as a load failure, so `--strict` refuses to run and a plain
+    report says budgets were not checked.
     """
     problems: list[str] = []
     if not budgets:
@@ -2440,22 +2372,18 @@ CAPTURE_DURATION_TOLERANCE_S = 1.0
 def capture_completion_warnings(run: LabelledRun) -> list[str]:
     """Did this capture finish, and did it collect what it was asked for?
 
-    Two separate questions, gated differently on purpose.
+    Two questions, gated differently on purpose.
 
-    *Did it finish* can only be asked of a run bench.py itself captured, and
-    `host_time` on the `run_start` is what says so — hand-built logs and test
-    fixtures carry a `run_start` but never that stamp, and they have no
-    `run_end` to expect either. A real capture that predates the completion
-    contract is reported as unverified rather than assumed complete, the same
-    way a capture carrying no `workflow` is reported rather than assumed to be
-    a page-turn run.
+    *Did it finish* can only be asked of a run bench.py captured, which
+    `host_time` on the `run_start` is what says: hand-built logs and fixtures
+    carry a `run_start` but never that stamp, and owe no `run_end` either. A
+    real capture predating the contract is reported as unverified rather than
+    assumed complete.
 
     *Did it collect what was asked for* is asked of any run that recorded a
-    request, whatever wrote it. That is the check `--strict` was missing: it
-    verified that expected telemetry appeared somewhere in the capture, not
-    that the requested capture happened, so a `--cycles 10` run interrupted
-    after one valid cycle and a `--minutes 30` soak interrupted after one
-    input/render/sleep/wake sequence both passed.
+    request, whatever wrote it. That is what `--strict` was missing — it
+    checked that expected telemetry appeared, not that the requested capture
+    happened, so a `--cycles 10` run cut short after one cycle passed.
     """
     start = next(
         (event for event in run.events if event.get("event") == "run_start"), {}

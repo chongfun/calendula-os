@@ -33,31 +33,29 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   request — seconds, turns, cycles, storage modes — and `run_end` records how
   the capture ended (`stop_reason`) and whether that was a stop condition
   anyone asked for (`completed`). `--strict` checks the run against its own
-  request, so a `--cycles 10` run interrupted after one cycle, a `--minutes
-  30` soak stopped at 95 seconds, and a log truncated before its `run_end` all
-  fail instead of passing on the strength of having produced *some* expected
-  telemetry. Ctrl-C completes a capture that asked for no other stop condition
-  and cuts short one that did. Captures predating this carry no completion
-  status and are reported as unverified rather than assumed complete.
+  request, so a `--cycles 10` run interrupted after one cycle, a `--minutes 30`
+  soak stopped at 95 seconds, and a log truncated before its `run_end` all fail
+  rather than passing on having produced *some* expected telemetry. Ctrl-C
+  completes a capture that asked for no other stop condition and cuts short one
+  that did. Captures predating this are reported as unverified, not assumed
+  complete.
 - **A count and a duration are not both minimums.** Whichever the operator
   *typed* is the contract. `page-turn --turns 50 --seconds 60` owes 50 turns
-  and treats `--seconds` as a ceiling — an unattended capture's way out, not a
-  window it owes — and the banner names both stop conditions and says which is
-  which. `page-turn --seconds 60` owes 60 seconds and nothing else: 50 is the
-  suite's default, not a request, so it neither stops the capture nor becomes
-  a contract, which otherwise reported almost every time-boxed capture as
-  short of a sample count nobody asked for. Suites with no count
-  (`reader-soak`, `thermal-run`, `storage-cache`) keep the duration as theirs.
+  and treats `--seconds` as a ceiling; the banner names both stop conditions
+  and says which is which. `page-turn --seconds 60` owes 60 seconds and
+  nothing else — 50 is the suite's default, not a request, so it neither stops
+  the capture nor gates it, which otherwise reported almost every time-boxed
+  capture as short of a count nobody asked for. Suites with no count keep the
+  duration as their contract.
 - **Durations and counts must be positive.** `--seconds 0`, `--minutes 0`,
   `--turns 0` and `--cycles 0` are rejected at the command line; zero used to
   disable the deadline and capture forever. Omit the flag to capture without
   that limit.
 - **`--reset-before` is setup, not telemetry.** The capture window opens once
-  the reset has returned, so `--reset-before --seconds 20` collects twenty
-  seconds of telemetry rather than twenty seconds minus espflash and device
-  re-enumeration. `run_end` carries both: `elapsed_s` is the telemetry window
-  a requested duration is checked against, `command_elapsed_s` the whole
-  command.
+  the reset returns, so `--reset-before --seconds 20` collects twenty seconds
+  rather than twenty minus espflash and re-enumeration. `run_end` carries
+  both: `elapsed_s` is the telemetry window a requested duration is checked
+  against, `command_elapsed_s` the whole command.
 - `reader-soak` is a passive capture: the operator runs the described
   reading workflow on the device by hand while bench.py records. Menus
   idle-sleep after 3 minutes (Reading after 10), so keep interacting. **Do
@@ -118,23 +116,21 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   trusted — the median was right and the tails were fiction.
 - **`storage-cache --cold` and `--warm` are checked, not decorative.**
   bench.py only listens, so the flags cannot steer the device; they declare
-  which paths the run will exercise, get recorded in `run_start`, and
-  `--strict` fails if the capture never took one of them. Cold is shown by a
-  book open that had to build its cache or by a catalog scan that *succeeded*;
-  warm by an open served from an already-built cache or from the loaded RAM
-  window, or by a catalog loaded from its snapshot. Passing neither flag is an
-  unrestricted operator-guided capture and requires no particular path. Until
-  2026-07-31 the flags were read once by argparse and never written down or
-  checked, so `--cold --warm --strict` passed without proving either path.
+  which paths the run will exercise, are recorded in `run_start`, and
+  `--strict` fails if the capture never took one. Cold is shown by a book open
+  that had to build its cache, or a catalog scan that *succeeded*; warm by an
+  open served from an already-built cache or the loaded RAM window, or a
+  catalog loaded from its snapshot. Neither flag means an unrestricted capture
+  owing no particular path. Until 2026-07-31 the flags were read once by
+  argparse and never checked, so `--cold --warm --strict` proved neither.
 - **A failed storage operation is not evidence, and not a sample.** The scan
   line carries its own `ok`, stamped before the firmware's UI fallback can
-  replace a failed scan's `Error` status with `Ready` — that fallback keeps
-  the reader on an older in-memory catalog, which is right for the reader and
-  made the marker read as a success, so a failed scan could evidence the cold
-  path. Failed operations are excluded from mode evidence and from the
-  `catalog_load_warn_ms` population, counted on their own report line, and a
-  `storage-cache` run containing one fails `--strict` the way a failed sleep
-  phase fails a sleep suite.
+  replace a failed scan's `Error` with `Ready` — that fallback keeps the
+  reader on an older in-memory catalog, which made the marker read as success
+  and let a failed scan evidence the cold path. Failed operations are out of
+  mode evidence and out of the `catalog_load_warn_ms` population, counted on
+  their own report line, and one in a `storage-cache` run fails `--strict` the
+  way a failed sleep phase fails a sleep suite.
 - **A missing snapshot is the cold path; anything else is a fault.** The
   catalog load reports `result=hit|miss|stale|invalid|error`, because its `ok`
   could not tell a card with nothing to hand over from a card that failed.
@@ -151,56 +147,49 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
 
   The other two are findings and fail `--strict` even when a later scan
   succeeds: `invalid` (wrong magic, the version-0 placeholder an interrupted
-  scan leaves behind, a length disagreeing with its header, or a record that
-  ended early) and `error` (a refused open, seek or read). The firmware used
-  to reduce the whole read to a bool *inside* the SD session, so every one of
-  those faults surfaced as the benign miss. No non-`hit` result enters the
+  scan leaves, a length disagreeing with its header, or a record that ended
+  early) and `error` (a refused open, seek or read). The firmware used to
+  reduce the whole read to a bool *inside* the SD session, so every one of
+  those surfaced as the benign miss. No non-`hit` result enters the
   `catalog_load_warn_ms` population, where it would measure how fast the card
-  said no rather than how long a load takes. A `result=` outside that
-  vocabulary — a typo, or a log from firmware newer than this bench.py — is
-  reported and fails `--strict` rather than passing over: it is neither a
-  success, nor a fault this tool recognises, nor result-less legacy
-  telemetry, so silence about it would read as a pass.
+  said no. A `result=` outside the vocabulary — a typo, or a log from newer
+  firmware — also fails `--strict`: it is neither a success, nor a fault this
+  tool recognises, nor legacy telemetry, so silence would read as a pass.
 - **Strict evidence needs confirmed success; the figures tolerate old logs.**
   A requested `--cold`/`--warm` path is proven only by an operation that says
   it succeeded. Telemetry too old to carry a result gets `cannot be verified
-  from this capture` rather than a silent pass — the host tool records the
-  requested modes whatever firmware is on the device, so without this a
-  current bench.py against an older build would certify a path from a line
-  that cannot support the claim. Nothing regresses: such a capture never had
-  its mode verified at all. The duration figures and budgets take the opposite
-  policy on purpose and still include result-less legacy lines, because a
-  budget asks how long the working path took rather than making a claim about
-  what ran; that is the single place the compatibility assumption is applied.
+  from this capture` rather than a silent pass: the host records the requested
+  modes whatever firmware is on the device, so otherwise a current bench.py
+  against an older build would certify a path from a line that cannot support
+  the claim. Nothing regresses — such a capture never had its mode verified.
+  The duration figures and budgets take the opposite policy on purpose and
+  still include result-less lines, because a budget asks how long the working
+  path took rather than claiming what ran.
 - **Not every cache build belongs to an open.** A background walk's last step
   publishes through the same path, emitting `storage_build` with no open in
-  flight, and is announced as `storage_background_build` immediately after.
-  The announcement consumes the pending build, so the next ordinary open —
-  possibly minutes later — is still classified as warm. Without that it was
-  filed as cold: a real warm sample lost to the budget, a requested `--warm`
-  path reported missing, and a 72 ms open described as a 14-64 second one.
+  flight, and is announced as `storage_background_build` right after. The
+  announcement consumes the pending build, so the next ordinary open — perhaps
+  minutes later — stays warm. Without it that open was filed as cold: a real
+  warm sample lost to the budget, a `--warm` path reported missing, and a
+  72 ms open described as a 14-64 second one.
 - **A book open is reported per path, never pooled.** `storage open (ram)`,
-  `(warm)` and `(cold)` are three different pieces of work — 0-15 ms, 57-95 ms
-  and 14-64 *seconds* on this repo's captures — so a pooled percentile
-  describes none of them. `warm_book_open_warn_ms` measures the warm
-  population alone: an open that read the card with no cache build inside the
-  same transaction. It used to be computed over every `storage_open`, where a
-  deliberately cold open failed the *warm* ceiling and a RAM hit pulled the
-  percentile back under it. Cold opens scale with book size by construction
-  and are reported without a budget.
+  `(warm)` and `(cold)` are different work — 0-15 ms, 57-95 ms and 14-64
+  *seconds* on this repo's captures — so a pooled percentile describes none of
+  them. `warm_book_open_warn_ms` measures the warm population alone: an open
+  that read the card with no cache build in the same transaction. Computed
+  over every `storage_open`, a deliberately cold open failed the *warm*
+  ceiling and a RAM hit pulled the percentile back under it. Cold opens scale
+  with book size and are reported without a budget.
 - **A malformed budget file is a configuration error.** Sections, key
-  spelling, and value types are validated against `BUDGET_SCHEMA` in bench.py
-  before any capture is read, so a typo like `median_press_to_settledd_ms`
-  fails the load instead of silently leaving page-turn with no operative
-  latency threshold. Empty sections, unknown keys, strings and booleans are
-  rejected the same way (`isinstance(True, int)` holds in Python, so a bool
-  would otherwise have reached the comparison as 1). So are values that are
-  the right type and still gate nothing: a negative millisecond threshold, and
-  a floor above its own ceiling — `full_refresh_busy_min_ms` over
-  `full_refresh_busy_max_ms`, or the two `median_press_to_settled` bounds
-  inverted — which no measurement can satisfy. `--strict` refuses to run; a
-  non-strict report says the budgets were not checked. Adding a budget to
-  `benches.toml` means adding it to the schema and reading it somewhere.
+  spelling and value types are validated against `BUDGET_SCHEMA` before any
+  capture is read, so a typo like `median_press_to_settledd_ms` fails the load
+  instead of silently leaving page-turn with no latency threshold. Unknown
+  keys, strings and booleans go the same way (`isinstance(True, int)` holds,
+  so a bool would have reached the comparison as 1) — as do values that are
+  the right type and still gate nothing: a negative threshold, a floor above
+  its own ceiling, an empty section, and a document with no sections at all.
+  `--strict` refuses to run; a plain report says budgets were not checked.
+  Adding a budget means adding it to the schema and reading it somewhere.
 - **A budget with nothing to measure is now a warning**, not a silent pass.
   If a run does not produce the telemetry a configured budget covers — a
   page-turn capture with no refresh events, say — the report says so and

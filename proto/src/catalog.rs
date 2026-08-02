@@ -63,15 +63,15 @@ pub fn catalog_file_len(count: u16) -> usize {
 }
 
 /// Why a header did not decode, for callers that report rather than just
-/// rebuild. Both outcomes lead to the same fresh scan; they differ only in
-/// whether anything went wrong.
+/// rebuild. Both lead to the same fresh scan; they differ only in whether
+/// anything went wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CatalogHeaderFault {
     /// Right magic, a version this build does not read, and not the
-    /// placeholder: a catalog written by older firmware. Bumping
+    /// placeholder: a catalog written by other firmware. Bumping
     /// `CATALOG_VERSION` *is* how this format migrates — the old snapshot
-    /// stops loading and a scan rebuilds it, with no migration code — so this
-    /// is the designed path on the first boot after an upgrade, not damage.
+    /// stops loading and a scan rebuilds it — so this is the designed first
+    /// boot after an upgrade, not damage.
     Stale,
     /// Wrong magic, or the version-0 placeholder a scan leaves in place while
     /// its records are still landing. Either means this is not a catalog the
@@ -301,10 +301,10 @@ mod tests {
 
     #[test]
     fn header_faults_separate_another_version_from_damage() {
-        // All four rescan; only the first is the format doing its job. A
-        // reader that reports — the bench telemetry — must not call the
-        // designed migration a storage fault, or the first boot after every
-        // CATALOG_VERSION bump fails a strict capture.
+        // All four rescan; only the version cases are the format doing its
+        // job. A reader that reports must not call the designed migration a
+        // fault, or the first boot after every CATALOG_VERSION bump fails a
+        // strict capture.
         let mut header = [0u8; CATALOG_HEADER_BYTES];
         encode_catalog_header(1234, &mut header);
         assert_eq!(classify_catalog_header(&header), Ok(1234));
