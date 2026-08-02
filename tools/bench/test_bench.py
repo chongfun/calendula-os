@@ -1657,6 +1657,73 @@ class PageTurnCounterTests(unittest.TestCase):
         counts = self._counts(lines, 2)
         self.assertEqual(counts.get("page_turn"), 2)
 
+    @staticmethod
+    def _turns(events: list) -> tuple:
+        counter = bench.PageTurnCounter()
+        for event in events:
+            counter.observe(event)
+        return counter.turns, len(bench.page_turn_stats_over_epochs(events).durations)
+
+    @staticmethod
+    def _reading(t_ms: int) -> list:
+        return [
+            {"event": "input", "button": "Next", "t_ms": t_ms},
+            {"event": "render", "view": "Reading", "t_ms": t_ms + 470, "req_ms": t_ms},
+        ]
+
+    # The operator's last tap before the device sleeps, which no render
+    # answers. `t_ms` restarts on the far side of the wake, so it sits at the
+    # head of the pending FIFO with a timestamp nothing after it can reach.
+    STRANDED_PRESS: ClassVar[dict[str, Any]] = {
+        "event": "input",
+        "button": "Next",
+        "t_ms": 59000,
+    }
+    WAKE: ClassVar[dict[str, Any]] = {
+        "event": "boot",
+        "deep_sleep_wake": True,
+        "gpio": True,
+        "sleep_image": True,
+    }
+
+    def test_a_press_stranded_by_a_sleep_does_not_stop_the_count(self) -> None:
+        """One unanswered press used to halt the counter for the whole run.
+
+        Every render after the wake compared against a `t_ms` from before it,
+        popped nothing, and counted no turn -- so `--turns N` never reached N
+        and the capture ran to its deadline, while the report, which splits by
+        boot segment, showed the turns that did happen.
+        """
+        events = (
+            self._reading(1000)
+            + self._reading(4000)
+            + [self.STRANDED_PRESS, self.WAKE]
+            + self._reading(600)
+            + self._reading(3600)
+        )
+        self.assertEqual(self._turns(events), (4, 4))
+
+    def test_a_bare_uptime_regression_ends_the_epoch_too(self) -> None:
+        """A watchdog or brownout reset prints no boot marker."""
+        events = (
+            self._reading(1000) + [self.STRANDED_PRESS] + self._reading(600) + self._reading(3600)
+        )
+        self.assertEqual(self._turns(events), (3, 3))
+
+    def test_a_millisecond_inversion_is_not_a_reboot(self) -> None:
+        """`bench: input` can preempt the display task mid-print.
+
+        The counter uses the same skew guard as `boot_segments`, so a hair of
+        print inversion must not drop the pending press behind it.
+        """
+        events = [
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1470, "req_ms": 1000},
+            {"event": "input", "button": "Next", "t_ms": 1469},
+            {"event": "render", "view": "Reading", "t_ms": 2000, "req_ms": 1600},
+        ]
+        self.assertEqual(self._turns(events), (2, 2))
+
     def test_the_live_counter_agrees_with_the_report(self) -> None:
         """The stop rule and the reported figure must not drift apart."""
         lines = (

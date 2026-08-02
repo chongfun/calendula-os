@@ -32,22 +32,41 @@ jobs:
         run: tools/check.sh fmt
 
   python:
-    name: Lint and Test Python
+    name: Lint and Test Python (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor `ruff.toml` declares and the interpreter macOS
+        # ships, so it is what an operator captures with; 3.14 is a current
+        # release, and the only one where `tomllib` exists, so it is the only
+        # leg that actually enforces a budget. Running the runner's default
+        # python tested neither: it is neither the floor nor pinned, and the
+        # 3.9 support the harness carries (the `tomli` fallback, the syntax it
+        # avoids) was verified only by hand.
+        python-version: ["3.9", "3.14"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      # The bench harness produces every device performance number this
-      # project has, and neither its lint nor its own tests ran here until
-      # now -- a gate that exists only on whoever remembers to run it locally
-      # is the shape this repo keeps arguing against.
-      # Pinned to match ruff.toml's `required-version`; ruff exits with
-      # the mismatch if the two ever drift apart.
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Lint once. ruff is a standalone binary and `target-version` is config,
+      # so its verdict does not depend on which python is installed, and the
+      # second leg would only repeat it. Pinned to match ruff.toml's
+      # `required-version`; ruff exits with the mismatch if the two drift.
       - name: Install ruff
+        if: matrix.python-version == '3.14'
         run: pipx install ruff==0.16.1
       - name: Lint and format-check Python
+        if: matrix.python-version == '3.14'
         run: tools/check.sh ruff
+      # The bench harness produces every device performance number this
+      # project has, and its tests ran in no workflow at all until now -- a
+      # gate that exists only on whoever remembers it locally is the shape
+      # this repo keeps arguing against. Both legs, because the harness
+      # supports both and they take different paths through `load_budgets`.
       - name: Test bench harness
         run: tools/check.sh test-bench
 

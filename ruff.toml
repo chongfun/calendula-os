@@ -55,11 +55,5 @@ ignore = [
     "RUF005",
 ]
 
-[lint.per-file-ignores]
-# The generators are run by hand (`uv run --with fonttools ...`), print as
-# they go, and are not imported by anything.
-"tools/generate_*.py" = ["T201"]
-"tools/build_font_pack.py" = ["T201"]
-
 [lint.isort]
 known-first-party = ["bench", "fontgen_common"]

@@ -1527,10 +1527,37 @@ class PageTurnCounter:
     def __init__(self) -> None:
         self.pending: list[int] = []
         self.turns = 0
+        self.last_t: int | None = None
+
+    def _new_epoch(self) -> None:
+        """Drop presses from the boot that just ended.
+
+        `t_ms` restarts at every reboot, and `pending` is a FIFO ordered by it,
+        so a press left unanswered before a sleep or a reset sits at the head
+        with a timestamp no later render can reach: every render after the
+        wake compares against it, pops nothing, and counts no turn. One stale
+        press stopped the counter permanently, which meant a `--turns N`
+        capture that slept partway through never reached N and ran to its
+        deadline instead — while the report, which splits by boot segment,
+        reported the turns that did happen. This is the drift the two
+        implementations are paired to prevent.
+        """
+        self.pending.clear()
+        self.last_t = None
 
     def observe(self, event: dict[str, Any]) -> None:
         name = event.get("event")
         t_ms = event.get("t_ms")
+        if name == "boot":
+            # The first print of a new boot, emitted before the timer starts,
+            # so it carries no `t_ms` to compare against.
+            self._new_epoch()
+        elif isinstance(t_ms, int):
+            # The same regression test `boot_segments` splits on, so the live
+            # counter and the report agree on where one boot ends.
+            if self.last_t is not None and self.last_t - t_ms > _BOOT_REGRESSION_SKEW_MS:
+                self._new_epoch()
+            self.last_t = t_ms
         if name == "input" and event.get("button") in {"Next", "Previous"}:
             if isinstance(t_ms, int):
                 self.pending.append(t_ms)
