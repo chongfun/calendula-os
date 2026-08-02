@@ -2665,6 +2665,41 @@ class BudgetSchemaTests(unittest.TestCase):
         self.assertEqual(result, {})
         self.assertIn("cannot parse", problem)
 
+    def test_an_unreadable_budget_path_is_reported_rather_than_raised(self) -> None:
+        """A directory satisfies `exists()` and then fails to open.
+
+        Same contract as a missing parser or a syntax error: every
+        involuntary empty result carries its reason, so a plain report warns
+        and `--strict` raises its own SystemExit instead of a traceback.
+        A directory is used because it raises `IsADirectoryError` on every
+        platform, where an unreadable file depends on permission behaviour.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_file = Path(tmp) / "budgets.toml"
+            not_a_file.mkdir()
+            with patch.object(bench, "tomllib", self._fake_parser({})):
+                budgets, problem = bench.load_budgets(not_a_file)
+        self.assertEqual(budgets, {})
+        self.assertIn("cannot read", problem)
+
+    def test_strict_refuses_to_run_against_an_unreadable_budget_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log.jsonl"
+            log.write_text(
+                json.dumps(
+                    {"suite": "page-turn", "event": "render", "view": "Reading", "t_ms": 1}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            not_a_file = Path(tmp) / "budgets.toml"
+            not_a_file.mkdir()
+            with patch.object(bench, "tomllib", self._fake_parser({})):
+                with self.assertRaises(SystemExit) as ctx:
+                    bench.summarize_paths([log], not_a_file, validate_suites=True)
+        self.assertIn("--strict cannot enforce budgets", str(ctx.exception))
+        self.assertIn("cannot read", str(ctx.exception))
+
     def test_load_budgets_reports_a_malformed_document(self) -> None:
         with patch.object(
             bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})

@@ -1965,10 +1965,16 @@ def load_budgets(path: Path | None) -> tuple[dict[str, Any], str | None]:
     # error propagate instead broke that contract with a traceback.
     # `TOMLDecodeError` is resolved off whichever parser is bound (stdlib,
     # `tomli`, or a test double) and subclasses `ValueError` in both real ones.
+    # `path.exists()` above is satisfied by a directory and by a file this
+    # process may not read, so the open itself still has to be guarded:
+    # otherwise `--budgets` pointed at a directory raises `IsADirectoryError`
+    # straight through the contract this function exists to keep.
     decode_error = getattr(tomllib, "TOMLDecodeError", ValueError)
     try:
         with path.open("rb") as handle:
             budgets = tomllib.load(handle)
+    except OSError as err:
+        return {}, f"cannot read {path}: {err}"
     except decode_error as err:
         return {}, f"cannot parse {path}: {err}"
     problems = budget_schema_problems(budgets)
