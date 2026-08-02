@@ -118,10 +118,12 @@ case "$COMMAND" in
         elif python3 -c "import ruff" >/dev/null 2>&1; then
             RUFF=(python3 -m ruff)
         else
-            echo "Error: ruff not found. Install it with one of:" >&2
-            echo "  pipx install ruff        (or) uv tool install ruff" >&2
-            echo "  python3 -m pip install ruff" >&2
-            echo "  brew install ruff" >&2
+            echo "Error: ruff not found. Install the pinned version:" >&2
+            echo "  uv tool install ruff==0.16.1" >&2
+            echo "  pipx install ruff==0.16.1" >&2
+            echo "  python3 -m pip install ruff==0.16.1" >&2
+            echo "(ruff.toml pins the version; brew installs whichever" >&2
+            echo " release is current, which may not match.)" >&2
             exit 1
         fi
         "${RUFF[@]}" check .

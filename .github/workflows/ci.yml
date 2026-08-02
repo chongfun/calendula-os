@@ -42,8 +42,10 @@ jobs:
       # project has, and neither its lint nor its own tests ran here until
       # now -- a gate that exists only on whoever remembers to run it locally
       # is the shape this repo keeps arguing against.
+      # Pinned to match ruff.toml's `required-version`; ruff exits with
+      # the mismatch if the two ever drift apart.
       - name: Install ruff
-        run: pipx install ruff
+        run: pipx install ruff==0.16.1
       - name: Lint and format-check Python
         run: tools/check.sh ruff
       - name: Test bench harness

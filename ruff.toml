@@ -7,6 +7,17 @@
 # `check.sh` invokes whatever `python3` is on PATH, which on macOS is 3.9, and
 # a lint that assumed newer syntax would pass here and fail on the interpreter
 # an operator captures with.
+# The formatter's stable style may change in a minor release, and can change
+# in a patch release to fix a semantic or comment-preservation defect. So the
+# version is pinned for the same reason `select` below is: without it the same
+# unchanged checkout passes on one machine and fails on another, or starts
+# failing CI on a day nobody touched the repo. Ruff enforces this itself and
+# exits with the mismatch, so the failure names its own cause.
+#
+# Bumping it is a deliberate change: raise the pin, run `ruff format .`, and
+# commit whatever reflow comes with it. Keep .github/workflows/ci.yml and the
+# hints in tools/check.sh on the same version.
+required-version = "==0.16.1"
 target-version = "py39"
 line-length = 100
 
