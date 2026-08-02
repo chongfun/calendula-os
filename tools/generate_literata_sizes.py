@@ -8,6 +8,7 @@ is deliberately not regenerated here because glyph rasterization differs
 across Pillow/freetype builds and regenerating it would churn every
 checked-in golden frame that uses the default size.
 """
+
 from pathlib import Path
 
 from PIL import ImageFont
@@ -78,7 +79,9 @@ def main():
                 offset += len(rows)
 
             name = f"LITERATA_{px}_{style}"
-            out.append(f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; SIZES_COUNT] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; SIZES_COUNT] = [\n"
+            )
             for item in metrics:
                 out.append(
                     "    GlyphMetric { "
@@ -87,7 +90,9 @@ def main():
                 )
             out.append("];\n\n")
 
-            out.append(f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n"
+            )
             if not bitmap:
                 out.append("    0x00,\n")
             for chunk_start in range(0, len(bitmap), 16):

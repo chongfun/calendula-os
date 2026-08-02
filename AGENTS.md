@@ -22,9 +22,11 @@ Never say that tests, lint, builds, or visual checks pass unless you actually ra
 Use the repository verification entry points:
 
 - `tools/check.sh fmt` for formatting.
-- `tools/check.sh ruff` for Python changes (config in `ruff.toml`; install with
-  `pipx install ruff`, `uv tool install ruff`, or `brew install ruff`). It is
-  part of `fast`, and refuses to run rather than skipping when ruff is absent.
+- `tools/check.sh ruff` for Python changes: lint plus a formatting check
+  (config in `ruff.toml`; install with `pipx install ruff`,
+  `uv tool install ruff`, or `brew install ruff`). Run `ruff format .` to fix
+  formatting. It is part of `fast`, and refuses to run rather than skipping
+  when ruff is absent.
 - `tools/check.sh fast` for normal Rust changes.
 - `tools/check.sh emulator` for UI, layout, rendering, typography, reader-state, or golden-frame changes.
 - `tools/check.sh firmware` for firmware, HAL, board-specific, or release-sensitive changes.

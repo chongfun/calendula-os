@@ -44,7 +44,7 @@ jobs:
       # is the shape this repo keeps arguing against.
       - name: Install ruff
         run: pipx install ruff
-      - name: Lint Python
+      - name: Lint and format-check Python
         run: tools/check.sh ruff
       - name: Test bench harness
         run: tools/check.sh test-bench

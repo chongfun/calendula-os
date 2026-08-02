@@ -1,6 +1,7 @@
-# Lint config for the repository's Python: the bench harness, the stack-frame
-# analyser, and the font/asset generators. Run by `tools/check.sh ruff`, which
-# `fast` and `all` both include.
+# Lint and format config for the repository's Python: the bench harness, the
+# stack-frame analyser, and the font/asset generators. Run by
+# `tools/check.sh ruff`, which `fast` and `all` both include, and which checks
+# formatting as well as lint. `ruff format .` is what fixes the formatting.
 #
 # `target-version` is the floor the tools actually run on, not an aspiration:
 # `check.sh` invokes whatever `python3` is on PATH, which on macOS is 3.9, and

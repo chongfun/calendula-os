@@ -167,13 +167,17 @@ def codepoints_from_ranges(ranges: list[tuple[int, int]]) -> list[int]:
     return sorted(set(values))
 
 
-def build_face(source: SourceFace, size_px: int, line_height: int, baseline: int, cps: list[int]) -> BuiltFace:
+def build_face(
+    source: SourceFace, size_px: int, line_height: int, baseline: int, cps: list[int]
+) -> BuiltFace:
     try:
         from PIL import ImageFont
 
         from fontgen_common import kerning_entries, rasterize_glyph
     except ModuleNotFoundError as exc:
-        raise RuntimeError("Pillow is required. Use .venv-font/bin/python or install pillow.") from exc
+        raise RuntimeError(
+            "Pillow is required. Use .venv-font/bin/python or install pillow."
+        ) from exc
 
     font = ImageFont.truetype(str(source.path), size_px)
     metric_records = bytearray()
@@ -185,9 +189,7 @@ def build_face(source: SourceFace, size_px: int, line_height: int, baseline: int
                 f"{source.path} glyph U+{code:04X} at {size_px}px is too large: {width}x{height}"
             )
         if len(rows) > 0xFFFF:
-            raise ValueError(
-                f"{source.path} glyph U+{code:04X} at {size_px}px bitmap is too large"
-            )
+            raise ValueError(f"{source.path} glyph U+{code:04X} at {size_px}px bitmap is too large")
         metric_records.extend(
             struct.pack(
                 "<IHBBbbH",
@@ -280,7 +282,9 @@ def build_pack(args: argparse.Namespace) -> dict[str, object]:
     header[20:22] = struct.pack("<H", len(built_faces))
     header[22:24] = struct.pack("<H", len(cps))
     header[24:26] = struct.pack("<H", len(name))
-    header[26:28] = struct.pack("<H", sum(1 << source.style for source in source_faces if not source.synthetic))
+    header[26:28] = struct.pack(
+        "<H", sum(1 << source.style for source in source_faces if not source.synthetic)
+    )
     header[28:32] = struct.pack("<I", face_table_offset)
     header[32:36] = struct.pack("<I", codepoints_offset)
     header[36:40] = struct.pack("<I", name_offset)
@@ -380,9 +384,7 @@ def summarize_pack(path: Path, data: bytes | None = None) -> dict[str, object]:
         "bytes": len(data),
         "codepoints": codepoint_count,
         "coverage": f"U+{min(cps):04X}..U+{max(cps):04X}" if cps else "",
-        "styles": [
-            label for bit, label in STYLE_LABELS.items() if style_bits & (1 << bit)
-        ],
+        "styles": [label for bit, label in STYLE_LABELS.items() if style_bits & (1 << bit)],
         "faces": faces,
     }
 

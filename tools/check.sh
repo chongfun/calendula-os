@@ -107,11 +107,12 @@ case "$COMMAND" in
         python3 -m unittest discover -s tools/bench -p 'test_*.py'
         ;;
     ruff)
-        # Python lint, configured in ruff.toml at the repo root. Refuses to
-        # run rather than skipping when ruff is missing, for the same reason
-        # --strict refuses without a TOML parser: a linter that quietly does
-        # nothing is worse than none, because the green tick still appears.
-        echo "Running Python lint..."
+        # Python lint and formatting, configured in ruff.toml at the repo
+        # root. Refuses to run rather than skipping when ruff is missing, for
+        # the same reason --strict refuses without a TOML parser: a check that
+        # quietly does nothing is worse than none, because the green tick
+        # still appears.
+        echo "Running Python lint and format checks..."
         if command -v ruff >/dev/null 2>&1; then
             RUFF=(ruff)
         elif python3 -c "import ruff" >/dev/null 2>&1; then
@@ -124,6 +125,8 @@ case "$COMMAND" in
             exit 1
         fi
         "${RUFF[@]}" check .
+        # `--check` only reports; `ruff format .` is what fixes it.
+        "${RUFF[@]}" format --check .
         ;;
     fast)
         "$0" fmt

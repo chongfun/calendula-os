@@ -74,7 +74,9 @@ def main():
             bitmap.extend(rows)
             offset += len(rows)
 
-        out.append(f"#[rustfmt::skip]\npub static LITERATA_{style}_METRICS: [GlyphMetric; LITERATA_COUNT] = [\n")
+        out.append(
+            f"#[rustfmt::skip]\npub static LITERATA_{style}_METRICS: [GlyphMetric; LITERATA_COUNT] = [\n"
+        )
         for item in metrics:
             out.append(
                 "    GlyphMetric { "
@@ -83,7 +85,9 @@ def main():
             )
         out.append("];\n\n")
 
-        out.append(f"#[rustfmt::skip]\npub static LITERATA_{style}_BITMAP: [u8; {len(bitmap)}] = [\n")
+        out.append(
+            f"#[rustfmt::skip]\npub static LITERATA_{style}_BITMAP: [u8; {len(bitmap)}] = [\n"
+        )
         for chunk_start in range(0, len(bitmap), 16):
             chunk = bitmap[chunk_start : chunk_start + 16]
             out.append("    ")

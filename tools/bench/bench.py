@@ -194,9 +194,7 @@ def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser],
     p.add_argument("--note", action="append", default=[], help="free-form note stored in metadata")
     p.add_argument("--book", default=None, help="operator label for the book under test")
     if name == "page-turn":
-        p.add_argument(
-            "--turns", type=positive_int, default=None, help="default 50; see --seconds"
-        )
+        p.add_argument("--turns", type=positive_int, default=None, help="default 50; see --seconds")
     if name == "reader-soak":
         p.add_argument("--minutes", type=positive_int, default=30)
     if name == "sleep-sync":
@@ -267,11 +265,21 @@ def process_capture_stream(
 
         if pending_prestage:
             has_prestage = any(e.get("event") == "prestage" for e in parsed_events)
-            has_new_turn_or_render = any(e.get("event") in {"render", "input"} for e in parsed_events)
+            has_new_turn_or_render = any(
+                e.get("event") in {"render", "input"} for e in parsed_events
+            )
             if line != "":
                 pending_prestage_lines += 1
-            expired = pending_prestage_deadline is not None and time.monotonic() >= pending_prestage_deadline
-            if has_prestage or has_new_turn_or_render or pending_prestage_lines >= MAX_PENDING_PRESTAGE_LINES or expired:
+            expired = (
+                pending_prestage_deadline is not None
+                and time.monotonic() >= pending_prestage_deadline
+            )
+            if (
+                has_prestage
+                or has_new_turn_or_render
+                or pending_prestage_lines >= MAX_PENDING_PRESTAGE_LINES
+                or expired
+            ):
                 break
         elif stop_target and counts.get(stop_target[0], 0) >= stop_target[1]:
             if stop_target[0] == "page_turn":
@@ -396,9 +404,7 @@ def run_capture(args: argparse.Namespace) -> int:
             # Ctrl-C *is* the stop condition when none was requested, so a
             # capture that asked for nothing else ends complete. One that did
             # ask was cut short, and must not read as though it finished.
-            stop_reason = (
-                "operator" if seconds is None and stop_target is None else "interrupt"
-            )
+            stop_reason = "operator" if seconds is None and stop_target is None else "interrupt"
         finally:
             write_event(
                 out,
@@ -457,9 +463,7 @@ def capture_request(
     other.
     """
     request: dict[str, Any] = {}
-    count_key = (
-        STOP_EVENT_REQUEST_KEYS.get(stop_target[0]) if stop_target is not None else None
-    )
+    count_key = STOP_EVENT_REQUEST_KEYS.get(stop_target[0]) if stop_target is not None else None
     if count_key is not None:
         request[count_key] = stop_target[1]
     elif seconds is not None:
@@ -605,7 +609,9 @@ def capture_lines(
             if not connected or err.errno not in PORT_LOST_ERRNOS:
                 raise
             if not reconnecting:
-                print(f"port: {port} vanished (device asleep?); wake it to resume capture", flush=True)
+                print(
+                    f"port: {port} vanished (device asleep?); wake it to resume capture", flush=True
+                )
                 reconnecting = True
         else:
             return
@@ -847,9 +853,7 @@ def summarize_paths(
     budgets, budgets_problem = load_budgets(budgets_path)
     if budgets_problem is not None:
         if validate_suites:
-            raise SystemExit(
-                f"bench report: --strict cannot enforce budgets: {budgets_problem}"
-            )
+            raise SystemExit(f"bench report: --strict cannot enforce budgets: {budgets_problem}")
         print(f"bench report: warning: budgets not checked: {budgets_problem}")
 
     if not events:
@@ -895,10 +899,7 @@ def summarize_paths(
     if pool.trusted.durations:
         print_duration("page turn", pool.trusted.durations)
     elif turn_stats.durations:
-        print(
-            "page turn      no run paired at a trustworthy cadence; median "
-            "suppressed"
-        )
+        print("page turn      no run paired at a trustworthy cadence; median suppressed")
     if turn_stats.presses:
         print(
             f"page inputs:   presses={turn_stats.presses} "
@@ -941,9 +942,7 @@ def summarize_paths(
                 )
             reasons = [
                 f"{count} "
-                + CATALOG_LOAD_REASONS.get(
-                    result, f"reported an unrecognised result ({result})"
-                )
+                + CATALOG_LOAD_REASONS.get(result, f"reported an unrecognised result ({result})")
                 for result, count in sorted(faults.items())
             ]
         print(f"catalog {action}:  " + ", ".join(reasons) + ", left out of the figure above")
@@ -994,9 +993,7 @@ def summarize_paths(
     if boot_paints:
         print(
             "boots:         "
-            + " ".join(
-                f"{kind}={len(boot_paints[kind])}" for kind in sorted(boot_paints)
-            )
+            + " ".join(f"{kind}={len(boot_paints[kind])}" for kind in sorted(boot_paints))
             + " (first render t_ms per witnessed boot; reset = unexplained reboot)"
         )
     if boot_stages:
@@ -1387,12 +1384,7 @@ class PageTurnStats:
 
     @property
     def unmatched_presses(self) -> int:
-        return (
-            self.presses
-            - len(self.durations)
-            - self.nav_answered
-            - self.coalesced_presses
-        )
+        return self.presses - len(self.durations) - self.nav_answered - self.coalesced_presses
 
     @property
     def untrusted_presses(self) -> int:
@@ -1509,9 +1501,7 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
                 durations.append(t_ms - newest_answered)
             else:
                 nav_answered += 1
-    return PageTurnStats(
-        durations, presses, reading_renders, nav_answered, coalesced_presses
-    )
+    return PageTurnStats(durations, presses, reading_renders, nav_answered, coalesced_presses)
 
 
 class PageTurnCounter:
@@ -1647,9 +1637,7 @@ def page_turn_exclusion(stats: PageTurnStats) -> str:
 
 def page_turn_pool(runs: list[LabelledRun]) -> PageTurnPool:
     """Pair presses to renders inside each run, keeping the runs apart."""
-    return PageTurnPool(
-        [(run.label, page_turn_stats_over_epochs(run.events)) for run in runs]
-    )
+    return PageTurnPool([(run.label, page_turn_stats_over_epochs(run.events)) for run in runs])
 
 
 def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
@@ -1762,9 +1750,7 @@ def has_failed_sleep(events: list[dict[str, Any]]) -> bool:
     away. The structured event is the only record of it — the parser drops
     the duplicate unstructured "framebuffer flush failed" line on purpose.
     """
-    return any(
-        event.get("event") == "sleep" and event.get("ok") is False for event in events
-    )
+    return any(event.get("event") == "sleep" and event.get("ok") is False for event in events)
 
 
 # A t_ms decrease smaller than this is treated as clock skew, not a reboot.
@@ -2035,13 +2021,11 @@ def budget_schema_problems(budgets: dict[str, Any]) -> list[str]:
         for key, value in sorted(entries.items()):
             if key not in known:
                 problems.append(
-                    f"[{section}] has unknown key {key} (known keys are "
-                    f"{', '.join(sorted(known))})"
+                    f"[{section}] has unknown key {key} (known keys are {', '.join(sorted(known))})"
                 )
             elif isinstance(value, bool) or not isinstance(value, int):
                 problems.append(
-                    f"[{section}] {key} must be an integer number of "
-                    f"milliseconds, not {value!r}"
+                    f"[{section}] {key} must be an integer number of milliseconds, not {value!r}"
                 )
             elif value < 0:
                 problems.append(
@@ -2082,10 +2066,7 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
         # per capture: an untrusted run is named and dropped rather than
         # averaged into the pool it would otherwise corrupt.
         for label, stats in pool.untrusted:
-            warnings.append(
-                f"page-turn median excludes {label}: "
-                f"{page_turn_exclusion(stats)}"
-            )
+            warnings.append(f"page-turn median excludes {label}: {page_turn_exclusion(stats)}")
         if pool.trusted.durations:
             turn_median = statistics.median(pool.trusted.durations)
             warn_if_above(
@@ -2102,12 +2083,15 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             )
         elif pool.every.durations:
             warnings.append(
-                "page-turn median: no run paired at a trustworthy cadence; "
-                "budget not checked"
+                "page-turn median: no run paired at a trustworthy cadence; budget not checked"
             )
         for key in ("median_press_to_settled_ms", "median_press_to_settled_min_ms"):
             warn_if_unobserved(
-                warnings, "page-turn", page_turn, key, runs,
+                warnings,
+                "page-turn",
+                page_turn,
+                key,
+                runs,
                 [stats.durations for _label, stats in pool.per_run],
                 "press-to-settled pairings",
             )
@@ -2129,8 +2113,13 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             page_turn.get("reading_layout_warn_ms"),
         )
         warn_if_unobserved(
-            warnings, "page-turn", page_turn, "reading_layout_warn_ms",
-            runs, per_run_layout, "Reading renders",
+            warnings,
+            "page-turn",
+            page_turn,
+            "reading_layout_warn_ms",
+            runs,
+            per_run_layout,
+            "Reading renders",
         )
         per_run_prestage, prestage = per_run_samples(runs, prestage_values)
         warn_if_above(
@@ -2140,8 +2129,13 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             page_turn.get("prestage_warn_ms"),
         )
         warn_if_unobserved(
-            warnings, "page-turn", page_turn, "prestage_warn_ms",
-            runs, per_run_prestage, "prestage samples",
+            warnings,
+            "page-turn",
+            page_turn,
+            "prestage_warn_ms",
+            runs,
+            per_run_prestage,
+            "prestage samples",
         )
         per_run_fast, fast_busy = per_run_samples(
             runs, lambda run_events: refresh_busy_values(run_events, "Fast")
@@ -2153,8 +2147,13 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             page_turn.get("fast_refresh_busy_warn_ms"),
         )
         warn_if_unobserved(
-            warnings, "page-turn", page_turn, "fast_refresh_busy_warn_ms",
-            runs, per_run_fast, "Fast refresh events",
+            warnings,
+            "page-turn",
+            page_turn,
+            "fast_refresh_busy_warn_ms",
+            runs,
+            per_run_fast,
+            "Fast refresh events",
         )
 
     sleep_sync = budgets.get("sleep-sync", {})
@@ -2180,8 +2179,13 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             warnings.append(f"{len(failed_sleeps)} failed sleep phase(s)")
         for key in ("full_refresh_busy_min_ms", "full_refresh_busy_max_ms"):
             warn_if_unobserved(
-                warnings, "sleep-sync", sleep_sync, key,
-                runs, per_run_full, "Full refresh events",
+                warnings,
+                "sleep-sync",
+                sleep_sync,
+                key,
+                runs,
+                per_run_full,
+                "Full refresh events",
             )
     storage_cache = budgets.get("storage-cache", {})
     if storage_cache and "storage-cache" in in_play:
@@ -2202,8 +2206,13 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             storage_cache.get("warm_book_open_warn_ms"),
         )
         warn_if_unobserved(
-            warnings, "storage-cache", storage_cache, "warm_book_open_warn_ms",
-            runs, per_run_open, "warm storage_open events",
+            warnings,
+            "storage-cache",
+            storage_cache,
+            "warm_book_open_warn_ms",
+            runs,
+            per_run_open,
+            "warm storage_open events",
         )
         # Loads that actually loaded: a miss (no snapshot on the card yet) and
         # a refused session both return in a fraction of the time a real load
@@ -2220,8 +2229,13 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             storage_cache.get("catalog_load_warn_ms"),
         )
         warn_if_unobserved(
-            warnings, "storage-cache", storage_cache, "catalog_load_warn_ms",
-            runs, per_run_catalog, "catalog load events",
+            warnings,
+            "storage-cache",
+            storage_cache,
+            "catalog_load_warn_ms",
+            runs,
+            per_run_catalog,
+            "catalog load events",
         )
     return warnings
 
@@ -2247,9 +2261,7 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
         label = run.label
         warnings.extend(capture_completion_warnings(run))
         signal_events = [
-            event
-            for event in run.events
-            if event.get("event") not in {"run_start", "run_end"}
+            event for event in run.events if event.get("event") not in {"run_start", "run_end"}
         ]
         if not signal_events:
             warnings.append(f"{label}: no parsed bench telemetry")
@@ -2302,9 +2314,7 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
             # A result nothing here recognises is neither a success nor a
             # known fault, so it would otherwise be the one storage outcome
             # `--strict` says nothing at all about.
-            unknown = [
-                event for event in signal_events if unknown_catalog_result(event)
-            ]
+            unknown = [event for event in signal_events if unknown_catalog_result(event)]
             if unknown:
                 seen = sorted({repr(event.get("result")) for event in unknown})
                 warnings.append(
@@ -2386,9 +2396,7 @@ def capture_completion_warnings(run: LabelledRun) -> list[str]:
     checked that expected telemetry appeared, not that the requested capture
     happened, so a `--cycles 10` run cut short after one cycle passed.
     """
-    start = next(
-        (event for event in run.events if event.get("event") == "run_start"), {}
-    )
+    start = next((event for event in run.events if event.get("event") == "run_start"), {})
     warnings: list[str] = []
     if "host_time" in start:
         warnings.extend(capture_stop_warnings(run))
@@ -2439,9 +2447,7 @@ def requested_counts(start: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def request_shortfall_warnings(
-    run: LabelledRun, start: dict[str, Any]
-) -> list[str]:
+def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[str]:
     """Each thing the capture was asked for, against what it came home with."""
     requested = requested_counts(start)
     if not requested:
@@ -2680,25 +2686,16 @@ def budget_sections_in_play(
     labelled = {label for label in per_run if label is not None}
     if not labelled:
         return set(budgets), []
-    sections = {
-        name
-        for name in budgets
-        if labelled & BUDGET_SECTION_WORKFLOWS.get(name, {name})
-    }
+    sections = {name for name in budgets if labelled & BUDGET_SECTION_WORKFLOWS.get(name, {name})}
     warnings = []
     for workflow in sorted(labelled):
-        if any(
-            workflow in BUDGET_SECTION_WORKFLOWS.get(section, {section})
-            for section in budgets
-        ):
+        if any(workflow in BUDGET_SECTION_WORKFLOWS.get(section, {section}) for section in budgets):
             continue
         # Every unclaimed workflow, not only the ones this bench.py knows: a
         # misspelled or newer name matches no section either, and skipping
         # the warning for it let malformed metadata buy silence.
         unknown = "" if workflow in SUITES else " (not a workflow this bench.py knows)"
-        warnings.append(
-            f"workflow {workflow} has no budget section to check it against{unknown}"
-        )
+        warnings.append(f"workflow {workflow} has no budget section to check it against{unknown}")
     unlabelled = sum(1 for label in per_run if label is None)
     if unlabelled:
         warnings.append(

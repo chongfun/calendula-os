@@ -12,13 +12,37 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else "."
 SRC = sys.argv[1] if len(sys.argv) > 1 else "."
 
 ROMAN = {
-    "I": "One", "II": "Two", "III": "Three", "IV": "Four", "V": "Five",
-    "VI": "Six", "VII": "Seven", "VIII": "Eight", "IX": "Nine", "X": "Ten",
-    "XI": "Eleven", "XII": "Twelve",
+    "I": "One",
+    "II": "Two",
+    "III": "Three",
+    "IV": "Four",
+    "V": "Five",
+    "VI": "Six",
+    "VII": "Seven",
+    "VIII": "Eight",
+    "IX": "Nine",
+    "X": "Ten",
+    "XI": "Eleven",
+    "XII": "Twelve",
 }
 
 
-SMALL_WORDS = {"a", "an", "and", "of", "the", "in", "on", "his", "her", "to", "with", "at", "by", "for"}
+SMALL_WORDS = {
+    "a",
+    "an",
+    "and",
+    "of",
+    "the",
+    "in",
+    "on",
+    "his",
+    "her",
+    "to",
+    "with",
+    "at",
+    "by",
+    "for",
+}
 
 
 def title_case(text: str) -> str:
@@ -34,16 +58,37 @@ def title_case(text: str) -> str:
 
 def normalize(text: str) -> str:
     for a, b in [
-        ("“", '"'), ("”", '"'), ("‘", "'"), ("’", "'"),
-        ("Æ", "Ae"), ("æ", "ae"), ("Œ", "Oe"), ("œ", "oe"),
-        ("…", "..."), ("–", "-"), (" ", " "),
+        ("“", '"'),
+        ("”", '"'),
+        ("‘", "'"),
+        ("’", "'"),
+        ("Æ", "Ae"),
+        ("æ", "ae"),
+        ("Œ", "Oe"),
+        ("œ", "oe"),
+        ("…", "..."),
+        ("–", "-"),
+        (" ", " "),
         ("—", "--"),
-        ("ê", "e"), ("é", "e"), ("è", "e"), ("ë", "e"), ("â", "a"),
-        ("à", "a"), ("ô", "o"), ("î", "i"), ("ç", "c"), ("ï", "i"),
-        ("ü", "u"), ("ñ", "n"), ("«", '"'), ("»", '"'),
+        ("ê", "e"),
+        ("é", "e"),
+        ("è", "e"),
+        ("ë", "e"),
+        ("â", "a"),
+        ("à", "a"),
+        ("ô", "o"),
+        ("î", "i"),
+        ("ç", "c"),
+        ("ï", "i"),
+        ("ü", "u"),
+        ("ñ", "n"),
+        ("«", '"'),
+        ("»", '"'),
         # This Pegana edition renders the macron'd river names Eimes,
         # Zanes, Segastrion with stray glyphs; fold them to plain vowels.
-        ("Î", "e"), ("‰", "a"), ("·", "a"),
+        ("Î", "e"),
+        ("‰", "a"),
+        ("·", "a"),
         ("_", ""),  # PG italics markers
     ]:
         text = text.replace(a, b)
@@ -52,7 +97,7 @@ def normalize(text: str) -> str:
 
 def body(path: str) -> list[str]:
     raw = Path(path).read_text(encoding="utf-8")
-    raw = raw.split("***", 2)[2]          # after START sentinel
+    raw = raw.split("***", 2)[2]  # after START sentinel
     raw = raw.rsplit("*** END", 1)[0]
     return normalize(raw).splitlines()
 
@@ -147,9 +192,9 @@ def aesop(count: int = 40) -> None:
         stripped = line.strip()
         is_title = (
             stripped.lower() in titles
-            and index > 700                      # past the TOC and front matter
+            and index > 700  # past the TOC and front matter
             and index + 1 < len(lines)
-            and not lines[index + 1].strip()     # blank after a heading
+            and not lines[index + 1].strip()  # blank after a heading
             and not line.startswith(" ")
         )
         if is_title:
@@ -223,8 +268,10 @@ def marker_book(name: str, marker: "re.Pattern", book_re) -> None:
         if book_re and book_re.match(line.strip()):
             sub = lines[i + 1].strip() if i + 1 < len(lines) else ""
             flush(par, out)
-            emit_heading(out, f"{head_case(line.strip())}: {head_case(sub)}"
-                         if sub else head_case(line.strip()))
+            emit_heading(
+                out,
+                f"{head_case(line.strip())}: {head_case(sub)}" if sub else head_case(line.strip()),
+            )
             started = True
             i += 2
             continue
@@ -248,7 +295,7 @@ def marker_book(name: str, marker: "re.Pattern", book_re) -> None:
         i += 1
     flush(par, out)
     text = "\n".join(out)
-    text = "# " + text.split("# ", 1)[1]      # drop front matter/TOC
+    text = "# " + text.split("# ", 1)[1]  # drop front matter/TOC
     Path(f"{OUT}/{name}.txt").write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
@@ -302,7 +349,7 @@ def lastmen() -> None:
     lines = body(f"{SRC}/lastmen.txt")
     chap = re.compile(r"^ {4,}([IVXL]+) ([A-Z][A-Za-z].*)$")
     sect = re.compile(r"^ {4,}\d+\. ([A-Z].*)$")
-    spaced = re.compile(r"^ {4,}([A-Z] )+[A-Z],?.*$")     # 'T H E   C H R O N I C L E'
+    spaced = re.compile(r"^ {4,}([A-Z] )+[A-Z],?.*$")  # 'T H E   C H R O N I C L E'
     intro = re.compile(r"^ {4,}Introduction\s*$")
     out: list[str] = []
     par: list[str] = []
@@ -330,7 +377,7 @@ def lastmen() -> None:
         if not stripped:
             flush(par, out)
         elif stripped == "By One of the Last Men":
-            pass                                          # intro subtitle, drop
+            pass  # intro subtitle, drop
         else:
             par.append(stripped)
         i += 1
@@ -340,8 +387,8 @@ def lastmen() -> None:
     Path(f"{OUT}/lastmen.txt").write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
-ROMAN_LINE = re.compile(r"^\s*[IVXLC]+\.\s*$")            # ' I.'  'II.'
-CHAPTER_LINE = re.compile(r"^CHAPTER\s+[IVXLC]+\s*$")     # 'CHAPTER I'
+ROMAN_LINE = re.compile(r"^\s*[IVXLC]+\.\s*$")  # ' I.'  'II.'
+CHAPTER_LINE = re.compile(r"^CHAPTER\s+[IVXLC]+\s*$")  # 'CHAPTER I'
 BOOK_LINE = re.compile(r"^BOOK\s+(ONE|TWO|THREE)$")
 
 alice()

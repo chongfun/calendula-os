@@ -198,7 +198,9 @@ class BenchReportTests(unittest.TestCase):
                 "\n".join(
                     [
                         json.dumps({"suite": "run1", "event": "run_start"}),
-                        json.dumps({"suite": "run1", "event": "render", "view": "Reading", "mode": "Fast"}),
+                        json.dumps(
+                            {"suite": "run1", "event": "render", "view": "Reading", "mode": "Fast"}
+                        ),
                         json.dumps({"suite": "run2", "event": "run_start"}),
                         json.dumps({"suite": "run2", "event": "refresh", "busy_ms": 100}),
                     ]
@@ -207,11 +209,13 @@ class BenchReportTests(unittest.TestCase):
                 encoding="utf-8",
             )
             bench.summarize_paths([path], None)
-            
+
             # Since latest_only=True, we should only see run2's events.
             mock_print.assert_any_call("events:        2")
             mock_print.assert_any_call("renders:       0")
-            mock_print.assert_any_call("bench report: latest run only (run2; 1 earlier run(s) in the log — pass --all to pool)")
+            mock_print.assert_any_call(
+                "bench report: latest run only (run2; 1 earlier run(s) in the log — pass --all to pool)"
+            )
 
     @patch("builtins.print")
     def test_summarize_paths_all_reports_every_run(self, mock_print) -> None:
@@ -221,7 +225,9 @@ class BenchReportTests(unittest.TestCase):
                 "\n".join(
                     [
                         json.dumps({"suite": "run1", "event": "run_start"}),
-                        json.dumps({"suite": "run1", "event": "render", "view": "Reading", "mode": "Fast"}),
+                        json.dumps(
+                            {"suite": "run1", "event": "render", "view": "Reading", "mode": "Fast"}
+                        ),
                         json.dumps({"suite": "run2", "event": "run_start"}),
                         json.dumps({"suite": "run2", "event": "refresh", "busy_ms": 100}),
                     ]
@@ -230,10 +236,11 @@ class BenchReportTests(unittest.TestCase):
                 encoding="utf-8",
             )
             bench.summarize_paths([path], None, latest_only=False)
-            
+
             # Since latest_only=False, we should see both run1 and run2's events.
             mock_print.assert_any_call("events:        4")
             mock_print.assert_any_call("renders:       1")
+
 
 class BudgetLoadingTests(unittest.TestCase):
     def test_none_path_is_intentionally_disabled(self) -> None:
@@ -254,9 +261,7 @@ class BudgetLoadingTests(unittest.TestCase):
     def _write_minimal_log(self, tmp: str) -> Path:
         path = Path(tmp) / "log.jsonl"
         path.write_text(
-            json.dumps(
-                {"suite": "page-turn", "event": "render", "view": "Reading", "t_ms": 100}
-            )
+            json.dumps({"suite": "page-turn", "event": "render", "view": "Reading", "t_ms": 100})
             + "\n",
             encoding="utf-8",
         )
@@ -425,9 +430,7 @@ class PageTurnTrustTests(unittest.TestCase):
             self._burst_events(),
             {"page-turn": {"median_press_to_settled_ms": 550}},
         )
-        self.assertTrue(
-            any("median excludes" in warning for warning in warnings), warnings
-        )
+        self.assertTrue(any("median excludes" in warning for warning in warnings), warnings)
         self.assertFalse(any("above warning budget" in warning for warning in warnings))
 
     def test_budget_floor_warns_on_suspiciously_fast_median(self) -> None:
@@ -443,9 +446,7 @@ class PageTurnTrustTests(unittest.TestCase):
 
     def test_suite_signals_flag_untrusted_page_turn(self) -> None:
         warnings = bench.evaluate_suite_signals(self._burst_events())
-        self.assertTrue(
-            any("produced no page turn" in warning for warning in warnings)
-        )
+        self.assertTrue(any("produced no page turn" in warning for warning in warnings))
 
     @patch("builtins.print")
     def test_report_suppresses_untrusted_median(self, mock_print) -> None:
@@ -751,9 +752,7 @@ class BudgetSuiteIsolationTests(unittest.TestCase):
             events,
             {"sleep-sync": {"full_refresh_busy_max_ms": 4300}},
         )
-        self.assertTrue(
-            any("above budget ceiling" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("above budget ceiling" in w for w in warnings), warnings)
 
     def test_a_thermal_run_with_no_recorded_workflow_is_reported(self) -> None:
         """Captured before the workflow was recorded: guessing it is worse.
@@ -769,9 +768,7 @@ class BudgetSuiteIsolationTests(unittest.TestCase):
             events,
             {"page-turn": {"fast_refresh_busy_warn_ms": 500}},
         )
-        self.assertTrue(
-            any("thermal-run has no budget section" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("thermal-run has no budget section" in w for w in warnings), warnings)
 
     def test_a_suite_no_budget_section_claims_is_reported(self) -> None:
         events = [
@@ -782,9 +779,7 @@ class BudgetSuiteIsolationTests(unittest.TestCase):
             events,
             {"page-turn": {"fast_refresh_busy_warn_ms": 500}},
         )
-        self.assertTrue(
-            any("sleep-sync has no budget section" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("sleep-sync has no budget section" in w for w in warnings), warnings)
 
     def test_an_unlabelled_log_still_measures_everything(self) -> None:
         """Hand-built fixtures and captures predating suite tagging."""
@@ -873,9 +868,7 @@ class PerRunCoverageTests(unittest.TestCase):
             events,
             {"page-turn": {"median_press_to_settled_ms": 550}},
         )
-        self.assertTrue(
-            any("page-turn median 1200ms" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("page-turn median 1200ms" in w for w in warnings), warnings)
 
 
 class TerminalSleepTests(unittest.TestCase):
@@ -896,9 +889,7 @@ class TerminalSleepTests(unittest.TestCase):
 
     def test_a_requested_sleep_is_not_a_completed_one(self) -> None:
         warnings = bench.evaluate_suite_signals(self.REQUESTED_ONLY)
-        self.assertTrue(
-            any("no completed sleep captured" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("no completed sleep captured" in w for w in warnings), warnings)
 
     def test_a_strict_report_fails_on_a_sleep_that_never_completed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -907,10 +898,13 @@ class TerminalSleepTests(unittest.TestCase):
                 "\n".join(json.dumps(event) for event in self.REQUESTED_ONLY) + "\n",
                 encoding="utf-8",
             )
-            with patch("builtins.print"), patch.object(
-                bench,
-                "load_budgets",
-                return_value=({"sleep-sync": {"full_refresh_busy_min_ms": 3000}}, None),
+            with (
+                patch("builtins.print"),
+                patch.object(
+                    bench,
+                    "load_budgets",
+                    return_value=({"sleep-sync": {"full_refresh_busy_min_ms": 3000}}, None),
+                ),
             ):
                 warnings = bench.summarize_paths(
                     [path], bench.DEFAULT_BUDGETS, validate_suites=True
@@ -942,9 +936,7 @@ class TerminalSleepTests(unittest.TestCase):
         parsed = bench.parse_line("display: sleep deep", "sleep-sync")[0]
         self.assertFalse(bench.is_terminal_sleep(parsed))
         warnings = bench.evaluate_suite_signals(self.REQUESTED_ONLY + [parsed])
-        self.assertTrue(
-            any("no completed sleep captured" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("no completed sleep captured" in w for w in warnings), warnings)
 
     def test_a_reset_after_an_x4_pre_command_marker_is_not_a_wake(self) -> None:
         run = [
@@ -975,12 +967,8 @@ class TerminalSleepTests(unittest.TestCase):
             {"event": "sleep", "phase": "complete", "ok": False, "t_ms": 44000},
         ]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("no completed sleep captured" in w for w in warnings), warnings
-        )
-        self.assertTrue(
-            any("failed sleep phase captured" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("no completed sleep captured" in w for w in warnings), warnings)
+        self.assertTrue(any("failed sleep phase captured" in w for w in warnings), warnings)
 
 
 class PageTurnTrustPoolTests(unittest.TestCase):
@@ -1033,9 +1021,7 @@ class PageTurnTrustPoolTests(unittest.TestCase):
             )
             with patch("builtins.print") as mock_print:
                 bench.summarize_paths([path], None, latest_only=False)
-        printed = "\n".join(
-            str(call.args[0]) for call in mock_print.call_args_list if call.args
-        )
+        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
         self.assertIn("EXCLUDED page-turn run 1 of 2", printed)
         # A min of 10ms would be the cadence run's sample leaking in.
         self.assertIn("page turn      median=400ms p95=400ms min=400ms", printed)
@@ -1055,12 +1041,8 @@ class PageTurnTrustPoolTests(unittest.TestCase):
                 }
             },
         )
-        self.assertTrue(
-            any("excludes page-turn run 1 of 2" in w for w in warnings), warnings
-        )
-        self.assertFalse(
-            any("below plausibility floor" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("excludes page-turn run 1 of 2" in w for w in warnings), warnings)
+        self.assertFalse(any("below plausibility floor" in w for w in warnings), warnings)
 
     def test_a_run_that_paired_nothing_is_named_too(self) -> None:
         """Presses but no answering render: excluded, so it must be reported.
@@ -1076,9 +1058,7 @@ class PageTurnTrustPoolTests(unittest.TestCase):
         ]
         events = stranded + self.clean_run(20, 400)
         pool = self._pool(events)
-        self.assertEqual(
-            [label for label, _stats in pool.untrusted], ["page-turn run 1 of 2"]
-        )
+        self.assertEqual([label for label, _stats in pool.untrusted], ["page-turn run 1 of 2"])
         self.assertEqual(pool.trusted.durations, [400] * 20)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1089,12 +1069,9 @@ class PageTurnTrustPoolTests(unittest.TestCase):
             )
             with patch("builtins.print") as mock_print:
                 bench.summarize_paths([path], None, latest_only=False)
-        printed = "\n".join(
-            str(call.args[0]) for call in mock_print.call_args_list if call.args
-        )
+        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
         self.assertIn(
-            "EXCLUDED page-turn run 1 of 2: 2 presses and no "
-            "input-to-Reading-render sample",
+            "EXCLUDED page-turn run 1 of 2: 2 presses and no input-to-Reading-render sample",
             printed,
         )
 
@@ -1112,9 +1089,7 @@ class PageTurnTrustPoolTests(unittest.TestCase):
             self.CADENCE_RUN,
             {"page-turn": {"median_press_to_settled_ms": 550}},
         )
-        self.assertTrue(
-            any("budget not checked" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("budget not checked" in w for w in warnings), warnings)
 
     def test_a_pool_of_trusted_runs_is_still_pooled(self) -> None:
         events = self.clean_run(3, 400) + self.clean_run(3, 2000)
@@ -1147,9 +1122,7 @@ class UnknownWorkflowTests(unittest.TestCase):
 
     def test_an_unknown_workflow_has_no_signal_requirements_and_says_so(self) -> None:
         warnings = bench.evaluate_suite_signals(self.MISSPELLED)
-        self.assertTrue(
-            any("unrecognised workflow" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("unrecognised workflow" in w for w in warnings), warnings)
 
     def test_an_unlabelled_run_says_nothing_was_checked(self) -> None:
         warnings = bench.evaluate_suite_signals(
@@ -1170,9 +1143,7 @@ class PooledFileTests(unittest.TestCase):
 
     def _write(self, directory: str, name: str, events: list[dict]) -> Path:
         path = Path(directory) / name
-        path.write_text(
-            "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
-        )
+        path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
         return path
 
     LABELLED: ClassVar[list[dict[str, Any]]] = [
@@ -1205,8 +1176,9 @@ class PooledFileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._write(tmp, "labelled.jsonl", self.LABELLED)
             self._write(tmp, "legacy.jsonl", self.LEGACY)
-            with patch("builtins.print"), patch.object(
-                bench, "load_budgets", return_value=self.BUDGETS
+            with (
+                patch("builtins.print"),
+                patch.object(bench, "load_budgets", return_value=self.BUDGETS),
             ):
                 return bench.summarize_paths(
                     [Path(tmp) / name for name in order],
@@ -1221,8 +1193,7 @@ class PooledFileTests(unittest.TestCase):
         # Everything else about the verdict must be identical.
         def verdict(order: list[str]) -> list[str]:
             return sorted(
-                re.sub(r" run \d+ of \d+", "", warning)
-                for warning in self._warnings(order)
+                re.sub(r" run \d+ of \d+", "", warning) for warning in self._warnings(order)
             )
 
         self.assertEqual(
@@ -1237,26 +1208,21 @@ class PooledFileTests(unittest.TestCase):
         ):
             with self.subTest(order=order):
                 warnings = self._warnings(order)
-                self.assertFalse(
-                    any("page-turn median" in w for w in warnings), warnings
-                )
+                self.assertFalse(any("page-turn median" in w for w in warnings), warnings)
 
     def test_an_unlabelled_run_in_a_pool_is_reported(self) -> None:
         warnings = self._warnings(["labelled.jsonl", "legacy.jsonl"])
-        self.assertTrue(
-            any("carry no suite label" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("carry no suite label" in w for w in warnings), warnings)
 
     def test_a_lone_legacy_log_is_still_measured(self) -> None:
         """Nothing to be ambiguous about, so the old behaviour stands."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, "legacy.jsonl", self.LEGACY)
-            with patch("builtins.print"), patch.object(
-                bench, "load_budgets", return_value=self.BUDGETS
+            with (
+                patch("builtins.print"),
+                patch.object(bench, "load_budgets", return_value=self.BUDGETS),
             ):
-                warnings = bench.summarize_paths(
-                    [path], bench.DEFAULT_BUDGETS, latest_only=False
-                )
+                warnings = bench.summarize_paths([path], bench.DEFAULT_BUDGETS, latest_only=False)
         self.assertTrue(any("page-turn median" in w for w in warnings), warnings)
         self.assertFalse(any("carry no suite label" in w for w in warnings), warnings)
 
@@ -1266,9 +1232,7 @@ class CaptureWorkflowTests(unittest.TestCase):
 
     def test_thermal_run_records_its_underlying_workflow(self) -> None:
         args = argparse.Namespace(suite="sleep-sync")
-        self.assertEqual(
-            bench.capture_workflow(args, bench.SUITES["thermal-run"]), "sleep-sync"
-        )
+        self.assertEqual(bench.capture_workflow(args, bench.SUITES["thermal-run"]), "sleep-sync")
 
     def test_every_other_suite_is_its_own_workflow(self) -> None:
         args = argparse.Namespace()
@@ -1579,14 +1543,15 @@ class SplitRunsTests(unittest.TestCase):
         self.assertEqual(bench.split_runs([]), [])
 
 
-
 class CaptureLinesTests(unittest.TestCase):
     @patch("bench.serial_lines")
     def test_initial_oserror_propagates(self, mock_serial) -> None:
         import errno
+
         def gen():
             raise OSError(errno.ENOENT, "Not found")
             yield
+
         mock_serial.return_value = gen()
         with self.assertRaises(OSError):
             list(bench.capture_lines("/dev/port"))
@@ -1595,24 +1560,31 @@ class CaptureLinesTests(unittest.TestCase):
     @patch("bench.time.sleep")
     @patch("bench.os.path.exists")
     @patch("bench.serial_lines")
-    def test_reconnects_after_oserror(self, mock_serial, mock_exists, mock_sleep, mock_print) -> None:
+    def test_reconnects_after_oserror(
+        self, mock_serial, mock_exists, mock_sleep, mock_print
+    ) -> None:
         import errno
         from unittest.mock import call
+
         def gen1():
             yield ""
             yield "data\n"
             raise OSError(errno.ENODEV, "Vanished")
+
         def gen2():
             yield ""
             yield "more data\n"
+
         mock_serial.side_effect = [gen1(), gen2()]
         mock_exists.side_effect = [False, True]
-        
+
         lines = list(bench.capture_lines("/dev/port"))
-        
+
         self.assertEqual(lines, ["data\n", "more data\n"])
         mock_sleep.assert_has_calls([call(0.5), call(0.5)])
-        mock_print.assert_any_call("port: /dev/port vanished (device asleep?); wake it to resume capture", flush=True)
+        mock_print.assert_any_call(
+            "port: /dev/port vanished (device asleep?); wake it to resume capture", flush=True
+        )
         mock_print.assert_any_call("port: back; resuming capture", flush=True)
 
     @patch("builtins.print")
@@ -1620,20 +1592,26 @@ class CaptureLinesTests(unittest.TestCase):
     @patch("bench.time.monotonic")
     @patch("bench.os.path.exists")
     @patch("bench.serial_lines")
-    def test_stop_at_expiration_while_absent(self, mock_serial, mock_exists, mock_monotonic, mock_sleep, mock_print) -> None:
+    def test_stop_at_expiration_while_absent(
+        self, mock_serial, mock_exists, mock_monotonic, mock_sleep, mock_print
+    ) -> None:
         import errno
+
         def gen():
             yield ""
             yield "data\n"
             raise OSError(errno.ENODEV, "Vanished")
+
         mock_serial.return_value = gen()
         mock_exists.return_value = False
         mock_monotonic.return_value = 100.0
-        
+
         lines = list(bench.capture_lines("/dev/port", stop_at=50.0))
-        
+
         self.assertEqual(lines, ["data\n"])
-        mock_print.assert_any_call("port: capture window ended while the device was away", flush=True)
+        mock_print.assert_any_call(
+            "port: capture window ended while the device was away", flush=True
+        )
         mock_sleep.assert_not_called()
 
 
@@ -1675,29 +1653,29 @@ class PageTurnCounterTests(unittest.TestCase):
 
     def test_the_capture_runs_until_the_turns_are_paired(self) -> None:
         """Two turns requested, one repaint in the middle: still two turns."""
-        lines = (
-            self.PRESS_AND_TURN + [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN
-        )
+        lines = self.PRESS_AND_TURN + [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN
         counts = self._counts(lines, 2)
         self.assertEqual(counts.get("page_turn"), 2)
 
     def test_the_live_counter_agrees_with_the_report(self) -> None:
         """The stop rule and the reported figure must not drift apart."""
-        lines = [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN * 3 + [
-            # A press answered by a Home render is navigation, not a turn.
-            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
-            (
-                "bench: render view=Home mode=Fast page=0 chapter=0 layout_ms=10 "
-                "flush_ms=400 req_ms=9000 t_ms=9430\n"
-            ),
-        ]
+        lines = (
+            [self.UNPROMPTED_RENDER]
+            + self.PRESS_AND_TURN * 3
+            + [
+                # A press answered by a Home render is navigation, not a turn.
+                "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
+                (
+                    "bench: render view=Home mode=Fast page=0 chapter=0 layout_ms=10 "
+                    "flush_ms=400 req_ms=9000 t_ms=9430\n"
+                ),
+            ]
+        )
         events = [event for line in lines for event in bench.parse_line(line, "page-turn")]
         counter = bench.PageTurnCounter()
         for event in events:
             counter.observe(event)
-        self.assertEqual(
-            counter.turns, len(bench.page_turn_stats_over_epochs(events).durations)
-        )
+        self.assertEqual(counter.turns, len(bench.page_turn_stats_over_epochs(events).durations))
 
     def test_a_short_capture_is_reported_against_what_was_asked_for(self) -> None:
         events = [
@@ -1706,9 +1684,7 @@ class PageTurnCounterTests(unittest.TestCase):
             {"event": "render", "view": "Reading", "t_ms": 1430, "req_ms": 1000},
         ]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("1 of 50 requested page turns" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("1 of 50 requested page turns" in w for w in warnings), warnings)
 
     def test_a_complete_capture_is_not_faulted(self) -> None:
         events: list[dict] = [
@@ -1741,9 +1717,7 @@ class ReaderSoakSignalTests(unittest.TestCase):
     def test_a_soak_that_never_slept_is_reported(self) -> None:
         events = [{"event": "run_start", "suite": "reader-soak"}] + self._reading(1000)
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("no completed sleep captured" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("no completed sleep captured" in w for w in warnings), warnings)
 
     def test_a_soak_that_slept_but_never_woke_is_reported(self) -> None:
         events = (
@@ -1752,9 +1726,7 @@ class ReaderSoakSignalTests(unittest.TestCase):
             + [{"event": "sleep", "phase": "complete", "ok": True, "t_ms": 40000}]
         )
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("no wake followed it" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("no wake followed it" in w for w in warnings), warnings)
 
     def test_a_full_sleep_wake_cycle_passes(self) -> None:
         events = (
@@ -1863,9 +1835,7 @@ class WokeAfterSleepTests(unittest.TestCase):
 class HasFailedSleepTests(unittest.TestCase):
     def test_any_failed_phase_counts(self) -> None:
         self.assertTrue(
-            bench.has_failed_sleep(
-                [{"event": "sleep", "phase": "power_down_start", "ok": False}]
-            )
+            bench.has_failed_sleep([{"event": "sleep", "phase": "power_down_start", "ok": False}])
         )
 
     def test_a_successful_run_has_none(self) -> None:
@@ -1906,9 +1876,7 @@ class BenchCaptureLoopTests(unittest.TestCase):
         self.assertEqual(counts.get("page_turn"), 1)
         self.assertEqual(counts.get("reading_render"), 1)
         self.assertEqual(counts.get("prestage"), 1)
-        self.assertEqual(
-            [event["event"] for event in written], ["input", "render", "prestage"]
-        )
+        self.assertEqual([event["event"] for event in written], ["input", "render", "prestage"])
 
     def test_capture_stops_immediately_for_structured_combined_render(self) -> None:
         """Structured combined render with prestage_ms stops without waiting for standalone prestage."""
@@ -2046,9 +2014,7 @@ class StopReasonTests(unittest.TestCase):
         )
 
     def test_an_expired_deadline_completes_the_capture(self) -> None:
-        self.assertEqual(
-            bench.observed_stop_reason({}, None, time.monotonic() - 1), "duration"
-        )
+        self.assertEqual(bench.observed_stop_reason({}, None, time.monotonic() - 1), "duration")
 
     def test_a_stream_that_simply_ended_did_not_complete(self) -> None:
         """The device stopped talking; nobody asked for that."""
@@ -2068,9 +2034,7 @@ class StopReasonTests(unittest.TestCase):
         question, answered by the request shortfall checks, not here.
         """
         self.assertEqual(
-            bench.observed_stop_reason(
-                {"page_turn": 3}, ("page_turn", 50), time.monotonic() - 1
-            ),
+            bench.observed_stop_reason({"page_turn": 3}, ("page_turn", 50), time.monotonic() - 1),
             "duration",
         )
 
@@ -2172,9 +2136,7 @@ class CaptureContractTests(unittest.TestCase):
         for command, extra, expected in cases:
             with self.subTest(command=command):
                 events = self._capture(command, [], **extra)
-                self.assertEqual(
-                    self._marker(events, "run_start")["requested"], expected
-                )
+                self.assertEqual(self._marker(events, "run_start")["requested"], expected)
 
     def test_an_unrequested_mode_is_not_recorded(self) -> None:
         events = self._capture("storage-cache", [], cold=True, warm=False)
@@ -2197,9 +2159,7 @@ class CaptureContractTests(unittest.TestCase):
 
     def test_ctrl_c_completes_a_capture_that_asked_for_no_stop_condition(self) -> None:
         """`storage-cache` with no --seconds stops on Ctrl-C by design."""
-        events = self._capture(
-            "storage-cache", [], cold=False, warm=False, interrupt=True
-        )
+        events = self._capture("storage-cache", [], cold=False, warm=False, interrupt=True)
         end = self._marker(events, "run_end")
         self.assertEqual(end["stop_reason"], "operator")
         self.assertTrue(end["completed"])
@@ -2298,17 +2258,13 @@ class CaptureCompletionReportTests(unittest.TestCase):
         """The minimum valid input/render/sleep/wake sequence is not 30 minutes."""
         events = self._soak({"seconds": 1800}, self._end(elapsed_s=95.0))
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("95s of the 1800s requested" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("95s of the 1800s requested" in w for w in warnings), warnings)
 
     def test_a_capture_predating_the_contract_is_reported_not_assumed(self) -> None:
         """An old real capture cannot prove it finished; say so."""
         events = self._soak({}, {"event": "run_end", "elapsed_s": 1800.0})
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("recorded no completion status" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("recorded no completion status" in w for w in warnings), warnings)
 
     def test_a_hand_built_log_is_not_asked_for_a_run_end(self) -> None:
         """Fixtures and hand-assembled logs carry no host_time and no run_end."""
@@ -2337,9 +2293,7 @@ class CaptureCompletionReportTests(unittest.TestCase):
             self._end(elapsed_s=61.0),
         ]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("1 of 10 requested sleep cycles" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("1 of 10 requested sleep cycles" in w for w in warnings), warnings)
 
     def test_a_sleep_sync_run_that_completed_its_cycles_passes(self) -> None:
         events = [self._start("sleep-sync", {"sleep_cycles": 2})]
@@ -2363,9 +2317,7 @@ class CaptureCompletionReportTests(unittest.TestCase):
             self._end(),
         ]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("0 of 1 requested sleep cycles" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("0 of 1 requested sleep cycles" in w for w in warnings), warnings)
 
     def test_the_x3_panel_marker_does_not_double_count_a_cycle(self) -> None:
         """uc8253 prints phase=deep_sleep beside the display task's complete."""
@@ -2408,9 +2360,7 @@ class CaptureCompletionReportTests(unittest.TestCase):
             self._end(),
         ]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("1 of 50 requested page turns" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("1 of 50 requested page turns" in w for w in warnings), warnings)
 
 
 class StorageModeTests(unittest.TestCase):
@@ -2428,16 +2378,22 @@ class StorageModeTests(unittest.TestCase):
 
     END: ClassVar[dict[str, Any]] = {"event": "run_end", "elapsed_s": 20.0, "completed": True}
 
-    WARM_OPEN: ClassVar[dict[str, Any]] = {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72}
+    WARM_OPEN: ClassVar[dict[str, Any]] = {
+        "event": "storage_open",
+        "ram_hit": False,
+        "elapsed_ms": 72,
+    }
     COLD_BUILD: ClassVar[dict[str, Any]] = {"event": "storage_build", "elapsed_ms": 14948}
-    COLD_OPEN: ClassVar[dict[str, Any]] = {"event": "storage_open", "ram_hit": False, "elapsed_ms": 15034}
+    COLD_OPEN: ClassVar[dict[str, Any]] = {
+        "event": "storage_open",
+        "ram_hit": False,
+        "elapsed_ms": 15034,
+    }
 
     def test_a_warm_only_capture_fails_the_cold_request(self) -> None:
         events = [self._start(["cold", "warm"]), self.WARM_OPEN, self.END]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("--cold was requested" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("--cold was requested" in w for w in warnings), warnings)
         self.assertFalse(any("--warm was requested" in w for w in warnings), warnings)
 
     def test_a_capture_showing_both_paths_passes(self) -> None:
@@ -2487,9 +2443,7 @@ class StorageModeTests(unittest.TestCase):
     def test_an_unrecognised_mode_fails_closed(self) -> None:
         events = [self._start(["tepid"]), self.WARM_OPEN, self.END]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("unrecognised storage mode tepid" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("unrecognised storage mode tepid" in w for w in warnings), warnings)
 
 
 class StorageOpenPopulationTests(unittest.TestCase):
@@ -2560,9 +2514,7 @@ class StorageOpenPopulationTests(unittest.TestCase):
         warnings = bench.evaluate_budgets(
             events, {"storage-cache": {"warm_book_open_warn_ms": 150}}
         )
-        self.assertTrue(
-            any("warm book open p95 900ms above" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("warm book open p95 900ms above" in w for w in warnings), warnings)
 
     def test_a_capture_with_only_cold_opens_has_nothing_to_gate(self) -> None:
         """Fail closed: the budget covered no sample in this run."""
@@ -2574,25 +2526,19 @@ class StorageOpenPopulationTests(unittest.TestCase):
         warnings = bench.evaluate_budgets(
             events, {"storage-cache": {"warm_book_open_warn_ms": 150}}
         )
-        self.assertTrue(
-            any("no warm storage_open events" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("no warm storage_open events" in w for w in warnings), warnings)
 
     @patch("builtins.print")
     def test_the_report_prints_one_line_per_path(self, mock_print) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "log.jsonl"
             path.write_text(
-                "\n".join(
-                    json.dumps(dict(event, suite="storage-cache")) for event in self.RUN
-                )
+                "\n".join(json.dumps(dict(event, suite="storage-cache")) for event in self.RUN)
                 + "\n",
                 encoding="utf-8",
             )
             bench.summarize_paths([path], None)
-        printed = "\n".join(
-            str(call.args[0]) for call in mock_print.call_args_list if call.args
-        )
+        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
         self.assertIn("storage open (ram)", printed)
         self.assertIn("storage open (warm)", printed)
         self.assertIn("storage open (cold)", printed)
@@ -2605,17 +2551,13 @@ class BudgetSchemaTests(unittest.TestCase):
 
     def test_a_valid_document_has_no_problems(self) -> None:
         self.assertEqual(
-            bench.budget_schema_problems(
-                {"page-turn": {"median_press_to_settled_ms": 550}}
-            ),
+            bench.budget_schema_problems({"page-turn": {"median_press_to_settled_ms": 550}}),
             [],
         )
 
     def test_a_misspelled_key_is_rejected(self) -> None:
         """This left page-turn with no operative latency threshold at all."""
-        problems = bench.budget_schema_problems(
-            {"page-turn": {"median_press_to_settledd_ms": 550}}
-        )
+        problems = bench.budget_schema_problems({"page-turn": {"median_press_to_settledd_ms": 550}})
         self.assertTrue(
             any("unknown key median_press_to_settledd_ms" in p for p in problems),
             problems,
@@ -2633,9 +2575,7 @@ class BudgetSchemaTests(unittest.TestCase):
 
     def test_a_boolean_threshold_is_rejected(self) -> None:
         """`isinstance(True, int)` holds, so a bool reached the comparison."""
-        problems = bench.budget_schema_problems(
-            {"page-turn": {"median_press_to_settled_ms": True}}
-        )
+        problems = bench.budget_schema_problems({"page-turn": {"median_press_to_settled_ms": True}})
         self.assertTrue(any("must be an integer" in p for p in problems), problems)
 
     def test_an_empty_document_is_rejected(self) -> None:
@@ -2733,9 +2673,7 @@ class BudgetSchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "log.jsonl"
             log.write_text(
-                json.dumps(
-                    {"suite": "page-turn", "event": "render", "view": "Reading", "t_ms": 1}
-                )
+                json.dumps({"suite": "page-turn", "event": "render", "view": "Reading", "t_ms": 1})
                 + "\n",
                 encoding="utf-8",
             )
@@ -2748,9 +2686,7 @@ class BudgetSchemaTests(unittest.TestCase):
         self.assertIn("cannot read", str(ctx.exception))
 
     def test_load_budgets_reports_a_malformed_document(self) -> None:
-        with patch.object(
-            bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})
-        ):
+        with patch.object(bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})):
             budgets, problem = bench.load_budgets(bench.DEFAULT_BUDGETS)
         self.assertEqual(budgets, {})
         self.assertIn("unknown key typo_ms", problem)
@@ -2759,9 +2695,7 @@ class BudgetSchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "log.jsonl"
             log.write_text(
-                json.dumps(
-                    {"suite": "page-turn", "event": "render", "view": "Reading", "t_ms": 1}
-                )
+                json.dumps({"suite": "page-turn", "event": "render", "view": "Reading", "t_ms": 1})
                 + "\n",
                 encoding="utf-8",
             )
@@ -2790,9 +2724,7 @@ class BudgetSchemaTests(unittest.TestCase):
                 self.assertIn(section, bench.BUDGET_SCHEMA, f"unknown section {section}")
                 continue
             key, _, value = (part.strip() for part in line.partition("="))
-            self.assertIn(
-                key, bench.BUDGET_SCHEMA[section], f"{key} is not in BUDGET_SCHEMA"
-            )
+            self.assertIn(key, bench.BUDGET_SCHEMA[section], f"{key} is not in BUDGET_SCHEMA")
             # No leading minus: a negative millisecond budget is a bound no
             # measurement can cross, which is a gate that is silently off.
             self.assertRegex(value, r"^\d+$", f"{key} is not a non-negative integer")
@@ -2830,12 +2762,8 @@ class CountAndDurationContractTests(unittest.TestCase):
         )
 
     def test_a_counting_suite_records_only_its_count(self) -> None:
-        self.assertEqual(
-            self._request("page-turn", 60, turns=50), {"page_turns": 50}
-        )
-        self.assertEqual(
-            self._request("sleep-sync", 60, cycles=10), {"sleep_cycles": 10}
-        )
+        self.assertEqual(self._request("page-turn", 60, turns=50), {"page_turns": 50})
+        self.assertEqual(self._request("sleep-sync", 60, cycles=10), {"sleep_cycles": 10})
 
     def test_a_counting_suite_without_seconds_is_unchanged(self) -> None:
         self.assertEqual(self._request("page-turn", None, turns=50), {"page_turns": 50})
@@ -2847,12 +2775,8 @@ class CountAndDurationContractTests(unittest.TestCase):
         capture to it reported almost every one as short of a sample count
         the operator never asked for.
         """
-        self.assertEqual(
-            self._request("page-turn", 60, turns=None), {"seconds": 60}
-        )
-        self.assertEqual(
-            self._request("sleep-sync", 60, cycles=None), {"seconds": 60}
-        )
+        self.assertEqual(self._request("page-turn", 60, turns=None), {"seconds": 60})
+        self.assertEqual(self._request("sleep-sync", 60, cycles=None), {"seconds": 60})
 
     def test_a_defaulted_count_does_not_stop_a_duration_capture(self) -> None:
         """It must leave the stopping rule as well as the contract.
@@ -2865,15 +2789,11 @@ class CountAndDurationContractTests(unittest.TestCase):
 
     def test_a_named_count_still_outranks_a_duration(self) -> None:
         args = argparse.Namespace(command="page-turn", seconds=60, turns=50)
-        self.assertEqual(
-            bench.stop_target_for(args, bench.SUITES["page-turn"]), ("page_turn", 50)
-        )
+        self.assertEqual(bench.stop_target_for(args, bench.SUITES["page-turn"]), ("page_turn", 50))
 
     def test_the_suite_default_still_applies_with_no_duration(self) -> None:
         args = argparse.Namespace(command="page-turn", seconds=None, turns=None)
-        self.assertEqual(
-            bench.stop_target_for(args, bench.SUITES["page-turn"]), ("page_turn", 50)
-        )
+        self.assertEqual(bench.stop_target_for(args, bench.SUITES["page-turn"]), ("page_turn", 50))
         args = argparse.Namespace(command="sleep-sync", seconds=None, cycles=None)
         self.assertEqual(
             bench.stop_target_for(args, bench.SUITES["sleep-sync"]),
@@ -2900,9 +2820,7 @@ class CountAndDurationContractTests(unittest.TestCase):
             },
         ]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertFalse(
-            any("requested page turns" in w for w in warnings), warnings
-        )
+        self.assertFalse(any("requested page turns" in w for w in warnings), warnings)
         self.assertEqual(warnings, [])
 
     def test_a_duration_suite_records_its_duration(self) -> None:
@@ -2910,9 +2828,7 @@ class CountAndDurationContractTests(unittest.TestCase):
             self._request("storage-cache", 20, cold=False, warm=False),
             {"seconds": 20},
         )
-        self.assertEqual(
-            self._request("reader-soak", None, minutes=30), {"seconds": 1800}
-        )
+        self.assertEqual(self._request("reader-soak", None, minutes=30), {"seconds": 1800})
         self.assertEqual(
             self._request("thermal-run", None, minutes=45, suite="page-turn"),
             {"seconds": 2700},
@@ -2980,9 +2896,7 @@ class CountAndDurationContractTests(unittest.TestCase):
         the run for a count nothing had told them was still in force.
         """
         printed: list = []
-        CaptureContractTests._capture(
-            "page-turn", [], turns=50, seconds=60, printed=printed
-        )
+        CaptureContractTests._capture("page-turn", [], turns=50, seconds=60, printed=printed)
         banner = "\n".join(printed)
         self.assertIn("50 parsed page_turn(s) or 60s, whichever comes first", banner)
         self.assertIn("--seconds is a ceiling", banner)
@@ -3029,9 +2943,7 @@ class BackgroundBuildTests(unittest.TestCase):
         warnings = bench.evaluate_budgets(
             events, {"storage-cache": {"warm_book_open_warn_ms": 150}}
         )
-        self.assertTrue(
-            any("warm book open p95 900ms above" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("warm book open p95 900ms above" in w for w in warnings), warnings)
 
     def test_a_requested_warm_path_is_not_lost_to_a_background_build(self) -> None:
         events = [
@@ -3093,9 +3005,7 @@ class CatalogResultTests(unittest.TestCase):
             {"action": "scan", "ok": True, "status": "Ready", "elapsed_ms": 900},
             ["cold"],
         )
-        self.assertEqual(
-            [w for w in bench.evaluate_suite_signals(events) if "--cold" in w], []
-        )
+        self.assertEqual([w for w in bench.evaluate_suite_signals(events) if "--cold" in w], [])
 
     def test_a_scan_predating_the_field_cannot_prove_the_cold_path(self) -> None:
         """Strict evidence is a claim, so it rests only on confirmed success.
@@ -3150,9 +3060,7 @@ class CatalogResultTests(unittest.TestCase):
             {"event": "storage_catalog", "action": "scan", "ok": False, "elapsed_ms": 900},
         ]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("failed storage operation(s)" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("failed storage operation(s)" in w for w in warnings), warnings)
 
     def test_a_failed_load_is_not_in_the_catalog_budget(self) -> None:
         events = [
@@ -3160,12 +3068,8 @@ class CatalogResultTests(unittest.TestCase):
             {"event": "storage_catalog", "action": "load", "ok": True, "elapsed_ms": 31},
             {"event": "storage_catalog", "action": "load", "ok": False, "elapsed_ms": 4000},
         ]
-        warnings = bench.evaluate_budgets(
-            events, {"storage-cache": {"catalog_load_warn_ms": 500}}
-        )
-        self.assertEqual(
-            [w for w in warnings if "catalog load p95" in w], [], warnings
-        )
+        warnings = bench.evaluate_budgets(events, {"storage-cache": {"catalog_load_warn_ms": 500}})
+        self.assertEqual([w for w in warnings if "catalog load p95" in w], [], warnings)
 
     def test_a_failed_load_is_not_warm_evidence(self) -> None:
         events = [
@@ -3204,9 +3108,7 @@ class CatalogResultTests(unittest.TestCase):
                 encoding="utf-8",
             )
             bench.summarize_paths([path], None)
-        printed = "\n".join(
-            str(call.args[0]) for call in mock_print.call_args_list if call.args
-        )
+        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
         self.assertIn("catalog scan:  1 failed", printed)
 
 
@@ -3271,9 +3173,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
     def test_a_card_error_fails_strict(self) -> None:
         events = self._run([self.ERROR, self.SCAN], ["cold"])
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("failed storage operation(s)" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("failed storage operation(s)" in w for w in warnings), warnings)
 
     def test_a_progress_write_failure_is_still_a_failure(self) -> None:
         """Only the catalog load's ok=false is ambiguous; nothing else's is."""
@@ -3298,9 +3198,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
             },
             self.MISS,
         ]
-        self.assertEqual(
-            bench.values(bench.catalog_samples(events, "load"), "elapsed_ms"), [31]
-        )
+        self.assertEqual(bench.values(bench.catalog_samples(events, "load"), "elapsed_ms"), [31])
 
     INVALID: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
@@ -3356,9 +3254,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
             with self.subTest(result=fault["result"]):
                 events = self._run([fault, self.SCAN], ["cold"])
                 warnings = bench.evaluate_suite_signals(events)
-                self.assertTrue(
-                    any("failed storage operation(s)" in w for w in warnings), warnings
-                )
+                self.assertTrue(any("failed storage operation(s)" in w for w in warnings), warnings)
 
     UNKNOWN: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
@@ -3395,9 +3291,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
             {"event": "run_end", "elapsed_s": 20.0, "completed": True},
         ]
         warnings = bench.evaluate_suite_signals(events)
-        self.assertTrue(
-            any("does not know ('timeout')" in w for w in warnings), warnings
-        )
+        self.assertTrue(any("does not know ('timeout')" in w for w in warnings), warnings)
 
     NULL_OK: ClassVar[dict[str, Any]] = {
         "event": "storage_catalog",
@@ -3494,18 +3388,14 @@ class ColdCatalogFallbackTests(unittest.TestCase):
                 encoding="utf-8",
             )
             bench.summarize_paths([path], None)
-        printed = "\n".join(
-            str(call.args[0]) for call in mock_print.call_args_list if call.args
-        )
+        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
         self.assertIn("1 reported an unrecognised result (timeout)", printed)
 
     def test_every_firmware_result_token_is_known_to_the_host(self) -> None:
         """The two sides agree on the vocabulary, or a token means nothing."""
         source = Path(bench.__file__).read_text(encoding="utf-8")
         firmware = Path(__file__).resolve().parents[2] / "fw" / "src" / "library_sd.rs"
-        emitted = set(
-            re.findall(r'Self::\w+ => "(\w+)"', firmware.read_text(encoding="utf-8"))
-        )
+        emitted = set(re.findall(r'Self::\w+ => "(\w+)"', firmware.read_text(encoding="utf-8")))
         self.assertTrue(emitted, "no result tokens found -- the scan is broken")
         # "hit" is produced by the caller rather than the fault enum.
         self.assertEqual(emitted | {"hit"}, bench.CATALOG_LOAD_RESULTS)
@@ -3540,9 +3430,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
                 encoding="utf-8",
             )
             bench.summarize_paths([path], None)
-        printed = "\n".join(
-            str(call.args[0]) for call in mock_print.call_args_list if call.args
-        )
+        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
         self.assertIn("1 found no snapshot (normal cold path)", printed)
 
 
@@ -3558,17 +3446,13 @@ class BudgetValueTests(unittest.TestCase):
 
     def test_zero_is_allowed(self) -> None:
         """A zero ceiling is degenerate but honest: everything exceeds it."""
-        self.assertEqual(
-            bench.budget_schema_problems({"page-turn": {"prestage_warn_ms": 0}}), []
-        )
+        self.assertEqual(bench.budget_schema_problems({"page-turn": {"prestage_warn_ms": 0}}), [])
 
     def test_a_floor_above_its_ceiling_is_rejected(self) -> None:
         problems = bench.budget_schema_problems(
             {"sleep-sync": {"full_refresh_busy_min_ms": 4300, "full_refresh_busy_max_ms": 3000}}
         )
-        self.assertTrue(
-            any("no measurement can satisfy both" in p for p in problems), problems
-        )
+        self.assertTrue(any("no measurement can satisfy both" in p for p in problems), problems)
 
     def test_the_page_turn_median_pair_is_checked_too(self) -> None:
         problems = bench.budget_schema_problems(
@@ -3579,9 +3463,7 @@ class BudgetValueTests(unittest.TestCase):
                 }
             }
         )
-        self.assertTrue(
-            any("no measurement can satisfy both" in p for p in problems), problems
-        )
+        self.assertTrue(any("no measurement can satisfy both" in p for p in problems), problems)
 
     def test_a_well_ordered_pair_passes(self) -> None:
         self.assertEqual(
