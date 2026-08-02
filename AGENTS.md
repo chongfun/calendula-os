@@ -22,6 +22,11 @@ Never say that tests, lint, builds, or visual checks pass unless you actually ra
 Use the repository verification entry points:
 
 - `tools/check.sh fmt` for formatting.
+- Python runs on the single version in `.python-version` (3.14.6). `python3`
+  is not assumed to be it -- macOS ships 3.9 under that name -- so
+  `tools/check.sh` prefers `python3.14`, verifies what it found, and fails
+  with instructions otherwise; `PYTHON=/path/to/python3.14` overrides. Install
+  it with `uv python install 3.14.6` or `pyenv install 3.14.6`.
 - `tools/check.sh ruff` for Python changes: lint plus a formatting check.
   `ruff.toml` pins the version (`required-version`), because the formatter's
   style can move between releases; install that exact one, e.g.

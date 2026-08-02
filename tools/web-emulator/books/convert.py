@@ -252,7 +252,7 @@ def emit_heading(out: list[str], title: str) -> None:
     out.append("")
 
 
-def marker_book(name: str, marker: "re.Pattern", book_re) -> None:
+def marker_book(name: str, marker: re.Pattern, book_re) -> None:
     """A book whose chapters are a numeral line followed by a title line.
 
     `book_re` (optional) matches a 'BOOK ONE' part divider whose subtitle is

@@ -82,11 +82,12 @@ telemetry is not covered by a sibling run that did, and the warning names the
 run. The medians and percentiles those budgets gate are still computed across
 every run the section owns.
 
-**Budget checking needs Python >= 3.11 (`tomllib`) or the `tomli` package.**
-Capture and plain reporting run on any Python 3.9+, but `--strict` refuses to
-run without a TOML parser — macOS system `python3` is 3.9, and a strict gate
-that silently checks nothing is how a 16.7x budget overrun once passed clean.
-Non-strict reports print a warning when budgets could not be loaded.
+**Runs on the Python in `.python-version`** (3.14.6), which
+`tools/check.sh` resolves — macOS ships 3.9 as `python3`, so do not assume
+that name. Budgets parse with `tomllib`, which that interpreter always has;
+when the parser was optional, `--strict` could silently check nothing, and
+that is how a 16.7x budget overrun once passed clean. A budget file that
+cannot be read or parsed still fails `--strict` and warns a plain report.
 
 The `page turn` statistic is guarded against operator cadence: the report
 prints a `page inputs:` line accounting for every press (`presses`,

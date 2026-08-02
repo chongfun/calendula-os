@@ -1,8 +1,7 @@
 # Warning budgets enforced by `bench.py report --strict` (and by `--strict`
 # on capture commands, against the log just written). A non-strict report
-# prints violations without failing. Budget parsing needs Python >= 3.11
-# (tomllib) or the optional `tomli` package; `--strict` refuses to run
-# without one rather than silently checking nothing.
+# prints violations without failing. Budget parsing uses `tomllib`, which the
+# repo's pinned interpreter (.python-version) always has.
 #
 # Sections and keys are validated against `BUDGET_SCHEMA` in bench.py before
 # any capture is read: an unknown section, a misspelled key, a non-integer or

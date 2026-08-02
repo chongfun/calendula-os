@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 """Development bench harness for CalendulaOS hardware runs.
 
 The harness deliberately starts as a serial log collector and parser. The
@@ -22,19 +22,11 @@ import subprocess
 import sys
 import termios
 import time
-from collections.abc import Iterable
+import tomllib
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TextIO
-
-try:
-    import tomllib
-except ImportError:  # pragma: no cover - Python < 3.11 fallback.
-    try:
-        # Third-party backport with the same API; optional, never required.
-        import tomli as tomllib  # type: ignore[no-redef]
-    except ImportError:
-        tomllib = None  # type: ignore[assignment]
+from typing import Any, TextIO
 
 try:
     import fcntl
@@ -1944,17 +1936,13 @@ def load_budgets(path: Path | None) -> tuple[dict[str, Any], str | None]:
     ``problem`` is a human-readable reason the budgets could not be loaded,
     and ``budgets`` is empty whenever it is set. A ``None`` path means the
     caller intentionally disabled budgets, which is not a problem. Budgets
-    silently absent is how ``--strict`` spent months verifying nothing on
-    Python 3.9, so every involuntary empty result must carry its reason.
+    silently absent is how ``--strict`` spent months verifying nothing when
+    the parser could go missing, so every involuntary empty result must carry
+    its reason. The parser itself no longer can: `tomllib` is imported
+    directly, and the repo pins the interpreter that has it.
     """
     if path is None:
         return {}, None
-    if tomllib is None:
-        version = ".".join(str(part) for part in sys.version_info[:3])
-        return {}, (
-            f"cannot parse {path}: tomllib needs Python >= 3.11 (this is "
-            f"{version}); re-run under a newer python3 or `pip install tomli`"
-        )
     if not path.exists():
         return {}, f"budgets file {path} does not exist"
     # Unreadable and unparseable both owe the same answer as a missing parser:
@@ -2576,7 +2564,10 @@ def warn_if_unobserved(
     """
     if budgets.get(key) is None:
         return
-    for run, samples in zip(runs, per_run):
+    # `per_run` is built from `runs` one-for-one by `per_run_samples`, so a
+    # length mismatch would mean a caller paired the wrong two lists and
+    # silently checked coverage against the wrong capture.
+    for run, samples in zip(runs, per_run, strict=True):
         if samples:
             continue
         warnings.append(

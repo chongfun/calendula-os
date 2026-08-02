@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 """Fail the build when one function's stack frame gets too big.
 
 The device has no stack guard page. An overflow runs off the bottom of the
@@ -211,7 +211,7 @@ def stack_region(elf: str) -> int | None:
         out = subprocess.run(
             [nm, elf], capture_output=True, text=True, check=True, timeout=30
         ).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+    except subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired:
         return None
     marks = {}
     for line in out.splitlines():

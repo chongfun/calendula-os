@@ -246,13 +246,6 @@ class BudgetLoadingTests(unittest.TestCase):
     def test_none_path_is_intentionally_disabled(self) -> None:
         self.assertEqual(bench.load_budgets(None), ({}, None))
 
-    def test_missing_parser_reports_problem(self) -> None:
-        with patch.object(bench, "tomllib", None):
-            budgets, problem = bench.load_budgets(Path("benches.toml"))
-        self.assertEqual(budgets, {})
-        self.assertIn("tomllib", problem)
-        self.assertIn("tomli", problem)
-
     def test_missing_file_reports_problem(self) -> None:
         budgets, problem = bench.load_budgets(Path("does-not-exist.toml"))
         self.assertEqual(budgets, {})
@@ -268,12 +261,16 @@ class BudgetLoadingTests(unittest.TestCase):
         return path
 
     def test_strict_report_fails_loudly_when_budgets_unloadable(self) -> None:
-        """--strict with no TOML parser must exit non-zero, not verify nothing."""
+        """--strict must exit non-zero rather than verify nothing.
+
+        The file parses; it is the section with no keys in it that makes the
+        document unusable, which is a real budget file this could be handed.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             log = self._write_minimal_log(tmp)
             budgets = Path(tmp) / "benches.toml"
             budgets.write_text("[page-turn]\n", encoding="utf-8")
-            with patch.object(bench, "tomllib", None), self.assertRaises(SystemExit) as ctx:
+            with self.assertRaises(SystemExit) as ctx:
                 bench.summarize_paths([log], budgets, validate_suites=True)
         self.assertIn("--strict cannot enforce budgets", str(ctx.exception))
 
@@ -283,8 +280,7 @@ class BudgetLoadingTests(unittest.TestCase):
             log = self._write_minimal_log(tmp)
             budgets = Path(tmp) / "benches.toml"
             budgets.write_text("[page-turn]\n", encoding="utf-8")
-            with patch.object(bench, "tomllib", None):
-                warnings = bench.summarize_paths([log], budgets)
+            warnings = bench.summarize_paths([log], budgets)
         self.assertEqual(warnings, [])
         printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
         self.assertIn("budgets not checked", printed)
@@ -296,28 +292,6 @@ class BudgetLoadingTests(unittest.TestCase):
             path.write_text("", encoding="utf-8")
             warnings = bench.summarize_paths([path], None, validate_suites=True)
         self.assertEqual(warnings, ["no events parsed"])
-
-    def test_load_budgets_uses_whatever_parser_is_bound(self) -> None:
-        """The `tomli` fallback is advertised in the README and the --strict
-        error message, so it must actually be consumed. The import-time
-        branch cannot be exercised here, but the risk it carries can: that
-        the fallback binds and `load_budgets` ignores it.
-        """
-
-        class FakeParser:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def load(self, handle) -> dict:
-                self.calls += 1
-                return {"page-turn": {"median_press_to_settled_ms": 42}}
-
-        parser = FakeParser()
-        with patch.object(bench, "tomllib", parser):
-            budgets, problem = bench.load_budgets(bench.DEFAULT_BUDGETS)
-        self.assertIsNone(problem)
-        self.assertEqual(parser.calls, 1)
-        self.assertEqual(budgets["page-turn"]["median_press_to_settled_ms"], 42)
 
     def test_checked_in_budgets_have_no_dead_keys(self) -> None:
         """Every key in benches.toml must be read somewhere in bench.py.
@@ -1166,10 +1140,9 @@ class PooledFileTests(unittest.TestCase):
         {"event": "render", "view": "Reading", "t_ms": 11000, "req_ms": 6000},
     ]
 
-    # Supplied directly rather than read from benches.toml: this exercises
-    # pooling, and on Python 3.9 there is no tomllib for --strict to load
-    # with, which would make the check disappear on the interpreter most
-    # likely to run it.
+    # Supplied directly rather than read from benches.toml: this test is
+    # about pooling, and pinning the threshold here keeps it from moving when
+    # the shipped budget does.
     BUDGETS = ({"page-turn": {"median_press_to_settled_ms": 550}}, None)
 
     def _warnings(self, order: list[str]) -> list[str]:
@@ -2681,8 +2654,7 @@ class BudgetSchemaTests(unittest.TestCase):
             )
             budgets = Path(tmp) / "empty.toml"
             budgets.write_text("# nothing configured\n", encoding="utf-8")
-            empty = self._fake_parser({})
-            with patch.object(bench, "tomllib", empty), self.assertRaises(SystemExit) as ctx:
+            with self.assertRaises(SystemExit) as ctx:
                 bench.summarize_paths([log], budgets, validate_suites=True)
         self.assertIn("configures no budget sections", str(ctx.exception))
 
@@ -2695,14 +2667,6 @@ class BudgetSchemaTests(unittest.TestCase):
         problems = bench.budget_schema_problems({"page-turn": 550})
         self.assertTrue(any("is not a table" in p for p in problems), problems)
 
-    def _fake_parser(self, document: dict):
-        class FakeParser:
-            @staticmethod
-            def load(handle) -> dict:
-                return document
-
-        return FakeParser()
-
     def test_invalid_toml_is_reported_rather_than_raised(self) -> None:
         """A syntax error owes the same answer as a missing parser.
 
@@ -2710,8 +2674,6 @@ class BudgetSchemaTests(unittest.TestCase):
         traceback instead of the SystemExit it promises, and a plain report
         crashed instead of warning.
         """
-        if bench.tomllib is None:
-            self.skipTest("no TOML parser on this interpreter")
         with tempfile.TemporaryDirectory() as tmp:
             budgets = Path(tmp) / "benches.toml"
             budgets.write_text("[page-turn\nnot = toml =\n", encoding="utf-8")
@@ -2731,8 +2693,7 @@ class BudgetSchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             not_a_file = Path(tmp) / "budgets.toml"
             not_a_file.mkdir()
-            with patch.object(bench, "tomllib", self._fake_parser({})):
-                budgets, problem = bench.load_budgets(not_a_file)
+            budgets, problem = bench.load_budgets(not_a_file)
         self.assertEqual(budgets, {})
         self.assertIn("cannot read", problem)
 
@@ -2746,16 +2707,17 @@ class BudgetSchemaTests(unittest.TestCase):
             )
             not_a_file = Path(tmp) / "budgets.toml"
             not_a_file.mkdir()
-            empty = self._fake_parser({})
-            with patch.object(bench, "tomllib", empty), self.assertRaises(SystemExit) as ctx:
+            with self.assertRaises(SystemExit) as ctx:
                 bench.summarize_paths([log], not_a_file, validate_suites=True)
         self.assertIn("--strict cannot enforce budgets", str(ctx.exception))
         self.assertIn("cannot read", str(ctx.exception))
 
     def test_load_budgets_reports_a_malformed_document(self) -> None:
-        with patch.object(bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})):
-            budgets, problem = bench.load_budgets(bench.DEFAULT_BUDGETS)
-        self.assertEqual(budgets, {})
+        with tempfile.TemporaryDirectory() as tmp:
+            budgets = Path(tmp) / "benches.toml"
+            budgets.write_text("[page-turn]\ntypo_ms = 1\n", encoding="utf-8")
+            loaded, problem = bench.load_budgets(budgets)
+        self.assertEqual(loaded, {})
         self.assertIn("unknown key typo_ms", problem)
 
     def test_strict_refuses_to_run_against_a_malformed_budget_file(self) -> None:
@@ -2771,8 +2733,7 @@ class BudgetSchemaTests(unittest.TestCase):
             # test is about -- is never reached.
             budgets = Path(tmp) / "budgets.toml"
             budgets.write_text("[page-turn]\ntypo_ms = 1\n", encoding="utf-8")
-            typo = self._fake_parser({"page-turn": {"typo_ms": 1}})
-            with patch.object(bench, "tomllib", typo), self.assertRaises(SystemExit) as ctx:
+            with self.assertRaises(SystemExit) as ctx:
                 bench.summarize_paths([log], budgets, validate_suites=True)
         message = str(ctx.exception)
         self.assertIn("--strict cannot enforce budgets", message)

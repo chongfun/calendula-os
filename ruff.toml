@@ -18,7 +18,12 @@
 # commit whatever reflow comes with it. Keep .github/workflows/ci.yml and the
 # hints in tools/check.sh on the same version.
 required-version = "==0.16.1"
-target-version = "py39"
+# One interpreter, named in `.python-version` and resolved by `tools/check.sh`
+# -- not "whatever python3 is on PATH", which on macOS is 3.9. The harness
+# imports `tomllib` directly, so an older interpreter fails at import rather
+# than degrading quietly, and there is no second version for a check to pass
+# on and fail against.
+target-version = "py314"
 line-length = 100
 
 [lint]

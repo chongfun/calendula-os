@@ -236,12 +236,13 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   stays unlabelled, sits outside every budget section, and `--strict` says
   so — labelled and unlabelled captures in one report is not something the
   harness will guess about.
-- **Budgets need Python ≥ 3.11**, or the optional `tomli` package. macOS
-  system `python3` is 3.9, where `tomllib` does not exist. `--strict` now
-  refuses to run without a parser rather than passing everything silently;
-  a non-strict report prints a `budgets not checked` warning and carries on.
-  Any result previously signed off "with `--strict`" on an older interpreter
-  verified nothing.
+- **One interpreter, named in `.python-version`** (3.14.6). macOS ships 3.9
+  as `python3`, so `tools/check.sh` prefers `python3.14` and fails with
+  instructions if it cannot find it; `PYTHON=...` overrides. The harness
+  imports `tomllib` directly rather than degrading, so a budget cannot be
+  enforced in CI and silently skipped on the bench -- which is what happened
+  when the parser was optional: any result signed off "with `--strict`" on an
+  interpreter without one verified nothing.
 - **Boot and wake timings** come from the `t_ms` on a boot's first render, so
   they only appear for boots the capture witnessed (`--reset-before`, a boot
   marker, or a wake). They are reported **per kind** — `boot to paint (cold)`
