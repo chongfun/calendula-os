@@ -117,7 +117,34 @@ SUITES = {
 }
 
 
+def require_pinned_python() -> None:
+    """Fail with the version, not a traceback, on the wrong interpreter.
+
+    A capture is run straight off the shebang -- `tools/bench/bench.py
+    page-turn --port ...` -- so it never passes through `tools/check.sh`, and
+    `python3.14` names a series rather than the one release `.python-version`
+    pins. Checked in `main` rather than at import so the module stays
+    importable by the tests, which `check.sh` has already vetted.
+
+    Silent when the pin cannot be read: a copy of this file outside the repo
+    has nothing to check itself against.
+    """
+    pin = Path(__file__).resolve().parents[2] / ".python-version"
+    try:
+        pinned = pin.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    running = ".".join(str(part) for part in sys.version_info[:3])
+    if running != pinned:
+        raise SystemExit(
+            f"bench: this repo pins Python {pinned} (.python-version); this is "
+            f"{running}. Install it (`uv python install {pinned}`) and re-run, "
+            f"or invoke it explicitly: python{pinned.rsplit('.', 1)[0]} {sys.argv[0]}"
+        )
+
+
 def main() -> int:
+    require_pinned_python()
     parser = argparse.ArgumentParser(prog="bench")
     sub = parser.add_subparsers(dest="command", required=True)
 

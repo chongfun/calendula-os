@@ -13,24 +13,36 @@ fi
 # is no fallback path any more: the bench harness imports `tomllib` directly,
 # so an older python does not degrade, it fails at import. `python3` is not
 # assumed to be it -- macOS ships 3.9 under that name -- so a versioned binary
-# is preferred and the result is checked before anything uses it.
-PYTHON_VERSION="$(tr -d '[:space:]' < "$(dirname "$0")/../.python-version")"
-PYTHON_SERIES="${PYTHON_VERSION%.*}"
-if [ -n "${PYTHON:-}" ]; then
-    :
-elif command -v "python${PYTHON_SERIES}" >/dev/null 2>&1; then
-    PYTHON="python${PYTHON_SERIES}"
-else
-    PYTHON="python3"
-fi
-if ! FOUND="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" ||
-   [ "$FOUND" != "$PYTHON_SERIES" ]; then
-    echo "Error: this repo needs Python $PYTHON_VERSION (.python-version)." >&2
-    echo "  '$PYTHON' is ${FOUND:-not runnable}." >&2
-    echo "  Install it and put python${PYTHON_SERIES} on PATH, or set PYTHON=/path/to/python${PYTHON_SERIES}." >&2
-    echo "  With a version manager: 'uv python install $PYTHON_VERSION' or 'pyenv install $PYTHON_VERSION'." >&2
-    exit 1
-fi
+# is preferred and the exact version is checked before anything uses it.
+#
+# Called only by the targets that run Python. Resolving it up front made every
+# Rust-only target -- fmt, both clippys, the host tests, the golden frames --
+# refuse to start without 3.14 installed, which broke five of the seven CI
+# jobs, none of which have any Python in them.
+require_python() {
+    [ -n "${PYTHON_CHECKED:-}" ] && return 0
+    PYTHON_VERSION="$(tr -d '[:space:]' < "$(dirname "$0")/../.python-version")"
+    PYTHON_SERIES="${PYTHON_VERSION%.*}"
+    if [ -n "${PYTHON:-}" ]; then
+        :
+    elif command -v "python${PYTHON_SERIES}" >/dev/null 2>&1; then
+        PYTHON="python${PYTHON_SERIES}"
+    else
+        PYTHON="python3"
+    fi
+    # All three components: `.python-version` names one interpreter, and CI
+    # installs exactly it, so accepting any 3.14.x locally would mean the
+    # thing being verified is not the thing that was pinned.
+    FOUND="$("$PYTHON" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)" || FOUND=""
+    if [ "$FOUND" != "$PYTHON_VERSION" ]; then
+        echo "Error: this repo needs Python $PYTHON_VERSION (.python-version)." >&2
+        echo "  '$PYTHON' is ${FOUND:-not runnable}." >&2
+        echo "  Install it and put python${PYTHON_SERIES} on PATH, or set PYTHON=/path/to/python." >&2
+        echo "  With a version manager: 'uv python install $PYTHON_VERSION' or 'pyenv install $PYTHON_VERSION'." >&2
+        exit 1
+    fi
+    PYTHON_CHECKED=1
+}
 
 COMMAND="$1"
 shift || true
@@ -108,6 +120,7 @@ case "$COMMAND" in
         # Builds and checks one device at a time: both share a target dir, so
         # the second build overwrites the first binary. See tools/stack_frames.py
         # for what this catches and why the source diff never shows it.
+        require_python
         echo "Running stack frame analyzer unit tests..."
         "$PYTHON" -m unittest tools/stack_frames.py
 
@@ -124,6 +137,7 @@ case "$COMMAND" in
         # project has. It runs on the one interpreter resolved above, which is
         # also the one an operator captures with -- a single version, so a
         # budget cannot be enforced in CI and silently skipped on the bench.
+        require_python
         echo "Running bench harness tests..."
         "$PYTHON" -m unittest discover -s tools/bench -p 'test_*.py'
         ;;
@@ -133,6 +147,7 @@ case "$COMMAND" in
         # the same reason --strict refuses without a TOML parser: a check that
         # quietly does nothing is worse than none, because the green tick
         # still appears.
+        require_python
         echo "Running Python lint and format checks..."
         if command -v ruff >/dev/null 2>&1; then
             RUFF=(ruff)

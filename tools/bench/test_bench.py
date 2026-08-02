@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import re
+import sys
 import tempfile
 import time
 import unittest
@@ -2771,6 +2772,40 @@ class BudgetSchemaTests(unittest.TestCase):
                     source.count(f'"{key}"'), 2, f"budget key {key} is read by nothing"
                 )
             self.assertIn(f'"{section}"', source, f"budget section {section} is unused")
+
+
+class PinnedInterpreterTests(unittest.TestCase):
+    """A capture runs off the shebang, so it checks its own interpreter.
+
+    `python3.14` names a series; `.python-version` names one release. Without
+    this, local capture and verification were looser than the CI that was
+    exactly pinned.
+    """
+
+    def test_the_pinned_version_passes(self) -> None:
+        pinned = (
+            (Path(bench.__file__).resolve().parents[2] / ".python-version")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        with patch.object(
+            sys, "version_info", tuple(int(p) for p in pinned.split(".")) + ("final", 0)
+        ):
+            bench.require_pinned_python()
+
+    def test_another_patch_release_is_refused_by_version(self) -> None:
+        version = (3, 14, 0, "final", 0)
+        with patch.object(sys, "version_info", version), self.assertRaises(SystemExit) as ctx:
+            bench.require_pinned_python()
+        message = str(ctx.exception)
+        self.assertIn("3.14.0", message)
+        self.assertIn(".python-version", message)
+
+    def test_a_copy_outside_the_repo_checks_nothing(self) -> None:
+        """Nothing to compare against, so it must not invent a failure."""
+        elsewhere = patch.object(bench, "__file__", "/tmp/elsewhere/bench.py")
+        with elsewhere, patch.object(sys, "version_info", (3, 9, 6, "final", 0)):
+            bench.require_pinned_python()
 
 
 class CountAndDurationContractTests(unittest.TestCase):
