@@ -20,7 +20,7 @@ use proto::catalog::{
 
 /// Why a catalog read did not hand back a catalog.
 ///
-/// The three are one `Err(())` as far as every caller that only wants to know
+/// The four are one `Err(())` as far as every caller that only wants to know
 /// whether it worked is concerned, and they are kept apart for the one caller
 /// that reports: `load_catalog_cache` prints this, and a bench capture
 /// distinguishes the ordinary cold path from a fault on it. Collapsing them —
@@ -33,9 +33,16 @@ enum CatalogFault {
     /// This is the normal state of a card whose catalog has not been built,
     /// and what makes the caller queue a scan.
     Missing,
-    /// The file is there and does not check out: a header this build does not
-    /// understand, a length disagreeing with that header, or a record that
-    /// ended early. The card answered; what it held is unusable.
+    /// A catalog written by firmware of another version. Bumping
+    /// `CATALOG_VERSION` is how this format migrates — the old snapshot stops
+    /// loading and the scan below rebuilds it — so this is the designed path
+    /// on the first boot after an upgrade, and reporting it as a fault failed
+    /// a strict capture for behaving exactly as intended.
+    Stale,
+    /// The file is there and does not check out: wrong magic, the version-0
+    /// placeholder an interrupted scan leaves behind, a length disagreeing
+    /// with its header, or a record that ended early. The card answered; what
+    /// it held is unusable.
     Invalid,
     /// The card refused an open, a seek, or a read.
     Device,
@@ -54,6 +61,7 @@ impl CatalogFault {
     const fn bench_result(self) -> &'static str {
         match self {
             Self::Missing => "miss",
+            Self::Stale => "stale",
             Self::Invalid => "invalid",
             Self::Device => "error",
         }
@@ -147,7 +155,7 @@ pub(crate) fn load_catalog_cache(
     // A valid header (even an empty catalog) counts as loaded; a missing or
     // wrong-version file returns false so the caller runs a fresh scan.
     // The *reason* is carried out of the session, not flattened to a bool
-    // inside it. Four outcomes the original `ok` could not tell apart, and the
+    // inside it. Five outcomes the original `ok` could not tell apart, and the
     // difference decides whether a bench capture is looking at a fault or at
     // the ordinary cold path: a `miss` is what makes the caller queue
     // `RefreshCatalog`, so a card with no snapshot yet prints one immediately
@@ -395,7 +403,12 @@ where
         .map_err(open_fault)?;
     let mut header = [0u8; CATALOG_HEADER_BYTES];
     read_exact_file(&file, &mut header)?;
-    let count = proto::catalog::decode_catalog_header(&header).ok_or(CatalogFault::Invalid)?;
+    // An older format is the migration doing its job; only a header that is
+    // not a catalog at all, or the placeholder a torn scan leaves, is a fault.
+    let count = proto::catalog::classify_catalog_header(&header).map_err(|fault| match fault {
+        proto::catalog::CatalogHeaderFault::Stale => CatalogFault::Stale,
+        proto::catalog::CatalogHeaderFault::Invalid => CatalogFault::Invalid,
+    })?;
     // A committed header whose count disagrees with the file length means
     // the file was truncated or appended outside the writer's control;
     // nothing downstream may trust its record offsets.

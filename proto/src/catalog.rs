@@ -62,13 +62,48 @@ pub fn catalog_file_len(count: u16) -> usize {
     CATALOG_HEADER_BYTES + count as usize * CATALOG_RECORD_BYTES
 }
 
+/// Why a header did not decode, for callers that report rather than just
+/// rebuild. Both outcomes lead to the same fresh scan; they differ only in
+/// whether anything went wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogHeaderFault {
+    /// Right magic, a version this build does not read, and not the
+    /// placeholder: a catalog written by older firmware. Bumping
+    /// `CATALOG_VERSION` *is* how this format migrates — the old snapshot
+    /// stops loading and a scan rebuilds it, with no migration code — so this
+    /// is the designed path on the first boot after an upgrade, not damage.
+    Stale,
+    /// Wrong magic, or the version-0 placeholder a scan leaves in place while
+    /// its records are still landing. Either means this is not a catalog the
+    /// reader may trust, and the second means a scan was interrupted.
+    Invalid,
+}
+
+/// The book count, or why the header was rejected. Callers that only need to
+/// know whether to rescan can use [`decode_catalog_header`].
+pub fn classify_catalog_header(
+    header: &[u8; CATALOG_HEADER_BYTES],
+) -> Result<u16, CatalogHeaderFault> {
+    if &header[..4] != CATALOG_MAGIC {
+        return Err(CatalogHeaderFault::Invalid);
+    }
+    let version = header[4];
+    if version == CATALOG_VERSION {
+        return Ok(u16::from_le_bytes([header[5], header[6]]));
+    }
+    // Version 0 is the placeholder, so it is a torn write rather than an
+    // older format, however much the two look alike from here.
+    Err(if version == 0 {
+        CatalogHeaderFault::Invalid
+    } else {
+        CatalogHeaderFault::Stale
+    })
+}
+
 /// The book count, or `None` when the magic or version doesn't match (the
 /// caller then runs a fresh scan).
 pub fn decode_catalog_header(header: &[u8; CATALOG_HEADER_BYTES]) -> Option<u16> {
-    if &header[..4] != CATALOG_MAGIC || header[4] != CATALOG_VERSION {
-        return None;
-    }
-    Some(u16::from_le_bytes([header[5], header[6]]))
+    classify_catalog_header(header).ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,6 +297,47 @@ mod tests {
         let mut header = [0u8; CATALOG_HEADER_BYTES];
         encode_catalog_placeholder_header(&mut header);
         assert_eq!(decode_catalog_header(&header), None);
+    }
+
+    #[test]
+    fn an_older_version_is_stale_and_everything_else_is_invalid() {
+        // All four rescan; only the first is the format doing its job. A
+        // reader that reports — the bench telemetry — must not call the
+        // designed migration a storage fault, or the first boot after every
+        // CATALOG_VERSION bump fails a strict capture.
+        let mut header = [0u8; CATALOG_HEADER_BYTES];
+        encode_catalog_header(1234, &mut header);
+        assert_eq!(classify_catalog_header(&header), Ok(1234));
+
+        let mut stale = header;
+        stale[4] = CATALOG_VERSION - 1;
+        assert_eq!(
+            classify_catalog_header(&stale),
+            Err(CatalogHeaderFault::Stale)
+        );
+
+        // A version this build has never seen is still just a version.
+        let mut newer = header;
+        newer[4] = CATALOG_VERSION + 1;
+        assert_eq!(
+            classify_catalog_header(&newer),
+            Err(CatalogHeaderFault::Stale)
+        );
+
+        // The placeholder shares the magic and means an interrupted scan.
+        let mut placeholder = [0u8; CATALOG_HEADER_BYTES];
+        encode_catalog_placeholder_header(&mut placeholder);
+        assert_eq!(
+            classify_catalog_header(&placeholder),
+            Err(CatalogHeaderFault::Invalid)
+        );
+
+        let mut wrong_magic = header;
+        wrong_magic[0] = b'Y';
+        assert_eq!(
+            classify_catalog_header(&wrong_magic),
+            Err(CatalogHeaderFault::Invalid)
+        );
     }
 
     #[test]

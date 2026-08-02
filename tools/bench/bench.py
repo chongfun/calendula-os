@@ -84,6 +84,11 @@ class Suite:
     guidance: str
     stop_event: str | None = None
     stop_count_arg: str | None = None
+    # What the count flag falls back to when the operator does not name one.
+    # Held here rather than as an argparse default so the two cases stay
+    # distinguishable: a count that was asked for is a contract, and a count
+    # nobody typed is only a stopping rule.
+    stop_count_default: int | None = None
 
 
 SUITES = {
@@ -95,6 +100,7 @@ SUITES = {
         # those ended the capture one real sample short per repaint.
         stop_event="page_turn",
         stop_count_arg="turns",
+        stop_count_default=50,
     ),
     "reader-soak": Suite(
         "reader-soak",
@@ -109,6 +115,7 @@ SUITES = {
         "After several fast page turns, press Power or wait for idle sleep, then wake and repeat.",
         stop_event="sleep_complete",
         stop_count_arg="cycles",
+        stop_count_default=10,
     ),
     "thermal-run": Suite(
         "thermal-run",
@@ -188,11 +195,15 @@ def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser],
     p.add_argument("--note", action="append", default=[], help="free-form note stored in metadata")
     p.add_argument("--book", default=None, help="operator label for the book under test")
     if name == "page-turn":
-        p.add_argument("--turns", type=positive_int, default=50)
+        p.add_argument(
+            "--turns", type=positive_int, default=None, help="default 50; see --seconds"
+        )
     if name == "reader-soak":
         p.add_argument("--minutes", type=positive_int, default=30)
     if name == "sleep-sync":
-        p.add_argument("--cycles", type=positive_int, default=10)
+        p.add_argument(
+            "--cycles", type=positive_int, default=None, help="default 10; see --seconds"
+        )
     if name == "storage-cache":
         p.add_argument(
             "--cold",
@@ -535,9 +546,26 @@ def capture_seconds(args: argparse.Namespace) -> int | None:
 
 
 def stop_target_for(args: argparse.Namespace, suite: Suite) -> tuple[str, int] | None:
+    """The count this capture stops on, if a count is what it is bounded by.
+
+    A count the operator typed is theirs, and `--seconds` is a ceiling over it
+    (see `capture_request`). A count they did not type is only this suite's
+    default, and must not outrank a duration they *did* type: holding
+    `page-turn --seconds 60` to 50 turns reported almost every time-boxed
+    capture as short of a sample count nobody had asked for. So a named
+    duration with no named count leaves the count out of both the stopping
+    rule and the contract.
+    """
     if suite.stop_event is None or suite.stop_count_arg is None:
         return None
-    return suite.stop_event, int(getattr(args, suite.stop_count_arg))
+    requested = getattr(args, suite.stop_count_arg, None)
+    if requested is None:
+        if getattr(args, "seconds", None) is not None:
+            return None
+        requested = suite.stop_count_default
+    if requested is None:
+        return None
+    return suite.stop_event, int(requested)
 
 
 # Errno values a vanishing USB-serial device raises: the ESP32-C3's
@@ -1148,25 +1176,32 @@ def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, 
 #            prints one immediately before the scan that builds it. Reading it
 #            as a failure faulted a healthy cold boot, which `--reset-before`
 #            makes the common case.
-#   invalid  the file was there and did not check out: a header this build
-#            does not understand, a length disagreeing with that header, or a
-#            record that ended early. The card answered and what it held was
-#            unusable, which is a finding, not a cold path.
+#   stale    the file was written by firmware of another catalog version.
+#            Bumping `CATALOG_VERSION` is how that format migrates — the old
+#            snapshot stops loading and the scan rebuilds it — so this is the
+#            designed first boot after an upgrade, not a fault.
+#   invalid  the file was there and did not check out: wrong magic, the
+#            version-0 placeholder an interrupted scan leaves behind, a length
+#            disagreeing with its header, or a record that ended early. The
+#            card answered and what it held was unusable, which is a finding.
 #   error    the card refused an open, a seek, or a read.
 #
-# `miss` is deliberately the *narrowest* of the four. The firmware used to
+# `miss` is deliberately the *narrowest* of the five. The firmware used to
 # reduce the whole read to a bool inside the SD session, so a refused read, a
 # failed seek or a torn file all surfaced as the benign one — the precise
 # false pass this taxonomy exists to close.
-CATALOG_LOAD_RESULTS = {"hit", "miss", "invalid", "error"}
+CATALOG_LOAD_RESULTS = {"hit", "miss", "stale", "invalid", "error"}
 
-# The results that mean something went wrong, as opposed to there being
-# nothing there yet.
+# The results that mean something went wrong. `miss` and `stale` are the two
+# that do not: one is a card whose catalog has not been built, the other a
+# card whose catalog the running firmware has outgrown, and both are answered
+# by the same scan.
 CATALOG_LOAD_FAULTS = {"invalid", "error"}
 
 # How the report names each one, so a miss does not read as a fault.
 CATALOG_LOAD_REASONS = {
     "miss": "found no snapshot (normal cold path)",
+    "stale": "found an older catalog version (rebuilt by the scan)",
     "invalid": "found an unusable snapshot",
     "error": "card error",
     "not loaded": "did not load (older firmware: reason not recorded)",
@@ -1923,8 +1958,19 @@ def load_budgets(path: Path | None) -> tuple[dict[str, Any], str | None]:
         )
     if not path.exists():
         return {}, f"budgets file {path} does not exist"
-    with path.open("rb") as handle:
-        budgets = tomllib.load(handle)
+    # A budget file that is not valid TOML is the same class of failure as one
+    # this parser cannot be loaded for, and owes the same answer: every
+    # involuntary empty result carries its reason, so `--strict` exits on it
+    # and a plain report says budgets were not checked. Letting the decode
+    # error propagate instead broke that contract with a traceback.
+    # `TOMLDecodeError` is resolved off whichever parser is bound (stdlib,
+    # `tomli`, or a test double) and subclasses `ValueError` in both real ones.
+    decode_error = getattr(tomllib, "TOMLDecodeError", ValueError)
+    try:
+        with path.open("rb") as handle:
+            budgets = tomllib.load(handle)
+    except decode_error as err:
+        return {}, f"cannot parse {path}: {err}"
     problems = budget_schema_problems(budgets)
     if problems:
         return {}, f"{path} is not a valid budget file: " + "; ".join(problems)
@@ -2349,30 +2395,36 @@ def capture_completion_warnings(run: LabelledRun) -> list[str]:
     )
     warnings: list[str] = []
     if "host_time" in start:
-        warnings.extend(capture_stop_warnings(run, start))
+        warnings.extend(capture_stop_warnings(run))
     warnings.extend(request_shortfall_warnings(run, start))
     return warnings
 
 
-def capture_stop_warnings(run: LabelledRun, start: dict[str, Any]) -> list[str]:
+def capture_stop_warnings(run: LabelledRun) -> list[str]:
     """Whether the capture reached a stop condition anyone asked for."""
     end = next((event for event in run.events if event.get("event") == "run_end"), None)
     if end is None:
         return [
-            f"{run.label}: the capture recorded no run_end, so it was killed "
-            "or the log is truncated; its telemetry is a fragment"
+            (
+                f"{run.label}: the capture recorded no run_end, so it was "
+                "killed or the log is truncated; its telemetry is a fragment"
+            )
         ]
     completed = end.get("completed")
     if not isinstance(completed, bool):
         return [
-            f"{run.label}: the capture recorded no completion status, so "
-            "nothing says it ran to a stop condition; recapture with a "
-            "current bench.py"
+            (
+                f"{run.label}: the capture recorded no completion status, so "
+                "nothing says it ran to a stop condition; recapture with a "
+                "current bench.py"
+            )
         ]
     if not completed:
         return [
-            f"{run.label}: the capture did not complete (stopped by "
-            f"{end.get('stop_reason', 'an unrecorded cause')})"
+            (
+                f"{run.label}: the capture did not complete (stopped by "
+                f"{end.get('stop_reason', 'an unrecorded cause')})"
+            )
         ]
     return []
 

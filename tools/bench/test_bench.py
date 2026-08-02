@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import io
 import json
 import re
@@ -2053,8 +2054,15 @@ class StopReasonTests(unittest.TestCase):
         self.assertEqual(reason, "stream-ended")
         self.assertNotIn(reason, bench.COMPLETED_STOP_REASONS)
 
-    def test_a_short_count_does_not_complete_on_its_deadline_alone(self) -> None:
-        """`--turns 50 --seconds 60` that ran out of time is still short."""
+    def test_an_expired_deadline_is_the_reason_even_when_the_count_is_short(
+        self,
+    ) -> None:
+        """`--turns 50 --seconds 60` that ran out of time stopped on time.
+
+        "duration" is a *completed* reason: the capture reached a stop
+        condition it was given. Whether it collected enough is a separate
+        question, answered by the request shortfall checks, not here.
+        """
         self.assertEqual(
             bench.observed_stop_reason(
                 {"page_turn": 3}, ("page_turn", 50), time.monotonic() - 1
@@ -2120,13 +2128,14 @@ class CaptureContractTests(unittest.TestCase):
             ]
             if on_reset is not None:
                 patches.append(patch.object(bench, "reset_device", on_reset))
-            for entered in patches:
-                entered.start()
-            try:
+            # An ExitStack rather than start()/stop() loops: a patch that
+            # fails to apply half way through the list would otherwise leave
+            # the ones before it permanently installed, and print or
+            # summarize_paths staying patched poisons every later test.
+            with contextlib.ExitStack() as stack:
+                for entered in patches:
+                    stack.enter_context(entered)
                 bench.run_capture(args)
-            finally:
-                for entered in reversed(patches):
-                    entered.stop()
             return [
                 json.loads(line)
                 for line in out.read_text(encoding="utf-8").splitlines()
@@ -2640,6 +2649,22 @@ class BudgetSchemaTests(unittest.TestCase):
 
         return FakeParser()
 
+    def test_invalid_toml_is_reported_rather_than_raised(self) -> None:
+        """A syntax error owes the same answer as a missing parser.
+
+        It used to propagate out of `tomllib.load`, so `--strict` died with a
+        traceback instead of the SystemExit it promises, and a plain report
+        crashed instead of warning.
+        """
+        if bench.tomllib is None:
+            self.skipTest("no TOML parser on this interpreter")
+        with tempfile.TemporaryDirectory() as tmp:
+            budgets = Path(tmp) / "benches.toml"
+            budgets.write_text("[page-turn\nnot = toml =\n", encoding="utf-8")
+            result, problem = bench.load_budgets(budgets)
+        self.assertEqual(result, {})
+        self.assertIn("cannot parse", problem)
+
     def test_load_budgets_reports_a_malformed_document(self) -> None:
         with patch.object(
             bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})
@@ -2658,12 +2683,19 @@ class BudgetSchemaTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            # The file has to exist, or load_budgets stops at "does not
+            # exist" and the parser -- and with it the schema check this
+            # test is about -- is never reached.
+            budgets = Path(tmp) / "budgets.toml"
+            budgets.write_text("[page-turn]\ntypo_ms = 1\n", encoding="utf-8")
             with patch.object(
                 bench, "tomllib", self._fake_parser({"page-turn": {"typo_ms": 1}})
             ):
                 with self.assertRaises(SystemExit) as ctx:
-                    bench.summarize_paths([log], Path("budgets.toml"), validate_suites=True)
-        self.assertIn("--strict cannot enforce budgets", str(ctx.exception))
+                    bench.summarize_paths([log], budgets, validate_suites=True)
+        message = str(ctx.exception)
+        self.assertIn("--strict cannot enforce budgets", message)
+        self.assertIn("unknown key typo_ms", message)
 
     def test_the_checked_in_budgets_satisfy_the_schema(self) -> None:
         """The file this repo ships must load, or --strict fails everywhere."""
@@ -2727,6 +2759,71 @@ class CountAndDurationContractTests(unittest.TestCase):
 
     def test_a_counting_suite_without_seconds_is_unchanged(self) -> None:
         self.assertEqual(self._request("page-turn", None, turns=50), {"page_turns": 50})
+
+    def test_a_duration_beats_a_count_nobody_typed(self) -> None:
+        """`page-turn --seconds 60` owes 60 seconds, not 50 turns.
+
+        50 is this suite's default, not a request. Holding a time-boxed
+        capture to it reported almost every one as short of a sample count
+        the operator never asked for.
+        """
+        self.assertEqual(
+            self._request("page-turn", 60, turns=None), {"seconds": 60}
+        )
+        self.assertEqual(
+            self._request("sleep-sync", 60, cycles=None), {"seconds": 60}
+        )
+
+    def test_a_defaulted_count_does_not_stop_a_duration_capture(self) -> None:
+        """It must leave the stopping rule as well as the contract.
+
+        Otherwise the capture still ends at turn 50 and then fails the
+        duration it does owe — the same unsatisfiable pair, mirrored.
+        """
+        args = argparse.Namespace(command="page-turn", seconds=60, turns=None)
+        self.assertIsNone(bench.stop_target_for(args, bench.SUITES["page-turn"]))
+
+    def test_a_named_count_still_outranks_a_duration(self) -> None:
+        args = argparse.Namespace(command="page-turn", seconds=60, turns=50)
+        self.assertEqual(
+            bench.stop_target_for(args, bench.SUITES["page-turn"]), ("page_turn", 50)
+        )
+
+    def test_the_suite_default_still_applies_with_no_duration(self) -> None:
+        args = argparse.Namespace(command="page-turn", seconds=None, turns=None)
+        self.assertEqual(
+            bench.stop_target_for(args, bench.SUITES["page-turn"]), ("page_turn", 50)
+        )
+        args = argparse.Namespace(command="sleep-sync", seconds=None, cycles=None)
+        self.assertEqual(
+            bench.stop_target_for(args, bench.SUITES["sleep-sync"]),
+            ("sleep_complete", 10),
+        )
+
+    def test_a_seconds_bounded_page_turn_run_is_not_faulted_for_turns(self) -> None:
+        """End to end: the warning that used to fire on every timed capture."""
+        events = [
+            {
+                "event": "run_start",
+                "suite": "page-turn",
+                "workflow": "page-turn",
+                "host_time": 1.0,
+                "requested": self._request("page-turn", 60, turns=None),
+            },
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1470, "req_ms": 1000},
+            {
+                "event": "run_end",
+                "elapsed_s": 60.0,
+                "stop_reason": "duration",
+                "completed": True,
+            },
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertFalse(
+            any("requested page turns" in w for w in warnings), warnings
+        )
+        self.assertEqual(warnings, [])
 
     def test_a_duration_suite_records_its_duration(self) -> None:
         self.assertEqual(
@@ -3130,6 +3227,32 @@ class ColdCatalogFallbackTests(unittest.TestCase):
         "result": "invalid",
         "elapsed_ms": 9,
     }
+
+    STALE = {
+        "event": "storage_catalog",
+        "action": "load",
+        "ok": False,
+        "result": "stale",
+        "elapsed_ms": 6,
+    }
+
+    def test_an_older_catalog_version_is_not_a_failure(self) -> None:
+        """The first boot after a CATALOG_VERSION bump.
+
+        Bumping the version is how the on-card format migrates: the old
+        snapshot stops loading and the scan rebuilds it, by design and with
+        no migration code. Counting that as a storage fault failed
+        `--cold --strict` on every device's first boot after a catalog
+        upgrade, for behaving exactly as intended.
+        """
+        self.assertEqual(bench.failed_storage_ops([self.STALE]), [])
+        events = self._run([self.STALE, self.SCAN], ["cold"])
+        self.assertEqual(bench.evaluate_suite_signals(events), [])
+
+    def test_a_stale_snapshot_is_still_not_a_warm_load(self) -> None:
+        """It did not load, so it measures nothing and evidences nothing."""
+        self.assertFalse(bench.catalog_load_hit(self.STALE))
+        self.assertEqual(bench.catalog_samples([self.STALE], "load"), [])
 
     def test_an_unusable_snapshot_is_not_a_miss(self) -> None:
         """A header that did not decode, or a record that ended early.

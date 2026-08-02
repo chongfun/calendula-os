@@ -39,14 +39,14 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   telemetry. Ctrl-C completes a capture that asked for no other stop condition
   and cuts short one that did. Captures predating this carry no completion
   status and are reported as unverified rather than assumed complete.
-- **A count and a duration are not both minimums.** `page-turn` and
-  `sleep-sync` always carry a count target, and `--seconds` is offered by
-  every capture command, so for those two suites the count is the contract
-  and `--seconds` is a ceiling — an unattended capture's way out, not a window
-  it owes. `page-turn --seconds 60` is held to its 50 turns; if the deadline
-  cuts it short, the report says it is short of its *samples* rather than
-  faulting it for a duration it never requested. The startup banner names both
-  stop conditions and says which one is the contract. Suites with no count
+- **A count and a duration are not both minimums.** Whichever the operator
+  *typed* is the contract. `page-turn --turns 50 --seconds 60` owes 50 turns
+  and treats `--seconds` as a ceiling — an unattended capture's way out, not a
+  window it owes — and the banner names both stop conditions and says which is
+  which. `page-turn --seconds 60` owes 60 seconds and nothing else: 50 is the
+  suite's default, not a request, so it neither stops the capture nor becomes
+  a contract, which otherwise reported almost every time-boxed capture as
+  short of a sample count nobody asked for. Suites with no count
   (`reader-soak`, `thermal-run`, `storage-cache`) keep the duration as theirs.
 - **Durations and counts must be positive.** `--seconds 0`, `--minutes 0`,
   `--turns 0` and `--cycles 0` are rejected at the command line; zero used to
@@ -136,20 +136,27 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   `storage-cache` run containing one fails `--strict` the way a failed sleep
   phase fails a sleep suite.
 - **A missing snapshot is the cold path; anything else is a fault.** The
-  catalog load reports `result=hit|miss|invalid|error`, because its `ok` could
-  not tell a card with nothing to hand over from a card that failed — and only
-  the first is *normal*: `load_catalog_cache` returning false is what queues
-  the scan, so a card whose catalog has not been built yet prints `load
-  ok=false result=miss` immediately before the scan that builds it, and
-  `--reset-before` makes that the common case. `miss` is deliberately the
-  narrowest of the four: it means no catalog directory or no file in it.
-  A header this build cannot decode, a length disagreeing with that header, or
-  a record that ended early is `invalid`; a refused open, seek or read is
-  `error`. Both fail `--strict` even when a later scan succeeds, because the
-  firmware used to reduce the whole read to a bool *inside* the SD session and
-  every one of those faults surfaced as the benign miss. None of the three
-  non-hit results enters the `catalog_load_warn_ms` population, where they
-  would measure how fast the card said no.
+  catalog load reports `result=hit|miss|stale|invalid|error`, because its `ok`
+  could not tell a card with nothing to hand over from a card that failed.
+  Two of those are *expected*, and neither fails `--strict`:
+
+  - `miss` — no catalog directory, or no file in it. `load_catalog_cache`
+    returning false is what queues the scan, so a card whose catalog has not
+    been built yet prints one immediately before the scan that builds it, and
+    `--reset-before` makes that the common case.
+  - `stale` — a catalog written by another `CATALOG_VERSION`. Bumping that
+    version *is* how the on-card format migrates (the old snapshot stops
+    loading, the scan rebuilds it, no migration code), so this is the designed
+    first boot after a firmware upgrade.
+
+  The other two are findings and fail `--strict` even when a later scan
+  succeeds: `invalid` (wrong magic, the version-0 placeholder an interrupted
+  scan leaves behind, a length disagreeing with its header, or a record that
+  ended early) and `error` (a refused open, seek or read). The firmware used
+  to reduce the whole read to a bool *inside* the SD session, so every one of
+  those faults surfaced as the benign miss. No non-`hit` result enters the
+  `catalog_load_warn_ms` population, where it would measure how fast the card
+  said no rather than how long a load takes.
 - **Strict evidence needs confirmed success; the figures tolerate old logs.**
   A requested `--cold`/`--warm` path is proven only by an operation that says
   it succeeded. Telemetry too old to carry a result gets `cannot be verified
