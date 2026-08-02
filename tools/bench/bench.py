@@ -952,7 +952,10 @@ def summarize_paths(
                     faults.get(str(event.get("result", "not loaded")), 0) + 1
                 )
             reasons = [
-                f"{count} {CATALOG_LOAD_REASONS.get(result, result)}"
+                f"{count} "
+                + CATALOG_LOAD_REASONS.get(
+                    result, f"reported an unrecognised result ({result})"
+                )
                 for result, count in sorted(faults.items())
             ]
         print(f"catalog {action}:  " + ", ".join(reasons) + ", left out of the figure above")
@@ -1224,6 +1227,26 @@ def catalog_load_error(event: dict[str, Any]) -> bool:
     one, so it is not called a failure on that evidence.
     """
     return event.get("result") in CATALOG_LOAD_FAULTS
+
+
+def unknown_catalog_result(event: dict[str, Any]) -> bool:
+    """A `result=` this bench.py has no meaning for.
+
+    A typo, a value some future firmware adds, or a token that did not parse
+    as a string at all. It is not a hit, so it evidences nothing and enters no
+    budget; it is not a recognised fault, so `failed_storage_ops` passes over
+    it; and it is not result-less, so it does not read as legacy telemetry
+    either. Every predicate answering "no" is exactly how it used to slip
+    through `--strict` in silence, next to a valid `hit` in the same run.
+
+    Reported rather than guessed at, the same way an unrecognised workflow is:
+    nothing here knows what the firmware was saying, and silence reads as a
+    pass.
+    """
+    result = event.get("result")
+    if event.get("event") != "storage_catalog" or result is None:
+        return False
+    return not isinstance(result, str) or result not in CATALOG_LOAD_RESULTS
 
 
 def unverifiable_catalog_op(event: dict[str, Any]) -> bool:
@@ -2317,6 +2340,19 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                 warnings.append(
                     f"{label}: {len(failed)} failed storage operation(s) "
                     f"captured ({', '.join(actions)})"
+                )
+            # A result nothing here recognises is neither a success nor a
+            # known fault, so it would otherwise be the one storage outcome
+            # `--strict` says nothing at all about.
+            unknown = [
+                event for event in signal_events if unknown_catalog_result(event)
+            ]
+            if unknown:
+                seen = sorted({repr(event.get("result")) for event in unknown})
+                warnings.append(
+                    f"{label}: {len(unknown)} catalog operation(s) reported a "
+                    f"result this bench.py does not know ({', '.join(seen)}); "
+                    f"known results are {', '.join(sorted(CATALOG_LOAD_RESULTS))}"
                 )
         elif workflow == "sleep-sync":
             if not any(is_terminal_sleep(event) for event in signal_events):

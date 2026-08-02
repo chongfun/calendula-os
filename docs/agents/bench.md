@@ -156,7 +156,11 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   to reduce the whole read to a bool *inside* the SD session, so every one of
   those faults surfaced as the benign miss. No non-`hit` result enters the
   `catalog_load_warn_ms` population, where it would measure how fast the card
-  said no rather than how long a load takes.
+  said no rather than how long a load takes. A `result=` outside that
+  vocabulary — a typo, or a log from firmware newer than this bench.py — is
+  reported and fails `--strict` rather than passing over: it is neither a
+  success, nor a fault this tool recognises, nor result-less legacy
+  telemetry, so silence about it would read as a pass.
 - **Strict evidence needs confirmed success; the figures tolerate old logs.**
   A requested `--cold`/`--warm` path is proven only by an operation that says
   it succeeded. Telemetry too old to carry a result gets `cannot be verified

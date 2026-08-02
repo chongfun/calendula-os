@@ -3313,6 +3313,90 @@ class ColdCatalogFallbackTests(unittest.TestCase):
                     any("failed storage operation(s)" in w for w in warnings), warnings
                 )
 
+    UNKNOWN = {
+        "event": "storage_catalog",
+        "action": "load",
+        "ok": False,
+        "result": "timeout",
+        "elapsed_ms": 5000,
+    }
+    HIT = {
+        "event": "storage_catalog",
+        "action": "load",
+        "ok": True,
+        "result": "hit",
+        "elapsed_ms": 31,
+    }
+
+    def test_an_unknown_result_does_not_pass_in_silence(self) -> None:
+        """A newer firmware's token, or a typo, next to a valid hit.
+
+        It is not a hit, not a known fault and not result-less, so every
+        predicate answered "no" about it and `--strict` said nothing at all.
+        """
+        events = [
+            {
+                "event": "run_start",
+                "suite": "storage-cache",
+                "workflow": "storage-cache",
+                "host_time": 1.0,
+                "requested": {"storage_modes": ["warm"]},
+            },
+            self.UNKNOWN,
+            self.HIT,
+            {"event": "storage_open", "ram_hit": False, "elapsed_ms": 72},
+            {"event": "run_end", "elapsed_s": 20.0, "completed": True},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("does not know ('timeout')" in w for w in warnings), warnings
+        )
+
+    def test_a_non_string_result_is_unknown_too(self) -> None:
+        """`parse_value` turns a bare number into an int before we see it."""
+        self.assertTrue(
+            bench.unknown_catalog_result(
+                {"event": "storage_catalog", "action": "load", "result": 0}
+            )
+        )
+
+    def test_every_known_result_is_accepted(self) -> None:
+        for result in bench.CATALOG_LOAD_RESULTS:
+            with self.subTest(result=result):
+                self.assertFalse(
+                    bench.unknown_catalog_result(
+                        {"event": "storage_catalog", "action": "load", "result": result}
+                    )
+                )
+
+    def test_a_result_less_line_is_legacy_not_unknown(self) -> None:
+        """The two failure modes stay apart; they need different fixes."""
+        legacy = {"event": "storage_catalog", "action": "scan", "elapsed_ms": 900}
+        self.assertFalse(bench.unknown_catalog_result(legacy))
+        self.assertTrue(bench.unverifiable_catalog_op(legacy))
+
+    def test_an_unknown_result_is_not_warm_evidence_or_a_sample(self) -> None:
+        self.assertFalse(bench.catalog_load_hit(self.UNKNOWN))
+        self.assertEqual(bench.catalog_samples([self.UNKNOWN], "load"), [])
+
+    @patch("builtins.print")
+    def test_the_report_names_an_unrecognised_result(self, mock_print) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(dict(event, suite="storage-cache"))
+                    for event in [{"event": "run_start"}, self.UNKNOWN]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bench.summarize_paths([path], None)
+        printed = "\n".join(
+            str(call.args[0]) for call in mock_print.call_args_list if call.args
+        )
+        self.assertIn("1 reported an unrecognised result (timeout)", printed)
+
     def test_every_firmware_result_token_is_known_to_the_host(self) -> None:
         """The two sides agree on the vocabulary, or a token means nothing."""
         source = Path(bench.__file__).read_text(encoding="utf-8")
