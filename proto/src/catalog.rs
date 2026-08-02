@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn an_older_version_is_stale_and_everything_else_is_invalid() {
+    fn header_faults_separate_another_version_from_damage() {
         // All four rescan; only the first is the format doing its job. A
         // reader that reports — the bench telemetry — must not call the
         // designed migration a storage fault, or the first boot after every

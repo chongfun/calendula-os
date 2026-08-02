@@ -1212,10 +1212,16 @@ CATALOG_LOAD_REASONS = {
 
 
 def catalog_load_hit(event: dict[str, Any]) -> bool:
-    """The snapshot loaded — the only load that evidences the warm path."""
-    result = event.get("result")
-    if isinstance(result, str):
-        return result == "hit"
+    """The snapshot loaded — the only load that evidences the warm path.
+
+    Decided on whether the field is *present*, not on whether its value is a
+    string. Falling back to `ok` for any non-string made an explicit
+    `{"ok": true, "result": null}` read as a confirmed hit and enter the load
+    budget; only a line carrying no `result` at all is old enough for `ok` to
+    be the whole story.
+    """
+    if "result" in event:
+        return event["result"] == "hit"
     return event.get("ok") is True
 
 
@@ -1243,9 +1249,9 @@ def unknown_catalog_result(event: dict[str, Any]) -> bool:
     nothing here knows what the firmware was saying, and silence reads as a
     pass.
     """
-    result = event.get("result")
-    if event.get("event") != "storage_catalog" or result is None:
+    if event.get("event") != "storage_catalog" or "result" not in event:
         return False
+    result = event["result"]
     return not isinstance(result, str) or result not in CATALOG_LOAD_RESULTS
 
 
@@ -1258,9 +1264,13 @@ def unverifiable_catalog_op(event: dict[str, Any]) -> bool:
     question: the firmware replaces a failed scan's `Error` with `Ready` when
     an older in-memory catalog is still listed, so the marker read as success.
     """
-    if isinstance(event.get("result"), str) or isinstance(event.get("ok"), bool):
+    if event.get("event") != "storage_catalog":
         return False
-    return event.get("event") == "storage_catalog"
+    # Either field being *present* means the line said something about how the
+    # operation went. Whether what it said is readable is
+    # `unknown_catalog_result`'s business, and a line it cannot read must not
+    # be pooled here as though it were merely old.
+    return "result" not in event and not isinstance(event.get("ok"), bool)
 
 
 def catalog_succeeded(event: dict[str, Any]) -> bool:
@@ -2065,8 +2075,16 @@ def budget_schema_problems(budgets: dict[str, Any]) -> list[str]:
     Reported as a load failure, so `--strict` refuses to run and a non-strict
     report says the budgets were not checked, rather than either one
     proceeding against a file it could not honour.
+
+    A document with no sections at all is rejected for the same reason as an
+    empty one, and needs saying separately because the loop below has nothing
+    to iterate: an empty or comments-only file parsed to `{}`, which
+    `budget_sections_in_play` cannot tell from budgets deliberately disabled,
+    so `--strict` reported success having enforced not one threshold.
     """
     problems: list[str] = []
+    if not budgets:
+        return ["the document configures no budget sections"]
     for section, entries in sorted(budgets.items()):
         known = BUDGET_SCHEMA.get(section)
         if known is None:
@@ -2333,7 +2351,14 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
             if failed:
                 actions = sorted(
                     {
-                        f"{event.get('event')} {event.get('action')}".strip()
+                        # Not every storage event carries an action, and
+                        # interpolating a missing one printed the literal
+                        # "storage_x None" into the warning.
+                        " ".join(
+                            str(part)
+                            for part in (event.get("event"), event.get("action"))
+                            if part is not None
+                        )
                         for event in failed
                     }
                 )

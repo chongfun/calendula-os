@@ -2080,8 +2080,8 @@ class CaptureContractTests(unittest.TestCase):
         "flush_ms=400 req_ms=1000 prestage_ms=15 t_ms=1430\n",
     ]
 
+    @staticmethod
     def _capture(
-        self,
         command: str,
         lines: list,
         *,
@@ -2632,6 +2632,47 @@ class BudgetSchemaTests(unittest.TestCase):
         )
         self.assertTrue(any("must be an integer" in p for p in problems), problems)
 
+    def test_an_empty_document_is_rejected(self) -> None:
+        self.assertEqual(
+            bench.budget_schema_problems({}),
+            ["the document configures no budget sections"],
+        )
+
+    def test_strict_refuses_a_budget_file_with_no_sections(self) -> None:
+        """An empty or comments-only file parsed to `{}` and gated nothing.
+
+        `budget_sections_in_play` cannot tell that from budgets deliberately
+        disabled, so `--strict` exited 0 having enforced not one threshold —
+        over a capture the real file would have failed.
+        """
+        over_budget = [
+            {"suite": "page-turn", "workflow": "page-turn", "event": "run_start"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 9000, "req_ms": 1000},
+        ]
+        # The same capture against a configured section, to show the empty
+        # file was hiding a real violation rather than describing a clean run.
+        self.assertTrue(
+            any(
+                "page-turn median" in warning
+                for warning in bench.evaluate_budgets(
+                    over_budget, {"page-turn": {"median_press_to_settled_ms": 550}}
+                )
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log.jsonl"
+            log.write_text(
+                "\n".join(json.dumps(event) for event in over_budget) + "\n",
+                encoding="utf-8",
+            )
+            budgets = Path(tmp) / "empty.toml"
+            budgets.write_text("# nothing configured\n", encoding="utf-8")
+            with patch.object(bench, "tomllib", self._fake_parser({})):
+                with self.assertRaises(SystemExit) as ctx:
+                    bench.summarize_paths([log], budgets, validate_suites=True)
+        self.assertIn("configures no budget sections", str(ctx.exception))
+
     def test_an_empty_section_is_rejected(self) -> None:
         """It names a workflow, survives section selection, and gates nothing."""
         problems = bench.budget_schema_problems({"page-turn": {}})
@@ -2933,7 +2974,7 @@ class CountAndDurationContractTests(unittest.TestCase):
         the run for a count nothing had told them was still in force.
         """
         printed: list = []
-        CaptureContractTests()._capture(
+        CaptureContractTests._capture(
             "page-turn", [], turns=50, seconds=60, printed=printed
         )
         banner = "\n".join(printed)
@@ -2942,7 +2983,7 @@ class CountAndDurationContractTests(unittest.TestCase):
 
     def test_a_count_only_capture_names_just_the_count(self) -> None:
         printed: list = []
-        CaptureContractTests()._capture("page-turn", [], turns=50, printed=printed)
+        CaptureContractTests._capture("page-turn", [], turns=50, printed=printed)
         banner = "\n".join(printed)
         self.assertIn("stop: after 50 parsed page_turn(s)", banner)
         self.assertNotIn("ceiling", banner)
@@ -3351,6 +3392,61 @@ class ColdCatalogFallbackTests(unittest.TestCase):
         self.assertTrue(
             any("does not know ('timeout')" in w for w in warnings), warnings
         )
+
+    NULL_OK = {
+        "event": "storage_catalog",
+        "action": "load",
+        "ok": True,
+        "result": None,
+    }
+    NULL_NOT_OK = {
+        "event": "storage_catalog",
+        "action": "load",
+        "ok": False,
+        "result": None,
+    }
+
+    def test_an_explicit_null_result_is_not_a_hit(self) -> None:
+        """A present-but-unreadable result must not fall back to `ok`.
+
+        `{"ok": true, "result": null}` counted as a confirmed warm hit and
+        entered the load budget, because the fallback keyed on the value's
+        type rather than the field's presence. Only a line carrying no
+        `result` at all is old enough for `ok` to be the whole story.
+        """
+        self.assertFalse(bench.catalog_load_hit(self.NULL_OK))
+        self.assertTrue(bench.unknown_catalog_result(self.NULL_OK))
+        self.assertFalse(bench.unverifiable_catalog_op(self.NULL_OK))
+        self.assertEqual(bench.catalog_samples([self.NULL_OK], "load"), [])
+
+    def test_an_explicit_null_result_is_unknown_either_way(self) -> None:
+        self.assertTrue(bench.unknown_catalog_result(self.NULL_NOT_OK))
+        self.assertFalse(bench.catalog_load_hit(self.NULL_NOT_OK))
+
+    def test_a_null_result_fails_strict(self) -> None:
+        events = [
+            {
+                "event": "run_start",
+                "suite": "storage-cache",
+                "workflow": "storage-cache",
+                "host_time": 1.0,
+            },
+            self.NULL_OK,
+            {"event": "run_end", "elapsed_s": 20.0, "completed": True},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(any("does not know" in w for w in warnings), warnings)
+
+    def test_a_failed_op_with_no_action_is_named_without_one(self) -> None:
+        """The label interpolated a missing action as the literal "None"."""
+        events = [
+            {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
+            {"event": "storage_progress", "ok": False},
+        ]
+        warnings = [w for w in bench.evaluate_suite_signals(events) if "failed" in w]
+        self.assertTrue(warnings)
+        self.assertIn("storage_progress", warnings[0])
+        self.assertNotIn("None", warnings[0])
 
     def test_a_non_string_result_is_unknown_too(self) -> None:
         """`parse_value` turns a bare number into an int before we see it."""
