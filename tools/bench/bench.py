@@ -872,7 +872,7 @@ def summarize_paths(
 
     # `validate_suites` is the --strict flag. A strict gate that cannot load
     # its budgets must fail loudly: exiting 0 with the checks silently absent
-    # is exactly the Python-3.9 tomllib hole this guards against.
+    # is how a 16.7x overrun once passed clean.
     budgets, budgets_problem = load_budgets(budgets_path)
     if budgets_problem is not None:
         if validate_suites:
@@ -1967,10 +1967,9 @@ def load_budgets(path: Path | None) -> tuple[dict[str, Any], str | None]:
     ``problem`` is a human-readable reason the budgets could not be loaded,
     and ``budgets`` is empty whenever it is set. A ``None`` path means the
     caller intentionally disabled budgets, which is not a problem. Budgets
-    silently absent is how ``--strict`` spent months verifying nothing when
-    the parser could go missing, so every involuntary empty result must carry
-    its reason. The parser itself no longer can: `tomllib` is imported
-    directly, and the repo pins the interpreter that has it.
+    silently absent is how ``--strict`` once verified nothing for months, so
+    every involuntary empty result carries its reason. The parser is no longer
+    one of them: `tomllib` is imported directly.
     """
     if path is None:
         return {}, None

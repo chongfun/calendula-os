@@ -238,12 +238,11 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   harness will guess about.
 - **One interpreter series, named in `.python-version`** (3.14). macOS ships
   3.9 as `python3`, so `tools/check.sh` prefers `python3.14` and fails with
-  instructions if it cannot find it; `PYTHON=...` overrides. A capture run off
-  the shebang checks itself the same way. The harness
-  imports `tomllib` directly rather than degrading, so a budget cannot be
-  enforced in CI and silently skipped on the bench -- which is what happened
-  when the parser was optional: any result signed off "with `--strict`" on an
-  interpreter without one verified nothing.
+  instructions if it cannot find it; `PYTHON=...` overrides, and a capture run
+  off the shebang checks itself the same way. `tomllib` is imported directly
+  rather than falling back, so a budget cannot be enforced in CI and silently
+  skipped on the bench — which is what happened while the parser was optional:
+  any result signed off "with `--strict`" without one verified nothing.
 - **Boot and wake timings** come from the `t_ms` on a boot's first render, so
   they only appear for boots the capture witnessed (`--reset-before`, a boot
   marker, or a wake). They are reported **per kind** — `boot to paint (cold)`

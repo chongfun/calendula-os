@@ -13,7 +13,7 @@ fi
 # is no fallback path any more: the bench harness imports `tomllib` directly,
 # so an older python does not degrade, it fails at import. `python3` is not
 # assumed to be it -- macOS ships 3.9 under that name -- so a versioned binary
-# is preferred and the exact version is checked before anything uses it.
+# is preferred and checked against the pin before anything uses it.
 #
 # Called only by the targets that run Python. Resolving it up front made every
 # Rust-only target -- fmt, both clippys, the host tests, the golden frames --
@@ -145,9 +145,9 @@ case "$COMMAND" in
     ruff)
         # Python lint and formatting, configured in ruff.toml at the repo
         # root. Refuses to run rather than skipping when ruff is missing, for
-        # the same reason --strict refuses without a TOML parser: a check that
-        # quietly does nothing is worse than none, because the green tick
-        # still appears.
+        # the same reason --strict refuses when it cannot load its budgets: a
+        # check that quietly does nothing is worse than none, because the
+        # green tick still appears.
         require_python
         echo "Running Python lint and format checks..."
         if command -v ruff >/dev/null 2>&1; then

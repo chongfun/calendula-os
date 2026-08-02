@@ -85,9 +85,9 @@ every run the section owns.
 **Runs on the Python series in `.python-version`** (3.14), which
 `tools/check.sh` resolves — macOS ships 3.9 as `python3`, so do not assume
 that name. Budgets parse with `tomllib`, which that interpreter always has;
-when the parser was optional, `--strict` could silently check nothing, and
-that is how a 16.7x budget overrun once passed clean. A budget file that
-cannot be read or parsed still fails `--strict` and warns a plain report.
+while the parser was optional `--strict` could silently check nothing, which
+is how a 16.7x budget overrun once passed clean. A budget file that cannot be
+read or parsed still fails `--strict` and warns a plain report.
 
 The `page turn` statistic is guarded against operator cadence: the report
 prints a `page inputs:` line accounting for every press (`presses`,
