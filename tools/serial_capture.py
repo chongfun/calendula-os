@@ -1,14 +1,17 @@
 import fcntl
 import os
 import struct
-import sys
 import termios
 import time
 
 PORT = "/dev/cu.usbmodem101"
 LOG = "/tmp/x4raw.log"
 
-out = open(LOG, "ab", buffering=0)
+# Held open for the life of the process. This capture runs until it is killed
+# and appends from two places -- the read loop and the reconnect path below --
+# so there is no scope a context manager could close it at. Unbuffered so a
+# `tail -f` sees lines as they land and a kill loses nothing.
+out = open(LOG, "ab", buffering=0)  # noqa: SIM115
 
 
 def attach_once() -> None:

@@ -1,10 +1,23 @@
-# Initial warning budgets for development bench summaries.
-# The CLI currently reports timings only; these values are the baseline for
-# turning reports into explicit pass/fail checks once several known-good X4/X3
-# runs have been captured.
+# Warning budgets enforced by `bench.py report --strict` (and by `--strict`
+# on capture commands, against the log just written). A non-strict report
+# prints violations without failing. Budget parsing uses `tomllib`, which the
+# repo's pinned interpreter (.python-version) always has.
+#
+# Sections and keys are validated against `BUDGET_SCHEMA` in bench.py before
+# any capture is read: an unknown section, a misspelled key, a non-integer or
+# negative value, an empty section, or an empty document is a load failure
+# rather than something to skip past. A key that reads as enforced and is
+# enforced by nothing is what this file exists to prevent, so adding a budget
+# here means adding it there too.
 
 [page-turn]
 median_press_to_settled_ms = 550
+# Floor for the same median: a genuine press-to-settled includes a full Fast
+# refresh (379-455 ms busy measured on X3), so a median anywhere near or
+# below this is presses paired against renders already in flight — operator
+# burst cadence, not a faster device. Kept well under the real turn time so
+# a legitimate optimization cannot trip it.
+median_press_to_settled_min_ms = 250
 fast_refresh_busy_warn_ms = 500
 reading_layout_warn_ms = 60
 prestage_warn_ms = 40
@@ -14,6 +27,15 @@ full_refresh_busy_min_ms = 3000
 full_refresh_busy_max_ms = 4300
 
 [storage-cache]
+# Warm book opens only: `storage_open` with `ram_hit=false` and no cache build
+# in the same transaction — the path that loads an already-built cache,
+# measured 57-95 ms here. Until 2026-07-31 this was computed over every
+# `storage_open`, pooling three populations that do not overlap (RAM hits at
+# 0-15 ms, cold builds at 14-64 *seconds*), so a cold open failed the warm
+# ceiling and a RAM hit pulled the percentile back under it. Cold opens scale
+# with book size; the report prints them per path and gates none.
 warm_book_open_warn_ms = 150
 catalog_load_warn_ms = 500
-section_extend_warn_ms = 150
+# section_extend_warn_ms was deleted 2026-07-30: no section-extend telemetry
+# exists for it to gate (extends surface as `storage_open` with ram_hit), and
+# a budget key that looks enforced but is read by nothing is worse than none.

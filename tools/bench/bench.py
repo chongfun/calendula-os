@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 """Development bench harness for CalendulaOS hardware runs.
 
 The harness deliberately starts as a serial log collector and parser. The
@@ -22,14 +22,11 @@ import subprocess
 import sys
 import termios
 import time
+import tomllib
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, TextIO
-
-try:
-    import tomllib
-except ImportError:  # pragma: no cover - Python < 3.11 fallback.
-    tomllib = None  # type: ignore[assignment]
+from typing import Any, TextIO
 
 try:
     import fcntl
@@ -55,6 +52,23 @@ STORAGE_OPEN_RE = re.compile(
     r"storage: open complete status=(?P<status>\w+) pages=(?P<pages>\d+) "
     r"chapters=(?P<chapters>\d+)"
 )
+# Printed once per boot, before esp_rtos::start, so it carries no t_ms; it
+# marks the start of a boot's time base and says how the chip woke.
+DEEP_SLEEP_WAKE_RE = re.compile(
+    r"main: deep_sleep_wake=(?P<wake>true|false) "
+    r"\(gpio=(?P<gpio>true|false), sleep_image=(?P<image>true|false)\)"
+)
+# Boot-stage lines that carry a t_ms so boot-to-first-paint can be attributed
+# to a stage rather than just totalled. Each must fire at most once per boot,
+# or its median describes nothing. `sd: session enter` is deliberately NOT
+# here: several SD sessions run before first paint (catalog load, book open,
+# cache build), so it contributed multiple samples from one boot and its
+# "median" marked no repeatable point. Filtering to stages ahead of the first
+# render does not fix that — they are all ahead of it.
+BOOT_STAGE_RE = re.compile(
+    r"(?P<stage>main: spawn \w+|display: started|display: x3 init done)"
+    r" t_ms=(?P<t>\d+)$"
+)
 
 
 @dataclass(frozen=True)
@@ -63,14 +77,23 @@ class Suite:
     guidance: str
     stop_event: str | None = None
     stop_count_arg: str | None = None
+    # What the count flag falls back to when the operator does not name one.
+    # Held here rather than as an argparse default so the two cases stay
+    # distinguishable: a count that was asked for is a contract, and a count
+    # nobody typed is only a stopping rule.
+    stop_count_default: int | None = None
 
 
 SUITES = {
     "page-turn": Suite(
         "page-turn",
         "Open a warmed SD book, then press Next for the requested turn count.",
-        stop_event="reading_render",
+        # Turns, not Reading renders: the boot paint and any storage-driven
+        # repaint is a Reading render that answered no press, and counting
+        # those ended the capture one real sample short per repaint.
+        stop_event="page_turn",
         stop_count_arg="turns",
+        stop_count_default=50,
     ),
     "reader-soak": Suite(
         "reader-soak",
@@ -85,6 +108,7 @@ SUITES = {
         "After several fast page turns, press Power or wait for idle sleep, then wake and repeat.",
         stop_event="sleep_complete",
         stop_count_arg="cycles",
+        stop_count_default=10,
     ),
     "thermal-run": Suite(
         "thermal-run",
@@ -93,7 +117,38 @@ SUITES = {
 }
 
 
+def require_pinned_python() -> None:
+    """Fail with the version, not a traceback, on the wrong interpreter.
+
+    A capture is run straight off the shebang -- `tools/bench/bench.py
+    page-turn --port ...` -- so it never passes through `tools/check.sh`.
+    Checked in `main` rather than at import so the module stays importable by
+    the tests, which `check.sh` has already vetted.
+
+    However many components `.python-version` names is how many are compared,
+    so `3.14` accepts any release in that series and a fully-specified pin
+    would not, without this having to know which is in force.
+
+    Silent when the pin cannot be read: a copy of this file outside the repo
+    has nothing to check itself against.
+    """
+    pin = Path(__file__).resolve().parents[2] / ".python-version"
+    try:
+        pinned = pin.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    running = ".".join(str(part) for part in sys.version_info[: len(pinned.split("."))])
+    if running != pinned:
+        series = ".".join(pinned.split(".")[:2])
+        raise SystemExit(
+            f"bench: this repo needs Python {pinned} (.python-version); this is "
+            f"{running}. Install it (`uv python install {pinned}`) and re-run, "
+            f"or invoke it explicitly: python{series} {sys.argv[0]}"
+        )
+
+
 def main() -> int:
+    require_pinned_python()
     parser = argparse.ArgumentParser(prog="bench")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -124,12 +179,34 @@ def main() -> int:
     return args.func(args)
 
 
+def positive_int(text: str) -> int:
+    """An argparse type for durations and counts, where zero is not "no limit".
+
+    The capture loop asked `if seconds:`, so `--seconds 0` disabled the
+    deadline and ran forever instead of being rejected; `--minutes 0` and
+    `--cycles 0` inherited it. The only way to ask for no limit is to leave
+    the flag off.
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{value} is not a positive count or duration; omit the flag to "
+            "capture without that limit"
+        )
+    return value
+
+
 def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser], name: str) -> None:
     suite = SUITES[name]
     p = sub.add_parser(name, help=suite.guidance)
     p.add_argument("--port", default=DEFAULT_PORT)
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--seconds", type=int, default=None, help="stop after this many seconds")
+    p.add_argument(
+        "--seconds", type=positive_int, default=None, help="stop after this many seconds"
+    )
     p.add_argument(
         "--reset-before",
         action="store_true",
@@ -140,17 +217,27 @@ def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser],
     p.add_argument("--note", action="append", default=[], help="free-form note stored in metadata")
     p.add_argument("--book", default=None, help="operator label for the book under test")
     if name == "page-turn":
-        p.add_argument("--turns", type=int, default=50)
+        p.add_argument("--turns", type=positive_int, default=None, help="default 50; see --seconds")
     if name == "reader-soak":
-        p.add_argument("--minutes", type=int, default=30)
+        p.add_argument("--minutes", type=positive_int, default=30)
     if name == "sleep-sync":
-        p.add_argument("--cycles", type=int, default=10)
+        p.add_argument(
+            "--cycles", type=positive_int, default=None, help="default 10; see --seconds"
+        )
     if name == "storage-cache":
-        p.add_argument("--cold", action="store_true")
-        p.add_argument("--warm", action="store_true")
+        p.add_argument(
+            "--cold",
+            action="store_true",
+            help="the capture must exercise a cold storage path; --strict fails if it did not",
+        )
+        p.add_argument(
+            "--warm",
+            action="store_true",
+            help="the capture must exercise a warm storage path; --strict fails if it did not",
+        )
     if name == "thermal-run":
         p.add_argument("--suite", choices=["page-turn", "sleep-sync"], default="page-turn")
-        p.add_argument("--minutes", type=int, default=45)
+        p.add_argument("--minutes", type=positive_int, default=45)
     p.set_defaults(func=run_capture)
 
 
@@ -176,6 +263,7 @@ def process_capture_stream(
     on_deadline_set: Callable[[float], None] | None = None,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
+    turns = PageTurnCounter()
     pending_prestage = False
     pending_prestage_deadline: float | None = None
     pending_prestage_lines = 0
@@ -193,19 +281,31 @@ def process_capture_stream(
                     event_callback(event)
                 for counter in event_counters(event):
                     counts[counter] = counts.get(counter, 0) + 1
+                turns.observe(event)
+                counts["page_turn"] = turns.turns
         else:
             parsed_events = []
 
         if pending_prestage:
             has_prestage = any(e.get("event") == "prestage" for e in parsed_events)
-            has_new_turn_or_render = any(e.get("event") in {"render", "input"} for e in parsed_events)
+            has_new_turn_or_render = any(
+                e.get("event") in {"render", "input"} for e in parsed_events
+            )
             if line != "":
                 pending_prestage_lines += 1
-            expired = pending_prestage_deadline is not None and time.monotonic() >= pending_prestage_deadline
-            if has_prestage or has_new_turn_or_render or pending_prestage_lines >= MAX_PENDING_PRESTAGE_LINES or expired:
+            expired = (
+                pending_prestage_deadline is not None
+                and time.monotonic() >= pending_prestage_deadline
+            )
+            if (
+                has_prestage
+                or has_new_turn_or_render
+                or pending_prestage_lines >= MAX_PENDING_PRESTAGE_LINES
+                or expired
+            ):
                 break
         elif stop_target and counts.get(stop_target[0], 0) >= stop_target[1]:
-            if stop_target[0] == "reading_render":
+            if stop_target[0] == "page_turn":
                 already_prestaged = any(
                     e.get("event") == "render" and isinstance(e.get("prestage_ms"), int)
                     for e in parsed_events
@@ -231,15 +331,39 @@ def run_capture(args: argparse.Namespace) -> int:
     stop_target = stop_target_for(args, suite)
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
+    workflow = capture_workflow(args, suite)
+    requested = capture_request(args, seconds, stop_target)
     print(f"bench {suite.name}: {suite.guidance}")
+    if workflow != suite.name:
+        # What the report will hold this run to, said before it starts.
+        print(f"workflow: {workflow} (budgets and signal checks follow it)")
     print(f"port: {args.port}")
     print(f"out:  {args.out}")
-    if seconds:
-        print(f"stop: after {seconds}s")
+    if stop_target and seconds is not None:
+        # Both stop the capture, so say both. Printing only the duration —
+        # the count message sat behind an `elif` — left the operator to
+        # discover the count was still in force when the report faulted the
+        # run for missing it.
+        print(
+            f"stop: after {stop_target[1]} parsed {stop_target[0]}(s) or {seconds}s, "
+            "whichever comes first"
+        )
+        print(
+            f"note: {stop_target[1]} {stop_target[0]}(s) is the contract; --seconds is "
+            "a ceiling, and a capture it cuts short is reported as short"
+        )
     elif stop_target:
-        print(f"stop: after {stop_target[1]} parsed {stop_target[0]} events")
+        print(f"stop: after {stop_target[1]} parsed {stop_target[0]}(s)")
+    elif seconds is not None:
+        print(f"stop: after {seconds}s")
     else:
         print("stop: Ctrl-C")
+    modes = requested.get("storage_modes")
+    if modes:
+        print(
+            f"modes: {', '.join(modes)} — the capture must show each of these "
+            "paths; --strict fails if one was never exercised"
+        )
     if args.note:
         print("notes:", "; ".join(args.note))
     if args.reset_before:
@@ -247,17 +371,31 @@ def run_capture(args: argparse.Namespace) -> int:
 
     metadata = {
         "suite": suite.name,
+        "workflow": workflow,
         "event": "run_start",
         "host_time": time.time(),
         "port": args.port,
         "notes": args.note,
         "book": getattr(args, "book", None),
         "reset_before": bool(args.reset_before),
+        # What the operator asked this capture to collect, so the report can
+        # say whether they got it. A capture cut short — by Ctrl-C, by a stop
+        # rule that miscounted, or by a `--seconds` window that closed first —
+        # otherwise looks exactly like a complete one. Always written, even
+        # empty, because its presence is what tells the report this run
+        # carries a completion contract at all.
+        "requested": requested,
     }
     counts: dict[str, int] = {}
-    started = time.monotonic()
-    stop_at = started + seconds if seconds else None
+    command_started = time.monotonic()
+    # Reassigned once the device is back and the port is readable: a reset and
+    # its re-enumeration are setup, not telemetry, and counting them against
+    # `--seconds 20` collected materially less than 20 seconds while reporting
+    # about 20 elapsed.
+    started = command_started
+    stop_at: float | None = None
     pending_deadline: float | None = None
+    stop_reason = "stream-ended"
 
     def get_stop_at() -> float | None:
         if stop_at is not None and pending_deadline is not None:
@@ -273,6 +411,8 @@ def run_capture(args: argparse.Namespace) -> int:
         try:
             if args.reset_before:
                 reset_device(args.espflash, args.port)
+            started = time.monotonic()
+            stop_at = started + seconds if seconds is not None else None
             counts = process_capture_stream(
                 capture_lines(args.port, stop_at=stop_at, get_stop_at=get_stop_at),
                 suite.name,
@@ -281,8 +421,13 @@ def run_capture(args: argparse.Namespace) -> int:
                 print_lines=True,
                 on_deadline_set=set_pending_deadline,
             )
+            stop_reason = observed_stop_reason(counts, stop_target, stop_at)
         except KeyboardInterrupt:
             print("\nbench: capture stopped")
+            # Ctrl-C *is* the stop condition when none was requested, so a
+            # capture that asked for nothing else ends complete. One that did
+            # ask was cut short, and must not read as though it finished.
+            stop_reason = "operator" if seconds is None and stop_target is None else "interrupt"
         finally:
             write_event(
                 out,
@@ -290,7 +435,13 @@ def run_capture(args: argparse.Namespace) -> int:
                     "suite": suite.name,
                     "event": "run_end",
                     "host_time": time.time(),
+                    # The telemetry window, which is what a requested duration
+                    # is checked against; `command_elapsed_s` is the whole
+                    # command, reset and re-enumeration included.
                     "elapsed_s": round(time.monotonic() - started, 3),
+                    "command_elapsed_s": round(time.monotonic() - command_started, 3),
+                    "stop_reason": stop_reason,
+                    "completed": stop_reason in COMPLETED_STOP_REASONS,
                     "counts": counts,
                 },
             )
@@ -300,6 +451,79 @@ def run_capture(args: argparse.Namespace) -> int:
         validate_suites=args.strict,
     )
     return 1 if args.strict and report_warnings else 0
+
+
+# Stop conditions that mean the capture collected what it was told to. The
+# rest — an interrupted capture that had one, a stream that simply ended —
+# leave a partial run `--strict` must not certify.
+COMPLETED_STOP_REASONS = {"count", "duration", "operator"}
+
+# Stop events and the request key that names what the operator asked for.
+STOP_EVENT_REQUEST_KEYS = {
+    "page_turn": "page_turns",
+    "sleep_complete": "sleep_cycles",
+}
+
+
+def capture_request(
+    args: argparse.Namespace,
+    seconds: int | None,
+    stop_target: tuple[str, int] | None,
+) -> dict[str, Any]:
+    """The contract a capture is held to: everything the operator asked for.
+
+    Only the page-turn count was ever recorded, so `sleep-sync --cycles 10`,
+    `reader-soak --minutes 30` and `thermal-run --minutes 45` could stop at
+    the first valid signal and still satisfy `--strict` — proof that *some*
+    expected telemetry occurred, not that the requested capture happened.
+    `--cold`/`--warm` were worse: read once by argparse and never checked.
+
+    A count and a duration are not both minimums. Whichever the operator
+    typed is the contract (`stop_target_for` drops a defaulted count when a
+    duration was named); with both named the count wins and `--seconds` is a
+    ceiling. Recording both made `page-turn --seconds 60` unsatisfiable — the
+    capture stops at whichever lands first, and the report faulted it for the
+    other.
+    """
+    request: dict[str, Any] = {}
+    count_key = STOP_EVENT_REQUEST_KEYS.get(stop_target[0]) if stop_target is not None else None
+    if count_key is not None:
+        request[count_key] = stop_target[1]
+    elif seconds is not None:
+        request["seconds"] = seconds
+    modes = [mode for mode in STORAGE_MODES if getattr(args, mode, False)]
+    if modes:
+        request["storage_modes"] = modes
+    return request
+
+
+def observed_stop_reason(
+    counts: dict[str, int],
+    stop_target: tuple[str, int] | None,
+    stop_at: float | None,
+) -> str:
+    """Why the capture stream ended, from what it actually reached."""
+    if stop_target is not None and counts.get(stop_target[0], 0) >= stop_target[1]:
+        return "count"
+    if stop_at is not None and time.monotonic() >= stop_at:
+        return "duration"
+    # The device stopped talking and never came back, or the port was pulled:
+    # neither is a stop condition anyone asked for.
+    return "stream-ended"
+
+
+def capture_workflow(args: argparse.Namespace, suite: Suite) -> str:
+    """The workflow a capture actually ran, which is not always its suite.
+
+    `thermal-run` is a condition, not a workload: `--suite` picks which of the
+    other workflows runs under it. That choice decided what telemetry the run
+    would produce and was then thrown away, so every thermal run looked alike
+    to the report — a `--suite sleep-sync` capture was gated by the page-turn
+    budgets and never asked for a sleep at all, which is the "selected and
+    unchecked" shape this harness exists to catch.
+    """
+    underlying = getattr(args, "suite", None)
+    return str(underlying) if isinstance(underlying, str) else suite.name
 
 
 def reset_device(espflash: str, port: str) -> None:
@@ -322,7 +546,7 @@ def event_counters(event: dict[str, Any]) -> list[str]:
     counters = [event_name]
     if event_name == "render" and event.get("view") == "Reading":
         counters.append("reading_render")
-    if event_name == "sleep" and event.get("phase") == "complete":
+    if is_completed_sleep_cycle(event):
         counters.append("sleep_complete")
     if event_name == "input" and event.get("button") in {"Next", "Previous"}:
         counters.append("page_input")
@@ -338,9 +562,25 @@ def capture_seconds(args: argparse.Namespace) -> int | None:
 
 
 def stop_target_for(args: argparse.Namespace, suite: Suite) -> tuple[str, int] | None:
+    """The count this capture stops on, if a count is what bounds it.
+
+    A count the operator typed is theirs, and `--seconds` is a ceiling over
+    it. A count they did not type is only this suite's default and must not
+    outrank a duration they did: holding `page-turn --seconds 60` to 50 turns
+    reported almost every time-boxed capture as short of a sample count nobody
+    asked for. So a named duration with no named count drops the count from
+    both the stopping rule and the contract.
+    """
     if suite.stop_event is None or suite.stop_count_arg is None:
         return None
-    return suite.stop_event, int(getattr(args, suite.stop_count_arg))
+    requested = getattr(args, suite.stop_count_arg, None)
+    if requested is None:
+        if getattr(args, "seconds", None) is not None:
+            return None
+        requested = suite.stop_count_default
+    if requested is None:
+        return None
+    return suite.stop_event, int(requested)
 
 
 # Errno values a vanishing USB-serial device raises: the ESP32-C3's
@@ -392,7 +632,9 @@ def capture_lines(
             if not connected or err.errno not in PORT_LOST_ERRNOS:
                 raise
             if not reconnecting:
-                print(f"port: {port} vanished (device asleep?); wake it to resume capture", flush=True)
+                print(
+                    f"port: {port} vanished (device asleep?); wake it to resume capture", flush=True
+                )
                 reconnecting = True
         else:
             return
@@ -493,8 +735,14 @@ def parse_line(line: str, suite: str = "unknown") -> list[dict[str, Any]]:
 
     if text == "display: sleep deep":
         return [{"suite": suite, "event": "sleep", "phase": "deep", "legacy": True}]
-    if text == "display: sleep framebuffer flush failed":
-        return [{"suite": suite, "event": "sleep", "phase": "refresh", "ok": False}]
+    # `display: sleep framebuffer flush failed` is deliberately NOT parsed.
+    # The firmware prints it beside `bench: sleep phase=refresh ok=false`, and
+    # has since both were added, so parsing it recorded every failed flush
+    # twice and the report said "2 failed sleep phase(s)" for one failure. The
+    # println stays in the firmware because it is an error path, and error
+    # paths are unconditional there (see fw::log) — it is the only word a
+    # `--no-default-features` build says about a failed sleep. Its sibling
+    # `display: sleep transition failed` was never parsed either.
     if "queue full" in text or "panicked at" in text or "watchdog" in text.lower():
         return [{"suite": suite, "event": "warning", "line": text}]
 
@@ -508,6 +756,29 @@ def parse_line(line: str, suite: str = "unknown") -> list[dict[str, Any]]:
                 "pages": int(match.group("pages")),
                 "chapters": int(match.group("chapters")),
                 "legacy": True,
+            }
+        ]
+
+    match = DEEP_SLEEP_WAKE_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "boot",
+                "deep_sleep_wake": match.group("wake") == "true",
+                "gpio": match.group("gpio") == "true",
+                "sleep_image": match.group("image") == "true",
+            }
+        ]
+
+    match = BOOT_STAGE_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "boot_stage",
+                "stage": match.group("stage"),
+                "t_ms": int(match.group("t")),
             }
         ]
     return []
@@ -586,10 +857,31 @@ def summarize_paths(
 ) -> list[str]:
     events: list[dict[str, Any]] = []
     for path in paths:
-        events.extend(read_events(path))
+        file_events = read_events(path)
+        if events and file_events and file_events[0].get("event") != "run_start":
+            # Two files are two captures, but the event stream was simply
+            # concatenated, so a log that opens without a `run_start` — every
+            # capture predating the marker, and every hand-built one — had no
+            # boundary and was swallowed by whichever run preceded it. Its
+            # samples then inherited that run's suite and its device time base,
+            # both wrong, and both decided by the order of the paths on the
+            # command line. The marker is synthesized in memory only; it
+            # carries no suite, so the run stays unlabelled and says so.
+            events.append({"event": "run_start", "file_boundary": str(path)})
+        events.extend(file_events)
+
+    # `validate_suites` is the --strict flag. A strict gate that cannot load
+    # its budgets must fail loudly: exiting 0 with the checks silently absent
+    # is how a 16.7x overrun once passed clean.
+    budgets, budgets_problem = load_budgets(budgets_path)
+    if budgets_problem is not None:
+        if validate_suites:
+            raise SystemExit(f"bench report: --strict cannot enforce budgets: {budgets_problem}")
+        print(f"bench report: warning: budgets not checked: {budgets_problem}")
+
     if not events:
         print("bench report: no events")
-        return []
+        return ["no events parsed"] if validate_suites else []
 
     runs = split_runs(events)
     if latest_only and len(runs) > 1:
@@ -599,6 +891,10 @@ def summarize_paths(
             f"bench report: latest run only ({start.get('suite', 'unknown')}; "
             f"{len(runs) - 1} earlier run(s) in the log — pass --all to pool)"
         )
+    # Boot detection and t_ms monotonicity are per run: pooled runs restart
+    # the device time base at every run_start, which is not a reset.
+    scoped_runs = runs[-1:] if latest_only else runs
+    boot_paints, boot_stages, time_warnings = boot_report(scoped_runs)
 
     renders = [event for event in events if event.get("event") == "render"]
     reading_renders = [event for event in renders if event.get("view") == "Reading"]
@@ -608,42 +904,71 @@ def summarize_paths(
     storage = [event for event in events if str(event.get("event", "")).startswith("storage")]
 
     print("\nbench report")
-    print(f"events:        {len(events)}")
+    # Synthesized file boundaries are structure, not telemetry; counting them
+    # would report more events than the logs hold.
+    print(f"events:        {sum(1 for e in events if 'file_boundary' not in e)}")
     print(f"renders:       {len(renders)}")
     print(f"storage:       {len(storage)}")
     print(f"sleeps:        {len(sleeps)}")
     print(f"warnings:      {len(warnings)}")
     print_duration("reading layout", values(reading_renders, "layout_ms"))
-    print_duration("page turn", page_turn_durations(events))
+    pool = page_turn_pool(labelled_runs(events))
+    turn_stats = pool.every
+    for label, stats in pool.untrusted:
+        print(
+            f"page turn      EXCLUDED {label}: {page_turn_exclusion(stats)} — "
+            "left out of the page turn figure below"
+        )
+    if pool.trusted.durations:
+        print_duration("page turn", pool.trusted.durations)
+    elif turn_stats.durations:
+        print("page turn      no run paired at a trustworthy cadence; median suppressed")
+    if turn_stats.presses:
+        print(
+            f"page inputs:   presses={turn_stats.presses} "
+            f"page_turns={len(turn_stats.durations)} "
+            f"nav={turn_stats.nav_answered} "
+            f"coalesced={turn_stats.coalesced_presses} "
+            f"unmatched={turn_stats.unmatched_presses} "
+            f"reading_renders={turn_stats.reading_renders}"
+        )
     print_duration("render flush", values(renders, "flush_ms"))
     print_duration("prestage", prestage_values(events))
     print_duration("refresh busy", values(refreshes, "busy_ms"))
-    print_duration(
-        "storage open",
-        values([event for event in events if event.get("event") == "storage_open"], "elapsed_ms"),
-    )
-    print_duration(
-        "catalog load",
-        values(
-            [
-                event
-                for event in events
-                if event.get("event") == "storage_catalog" and event.get("action") == "load"
-            ],
-            "elapsed_ms",
-        ),
-    )
-    print_duration(
-        "catalog scan",
-        values(
-            [
-                event
-                for event in events
-                if event.get("event") == "storage_catalog" and event.get("action") == "scan"
-            ],
-            "elapsed_ms",
-        ),
-    )
+    # One line per path, never a pooled median — the same rule the boot report
+    # follows, for the same reason: a cache build and a RAM hit are different
+    # work by three orders of magnitude, and their mixture is a number
+    # matching no open that ever happened.
+    opens = storage_open_kinds(events)
+    for kind in STORAGE_OPEN_KINDS:
+        print_duration(f"storage open ({kind})", values(opens[kind], "elapsed_ms"))
+    # The same population the budgets measure, so the printed figure and the
+    # gated one cannot disagree about what was sampled. What is left out is
+    # named below rather than hidden.
+    print_duration("catalog load", values(catalog_samples(events, "load"), "elapsed_ms"))
+    print_duration("catalog scan", values(catalog_samples(events, "scan"), "elapsed_ms"))
+    for action in ("load", "scan"):
+        excluded = [
+            event
+            for event in catalog_events(events, action)
+            if not catalog_succeeded(event) and not unverifiable_catalog_op(event)
+        ]
+        if not excluded:
+            continue
+        if action == "scan":
+            reasons = [f"{len(excluded)} failed"]
+        else:
+            faults: dict[str, int] = {}
+            for event in excluded:
+                faults[str(event.get("result", "not loaded"))] = (
+                    faults.get(str(event.get("result", "not loaded")), 0) + 1
+                )
+            reasons = [
+                f"{count} "
+                + CATALOG_LOAD_REASONS.get(result, f"reported an unrecognised result ({result})")
+                for result, count in sorted(faults.items())
+            ]
+        print(f"catalog {action}:  " + ", ".join(reasons) + ", left out of the figure above")
     print_duration(
         "progress write",
         values(
@@ -655,6 +980,49 @@ def summarize_paths(
             "elapsed_ms",
         ),
     )
+    builds = [event for event in events if event.get("event") == "storage_build"]
+    print_duration("storage build", values(builds, "elapsed_ms"))
+    print_duration("build spine", values(builds, "spine_ms"))
+    print_duration("build write", values(builds, "write_ms"))
+    if builds:
+        totals = {
+            key: sum(int(event[key]) for event in builds if isinstance(event.get(key), int))
+            for key in ("rd_calls", "rd_blocks", "wr_calls", "wr_blocks")
+        }
+        print(
+            f"build io:      builds={len(builds)} "
+            + " ".join(f"{key}={value}" for key, value in totals.items())
+        )
+    print_duration(
+        "first page",
+        values(
+            [event for event in events if event.get("event") == "storage_first_page"],
+            "elapsed_ms",
+        ),
+    )
+    print_duration(
+        "bg build",
+        values(
+            [event for event in events if event.get("event") == "storage_background_build"],
+            "elapsed_ms",
+        ),
+    )
+    # One line per boot kind, never a pooled median: a cold boot pays the full
+    # waveform and a wake does not, so their mixture is a number matching no
+    # boot that ever happened — and the mixing ratio is decided by the suite
+    # (sleep-sync is ~1 cold to 20 wakes, --reset-before is all cold).
+    for kind in sorted(boot_paints):
+        print_duration(f"boot to paint ({kind})", boot_paints[kind])
+    if boot_paints:
+        print(
+            "boots:         "
+            + " ".join(f"{kind}={len(boot_paints[kind])}" for kind in sorted(boot_paints))
+            + " (first render t_ms per witnessed boot; reset = unexplained reboot)"
+        )
+    if boot_stages:
+        print("boot stages:   (median t_ms across witnessed boots)")
+        for stage, samples in sorted(boot_stages.items(), key=lambda kv: statistics.median(kv[1])):
+            print(f"  {stage:24} {statistics.median(samples):.0f}ms (n={len(samples)})")
 
     modes: dict[str, int] = {}
     for event in renders:
@@ -666,8 +1034,12 @@ def summarize_paths(
         print("warning lines:")
         for event in warnings[:10]:
             print(f"  {event.get('line', event)}")
-    budget_warnings = evaluate_budgets(events, load_budgets(budgets_path))
+    budget_warnings = evaluate_budgets(events, budgets)
     suite_warnings = evaluate_suite_signals(events) if validate_suites else []
+    if time_warnings:
+        print("time warnings:")
+        for warning in time_warnings:
+            print(f"  {warning}")
     if budget_warnings:
         print("budget warnings:")
         for warning in budget_warnings:
@@ -676,7 +1048,7 @@ def summarize_paths(
         print("suite warnings:")
         for warning in suite_warnings:
             print(f"  {warning}")
-    return budget_warnings + suite_warnings
+    return time_warnings + budget_warnings + suite_warnings
 
 
 def read_events(path: Path) -> list[dict[str, Any]]:
@@ -695,6 +1067,278 @@ def read_events(path: Path) -> list[dict[str, Any]]:
 
 def values(events: list[dict[str, Any]], key: str) -> list[int]:
     return [int(event[key]) for event in events if isinstance(event.get(key), int)]
+
+
+def refresh_busy_values(events: list[dict[str, Any]], mode: str) -> list[int]:
+    return values(
+        [
+            event
+            for event in events
+            if event.get("event") == "refresh" and event.get("mode") == mode
+        ],
+        "busy_ms",
+    )
+
+
+# The three populations a `storage_open` can belong to. They are three
+# different pieces of work, and on this repo's own captures they do not
+# overlap at all: RAM hits run 0-15 ms, warm opens 57-95 ms, cold opens
+# 14-64 seconds. Pooling them produced a "storage open p95" that described
+# none of them, and let a deliberately cold open decide the *warm* budget.
+#
+#   ram   the requested page was inside the section window already loaded, so
+#         nothing touched the card (`ram_hit=true`).
+#   warm  the card was read but the book's cache was already built, so the
+#         open loaded it. This is the population `warm_book_open_warn_ms`
+#         describes.
+#   cold  the cache had to be built first, which the firmware announces as a
+#         `storage_build` inside the same transaction. Book-size dependent by
+#         construction, so it is reported and never gated.
+STORAGE_OPEN_KINDS = ("ram", "warm", "cold")
+
+
+def storage_open_kinds(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Split `storage_open` events into the three paths they can take.
+
+    Cold is decided positionally, because `storage_build` carries no request
+    id or `t_ms` to join on: the firmware prints it from inside the open's
+    `LoadSection` step, so a build seen since the previous open belongs to it.
+    Only events carrying a boolean `ram_hit` close an open — the legacy
+    `storage: open complete` line parses to a `storage_open` too and would
+    otherwise consume the build belonging to the structured event right after
+    it. Those legacy lines land in no kind; they carry no `elapsed_ms` either,
+    so no budget can be satisfied by an event that measured nothing.
+
+    Three things clear a pending build. `storage_background_build`, because a
+    background walk's last step publishes through the same `report_publish`
+    with no open in flight — reliably paired, since `report_publish` fires
+    only on the `Ready` outcome that makes the step `Finished`. And
+    `run_start`/`boot`, because `--all` concatenates captures and a build at
+    the end of one run would be charged to the first open of the next. The
+    cost is the same either way: a real warm sample filed as a 14-64 second
+    cold one, out of the budget and out of `--warm` evidence.
+    """
+    kinds: dict[str, list[dict[str, Any]]] = {kind: [] for kind in STORAGE_OPEN_KINDS}
+    built = False
+    for event in events:
+        name = event.get("event")
+        if name in {"run_start", "boot", "storage_background_build"}:
+            built = False
+        elif name == "storage_build":
+            built = True
+        elif name == "storage_open" and isinstance(event.get("ram_hit"), bool):
+            if event["ram_hit"]:
+                kinds["ram"].append(event)
+            else:
+                kinds["cold" if built else "warm"].append(event)
+            built = False
+    return kinds
+
+
+def storage_open_values(events: list[dict[str, Any]], kind: str) -> list[int]:
+    return values(storage_open_kinds(events)[kind], "elapsed_ms")
+
+
+# What `storage-cache --cold` / `--warm` are asking the operator to exercise,
+# and the telemetry that shows they did. bench.py only listens — the operator
+# drives the device — so the flags cannot steer the capture; they declare an
+# intent the report then holds the capture to. Before this they were read once
+# by argparse and never written down or checked, so `--cold --warm --strict`
+# passed without proving either path.
+STORAGE_MODES = ("cold", "warm")
+
+STORAGE_MODE_EVIDENCE = {
+    "cold": "a book open that had to build its cache, or a catalog scan that succeeded",
+    "warm": (
+        "a book open served from an already-built cache or from the loaded "
+        "RAM window, or a catalog loaded from its snapshot"
+    ),
+}
+
+
+def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, Any]]:
+    return [
+        event
+        for event in events
+        if event.get("event") == "storage_catalog" and event.get("action") == action
+    ]
+
+
+# A catalog load reports three outcomes its original `ok` could not tell
+# apart, and the difference decides whether a capture is looking at a fault or
+# at the ordinary cold path.
+#
+#   hit      the snapshot loaded.
+#   miss     there was nothing to load — no catalog directory, or no file in
+#            it. This is *normal*: it is what makes the firmware queue
+#            `RefreshCatalog`, so a card whose catalog has not been built yet
+#            prints one immediately before the scan that builds it. Reading it
+#            as a failure faulted a healthy cold boot, which `--reset-before`
+#            makes the common case.
+#   stale    the file was written by firmware of another catalog version.
+#            Bumping `CATALOG_VERSION` is how that format migrates — the old
+#            snapshot stops loading and the scan rebuilds it — so this is the
+#            designed first boot after an upgrade, not a fault.
+#   invalid  the file was there and did not check out: wrong magic, the
+#            version-0 placeholder an interrupted scan leaves behind, a length
+#            disagreeing with its header, or a record that ended early. The
+#            card answered and what it held was unusable, which is a finding.
+#   error    the card refused an open, a seek, or a read.
+#
+# `miss` is deliberately the narrowest of the five: the firmware used to
+# reduce the whole read to a bool inside the SD session, so a refused read, a
+# failed seek and a torn file all surfaced as that benign one.
+CATALOG_LOAD_RESULTS = {"hit", "miss", "stale", "invalid", "error"}
+
+# The results that mean something went wrong. `miss` and `stale` do not: a
+# catalog not built yet and one the firmware has outgrown, both answered by
+# the same scan.
+CATALOG_LOAD_FAULTS = {"invalid", "error"}
+
+# How the report names each one, so a miss does not read as a fault.
+CATALOG_LOAD_REASONS = {
+    "miss": "found no snapshot (normal cold path)",
+    "stale": "found an older catalog version (rebuilt by the scan)",
+    "invalid": "found an unusable snapshot",
+    "error": "card error",
+    "not loaded": "did not load (older firmware: reason not recorded)",
+}
+
+
+def catalog_load_hit(event: dict[str, Any]) -> bool:
+    """The snapshot loaded — the only load that evidences the warm path.
+
+    Keyed on the field being *present*, not on its value being a string:
+    falling back to `ok` for any non-string made `{"ok": true, "result": null}`
+    read as a confirmed hit. Only a line with no `result` at all is old enough
+    for `ok` to be the whole story.
+    """
+    if "result" in event:
+        return event["result"] == "hit"
+    return event.get("ok") is True
+
+
+def catalog_load_error(event: dict[str, Any]) -> bool:
+    """The read went wrong, as opposed to there being nothing to hand over.
+
+    Asserted only from `result`: a pre-`result` capture's `ok=false` covers
+    every outcome at once, and the miss is by far the common one.
+    """
+    return event.get("result") in CATALOG_LOAD_FAULTS
+
+
+def unknown_catalog_result(event: dict[str, Any]) -> bool:
+    """A `result=` this bench.py has no meaning for.
+
+    A typo, a token some future firmware adds, or a value that did not parse
+    as a string. Not a hit, not a recognised fault, and not result-less, so
+    every other predicate answered "no" about it — which is how it slipped
+    through `--strict` in silence beside a valid `hit` in the same run.
+    Reported rather than guessed at, as an unrecognised workflow is.
+    """
+    if event.get("event") != "storage_catalog" or "result" not in event:
+        return False
+    result = event["result"]
+    return not isinstance(result, str) or result not in CATALOG_LOAD_RESULTS
+
+
+def unverifiable_catalog_op(event: dict[str, Any]) -> bool:
+    """A catalog line that does not say how the operation went.
+
+    In practice a scan from firmware older than the scan line's `ok`, which is
+    every capture predating it: `status` could not answer the question,
+    because the firmware replaces a failed scan's `Error` with `Ready` while
+    an older in-memory catalog is still listed.
+    """
+    if event.get("event") != "storage_catalog":
+        return False
+    # Either field *present* means the line said something. Whether it is
+    # readable is `unknown_catalog_result`'s business, not grounds to pool the
+    # line here as though it were merely old.
+    return "result" not in event and not isinstance(event.get("ok"), bool)
+
+
+def catalog_succeeded(event: dict[str, Any]) -> bool:
+    """Confirmed success, which is what strict evidence is allowed to rest on."""
+    if event.get("action") == "load":
+        return catalog_load_hit(event)
+    return event.get("ok") is True
+
+
+def catalog_samples(events: list[dict[str, Any]], action: str) -> list[dict[str, Any]]:
+    """The operations whose duration describes the path a budget is about.
+
+    Confirmed successes, plus lines too old to say — the one place that
+    compatibility assumption is applied. A budget asks how long the working
+    path took, so a legacy line is read as it always was; strict *evidence*
+    demands proof instead (`storage_mode_evidence`), because proving a path
+    ran is a claim rather than a measurement. Confirmed non-successes are out
+    of both: a miss and a refused session return in a fraction of the time,
+    so pooling them measures how fast the card said no.
+    """
+    return [
+        event
+        for event in catalog_events(events, action)
+        if catalog_succeeded(event) or unverifiable_catalog_op(event)
+    ]
+
+
+def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Storage operations the firmware reported as genuinely failed.
+
+    A catalog load is judged on `result` alone: its `ok=false` is the normal
+    cold path — no snapshot yet — far more often than it is a fault.
+    Everything else storage-side means what `ok=false` says.
+    """
+    failed = []
+    for event in events:
+        if not str(event.get("event", "")).startswith("storage"):
+            continue
+        if event.get("event") == "storage_catalog" and event.get("action") == "load":
+            if catalog_load_error(event):
+                failed.append(event)
+        elif event.get("ok") is False:
+            failed.append(event)
+    return failed
+
+
+# What `storage_mode_evidence` found. A mode never taken and one witnessed
+# only by telemetry too old to say both fail `--strict`, but the operator
+# fixes them differently: capture it, or reflash.
+STORAGE_MODE_ABSENT = "absent"
+STORAGE_MODE_UNVERIFIED = "unverified"
+STORAGE_MODE_CONFIRMED = "confirmed"
+
+
+def storage_mode_evidence(events: list[dict[str, Any]], mode: str) -> str:
+    """How well this capture proves it took the storage path it was asked to.
+
+    Strict evidence rests only on confirmed success. Nothing regresses by
+    demanding it — a capture whose firmware predates the result fields never
+    had its mode verified anyway — and it is the case that matters, since the
+    *host* records `requested.storage_modes` whatever firmware is on the
+    device.
+    """
+    opens = storage_open_kinds(events)
+    if mode == "cold":
+        confirming = bool(opens["cold"]) or any(
+            catalog_succeeded(event) for event in catalog_events(events, "scan")
+        )
+        unverifiable = any(
+            unverifiable_catalog_op(event) for event in catalog_events(events, "scan")
+        )
+    elif mode == "warm":
+        confirming = bool(opens["warm"] or opens["ram"]) or any(
+            catalog_load_hit(event) for event in catalog_events(events, "load")
+        )
+        unverifiable = any(
+            unverifiable_catalog_op(event) for event in catalog_events(events, "load")
+        )
+    else:
+        return STORAGE_MODE_ABSENT
+    if confirming:
+        return STORAGE_MODE_CONFIRMED
+    return STORAGE_MODE_UNVERIFIED if unverifiable else STORAGE_MODE_ABSENT
 
 
 def print_duration(label: str, data: list[int]) -> None:
@@ -725,21 +1369,349 @@ def prestage_values(events: list[dict[str, Any]]) -> list[int]:
     return result
 
 
-def page_turn_durations(events: list[dict[str, Any]]) -> list[int]:
+# Fraction of page presses that may fail to produce a page-turn sample before
+# the median is untrustworthy. Two ways a press produces no sample, and both
+# mean the same thing — the capture is recording tapping rhythm rather than
+# firmware latency:
+#
+#   unmatched  no render ever answered it (the firmware logs every debounced
+#              press whether or not the reader acts on it, and the input
+#              channel drops the oldest event on overflow).
+#   coalesced  a newer press superseded it before any render began. The app
+#              coalesces input while a render is in flight, so N presses
+#              during one refresh produce one frame showing the latest state.
+#              The superseded presses never had a frame of their own and
+#              their "latency" is just how fast the operator tapped.
+#
+# A deliberate-cadence capture (one press per settled page) leaves at most a
+# press or two in either bucket — a final press after the last captured
+# render, say — so ~2-4% of a 50-turn run. 10% keeps headroom over that
+# boundary noise while still catching a burst or a dropped-input episode.
+PAGE_TURN_UNTRUSTED_MAX_FRACTION = 0.10
+
+
+@dataclass(frozen=True)
+class PageTurnStats:
+    """Press-to-settled pairing, with the bookkeeping needed to trust it."""
+
+    durations: list[int]
+    presses: int
+    reading_renders: int
+    # Presses whose answering render was not a Reading render: Library/Home
+    # navigation, accounted for but not page turns.
+    nav_answered: int
+    # Presses superseded by a newer press before any render began. See the
+    # constant above — these are the burst signal, and the reason the median
+    # cannot be trusted on unmatched count alone.
+    coalesced_presses: int
+
+    @property
+    def unmatched_presses(self) -> int:
+        return self.presses - len(self.durations) - self.nav_answered - self.coalesced_presses
+
+    @property
+    def untrusted_presses(self) -> int:
+        """Presses that produced no page-turn sample, for either reason."""
+        return self.unmatched_presses + self.coalesced_presses
+
+    @property
+    def untrusted_fraction(self) -> float:
+        if self.presses == 0:
+            return 0.0
+        return self.untrusted_presses / self.presses
+
+    @property
+    def median_trusted(self) -> bool:
+        return bool(self.durations) and (
+            self.untrusted_fraction <= PAGE_TURN_UNTRUSTED_MAX_FRACTION
+        )
+
+
+def render_begin_ms(event: dict[str, Any]) -> int:
+    """When the reader state this render displays stopped being able to change.
+
+    A press later than this cannot be reflected in the frame, so it must not
+    be credited to it. `req_ms` is that boundary, stamped by the app as it
+    freezes the request. `deq_ms`, when present, is the later instant the
+    display task dequeued that request; it is reported for diagnosis and
+    never used for pairing.
+
+    Older captures have no `req_ms` and fall back to `t_ms - layout_ms -
+    flush_ms`. That estimate is deliberately *not* trusted where the real
+    stamp exists, because it omits everything outside those two intervals —
+    the catalog and TOC window reads ahead of layout, and after the flush the
+    planner record, a 52 KB framebuffer copy, and a chapter-tracking read that
+    touches the card whenever the chapter changes. Each omission pushes the
+    estimate later than the truth, which is the direction that mispairs: a
+    press inside one of those windows looks earlier than the render's start
+    and gets charged to it, worst at chapter boundaries. Treat page-turn
+    minima from pre-`req_ms` logs as suspect for that reason.
+    """
+    # `req_ms` is stamped by the app as it freezes the request, so it is the
+    # instant the frame's state stopped being able to change. It is deliberately
+    # not the display task's dequeue time: a render can wait in the channel
+    # behind a flush, a prestage, a storage command or a background build step,
+    # and a press arriving during that wait belongs to the next frame, not this
+    # one. (`deq_ms`, when present, is the dequeue instant; `deq_ms - req_ms` is
+    # the queue wait, reported for diagnosis and never used for pairing.)
+    # 0 means unstamped — see `RenderRequest::requested_at_ms`.
+    req_ms = event.get("req_ms")
+    if isinstance(req_ms, int) and req_ms > 0:
+        return req_ms
+    t_ms = int(event["t_ms"])
+    layout_ms = event.get("layout_ms")
+    flush_ms = event.get("flush_ms")
+    if isinstance(layout_ms, int) and isinstance(flush_ms, int):
+        return t_ms - layout_ms - flush_ms
+    return t_ms
+
+
+def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
+    """Press-to-settled durations, robust to renders the press did not cause.
+
+    Each press is credited with the first render that *began* after it
+    (the display task coalesces queued input into the latest reader state,
+    so every press older than a render's begin time is reflected in it).
+    A press that lands while a render is already in flight is NOT credited
+    with the remainder of that render — it waits for the next one. This is
+    what makes the statistic a function of firmware latency rather than
+    tapping rhythm: a repaint or a storage-driven re-render begins after the
+    press it follows was already answered and therefore credits nothing,
+    where the old render-driven FIFO charged it to the *next* press and
+    produced impossible 2 ms samples next to multi-second stale-press ones.
+
+    A render yields at most one duration, measured from the newest press it
+    answers. Older presses it also clears were superseded before it began —
+    the app coalesced them into this one frame — so they are counted as
+    `coalesced_presses` rather than given a duration of their own. Charging
+    them would reintroduce the defect from the other side: a burst would
+    produce a long sample per superseded press and still report every press
+    as "matched". Presses answered by a non-Reading render are navigation,
+    counted but excluded from durations.
+    """
     pending_inputs: list[int] = []
     durations: list[int] = []
+    presses = 0
+    reading_renders = 0
+    nav_answered = 0
+    coalesced_presses = 0
     for event in sorted(events, key=event_sort_key):
-        if event.get("event") == "input" and event.get("button") in {"Next", "Previous"}:
+        name = event.get("event")
+        if name == "input" and event.get("button") in {"Next", "Previous"}:
             t_ms = event.get("t_ms")
             if isinstance(t_ms, int):
+                presses += 1
                 pending_inputs.append(t_ms)
-        elif event.get("event") == "render" and event.get("view") == "Reading":
+        elif name == "render":
             t_ms = event.get("t_ms")
-            if isinstance(t_ms, int) and pending_inputs:
-                input_t = pending_inputs.pop(0)
-                if t_ms >= input_t:
-                    durations.append(t_ms - input_t)
-    return durations
+            if not isinstance(t_ms, int):
+                continue
+            is_reading = event.get("view") == "Reading"
+            if is_reading:
+                reading_renders += 1
+            begin = render_begin_ms(event)
+            # Events are sorted by t_ms, so pending_inputs is nondecreasing
+            # and this pops exactly the presses this render answers.
+            newest_answered: int | None = None
+            answered = 0
+            while pending_inputs and pending_inputs[0] <= begin:
+                newest_answered = pending_inputs.pop(0)
+                answered += 1
+            if newest_answered is None:
+                continue
+            coalesced_presses += answered - 1
+            if is_reading:
+                durations.append(t_ms - newest_answered)
+            else:
+                nav_answered += 1
+    return PageTurnStats(durations, presses, reading_renders, nav_answered, coalesced_presses)
+
+
+class PageTurnCounter:
+    """Live count of presses answered by a Reading render.
+
+    The capture loop stops on this rather than on Reading renders, because a
+    render that answered no press is not a sample: the boot paint and any
+    storage-driven repaint are Reading renders, and each one used to end the
+    capture a real turn short of what the operator asked for. Nothing
+    downstream could notice — the report pairs properly, so it simply
+    reported 49 turns for `--turns 50` and no check said otherwise.
+
+    Applies the same rule as `page_turn_stats`, incrementally: a render
+    answers every pending press older than its request-freeze boundary and
+    yields at most one turn, and a press answered by a non-Reading render is
+    navigation. A test pairs the two implementations against the same stream
+    so they cannot drift. It works in arrival order rather than sorting by
+    `t_ms`, which is what a live stream can do; the harness already documents
+    that the two differ only by the odd millisecond of print inversion, which
+    cannot change whether a press was answered.
+    """
+
+    def __init__(self) -> None:
+        self.pending: list[int] = []
+        self.turns = 0
+        self.last_t: int | None = None
+
+    def _new_epoch(self) -> None:
+        """Drop presses from the boot that just ended.
+
+        `t_ms` restarts at every reboot, and `pending` is a FIFO ordered by it,
+        so a press left unanswered before a sleep or a reset sits at the head
+        with a timestamp no later render can reach: every render after the
+        wake compares against it, pops nothing, and counts no turn. One stale
+        press stopped the counter permanently, which meant a `--turns N`
+        capture that slept partway through never reached N and ran to its
+        deadline instead — while the report, which splits by boot segment,
+        reported the turns that did happen. This is the drift the two
+        implementations are paired to prevent.
+        """
+        self.pending.clear()
+        self.last_t = None
+
+    def observe(self, event: dict[str, Any]) -> None:
+        name = event.get("event")
+        t_ms = event.get("t_ms")
+        if name == "boot":
+            # The first print of a new boot, emitted before the timer starts,
+            # so it carries no `t_ms` to compare against.
+            self._new_epoch()
+        elif isinstance(t_ms, int):
+            # The same regression test `boot_segments` splits on, so the live
+            # counter and the report agree on where one boot ends.
+            if self.last_t is not None and self.last_t - t_ms > _BOOT_REGRESSION_SKEW_MS:
+                self._new_epoch()
+            self.last_t = t_ms
+        if name == "input" and event.get("button") in {"Next", "Previous"}:
+            if isinstance(t_ms, int):
+                self.pending.append(t_ms)
+        elif name == "render" and isinstance(t_ms, int):
+            begin = render_begin_ms(event)
+            answered = 0
+            while self.pending and self.pending[0] <= begin:
+                self.pending.pop(0)
+                answered += 1
+            if answered and event.get("view") == "Reading":
+                self.turns += 1
+
+
+def page_turn_stats_over_epochs(events: list[dict[str, Any]]) -> PageTurnStats:
+    """Pair presses to renders within each device time epoch, then merge.
+
+    `t_ms` is device uptime. It restarts at every reboot, and separate
+    captures in one log each carry their own. `page_turn_stats` sorts by it,
+    so handing it events that span an epoch boundary interleaves two clocks:
+    two healthy runs that each recorded `input @1000, render @1500` sort as
+    two inputs then two renders, and the first render answers both — one
+    invented coalesced press, one render credited with nothing, and with
+    other overlaps, durations measured from one run's press to another run's
+    render.
+
+    `boot_report` documents this hazard and guards against it; page-turn
+    pairing did not, which left `--all` and any single capture containing a
+    sleep or a reset (so `sleep-sync` and `reader-soak` by construction)
+    reporting cross-epoch samples. Splitting by run *and* by boot segment is
+    the same decomposition the boot report already computes.
+    """
+    return merge_page_turn_stats(
+        [
+            page_turn_stats(segment)
+            for run in split_runs(events)
+            for segment, _kind in boot_segments(run)[0]
+        ]
+    )
+
+
+@dataclass(frozen=True)
+class PageTurnPool:
+    """One page-turn population per run, and the two ways of adding them up.
+
+    Trust is a property of how a capture was *performed*, so it has to be
+    decided before the runs are added together. Merging first hides the bad
+    one in the good ones: a run of 1 turn and 1 unanswered press is 50%
+    untrusted on its own, and pooled with a clean 20-turn run it becomes 1 in
+    22 and passes the 10% threshold. The report then prints, and `--strict`
+    gates on, a median partly drawn from a capture this same tool would
+    refuse to report on its own.
+
+    `every` accounts for every press and is what the `page inputs:` line
+    reports. `trusted` is the population the median comes from: runs that
+    paired at a cadence worth believing. `untrusted` is what was left out,
+    named, so the operator knows which capture to redo.
+    """
+
+    per_run: list[tuple[str, PageTurnStats]]
+
+    @property
+    def every(self) -> PageTurnStats:
+        return merge_page_turn_stats([stats for _label, stats in self.per_run])
+
+    @property
+    def trusted(self) -> PageTurnStats:
+        return merge_page_turn_stats(
+            [stats for _label, stats in self.per_run if stats.median_trusted]
+        )
+
+    @property
+    def untrusted(self) -> list[tuple[str, PageTurnStats]]:
+        """Runs whose presses gave the median nothing it could use.
+
+        A run that produced no pairing at all belongs here as much as a
+        cadence-corrupted one: `trusted` drops both, so reporting only the
+        second meant a pooled report printed the healthy run's median with no
+        sign that a whole capture had contributed nothing. Runs with no
+        presses are silent because nothing was attempted in them.
+        """
+        return [
+            (label, stats)
+            for label, stats in self.per_run
+            if stats.presses and not stats.median_trusted
+        ]
+
+
+def page_turn_exclusion(stats: PageTurnStats) -> str:
+    """Why a run's presses are not in the pooled median.
+
+    One wording for both the report and the budget warning, so the two
+    cannot drift into disagreeing about what was left out.
+    """
+    if not stats.durations:
+        return f"{stats.presses} presses and no input-to-Reading-render sample"
+    return (
+        f"{stats.untrusted_presses}/{stats.presses} presses produced no page "
+        f"turn ({stats.coalesced_presses} coalesced, "
+        f"{stats.unmatched_presses} unanswered; over "
+        f"{PAGE_TURN_UNTRUSTED_MAX_FRACTION:.0%}), so its samples are operator "
+        "cadence, not firmware latency"
+    )
+
+
+def page_turn_pool(runs: list[LabelledRun]) -> PageTurnPool:
+    """Pair presses to renders inside each run, keeping the runs apart."""
+    return PageTurnPool([(run.label, page_turn_stats_over_epochs(run.events)) for run in runs])
+
+
+def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
+    """Sum independently paired populations into one.
+
+    Used both for the boot segments inside a run and for the runs inside a
+    pooled report: the counters add and the durations concatenate, so a
+    pooled figure is exactly its parts and coverage can be judged per part
+    without measuring anything twice.
+    """
+    merged = PageTurnStats([], 0, 0, 0, 0)
+    for stats in parts:
+        merged = PageTurnStats(
+            merged.durations + stats.durations,
+            merged.presses + stats.presses,
+            merged.reading_renders + stats.reading_renders,
+            merged.nav_answered + stats.nav_answered,
+            merged.coalesced_presses + stats.coalesced_presses,
+        )
+    return merged
+
+
+def page_turn_durations(events: list[dict[str, Any]]) -> list[int]:
+    return page_turn_stats_over_epochs(events).durations
 
 
 def event_sort_key(event: dict[str, Any]) -> tuple[int, float]:
@@ -752,28 +1724,432 @@ def event_sort_key(event: dict[str, Any]) -> tuple[int, float]:
     return (2, 0)
 
 
-def load_budgets(path: Path | None) -> dict[str, Any]:
-    if path is None or tomllib is None or not path.exists():
-        return {}
-    with path.open("rb") as handle:
-        return tomllib.load(handle)
+# `t_ms` is device uptime, so within one boot it only grows; a decrease in
+# capture (file) order marks a reboot. A reboot right after a completed deep
+# sleep is the normal wake path. Any other one is a watchdog/brownout/manual
+# reset, and it matters because `event_sort_key` orders events by t_ms while
+# `split_runs` splits only on host-side run_start markers: the two boots'
+# time bases interleave and press/render pairings straddle the reset.
+_SLEEP_TERMINAL_PHASES = {"deep_sleep", "complete"}
+
+
+def is_terminal_sleep(event: dict[str, Any]) -> bool:
+    """A sleep line that says the device actually went to sleep.
+
+    Most `sleep` lines say no such thing: `phase=requested` opens the
+    transition, and `refresh`, `power_down_start`, `power_down_done` and
+    `power_off` are steps inside it that a failed handshake reaches too.
+    Counting any of them as a sleep let a `sleep-sync --strict` capture pass
+    having only *asked* for one.
+
+    The terminal markers are `complete`, printed by the display task on both
+    devices once the panel acknowledged, and `deep_sleep`, printed by the X3
+    panel driver *after* its deep-sleep command returned — the only terminal
+    marker in captures predating the `complete ok=true` line, whose absence
+    on the success path was itself a defect. `phase=complete` prints on both
+    outcomes and carries the result in `ok`; absent (older captures) is
+    treated as success.
+
+    The X4's `display: sleep deep` (parsed as `phase=deep`) is deliberately
+    not one of them, despite the name: ssd1677 prints it after the power-down
+    handshake and *before* sending its deep-sleep command, which can still
+    fail. It also carries no `t_ms`, so a boot segment latched by it could
+    never be un-latched by the later `complete ok=false` and a reset was
+    filed as a wake. An X4 capture with no `complete ok=true` cannot prove a
+    sleep finished, and now fails closed instead of claiming one.
+    """
+    return (
+        event.get("event") == "sleep"
+        and event.get("phase") in _SLEEP_TERMINAL_PHASES
+        and event.get("ok") is not False
+    )
+
+
+def is_completed_sleep_cycle(event: dict[str, Any]) -> bool:
+    """One sleep cycle the panel finished, counted exactly once.
+
+    `sleep-sync --cycles N` stops on this and the report checks against the
+    same predicate, so the two cannot disagree. Narrower than
+    `is_terminal_sleep` on both sides, deliberately:
+
+    - `ok` must not be false. `phase=complete` prints on both outcomes, and
+      counting a failed one ended the capture as though a cycle had landed.
+    - `phase=deep_sleep` is not counted: the X3 panel driver prints it
+      *beside* the display task's `phase=complete`, so admitting it counted
+      every X3 cycle twice and `--cycles 10` would have stopped at five.
+      `is_terminal_sleep` still accepts it — "did this device ever sleep?" of
+      a pre-`complete` capture is a different question.
+    """
+    return (
+        event.get("event") == "sleep"
+        and event.get("phase") == "complete"
+        and event.get("ok") is not False
+    )
+
+
+def completed_sleep_cycles(events: list[dict[str, Any]]) -> int:
+    return sum(1 for event in events if is_completed_sleep_cycle(event))
+
+
+def has_failed_sleep(events: list[dict[str, Any]]) -> bool:
+    """A sleep phase the firmware reported as failed.
+
+    Any phase counts, not just the terminal ones: `refresh`, `power_down_*`
+    and `power_off` each fail on their own, and the power task retries, so a
+    later completed cycle in the same capture does not make the failure go
+    away. The structured event is the only record of it — the parser drops
+    the duplicate unstructured "framebuffer flush failed" line on purpose.
+    """
+    return any(event.get("event") == "sleep" and event.get("ok") is False for event in events)
+
+
+# A t_ms decrease smaller than this is treated as clock skew, not a reboot.
+# `bench: input` is stamped and printed from the interrupt-priority executor
+# and can preempt the display task between its `Instant::now()` and its
+# blocking UART write, so two lines can land out of order by a hair. A real
+# reboot restarts the uptime clock, so its regression is the whole elapsed
+# session — orders of magnitude above this. Without the guard a 1 ms
+# inversion fabricates a boot, a boot-to-first-paint sample, and a --strict
+# failure; no inversion of any size appears in the reference capture, so this
+# guards a hazard rather than an observed defect.
+_BOOT_REGRESSION_SKEW_MS = 250
+
+
+def boot_segments(
+    run: list[dict[str, Any]],
+) -> tuple[list[tuple[list[dict[str, Any]], str]], list[str]]:
+    """Split one run's events (kept in capture order) at device reboots.
+
+    Returns ``([(segment, kind)], warnings)``. The leading segment's kind is
+    "attach" (capture joined an already-running device; its t_ms values do
+    not date from a witnessed boot). Later segments start at a reboot:
+    "wake" when the boot marker reports a real deep-sleep wake (or, with no
+    marker at all, a completed deep sleep preceded it), "cold" when the
+    marker says otherwise, and "reset" for a bare t_ms regression - an
+    unexplained reboot, which is also returned as a warning.
+    """
+    segments: list[list[Any]] = [[[], "attach"]]
+    warnings: list[str] = []
+    last_t: int | None = None
+    slept = False
+    slept_at: int | None = None
+    for event in run:
+        name = str(event.get("event", ""))
+        if name == "boot":
+            # Explicit marker line: the first print of a new boot. The
+            # firmware already decided this — `deep_sleep_wake` is
+            # `gpio && sleep_image`, because a wake pin that fired is only
+            # half the story: a wake whose sleep image was not retained pays
+            # the full waveform, so its first paint belongs with the cold
+            # cluster. Take that verdict as given. A preceding sleep must not
+            # overrule it: a device that browns out or resets after a
+            # completed sleep reports false here, and reading it as a wake
+            # files a full cold boot in the fast cluster. The heuristic is
+            # kept only for markers too old to carry the fields.
+            wake = event.get("deep_sleep_wake")
+            gpio = event.get("gpio")
+            if not isinstance(wake, bool) and isinstance(gpio, bool):
+                # A marker printed before the combined field existed: the
+                # same rule, spelled out from its two halves.
+                wake = gpio and event.get("sleep_image") is not False
+            if isinstance(wake, bool):
+                boot_kind = "wake" if wake else "cold"
+            else:
+                # No marker fields at all — only then is a preceding sleep
+                # the best evidence available.
+                boot_kind = "wake" if slept else "cold"
+            if segments[-1][0]:
+                segments.append([[], boot_kind])
+            else:
+                segments[-1][1] = boot_kind
+            slept = False
+            slept_at = None
+            last_t = None
+        t_ms = event.get("t_ms")
+        if isinstance(t_ms, int):
+            if last_t is not None and last_t - t_ms > _BOOT_REGRESSION_SKEW_MS:
+                kind = "wake" if slept else "reset"
+                if kind == "reset":
+                    warnings.append(
+                        f"t_ms went backwards ({last_t} -> {t_ms}) with no deep sleep "
+                        "recorded: unexpected reset (watchdog/brownout?); timings "
+                        "straddle two boots"
+                    )
+                segments.append([[], kind])
+                slept = False
+                slept_at = None
+            elif slept and slept_at is not None and t_ms > slept_at:
+                # The device went on running past a sleep it reported as
+                # terminal, so it did not deep-sleep: the panel handshake
+                # failed and the power task stayed awake to retry. Anything
+                # that follows is not a wake, and a reset after it must still
+                # be reported as one.
+                slept = False
+                slept_at = None
+            last_t = t_ms
+        if is_terminal_sleep(event):
+            slept = True
+            slept_at = t_ms if isinstance(t_ms, int) else None
+        segments[-1][0].append(event)
+    return [(segment, kind) for segment, kind in segments if segment], warnings
+
+
+def woke_after_sleep(run: list[dict[str, Any]]) -> bool:
+    """True when a wake in this run followed a sleep this run captured.
+
+    Asking the two halves separately - does a completed sleep appear, does
+    any segment read as a wake - passes a capture that was started while the
+    device was already asleep: the operator wakes it to begin, the leading
+    boot marker says `deep_sleep_wake=true`, and the sleep at the far end of
+    the run is never woken from. That is the ordinary way a soak is started,
+    and it left the wake path unexercised while reading as a full cycle. So
+    walk the segments in capture order and require the wake to come after.
+    """
+    slept = False
+    for segment, kind in boot_segments(run)[0]:
+        if slept and kind == "wake":
+            return True
+        if any(is_terminal_sleep(event) for event in segment):
+            slept = True
+    return False
+
+
+def boot_report(
+    scoped_runs: list[list[dict[str, Any]]],
+) -> tuple[dict[str, list[int]], dict[str, list[int]], list[str]]:
+    """Boot-to-first-paint per witnessed boot, plus boot-stage samples.
+
+    The t_ms epoch is the esp-hal systimer (embassy_time resolves to
+    esp_rtos::now() -> Instant::now().duration_since_epoch()), which starts
+    a little before esp_rtos::start. Neither epoch includes the ROM and
+    second-stage bootloader, so "boot to paint" is firmware-visible boot
+    time and not wall-clock time from the button press. The t_ms of a boot's
+    first render is that figure - but only when the capture actually witnessed
+    the boot (a reset_before run start, a boot marker line, a wake, or a
+    t_ms regression). An "attach" segment joined mid-session, and its first
+    render says nothing about boot. Note a wake whose first-paint line was
+    lost while the serial port re-enumerated can leave an inflated sample;
+    it shows up as an outlier against the boot-time cluster.
+    """
+    paints: dict[str, list[int]] = {}
+    stages: dict[str, list[int]] = {}
+    warnings: list[str] = []
+    for run in scoped_runs:
+        run_start = next((e for e in run if e.get("event") == "run_start"), {})
+        segments, segment_warnings = boot_segments(run)
+        warnings.extend(segment_warnings)
+        for index, (segment, kind) in enumerate(segments):
+            if index == 0 and kind == "attach" and run_start.get("reset_before"):
+                # `--reset-before` hard-resets after the capture opens, so
+                # the run's leading segment is a witnessed cold boot.
+                kind = "cold"
+            if kind == "attach":
+                continue
+            first_render_t: int | None = None
+            for event in segment:
+                if event.get("event") == "render" and isinstance(event.get("t_ms"), int):
+                    first_render_t = int(event["t_ms"])
+                    break
+            if first_render_t is None:
+                continue
+            paints.setdefault(kind, []).append(first_render_t)
+            for event in segment:
+                if event.get("event") == "boot_stage" and isinstance(event.get("t_ms"), int):
+                    t_ms = int(event["t_ms"])
+                    if t_ms <= first_render_t:
+                        stages.setdefault(str(event.get("stage")), []).append(t_ms)
+    return paints, stages, warnings
+
+
+def load_budgets(path: Path | None) -> tuple[dict[str, Any], str | None]:
+    """Returns (budgets, problem).
+
+    ``problem`` is a human-readable reason the budgets could not be loaded,
+    and ``budgets`` is empty whenever it is set. A ``None`` path means the
+    caller intentionally disabled budgets, which is not a problem. Budgets
+    silently absent is how ``--strict`` once verified nothing for months, so
+    every involuntary empty result carries its reason. The parser is no longer
+    one of them: `tomllib` is imported directly.
+    """
+    if path is None:
+        return {}, None
+    if not path.exists():
+        return {}, f"budgets file {path} does not exist"
+    # Unreadable and unparseable both owe the same answer as a missing parser:
+    # every involuntary empty result carries its reason, so `--strict` exits
+    # on it and a plain report warns. Letting either raise broke that with a
+    # traceback — `path.exists()` is satisfied by a directory, and a decode
+    # error propagated straight out. `TOMLDecodeError` is resolved off
+    # whichever parser is bound, so a test double without one still works.
+    decode_error = getattr(tomllib, "TOMLDecodeError", ValueError)
+    try:
+        with path.open("rb") as handle:
+            budgets = tomllib.load(handle)
+    except OSError as err:
+        return {}, f"cannot read {path}: {err}"
+    except decode_error as err:
+        return {}, f"cannot parse {path}: {err}"
+    problems = budget_schema_problems(budgets)
+    if problems:
+        return {}, f"{path} is not a valid budget file: " + "; ".join(problems)
+    return budgets, None
+
+
+# Every budget this harness enforces, and the section that owns it. This is
+# the registry, not documentation: a key absent from here is rejected rather
+# than ignored, so a misspelling cannot leave a section with no operative
+# threshold while `--strict` still reports success.
+BUDGET_SCHEMA: dict[str, set[str]] = {
+    "page-turn": {
+        "median_press_to_settled_ms",
+        "median_press_to_settled_min_ms",
+        "fast_refresh_busy_warn_ms",
+        "reading_layout_warn_ms",
+        "prestage_warn_ms",
+    },
+    "sleep-sync": {
+        "full_refresh_busy_min_ms",
+        "full_refresh_busy_max_ms",
+    },
+    "storage-cache": {
+        "warm_book_open_warn_ms",
+        "catalog_load_warn_ms",
+    },
+}
+
+# Budget keys that bound the same measurement from both sides, as
+# (floor, ceiling). A floor above its ceiling admits no sample at all, so it
+# is a budget guaranteed to fire or guaranteed never to — either way it is not
+# measuring anything, which is what this validation exists to catch.
+BUDGET_BOUND_PAIRS: dict[str, list[tuple[str, str]]] = {
+    "page-turn": [("median_press_to_settled_min_ms", "median_press_to_settled_ms")],
+    "sleep-sync": [("full_refresh_busy_min_ms", "full_refresh_busy_max_ms")],
+}
+
+
+def budget_schema_problems(budgets: dict[str, Any]) -> list[str]:
+    """Everything wrong with a budget document, before any capture is read.
+
+    Every consumer fails open: `warn_if_above`/`warn_if_below` return silently
+    unless the threshold is an `int`, and an unknown key is never looked up.
+    So `median_press_to_settledd_ms = 550` left page-turn with no operative
+    threshold while `--strict` still exited 0 — a file that reads as enforced
+    and enforces nothing. A string did the same, and so did `true`, since
+    `isinstance(True, int)` holds and a bool arrives at the comparison as 1.
+
+    Rejected for the same reason, each being a gate that cannot fire: an empty
+    section, a negative threshold, a floor above its own ceiling, and a
+    document with no sections at all — that last separately, because the loop
+    below has nothing to iterate and `budget_sections_in_play` cannot tell
+    `{}` from budgets deliberately disabled.
+
+    Reported as a load failure, so `--strict` refuses to run and a plain
+    report says budgets were not checked.
+    """
+    problems: list[str] = []
+    if not budgets:
+        return ["the document configures no budget sections"]
+    for section, entries in sorted(budgets.items()):
+        known = BUDGET_SCHEMA.get(section)
+        if known is None:
+            problems.append(
+                f"unknown section [{section}] (known sections are "
+                f"{', '.join(sorted(BUDGET_SCHEMA))})"
+            )
+            continue
+        if not isinstance(entries, dict):
+            problems.append(f"[{section}] is not a table")
+            continue
+        if not entries:
+            problems.append(f"[{section}] configures no budget")
+            continue
+        for key, value in sorted(entries.items()):
+            if key not in known:
+                problems.append(
+                    f"[{section}] has unknown key {key} (known keys are {', '.join(sorted(known))})"
+                )
+            elif isinstance(value, bool) or not isinstance(value, int):
+                problems.append(
+                    f"[{section}] {key} must be an integer number of milliseconds, not {value!r}"
+                )
+            elif value < 0:
+                problems.append(
+                    f"[{section}] {key} is {value}; a millisecond budget "
+                    "cannot be negative, and as a bound it would gate nothing"
+                )
+        problems.extend(budget_bound_problems(section, entries))
+    return problems
+
+
+def budget_bound_problems(section: str, entries: dict[str, Any]) -> list[str]:
+    """Floors that sit above their own ceilings."""
+    problems = []
+    for floor_key, ceiling_key in BUDGET_BOUND_PAIRS.get(section, []):
+        floor = entries.get(floor_key)
+        ceiling = entries.get(ceiling_key)
+        if (
+            isinstance(floor, int)
+            and isinstance(ceiling, int)
+            and not isinstance(floor, bool)
+            and not isinstance(ceiling, bool)
+            and floor > ceiling
+        ):
+            problems.append(
+                f"[{section}] {floor_key} ({floor}ms) is above {ceiling_key} "
+                f"({ceiling}ms), so no measurement can satisfy both"
+            )
+    return problems
 
 
 def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> list[str]:
-    warnings: list[str] = []
+    in_play, warnings = budget_sections_in_play(events, budgets)
     page_turn = budgets.get("page-turn", {})
-    if page_turn:
-        render_events = [event for event in events if event.get("event") == "render"]
-        turn_durations = page_turn_durations(events)
-        warn_if_above(
-            warnings,
-            "page-turn median",
-            statistics.median(turn_durations) if turn_durations else None,
-            page_turn.get("median_press_to_settled_ms"),
-        )
-        reading_layout = values(
-            [event for event in render_events if event.get("view") == "Reading"],
-            "layout_ms",
+    if page_turn and "page-turn" in in_play:
+        runs = section_runs(events, "page-turn")
+        pool = page_turn_pool(runs)
+        # A gate over a cadence artifact is worse than no gate, and trust is
+        # per capture: an untrusted run is named and dropped rather than
+        # averaged into the pool it would otherwise corrupt.
+        for label, stats in pool.untrusted:
+            warnings.append(f"page-turn median excludes {label}: {page_turn_exclusion(stats)}")
+        if pool.trusted.durations:
+            turn_median = statistics.median(pool.trusted.durations)
+            warn_if_above(
+                warnings,
+                "page-turn median",
+                turn_median,
+                page_turn.get("median_press_to_settled_ms"),
+            )
+            warn_if_below(
+                warnings,
+                "page-turn median",
+                turn_median,
+                page_turn.get("median_press_to_settled_min_ms"),
+            )
+        elif pool.every.durations:
+            warnings.append(
+                "page-turn median: no run paired at a trustworthy cadence; budget not checked"
+            )
+        for key in ("median_press_to_settled_ms", "median_press_to_settled_min_ms"):
+            warn_if_unobserved(
+                warnings,
+                "page-turn",
+                page_turn,
+                key,
+                runs,
+                [stats.durations for _label, stats in pool.per_run],
+                "press-to-settled pairings",
+            )
+        per_run_layout, reading_layout = per_run_samples(
+            runs,
+            lambda run_events: values(
+                [
+                    event
+                    for event in run_events
+                    if event.get("event") == "render" and event.get("view") == "Reading"
+                ],
+                "layout_ms",
+            ),
         )
         warn_if_above(
             warnings,
@@ -781,36 +2157,56 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             percentile(reading_layout, 95) if reading_layout else None,
             page_turn.get("reading_layout_warn_ms"),
         )
-        prestage = prestage_values(events)
+        warn_if_unobserved(
+            warnings,
+            "page-turn",
+            page_turn,
+            "reading_layout_warn_ms",
+            runs,
+            per_run_layout,
+            "Reading renders",
+        )
+        per_run_prestage, prestage = per_run_samples(runs, prestage_values)
         warn_if_above(
             warnings,
             "prestage p95",
             percentile(prestage, 95) if prestage else None,
             page_turn.get("prestage_warn_ms"),
         )
-        fast_busy = [
-            int(event["busy_ms"])
-            for event in events
-            if event.get("event") == "refresh"
-            and event.get("mode") == "Fast"
-            and isinstance(event.get("busy_ms"), int)
-        ]
+        warn_if_unobserved(
+            warnings,
+            "page-turn",
+            page_turn,
+            "prestage_warn_ms",
+            runs,
+            per_run_prestage,
+            "prestage samples",
+        )
+        per_run_fast, fast_busy = per_run_samples(
+            runs, lambda run_events: refresh_busy_values(run_events, "Fast")
+        )
         warn_if_above(
             warnings,
             "Fast refresh busy p95",
             percentile(fast_busy, 95) if fast_busy else None,
             page_turn.get("fast_refresh_busy_warn_ms"),
         )
+        warn_if_unobserved(
+            warnings,
+            "page-turn",
+            page_turn,
+            "fast_refresh_busy_warn_ms",
+            runs,
+            per_run_fast,
+            "Fast refresh events",
+        )
 
     sleep_sync = budgets.get("sleep-sync", {})
-    if sleep_sync:
-        full_busy = [
-            int(event["busy_ms"])
-            for event in events
-            if event.get("event") == "refresh"
-            and event.get("mode") == "Full"
-            and isinstance(event.get("busy_ms"), int)
-        ]
+    if sleep_sync and "sleep-sync" in in_play:
+        runs = section_runs(events, "sleep-sync")
+        per_run_full, full_busy = per_run_samples(
+            runs, lambda run_events: refresh_busy_values(run_events, "Full")
+        )
         min_ms = sleep_sync.get("full_refresh_busy_min_ms")
         max_ms = sleep_sync.get("full_refresh_busy_max_ms")
         for busy in full_busy:
@@ -820,30 +2216,56 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
                 warnings.append(f"Full refresh busy {busy}ms above budget ceiling {max_ms}ms")
         failed_sleeps = [
             event
-            for event in events
+            for run in runs
+            for event in run.events
             if event.get("event") == "sleep" and event.get("ok") is False
         ]
         if failed_sleeps:
             warnings.append(f"{len(failed_sleeps)} failed sleep phase(s)")
+        for key in ("full_refresh_busy_min_ms", "full_refresh_busy_max_ms"):
+            warn_if_unobserved(
+                warnings,
+                "sleep-sync",
+                sleep_sync,
+                key,
+                runs,
+                per_run_full,
+                "Full refresh events",
+            )
     storage_cache = budgets.get("storage-cache", {})
-    if storage_cache:
-        storage_open = values(
-            [event for event in events if event.get("event") == "storage_open"],
-            "elapsed_ms",
+    if storage_cache and "storage-cache" in in_play:
+        runs = section_runs(events, "storage-cache")
+        # Warm opens only. The budget is named for the warm path and sized for
+        # it (150 ms against a 57-95 ms population), but it was computed over
+        # every `storage_open`, so a cold build — 14 to 64 seconds on this
+        # repo's captures — failed the *warm* ceiling, and a RAM hit at 0 ms
+        # dragged the percentile back under it. Neither number described the
+        # path the key is about.
+        per_run_open, warm_open = per_run_samples(
+            runs, lambda run_events: storage_open_values(run_events, "warm")
         )
         warn_if_above(
             warnings,
-            "storage open p95",
-            percentile(storage_open, 95) if storage_open else None,
+            "warm book open p95",
+            percentile(warm_open, 95) if warm_open else None,
             storage_cache.get("warm_book_open_warn_ms"),
         )
-        catalog_load = values(
-            [
-                event
-                for event in events
-                if event.get("event") == "storage_catalog" and event.get("action") == "load"
-            ],
-            "elapsed_ms",
+        warn_if_unobserved(
+            warnings,
+            "storage-cache",
+            storage_cache,
+            "warm_book_open_warn_ms",
+            runs,
+            per_run_open,
+            "warm storage_open events",
+        )
+        # Loads that actually loaded: a miss (no snapshot on the card yet) and
+        # a refused session both return in a fraction of the time a real load
+        # takes, so pooling them measured how fast the card said no and pulled
+        # the percentile away from the path the budget is about.
+        per_run_catalog, catalog_load = per_run_samples(
+            runs,
+            lambda run_events: values(catalog_samples(run_events, "load"), "elapsed_ms"),
         )
         warn_if_above(
             warnings,
@@ -851,46 +2273,484 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             percentile(catalog_load, 95) if catalog_load else None,
             storage_cache.get("catalog_load_warn_ms"),
         )
+        warn_if_unobserved(
+            warnings,
+            "storage-cache",
+            storage_cache,
+            "catalog_load_warn_ms",
+            runs,
+            per_run_catalog,
+            "catalog load events",
+        )
     return warnings
 
 
 def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
-    warnings: list[str] = []
-    by_suite: dict[str, list[dict[str, Any]]] = {}
-    for event in events:
-        suite = str(event.get("suite", "unknown"))
-        by_suite.setdefault(suite, []).append(event)
+    """The telemetry each capture owes, checked against what it produced.
 
-    for suite, suite_events in sorted(by_suite.items()):
+    Resolved by workflow rather than by suite: a `thermal-run --suite
+    sleep-sync` capture owes sleep telemetry, and asking it only for the
+    refresh events every thermal run has is how a deliberately selected
+    workflow passed `--strict` without its own signal ever being looked for.
+
+    Checked per run, not per workflow. Runs of one workflow used to be
+    concatenated before the check, so two sleep-sync captures — one holding
+    only a Full refresh, one only a completed sleep — answered for each other
+    and both passed while neither was a complete capture. Runs are named
+    `suite/workflow`, and by position when the log holds more than one, so a
+    warning says which capture it came from.
+    """
+    warnings: list[str] = []
+    for run in labelled_runs(events):
+        workflow = run.workflow
+        label = run.label
+        warnings.extend(capture_completion_warnings(run))
         signal_events = [
-            event
-            for event in suite_events
-            if event.get("event") not in {"run_start", "run_end"}
+            event for event in run.events if event.get("event") not in {"run_start", "run_end"}
         ]
         if not signal_events:
-            warnings.append(f"{suite}: no parsed bench telemetry")
+            warnings.append(f"{label}: no parsed bench telemetry")
             continue
         event_names = {str(event.get("event")) for event in signal_events}
         if "warning" in event_names:
-            warnings.append(f"{suite}: warning events present")
-        if suite == "page-turn":
-            if not page_turn_durations(suite_events):
-                warnings.append("page-turn: no input-to-Reading-render duration captured")
-        elif suite == "storage-cache":
+            warnings.append(f"{label}: warning events present")
+        if run.suite == "thermal-run" and "refresh" not in event_names:
+            # Ambient investigations live on refresh timing whatever workflow
+            # they ran under.
+            warnings.append(f"{label}: no refresh timing telemetry captured")
+        if workflow == "page-turn":
+            turn_stats = page_turn_stats_over_epochs(run.events)
+            if not turn_stats.durations:
+                warnings.append(f"{label}: no input-to-Reading-render duration captured")
+            elif not turn_stats.median_trusted:
+                warnings.append(
+                    f"{label}: {turn_stats.untrusted_presses}/{turn_stats.presses} "
+                    "presses produced no page turn; the press-to-settled figure "
+                    "is cadence, not firmware — recapture at one press per "
+                    "settled page"
+                )
+        elif workflow == "storage-cache":
             if not any(name.startswith("storage") for name in event_names):
-                warnings.append("storage-cache: no storage telemetry captured")
-        elif suite == "sleep-sync":
-            if not any(event.get("event") == "sleep" for event in signal_events):
-                warnings.append("sleep-sync: no sleep telemetry captured")
-            if any(event.get("event") == "sleep" and event.get("ok") is False for event in signal_events):
-                warnings.append("sleep-sync: failed sleep phase captured")
-        elif suite == "reader-soak":
+                warnings.append(f"{label}: no storage telemetry captured")
+            # The same rule as a failed sleep phase in a sleep suite: the
+            # workflow that owns this telemetry is the one that has to answer
+            # for it, and a later success does not undo the failure. The
+            # unstructured `sd: session failed` line is deliberately not
+            # parsed, so the structured `ok=false` is the only record.
+            failed = failed_storage_ops(signal_events)
+            if failed:
+                actions = sorted(
+                    {
+                        # Not every storage event carries an action, and
+                        # interpolating a missing one printed the literal
+                        # "storage_x None" into the warning.
+                        " ".join(
+                            str(part)
+                            for part in (event.get("event"), event.get("action"))
+                            if part is not None
+                        )
+                        for event in failed
+                    }
+                )
+                warnings.append(
+                    f"{label}: {len(failed)} failed storage operation(s) "
+                    f"captured ({', '.join(actions)})"
+                )
+            # A result nothing here recognises is neither a success nor a
+            # known fault, so it would otherwise be the one storage outcome
+            # `--strict` says nothing at all about.
+            unknown = [event for event in signal_events if unknown_catalog_result(event)]
+            if unknown:
+                seen = sorted({repr(event.get("result")) for event in unknown})
+                warnings.append(
+                    f"{label}: {len(unknown)} catalog operation(s) reported a "
+                    f"result this bench.py does not know ({', '.join(seen)}); "
+                    f"known results are {', '.join(sorted(CATALOG_LOAD_RESULTS))}"
+                )
+        elif workflow == "sleep-sync":
+            if not any(is_terminal_sleep(event) for event in signal_events):
+                warnings.append(
+                    f"{label}: no completed sleep captured; a requested or "
+                    "part-way sleep does not show the panel slept"
+                )
+            if has_failed_sleep(signal_events):
+                warnings.append(f"{label}: failed sleep phase captured")
+        elif workflow == "reader-soak":
             if not {"render", "input"}.issubset(event_names):
-                warnings.append("reader-soak: expected both input and render telemetry")
-        elif suite == "thermal-run":
-            if "refresh" not in event_names:
-                warnings.append("thermal-run: no refresh timing telemetry captured")
+                warnings.append(f"{label}: expected both input and render telemetry")
+            # The suite's guidance promises a sleep/wake cycle, and the wake
+            # path is the part of the workflow nothing else exercises: a soak
+            # that only turned pages was a page-turn run wearing the soak's
+            # name, and passed strict as one.
+            if not any(is_terminal_sleep(event) for event in signal_events):
+                warnings.append(
+                    f"{label}: no completed sleep captured; the soak workflow "
+                    "includes a sleep/wake cycle"
+                )
+            elif not woke_after_sleep(run.events):
+                warnings.append(
+                    f"{label}: a sleep completed but no wake followed it; the "
+                    "soak workflow includes a sleep/wake cycle"
+                )
+            if has_failed_sleep(signal_events):
+                warnings.append(f"{label}: failed sleep phase captured")
+        elif workflow == "thermal-run":
+            # No workflow recorded, so there is nothing to check beyond the
+            # refresh timing above; say so rather than imply it was gated.
+            warnings.append(
+                f"{label}: no workflow recorded, so no workflow signal was "
+                "checked; recapture with a current bench.py"
+            )
+        elif workflow is None:
+            warnings.append(
+                f"{label}: no suite label, so nothing workflow-specific was "
+                "checked; report this log on its own"
+            )
+        else:
+            # A misspelling, or a workflow newer than this bench.py. Either
+            # way nothing here knows what the run owed, and silence would
+            # read as a pass — the fail-closed direction is to say so.
+            warnings.append(
+                f"{label}: unrecognised workflow, so nothing workflow-specific "
+                f"was checked; known workflows are {', '.join(sorted(SUITES))}"
+            )
     return warnings
+
+
+# How far a capture's telemetry window may fall short of the duration asked
+# for before it counts as cut short. The window is closed by a select() with a
+# 0.2 s tick and the run_end timestamp is taken after it, so a healthy capture
+# lands a few tens of milliseconds over, never under; a second of slack covers
+# rounding without admitting a run that stopped early.
+CAPTURE_DURATION_TOLERANCE_S = 1.0
+
+
+def capture_completion_warnings(run: LabelledRun) -> list[str]:
+    """Did this capture finish, and did it collect what it was asked for?
+
+    Two questions, gated differently on purpose.
+
+    *Did it finish* can only be asked of a run bench.py captured, which
+    `host_time` on the `run_start` is what says: hand-built logs and fixtures
+    carry a `run_start` but never that stamp, and owe no `run_end` either. A
+    real capture predating the contract is reported as unverified rather than
+    assumed complete.
+
+    *Did it collect what was asked for* is asked of any run that recorded a
+    request, whatever wrote it. That is what `--strict` was missing — it
+    checked that expected telemetry appeared, not that the requested capture
+    happened, so a `--cycles 10` run cut short after one cycle passed.
+    """
+    start = next((event for event in run.events if event.get("event") == "run_start"), {})
+    warnings: list[str] = []
+    if "host_time" in start:
+        warnings.extend(capture_stop_warnings(run))
+    warnings.extend(request_shortfall_warnings(run, start))
+    return warnings
+
+
+def capture_stop_warnings(run: LabelledRun) -> list[str]:
+    """Whether the capture reached a stop condition anyone asked for."""
+    end = next((event for event in run.events if event.get("event") == "run_end"), None)
+    if end is None:
+        return [
+            (
+                f"{run.label}: the capture recorded no run_end, so it was "
+                "killed or the log is truncated; its telemetry is a fragment"
+            )
+        ]
+    completed = end.get("completed")
+    if not isinstance(completed, bool):
+        return [
+            (
+                f"{run.label}: the capture recorded no completion status, so "
+                "nothing says it ran to a stop condition; recapture with a "
+                "current bench.py"
+            )
+        ]
+    if not completed:
+        return [
+            (
+                f"{run.label}: the capture did not complete (stopped by "
+                f"{end.get('stop_reason', 'an unrecorded cause')})"
+            )
+        ]
+    return []
+
+
+def requested_counts(start: dict[str, Any]) -> dict[str, Any]:
+    """What a run recorded as its request, across both metadata shapes.
+
+    `requested_page_turns` was the first and only such field; captures
+    carrying it still report against it.
+    """
+    requested = start.get("requested")
+    result = dict(requested) if isinstance(requested, dict) else {}
+    legacy = start.get("requested_page_turns")
+    if isinstance(legacy, int) and "page_turns" not in result:
+        result["page_turns"] = legacy
+    return result
+
+
+def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[str]:
+    """Each thing the capture was asked for, against what it came home with."""
+    requested = requested_counts(start)
+    if not requested:
+        return []
+    warnings: list[str] = []
+    end = next((event for event in run.events if event.get("event") == "run_end"), None)
+
+    seconds = requested.get("seconds")
+    # A run with no `run_end` at all is already reported as truncated, so the
+    # duration check stays quiet rather than saying the same thing twice.
+    if isinstance(seconds, int) and end is not None:
+        elapsed = end.get("elapsed_s")
+        if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool):
+            warnings.append(
+                f"{run.label}: {seconds}s were requested but the capture "
+                "recorded no length to check that against"
+            )
+        elif elapsed + CAPTURE_DURATION_TOLERANCE_S < seconds:
+            warnings.append(
+                f"{run.label}: {elapsed:.0f}s of the {seconds}s requested were "
+                "captured; the run is short of the window it was asked for"
+            )
+
+    turns = requested.get("page_turns")
+    if isinstance(turns, int):
+        paired = len(page_turn_stats_over_epochs(run.events).durations)
+        if paired < turns:
+            warnings.append(
+                f"{run.label}: {paired} of {turns} requested page turns "
+                "captured; the run is short of the sample count it was asked "
+                "for"
+            )
+
+    cycles = requested.get("sleep_cycles")
+    if isinstance(cycles, int):
+        completed = completed_sleep_cycles(run.events)
+        if completed < cycles:
+            warnings.append(
+                f"{run.label}: {completed} of {cycles} requested sleep cycles "
+                "completed; the run is short of the cycle count it was asked "
+                "for"
+            )
+
+    modes = requested.get("storage_modes")
+    if isinstance(modes, list):
+        for mode in modes:
+            name = str(mode)
+            if name not in STORAGE_MODE_EVIDENCE:
+                warnings.append(
+                    f"{run.label}: unrecognised storage mode {name}, so "
+                    "nothing checked that it was exercised"
+                )
+                continue
+            verdict = storage_mode_evidence(run.events, name)
+            if verdict == STORAGE_MODE_ABSENT:
+                warnings.append(
+                    f"{run.label}: --{name} was requested but the capture "
+                    f"shows no {name} storage path ("
+                    f"{STORAGE_MODE_EVIDENCE[name]})"
+                )
+            elif verdict == STORAGE_MODE_UNVERIFIED:
+                warnings.append(
+                    f"{run.label}: --{name} cannot be verified from this "
+                    "capture: its catalog telemetry predates the result field "
+                    "that says whether the operation succeeded, so nothing "
+                    "here proves the path ran — reflash and recapture"
+                )
+    return warnings
+
+
+def warn_if_unobserved(
+    warnings: list[str],
+    section: str,
+    budgets: dict[str, Any],
+    key: str,
+    runs: list[LabelledRun],
+    per_run: list[list[int]],
+    what: str,
+) -> None:
+    """Report a budget that is configured but had nothing to measure.
+
+    `warn_if_above` and `warn_if_below` return silently when the value is
+    `None`, which is right for an exploratory report and wrong for a gate:
+    a run missing the telemetry a budget covers passed `--strict` while
+    enforcing nothing, which is the same "configured but not protecting
+    anything" shape this harness exists to stop. A budget with zero samples
+    is now a warning, so a non-strict report says so and `--strict` fails.
+
+    Checked per capture, not per pool. `--all` reports several runs together,
+    and a run that never produced the telemetry a budget covers is not
+    excused by a sibling that did: two sleep-sync captures, one holding only
+    a Full refresh and the other only a completed sleep, between them
+    satisfied every check while neither was a complete capture. Each run is
+    named so the incomplete one can be found.
+
+    Callers only reach this for a section whose workflow the log actually
+    contains, so a page-turn capture is never faulted for holding no storage
+    telemetry.
+    """
+    if budgets.get(key) is None:
+        return
+    # `per_run` is built from `runs` one-for-one by `per_run_samples`, so a
+    # length mismatch would mean a caller paired the wrong two lists and
+    # silently checked coverage against the wrong capture.
+    for run, samples in zip(runs, per_run, strict=True):
+        if samples:
+            continue
+        warnings.append(
+            f"[{section}] {key} is configured but nothing was measured against "
+            f"it: no {what} in {run.label}"
+        )
+
+
+# Which workflows produce the measurements each budget section gates. A
+# section is named after the workflow that owns it, but `reader-soak` is page
+# turns plus navigation, so it answers to the page-turn budgets too. Nothing
+# else is folded in: reader-soak sleeps once, so pointing it at `sleep-sync`
+# would fault a healthy capture for a Full refresh it never owed.
+#
+# Keyed on workflow rather than suite so `thermal-run --suite sleep-sync`
+# resolves to the sleep-sync budgets, which is the whole point of the flag.
+# The map is also the isolation boundary — a section measures only the
+# workflows listed for it, so pooling with `--all` cannot let one capture's
+# samples decide another's verdict.
+BUDGET_SECTION_WORKFLOWS: dict[str, set[str]] = {
+    "page-turn": {"page-turn", "reader-soak"},
+    "sleep-sync": {"sleep-sync"},
+    "storage-cache": {"storage-cache"},
+}
+
+
+@dataclass(frozen=True)
+class LabelledRun:
+    events: list[dict[str, Any]]
+    suite: str | None
+    workflow: str | None
+    # How a warning names this run. Carries its position in the log whenever
+    # there is more than one, because "no Fast refresh events" is only
+    # actionable if the operator can tell which capture is missing them.
+    label: str
+
+
+def labelled_runs(events: list[dict[str, Any]]) -> list[LabelledRun]:
+    """Each run with the suite and workflow it was captured under.
+
+    Both are properties of the run, not of the event: `run_start` is the only
+    line that carries `workflow`, and hand-built fixtures and older captures
+    put even `suite` only there. Every event therefore takes its run's labels
+    rather than being dropped from every section for want of its own.
+
+    A run with no recorded `workflow` falls back to its suite name. For
+    `thermal-run` that resolves to nothing a budget section claims, and is
+    reported — the alternative is assuming the argparse default and gating a
+    `--suite sleep-sync` capture as if it were a page-turn run, which is the
+    guess that made this worth fixing.
+    """
+    split = split_runs(events)
+    runs = []
+    for index, run in enumerate(split):
+        suite = next(
+            (str(event["suite"]) for event in run if isinstance(event.get("suite"), str)),
+            None,
+        )
+        start = next((event for event in run if event.get("event") == "run_start"), {})
+        workflow = start.get("workflow")
+        workflow = str(workflow) if isinstance(workflow, str) else suite
+        name = workflow or "unlabelled"
+        if suite is not None and suite != workflow:
+            name = f"{suite}/{name}"
+        label = name if len(split) == 1 else f"{name} run {index + 1} of {len(split)}"
+        runs.append(LabelledRun(run, suite, workflow, label))
+    return runs
+
+
+def section_runs(events: list[dict[str, Any]], section: str) -> list[LabelledRun]:
+    """The runs a budget section is allowed to measure.
+
+    Choosing *which* sections to evaluate was never enough: the measurements
+    themselves were taken from the whole pooled log, so a file holding a
+    `page-turn` run next to a `storage-cache` or `sleep-sync` one had its
+    strict verdict decided partly by samples from a workflow that budget does
+    not describe — a false pass or a false failure, either way from the wrong
+    population.
+
+    Returned as runs rather than a flat event list because coverage is a
+    property of each capture too: pool first and ask "were there any
+    samples?" afterwards, and one healthy run answers for a sibling that
+    produced nothing. Every caller pools for its statistic and checks
+    coverage per run — see `per_run_samples` and `warn_if_unobserved`.
+
+    A log with no label anywhere measures everything: there is nothing better
+    to go on. Once *any* run is labelled the unlabelled ones are left out
+    rather than folded in, and `budget_sections_in_play` reports the mixture.
+    """
+    workflows = BUDGET_SECTION_WORKFLOWS.get(section, {section})
+    runs = labelled_runs(events)
+    if all(run.workflow is None for run in runs):
+        return runs
+    return [run for run in runs if run.workflow in workflows]
+
+
+def per_run_samples(
+    runs: list[LabelledRun],
+    extract: Callable[[list[dict[str, Any]]], list[int]],
+) -> tuple[list[list[int]], list[int]]:
+    """Each run's samples, and the pooled list built out of them.
+
+    Coverage reads the first, the percentile or median reads the second.
+    Deriving the pool from the parts rather than measuring the concatenated
+    stream keeps the two from ever disagreeing about what was sampled.
+    """
+    per_run = [extract(run.events) for run in runs]
+    return per_run, [sample for samples in per_run for sample in samples]
+
+
+def budget_sections_in_play(
+    events: list[dict[str, Any]], budgets: dict[str, Any]
+) -> tuple[set[str], list[str]]:
+    """Budget sections whose workflow this log actually contains, plus warnings.
+
+    Every section used to be evaluated against every log, which was harmless
+    while an absent metric silently skipped its check and is not once that
+    absence is a warning. Logs whose runs carry no label at all — hand-built
+    fixtures, and any capture predating suite tagging — keep the old
+    behaviour of evaluating everything, since there is nothing better to go
+    on.
+
+    Two things are reported rather than passed over, because both mean a
+    capture ran and nothing gated it, which is the silently-unenforced shape
+    this file exists to prevent: a known workflow no configured section
+    claims, and an unlabelled run pooled with labelled ones — the latter is
+    excluded from every section, and reading it into whichever run happened
+    to precede it in the file list would be worse than saying so.
+    """
+    if not budgets:
+        # Budgets deliberately disabled, or unloadable — reported elsewhere.
+        return set(), []
+    per_run = [run.workflow for run in labelled_runs(events)]
+    labelled = {label for label in per_run if label is not None}
+    if not labelled:
+        return set(budgets), []
+    sections = {name for name in budgets if labelled & BUDGET_SECTION_WORKFLOWS.get(name, {name})}
+    warnings = []
+    for workflow in sorted(labelled):
+        if any(workflow in BUDGET_SECTION_WORKFLOWS.get(section, {section}) for section in budgets):
+            continue
+        # Every unclaimed workflow, not only the ones this bench.py knows: a
+        # misspelled or newer name matches no section either, and skipping
+        # the warning for it let malformed metadata buy silence.
+        unknown = "" if workflow in SUITES else " (not a workflow this bench.py knows)"
+        warnings.append(f"workflow {workflow} has no budget section to check it against{unknown}")
+    unlabelled = sum(1 for label in per_run if label is None)
+    if unlabelled:
+        warnings.append(
+            f"{unlabelled} of {len(per_run)} runs carry no suite label and are "
+            "outside every budget section; report those logs on their own"
+        )
+    return sections, warnings
 
 
 def warn_if_above(
@@ -903,6 +2763,21 @@ def warn_if_above(
         return
     if actual > threshold:
         warnings.append(f"{label} {actual:.0f}ms above warning budget {threshold}ms")
+
+
+def warn_if_below(
+    warnings: list[str],
+    label: str,
+    actual: float | None,
+    threshold: Any,
+) -> None:
+    if actual is None or not isinstance(threshold, int):
+        return
+    if actual < threshold:
+        warnings.append(
+            f"{label} {actual:.0f}ms below plausibility floor {threshold}ms "
+            "(burst cadence or dropped presses, not a faster device)"
+        )
 
 
 def percentile(data: list[int], pct: int) -> float:

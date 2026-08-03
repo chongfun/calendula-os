@@ -33,7 +33,7 @@ pub(crate) async fn flush(
 ) -> Result<(), PanelError> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb).await?;
-    esp_println::println!(
+    bench_log!(
         "display: write BW RAM {:?} {} ms",
         mode,
         bw_start.elapsed().as_millis()
@@ -42,11 +42,11 @@ pub(crate) async fn flush(
         if prev_staged {
             // The previous frame was prestaged into RED RAM right after the
             // last refresh settled, so this page turn streams only BW.
-            esp_println::println!("display: RED RAM already holds previous");
+            bench_log!("display: RED RAM already holds previous");
         } else {
             let red_start = Instant::now();
             write_ram(epd, CMD_WRITE_RAM_RED, prev_fb).await?;
-            esp_println::println!(
+            bench_log!(
                 "display: write RED RAM previous {} ms",
                 red_start.elapsed().as_millis()
             );
@@ -54,13 +54,13 @@ pub(crate) async fn flush(
     } else {
         let red_start = Instant::now();
         write_ram(epd, CMD_WRITE_RAM_RED, fb).await?;
-        esp_println::println!(
+        bench_log!(
             "display: write RED RAM current {} ms",
             red_start.elapsed().as_millis()
         );
     }
 
-    esp_println::println!("display: refresh activate");
+    bench_log!("display: refresh activate");
     if mode == RefreshMode::FastClean {
         epd.command(CMD_WRITE_TEMPERATURE, &FAST_CLEAN_TEMPERATURE)
             .await?;
@@ -76,8 +76,8 @@ pub(crate) async fn flush(
     let start = Instant::now();
     epd.wait_ready().await?;
     let elapsed = start.elapsed();
-    esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
-    esp_println::println!(
+    bench_log!("display: refresh busy {} ms", elapsed.as_millis());
+    bench_log!(
         "bench: refresh mode={:?} busy_ms={} screen_on={}",
         mode,
         elapsed.as_millis(),
@@ -105,7 +105,7 @@ pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
     let start = Instant::now();
     esp_println::println!("display: sleep start");
-    esp_println::println!(
+    bench_log!(
         "bench: sleep phase=power_down_start t_ms={}",
         start.as_millis()
     );
@@ -117,7 +117,7 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
     epd.wait_ready().await?;
     esp_println::println!("display: sleep deep");
-    esp_println::println!(
+    bench_log!(
         "bench: sleep phase=power_down_done elapsed_ms={} t_ms={}",
         start.elapsed().as_millis(),
         Instant::now().as_millis(),

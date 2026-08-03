@@ -8,6 +8,22 @@ default-run = "fw"
 workspace = true
 
 [features]
+default = ["serial-log"]
+# `bench:` telemetry and per-refresh driver chatter (fw::log's bench_log!).
+# Default ON: tools/bench/bench.py parses these lines and every existing
+# workflow expects them, so the default build is byte-for-byte the old
+# behavior. Disable for a shipped untethered build — with no USB host there
+# is no SOF, and each print blocks at 115200 baud inside a critical section.
+# Error, panic, and boot-identity output is NOT behind this feature.
+#
+# Scope, so the saving is not overstated: this covers the six lines a steady
+# reading page turn emits (~418 B, ~36 ms untethered) and the per-refresh
+# driver chatter. It does NOT yet cover the SD session's per-call lines
+# (~7 per session, so an SD-touching turn still prints) or most of
+# book_build's build chatter, and fw still hard-enables reader-cache/esp-log.
+# So a cold build or boot is only partly reduced. Extending it is mechanical;
+# the seam is what needed to exist first.
+serial-log = []
 # Temporary on-device validation of the flash + otadata path without an SD card:
 # on first boot, copy the running image into the inactive slot and switch
 # otadata to it. Never enabled in a release build. See fw::ota_update.

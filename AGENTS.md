@@ -23,6 +23,21 @@ Never say that tests, lint, builds, or visual checks pass unless you actually ra
 Use the repository verification entry points:
 
 - `tools/check.sh fmt` for formatting.
+- Python runs on the series in `.python-version` (3.14), so any 3.14.x will
+  do and a patch release does not block anyone. `python3` is not assumed to be
+  it (macOS ships 3.9 under that name), so `tools/check.sh` prefers
+  `python3.14` and checks what it found; `PYTHON=/path/to/python` overrides.
+  Install with `uv python install 3.14` or `pyenv install 3.14`. Only the
+  targets that run Python require it -- `ruff`, `test-bench`, `stack-frames`
+  -- so the Rust-only ones need no interpreter at all. The check compares as
+  many components as the file names, so pinning a release later is a one-line
+  edit.
+- `tools/check.sh ruff` for Python changes: lint plus a formatting check.
+  `ruff.toml` pins the version (`required-version`), because the formatter's
+  style can move between releases; install that exact one, e.g.
+  `uv tool install ruff==0.16.1` or `pipx install ruff==0.16.1`. Run
+  `ruff format .` to fix formatting. It is part of `fast`, and refuses to run
+  rather than skipping when ruff is absent.
 - `tools/check.sh fast` for normal Rust changes.
 - `tools/check.sh emulator` for UI, layout, rendering, typography, reader-state, or golden-frame changes.
 - `tools/check.sh firmware` for firmware, HAL, board-specific, or release-sensitive changes.

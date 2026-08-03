@@ -7,7 +7,6 @@ import argparse
 import struct
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT / "display" / "src" / "custom_generated.rs"
 
@@ -84,7 +83,11 @@ def parse_pack(path: Path) -> dict[str, object]:
         raise ValueError(f"header length {total_len} does not match file length {len(data)}")
 
     name = read_exact(data, name_offset, name_len).decode("utf-8")
-    cps = list(struct.unpack(f"<{codepoint_count}H", read_exact(data, codepoints_offset, codepoint_count * 2)))
+    cps = list(
+        struct.unpack(
+            f"<{codepoint_count}H", read_exact(data, codepoints_offset, codepoint_count * 2)
+        )
+    )
     faces = []
     for index in range(face_count):
         record = read_exact(data, face_table_offset + index * FACE_RECORD_LEN, FACE_RECORD_LEN)
@@ -154,7 +157,9 @@ def emit_module(pack: dict[str, object]) -> str:
         metrics = face["metrics"]
         bitmap = face["bitmap"]
         kerning = face["kerning"]
-        out.append(f"#[rustfmt::skip]\npub static {face_name}_METRICS: [GlyphMetric; CUSTOM_COUNT] = [\n")
+        out.append(
+            f"#[rustfmt::skip]\npub static {face_name}_METRICS: [GlyphMetric; CUSTOM_COUNT] = [\n"
+        )
         for offset, length, width, height, x_offset, y_offset, advance_fp in metrics:
             out.append(
                 "    GlyphMetric { "
@@ -163,14 +168,18 @@ def emit_module(pack: dict[str, object]) -> str:
             )
         out.append("];\n\n")
 
-        out.append(f"#[rustfmt::skip]\npub static {face_name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n")
+        out.append(
+            f"#[rustfmt::skip]\npub static {face_name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n"
+        )
         if not bitmap:
             out.append("    0x00,\n")
         for chunk in chunks(bitmap, 16):
             out.append("    " + ", ".join(f"0x{byte:02X}" for byte in chunk) + ",\n")
         out.append("];\n\n")
 
-        out.append(f"#[rustfmt::skip]\npub const {face_name}_KERNING_COUNT: usize = {len(kerning)};\n")
+        out.append(
+            f"#[rustfmt::skip]\npub const {face_name}_KERNING_COUNT: usize = {len(kerning)};\n"
+        )
         out.append(
             f"#[rustfmt::skip]\npub static {face_name}_KERNING: "
             f"[KerningEntry; {face_name}_KERNING_COUNT] = [\n"

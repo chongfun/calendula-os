@@ -349,7 +349,10 @@ pub(crate) fn with_root<R>(
 ) -> Result<R, SdSessionError> {
     epd.deselect_display();
     sd_cs.set_high();
-    esp_println::println!("sd: session enter");
+    esp_println::println!(
+        "sd: session enter t_ms={}",
+        embassy_time::Instant::now().as_millis()
+    );
 
     // The callback is consumed only once the root dir is open, so a warm
     // acquire that bails before then leaves it intact for the cold retry.

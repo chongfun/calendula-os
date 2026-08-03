@@ -13,6 +13,7 @@ touched here: glyph rasterization differs across Pillow/freetype builds, so
 this file is a frozen artifact -- generate once, check in, do not re-run
 casually or it churns the Heavy-mode goldens.
 """
+
 from pathlib import Path
 from urllib.request import urlretrieve
 
@@ -95,7 +96,9 @@ def main():
                 offset += len(rows)
 
             name = f"LITERATA_{px}_{style}"
-            out.append(f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; SEMIBOLD_COUNT] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; SEMIBOLD_COUNT] = [\n"
+            )
             for item in metrics:
                 out.append(
                     "    GlyphMetric { "
@@ -104,7 +107,9 @@ def main():
                 )
             out.append("];\n\n")
 
-            out.append(f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n"
+            )
             if not bitmap:
                 out.append("    0x00,\n")
             for chunk_start in range(0, len(bitmap), 16):

@@ -107,6 +107,7 @@ use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
+use embassy_time::Instant;
 use esp_backtrace as _;
 use esp_hal::analog::adc::{
     Adc, AdcCalCurve, AdcCalScheme, AdcChannel, AdcConfig, AdcPin, Attenuation,
@@ -122,6 +123,11 @@ use esp_rtos::embassy::Executor;
 use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
 use tasks::input::InputPins;
+
+// `#[macro_use]` is textual: `log` must precede the modules that call
+// bench_log!.
+#[macro_use]
+mod log;
 
 mod book_build;
 pub mod catalog;
@@ -398,7 +404,7 @@ fn main() -> ! {
         let input_executor =
             INPUT_EXECUTOR.init(InterruptExecutor::new(sw_ints.software_interrupt1));
         let input_spawner = input_executor.start(Priority::Priority1);
-        esp_println::println!("main: spawn input");
+        esp_println::println!("main: spawn input t_ms={}", Instant::now().as_millis());
         input_spawner.spawn(
             tasks::input::run(
                 adc1,
@@ -418,16 +424,16 @@ fn main() -> ! {
     executor.run(|spawner: Spawner| {
         #[cfg(feature = "device-x3")]
         {
-            esp_println::println!("main: spawn battery");
+            esp_println::println!("main: spawn battery t_ms={}", Instant::now().as_millis());
             spawner.spawn(tasks::input::battery_run(battery_gauge).unwrap());
         }
-        esp_println::println!("main: spawn display");
+        esp_println::println!("main: spawn display t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::display::run(epd_bus, sd_cs, deep_sleep_wake).unwrap());
-        esp_println::println!("main: spawn power");
+        esp_println::println!("main: spawn power t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
-        esp_println::println!("main: spawn app");
+        esp_println::println!("main: spawn app t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::app::run().unwrap());
-        esp_println::println!("main: spawn wifi");
+        esp_println::println!("main: spawn wifi t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::wifi::run(spawner, peripherals.WIFI).unwrap());
     })
 }

@@ -18,6 +18,54 @@ use proto::catalog::{
     CATALOG_RECORD_TITLE_OFFSET, CATALOG_TITLE_BYTES,
 };
 
+/// Why a catalog read did not hand back a catalog.
+///
+/// All four are one `Err(())` to any caller that only wants to know whether
+/// it worked. They are kept apart for the one that reports: a bench capture
+/// has to tell the ordinary cold path from a fault on it, and collapsing them
+/// — which `read_catalog_window(..).is_ok()` did — reported a failed record
+/// read as a card that simply had no catalog yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogFault {
+    /// Nothing to load: no `XTEINK` directory, or no `CATALOG.BIN` in it.
+    /// This is the normal state of a card whose catalog has not been built,
+    /// and what makes the caller queue a scan.
+    Missing,
+    /// A catalog written by firmware of another version. Bumping
+    /// `CATALOG_VERSION` is how this format migrates — the old snapshot stops
+    /// loading and the scan rebuilds it — so this is the designed first boot
+    /// after an upgrade, and calling it a fault failed a strict capture for
+    /// behaving as intended.
+    Stale,
+    /// The file is there and does not check out: wrong magic, the version-0
+    /// placeholder an interrupted scan leaves behind, a length disagreeing
+    /// with its header, or a record that ended early. The card answered; what
+    /// it held is unusable.
+    Invalid,
+    /// The card refused an open, a seek, or a read.
+    Device,
+}
+
+/// A failed open is only a missing catalog when the card said so.
+fn open_fault<E: core::fmt::Debug>(error: embedded_sdmmc::Error<E>) -> CatalogFault {
+    match error {
+        embedded_sdmmc::Error::NotFound => CatalogFault::Missing,
+        _ => CatalogFault::Device,
+    }
+}
+
+impl CatalogFault {
+    /// The `result=` token a bench capture is judged on.
+    const fn bench_result(self) -> &'static str {
+        match self {
+            Self::Missing => "miss",
+            Self::Stale => "stale",
+            Self::Invalid => "invalid",
+            Self::Device => "error",
+        }
+    }
+}
+
 #[inline(never)]
 pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &mut ReaderStore) {
     let start = Instant::now();
@@ -69,14 +117,21 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         esp_println::println!("sd: session failed: {:?}", err);
         LibraryScanStatus::Error
     });
+    // The scan's own verdict, taken before the fallback below can replace it.
+    // That fallback keeps the UI on an older in-memory catalog when a scan
+    // fails with books already listed — right for the reader, wrong for
+    // telemetry, since `library.status` then reads `Ready` for a scan that
+    // did not happen. `Empty` is a scan that succeeded and found nothing.
+    let scan_ok = status != LibraryScanStatus::Error;
     library.status = if status == LibraryScanStatus::Error && !library.catalog_is_empty() {
         LibraryScanStatus::Ready
     } else {
         status
     };
     esp_println::println!("sd: scan complete, {} epub(s)", library.catalog_count());
-    esp_println::println!(
-        "bench: storage_catalog action=scan status={:?} count={} elapsed_ms={} t_ms={}",
+    bench_log!(
+        "bench: storage_catalog action=scan ok={} status={:?} count={} elapsed_ms={} t_ms={}",
+        scan_ok,
         library.status,
         library.catalog_count(),
         start.elapsed().as_millis(),
@@ -93,12 +148,22 @@ pub(crate) fn load_catalog_cache(
     let start = Instant::now();
     esp_println::println!("sd: catalog cache load start");
     library.clear_catalog();
-    // A valid header (even an empty catalog) counts as loaded; a missing or
-    // wrong-version file returns false so the caller runs a fresh scan.
-    let loaded = sd_session::with_root(epd, sd_cs, |root| {
-        read_catalog_window(root, library, 0).is_ok()
-    })
-    .unwrap_or(false);
+    // A valid header (even an empty catalog) counts as loaded; anything else
+    // returns false so the caller runs a fresh scan. The *reason* is carried
+    // out of the session rather than flattened to a bool inside it, because
+    // it decides whether a bench capture is looking at a fault or at the
+    // ordinary cold path: a `miss` is what queues `RefreshCatalog`, so a card
+    // with no snapshot prints one right before the scan that builds it.
+    // `.is_ok()` here reported every outcome — refused read, bad seek, torn
+    // file — as that same benign miss.
+    let outcome = sd_session::with_root(epd, sd_cs, |root| read_catalog_window(root, library, 0));
+    let result = match outcome {
+        Ok(Ok(())) => "hit",
+        Ok(Err(fault)) => fault.bench_result(),
+        // The session itself never opened, so no catalog read was attempted.
+        Err(_) => CatalogFault::Device.bench_result(),
+    };
+    let loaded = matches!(outcome, Ok(Ok(())));
     library.status = if !loaded {
         LibraryScanStatus::NotScanned
     } else if library.catalog_is_empty() {
@@ -114,9 +179,12 @@ pub(crate) fn load_catalog_cache(
     } else {
         esp_println::println!("sd: catalog cache unavailable");
     }
-    esp_println::println!(
-        "bench: storage_catalog action=load ok={} count={} elapsed_ms={} t_ms={}",
+    // `ok` keeps its original meaning — the snapshot loaded — so captures
+    // that predate `result` still read the same way.
+    bench_log!(
+        "bench: storage_catalog action=load ok={} result={} count={} elapsed_ms={} t_ms={}",
         loaded,
+        result,
         library.catalog_count(),
         start.elapsed().as_millis(),
         Instant::now().as_millis(),
@@ -314,24 +382,31 @@ fn with_catalog_file<
     R,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    f: impl FnOnce(&File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>, u16) -> Result<R, ()>,
-) -> Result<R, ()>
+    f: impl FnOnce(&File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>, u16) -> Result<R, CatalogFault>,
+) -> Result<R, CatalogFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CATALOG_ROOT_DIR).map_err(|_| ())?;
+    // `NotFound` is a card with no catalog yet; anything else from the same
+    // call is the card refusing, and the two must not report alike.
+    let xteink = root.open_dir(CATALOG_ROOT_DIR).map_err(open_fault)?;
     let file = xteink
         .open_file_in_dir(CATALOG_FILE, Mode::ReadOnly)
-        .map_err(|_| ())?;
+        .map_err(open_fault)?;
     let mut header = [0u8; CATALOG_HEADER_BYTES];
     read_exact_file(&file, &mut header)?;
-    let count = proto::catalog::decode_catalog_header(&header).ok_or(())?;
+    // An older format is the migration doing its job; only a header that is
+    // not a catalog, or the placeholder a torn scan leaves, is a fault.
+    let count = proto::catalog::classify_catalog_header(&header).map_err(|fault| match fault {
+        proto::catalog::CatalogHeaderFault::Stale => CatalogFault::Stale,
+        proto::catalog::CatalogHeaderFault::Invalid => CatalogFault::Invalid,
+    })?;
     // A committed header whose count disagrees with the file length means
     // the file was truncated or appended outside the writer's control;
     // nothing downstream may trust its record offsets.
     if file.length() as usize != catalog_file_len(count) {
-        return Err(());
+        return Err(CatalogFault::Invalid);
     }
     f(&file, count)
 }
@@ -349,7 +424,7 @@ fn read_catalog_window<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     library: &mut ReaderStore,
     start: usize,
-) -> Result<(), ()>
+) -> Result<(), CatalogFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -402,7 +477,7 @@ where
 {
     with_catalog_file(root, |file, count| {
         if index >= count as usize {
-            return Err(());
+            return Err(CatalogFault::Invalid);
         }
         seek_to_record(file, index)?;
         let mut record = [0u8; CATALOG_RECORD_BYTES];
@@ -456,7 +531,7 @@ where
 fn record_identity<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     index: usize,
-) -> Result<(u32, u32), ()>
+) -> Result<(u32, u32), CatalogFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -470,13 +545,14 @@ where
 fn seek_to_record<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     index: usize,
-) -> Result<(), ()>
+) -> Result<(), CatalogFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let offset = (CATALOG_HEADER_BYTES + index * CATALOG_RECORD_BYTES) as u32;
-    file.seek_from_start(offset).map_err(|_| ())
+    file.seek_from_start(offset)
+        .map_err(|_| CatalogFault::Device)
 }
 
 /// The list label override for a catalog record, read into `title` in place,
@@ -918,15 +994,17 @@ where
 fn read_exact_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     mut out: &mut [u8],
-) -> Result<(), ()>
+) -> Result<(), CatalogFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     while !out.is_empty() {
-        let read = file.read(out).map_err(|_| ())?;
+        // A refused read is the card; a read that returns nothing with bytes
+        // still owed is a file shorter than its header claims.
+        let read = file.read(out).map_err(|_| CatalogFault::Device)?;
         if read == 0 {
-            return Err(());
+            return Err(CatalogFault::Invalid);
         }
         let tmp = out;
         out = &mut tmp[read..];

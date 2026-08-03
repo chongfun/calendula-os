@@ -848,9 +848,16 @@ fn should_block_post_open_confirm(event: InputEvent, block_until: &mut Option<In
 }
 
 async fn send_render(kind: RenderKind, state: &ReaderState) {
-    DISPLAY_COMMANDS
-        .send(DisplayCommand::Render(state.render_request(kind)))
-        .await;
+    // Freeze and stamp together. This is the only place a render is sent, and
+    // the instant the state stops being able to change is the boundary the
+    // bench pairs presses against -- see `RenderRequest::requested_at_ms`.
+    // Stamping on the consumer side instead was wrong: a render queued while
+    // the display task is mid-flush, mid-prestage, or inside a storage or
+    // background-build step waits for all of it, and a press arriving during
+    // that wait would be credited to a frame frozen before it existed.
+    let mut request = state.render_request(kind);
+    request.requested_at_ms = Instant::now().as_millis();
+    DISPLAY_COMMANDS.send(DisplayCommand::Render(request)).await;
 }
 
 fn log_storage_command(label: &str, command: StorageCommand) {

@@ -5,6 +5,7 @@ Emits display/src/literata_extra_generated.rs: a 16px apparatus set
 (regular/bold/italic) and a 46px display set (regular). The 22px reading
 set stays in literata_generated.rs via tools/generate_literata.py.
 """
+
 from pathlib import Path
 
 from PIL import ImageFont
@@ -17,14 +18,26 @@ OUT = ROOT / "display" / "src" / "literata_extra_generated.rs"
 
 # (size name, px, line_height, baseline, [(style name, ttf)])
 SETS = [
-    ("SMALL", 16, 22, 17, [
-        ("REGULAR", "Literata-Regular.ttf"),
-        ("BOLD", "Literata-Bold.ttf"),
-        ("ITALIC", "Literata-Italic.ttf"),
-    ]),
-    ("DISPLAY", 46, 62, 48, [
-        ("REGULAR", "Literata-Regular.ttf"),
-    ]),
+    (
+        "SMALL",
+        16,
+        22,
+        17,
+        [
+            ("REGULAR", "Literata-Regular.ttf"),
+            ("BOLD", "Literata-Bold.ttf"),
+            ("ITALIC", "Literata-Italic.ttf"),
+        ],
+    ),
+    (
+        "DISPLAY",
+        46,
+        62,
+        48,
+        [
+            ("REGULAR", "Literata-Regular.ttf"),
+        ],
+    ),
 ]
 
 RANGES = [
@@ -66,7 +79,9 @@ def main():
                 offset += len(rows)
 
             name = f"LITERATA_{size_name}_{style}"
-            out.append(f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; EXTRA_COUNT] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; EXTRA_COUNT] = [\n"
+            )
             for item in metrics:
                 out.append(
                     "    GlyphMetric { "
@@ -75,7 +90,9 @@ def main():
                 )
             out.append("];\n\n")
 
-            out.append(f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n"
+            )
             if not bitmap:
                 out.append("    0x00,\n")
             for chunk_start in range(0, len(bitmap), 16):

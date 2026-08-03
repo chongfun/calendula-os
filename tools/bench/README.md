@@ -52,10 +52,66 @@ This is useful for boot, catalog-cache, and sleep/wake smoke runs because it
 does not rely on catching a manual button press at the right moment.
 
 `report --strict` exits non-zero when checked-in warning budgets are exceeded or
-when the selected suite did not capture its expected signal, such as storage
-telemetry for `storage-cache` or input-to-Reading-render timing for
-`page-turn`. Capture commands also accept `--strict`, applying the same gate to
-the log they just wrote.
+when the selected suite did not capture its expected signal: storage telemetry
+for `storage-cache`, a completed sleep for `sleep-sync`, a completed sleep with
+a wake *later in the same run* for `reader-soak` (waking the device to start the
+capture does not answer for a sleep at the end of it), and for `page-turn` both
+input-to-Reading-render timing and the full turn count that was asked for. Any
+`sleep` phase the firmware reported as failed fails both sleep suites, whether
+or not a later cycle succeeded. Capture commands also accept `--strict`,
+applying the same gate to the log they just wrote.
+
+`page-turn --turns N` stops on N *paired* turns — presses answered by a Reading
+render — not on N Reading renders, so a boot paint or a storage-driven repaint
+cannot consume one of them.
+
+Budgets and signal checks follow the *workflow* a capture ran, which for
+`thermal-run` is its `--suite` choice rather than `thermal-run` itself: a
+`thermal-run --suite sleep-sync` run owes sleep telemetry and is held to the
+Full-refresh budgets. A workflow name the harness does not recognize is
+reported as ungated rather than quietly skipped. A run's samples are measured
+only against the sections its own workflow owns, so pooling several logs in
+one `report` cannot let one capture decide another's verdict. Logs that
+predate suite labels are reported on their own — pooled with a labelled one
+they stay outside every budget section, and `--strict` says so rather than
+guessing where they belong.
+
+Whether a budget or a signal had anything to measure is decided **per run**,
+even when several are pooled: a capture that produced none of a budget's
+telemetry is not covered by a sibling run that did, and the warning names the
+run. The medians and percentiles those budgets gate are still computed across
+every run the section owns.
+
+**Runs on the Python series in `.python-version`** (3.14), which
+`tools/check.sh` resolves — macOS ships 3.9 as `python3`, so do not assume
+that name. Budgets parse with `tomllib`, which that interpreter always has;
+while the parser was optional `--strict` could silently check nothing, which
+is how a 16.7x budget overrun once passed clean. A budget file that cannot be
+read or parsed still fails `--strict` and warns a plain report.
+
+The `page turn` statistic is guarded against operator cadence: the report
+prints a `page inputs:` line accounting for every press (`presses`,
+`page_turns`, `nav`, `coalesced`, `unmatched`, `reading_renders`), suppresses
+the median when more than 10% of presses produced no page turn, and budgets
+give the median a plausibility floor as well as a ceiling. That test is
+applied to each capture before the runs are pooled — a pooled report names an
+untrusted run and leaves it out of the median rather than diluting it in the
+clean ones, and suppresses the median entirely when no run survives. Each press is
+credited to the first render whose request was *frozen* after it — `req_ms`,
+stamped by the app as the reader state stops being able to change — so a
+press landing while a render is already in flight waits for the next frame
+instead of being charged the remainder of this one, and presses the app
+coalesced into one frame are reported as `coalesced` rather than each given a
+duration of their own. The report also warns when `t_ms` goes backwards
+without a completed deep sleep — an unexplained mid-capture reset interleaves
+two boot time bases.
+
+`report` additionally summarizes cache-build telemetry (`storage build` with
+its spine/write split and read/write block totals, `first page`, `bg build`)
+and, for captures that witnessed a boot (`--reset-before`, a wake, or a
+reset), `boot to paint` — the `t_ms` of the boot's first render, i.e.
+boot-to-first-paint — with per-stage medians when the firmware's stamped
+boot-stage lines are present.
 
 ## When to use
 

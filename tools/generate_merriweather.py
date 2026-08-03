@@ -14,6 +14,7 @@ the Literata set at each size so pagination advances stay family-independent.
 The TTFs are downloaded on demand into tools/fonts/ (gitignored); only the
 generated bitmaps are committed, which OFL permits.
 """
+
 from pathlib import Path
 from urllib.request import urlretrieve
 
@@ -90,7 +91,9 @@ def main():
     out.append("use crate::font::{BitmapFont, GlyphMetric, KerningEntry};\n\n")
     cps = codepoints()
     out.append(f"#[rustfmt::skip]\npub const MERRIWEATHER_COUNT: usize = {len(cps)};\n")
-    out.append("#[rustfmt::skip]\npub static MERRIWEATHER_CODEPOINTS: [u16; MERRIWEATHER_COUNT] = [\n")
+    out.append(
+        "#[rustfmt::skip]\npub static MERRIWEATHER_CODEPOINTS: [u16; MERRIWEATHER_COUNT] = [\n"
+    )
     for chunk_start in range(0, len(cps), 12):
         chunk = cps[chunk_start : chunk_start + 12]
         out.append("    ")
@@ -111,7 +114,9 @@ def main():
                 offset += len(rows)
 
             name = f"MERRIWEATHER_{px}_{style}"
-            out.append(f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; MERRIWEATHER_COUNT] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; MERRIWEATHER_COUNT] = [\n"
+            )
             for item in metrics:
                 out.append(
                     "    GlyphMetric { "
@@ -120,7 +125,9 @@ def main():
                 )
             out.append("];\n\n")
 
-            out.append(f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n"
+            )
             if not bitmap:
                 out.append("    0x00,\n")
             for chunk_start in range(0, len(bitmap), 16):

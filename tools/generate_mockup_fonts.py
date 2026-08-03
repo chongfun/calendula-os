@@ -5,6 +5,7 @@ Emits tools/preview/src/mockup_fonts_generated.rs. These sizes are mockup-only;
 the firmware display crate keeps its single 22px set until a design direction
 is chosen and the needed sizes are promoted into display/src.
 """
+
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -17,19 +18,37 @@ OUT = ROOT / "tools" / "preview" / "src" / "mockup_fonts_generated.rs"
 
 # (size name, px, line_height, baseline, [(style name, ttf)])
 SETS = [
-    ("SMALL", 16, 22, 17, [
-        ("REGULAR", "Literata-Regular.ttf"),
-        ("BOLD", "Literata-Bold.ttf"),
-        ("ITALIC", "Literata-Italic.ttf"),
-    ]),
-    ("TITLE", 30, 41, 31, [
-        ("REGULAR", "Literata-Regular.ttf"),
-        ("BOLD", "Literata-Bold.ttf"),
-        ("ITALIC", "Literata-Italic.ttf"),
-    ]),
-    ("DISPLAY", 46, 62, 48, [
-        ("REGULAR", "Literata-Regular.ttf"),
-    ]),
+    (
+        "SMALL",
+        16,
+        22,
+        17,
+        [
+            ("REGULAR", "Literata-Regular.ttf"),
+            ("BOLD", "Literata-Bold.ttf"),
+            ("ITALIC", "Literata-Italic.ttf"),
+        ],
+    ),
+    (
+        "TITLE",
+        30,
+        41,
+        31,
+        [
+            ("REGULAR", "Literata-Regular.ttf"),
+            ("BOLD", "Literata-Bold.ttf"),
+            ("ITALIC", "Literata-Italic.ttf"),
+        ],
+    ),
+    (
+        "DISPLAY",
+        46,
+        62,
+        48,
+        [
+            ("REGULAR", "Literata-Regular.ttf"),
+        ],
+    ),
 ]
 
 RANGES = [
@@ -51,7 +70,7 @@ def codepoints():
 def glyph(font, code):
     ch = chr(code)
     bbox = font.getbbox(ch, anchor="ls")
-    advance = max(int(round(font.getlength(ch) * ADVANCE_SCALE)), ADVANCE_SCALE)
+    advance = max(round(font.getlength(ch) * ADVANCE_SCALE), ADVANCE_SCALE)
     if bbox is None:
         return (0, 0, 0, 0, max(advance, 1), [])
     left, top, right, bottom = bbox
@@ -108,7 +127,9 @@ def main():
                 offset += len(rows)
 
             name = f"{size_name}_{style}"
-            out.append(f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; MOCKUP_COUNT] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_METRICS: [GlyphMetric; MOCKUP_COUNT] = [\n"
+            )
             for item in metrics:
                 out.append(
                     "    GlyphMetric { "
@@ -117,7 +138,9 @@ def main():
                 )
             out.append("];\n\n")
 
-            out.append(f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n")
+            out.append(
+                f"#[rustfmt::skip]\npub static {name}_BITMAP: [u8; {max(len(bitmap), 1)}] = [\n"
+            )
             if not bitmap:
                 out.append("    0x00,\n")
             for chunk_start in range(0, len(bitmap), 16):

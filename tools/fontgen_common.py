@@ -1,17 +1,15 @@
-from pathlib import Path
 import os
 import struct
+from pathlib import Path
 
 from PIL import Image, ImageDraw
-
 
 ADVANCE_SCALE = 16
 DEFAULT_THRESHOLD = 128
 MIN_KERNING_ADJUST_FP = 8
 MAX_KERNING_ENTRIES = 1024
 KERNING_CODEPOINTS = frozenset(
-    list(range(0x20, 0x7F))
-    + [0x2018, 0x2019, 0x201C, 0x201D, 0x2013, 0x2014, 0x2026]
+    list(range(0x20, 0x7F)) + [0x2018, 0x2019, 0x201C, 0x201D, 0x2013, 0x2014, 0x2026]
 )
 
 
@@ -26,7 +24,7 @@ THRESHOLD = text_render_threshold()
 
 
 def advance_fp(font, text: str) -> int:
-    return max(int(round(font.getlength(text) * ADVANCE_SCALE)), ADVANCE_SCALE)
+    return max(round(font.getlength(text) * ADVANCE_SCALE), ADVANCE_SCALE)
 
 
 def rasterize_glyph(font, code: int):
@@ -337,7 +335,7 @@ def kerning_entries(font_path: Path, cps, px: int):
 
     entries = []
     for (left_glyph, right_glyph), value in adjustments.items():
-        adjust_fp = int(round(value * px * ADVANCE_SCALE / units_per_em))
+        adjust_fp = round(value * px * ADVANCE_SCALE / units_per_em)
         if abs(adjust_fp) < MIN_KERNING_ADJUST_FP:
             continue
         for left in cps_by_glyph.get(left_glyph, []):

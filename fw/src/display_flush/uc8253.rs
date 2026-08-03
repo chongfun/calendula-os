@@ -56,7 +56,7 @@ pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
     epd.command(CMD_DATA_STOP, &[]).await?;
 
     SCREEN_POWERED.store(false, Ordering::Relaxed);
-    esp_println::println!("display: x3 init done");
+    esp_println::println!("display: x3 init done t_ms={}", Instant::now().as_millis());
     Ok(())
 }
 
@@ -69,7 +69,7 @@ pub(crate) async fn flush(
     prev_staged: bool,
 ) -> Result<(), PanelError> {
     let plan = flush_plan(mode, SCREEN_POWERED.load(Ordering::Relaxed), prev_staged);
-    esp_println::println!(
+    bench_log!(
         "display: x3 flush requested={:?} effective={:?}",
         plan.requested_mode,
         plan.effective_mode
@@ -86,7 +86,7 @@ pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
     let start = Instant::now();
-    esp_println::println!(
+    bench_log!(
         "bench: sleep phase=power_down_start t_ms={}",
         start.as_millis()
     );
@@ -95,7 +95,7 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
             SleepStep::PowerOff => power_off(epd, start).await?,
             SleepStep::DeepSleep => {
                 epd.command(CMD_DEEP_SLEEP, &[DEEP_SLEEP_CHECK]).await?;
-                esp_println::println!(
+                bench_log!(
                     "bench: sleep phase=deep_sleep elapsed_ms={} t_ms={}",
                     start.elapsed().as_millis(),
                     Instant::now().as_millis()
@@ -142,7 +142,7 @@ async fn execute_steps(
 async fn power_on(epd: &mut Epd) -> Result<(), PanelError> {
     epd.command(CMD_POWER_ON, &[]).await?;
     let ms = epd.wait_two_phase().await?;
-    esp_println::println!(
+    bench_log!(
         "display: x3 PON busy_low=true {}ms level_high={:?}",
         ms,
         epd.busy_is_high()
@@ -155,12 +155,12 @@ async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), PanelEr
     let start = Instant::now();
     epd.command(CMD_DISPLAY_REFRESH, &[]).await?;
     let ms = epd.wait_two_phase().await?;
-    esp_println::println!(
+    bench_log!(
         "display: x3 DRF busy_low=true {}ms level_high={:?}",
         ms,
         epd.busy_is_high()
     );
-    esp_println::println!(
+    bench_log!(
         "bench: refresh mode={:?} busy_ms={} busy_low={} elapsed_ms={} screen_on={} t_ms={}",
         mode,
         ms,
@@ -175,8 +175,8 @@ async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), PanelEr
 async fn power_off(epd: &mut Epd, start: Instant) -> Result<(), PanelError> {
     epd.command(CMD_POWER_OFF, &[]).await?;
     let ms = epd.wait_two_phase().await?;
-    esp_println::println!("display: x3 POF busy_low=true {}ms", ms);
-    esp_println::println!(
+    bench_log!("display: x3 POF busy_low=true {}ms", ms);
+    bench_log!(
         "bench: sleep phase=power_off busy_ms={} busy_low={} elapsed_ms={} t_ms={}",
         ms,
         true,
