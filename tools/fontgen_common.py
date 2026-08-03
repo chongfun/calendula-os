@@ -32,7 +32,7 @@ def advance_fp(font, text: str) -> int:
 
 def rasterize_glyph(font, code: int):
     ch = chr(code)
-    bbox = font.getbbox(ch, anchor="ls")
+    bbox = font.getbbox(ch, anchor="ls", mode="1")
     advance = advance_fp(font, ch)
     if bbox is None:
         return (0, 0, 0, 0, advance, [])
@@ -51,14 +51,21 @@ def rasterize_glyph(font, code: int):
     # half-covered across two pixel columns rounds to one column or two
     # depending only on where it happens to fall.
     #
-    # The glyph box stays the one `getbbox` reported, which is the point. The
-    # metrics it feeds -- advance, left/top bearing, width, height -- are what
-    # `text_ink_width` and the wrap use, so pinning the box keeps layout
-    # byte-identical and no cached book repaginates. Measured over 8,469 glyph
-    # renders (3 Literata styles x 19/22/26 px x the full shipped coverage),
-    # 81 of them -- 37 codepoints, all diacritics, fractions or guillemets,
-    # and `_` the only ASCII one -- have mono ink a pixel outside that box and
-    # are clipped to it. Everything else is unchanged in size and position.
+    # The box has to come from the same mode as the raster, which is why
+    # `getbbox` is asked for the "1"-mode one. Without a mode it measures the
+    # antialiased layout, and the mono hinter is under no obligation to stay
+    # inside that: over 49,802 renders spanning every shipped face and size,
+    # 133 of them -- 71 codepoints, mostly diacritics and fractions but `r`,
+    # `u`, `=`, `{`, `~` and `_` among them -- put mono ink a pixel outside
+    # it, and a box that does not contain the bitmap lops that column or row
+    # off the glyph. The "1"-mode box contains the mono raster on all 49,802.
+    #
+    # It is also the honest box: the metrics it feeds -- left/top bearing,
+    # width, height -- then describe the bitmap that is actually stored, and
+    # those are what `text_ink_width` and the wrap consume. They move relative
+    # to the antialiased box, so the box is a pagination input; see
+    # `READER_LAYOUT_VERSION` in `ui/src/reading.rs`. Advances do not move:
+    # `font.getlength` is render-mode independent.
     image = Image.new("1", (width, height), 0)
     draw = ImageDraw.Draw(image)
     draw.text((-left, -top), ch, font=font, fill=1, anchor="ls")

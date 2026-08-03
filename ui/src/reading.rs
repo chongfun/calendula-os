@@ -576,8 +576,12 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// family widened from one bit to two bits so the Custom slot cannot collide
 /// with the version field. v18: the page box joins the layout config as a
 /// portrait bit — the upright frame wraps at the short axis, so portrait
-/// and landscape pagination cache separately.
-const READER_LAYOUT_VERSION: u16 = 18;
+/// and landscape pagination cache separately. v19: the generated glyph boxes
+/// come from the monochrome rasterization mode instead of the antialiased
+/// one, so they contain the bitmap that is actually stored rather than
+/// clipping it. Advances are unchanged, but `x_offset + width` moves on 737
+/// of 49,802 renders, which is a wrap input; existing caches rebuild.
+const READER_LAYOUT_VERSION: u16 = 19;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
@@ -1056,9 +1060,16 @@ pub fn draw_justified_wrapped_literata(
 /// every line of every page. Carrying the shortfall the way a Bresenham line
 /// carries its error spreads the wider gaps evenly instead.
 ///
-/// The total is unchanged: `next` returns 1 exactly `remainder` times across
-/// `gap_count` calls, because `carry` gains `remainder` per call and sheds
-/// `gap_count` per carry, so the line still ends where it did.
+/// The error starts half a gap in rather than at zero, which is the centred
+/// form of the same idea. From zero the accumulator cannot reach `gap_count`
+/// before the last call, so the final gap of every line took a pixel whenever
+/// there was one to give -- left-heavy traded for right-heavy. Half a gap of
+/// head start puts the lone wider gap of a remainder-1 line near the middle.
+///
+/// The total is unchanged either way: `next` returns 1 exactly `remainder`
+/// times across `gap_count` calls, because `carry` gains `remainder` per call,
+/// sheds `gap_count` per carry, and starts below `gap_count`, so the line
+/// still ends where it did.
 struct GapSlack {
     remainder: i16,
     gap_count: i16,
@@ -1071,7 +1082,7 @@ impl GapSlack {
         Self {
             remainder: if gap_count > 0 { extra % gap_count } else { 0 },
             gap_count,
-            carry: 0,
+            carry: gap_count / 2,
         }
     }
 
@@ -1089,6 +1100,17 @@ impl GapSlack {
     }
 }
 
+/// Whether the space at `index` closes an inter-word gap: the last space of
+/// its run, with a word after it.
+///
+/// `next_wrapped_line` hands the line over with its internal whitespace
+/// verbatim, so a run of spaces is one gap made of several bytes. Counting
+/// the gaps and widening them have to agree on that or the line overruns its
+/// measured width, which is why both go through this predicate.
+fn closes_word_gap(bytes: &[u8], index: usize) -> bool {
+    bytes[index] == b' ' && bytes.get(index + 1).is_some_and(|next| *next != b' ')
+}
+
 fn draw_justified_line(
     fb: &mut Framebuffer,
     font: &'static BitmapFont,
@@ -1098,10 +1120,8 @@ fn draw_justified_line(
     max_x: i16,
     is_last_line: bool,
 ) {
-    let gap_count = line
-        .as_bytes()
-        .windows(2)
-        .filter(|pair| pair[0] == b' ' && pair[1] != b' ')
+    let gap_count = (0..line.len())
+        .filter(|index| closes_word_gap(line.as_bytes(), *index))
         .count();
     if is_last_line || gap_count == 0 {
         draw_text(fb, font, line, x, baseline_y, false);
@@ -1129,8 +1149,15 @@ fn draw_justified_line(
                 let word = &line[start..index];
                 cursor_x = draw_text(fb, font, word, cursor_x, baseline_y, false);
             }
-            let gap = measure_text(font, " ") as i16 + extra_per_gap + slack.next();
-            cursor_x += gap;
+            cursor_x += measure_text(font, " ") as i16;
+            // The slack belongs to the gap, not to each space byte in it.
+            // `extra` was measured against a `text_ink_width` that already
+            // counts every space's own advance, so spending `extra_per_gap`
+            // once per byte would widen a double-space line past `max_x` and
+            // pull `slack` past its remainder.
+            if closes_word_gap(line.as_bytes(), index) {
+                cursor_x += extra_per_gap + slack.next();
+            }
         } else if word_start.is_none() {
             word_start = Some(index);
         }
@@ -1163,6 +1190,62 @@ mod tests {
             "the leading gaps must not absorb the whole remainder: {handed:?}"
         );
         assert_eq!(handed.iter().filter(|v| **v == 1).count(), 6);
+    }
+
+    /// A lone spare pixel belongs near the middle. Zeroing the accumulator
+    /// put it on the last gap of every line, which is front-loading pointed
+    /// the other way.
+    #[test]
+    fn justified_slack_centres_a_single_spare_pixel() {
+        let mut slack = GapSlack::new(21, 10);
+        let handed: heapless::Vec<i16, 10> = (0..10).map(|_| slack.next()).collect();
+        assert_eq!(
+            handed.as_slice(),
+            [0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+            "{handed:?}"
+        );
+    }
+
+    #[test]
+    fn justified_slack_spaces_two_spare_pixels_evenly() {
+        let mut slack = GapSlack::new(22, 10);
+        let handed: heapless::Vec<i16, 10> = (0..10).map(|_| slack.next()).collect();
+        assert_eq!(
+            handed.as_slice(),
+            [0, 0, 1, 0, 0, 0, 0, 1, 0, 0],
+            "{handed:?}"
+        );
+    }
+
+    /// A run of spaces is one inter-word gap. The count and the draw loop
+    /// share `closes_word_gap` so they cannot disagree about how many gaps
+    /// the slack is divided between.
+    #[test]
+    fn justified_gaps_are_counted_once_per_whitespace_run() {
+        let line = b"a  b  c";
+        let closes: heapless::Vec<usize, 8> = (0..line.len())
+            .filter(|index| closes_word_gap(line, *index))
+            .collect();
+        assert_eq!(closes.as_slice(), [2, 5], "{closes:?}");
+    }
+
+    /// Every pixel of the slack is spent, and spent once, however the spaces
+    /// are clumped: `extra_per_gap` per gap plus `remainder` single pixels.
+    #[test]
+    fn justified_slack_totals_the_extra_over_clumped_spaces() {
+        for line in [&b"a b c d"[..], b"a  b c  d", b"a   b   c   d"] {
+            let gap_count = (0..line.len())
+                .filter(|index| closes_word_gap(line, *index))
+                .count();
+            assert_eq!(gap_count, 3, "line {line:?}");
+            let extra = 26i16;
+            let mut slack = GapSlack::new(extra, gap_count);
+            let spent: i16 = (0..line.len())
+                .filter(|index| closes_word_gap(line, *index))
+                .map(|_| extra / gap_count as i16 + slack.next())
+                .sum();
+            assert_eq!(spent, extra, "line {line:?}");
+        }
     }
 
     #[test]
