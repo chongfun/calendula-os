@@ -168,12 +168,64 @@ case "$COMMAND" in
         "${RUFF[@]}" format --check .
         ;;
     fast)
-        "$0" fmt
-        "$0" clippy-host
-        "$0" test-host
-        "$0" test-host-x3
-        "$0" test-bench
-        "$0" ruff
+        # The six stages are independent commands, so they start together and
+        # are waited on as a group. The three cargo stages do contend: they
+        # share one build directory, and cargo prints "Blocking waiting for
+        # file lock" while it serialises their compiles. The win is that a
+        # stage's *test execution* happens outside that lock, so it overlaps
+        # the next stage's compile. Measured on a ten-core host, this target
+        # went from 22.1s serial to 15.5s after a one-file edit, and from 5.0s
+        # to 1.9s with nothing to rebuild; both repeatable to within a second.
+        #
+        # They share the one target dir on purpose. Giving each stage its own
+        # would drop the lock waits entirely, but target/ already runs to tens
+        # of gigabytes and a copy per stage costs far more disk than the
+        # remaining contention costs time.
+        #
+        # Output is captured per stage and replayed below in a fixed order
+        # rather than interleaved live: six concurrent cargo jobs sharing one
+        # terminal are unreadable, and -- the part that matters -- when one
+        # fails you cannot tell which. The cheap stages are listed first so
+        # that something appears while the cargo ones are still running.
+        #
+        # Only pre-push and `all` reach this. CI invokes the individual
+        # targets on separate runners and never goes through here.
+        FAST_STAGES=(fmt ruff test-bench clippy-host test-host test-host-x3)
+
+        FAST_TMP="$(mktemp -d)"
+        # Ctrl-C needs no handling: an interactive shell signals the whole
+        # foreground process group, so the children die with the script.
+        trap 'rm -rf "$FAST_TMP"' EXIT
+
+        FAST_PIDS=()
+        for stage in "${FAST_STAGES[@]}"; do
+            "$0" "$stage" > "$FAST_TMP/$stage.log" 2>&1 &
+            FAST_PIDS+=($!)
+        done
+        echo "Running ${#FAST_STAGES[@]} checks in parallel..."
+        echo
+
+        # Waiting in declaration order rather than completion order keeps the
+        # transcript identical from run to run, which matters when comparing a
+        # failure against a previous one.
+        FAST_FAILED=()
+        for ((i = 0; i < ${#FAST_STAGES[@]}; i++)); do
+            stage="${FAST_STAGES[$i]}"
+            if wait "${FAST_PIDS[$i]}"; then
+                echo "--- $stage: ok ---"
+            else
+                echo "--- $stage: FAILED ---"
+                FAST_FAILED+=("$stage")
+            fi
+            cat "$FAST_TMP/$stage.log"
+            echo
+        done
+
+        if [ ${#FAST_FAILED[@]} -ne 0 ]; then
+            echo "check.sh fast: ${#FAST_FAILED[@]} of ${#FAST_STAGES[@]} failed: ${FAST_FAILED[*]}" >&2
+            exit 1
+        fi
+        echo "check.sh fast: all ${#FAST_STAGES[@]} checks passed."
         ;;
     emulator)
         "$0" golden-frames
