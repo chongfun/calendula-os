@@ -17,11 +17,11 @@ full cache rebuild on every device, and bury a one-pixel seating fix inside an
 unreviewed font revision.
 
 So the repair is applied to the checked-in tables directly. The reference is
-`main`'s copy of the same tables, which is the antialiased rasterization of the
-identical font -- all 49,802 advances match between `main` and the current
-tables, which is what proves the outlines never changed. For every glyph the
-mono ink is moved so its top-left corner sits where `main`'s antialiased ink
-did, clamped to stay inside the box.
+`ANTIALIASED_REFERENCE`, a pinned commit whose copy of these tables is the
+antialiased rasterization of the identical font -- all 49,802 advances match
+between it and the current tables, which is what proves the outlines never
+changed. For every glyph the mono ink is moved so its top-left corner sits
+where the antialiased ink did, clamped to stay inside the box.
 
 That "identical font" claim is the entire safety argument, and glyphs are
 paired by array position, so `check_same_font` verifies it -- matching
@@ -35,7 +35,7 @@ height, x_offset, y_offset, advance_fp -- is left exactly as it is, so no wrap
 input moves, `READER_LAYOUT_VERSION` stays at 19, and devices keep the caches
 they have already rebuilt.
 
-Usage: tools/reseat_generated_glyphs.py [--reference main] [--check]
+Usage: tools/reseat_generated_glyphs.py [--reference REV] [--check]
 """
 
 import argparse
@@ -45,6 +45,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# "Improve bench harness measurement integrity (#58)" -- the last commit whose
+# glyph tables are the antialiased rasterization, i.e. `main` at the time this
+# repair was written. `check_same_font` still verifies whatever is passed, so
+# this pin decides the default, not the safety.
+ANTIALIASED_REFERENCE = "30a4a042323ed0d103b31109e31959e5a20d174c"
 FILES = [
     "display/src/literata_extra_generated.rs",
     "display/src/literata_generated.rs",
@@ -244,7 +249,15 @@ def render_bitmap(name, data):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--reference", default="main", help="revision holding the antialiased tables"
+        "--reference",
+        # The commit the antialiased tables were last shipped from, pinned
+        # rather than tracked. `main` was the obvious default and the wrong
+        # one: it is where these mono tables land once this branch merges, and
+        # it is where a future font revision lands too, so the default would
+        # have quietly stopped meaning "the antialiased rasterization of this
+        # font" at exactly the moment someone re-ran the script.
+        default=ANTIALIASED_REFERENCE,
+        help=f"revision holding the antialiased tables (default {ANTIALIASED_REFERENCE[:10]})",
     )
     parser.add_argument("--check", action="store_true", help="report without writing")
     args = parser.parse_args()
