@@ -102,6 +102,12 @@ Extended letters with no frame noticing — which is exactly what happened when
 mono rasterization first shipped against an antialiased glyph box. Font
 generator changes should be read off these frames first.
 
+The specimens render two of the thirty-four shipped tables. The other
+thirty-two are covered by fingerprints in `display/tests/glyph_tables.rs`,
+which run in the ordinary host test job (`tools/check.sh test-host`) and name
+the faces that moved and whether they gained or lost ink. A regeneration has to
+re-bless them; the failure prints the block to paste.
+
 ## Browser emulator
 
 `ui` and `display` changes also feed the wasm emulator, and the device chrome
