@@ -5,9 +5,10 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 ADVANCE_SCALE = 16
-# Only `generate_mockup_fonts.py` still antialiases and cuts at a threshold.
-# The shipped faces rasterize monochrome (see `rasterize_glyph`), where there
-# is no grey to threshold and `TEXT_RENDER_THRESHOLD` has no effect.
+# `generate_mockup_fonts.py` antialiases and cuts here to decide its pixels.
+# The shipped faces take their pixels from the monochrome raster instead, but
+# still cut here to decide where the antialiased reference glyph's ink starts,
+# which is what `rasterize_glyph` seats the monochrome raster against.
 DEFAULT_THRESHOLD = 128
 MIN_KERNING_ADJUST_FP = 8
 MAX_KERNING_ENTRIES = 1024
@@ -28,6 +29,36 @@ THRESHOLD = text_render_threshold()
 
 def advance_fp(font, text: str) -> int:
     return max(round(font.getlength(text) * ADVANCE_SCALE), ADVANCE_SCALE)
+
+
+# Room around the reported box for the monochrome raster to land outside it,
+# so its ink can be measured and moved rather than clipped where it falls.
+RESEAT_PAD = 8
+
+
+def _ink_bounds(image, threshold: int):
+    """`(left, top, right, bottom)` of the inked pixels, or None if blank."""
+    pixels = image.load()
+    width, height = image.size
+    columns = [x for x in range(width) if any(pixels[x, y] >= threshold for y in range(height))]
+    rows = [y for y in range(height) if any(pixels[x, y] >= threshold for x in range(width))]
+    if not columns or not rows:
+        return None
+    return (columns[0], rows[0], columns[-1] + 1, rows[-1] + 1)
+
+
+def _clamped_shift(desired: int, ink_low: int, ink_high: int, box_low: int, box_high: int) -> int:
+    """`desired`, reduced as far as needed to keep the ink inside the box.
+
+    When the ink is larger than the box no shift avoids clipping, so the
+    rasterizer's own placement stands rather than trading one clipped edge
+    for the other.
+    """
+    low = box_low - ink_low
+    high = box_high - ink_high
+    if low > high:
+        return 0
+    return max(low, min(desired, high))
 
 
 def rasterize_glyph(font, code: int):
@@ -51,30 +82,63 @@ def rasterize_glyph(font, code: int):
     # half-covered across two pixel columns rounds to one column or two
     # depending only on where it happens to fall.
     #
-    # The box has to come from the same mode as the raster, which is why
-    # `getbbox` is asked for the "1"-mode one. Without a mode it measures the
-    # antialiased layout, and the mono hinter is under no obligation to stay
-    # inside that: over 49,802 renders spanning every shipped face and size,
-    # 133 of them -- 71 codepoints, mostly diacritics and fractions but `r`,
-    # `u`, `=`, `{`, `~` and `_` among them -- put mono ink a pixel outside
-    # it, and a box that does not contain the bitmap lops that column or row
-    # off the glyph. The "1"-mode box contains the mono raster on all 49,802.
+    # The mono hinter grid-fits vertical edges, and for some glyphs that lifts
+    # the whole glyph a pixel: Literata's `f` at 22px and `t` at 19px, and
+    # Merriweather's `k` and `r`, all render with their crossbar or foot one
+    # row above where the antialiased raster puts it, while their neighbours
+    # stay put. A crossbar breaking the x-height line is the most visible
+    # defect this pipeline can produce -- the eye tracks that horizontal far
+    # more strongly than a foot leaving the baseline. Asking `getbbox` for the
+    # "1"-mode box does not address it: that box is identical to the
+    # antialiased one for `r` and `k`, and the shift is in the ink, not the
+    # box.
     #
-    # It is also the honest box: the metrics it feeds -- left/top bearing,
-    # width, height -- then describe the bitmap that is actually stored, and
-    # those are what `text_ink_width` and the wrap consume. They move relative
-    # to the antialiased box, so the box is a pagination input; see
-    # `READER_LAYOUT_VERSION` in `ui/src/reading.rs`. Advances do not move:
-    # `font.getlength` is render-mode independent.
-    image = Image.new("1", (width, height), 0)
-    draw = ImageDraw.Draw(image)
-    draw.text((-left, -top), ch, font=font, fill=1, anchor="ls")
+    # So the antialiased render is used as the placement reference and the
+    # monochrome render supplies the pixels. Both go onto one padded canvas,
+    # the mono ink is moved so its top-left corner matches the antialiased
+    # ink's, and the shift is clamped to keep it inside the box. Stems and
+    # bowls stay the mono hinter's -- that is the quality this buys -- while
+    # the glyph sits where the outline says it sits.
+    canvas = (width + 2 * RESEAT_PAD, height + 2 * RESEAT_PAD)
+    origin = (-left + RESEAT_PAD, -top + RESEAT_PAD)
+
+    image = Image.new("1", canvas, 0)
+    ImageDraw.Draw(image).text(origin, ch, font=font, fill=1, anchor="ls")
+    reference = Image.new("L", canvas, 0)
+    ImageDraw.Draw(reference).text(origin, ch, font=font, fill=255, anchor="ls")
+
+    mono_ink = _ink_bounds(image, 1)
+    reference_ink = _ink_bounds(reference, THRESHOLD)
+    shift_x = shift_y = 0
+    if mono_ink is not None and reference_ink is not None:
+        shift_x = _clamped_shift(
+            reference_ink[0] - mono_ink[0],
+            mono_ink[0],
+            mono_ink[2],
+            RESEAT_PAD,
+            RESEAT_PAD + width,
+        )
+        shift_y = _clamped_shift(
+            reference_ink[1] - mono_ink[1],
+            mono_ink[1],
+            mono_ink[3],
+            RESEAT_PAD,
+            RESEAT_PAD + height,
+        )
+
+    pixels = image.load()
     rows = []
     for y in range(height):
         byte = 0
         bits = 0
         for x in range(width):
-            if image.getpixel((x, y)):
+            source_x = RESEAT_PAD + x - shift_x
+            source_y = RESEAT_PAD + y - shift_y
+            if (
+                0 <= source_x < canvas[0]
+                and 0 <= source_y < canvas[1]
+                and pixels[source_x, source_y]
+            ):
                 byte |= 0x80 >> bits
             bits += 1
             if bits == 8:
