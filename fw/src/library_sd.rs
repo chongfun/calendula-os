@@ -1042,7 +1042,13 @@ where
             return;
         };
 
-        if is_epub_name(file_name) {
+        // Only the long name is tested for the hidden-entry rule. A leading
+        // dot cannot survive into an 8.3 short name -- `._book.epub` becomes
+        // something like `_BOOK~1.EPU` -- so the fallback above has no signal
+        // to test that would not also reject books legitimately starting with
+        // an underscore. In practice every AppleDouble sidecar carries a long
+        // name, because `._` plus the original never fits 8.3.
+        if is_epub_name(file_name) && !proto::storage::is_hidden_entry(file_name) {
             visit_prefixed(
                 prefix,
                 file_name,

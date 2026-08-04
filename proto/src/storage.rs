@@ -16,7 +16,7 @@ pub struct FileCandidate<'a> {
 
 impl<'a> FileCandidate<'a> {
     pub fn as_book(self, id: BookId) -> Option<BookMeta<'a>> {
-        if !is_epub_path(self.path) {
+        if !is_epub_path(self.path) || is_hidden_entry(self.path) {
             return None;
         }
         let file_name = self.path.rsplit('/').next().unwrap_or(self.path);
@@ -91,6 +91,27 @@ pub fn is_epub_path(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the entry is platform metadata rather than a book.
+///
+/// macOS writes an AppleDouble sidecar named `._<original>` beside every file
+/// it copies to a FAT volume, holding the resource fork. The sidecar keeps the
+/// `.epub` extension, so an extension test alone accepts it, and the card then
+/// lists a phantom duplicate of every book which cannot open: the sidecar is
+/// not an archive, so the reader fails with `Zip(MissingEndOfCentralDirectory)`
+/// and nothing on screen points at the real cause. Every book copied from a
+/// Mac in Finder has one.
+///
+/// The rule is any leading dot rather than `._` specifically, which also
+/// covers `.DS_Store`-style clutter and anything else a platform hides. No
+/// book wants a name starting with a dot.
+///
+/// Takes a name or a path: only the segment after the last `/` is examined, so
+/// `/books/._x.epub` is rejected while `/.hidden/x.epub` -- a hidden directory
+/// the scan was told to walk -- is not.
+pub fn is_hidden_entry(path: &str) -> bool {
+    path.rsplit('/').next().unwrap_or(path).starts_with('.')
+}
+
 /// Store the catalog's display path in its fixed-size field. The FAT short
 /// name remains the open handle; this only provides the user-facing label and
 /// a stable cache identity.
@@ -134,6 +155,46 @@ mod tests {
         assert!(is_epub_path("/books/Alice.EPUB"));
         assert!(is_epub_path("book.epub"));
         assert!(!is_epub_path("book.epub.tmp"));
+    }
+
+    /// A Mac writes `._<name>` beside every file copied to the card, and the
+    /// sidecar keeps the `.epub` extension. Catalogued, it becomes a phantom
+    /// duplicate of a real book that can never open.
+    #[test]
+    fn appledouble_sidecars_are_not_books() {
+        assert!(is_hidden_entry("._book.epub"));
+        assert!(is_hidden_entry("/._book.epub"));
+        assert!(is_hidden_entry("/books/._book.epub"));
+        // The 8.3 spelling of the same sidecar, which uploads also produce.
+        assert!(is_hidden_entry("/books/._book.epu"));
+    }
+
+    #[test]
+    fn ordinary_books_are_not_hidden() {
+        assert!(!is_hidden_entry("book.epub"));
+        assert!(!is_hidden_entry("/books/book.epub"));
+        // A dot inside the name, and a leading underscore, are both ordinary.
+        assert!(!is_hidden_entry("/books/vol._2.epub"));
+        assert!(!is_hidden_entry("/books/_book.epub"));
+        // A hidden directory the scan was pointed at does not hide its books.
+        assert!(!is_hidden_entry("/.stuff/book.epub"));
+    }
+
+    #[test]
+    fn hidden_entries_are_rejected_as_book_candidates() {
+        let sidecar = FileCandidate {
+            root: ScanRoot::CardRoot,
+            path: "/._algernon.epub",
+            byte_size: 4096,
+        };
+        assert!(sidecar.as_book(BookId(1)).is_none());
+
+        let real = FileCandidate {
+            root: ScanRoot::CardRoot,
+            path: "/algernon.epub",
+            byte_size: 4096,
+        };
+        assert!(real.as_book(BookId(1)).is_some());
     }
 
     #[test]
