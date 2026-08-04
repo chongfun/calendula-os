@@ -23,6 +23,13 @@ tables, which is what proves the outlines never changed. For every glyph the
 mono ink is moved so its top-left corner sits where `main`'s antialiased ink
 did, clamped to stay inside the box.
 
+That "identical font" claim is the entire safety argument, and glyphs are
+paired by array position, so `check_same_font` verifies it -- matching
+codepoint arrays, face tables and advances -- across every file before any file
+is written. A reference that is a different font revision, or ships a different
+repertoire, is refused rather than silently seating each bitmap against a
+stranger.
+
 Only bitmap bytes change. Every `GlyphMetric` field -- offset, len, width,
 height, x_offset, y_offset, advance_fp -- is left exactly as it is, so no wrap
 input moves, `READER_LAYOUT_VERSION` stays at 19, and devices keep the caches
@@ -46,12 +53,14 @@ FILES = [
     "display/src/merriweather_generated.rs",
 ]
 
+CODEPOINTS_RE = re.compile(r"static \w*CODEPOINTS: \[u16; \w+\] = \[(.*?)\];", re.S)
 METRICS_RE = re.compile(r"static (\w+)_METRICS: \[GlyphMetric; \w+\] = \[(.*?)\];", re.S)
 BITMAP_RE = re.compile(r"static (\w+)_BITMAP: \[u8; (\d+)\] = \[(.*?)\];", re.S)
 GLYPH_RE = re.compile(
     r"GlyphMetric \{ offset: (-?\d+), len: (-?\d+), width: (-?\d+), height: (-?\d+), "
     r"x_offset: (-?\d+), y_offset: (-?\d+), advance_fp: (-?\d+) \}"
 )
+ADVANCE = 6
 
 
 def read_revision(revision: str, path: str) -> str:
@@ -64,8 +73,22 @@ def read_revision(revision: str, path: str) -> str:
     ).stdout
 
 
+def resolve(revision: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", revision],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=ROOT,
+    ).stdout.strip()
+
+
 def parse(text: str):
-    """{table name: (metrics, bitmap bytes)}."""
+    """(codepoints, {table name: (metrics, bitmap bytes)})."""
+    codepoints = [
+        int(value, 16)
+        for value in re.findall(r"0x([0-9A-Fa-f]{4})", CODEPOINTS_RE.search(text).group(1))
+    ]
     bitmaps = {
         match.group(1): [int(b, 16) for b in re.findall(r"0x([0-9A-Fa-f]{2})", match.group(3))]
         for match in BITMAP_RE.finditer(text)
@@ -75,7 +98,65 @@ def parse(text: str):
         name = match.group(1)
         metrics = [tuple(int(g) for g in m.groups()) for m in GLYPH_RE.finditer(match.group(2))]
         tables[name] = (metrics, bitmaps[name])
-    return tables
+    return codepoints, tables
+
+
+def check_same_font(path, revision, current, reference):
+    """Refuse to migrate unless the reference is the same font, glyph for glyph.
+
+    The whole safety argument is that the reference is the antialiased
+    rasterization of the *same outlines*, so its ink positions are where these
+    bitmaps belong. Nothing else in this script would notice if it were not:
+    glyphs are paired by array position, so a reference with the same table
+    names and counts but a different repertoire or a different font revision
+    would seat each bitmap against a stranger, silently and irreversibly.
+
+    That is not hypothetical. `--reference` defaults to a mutable branch, and
+    the upstream fonts have already been revised once -- which is the reason
+    this script exists. So the argument is checked rather than asserted:
+    identical codepoint arrays, identical table sets, and identical advances
+    for every glyph. Advances are the tell, because `font.getlength` is
+    render-mode independent: they cannot move between two rasterizations of
+    one font, and they do move between font revisions.
+    """
+    current_codepoints, current_tables = current
+    reference_codepoints, reference_tables = reference
+
+    if current_codepoints != reference_codepoints:
+        detail = f"{len(current_codepoints)} codepoints here, {len(reference_codepoints)} there"
+        for index, (here, there) in enumerate(
+            zip(current_codepoints, reference_codepoints, strict=False)
+        ):
+            if here != there:
+                detail = (
+                    f"first divergence at index {index}: U+{here:04X} here, U+{there:04X} there"
+                )
+                break
+        raise SystemExit(
+            f"{path}: codepoint coverage differs from {revision} ({detail}). Glyphs are "
+            "paired by position, so the reference must ship exactly the same repertoire."
+        )
+    if current_tables.keys() != reference_tables.keys():
+        missing = sorted(current_tables.keys() ^ reference_tables.keys())
+        raise SystemExit(f"{path}: face tables differ from {revision}: {', '.join(missing)}")
+
+    for name, (metrics, _) in current_tables.items():
+        reference_metrics, _ = reference_tables[name]
+        if len(metrics) != len(reference_metrics):
+            raise SystemExit(
+                f"{name}: {len(metrics)} glyphs here, {len(reference_metrics)} in {revision}"
+            )
+        for codepoint, metric, reference_metric in zip(
+            current_codepoints, metrics, reference_metrics, strict=True
+        ):
+            if metric[ADVANCE] != reference_metric[ADVANCE]:
+                raise SystemExit(
+                    f"{name}: U+{codepoint:04X} advances {metric[ADVANCE]} here but "
+                    f"{reference_metric[ADVANCE]} in {revision}. Advances are render-mode "
+                    "independent, so the reference is a different font revision, not just a "
+                    "different rasterization of this one. Re-seating against it would move "
+                    "glyphs onto placements from outlines they were never rendered from."
+                )
 
 
 def unpack(metric, data):
@@ -168,15 +249,25 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="report without writing")
     args = parser.parse_args()
 
-    moved_total = glyphs_total = 0
+    revision = args.reference
+    print(f"reference {revision} = {resolve(revision)}")
+
+    # Every file is parsed and checked before any is written, so a reference
+    # that fails on the last file cannot leave the first four migrated.
+    parsed = []
     for path in FILES:
         current_text = (ROOT / path).read_text()
         current = parse(current_text)
-        reference = parse(read_revision(args.reference, path))
+        reference = parse(read_revision(revision, path))
+        check_same_font(path, revision, current, reference)
+        parsed.append((path, current_text, current, reference))
+
+    moved_total = glyphs_total = 0
+    for path, current_text, (_, current_tables), (_, reference_tables) in parsed:
         rebuilt = {}
         moved_here = 0
-        for name, (metrics, data) in current.items():
-            reference_metrics, reference_data = reference[name]
+        for name, (metrics, data) in current_tables.items():
+            reference_metrics, reference_data = reference_tables[name]
             out = []
             for metric, reference_metric in zip(metrics, reference_metrics, strict=True):
                 glyphs_total += 1
