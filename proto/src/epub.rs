@@ -163,26 +163,29 @@ pub const INFLATE_WINDOW_BYTES: usize = 32 * 1024;
 const INFLATE_WINDOW_MASK: usize = INFLATE_WINDOW_BYTES - 1;
 const _: () = assert!(INFLATE_WINDOW_BYTES.is_power_of_two());
 
-/// Decoder state plus its window, owned by the caller.
+/// Decoder window scratch, owned by the caller.
+///
+/// The current struct is ~32 KiB (the 32 KiB LZ77 window buffer plus a position
+/// counter and a borrowed decoder reference). The ~10.5 KiB `DecompressorOxide`
+/// decoder state is allocated in a separate static cell and supplied via
+/// [`Self::prepare`].
 ///
 /// The shape is dictated by one requirement: **this must be constructible
-/// without ever existing as a value.** It is ~43 KB against a 42 KB stack,
-/// and `miniz_oxide`'s own `InflateState` can only be built by value —
-/// which is how a 43 KB temporary once landed on the stack, ran 11 KB past
-/// the bottom of it and through `.bss`, with every host gate passing.
-/// Borrowing the whole struct from a static moved the allocation but not
-/// its initialization: `inflate_scratch()` still returned by value,
-/// leaving a ~21 KB frame that only survived because LLVM chose to elide
-/// part of the copy.
+/// without ever existing as a value on a tight stack.** Historically, when
+/// `ZipInflateScratch` held `InflateState` by value, the combined ~43 KB struct
+/// was returned by value against a 42 KB stack. That temporary landed on the stack,
+/// ran 11 KB past the bottom into `.bss`, and unwrapped `None` on a clock read.
+/// Borrowing the scratch moved the allocation, but `ZipInflateScratch::new()`
+/// returning a ~21 KB frame by value still relied on LLVM eliding the copy.
 ///
-/// So `new()` is a `const fn` whose value is **all zero bytes**, which is
-/// what gets it into `.bss` rather than copied out of flash at boot: the
-/// window is zeroes and the decoder is a null `Option<&mut _>`. Holding the
-/// decoder by value instead — `Option<DecompressorOxide>` — costs 43 KB of
-/// flash, because `None` there is not provably all-zero and the linker has
-/// to emit the whole struct into `.data`. Measured, both ways.
+/// Splitting out `DecompressorOxide` and keeping `ZipInflateScratch::new()` a
+/// `const fn` whose value is **all zero bytes** allows `ZipInflateScratch` to be
+/// const-initialized directly in `.bss`. Holding `DecompressorOxide` inside by
+/// value — even as `Option<DecompressorOxide>` — would cost 43 KB of flash because
+/// `None` is not provably all-zero and would force the whole struct into `.data`.
+/// Measured, both ways.
 ///
-/// The decoder is therefore borrowed, supplied once by [`Self::prepare`].
+/// The decoder is therefore borrowed separately, supplied once by [`Self::prepare`].
 pub struct ZipInflateScratch {
     /// `None` until [`Self::prepare`] runs. A null reference, so the const
     /// constructor stays all-zero — see the type docs.

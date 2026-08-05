@@ -121,16 +121,19 @@ pub(crate) struct ReaderCacheScratch<'a> {
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
     book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     /// Borrowed, not embedded, and that is load-bearing. `ZipInflateScratch` is
-    /// 43,280 bytes, of which 32 KB is the LZ77 window. Holding it by value made
-    /// this struct 43,340 bytes, and `ZipInflateScratch::new()` returns by value
-    /// — so initialising the static depended entirely on LLVM forwarding the
-    /// `sret` slot into `.bss` instead of building a copy on the stack. It did,
-    /// until a 28-byte field pushed the struct past whatever threshold that
-    /// decision hangs on; the copy reappeared, `ensure_epub_scratch` allocated
-    /// 53,744 bytes on a 42,136-byte stack, and the overflow wrote through
-    /// `.bss` into esp-hal's clock singleton. The next `Clocks::get()` unwrapped
-    /// a `None`. Behind a reference the window can never be a stack temporary of
-    /// this struct at all, so the cliff is gone rather than merely uphill.
+    /// now ~32 KiB (primarily the 32 KB LZ77 window), while its ~10.5 KiB
+    /// `DecompressorOxide` decoder is stored in a separate static cell.
+    /// Historically, when the scratch held the decoder by value, the combined
+    /// struct was 43,280 bytes. Embedding it by value made `ReaderCacheScratch`
+    /// 43,340 bytes, and `ZipInflateScratch::new()` returned by value — so
+    /// initialising the static depended entirely on LLVM forwarding the `sret`
+    /// slot into `.bss` instead of building a copy on the stack. It did, until
+    /// a 28-byte field pushed the struct past whatever threshold that decision
+    /// hangs on; the copy reappeared, `ensure_epub_scratch` allocated 53,744 bytes
+    /// on a 42,136-byte stack, and the overflow wrote through `.bss` into esp-hal's
+    /// clock singleton. The next `Clocks::get()` unwrapped a `None`. Behind a
+    /// reference the window can never be a stack temporary of this struct at all,
+    /// so the cliff is gone rather than merely uphill.
     zip_inflate: &'a mut ZipInflateScratch,
     /// The suspended progressive build that owns `book_sections`, if any.
     ///
