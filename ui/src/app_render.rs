@@ -70,6 +70,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         orientation: ui_orientation(request.orientation),
         front_pages_left: request.front_buttons == FrontButtons::PagesLeft,
         refresh_policy: ui_refresh_policy(request.refresh_policy),
+        refresh_quality: ui_refresh_quality(request.refresh_quality),
         font_size: request.font_size,
         line_spacing: request.line_spacing,
         font_weight: request.font_weight,
@@ -269,6 +270,13 @@ fn ui_refresh_policy(policy: RefreshPolicy) -> UiRefreshPolicy {
         RefreshPolicy::FastOnly => UiRefreshPolicy::FastOnly,
         RefreshPolicy::FullOnWake => UiRefreshPolicy::FullOnWake,
         RefreshPolicy::FullEveryTen => UiRefreshPolicy::FullEveryTen,
+    }
+}
+
+fn ui_refresh_quality(quality: app_core::RefreshQuality) -> crate::UiRefreshQuality {
+    match quality {
+        app_core::RefreshQuality::Normal => crate::UiRefreshQuality::Normal,
+        app_core::RefreshQuality::Fast => crate::UiRefreshQuality::Fast,
     }
 }
 

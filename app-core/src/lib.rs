@@ -10,7 +10,7 @@ pub mod buttons;
 /// The storage/display task's command loop, as sequences a host test can drive.
 pub mod storage_loop;
 
-pub const SETTINGS_ITEMS: u8 = 7;
+pub const SETTINGS_ITEMS: u8 = 8;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -133,6 +133,12 @@ enum HomeAction {
 pub enum FrontButtons {
     PagesRight,
     PagesLeft,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshQuality {
+    Normal,
+    Fast,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,6 +320,7 @@ pub struct RenderRequest {
     /// sheet, relabel the key rail, and show the wait or its note.
     pub library_menu: LibraryMenu,
     pub refresh_policy: RefreshPolicy,
+    pub refresh_quality: RefreshQuality,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
@@ -1322,6 +1329,7 @@ pub enum LibraryEvent {
         page_count: u32,
         reading_orientation: u8,
         refresh_policy: u8,
+        refresh_quality: u8,
         font_size: u8,
         line_spacing: u8,
         font_weight: u8,
@@ -1801,6 +1809,7 @@ pub struct PersistedAppState {
     pub shell_orientation: u8,
     pub reading_orientation: u8,
     pub refresh_policy: u8,
+    pub refresh_quality: u8,
     pub font_size: u8,
     pub line_spacing: u8,
     pub font_weight: u8,
@@ -1835,6 +1844,7 @@ pub struct ReaderState {
     pub orientation: DisplayOrientation,
     pub front_buttons: FrontButtons,
     pub refresh_policy: RefreshPolicy,
+    pub refresh_quality: RefreshQuality,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
@@ -1890,6 +1900,7 @@ impl ReaderState {
             orientation: DisplayOrientation::PortraitButtonsLeft,
             front_buttons: FrontButtons::PagesRight,
             refresh_policy: RefreshPolicy::FullOnWake,
+            refresh_quality: RefreshQuality::Normal,
             font_size: FontSize::Medium,
             line_spacing: LineSpacing::Normal,
             font_weight: FontWeight::Normal,
@@ -2383,6 +2394,7 @@ impl ReaderState {
                 page_count,
                 reading_orientation,
                 refresh_policy,
+                refresh_quality,
                 font_size,
                 line_spacing,
                 font_weight,
@@ -2415,6 +2427,9 @@ impl ReaderState {
                 }
                 if let Some(policy) = refresh_policy_from_u8(refresh_policy) {
                     self.refresh_policy = policy;
+                }
+                if let Some(quality) = refresh_quality_from_u8(refresh_quality) {
+                    self.refresh_quality = quality;
                 }
                 if let Some(size) = FontSize::from_u8(font_size) {
                     self.font_size = size;
@@ -2499,6 +2514,7 @@ impl ReaderState {
             reading_sheet: self.reading_sheet,
             library_menu: self.library_menu,
             refresh_policy: self.refresh_policy,
+            refresh_quality: self.refresh_quality,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
             font_weight: self.font_weight,
@@ -2527,6 +2543,7 @@ impl ReaderState {
             shell_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
             reading_orientation: self.orientation as u8,
             refresh_policy: self.refresh_policy as u8,
+            refresh_quality: self.refresh_quality as u8,
             font_size: self.font_size as u8,
             line_spacing: self.line_spacing as u8,
             font_weight: self.font_weight as u8,
@@ -2654,6 +2671,14 @@ pub fn refresh_policy_from_u8(value: u8) -> Option<RefreshPolicy> {
         0 => Some(RefreshPolicy::FastOnly),
         1 => Some(RefreshPolicy::FullOnWake),
         2 => Some(RefreshPolicy::FullEveryTen),
+        _ => None,
+    }
+}
+
+pub fn refresh_quality_from_u8(value: u8) -> Option<RefreshQuality> {
+    match value {
+        0 => Some(RefreshQuality::Normal),
+        1 => Some(RefreshQuality::Fast),
         _ => None,
     }
 }
@@ -2807,6 +2832,12 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
             state.front_buttons = match state.front_buttons {
                 FrontButtons::PagesRight => FrontButtons::PagesLeft,
                 FrontButtons::PagesLeft => FrontButtons::PagesRight,
+            };
+        }
+        7 => {
+            state.refresh_quality = match state.refresh_quality {
+                RefreshQuality::Normal => RefreshQuality::Fast,
+                RefreshQuality::Fast => RefreshQuality::Normal,
             };
         }
         _ => {}
@@ -3501,7 +3532,7 @@ mod tests {
         // 16 bytes and the planner's stored request four. Recorded because
         // `.bss` trades one-for-one against the main stack region on this
         // target, so a struct in a channel is never free.
-        assert_eq!(core::mem::size_of::<RenderRequest>(), 112);
+        assert_eq!(core::mem::size_of::<RenderRequest>(), 120);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
             "the departing state has outgrown the credentials variant",
@@ -4000,6 +4031,7 @@ mod tests {
                 page_count: 0,
                 reading_orientation: 0,
                 refresh_policy: 0,
+                refresh_quality: 0,
                 font_size: 0,
                 line_spacing: 0,
                 font_weight: 0,
@@ -4846,6 +4878,7 @@ mod tests {
                 page_count: 0,
                 reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
                 refresh_policy: RefreshPolicy::FullOnWake as u8,
+                refresh_quality: RefreshQuality::Normal as u8,
                 font_size: FontSize::Medium as u8,
                 line_spacing: LineSpacing::Normal as u8,
                 font_weight: FontWeight::Normal as u8,
@@ -4893,6 +4926,7 @@ mod tests {
                 page_count: 0,
                 reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
                 refresh_policy: RefreshPolicy::FullOnWake as u8,
+                refresh_quality: RefreshQuality::Normal as u8,
                 font_size: FontSize::Medium as u8,
                 line_spacing: LineSpacing::Normal as u8,
                 font_weight: FontWeight::Normal as u8,
@@ -4968,7 +5002,21 @@ mod tests {
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 6);
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, 7);
+        let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
+    }
+
+    #[test]
+    fn settings_change_key_toggles_refresh_quality() {
+        let mut state = press(ReaderState::boot(), Button::Next);
+        state.selection = 7;
+
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.refresh_quality, RefreshQuality::Fast);
+
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.refresh_quality, RefreshQuality::Normal);
     }
 
     #[test]
@@ -5188,6 +5236,7 @@ mod tests {
                 page_count: 0,
                 reading_orientation: DisplayOrientation::PortraitButtonsRight as u8,
                 refresh_policy: RefreshPolicy::FastOnly as u8,
+                refresh_quality: RefreshQuality::Fast as u8,
                 font_size: FontSize::Large as u8,
                 line_spacing: LineSpacing::Compact as u8,
                 font_weight: FontWeight::Normal as u8,
@@ -5487,6 +5536,7 @@ mod tests {
             shell_orientation: 0,
             reading_orientation: 0,
             refresh_policy: 0,
+            refresh_quality: 0,
             font_size: 0,
             line_spacing: 0,
             font_weight: 0,

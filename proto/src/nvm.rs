@@ -17,6 +17,7 @@ pub struct AppStateRecord {
     pub font_weight: u8,
     pub font_family: u8,
     pub front_buttons: u8,
+    pub refresh_quality: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -50,6 +51,7 @@ impl AppStateRecord {
             font_weight: Self::DEFAULT_FONT_WEIGHT,
             font_family: Self::DEFAULT_FONT_FAMILY,
             front_buttons: 0,
+            refresh_quality: 0,
             source_hash: 0,
             source_size: 0,
         }
@@ -73,10 +75,12 @@ impl AppStateRecord {
         // reserved tail. The font family later took reserved byte 29 and the
         // front-button layout byte 30: records written before either carry
         // zero there, which is the respective default (Literata, pages
-        // right), so no version bump was needed. Byte 31 stays reserved zero.
+        // right), so no version bump was needed. Byte 31 stores refresh_quality
+        // (default 0).
         out[28] = self.font_weight;
         out[29] = self.font_family;
         out[30] = self.front_buttons;
+        out[31] = self.refresh_quality;
         let checksum = checksum(&out[..32]);
         write_u32(&mut out, 32, checksum);
         out
@@ -110,6 +114,7 @@ impl AppStateRecord {
                     font_weight: bytes[28],
                     font_family: bytes[29],
                     front_buttons: bytes[30],
+                    refresh_quality: bytes[31],
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                 })
@@ -139,6 +144,7 @@ impl AppStateRecord {
                     font_weight: Self::DEFAULT_FONT_WEIGHT,
                     font_family: Self::DEFAULT_FONT_FAMILY,
                     front_buttons: 0,
+                    refresh_quality: 0,
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                 })
@@ -160,6 +166,7 @@ impl AppStateRecord {
                     font_weight: Self::DEFAULT_FONT_WEIGHT,
                     font_family: Self::DEFAULT_FONT_FAMILY,
                     front_buttons: 0,
+                    refresh_quality: 0,
                     source_hash: 0,
                     source_size: 0,
                 })
@@ -344,6 +351,7 @@ mod tests {
             shell_orientation: 2,
             reading_orientation: 1,
             refresh_policy: 2,
+            refresh_quality: 1,
             font_size: 2,
             line_spacing: 0,
             font_weight: 1,
@@ -365,7 +373,7 @@ mod tests {
     const STATE_GOLDEN: [u8; AppStateRecord::ENCODED_LEN] = [
         0x53, 0x4f, 0x34, 0x58, 0x04, 0x02, 0x01, 0x02, 0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x29,
         0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x40, 0xe2, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
-        0x01, 0x00, 0xa7, 0x76, 0x1e, 0x60,
+        0x01, 0x01, 0x14, 0x75, 0x1e, 0x5f,
     ];
 
     #[test]

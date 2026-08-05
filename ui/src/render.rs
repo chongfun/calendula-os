@@ -8,8 +8,8 @@
 //! only — the device does not tell time.
 
 use crate::{
-    join_qr, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem,
-    UiView,
+    join_qr, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiRefreshQuality, UiShell,
+    UiSyncStatus, UiTocItem, UiView,
 };
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{
@@ -698,10 +698,10 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    // Seven rows must clear the landscape footer line, so the settings
+    // Eight rows must clear the landscape footer line, so the settings
     // index runs tighter than the Library's ROW_STEP.
-    const SETTINGS_ROW_STEP: i16 = 52;
-    let rows: [(&str, &str); 7] = [
+    const SETTINGS_ROW_STEP: i16 = 46;
+    let rows: [(&str, &str); 8] = [
         (
             "Typeface",
             font_family_label(shell.font_family, shell.custom_font_name),
@@ -710,6 +710,10 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         ("Type weight", font_weight_label(shell.font_weight)),
         ("Line spacing", line_spacing_label(shell.line_spacing)),
         ("Refresh", refresh_policy_label(shell.refresh_policy)),
+        (
+            "Refresh quality",
+            refresh_quality_label(shell.refresh_quality),
+        ),
         ("Orientation", orientation_label(shell.orientation)),
         ("Front buttons", front_buttons_label(shell.front_pages_left)),
     ];
@@ -1360,6 +1364,13 @@ fn refresh_policy_label(policy: UiRefreshPolicy) -> &'static str {
         UiRefreshPolicy::FastOnly => "fast only",
         UiRefreshPolicy::FullOnWake => "full on wake",
         UiRefreshPolicy::FullEveryTen => "full every ten",
+    }
+}
+
+fn refresh_quality_label(quality: UiRefreshQuality) -> &'static str {
+    match quality {
+        UiRefreshQuality::Normal => "normal",
+        UiRefreshQuality::Fast => "fast",
     }
 }
 
