@@ -2,7 +2,8 @@ import hashlib
 import os
 import struct
 from pathlib import Path
-from urllib.request import urlretrieve
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 import PIL
 from PIL import Image, ImageDraw, features
@@ -106,7 +107,13 @@ def ensure_font(path: Path, url: str, sha256: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         print(f"downloading {path.name}")
-        urlretrieve(url, path)
+        try:
+            with urlopen(url, timeout=30) as response:
+                path.write_bytes(response.read())
+        except (HTTPError, URLError, OSError) as err:
+            if path.exists():
+                path.unlink(missing_ok=True)
+            raise SystemExit(f"Failed to download {path.name} from {url}: {err}") from err
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if digest != sha256:
         raise SystemExit(
