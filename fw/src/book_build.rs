@@ -229,9 +229,10 @@ impl<'a> ReaderCacheScratch<'a> {
 
 /// Tears the built scratch down into the raw regions the sync session
 /// loans to the radio. One-way: the regions alias the scratch's borrowed
-/// arrays and its own struct storage (the inflate state is the bulk of
-/// it), so the scratch must never be used as a scratch again — only the
-/// session-ending software reset brings the reader pipeline back.
+/// arrays, the separate inflate decoder static, and its own struct storage
+/// (the inflate window is the bulk of it), so the scratch must never be used
+/// as a scratch again — only the session-ending software reset brings the
+/// reader pipeline back.
 #[allow(unsafe_code)]
 pub(crate) fn dismantle_scratch(
     scratch: &'static mut ReaderCacheScratch<'static>,
@@ -249,10 +250,22 @@ pub(crate) fn dismantle_scratch(
     let container_ptr = scratch.container.as_mut_ptr();
     let tail_ptr = scratch.tail.as_mut_ptr();
 
-    // The zip inflate static allocation becomes the wifi heap region.
+    // The zip inflate static allocation becomes the wifi heap_a region.
     let struct_region = RawRegion {
         ptr: (scratch.zip_inflate as *mut ZipInflateScratch).cast::<u8>(),
         len: core::mem::size_of::<ZipInflateScratch>(),
+    };
+
+    // The separate zip decompressor static becomes the wifi heap_c region.
+    let decoder_region = match scratch.zip_inflate.take_decompressor() {
+        Some(decompressor) => RawRegion {
+            ptr: (decompressor as *mut proto::epub::DecompressorOxide).cast::<u8>(),
+            len: core::mem::size_of::<proto::epub::DecompressorOxide>(),
+        },
+        None => RawRegion {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        },
     };
 
     // Safety: each pointer addresses a distinct 'static allocation whose
@@ -261,6 +274,7 @@ pub(crate) fn dismantle_scratch(
         SyncLoan {
             heap_a: struct_region,
             heap_b: xhtml,
+            heap_c: decoder_region,
             tcp_rx: core::slice::from_raw_parts_mut(opf_ptr, READER_OPF_SCRATCH),
             tcp_tx: core::slice::from_raw_parts_mut(compressed_ptr, READER_COMPRESSED_SCRATCH),
             http_a: core::slice::from_raw_parts_mut(container_ptr, READER_CONTAINER_SCRATCH),

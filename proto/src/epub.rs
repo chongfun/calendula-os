@@ -215,6 +215,11 @@ impl ZipInflateScratch {
         self.decompressor = Some(decompressor);
     }
 
+    /// Take the prepared `DecompressorOxide` reference, if one was provided.
+    pub fn take_decompressor(&mut self) -> Option<&'static mut DecompressorOxide> {
+        self.decompressor.take()
+    }
+
     /// Borrow the decoder and window as separate pieces, with the decoder
     /// reset for a fresh stream. `None` when [`Self::prepare`] never ran.
     ///

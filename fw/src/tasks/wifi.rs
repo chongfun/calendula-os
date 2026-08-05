@@ -118,7 +118,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
             Err(error) => send_event(SyncEvent::Failed(error)),
         }
     };
-    sync_mem::donate_heap(loan.heap_a, loan.heap_b);
+    sync_mem::donate_heap(loan.heap_a, loan.heap_b, loan.heap_c);
     let SyncLoan {
         tcp_rx,
         tcp_tx,
