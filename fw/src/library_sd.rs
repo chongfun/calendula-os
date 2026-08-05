@@ -1022,42 +1022,31 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut lfn_storage = [0u8; 192];
+    // Sized so no name FAT can store overflows it. An overflowing long name
+    // is one this callback never sees, and an AppleDouble sidecar whose long
+    // name is lost is indistinguishable from a book: `._<book>.epub` shortens
+    // to something like `_BOOK~1.EPU`. `MAX_LFN_UTF8_BYTES` documents the
+    // bound. It costs 573 bytes over the 192-byte buffer it replaces, less
+    // the 8.3 staging string dropped below: measured on X3, the two
+    // instantiations of this function go from 464 bytes each to 1,024 and
+    // 976. The scan runs from the storage dispatcher, not under the reader's
+    // deep call chain, and both frames stay far inside the 24 KB per-frame
+    // budget and the 41,944-byte X3 stack region.
+    let mut lfn_storage = [0u8; proto::storage::MAX_LFN_UTF8_BYTES];
     let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
     dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
             return;
         }
 
-        let mut name = String::<64>::new();
+        // The 8.3 name stays the open handle whichever name is catalogued.
         let mut open_name = String::<16>::new();
         use core::fmt::Write;
         let _ = write!(open_name, "{}", entry.name);
-        let Some(file_name) = long_name else {
-            let _ = write!(name, "{}", entry.name);
-            if !is_epub_name(&name) {
-                return;
-            }
-            visit_prefixed(prefix, &name, &open_name, in_books_dir, entry.size, visit);
+        let Some(name) = proto::storage::catalog_scan_name(long_name, &open_name) else {
             return;
         };
-
-        // Only the long name is tested for the hidden-entry rule. A leading
-        // dot cannot survive into an 8.3 short name -- `._book.epub` becomes
-        // something like `_BOOK~1.EPU` -- so the fallback above has no signal
-        // to test that would not also reject books legitimately starting with
-        // an underscore. In practice every AppleDouble sidecar carries a long
-        // name, because `._` plus the original never fits 8.3.
-        if is_epub_name(file_name) && !proto::storage::is_hidden_entry(file_name) {
-            visit_prefixed(
-                prefix,
-                file_name,
-                &open_name,
-                in_books_dir,
-                entry.size,
-                visit,
-            );
-        }
+        visit_prefixed(prefix, name, &open_name, in_books_dir, entry.size, visit);
     })
     .map_err(|_| ())
 }
@@ -1073,38 +1062,4 @@ fn visit_prefixed(
     let mut path = String::<64>::new();
     proto::storage::catalog_display_path(prefix, name, &mut path);
     visit(&path, open_name, in_books_dir, byte_size);
-}
-
-fn is_epub_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    // Uploaded books carry 8.3 names whose extension truncates to ".epu".
-    if bytes.len() >= 4 {
-        let tail = &bytes[bytes.len() - 4..];
-        if tail[0] == b'.'
-            && tail[1].eq_ignore_ascii_case(&b'e')
-            && tail[2].eq_ignore_ascii_case(&b'p')
-            && tail[3].eq_ignore_ascii_case(&b'u')
-        {
-            return true;
-        }
-    }
-    if bytes.len() >= 5 {
-        let ext = &bytes[bytes.len() - 5..];
-        if ext[0] == b'.'
-            && ext[1].eq_ignore_ascii_case(&b'e')
-            && ext[2].eq_ignore_ascii_case(&b'p')
-            && ext[3].eq_ignore_ascii_case(&b'u')
-            && ext[4].eq_ignore_ascii_case(&b'b')
-        {
-            return true;
-        }
-    }
-    if bytes.len() >= 4 {
-        let ext = &bytes[bytes.len() - 4..];
-        return ext[0] == b'.'
-            && ext[1].eq_ignore_ascii_case(&b'e')
-            && ext[2].eq_ignore_ascii_case(&b'p')
-            && ext[3].eq_ignore_ascii_case(&b'u');
-    }
-    false
 }

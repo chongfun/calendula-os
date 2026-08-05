@@ -13,7 +13,18 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// probing each book's cache per window crossing; the version check makes
 /// an older catalog fail to load, and a fresh scan rebuilds it -- no
 /// migration code needed.
-pub const CATALOG_VERSION: u8 = 5;
+///
+/// v6 changes no bytes at all: the record layout is identical to v5, and the
+/// bump exists to retire the *contents* of every v5 catalog. Scans before it
+/// catalogued macOS AppleDouble sidecars (`._<book>.epub`) as books, so a
+/// card written by one holds a phantom, unopenable duplicate of every book
+/// copied there in Finder. The scan filter alone would not reach those
+/// cards: boot loads `CATALOG.BIN` and only queues a scan when the load
+/// fails, so a v5 snapshot would keep serving its sidecar records until the
+/// user forced a rescan. Bumping the version is how this format retires a
+/// snapshot; see `is_hidden_entry` in `proto::storage` for the rule the
+/// rebuild applies.
+pub const CATALOG_VERSION: u8 = 6;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 156;
 /// Byte range of the title field inside a record, exposed so the firmware
