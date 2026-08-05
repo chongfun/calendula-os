@@ -30,6 +30,7 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
+    fast_du: bool,
 ) -> Result<(), PanelError> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb).await?;
@@ -69,7 +70,7 @@ pub(crate) async fn flush(
         .await?;
     epd.command(
         CMD_DISPLAY_UPDATE_CTRL2,
-        &[update_control_2(mode, screen_on, false)],
+        &[update_control_2(mode, screen_on, false, fast_du)],
     )
     .await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
@@ -111,7 +112,7 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
     );
     epd.command(
         CMD_DISPLAY_UPDATE_CTRL2,
-        &[update_control_2(RefreshMode::PowerDown, true, false)],
+        &[update_control_2(RefreshMode::PowerDown, true, false, false)],
     )
     .await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;

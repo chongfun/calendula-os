@@ -446,6 +446,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.screen_on(),
                     mode,
                     prev_prestaged,
+                    request.refresh_quality == app_core::RefreshQuality::Fast,
                 )
                 .await
                 .is_ok()
@@ -692,6 +693,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.screen_on(),
                     RefreshMode::Full,
                     prev_prestaged,
+                    false,
                 )
                 .await
                 .is_ok()
@@ -812,6 +814,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                                 refresh_planner.screen_on(),
                                 mode,
                                 prev_prestaged,
+                                loading_request.refresh_quality == app_core::RefreshQuality::Fast,
                             )
                             .await
                             .is_ok()
@@ -2035,6 +2038,7 @@ fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppS
         shell_orientation: state.shell_orientation,
         reading_orientation: state.reading_orientation,
         refresh_policy: state.refresh_policy,
+        refresh_quality: state.refresh_quality,
         font_size: state.font_size,
         line_spacing: state.line_spacing,
         font_weight: state.font_weight,
@@ -2135,6 +2139,7 @@ fn restore_saved_state(
         page_count,
         reading_orientation: record.reading_orientation,
         refresh_policy: record.refresh_policy,
+        refresh_quality: record.refresh_quality,
         font_size: record.font_size,
         line_spacing: record.line_spacing,
         font_weight: record.font_weight,
@@ -2190,6 +2195,8 @@ fn sleep_request_from_saved_state(
         library_menu: app_core::LibraryMenu::None,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
+        refresh_quality: app_core::refresh_quality_from_u8(record.refresh_quality)
+            .unwrap_or(app_core::RefreshQuality::Normal),
         font_size: display::font::FontSize::from_u8(record.font_size)
             .unwrap_or(display::font::FontSize::Medium),
         line_spacing: display::font::LineSpacing::from_u8(record.line_spacing)

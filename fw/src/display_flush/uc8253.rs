@@ -67,6 +67,7 @@ pub(crate) async fn flush(
     _screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
+    _fast_du: bool,
 ) -> Result<(), PanelError> {
     let plan = flush_plan(mode, SCREEN_POWERED.load(Ordering::Relaxed), prev_staged);
     bench_log!(

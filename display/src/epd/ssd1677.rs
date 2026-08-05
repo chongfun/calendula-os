@@ -130,7 +130,12 @@ pub const fn ram_y_counter(rect: Rect) -> [u8; 2] {
     [bottom as u8, (bottom >> 8) as u8]
 }
 
-pub const fn update_control_2(mode: RefreshMode, screen_is_on: bool, turn_off: bool) -> u8 {
+pub const fn update_control_2(
+    mode: RefreshMode,
+    screen_is_on: bool,
+    turn_off: bool,
+    fast_du: bool,
+) -> u8 {
     let mut value = 0;
     if !screen_is_on {
         value |= 0xC0;
@@ -140,6 +145,7 @@ pub const fn update_control_2(mode: RefreshMode, screen_is_on: bool, turn_off: b
     }
     match mode {
         RefreshMode::Full => value | 0x34,
+        RefreshMode::Fast if fast_du => value | 0x18,
         RefreshMode::Fast => value | 0x1C,
         // Load LUT (display mode 1) + display, deliberately without the
         // 0x20 load-temperature bit so the FAST_CLEAN_TEMPERATURE override
