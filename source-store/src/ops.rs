@@ -515,6 +515,11 @@ pub enum RequestTrace {
     Metadata(SlotEntry),
     /// A tombstone carries it: a delete.
     Tombstone(Tombstone),
+    /// *More than one* committed record carries it, so the card holds
+    /// contradictory accounts of what this request did. No answer can be
+    /// served from evidence that disagrees with itself; every endpoint
+    /// refuses.
+    Conflict,
 }
 
 /// Find the committed record — of *any* type — that carries `request_id`.
@@ -533,10 +538,22 @@ pub enum RequestTrace {
 /// answered, with the evidence sitting in a file that endpoint never opens.
 /// So every endpoint asks this one question instead.
 ///
-/// Metadata is searched first. A well-formed card cannot have both — the
-/// second use of an ID is exactly what this prevents — so the order only
-/// decides what happens on a card written by a build that lacked this check,
-/// and there the metadata-first answer is the refusing one.
+/// Every record is scanned, not just up to the first hit, because a card
+/// *can* carry two — and the scan order must not be what decides the answer.
+/// A build whose delete fallback searched only tombstones would execute a
+/// delete under an ID an upload had already spent, leaving metadata and a
+/// tombstone both bearing it; the schema does not change across that upgrade,
+/// so such a card loads normally. Returning the first hit would then replay
+/// an upload result for a book that was subsequently deleted, or refuse a
+/// delete whose own tombstone is sitting right there. Neither is an answer,
+/// so a second match is [`RequestTrace::Conflict`] and every endpoint fails
+/// closed. Duplicate metadata or duplicate tombstones count the same way:
+/// whatever produced them, one request did not commit twice.
+///
+/// Receipts are still resolved first, ahead of this. A receipt is a stronger
+/// and later record than either file — the operation that wrote it saw the
+/// fallback state and was allowed to proceed — so a card with a receipt has
+/// an unambiguous answer even when its older records disagree.
 ///
 /// Epoch-zero IDs are outside the namespace and never match: they are local
 /// unmanaged provenance (see [`crate::unmanaged`]), which no client request
@@ -545,17 +562,24 @@ pub fn find_request_trace(ws: &OpsWorkspace, request_id: &[u8; REQUEST_ID_BYTES]
     if request_id[..8] == [0u8; 8] {
         return RequestTrace::None;
     }
+    let mut found = RequestTrace::None;
     for entry in ws.entries.iter().flatten() {
         if entry.metadata.operation_request_id == *request_id {
-            return RequestTrace::Metadata(*entry);
+            if !matches!(found, RequestTrace::None) {
+                return RequestTrace::Conflict;
+            }
+            found = RequestTrace::Metadata(*entry);
         }
     }
     for (_, stone) in ws.tombstones.iter().flatten() {
         if stone.delete_request_id == *request_id {
-            return RequestTrace::Tombstone(*stone);
+            if !matches!(found, RequestTrace::None) {
+                return RequestTrace::Conflict;
+            }
+            found = RequestTrace::Tombstone(*stone);
         }
     }
-    RequestTrace::None
+    found
 }
 
 /// The authoritative entry carrying `book_token`, if any. Superseded,
@@ -649,6 +673,10 @@ pub enum DeleteOutcome {
     /// be resolved against it. Retryable once a reload succeeds; see
     /// [`IdempotencyStore::is_usable`].
     IdempotencyUnavailable,
+    /// Committed records disagree about what this request ID already did;
+    /// see [`RequestTrace::Conflict`]. Not retryable as-is — the card needs
+    /// attention, not another attempt.
+    AmbiguousRequestEvidence,
     Failed(PublishError),
 }
 
@@ -715,6 +743,7 @@ where
             return DeleteOutcome::RejectedParameterMismatch;
         }
         RequestTrace::Metadata(_) => return DeleteOutcome::RejectedParameterMismatch,
+        RequestTrace::Conflict => return DeleteOutcome::AmbiguousRequestEvidence,
         RequestTrace::None => {}
     }
 

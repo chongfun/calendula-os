@@ -117,6 +117,9 @@ pub enum UploadBeginOutcome {
     /// The idempotency store cannot say what is committed; see
     /// [`IdempotencyStore::is_usable`].
     IdempotencyUnavailable,
+    /// Committed records disagree about what this request ID already did;
+    /// see [`RequestTrace::Conflict`].
+    AmbiguousRequestEvidence,
     Failed(PublishError),
 }
 
@@ -297,6 +300,7 @@ where
         // The ID was spent on a delete. A create's result is not an answer
         // to it, and the retry must not become a second execution.
         RequestTrace::Tombstone(_) => return UploadBeginOutcome::RejectedParameterMismatch,
+        RequestTrace::Conflict => return UploadBeginOutcome::AmbiguousRequestEvidence,
         RequestTrace::None => {}
     }
 

@@ -82,6 +82,9 @@ pub enum RecoveryOutcome {
     /// The idempotency store cannot say what is committed; see
     /// [`IdempotencyStore::is_usable`].
     IdempotencyUnavailable,
+    /// Committed records disagree about what this request ID already did;
+    /// see [`RequestTrace::Conflict`].
+    AmbiguousRequestEvidence,
     Failed(PublishError),
 }
 
@@ -191,6 +194,7 @@ where
         }
         // The ID was spent on a delete; a recovery result is no answer to it.
         RequestTrace::Tombstone(_) => return RecoveryOutcome::RejectedParameterMismatch,
+        RequestTrace::Conflict => return RecoveryOutcome::AmbiguousRequestEvidence,
         RequestTrace::None => {}
     }
 

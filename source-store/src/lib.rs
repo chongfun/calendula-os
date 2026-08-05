@@ -75,7 +75,9 @@
 //!   searches every committed record type rather than the one the endpoint
 //!   happens to write ([`ops::find_request_trace`]). Otherwise an ID spent
 //!   on a delete looks unused to an upload, and the retry becomes a second
-//!   execution.
+//!   execution. Evidence that contradicts itself — two committed records for
+//!   one ID, which an earlier build could leave behind — is refused outright
+//!   rather than resolved by scan order.
 //!
 //! ## Record framing
 //!

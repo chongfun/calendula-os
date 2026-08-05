@@ -84,6 +84,7 @@ fn begin_name(outcome: &UploadBeginOutcome) -> &'static str {
         UploadBeginOutcome::RejectedNoFreeSlot => "RejectedNoFreeSlot",
         UploadBeginOutcome::CatalogUnavailable => "CatalogUnavailable",
         UploadBeginOutcome::IdempotencyUnavailable => "IdempotencyUnavailable",
+        UploadBeginOutcome::AmbiguousRequestEvidence => "AmbiguousRequestEvidence",
         UploadBeginOutcome::Failed(_) => "Failed",
     }
 }

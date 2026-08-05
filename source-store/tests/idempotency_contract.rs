@@ -19,12 +19,18 @@
 
 mod common;
 
-use common::{new_card, open_mgr, open_root, Dir, SharedDisk};
-use source_store::bodies::{DisplayLabel, BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES};
+use common::{new_card, open_mgr, open_root, publish_metadata, sample_metadata, Dir, SharedDisk};
+use source_store::bodies::{
+    DisplayLabel, Tombstone, BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES,
+    TOMBSTONE_LOGICAL_BYTES, TOMBSTONE_MAGIC, TOMBSTONE_SCHEMA, TOMBSTONE_STATUS_DELETED,
+};
 use source_store::layout;
 use source_store::ops::{
-    delete_book, load_catalog, DeleteOutcome, DeleteRequest, IdempotencyStore, OpsWorkspace,
+    delete_book, find_request_trace, load_catalog, DeleteOutcome, DeleteRequest, IdempotencyStore,
+    OpsWorkspace, RequestTrace,
 };
+use source_store::publish::publish_record;
+use source_store::record::{record_file_len, seal_body};
 use source_store::recover::{recover_book, RecoveryOutcome, RecoveryRequest};
 use source_store::select::SlotDisposition;
 use source_store::upload::{
@@ -152,8 +158,23 @@ fn name(outcome: &UploadBeginOutcome) -> &'static str {
         UploadBeginOutcome::RejectedNoFreeSlot => "RejectedNoFreeSlot",
         UploadBeginOutcome::CatalogUnavailable => "CatalogUnavailable",
         UploadBeginOutcome::IdempotencyUnavailable => "IdempotencyUnavailable",
+        UploadBeginOutcome::AmbiguousRequestEvidence => "AmbiguousRequestEvidence",
         UploadBeginOutcome::Failed(_) => "Failed",
     }
+}
+
+/// Seal and commit a tombstone into `slot` directly, bypassing `delete_book`.
+/// The fixtures below need a tombstone carrying a request ID the current
+/// build would never let a delete spend, which is the whole point.
+fn publish_tombstone(root: &Dir<'_>, slot: u8, stone: &Tombstone) {
+    let mut buf = vec![0u8; record_file_len(TOMBSTONE_LOGICAL_BYTES).unwrap()];
+    let logical = stone.encode_into(&mut buf).expect("encode tombstone");
+    let sealed =
+        seal_body(TOMBSTONE_MAGIC, TOMBSTONE_SCHEMA, 1, logical, &mut buf).expect("seal tombstone");
+    let pair = layout::tombstone_pair(slot).expect("tombstone slot");
+    let mut scratch = [0u8; 4096];
+    publish_record(root, pair.pair(), &buf, &sealed, 0, &mut scratch, || true)
+        .expect("publish tombstone");
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +348,176 @@ fn a_recovery_cannot_reuse_a_deletes_request_id() {
         visible_tokens(&disk),
         vec![survivor.book_token],
         "the recovery committed a generation under a spent request ID"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Evidence that contradicts itself is not evidence
+// ---------------------------------------------------------------------------
+
+/// The request ID both an upload and a delete spent, on a card an older
+/// build could leave behind.
+const CONTESTED: u8 = 7;
+
+/// Build that card. The sequence it comes from ran on `b095a80`, whose
+/// delete fallback searched tombstones only:
+///
+/// 1. An upload commits metadata under this ID; its receipt does not land.
+/// 2. A delete reuses the ID. Finding no receipt and no tombstone, that
+///    build called it new and executed it — committing a tombstone under
+///    the same ID.
+/// 3. That receipt does not land either.
+///
+/// The metadata layout did not change across the upgrade, so the card loads
+/// normally and neither record can be dismissed as stale. The delete is
+/// published directly here because the current build, correctly, will not
+/// perform step 2.
+fn card_with_two_records_for_one_request(root: &Dir<'_>, disk: &SharedDisk) -> UploadResult {
+    let bytes = epub_bytes(4_000, 1);
+    let mut ws = workspace();
+    load_catalog(root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(root, &mut ws).expect("idem");
+    let created = upload_book(root, &mut idem, &mut ws, CONTESTED, 10, 20, &bytes);
+
+    let mut request_id = [0u8; REQUEST_ID_BYTES];
+    request_id[..8].copy_from_slice(&1u64.to_le_bytes());
+    request_id[8..].copy_from_slice(&[CONTESTED; 16]);
+    publish_tombstone(
+        root,
+        0,
+        &Tombstone {
+            logical_book_id: created.logical_book_id,
+            deleted_source_generation: created.source_generation,
+            deleted_book_token: created.book_token,
+            delete_request_id: request_id,
+            delete_result_status: TOMBSTONE_STATUS_DELETED,
+        },
+    );
+    lose_every_receipt(root);
+
+    // Both records are committed and both load: the epoch still accepts the
+    // ID, so cleanup will not quietly repair this either.
+    let mut ws = workspace();
+    load_catalog(root, &mut ws).expect("catalog after reboot");
+    assert_eq!(
+        find_request_trace(&ws, &request_id),
+        RequestTrace::Conflict,
+        "the fixture did not produce two committed records for one request ID"
+    );
+    assert!(
+        visible_tokens(disk).is_empty(),
+        "the tombstone should hide the book it names"
+    );
+    created
+}
+
+/// Neither record may be served. Metadata-first would replay an upload
+/// result for a book the tombstone says was deleted; tombstone-first would
+/// replay a delete the upload metadata contradicts. Scan order is not an
+/// adjudicator, so every endpoint refuses — and refuses without writing.
+#[test]
+fn contradictory_records_for_one_request_id_are_refused_by_every_endpoint() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let created = card_with_two_records_for_one_request(&root, &disk);
+    let before = disk.snapshot();
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+
+    // The original upload, retried with its original parameters.
+    let retried = begin_upload(
+        &root,
+        &mut idem,
+        &create_request(CONTESTED, &epub_bytes(4_000, 1)),
+        fresh(10, 20),
+        &mut ws,
+    );
+    assert!(
+        matches!(retried, UploadBeginOutcome::AmbiguousRequestEvidence),
+        "an upload replayed a result the card contradicts: {}",
+        name(&retried)
+    );
+
+    // The delete, retried with the token its tombstone names.
+    assert_eq!(
+        delete_book(&root, &mut idem, &delete_request(CONTESTED, 20), &mut ws),
+        DeleteOutcome::AmbiguousRequestEvidence,
+        "a delete was refused as client misuse rather than as a card problem"
+    );
+
+    // And a recovery reusing the same ID.
+    assert_eq!(
+        recover_book(
+            &root,
+            &mut idem,
+            &recovery_request(CONTESTED, 20, &epub_bytes(3_000, 2)),
+            [31; BOOK_TOKEN_BYTES],
+            &mut ws,
+            || true,
+        ),
+        RecoveryOutcome::AmbiguousRequestEvidence,
+        "a recovery ran against contradictory evidence"
+    );
+
+    assert!(
+        disk.snapshot() == before,
+        "refusing a contradictory request ID wrote to the card"
+    );
+    // The refusal is not a denial of service for other work: a different
+    // request ID still resolves normally.
+    assert_eq!(
+        find_request_trace(&ws, &[9; REQUEST_ID_BYTES]),
+        RequestTrace::None
+    );
+    let _ = created;
+}
+
+/// Two metadata records carrying one request ID is the same failure with a
+/// different shape — nothing legitimate writes an ID into two slots — and it
+/// must not be resolved by whichever slot is scanned first either.
+#[test]
+fn duplicate_metadata_for_one_request_id_is_a_conflict_too() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let mut request_id = [0u8; REQUEST_ID_BYTES];
+    request_id[..8].copy_from_slice(&1u64.to_le_bytes());
+    request_id[8..].copy_from_slice(&[CONTESTED; 16]);
+    for (slot, seed) in [(0u8, 40u8), (1, 41)] {
+        let mut meta = sample_metadata(1);
+        meta.physical_slot = slot;
+        meta.logical_book_id = [seed; LOGICAL_BOOK_ID_BYTES];
+        meta.book_token = [seed; BOOK_TOKEN_BYTES];
+        meta.operation_request_id = request_id;
+        let pair = layout::metadata_pair(slot).expect("slot");
+        publish_metadata(&root, pair.pair(), &meta, 1).expect("publish");
+    }
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    assert_eq!(find_request_trace(&ws, &request_id), RequestTrace::Conflict);
+
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+    let before = disk.snapshot();
+    let outcome = begin_upload(
+        &root,
+        &mut idem,
+        &create_request(CONTESTED, &epub_bytes(2_000, 3)),
+        fresh(50, 60),
+        &mut ws,
+    );
+    assert!(
+        matches!(outcome, UploadBeginOutcome::AmbiguousRequestEvidence),
+        "a duplicated request ID resolved to one of its records: {}",
+        name(&outcome)
+    );
+    assert!(
+        disk.snapshot() == before,
+        "refusing a duplicated request ID wrote to the card"
     );
 }
 
