@@ -88,6 +88,11 @@ fw/        boot, Embassy executor, task wiring, board-owned peripherals
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
+source-store/ M0S source-transaction foundation: commit-sector record framing,
+           the durable publication sequence (`durable_sync`), typed authority
+           records (source metadata, tombstones, staging markers, idempotency
+           receipts), and startup source selection; host-tested with
+           fault-injection and simulated power-cut replay
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup-stable Cargo wrapper for firmware builds/checks
 tools/bench/    serial bench harness for hardware timing, storage/cache,
