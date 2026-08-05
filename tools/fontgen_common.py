@@ -5,14 +5,9 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-try:
-    import PIL
-    from PIL import Image, ImageDraw, features
-except ImportError:
-    PIL = None  # type: ignore[assignment]
-    Image = None  # type: ignore[assignment]
-    ImageDraw = None  # type: ignore[assignment]
-    features = None  # type: ignore[assignment]
+import PIL
+from bitmap_pool import BitmapPool as BitmapPool
+from PIL import Image, ImageDraw, features
 
 # The tables in `display/src/*_generated.rs` reproduce byte for byte on this
 # Pillow and not on later ones. Pillow 11 changed `getlength` from the hinted
@@ -79,13 +74,6 @@ THRESHOLD = text_render_threshold()
 
 def require_pinned_pillow() -> None:
     """Stop before generating anything on a toolchain or threshold configuration that changes metrics."""
-    if PIL is None or features is None:
-        raise SystemExit(
-            f"fontgen needs Pillow {PILLOW_PIN} and FreeType {FREETYPE_PIN}, but Pillow is not installed.\n"
-            f"  Install the pin, ideally into a throwaway environment:\n"
-            f"    python3.12 -m venv .fontgen && .fontgen/bin/pip install 'pillow=={PILLOW_PIN}'\n"
-            f"    .fontgen/bin/python tools/generate_literata.py"
-        )
     freetype_ver = features.version_module("freetype2")
     if PIL.__version__ != PILLOW_PIN or freetype_ver != FREETYPE_PIN:
         raise SystemExit(
@@ -142,38 +130,6 @@ def ensure_font(path: Path, url: str, sha256: str) -> None:
 
 def advance_fp(font, text: str) -> int:
     return max(round(font.getlength(text) * ADVANCE_SCALE), ADVANCE_SCALE)
-
-
-class BitmapPool:
-    """The shared bitmap array, storing each distinct glyph once.
-
-    The shipped ranges run past what the TTFs cover, and every uncovered
-    codepoint rasterizes to the same hollow `.notdef` rectangle -- 792 copies
-    of one 11x16 box in Literata's regular face alone. Each copy used to get
-    its own bytes, so across the 34 shipped tables the most-repeated glyph in
-    each accounted for 741,627 of 2,014,522 bitmap bytes, about 37%.
-
-    Nothing reads the array sequentially: `BitmapFont::glyph` slices it by the
-    metric's own offset and length, so two codepoints can point at one slice
-    and render identically. Only `offset` changes, which is storage layout
-    rather than glyph identity -- advances, boxes and pixels are untouched, so
-    no wrap input moves and the fingerprints in `display/tests/glyph_tables.rs`
-    are unchanged by construction, since they deliberately exclude `offset`.
-    """
-
-    def __init__(self):
-        self.data = bytearray()
-        self._offsets = {}
-
-    def add(self, rows, width: int = 0, height: int = 0) -> int:
-        """The offset `rows` lives at, appending it only if it is new."""
-        key = (bytes(rows), width, height)
-        offset = self._offsets.get(key)
-        if offset is None:
-            offset = len(self.data)
-            self._offsets[key] = offset
-            self.data.extend(rows)
-        return offset
 
 
 # Room around the reported box for the monochrome raster to land outside it,

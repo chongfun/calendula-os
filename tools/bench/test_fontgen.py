@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fontgen_common import BitmapPool  # noqa: E402
+from bitmap_pool import BitmapPool  # noqa: E402
 
 
 class TestBitmapPool(unittest.TestCase):
