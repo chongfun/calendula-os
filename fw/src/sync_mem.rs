@@ -38,12 +38,13 @@ pub struct RawRegion {
 // loaning side never touches the memory again.
 unsafe impl Send for RawRegion {}
 
-/// Everything the display task hands the wifi task: two heap regions
-/// (the dismantled scratch struct and the XHTML window) plus initialized
-/// buffers reused directly as socket and HTTP scratch.
+/// Everything the display task hands the wifi task: three heap regions
+/// (the dismantled scratch struct, the decoder static, and the XHTML window)
+/// plus initialized buffers reused directly as socket and HTTP scratch.
 pub struct SyncLoan {
     pub heap_a: RawRegion,
     pub heap_b: RawRegion,
+    pub heap_c: RawRegion,
     pub tcp_rx: &'static mut [u8],
     pub tcp_tx: &'static mut [u8],
     pub http_a: &'static mut [u8],
@@ -85,16 +86,15 @@ pub fn take_prev_fb() -> Option<&'static mut display::fb::Framebuffer> {
 
 static HEAP_DONATED: AtomicBool = AtomicBool::new(false);
 
-/// Donates the two loaned regions to the esp-alloc heap the radio blob
-/// allocates from. Callable once; esp-alloc supports up to three regions,
-/// so the session's two donations fit with one to spare.
-pub fn donate_heap(heap_a: RawRegion, heap_b: RawRegion) {
+/// Donates the three loaned regions to the esp-alloc heap the radio blob
+/// allocates from. Callable once; esp-alloc supports up to three regions.
+pub fn donate_heap(heap_a: RawRegion, heap_b: RawRegion, heap_c: RawRegion) {
     if HEAP_DONATED.swap(true, Ordering::SeqCst) {
         return;
     }
     // Safety: each region is exclusively owned for the rest of the
     // session (the loans are a one-way handoff), 'static by construction,
-    // and non-empty.
+    // and non-empty (if provided).
     unsafe {
         esp_alloc::HEAP.add_region(HeapRegion::new(
             heap_a.ptr,
@@ -106,5 +106,12 @@ pub fn donate_heap(heap_a: RawRegion, heap_b: RawRegion) {
             heap_b.len,
             MemoryCapability::Internal.into(),
         ));
+        if heap_c.len > 0 {
+            esp_alloc::HEAP.add_region(HeapRegion::new(
+                heap_c.ptr,
+                heap_c.len,
+                MemoryCapability::Internal.into(),
+            ));
+        }
     }
 }

@@ -1,9 +1,13 @@
 use crate::book::{BookId, BookMeta, BookSource, ChapterMeta, CoverStatus};
 use crate::text::{FontStyle, TextAlign, TextBlock, TextRole};
 use heapless::Vec;
+use miniz_oxide::inflate::core::decompress_with_limit;
+use miniz_oxide::inflate::core::inflate_flags::{
+    TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+};
+pub use miniz_oxide::inflate::core::DecompressorOxide;
 use miniz_oxide::inflate::decompress_slice_iter_to_slice;
-use miniz_oxide::inflate::stream::{inflate, InflateState};
-use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
+use miniz_oxide::inflate::TINFLStatus;
 
 // One spine item per chapter, so this bounds how many chapters a book can have.
 // Items are now `Span`-encoded (see `SpineItem`/`Span`), ~half the size of the
@@ -151,21 +155,120 @@ pub struct ZipLocalStream<R> {
     pending_payload_remaining: u32,
 }
 
+/// The LZ77 window deflate decodes against, which is also the ring the
+/// decoded bytes land in. `inflate::core::decompress` requires a power of
+/// two, and a match may reach 32 KiB back, so this is the minimum that
+/// decodes every legal stream.
+pub const INFLATE_WINDOW_BYTES: usize = 32 * 1024;
+const INFLATE_WINDOW_MASK: usize = INFLATE_WINDOW_BYTES - 1;
+const _: () = assert!(INFLATE_WINDOW_BYTES.is_power_of_two());
+
+/// Decoder window scratch, owned by the caller.
+///
+/// The current struct is ~32 KiB (the 32 KiB LZ77 window buffer plus a position
+/// counter and a borrowed decoder reference). The ~10.5 KiB `DecompressorOxide`
+/// decoder state is allocated in a separate static cell and supplied via
+/// [`Self::prepare`].
+///
+/// The shape is dictated by one requirement: **this must be constructible
+/// without ever existing as a value on a tight stack.** Historically, when
+/// `ZipInflateScratch` held `InflateState` by value, the combined ~43 KB struct
+/// was returned by value against a 42 KB stack. That temporary landed on the stack,
+/// ran 11 KB past the bottom into `.bss`, and unwrapped `None` on a clock read.
+/// Borrowing the scratch moved the allocation, but `ZipInflateScratch::new()`
+/// returning a ~21 KB frame by value still relied on LLVM eliding the copy.
+///
+/// Splitting out `DecompressorOxide` and keeping `ZipInflateScratch::new()` a
+/// `const fn` whose value is **all zero bytes** allows `ZipInflateScratch` to be
+/// const-initialized directly in `.bss`. Holding `DecompressorOxide` inside by
+/// value — even as `Option<DecompressorOxide>` — would cost 43 KB of flash because
+/// `None` is not provably all-zero and would force the whole struct into `.data`.
+/// Measured, both ways.
+///
+/// The decoder is therefore borrowed separately, supplied once by [`Self::prepare`].
 pub struct ZipInflateScratch {
-    state: InflateState,
+    /// `None` until [`Self::prepare`] runs. A null reference, so the const
+    /// constructor stays all-zero — see the type docs.
+    decompressor: Option<&'static mut DecompressorOxide>,
+    window: [u8; INFLATE_WINDOW_BYTES],
+    /// Total bytes decoded into `window` this stream, unmasked, so the
+    /// write position is `window_pos & INFLATE_WINDOW_MASK`.
+    window_pos: usize,
 }
 
 impl ZipInflateScratch {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            state: InflateState::new(DataFormat::Raw),
+            decompressor: None,
+            window: [0; INFLATE_WINDOW_BYTES],
+            window_pos: 0,
         }
+    }
+
+    /// Adopt the decoder this scratch will use. Must be called before any
+    /// entry is decoded; decoding without it fails every entry.
+    ///
+    /// The decoder is passed in rather than built here because miniz only
+    /// constructs it by value at ~10 KB, and the caller knows which stack
+    /// can afford that. Firmware initializes a `StaticCell` for it while
+    /// setting up its scratch, on a shallow frame — the alternative is that
+    /// it lands several frames deep inside the EPUB open chain, the deepest
+    /// stack in the system.
+    pub fn prepare(&mut self, decompressor: &'static mut DecompressorOxide) {
+        self.decompressor = Some(decompressor);
+    }
+
+    /// Take the prepared `DecompressorOxide` reference, if one was provided.
+    pub fn take_decompressor(&mut self) -> Option<&'static mut DecompressorOxide> {
+        self.decompressor.take()
+    }
+
+    /// Borrow the decoder and window as separate pieces, with the decoder
+    /// reset for a fresh stream. `None` when [`Self::prepare`] never ran.
+    ///
+    /// The window keeps the previous entry's bytes; [`window_flags`] is what
+    /// stops the new stream from reading them, at no per-entry cost.
+    fn begin(&mut self) -> Option<(&mut DecompressorOxide, &mut [u8], &mut usize)> {
+        let decompressor = self.decompressor.as_deref_mut()?;
+        decompressor.init();
+        self.window_pos = 0;
+        Some((decompressor, &mut self.window, &mut self.window_pos))
     }
 }
 
 impl Default for ZipInflateScratch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Decode flags that keep one stream from reading another's leftovers.
+///
+/// The ring is not cleared between entries, so until it has wrapped once,
+/// everything at or past `window_pos` is still the *previous* entry's
+/// output. Wrapping mode would happily resolve a back-reference into it:
+/// miniz only rejects a distance larger than the whole buffer, computes the
+/// source with a wrapping subtraction, and a malformed entry whose first
+/// operation is a match at distance 32768 therefore copies out — and emits —
+/// 32 KiB of the last entry. ZIP deflate has no preset dictionary, so no
+/// legitimate stream does that.
+///
+/// `TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF` makes miniz compare the
+/// distance against `out_pos` instead, i.e. against what *this* stream has
+/// produced, and fail the stream when it reaches back further. Once the ring
+/// has wrapped, every byte within 32 KiB is genuinely this stream's own, and
+/// wrapping mode — the only mode that can address it — takes over. The flag
+/// is read fresh on each `decompress` call and leaves no state behind, so
+/// switching at the wrap is safe.
+///
+/// This replaces the `FullReset` the old `InflateState` path did, which zeroed
+/// a separate 32 KiB dictionary per entry; the point of the caller-owned ring
+/// is not to pay that.
+const fn window_flags(window_pos: usize) -> u32 {
+    if window_pos < INFLATE_WINDOW_BYTES {
+        TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
+    } else {
+        0
     }
 }
 
@@ -279,11 +382,13 @@ where
     }
 
     /// Stream a zip entry's uncompressed bytes into a caller-supplied sink.
-    /// The `output_window` buffer is reused across chunks; it only needs to be
-    /// large enough to make forward progress (a few hundred bytes is plenty).
-    /// `emit` is invoked with each filled window; the parser/tokenizer on the
-    /// other side consumes them incrementally and never has to materialize the
-    /// whole entry in RAM.
+    /// `output_window` bounds the chunks: it only needs to be large enough to
+    /// make forward progress (a few hundred bytes is plenty), and `emit` never
+    /// sees a slice longer than it. Stored entries are read through it;
+    /// deflated ones are decoded in the inflate scratch's own ring and it caps
+    /// how far each decode may run, so no byte is copied through it. Either
+    /// way the parser/tokenizer on the other side consumes the chunks
+    /// incrementally and never has to materialize the whole entry in RAM.
     pub fn read_entry_to_sink<F>(
         &mut self,
         entry: OwnedZipEntry,
@@ -295,6 +400,11 @@ where
     where
         F: FnMut(&[u8]) -> Result<(), ZipError>,
     {
+        // A zero-length window makes no progress on either path: stored
+        // entries would loop forever on a zero-byte read.
+        if output_window.is_empty() {
+            return Err(ZipError::OutputTooSmall);
+        }
         if entry.local_header_offset != self.pending_payload_offset
             || entry.compressed_size != self.pending_payload_remaining
         {
@@ -314,7 +424,7 @@ where
             8 => self.inflate_entry_to_sink(
                 entry.compressed_size,
                 input,
-                output_window,
+                output_window.len(),
                 inflate_scratch,
                 emit,
             ),
@@ -326,7 +436,7 @@ where
         &mut self,
         compressed_size: u32,
         input: &mut [u8],
-        output: &mut [u8],
+        emit_limit: usize,
         inflate_scratch: &mut ZipInflateScratch,
         emit: F,
     ) -> Result<(), ZipError>
@@ -338,7 +448,7 @@ where
             |_, buf| read_exact_stream(reader, buf),
             compressed_size,
             input,
-            output,
+            emit_limit,
             inflate_scratch,
             emit,
         )?;
@@ -640,6 +750,10 @@ where
     where
         F: FnMut(&[u8]) -> Result<(), ZipError>,
     {
+        // See `ZipLocalStream::read_entry_to_sink` for why zero is rejected.
+        if output_window.is_empty() {
+            return Err(ZipError::OutputTooSmall);
+        }
         let payload_offset = self.entry_payload_offset(entry)?;
         match entry.compression_method {
             0 => {
@@ -661,7 +775,7 @@ where
                 payload_offset,
                 entry.compressed_size,
                 compressed_scratch,
-                output_window,
+                output_window.len(),
                 inflate_scratch,
                 emit,
             ),
@@ -674,7 +788,7 @@ where
         payload_offset: u32,
         compressed_size: u32,
         input: &mut [u8],
-        output: &mut [u8],
+        emit_limit: usize,
         inflate_scratch: &mut ZipInflateScratch,
         emit: F,
     ) -> Result<(), ZipError>
@@ -686,7 +800,7 @@ where
             |fetched, buf| read_exact_at(reader, payload_offset + fetched, buf),
             compressed_size,
             input,
-            output,
+            emit_limit,
             inflate_scratch,
             emit,
         )
@@ -900,12 +1014,25 @@ where
 ///
 /// `fetch` fills `buf` with compressed payload bytes starting at the given
 /// payload-relative offset; the engine only moves forward, so sequential
-/// readers can ignore the offset. Inflate always runs with `MZFlush::None`:
-/// passing `Finish` on the first call makes miniz decompress straight into
-/// the caller's buffer and permanently fail the stream when that buffer is
-/// smaller than the entry — exactly the small-window case this engine exists
-/// for. The deflate stream's final block signals completion on its own, so
-/// `Finish` is never needed.
+/// readers can ignore the offset.
+///
+/// Decoding runs through `inflate::core::decompress`, whose output buffer
+/// *is* the LZ77 window: a power-of-two ring the decoder both writes to and
+/// resolves back-references against. That is why the scratch owns a 32 KiB
+/// ring rather than decoding into the caller's buffer — the caller's buffers
+/// run 4-24 KB, well under the 32 KiB a match may reach back, so they cannot
+/// serve as the window.
+///
+/// A decoded run is therefore always one contiguous slice of the ring,
+/// never a wrapped pair: the decoder clamps its own write limit to the end
+/// of the slice it is given, so a single call stops at the ring's physical
+/// end and the next resumes at zero. The engine relies on that — it hands
+/// `emit` a plain `&window[out_pos..]` subslice.
+///
+/// `emit_limit` caps how much one call may decode, and so bounds every slice
+/// `emit` sees. The ring stays a full 32 KiB behind it: that is what lets a
+/// match reach 32 KiB back while the caller still gets its chunks in the size
+/// it asked for.
 ///
 /// Returns the number of compressed bytes fetched, which sequential callers
 /// use to restore their cursor.
@@ -913,7 +1040,7 @@ fn inflate_chunks_to_sink<F, E>(
     mut fetch: F,
     compressed_size: u32,
     input: &mut [u8],
-    output: &mut [u8],
+    emit_limit: usize,
     inflate_scratch: &mut ZipInflateScratch,
     mut emit: E,
 ) -> Result<u32, ZipError>
@@ -921,66 +1048,63 @@ where
     F: FnMut(u32, &mut [u8]) -> Result<(), ZipError>,
     E: FnMut(&[u8]) -> Result<(), ZipError>,
 {
-    if input.is_empty() || output.is_empty() {
+    if input.is_empty() || emit_limit == 0 {
         return Err(ZipError::OutputTooSmall);
     }
     if compressed_size == 0 {
         return Ok(0);
     }
-    inflate_scratch.state.reset(DataFormat::Raw);
+    // A scratch nobody prepared has no decoder; see `ZipInflateScratch`.
+    let (decompressor, window, window_pos) = inflate_scratch.begin().ok_or(ZipError::Inflate)?;
+
     let mut compressed_read = 0u32;
-    let mut output_pos = 0usize;
     loop {
-        let remaining = (compressed_size - compressed_read) as usize;
-        let input_len = input.len().min(remaining);
+        let input_len = input
+            .len()
+            .min((compressed_size - compressed_read) as usize);
         if input_len > 0 {
             fetch(compressed_read, &mut input[..input_len])?;
             compressed_read += input_len as u32;
         }
+        // Withholding this flag on the final chunk is what turns a truncated
+        // stream into an error instead of a wait for input that never comes.
+        let input_flags = if compressed_read < compressed_size {
+            TINFL_FLAG_HAS_MORE_INPUT
+        } else {
+            0
+        };
         let mut consumed = 0usize;
         loop {
-            let result = inflate(
-                &mut inflate_scratch.state,
+            let out_pos = *window_pos & INFLATE_WINDOW_MASK;
+            let (status, used, written) = decompress_with_limit(
+                decompressor,
                 &input[consumed..input_len],
-                &mut output[output_pos..],
-                MZFlush::None,
+                window,
+                out_pos,
+                emit_limit,
+                input_flags | window_flags(*window_pos),
             );
-            consumed += result.bytes_consumed;
-            output_pos += result.bytes_written;
-            match result.status {
-                Ok(MZStatus::StreamEnd) => {
-                    if output_pos > 0 {
-                        emit(&output[..output_pos])?;
-                    }
-                    return Ok(compressed_read);
-                }
-                // `BufError` is miniz for "no room": output full or input
-                // empty. Neither is fatal here, so it shares the Ok logic and
-                // the progress checks below decide what happens next.
-                Ok(MZStatus::Ok) | Err(MZError::Buf) => {
-                    if output_pos == output.len() {
-                        emit(&output[..output_pos])?;
-                        output_pos = 0;
-                        continue;
-                    }
-                    if result.bytes_consumed == 0 && result.bytes_written == 0 {
-                        if consumed == input_len {
-                            // Chunk and dictionary both drained: fetch more.
-                            break;
-                        }
-                        // Input and window space available but no progress:
-                        // the stream is corrupt.
+            consumed += used;
+            if written > 0 {
+                emit(&window[out_pos..out_pos + written])?;
+                *window_pos += written;
+            }
+            match status {
+                TINFLStatus::Done => return Ok(compressed_read),
+                // The emit limit was reached, or this call hit the ring's
+                // end: go again at the advanced (possibly wrapped) position.
+                TINFLStatus::HasMoreOutput => {
+                    if used == 0 && written == 0 {
                         return Err(ZipError::Inflate);
                     }
-                    // Progress with window space left: inflate again. This
-                    // covers entries larger than the 32 KB dictionary, which
-                    // drain in partial pushes between input chunks.
                 }
+                TINFLStatus::NeedsMoreInput => break,
                 _ => return Err(ZipError::Inflate),
             }
         }
         if compressed_read == compressed_size {
-            // Every payload byte was consumed without an end-of-stream block.
+            // Only reachable if the decoder asked for input on the chunk that
+            // carried the last byte, which it cannot: the flag was withheld.
             return Err(ZipError::Inflate);
         }
     }
@@ -989,6 +1113,11 @@ where
 /// Prefix variant of [`inflate_chunks_to_sink`]: decodes into `output` until
 /// it fills, returning the decoded length, whether the whole entry fit, and
 /// the number of compressed bytes fetched.
+///
+/// Where the sink variant limits each decode to the caller's chunk size, this
+/// one limits it to the space left in `output`, so the ring never runs ahead
+/// of what has been copied out of it. The ring stays a full 32 KiB regardless,
+/// which is what lets a match reach further back than `output` is long.
 fn inflate_chunks_prefix<F>(
     mut fetch: F,
     compressed_size: u32,
@@ -1005,47 +1134,59 @@ where
     if compressed_size == 0 {
         return Ok((0, true, 0));
     }
-    inflate_scratch.state.reset(DataFormat::Raw);
+    let (decompressor, window, window_pos) = inflate_scratch.begin().ok_or(ZipError::Inflate)?;
+
     let mut compressed_read = 0u32;
     let mut output_pos = 0usize;
     loop {
-        let remaining = (compressed_size - compressed_read) as usize;
-        let input_len = input.len().min(remaining);
+        let input_len = input
+            .len()
+            .min((compressed_size - compressed_read) as usize);
         if input_len > 0 {
             fetch(compressed_read, &mut input[..input_len])?;
             compressed_read += input_len as u32;
         }
+        let input_flags = if compressed_read < compressed_size {
+            TINFL_FLAG_HAS_MORE_INPUT
+        } else {
+            0
+        };
         let mut consumed = 0usize;
         loop {
-            let result = inflate(
-                &mut inflate_scratch.state,
+            if output_pos == output.len() {
+                // The entry holds more than the prefix can take. Asking for
+                // another byte here would cap `out_max` at zero and spin.
+                return Ok((output_pos, false, compressed_read));
+            }
+            let out_pos = *window_pos & INFLATE_WINDOW_MASK;
+            let out_max = (INFLATE_WINDOW_BYTES - out_pos).min(output.len() - output_pos);
+            let (status, used, written) = decompress_with_limit(
+                decompressor,
                 &input[consumed..input_len],
-                &mut output[output_pos..],
-                MZFlush::None,
+                window,
+                out_pos,
+                out_max,
+                input_flags | window_flags(*window_pos),
             );
-            consumed += result.bytes_consumed;
-            output_pos += result.bytes_written;
-            match result.status {
-                Ok(MZStatus::StreamEnd) => return Ok((output_pos, true, compressed_read)),
-                // See `inflate_chunks_to_sink` for the shared Ok/Buf logic.
-                Ok(MZStatus::Ok) | Err(MZError::Buf) => {
-                    if output_pos == output.len() {
-                        // A full buffer with the stream still open means the
-                        // entry holds more bytes than the prefix can take.
-                        return Ok((output_pos, false, compressed_read));
-                    }
-                    if result.bytes_consumed == 0 && result.bytes_written == 0 {
-                        if consumed == input_len {
-                            break;
-                        }
+            consumed += used;
+            if written > 0 {
+                output[output_pos..output_pos + written]
+                    .copy_from_slice(&window[out_pos..out_pos + written]);
+                output_pos += written;
+                *window_pos += written;
+            }
+            match status {
+                TINFLStatus::Done => return Ok((output_pos, true, compressed_read)),
+                TINFLStatus::HasMoreOutput => {
+                    if used == 0 && written == 0 && output_pos < output.len() {
                         return Err(ZipError::Inflate);
                     }
                 }
+                TINFLStatus::NeedsMoreInput => break,
                 _ => return Err(ZipError::Inflate),
             }
         }
         if compressed_read == compressed_size {
-            // Every payload byte was consumed without an end-of-stream block.
             return Err(ZipError::Inflate);
         }
     }
@@ -3688,6 +3829,7 @@ extern crate std;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::boxed::Box as StdBox;
     use std::vec::Vec as StdVec;
 
     struct SliceReader<'a> {
@@ -4629,7 +4771,7 @@ mod tests {
             .expect("entry exists");
         let mut compressed = [0u8; 512];
         let mut window = [0u8; 32];
-        let mut inflate = ZipInflateScratch::new();
+        let mut inflate = inflate_scratch();
         let mut collected: std::vec::Vec<u8> = std::vec::Vec::new();
 
         stream
@@ -4669,7 +4811,7 @@ mod tests {
             .expect("entry exists");
         let mut compressed = [0u8; 16];
         let mut window = [0u8; 32];
-        let mut inflate = ZipInflateScratch::new();
+        let mut inflate = inflate_scratch();
         let mut collected: StdVec<u8> = StdVec::new();
 
         stream
@@ -4684,11 +4826,16 @@ mod tests {
 
     #[test]
     fn zip_stream_read_entry_to_sink_drains_entries_larger_than_inflate_dictionary() {
-        // 100 KB decompressed forces miniz to cycle its 32 KB internal
-        // dictionary several times, and the 33-byte window guarantees the
-        // dictionary drains in partial pushes that do not line up with input
-        // chunk boundaries. Catches the engine treating "no input consumed
-        // but output written" or BufError-at-chunk-edges as failures.
+        // 100 KB decompressed cycles the 32 KiB ring several times, in
+        // partial pushes that do not line up with input chunk boundaries.
+        // Catches the engine treating "no input consumed but output
+        // written", or a ring-end stop, as failure.
+        //
+        // The 33-byte buffer no longer *stages* the deflate path — the
+        // scratch's own ring does — but it still bounds it: nothing is
+        // copied through the buffer, and no emitted chunk may exceed it.
+        // Deflated bytes reach `emit` straight out of a 32 KiB ring, so
+        // that bound holds only while the engine caps each decode by it.
         let plain: StdVec<u8> = (0u32..100_000)
             .map(|value| (value.wrapping_mul(2_654_435_761) >> 13) as u8)
             .collect();
@@ -4702,7 +4849,271 @@ mod tests {
             .expect("entry exists");
         let mut compressed = [0u8; 1000];
         let mut window = [0u8; 33];
-        let mut inflate = ZipInflateScratch::new();
+        let mut inflate = inflate_scratch();
+        let mut collected: StdVec<u8> = StdVec::new();
+        let mut widest_chunk = 0usize;
+
+        stream
+            .read_entry_to_sink(entry, &mut compressed, &mut window, &mut inflate, |chunk| {
+                widest_chunk = widest_chunk.max(chunk.len());
+                collected.extend_from_slice(chunk);
+                Ok(())
+            })
+            .expect("entry streams");
+
+        assert_eq!(collected, plain);
+        assert!(
+            widest_chunk <= window.len(),
+            "emitted a {widest_chunk}-byte chunk into a {}-byte window",
+            window.len()
+        );
+    }
+
+    #[test]
+    fn zip_stream_to_sink_rejects_a_zero_length_output_window() {
+        // Zero makes no progress on either path, and the stored path would
+        // spin on it forever: a read of zero bytes never shrinks `remaining`.
+        let plain = b"whatever".as_slice();
+        let deflated = miniz_oxide::deflate::compress_to_vec(plain, 6);
+        let zip_bytes = zip_with_methods(&[
+            ("OPS/stored.xhtml", 0, plain, plain),
+            ("OPS/deflated.xhtml", 8, &deflated, plain),
+        ]);
+        let mut tail = [0u8; 1024];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut tail)
+            .expect("stream zip parses");
+        let mut inflate = inflate_scratch();
+
+        for name in ["OPS/stored.xhtml", "OPS/deflated.xhtml"] {
+            let entry = stream
+                .find_entry(name, &mut [0u8; 46], &mut [0u8; 64])
+                .expect("entry exists");
+            let result =
+                stream.read_entry_to_sink(entry, &mut [0u8; 64], &mut [], &mut inflate, |_| Ok(()));
+            assert!(
+                matches!(result, Err(ZipError::OutputTooSmall)),
+                "{name} accepted an empty window: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zip_stream_does_not_decode_an_entry_against_the_previous_entrys_window() {
+        // The 32 KiB ring is deliberately not cleared between entries, so
+        // nothing but the decode flags stops a malformed entry from reading
+        // what the last one left there. In miniz's wrapping mode a distance
+        // is rejected only when it exceeds the whole ring, and the source is
+        // computed by wrapping subtraction — so a first-operation match at
+        // distance 32768 resolves to ring offset 0 and copies out the
+        // previous entry. Zip deflate has no preset dictionary; no legal
+        // entry reaches back before its own first byte.
+        const MARKER: &[u8] = b"SECRET-PREVIOUS-ENTRY-BYTES\n";
+        let mut marker_plain: StdVec<u8> = StdVec::new();
+        while marker_plain.len() < 4096 {
+            marker_plain.extend_from_slice(MARKER);
+        }
+        let marker_deflated = miniz_oxide::deflate::compress_to_vec(&marker_plain, 6);
+        // Four maximal matches: 1032 bytes of whatever sits at the ring's
+        // front, which is where the entry above left its marker.
+        let attack_deflated = deflate_of_max_distance_matches(4);
+        let attack_plain = [0u8; 4 * 258];
+
+        let zip_bytes = zip_with_methods(&[
+            ("OPS/first.xhtml", 8, &marker_deflated, &marker_plain),
+            ("OPS/attack.xhtml", 8, &attack_deflated, &attack_plain),
+        ]);
+        let mut tail = [0u8; 1024];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut tail)
+            .expect("stream zip parses");
+        let mut compressed = [0u8; 512];
+        let mut window = [0u8; 512];
+        let mut inflate = inflate_scratch();
+
+        let first = stream
+            .find_entry("OPS/first.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+            .expect("entry exists");
+        let mut collected: StdVec<u8> = StdVec::new();
+        stream
+            .read_entry_to_sink(first, &mut compressed, &mut window, &mut inflate, |chunk| {
+                collected.extend_from_slice(chunk);
+                Ok(())
+            })
+            .expect("the first entry streams");
+        assert_eq!(collected, marker_plain, "the ring should hold the marker");
+
+        let attack = stream
+            .find_entry("OPS/attack.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+            .expect("entry exists");
+        let mut leaked: StdVec<u8> = StdVec::new();
+        let result = stream.read_entry_to_sink(
+            attack,
+            &mut compressed,
+            &mut window,
+            &mut inflate,
+            |chunk| {
+                leaked.extend_from_slice(chunk);
+                Ok(())
+            },
+        );
+
+        assert!(
+            !leaked.windows(MARKER.len()).any(|run| run == MARKER),
+            "the second entry emitted the first entry's bytes"
+        );
+        assert!(
+            matches!(result, Err(ZipError::Inflate)),
+            "a match reaching before the stream's first byte must fail it, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn zip_stream_prefix_does_not_decode_against_the_previous_entrys_window() {
+        // Same leak, through the prefix path, which runs its own decode loop.
+        const MARKER: &[u8] = b"SECRET-PREFIX-ENTRY-BYTES\n";
+        let mut marker_plain: StdVec<u8> = StdVec::new();
+        while marker_plain.len() < 4096 {
+            marker_plain.extend_from_slice(MARKER);
+        }
+        let marker_deflated = miniz_oxide::deflate::compress_to_vec(&marker_plain, 6);
+        let attack_deflated = deflate_of_max_distance_matches(4);
+        let attack_plain = [0u8; 4 * 258];
+
+        let zip_bytes = zip_with_methods(&[
+            ("OPS/first.xhtml", 8, &marker_deflated, &marker_plain),
+            ("OPS/attack.xhtml", 8, &attack_deflated, &attack_plain),
+        ]);
+        let mut tail = [0u8; 1024];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut tail)
+            .expect("stream zip parses");
+        let mut compressed = [0u8; 512];
+        let mut inflate = inflate_scratch();
+
+        let first = stream
+            .find_entry("OPS/first.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+            .expect("entry exists");
+        let mut resident = [0u8; 4200];
+        let len = stream
+            .read_entry_streamed(first, &mut compressed, &mut resident, &mut inflate)
+            .expect("the first entry reads");
+        assert_eq!(&resident[..len], &marker_plain[..]);
+
+        let attack = stream
+            .find_entry("OPS/attack.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+            .expect("entry exists");
+        let mut leaked = [0u8; 4 * 258];
+        let result = stream.read_entry_streamed(attack, &mut compressed, &mut leaked, &mut inflate);
+
+        assert!(
+            !leaked.windows(MARKER.len()).any(|run| run == MARKER),
+            "the prefix read emitted the first entry's bytes"
+        );
+        assert!(
+            matches!(result, Err(ZipError::Inflate)),
+            "a match reaching before the stream's first byte must fail it, got {result:?}"
+        );
+    }
+
+    /// A raw-deflate stream whose whole content is `repeats` back-references
+    /// at distance 32768 — the format's maximum — each 258 bytes long. From
+    /// the first byte of a stream that reaches back before anything it has
+    /// produced, so a decoder that honours the distance is reading somebody
+    /// else's memory. Hand-built because no compressor will emit one.
+    fn deflate_of_max_distance_matches(repeats: usize) -> StdVec<u8> {
+        let mut bits = BitWriter::default();
+        bits.push_bits(1, 1); // BFINAL
+        bits.push_bits(1, 2); // BTYPE = 01, fixed Huffman
+        for _ in 0..repeats {
+            // Fixed literal/length code 285 — length 258, no extra bits — is
+            // the 8-bit pattern 1100_0101.
+            bits.push_code(0b1100_0101, 8);
+            // Distance codes are plain 5-bit values; 29 covers 24577..=32768
+            // with 13 extra bits carrying the offset into that range.
+            bits.push_code(29, 5);
+            bits.push_bits(32_768 - 24_577, 13);
+        }
+        bits.push_code(0, 7); // end of block, code 256
+        bits.finish()
+    }
+
+    /// Just enough of a deflate bit packer for the fixture above.
+    #[derive(Default)]
+    struct BitWriter {
+        bytes: StdVec<u8>,
+        partial: u8,
+        filled: u32,
+    }
+
+    impl BitWriter {
+        /// Deflate packs plain integer fields low bit first.
+        fn push_bits(&mut self, value: u32, count: u32) {
+            for index in 0..count {
+                self.push_bit((value >> index) & 1);
+            }
+        }
+
+        /// Huffman codes go the other way: high bit of the code first.
+        fn push_code(&mut self, code: u32, count: u32) {
+            for index in (0..count).rev() {
+                self.push_bit((code >> index) & 1);
+            }
+        }
+
+        fn push_bit(&mut self, bit: u32) {
+            self.partial |= (bit as u8) << self.filled;
+            self.filled += 1;
+            if self.filled == 8 {
+                self.bytes.push(self.partial);
+                self.partial = 0;
+                self.filled = 0;
+            }
+        }
+
+        fn finish(mut self) -> StdVec<u8> {
+            if self.filled > 0 {
+                self.bytes.push(self.partial);
+            }
+            self.bytes
+        }
+    }
+
+    #[test]
+    fn zip_stream_resolves_matches_that_reach_back_across_the_ring_wrap() {
+        // The decoder's output buffer *is* its LZ77 window, so a match whose
+        // distance reaches back past the ring's physical end has to read the
+        // bytes that wrapped to the front. Near-random data (the test above)
+        // barely exercises that: it compresses into short, close matches.
+        //
+        // A 30 KB random block repeated eight times does. Every repeat is one
+        // match at distance 30,720 — just under the 32 KiB ceiling — so the
+        // matches are long, near-maximal, and land at every offset relative
+        // to the wrap. A ring the engine indexed wrongly returns garbage
+        // here while still returning `Done`.
+        let block: StdVec<u8> = (0u32..30_720)
+            .map(|value| (value.wrapping_mul(2_246_822_519) >> 11) as u8)
+            .collect();
+        let mut plain: StdVec<u8> = StdVec::new();
+        for _ in 0..8 {
+            plain.extend_from_slice(&block);
+        }
+        let deflated = miniz_oxide::deflate::compress_to_vec(&plain, 6);
+        assert!(
+            deflated.len() < plain.len() / 4,
+            "fixture must actually produce long matches, got {} from {}",
+            deflated.len(),
+            plain.len()
+        );
+        let zip_bytes = zip_with_methods(&[("OPS/repeat.xhtml", 8, &deflated, &plain)]);
+        let mut tail = [0u8; 1024];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut tail)
+            .expect("stream zip parses");
+        let entry = stream
+            .find_entry("OPS/repeat.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+            .expect("entry exists");
+        // A compressed chunk far smaller than the ring, so decode resumes
+        // mid-match at offsets unrelated to the wrap.
+        let mut compressed = [0u8; 512];
+        let mut window = [0u8; 64];
+        let mut inflate = inflate_scratch();
         let mut collected: StdVec<u8> = StdVec::new();
 
         stream
@@ -4712,7 +5123,48 @@ mod tests {
             })
             .expect("entry streams");
 
-        assert_eq!(collected, plain);
+        assert_eq!(collected.len(), plain.len());
+        assert!(collected == plain, "decoded bytes diverged from the source");
+    }
+
+    #[test]
+    fn zip_stream_prefix_keeps_window_history_beyond_its_output_buffer() {
+        // The prefix path caps how far the ring may run by the space left in
+        // the caller's buffer, which is smaller than the window. History has
+        // to survive that cap: a match reaching back further than `output`
+        // is long must still resolve, because the ring holds it even though
+        // the output buffer does not.
+        let block: StdVec<u8> = (0u32..20_000)
+            .map(|value| (value.wrapping_mul(2_654_435_761) >> 15) as u8)
+            .collect();
+        let mut plain: StdVec<u8> = StdVec::new();
+        for _ in 0..3 {
+            plain.extend_from_slice(&block);
+        }
+        let deflated = miniz_oxide::deflate::compress_to_vec(&plain, 6);
+        let zip_bytes = zip_with_methods(&[("OPS/prefix.xhtml", 8, &deflated, &plain)]);
+        let mut tail = [0u8; 1024];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut tail)
+            .expect("stream zip parses");
+        let entry = stream
+            .find_entry("OPS/prefix.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+            .expect("entry exists");
+        let mut compressed = [0u8; 512];
+        // Smaller than one block, so the second repeat's matches reach back
+        // past everything this buffer can hold.
+        let mut output = [0u8; 25_000];
+        let mut inflate = inflate_scratch();
+
+        let (len, complete) = stream
+            .read_entry_prefix_streamed(entry, &mut compressed, &mut output, &mut inflate)
+            .expect("prefix reads");
+
+        assert_eq!(len, output.len(), "the prefix should fill its buffer");
+        assert!(!complete, "the entry is larger than the buffer");
+        assert!(
+            output[..len] == plain[..len],
+            "the prefix diverged from the source"
+        );
     }
 
     #[test]
@@ -4743,7 +5195,7 @@ mod tests {
             .expect("big entry exists");
         let mut compressed = [0u8; 16];
         let mut prefix = [0u8; 64];
-        let mut inflate = ZipInflateScratch::new();
+        let mut inflate = inflate_scratch();
 
         let (len, complete) = stream
             .read_entry_prefix_streamed(entry, &mut compressed, &mut prefix, &mut inflate)
@@ -4778,7 +5230,7 @@ mod tests {
             .expect("entry exists");
         let mut compressed = [0u8; 8];
         let mut output = [0u8; 512];
-        let mut inflate = ZipInflateScratch::new();
+        let mut inflate = inflate_scratch();
 
         let len = stream
             .read_entry_streamed(entry, &mut compressed, &mut output, &mut inflate)
@@ -4798,7 +5250,7 @@ mod tests {
             .expect("entry exists");
         let mut compressed = [0u8; 4];
         let mut output = [0u8; 8];
-        let mut inflate = ZipInflateScratch::new();
+        let mut inflate = inflate_scratch();
 
         let (len, complete) = stream
             .read_entry_prefix_streamed(entry, &mut compressed, &mut output, &mut inflate)
@@ -4965,6 +5417,15 @@ mod tests {
         );
     }
 
+    /// A scratch with a decoder already adopted. `prepare` wants a `'static`
+    /// decoder because firmware's lives in a `StaticCell`; a test leaks one,
+    /// which costs nothing in a process that is about to exit.
+    fn inflate_scratch() -> ZipInflateScratch {
+        let mut scratch = ZipInflateScratch::new();
+        scratch.prepare(StdBox::leak(StdBox::new(DecompressorOxide::new())));
+        scratch
+    }
+
     fn stored_zip(files: &[(&str, &[u8])]) -> StdVec<u8> {
         let entries: StdVec<_> = files
             .iter()
@@ -5053,7 +5514,7 @@ mod tests {
         let mut header_scratch = [0u8; 46];
         let mut name_scratch = [0u8; 256];
         let mut compressed_scratch = [0u8; 1024];
-        let mut zip_inflate = ZipInflateScratch::new();
+        let mut zip_inflate = inflate_scratch();
         let mut opf_path_buf = heapless::String::<256>::new();
 
         // 1. With 3840 bytes (the regression limit), it must fail with OutputTooSmall
@@ -5079,7 +5540,7 @@ mod tests {
             cursor: 0,
         });
         let mut full_container_scratch = [0u8; 4096];
-        let mut zip_inflate = ZipInflateScratch::new(); // reset inflation
+        let mut zip_inflate = inflate_scratch(); // reset inflation
         let res_full = load_container_xml_and_find_opf_path(
             &mut zip_full,
             &mut header_scratch,

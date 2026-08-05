@@ -36,11 +36,12 @@ import subprocess
 import sys
 import unittest
 
-# Bytes. The largest legitimate frame today is ensure_epub_scratch at 20,960 --
-# the inflate state that miniz_oxide can only build by value. This sits far
-# enough above that to leave room for honest drift, and far enough below the
-# 42,136-byte X3 stack that a frame reaching it is worth a human deciding
-# whether the call chain beneath it still fits.
+# Bytes. The largest legitimate frame today is build_book_cache at ~13,840 --
+# while ensure_epub_scratch leaves a ~10,512-byte residual frame from
+# miniz_oxide's DecompressorOxide. This budget sits far enough above that to
+# leave room for honest drift, and far enough below the 42,136-byte X3 stack
+# that a frame reaching it is worth a human deciding whether the call chain
+# beneath it still fits.
 DEFAULT_BUDGET = 24 * 1024
 
 # Non-Rust assembly entry points and pre-compiled vendor SDK blobs whose stack

@@ -53,7 +53,18 @@ static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
     ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
 static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; MAX_BOOK_SECTIONS]> =
     ConstStaticCell::new([EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS]);
-static EPUB_ZIP_INFLATE: static_cell::StaticCell<proto::epub::ZipInflateScratch> =
+// Const-constructed like every other scratch above, which is the whole point
+// of `ZipInflateScratch`'s shape: it is ~32 KB against a 42 KB stack, so it
+// must reach `.bss` without ever being built as a value. A `StaticCell` here
+// meant writing one through a pointer, and that left a ~21 KB frame.
+static EPUB_ZIP_INFLATE: ConstStaticCell<proto::epub::ZipInflateScratch> =
+    ConstStaticCell::new(proto::epub::ZipInflateScratch::new());
+// Separate from the scratch above, and deliberately: miniz builds this ~10 KB
+// decoder only by value, so holding it *inside* the const scratch would make
+// that const no longer provably all-zero and push the whole 43 KB out of
+// `.bss` and into `.data` — 43 KB of flash, copied at every boot. An uninit
+// `StaticCell` stays in `.bss` and pays for the value once, here.
+static EPUB_DECOMPRESSOR: static_cell::StaticCell<proto::epub::DecompressorOxide> =
     static_cell::StaticCell::new();
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
@@ -1961,30 +1972,26 @@ fn close_out_departing_book(
     stored
 }
 
-/// Kept out of line: first-call initialization moves a multi-KB scratch
-/// value into the static; that spike must not sit at the base of the EPUB
-/// open call chain's frame.
+/// Kept out of line: first-call initialization constructs `DecompressorOxide`
+/// by value into a static; that temporary stack frame must not sit at the base
+/// of the EPUB open call chain.
 ///
-/// The spike is real and measured — 20,960 bytes, because
-/// `ZipInflateScratch::new()` still returns its 32 KB window by value and
-/// miniz_oxide offers no alloc-free way to build one in place. That is half
-/// the X3's 42,136-byte stack, so this frame is the largest in the binary and
-/// `#[inline(never)]` is what keeps it transient rather than resident under the
-/// EPUB build. `tools/check.sh stack-frames` is the guard on it.
-#[allow(unsafe_code)]
+/// While `EPUB_ZIP_INFLATE`'s 32 KiB window buffer is const-initialized in `.bss`,
+/// `DecompressorOxide::new()` still produces a measured 10,512-byte temporary
+/// frame when initializing the decoder. `#[inline(never)]` keeps this ~10.5 KiB
+/// allocation transient on a shallow frame rather than resident under the deeper
+/// EPUB open call stack, leaving the 13,840-byte EPUB cache builder as the largest
+/// frame in the binary. `tools/check.sh stack-frames` is the guard on it.
 #[inline(never)]
 fn ensure_epub_scratch<'a>(
     epub_scratch: &'a mut Option<&'static mut ReaderCacheScratch<'static>>,
 ) -> &'a mut ReaderCacheScratch<'static> {
     if epub_scratch.is_none() {
         esp_println::println!("storage: init epub scratch");
-        let zip_inflate_uninit = EPUB_ZIP_INFLATE.uninit();
-        let zip_ptr = zip_inflate_uninit.as_mut_ptr();
-        // SAFETY: EPUB_ZIP_INFLATE is a 'static allocation initialized once on demand.
-        let zip_ref = unsafe {
-            zip_ptr.write(proto::epub::ZipInflateScratch::new());
-            &mut *zip_ptr
-        };
+        let zip_ref = EPUB_ZIP_INFLATE.take();
+        // Build the decoder here rather than letting the first decode do it:
+        // this frame is shallow, the EPUB open chain's is not.
+        zip_ref.prepare(EPUB_DECOMPRESSOR.init(proto::epub::DecompressorOxide::new()));
         *epub_scratch = Some(EPUB_SCRATCH.init(ReaderCacheScratch::new(
             EPUB_TAIL.take(),
             EPUB_HEADER.take(),
