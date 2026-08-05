@@ -54,7 +54,7 @@ static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
 static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; MAX_BOOK_SECTIONS]> =
     ConstStaticCell::new([EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS]);
 // Const-constructed like every other scratch above, which is the whole point
-// of `ZipInflateScratch`'s shape: it is ~40 KB against a 42 KB stack, so it
+// of `ZipInflateScratch`'s shape: it is ~32 KB against a 42 KB stack, so it
 // must reach `.bss` without ever being built as a value. A `StaticCell` here
 // meant writing one through a pointer, and that left a ~21 KB frame.
 static EPUB_ZIP_INFLATE: ConstStaticCell<proto::epub::ZipInflateScratch> =

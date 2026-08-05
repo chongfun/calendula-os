@@ -268,7 +268,7 @@ pub(crate) fn dismantle_scratch(
         },
     };
 
-    // Safety: each pointer addresses a distinct 'static allocation whose
+    // SAFETY: each pointer addresses a distinct 'static allocation whose
     // only other path is the scratch struct this function retires.
     unsafe {
         SyncLoan {
