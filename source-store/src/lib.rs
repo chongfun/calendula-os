@@ -72,4 +72,5 @@ pub mod publish;
 pub mod receipts;
 pub mod record;
 pub mod select;
+pub mod upload;
 pub mod validate;
