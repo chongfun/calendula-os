@@ -1,8 +1,50 @@
+import hashlib
 import os
 import struct
 from pathlib import Path
+from urllib.request import urlretrieve
 
+import PIL
 from PIL import Image, ImageDraw
+
+# The tables in `display/src/*_generated.rs` reproduce byte for byte on this
+# Pillow and not on later ones. Pillow 11 changed `getlength` from the hinted
+# advance to the unhinted one, so every advance in every shipped face moves:
+# Literata's space at 16px goes 3.0px -> 3.1875px, `A` 12.0 -> 11.75, `m`
+# 16.0 -> 15.5. Advances are a wrap input, so accepting that silently would
+# move every wrap point in every book, force a `READER_LAYOUT_VERSION` bump
+# and repaginate every cached book on every device.
+#
+# Adopting the newer metrics may well be right -- unhinted advances are the
+# more usual choice -- but it is a typography decision with a cache rebuild
+# attached, not something a generator run should do by accident. Until someone
+# makes that call deliberately, the version is pinned and a mismatch stops the
+# run.
+PILLOW_PIN = "10.4.0"
+
+# SHA-256 of every TTF the shipped tables were built from, checked on every
+# run because `tools/fonts/` is gitignored and a stale local file is as
+# damaging as a changed upstream.
+FONT_SHA256 = {
+    "Literata-Regular.ttf": "0390890de9bb9d5862a6ba4125b82c61792ccc3d66b63e73eee75c1a16fcd208",
+    "Literata-Italic.ttf": "198f70cc9a17bab578553fa274b81984d58c440efe26bc06f1d841c194b6691a",
+    "Literata-Bold.ttf": "b6af95b3b443cdbce964aa06741596987f2f5c3ede46a2bc846e5addd99d061f",
+    "Literata-BoldItalic.ttf": "1dade59381ad02f4679d7e993a7a406472e587ac332af7a6168d3ad9214a99dc",
+    "Literata-SemiBold.ttf": "ee8f9413ebc974e1c1cfc76f6bdb9d08ddaadc66eeddd7320a65f8c581284d6d",
+    "Literata-SemiBoldItalic.ttf": "bf22f3e03804210abc5ee62362eb80fdd20829f69ef73fe1213347022b26963d",
+    "Merriweather.ttf": "d0ed0e359e396af7ad05e73dffd11a3a4c326ea0d0283c56bd9361cb2cc86a96",
+    "Merriweather-Italic.ttf": "f68a8f4989258679e4fbaf50aa42400132b5373c2d9d2514ba82ef6e85947a0b",
+}
+# Pinned to the commits the shipped tables were built from: Literata 3.103,
+# unchanged upstream since 2023-05-19, and Merriweather 2.100, unchanged since
+# 2025-01-29. google/fonts especially is a live monorepo, so a moving ref is one
+# release away from moving every advance without anyone choosing it.
+LITERATA_COMMIT = "0c2761b727a1b3a7cffd313c37f0f5163dfc7a63"
+LITERATA_BASE = (
+    f"https://raw.githubusercontent.com/googlefonts/literata/{LITERATA_COMMIT}/fonts/ttf"
+)
+MERRIWEATHER_COMMIT = "4fc3d16c59a4d5df700d37cbd9693e0d53f8d991"
+MERRIWEATHER_BASE = f"https://github.com/google/fonts/raw/{MERRIWEATHER_COMMIT}/ofl/merriweather"
 
 ADVANCE_SCALE = 16
 # `generate_mockup_fonts.py` antialiases and cuts here to decide its pixels.
@@ -25,6 +67,48 @@ def text_render_threshold() -> int:
 
 
 THRESHOLD = text_render_threshold()
+
+
+def require_pinned_pillow() -> None:
+    """Stop before generating anything on a Pillow that changes the metrics."""
+    if PIL.__version__ == PILLOW_PIN:
+        return
+    raise SystemExit(
+        f"fontgen needs Pillow {PILLOW_PIN}, found {PIL.__version__}.\n"
+        f"  Later Pillow returns unhinted advances, which moves every advance in\n"
+        f"  every shipped face and repaginates every cached book on every device.\n"
+        f"  Install the pin, ideally into a throwaway environment:\n"
+        f"    python3 -m venv .fontgen && .fontgen/bin/pip install 'pillow=={PILLOW_PIN}'\n"
+        f"    .fontgen/bin/python tools/generate_literata.py\n"
+        f"  If the intent is to adopt the newer metrics, that is a deliberate\n"
+        f"  typography change: bump READER_LAYOUT_VERSION, re-bless the goldens\n"
+        f"  and the fingerprints in display/tests/glyph_tables.rs, and move this\n"
+        f"  pin in the same commit."
+    )
+
+
+def ensure_font(path: Path, url: str, sha256: str) -> None:
+    """Download `url` to `path` if absent, and verify its hash either way.
+
+    The hash is checked on every run, not only after a download, because the
+    fonts live in a gitignored directory: a stale or hand-placed file is
+    exactly as damaging as a changed upstream, and neither announces itself.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        print(f"downloading {path.name}")
+        urlretrieve(url, path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != sha256:
+        raise SystemExit(
+            f"{path} does not match its pinned hash.\n"
+            f"  expected {sha256}\n"
+            f"  found    {digest}\n"
+            f"  source   {url}\n"
+            f"  Delete the file to re-download. If upstream genuinely moved, adopting\n"
+            f"  the new outlines is a deliberate change: it moves advances, so bump\n"
+            f"  READER_LAYOUT_VERSION and re-bless goldens and fingerprints with it."
+        )
 
 
 def advance_fp(font, text: str) -> int:

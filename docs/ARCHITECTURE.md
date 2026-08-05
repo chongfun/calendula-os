@@ -496,6 +496,25 @@ same mode so the stored metrics describe the stored bitmap. The box is a
 pagination input — the wrap reads `x_offset + width` — so changing how it is
 derived is a `READER_LAYOUT_VERSION` bump.
 
+Regeneration is pinned on both axes, because both move advances and advances
+are a wrap input. The TTFs are fetched from immutable upstream commits and
+checked against `FONT_SHA256` on every run, and Pillow is pinned to
+`PILLOW_PIN` — release 11 changed `getlength` from the hinted advance to the
+unhinted one, which moves every advance in every face. Both mismatches stop
+the run rather than quietly emitting different tables. Regenerate through a
+throwaway environment holding the pin:
+
+```sh
+python3 -m venv .fontgen && .fontgen/bin/pip install 'pillow==10.4.0'
+.fontgen/bin/python tools/generate_literata.py    # and the other generators
+cargo fmt -p display                              # strips a trailing blank line
+```
+
+Under the pin every shipped table reproduces byte for byte, so a regeneration
+diff contains only what was intended. Adopting newer metrics is a deliberate
+typography change: move the pin, bump `READER_LAYOUT_VERSION`, and re-bless
+the goldens and `display/tests/glyph_tables.rs` in the same commit.
+
 ## Development emulator
 
 `tools/emulator` is a host-side parity tool for fast development loops. It has a

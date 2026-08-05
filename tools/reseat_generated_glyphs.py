@@ -9,12 +9,18 @@ at 22px and `t` at 19px, Merriweather's `k` and `r` -- so their crossbar or
 foot breaks the line their neighbours hold.
 
 Regenerating the tables from that fixed generator is the natural way to apply
-it, and it is not available: the generators download Literata and Merriweather
-from a moving `main` branch, and upstream has since revised the fonts. A
-regeneration today changes 198 of 218 advances in the smallest table alone,
-which would move every wrap point, force a `READER_LAYOUT_VERSION` bump and a
-full cache rebuild on every device, and bury a one-pixel seating fix inside an
-unreviewed font revision.
+it, and at the time it was written that appeared impossible: a regeneration
+changed 198 of 218 advances in the smallest table alone, which was read as
+upstream having revised the fonts. That reading was wrong. The fonts had not
+moved -- Literata has been unchanged since 2023 and Merriweather since early
+2025 -- and the drift was Pillow, which from version 11 returns the unhinted
+advance where earlier releases returned the hinted one. Under the pinned
+Pillow the generators reproduce every shipped table byte for byte, this script
+included, so the repair here is reproducible from source after all.
+
+It is kept because it is what the shipped tables were actually built by, and
+because migrating checked-in tables is still the right shape for any change
+that must not disturb metrics.
 
 So the repair is applied to the checked-in tables directly. The reference is
 `ANTIALIASED_REFERENCE`, a pinned commit whose copy of these tables is the
