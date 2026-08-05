@@ -10,20 +10,26 @@ from bitmap_pool import BitmapPool as BitmapPool
 from PIL import Image, ImageDraw, features
 
 # The tables in `display/src/*_generated.rs` reproduce byte for byte on this
-# Pillow and not on later ones. Pillow 11 changed `getlength` from the hinted
-# advance to the unhinted one, so every advance in every shipped face moves:
-# Literata's space at 16px goes 3.0px -> 3.1875px, `A` 12.0 -> 11.75, `m`
-# 16.0 -> 15.5. Advances are a wrap input, so accepting that silently would
-# move every wrap point in every book, force a `READER_LAYOUT_VERSION` bump
-# and repaginate every cached book on every device.
+# Pillow/FreeType pair and not on the 10.4.0/2.13.2 pair pinned previously.
+# Verified 2026-08-05 by running all five generators unmodified under each:
+# 12.3.0/2.14.3 leaves the tree clean; 10.4.0/2.13.2 moves boxes and bitmaps
+# in every face -- FreeType's monochrome rasterization changed between 2.13
+# and 2.14, most visibly on the diacritic/fraction set (Ï ì ï ¾ _ ...) whose
+# ink boxes grew a pixel under 2.14 -- so the old pin could not regenerate
+# what is shipped. The getlength numbers the previous pin cited did not
+# reproduce here either: 10.4.0 and 12.3.0 return identical hinted advances
+# on this machine, so the advance risk that motivated 10.4.0 never applied
+# to this environment. If a regeneration on another machine trips this guard,
+# measure before moving the pin: the shipped bytes, not a version number,
+# are the thing being protected.
 #
-# Adopting the newer metrics may well be right -- unhinted advances are the
-# more usual choice -- but it is a typography decision with a cache rebuild
-# attached, not something a generator run should do by accident. Until someone
-# makes that call deliberately, the version is pinned and a mismatch stops the
-# run.
-PILLOW_PIN = "10.4.0"
-FREETYPE_PIN = "2.13.2"
+# Boxes and advances are wrap inputs, so a toolchain that moves them silently
+# would move wrap points in every book, force a `READER_LAYOUT_VERSION` bump
+# and repaginate every cached book on every device. Adopting new metrics is a
+# typography decision with a cache rebuild attached, not something a generator
+# run should do by accident; a mismatch stops the run.
+PILLOW_PIN = "12.3.0"
+FREETYPE_PIN = "2.14.3"
 
 # SHA-256 of every TTF the shipped tables were built from, checked on every
 # run because `tools/fonts/` is gitignored and a stale local file is as
@@ -50,10 +56,9 @@ MERRIWEATHER_COMMIT = "4fc3d16c59a4d5df700d37cbd9693e0d53f8d991"
 MERRIWEATHER_BASE = f"https://github.com/google/fonts/raw/{MERRIWEATHER_COMMIT}/ofl/merriweather"
 
 ADVANCE_SCALE = 16
-# `generate_mockup_fonts.py` antialiases and cuts here to decide its pixels.
-# The shipped faces take their pixels from the monochrome raster instead, but
-# still cut here to decide where the antialiased reference glyph's ink starts,
-# which is what `rasterize_glyph` seats the monochrome raster against.
+# Only `generate_mockup_fonts.py` antialiases and cuts here to decide its
+# pixels. The shipped faces cut at `AA_INK_THRESHOLD` in `rasterize_glyph`
+# instead, and no longer read this.
 DEFAULT_THRESHOLD = 128
 MIN_KERNING_ADJUST_FP = 8
 MAX_KERNING_ENTRIES = 1024
@@ -79,8 +84,8 @@ def require_pinned_pillow() -> None:
         raise SystemExit(
             f"fontgen needs Pillow {PILLOW_PIN} and FreeType {FREETYPE_PIN}, "
             f"found Pillow {PIL.__version__} / FreeType {freetype_ver}.\n"
-            f"  Later Pillow returns unhinted advances, and different FreeType builds\n"
-            f"  alter glyph rasterization and placement.\n"
+            f"  Different Pillow/FreeType builds alter glyph rasterization, placement,\n"
+            f"  and sometimes advances.\n"
             f"  Install the pin, ideally into a throwaway environment:\n"
             f"    python3.12 -m venv .fontgen && .fontgen/bin/pip install 'pillow=={PILLOW_PIN}'\n"
             f"    .fontgen/bin/python tools/generate_literata.py\n"
@@ -132,34 +137,27 @@ def advance_fp(font, text: str) -> int:
     return max(round(font.getlength(text) * ADVANCE_SCALE), ADVANCE_SCALE)
 
 
-# Room around the reported box for the monochrome raster to land outside it,
-# so its ink can be measured and moved rather than clipped where it falls.
-RESEAT_PAD = 8
-
-
-def _ink_bounds(image, threshold: int):
-    """`(left, top, right, bottom)` of the inked pixels, or None if blank."""
-    pixels = image.load()
-    width, height = image.size
-    columns = [x for x in range(width) if any(pixels[x, y] >= threshold for y in range(height))]
-    rows = [y for y in range(height) if any(pixels[x, y] >= threshold for x in range(width))]
-    if not columns or not rows:
-        return None
-    return (columns[0], rows[0], columns[-1] + 1, rows[-1] + 1)
-
-
-def _clamped_shift(desired: int, ink_low: int, ink_high: int, box_low: int, box_high: int) -> int:
-    """`desired`, reduced as far as needed to keep the ink inside the box.
-
-    When the ink is larger than the box no shift avoids clipping, so the
-    rasterizer's own placement stands rather than trading one clipped edge
-    for the other.
-    """
-    low = box_low - ink_low
-    high = box_high - ink_high
-    if low > high:
-        return 0
-    return max(low, min(desired, high))
+# Ink cut for the antialiased raster: a pixel FreeType covers at 112/255
+# (~44%) or more becomes black. Below 50% deliberately -- e-ink renders a
+# stroke thinner than the same bitmap on an emissive screen, so the cut errs
+# toward ink and a stem edge at half coverage keeps its column instead of
+# losing it to rounding. crosspoint-reader ships the same idea at a far
+# lower cut (any coverage >= ~12.5%), but its boxes are derived from the
+# same render and grow with the ink; ours are frozen cache geometry, so a
+# cut that low pushes the coverage halo a pixel past the box everywhere and
+# clips whole edge rows off reading glyphs.
+#
+# The value is from a sweep of 32..128 over every shipped render. Ink gain
+# against the previous tables by cut: 32 +25%, 64 +14%, 96 +8%, 112 +3.5%,
+# 128 +0.3%; box clipping collapses to noise at 64 and above. 96 looked like
+# the moderate choice until the per-face split: Literata's 22 px stems --
+# the default reading configuration -- have their antialiased edges at
+# coverage 96..112, so any cut at or below 96 swallows them wholesale
+# (+20..31% on those faces alone, a weight change, not darkening) while
+# every other size moves +4..7%. At 112 every face lands between +1% and
+# +5% except the 22 px italics (+11..15%), whose thinner slanted strokes
+# darkening slightly is the direction e-ink wants anyway.
+AA_INK_THRESHOLD = 112
 
 
 def rasterize_glyph(font, code: int):
@@ -173,59 +171,21 @@ def rasterize_glyph(font, code: int):
     height = max(0, bottom - top)
     if width == 0 or height == 0:
         return (0, 0, left, top, advance, [])
-    # Rasterize straight to 1 bit rather than antialiasing to 8 and cutting at
-    # a threshold. A "1"-mode canvas makes Pillow ask FreeType for its
-    # monochrome target, which selects the hinting algorithm built for a
-    # bilevel grid and applies dropout control; `FT_LOAD_MONOCHROME` on its
-    # own does not change hinting, and neither does thresholding after the
-    # fact. Thresholding an antialiased bitmap is what produced asymmetric
-    # bowls and stems that changed width partway down a stroke: a stem landing
-    # half-covered across two pixel columns rounds to one column or two
-    # depending only on where it happens to fall.
+    # One antialiased render, cut low, in place of the monochrome raster and
+    # the re-seat that placed it. The mono hinter grid-fits each glyph on its
+    # own, so neighbouring letters could come out with different stem weights
+    # and a lifted crossbar; and because its ink had to be re-seated against a
+    # separately-rendered antialiased reference, every disagreement between
+    # the two renders became a one-pixel placement lottery. A single render
+    # cannot disagree with itself: the ink and its seat come from the same
+    # rasterization, which is how crosspoint-reader builds every face it
+    # ships. The low cut (see AA_INK_THRESHOLD) is what keeps stems from
+    # dropping columns, the failure the mono experiment was meant to fix.
     #
-    # The mono hinter grid-fits vertical edges, and for some glyphs that lifts
-    # the whole glyph a pixel: Literata's `f` at 22px and `t` at 19px, and
-    # Merriweather's `k` and `r`, all render with their crossbar or foot one
-    # row above where the antialiased raster puts it, while their neighbours
-    # stay put. A crossbar breaking the x-height line is the most visible
-    # defect this pipeline can produce -- the eye tracks that horizontal far
-    # more strongly than a foot leaving the baseline. Asking `getbbox` for the
-    # "1"-mode box does not address it: that box is identical to the
-    # antialiased one for `r` and `k`, and the shift is in the ink, not the
-    # box.
-    #
-    # So the antialiased render is used as the placement reference and the
-    # monochrome render supplies the pixels. Both go onto one padded canvas,
-    # the mono ink is moved so its top-left corner matches the antialiased
-    # ink's, and the shift is clamped to keep it inside the box. Stems and
-    # bowls stay the mono hinter's -- that is the quality this buys -- while
-    # the glyph sits where the outline says it sits.
-    canvas = (width + 2 * RESEAT_PAD, height + 2 * RESEAT_PAD)
-    origin = (-left + RESEAT_PAD, -top + RESEAT_PAD)
-
-    image = Image.new("1", canvas, 0)
-    ImageDraw.Draw(image).text(origin, ch, font=font, fill=1, anchor="ls")
-    reference = Image.new("L", canvas, 0)
-    ImageDraw.Draw(reference).text(origin, ch, font=font, fill=255, anchor="ls")
-
-    mono_ink = _ink_bounds(image, 1)
-    reference_ink = _ink_bounds(reference, THRESHOLD)
-    shift_x = shift_y = 0
-    if mono_ink is not None and reference_ink is not None:
-        shift_x = _clamped_shift(
-            reference_ink[0] - mono_ink[0],
-            mono_ink[0],
-            mono_ink[2],
-            RESEAT_PAD,
-            RESEAT_PAD + width,
-        )
-        shift_y = _clamped_shift(
-            reference_ink[1] - mono_ink[1],
-            mono_ink[1],
-            mono_ink[3],
-            RESEAT_PAD,
-            RESEAT_PAD + height,
-        )
+    # The box stays the shipped table's box -- cache geometry, frozen. Ink
+    # the antialiased raster puts outside it clips where it falls.
+    image = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(image).text((-left, -top), ch, font=font, fill=255, anchor="ls")
 
     pixels = image.load()
     rows = []
@@ -233,13 +193,7 @@ def rasterize_glyph(font, code: int):
         byte = 0
         bits = 0
         for x in range(width):
-            source_x = RESEAT_PAD + x - shift_x
-            source_y = RESEAT_PAD + y - shift_y
-            if (
-                0 <= source_x < canvas[0]
-                and 0 <= source_y < canvas[1]
-                and pixels[source_x, source_y]
-            ):
+            if pixels[x, y] >= AA_INK_THRESHOLD:
                 byte |= 0x80 >> bits
             bits += 1
             if bits == 8:
