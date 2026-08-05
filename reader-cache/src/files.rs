@@ -987,6 +987,149 @@ where
     cleared
 }
 
+/// The section ordinal a `S###.BIN` name encodes, or `None` for any other
+/// name. Parsed rather than trusted: `SECTIONS/` is on removable media, so a
+/// name that is not one of ours must be left alone, not miscounted into the
+/// prune range.
+fn section_ordinal_from_name(name: &str) -> Option<u16> {
+    let digits = name
+        .strip_prefix(['S', 's'])?
+        .get(..3)
+        .filter(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))?;
+    let suffix = name.get(4..)?;
+    if !suffix.eq_ignore_ascii_case(".BIN") {
+        return None;
+    }
+    digits.parse::<u16>().ok()
+}
+
+/// Delete the section files a freshly published index no longer names.
+///
+/// Section files are keyed by section *ordinal* — a dense `0..count` counter
+/// the walk assigns as it flushes, distinct from the spine index the record
+/// also carries — so a rebuild producing fewer sections than the one before
+/// it strands `S<count>..` on the card. Nothing references them:
+/// `load_v2_section_by_global_page` indexes off BOOK.BIN. They are unreachable
+/// but not free, and they survive until the whole cache directory is emptied.
+///
+/// No shipping setting reaches that state today. Sections split on content
+/// volume — `flush_if_full` breaks on block and text capacity long before the
+/// page-count bound — so re-flowing the same content produces the same count.
+/// Measured on the X3 2026-08-04: one book at 1252, 763 and 708 pages across a
+/// type-size change and an orientation flip held 79 sections throughout. What
+/// *would* shrink the count is a change to the capacity constants themselves,
+/// which re-derives fewer sections over the same content and strands the old
+/// tail. This exists for that case; it is insurance, not a present-day leak.
+///
+/// **Only ever call this with a final section count.** A suspended walk is
+/// coming back to write more sections, and pruning against its provisional
+/// count would delete the ones it is about to need.
+///
+/// Best effort by design: orphans are dead weight, not corruption, so a
+/// failure here must not turn a successful publish into a failed one. It is
+/// safe to run only *after* the new index is on the card — everything it
+/// deletes is already unreachable from the index a reader could be holding.
+///
+/// Returns how many files it removed.
+fn prune_orphan_sections_in<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    keep_count: u16,
+) -> usize
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let mut removed = 0usize;
+    // Same shape as `empty_sections_dir`: collect a bounded batch by listing,
+    // delete it, and list again, because deleting while iterating is not
+    // something the directory walk promises. The spare pass proves the tail
+    // is gone rather than merely out of budget.
+    let max_passes = MAX_BOOK_SECTIONS.div_ceil(SECTION_SWEEP_BATCH) + 1;
+    for _ in 0..max_passes {
+        let mut names: heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH> =
+            heapless::Vec::new();
+        if sections
+            .iterate_dir(|entry| {
+                if entry.attributes.is_directory() || names.is_full() {
+                    return;
+                }
+                let mut name = String::<SHORT_NAME_BYTES>::new();
+                if write!(name, "{}", entry.name).is_err() {
+                    return;
+                }
+                match section_ordinal_from_name(name.as_str()) {
+                    Some(ordinal) if ordinal >= keep_count => {
+                        let _ = names.push(name);
+                    }
+                    _ => {}
+                }
+            })
+            .is_err()
+        {
+            return removed;
+        }
+        if names.is_empty() {
+            return removed;
+        }
+        // Attempt every name in the batch, including the ones after a failure.
+        // `remove_file_reclaiming_clusters` opens, truncates, closes and then
+        // deletes, and a fault in any of those fails that one file without
+        // saying anything about the next — the card model these paths are
+        // tested against injects exactly that, a single refused write followed
+        // by writes that succeed. Abandoning the batch on the first failure
+        // would leave the rest stranded until another completed rebuild, and
+        // for the capacity-constant change this exists for there may never be
+        // one.
+        let mut progressed = false;
+        for name in &names {
+            if upload_store::remove_file_reclaiming_clusters(sections, name.as_str())
+                != upload_store::RemoveStatus::Failed
+            {
+                removed += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            // A pass that took nothing is where best-effort stops. The listing
+            // is deterministic, so the next pass would collect the same names
+            // and refuse them again; this is the bound on a card that really
+            // has stopped accepting deletes, while a pass that took anything
+            // still earns the failures beside it one more attempt.
+            return removed;
+        }
+    }
+    removed
+}
+
+/// [`prune_orphan_sections_in`], opening the book's `SECTIONS/` directory.
+pub fn prune_orphan_sections<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    keep_count: u16,
+) -> usize
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_sections_dir(root, key, |sections| match sections {
+        Some(sections) => prune_orphan_sections_in(sections, keep_count),
+        None => 0,
+    })
+}
+
 /// Delete every file in an opened `SECTIONS/` directory, by listing rather
 /// than by generated name. Returns false if any delete failed or the directory
 /// still had entries after the pass budget — either way the caller must not
