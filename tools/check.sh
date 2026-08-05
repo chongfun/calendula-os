@@ -168,12 +168,99 @@ case "$COMMAND" in
         "${RUFF[@]}" format --check .
         ;;
     fast)
-        "$0" fmt
-        "$0" clippy-host
-        "$0" test-host
-        "$0" test-host-x3
-        "$0" test-bench
-        "$0" ruff
+        # The six stages are independent commands, so they start together and
+        # are waited on as a group. The three cargo stages do contend: they
+        # share one build directory, and cargo prints "Blocking waiting for
+        # file lock" while it serialises their compiles. The win is that a
+        # stage's *test execution* happens outside that lock, so it overlaps
+        # the next stage's compile. Measured on a ten-core host over six
+        # interleaved trials, this target went from ~22.5s serial to ~16s
+        # after a one-file edit, and from ~5s to ~2s with nothing to rebuild.
+        # The absolute numbers move with machine load, so they are only worth
+        # comparing against a serial run taken alongside; the ratio held near
+        # 0.7 across loads from 1 to 8.
+        #
+        # They share the one target dir on purpose. Giving each stage its own
+        # would drop the lock waits entirely, but target/ already runs to tens
+        # of gigabytes and a copy per stage costs far more disk than the
+        # remaining contention costs time.
+        #
+        # Output is captured per stage and replayed below in a fixed order
+        # rather than interleaved live: six concurrent cargo jobs sharing one
+        # terminal are unreadable, and -- the part that matters -- when one
+        # fails you cannot tell which. The cheap stages are listed first so
+        # that something appears while the cargo ones are still running.
+        #
+        # Only pre-push and `all` reach this. CI invokes the individual
+        # targets on separate runners and never goes through here.
+        FAST_STAGES=(fmt ruff test-bench clippy-host test-host test-host-x3)
+
+        # Job control, for cancellation. Two things follow from `set -m` that
+        # this arm depends on. Without it, POSIX has the shell set SIGINT to
+        # ignore in every command started with `&`, and that disposition
+        # survives exec, so Ctrl-C would leave the stages *and* their cargo
+        # descendants running while the script itself died -- orphaned builds
+        # holding the target-directory lock that the next run then blocks on.
+        # With it, each stage instead leads its own process group, so one
+        # `kill` on the negated pid reaches the whole tree rather than just
+        # the wrapper. Verified by sending SIGINT to the group: six survivors
+        # before, zero after.
+        set -m
+
+        FAST_TMP="$(mktemp -d)"
+        FAST_PIDS=()
+        # Stages sit in their own process groups now, which also means the
+        # terminal's Ctrl-C no longer reaches them on its own -- only the
+        # foreground group gets it. Tearing them down here is therefore
+        # required, not belt-and-braces. INT/TERM/HUP exit into the EXIT trap
+        # so that one teardown path serves every exit.
+        fast_cleanup() {
+            local p
+            for p in "${FAST_PIDS[@]}"; do
+                if [ -n "$p" ]; then
+                    kill -TERM "-$p" 2>/dev/null || true
+                fi
+            done
+            wait 2>/dev/null || true
+            rm -rf "$FAST_TMP"
+        }
+        trap fast_cleanup EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap 'exit 129' HUP
+
+        for stage in "${FAST_STAGES[@]}"; do
+            "$0" "$stage" > "$FAST_TMP/$stage.log" 2>&1 &
+            FAST_PIDS+=($!)
+        done
+        echo "Running ${#FAST_STAGES[@]} checks in parallel..."
+        echo
+
+        # Waiting in declaration order rather than completion order keeps the
+        # transcript identical from run to run, which matters when comparing a
+        # failure against a previous one.
+        FAST_FAILED=()
+        for ((i = 0; i < ${#FAST_STAGES[@]}; i++)); do
+            stage="${FAST_STAGES[$i]}"
+            if wait "${FAST_PIDS[$i]}"; then
+                echo "--- $stage: ok ---"
+            else
+                echo "--- $stage: FAILED ---"
+                FAST_FAILED+=("$stage")
+            fi
+            # Reaped, so drop it: the pid is free for reuse from here, and
+            # cleanup must not signal a group that some unrelated process has
+            # since been given. Stages still running keep their entry.
+            FAST_PIDS[$i]=""
+            cat "$FAST_TMP/$stage.log"
+            echo
+        done
+
+        if [ ${#FAST_FAILED[@]} -ne 0 ]; then
+            echo "check.sh fast: ${#FAST_FAILED[@]} of ${#FAST_STAGES[@]} failed: ${FAST_FAILED[*]}" >&2
+            exit 1
+        fi
+        echo "check.sh fast: all ${#FAST_STAGES[@]} checks passed."
         ;;
     emulator)
         "$0" golden-frames
