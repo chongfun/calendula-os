@@ -1972,17 +1972,16 @@ fn close_out_departing_book(
     stored
 }
 
-/// Kept out of line: first-call initialization moves a multi-KB scratch
-/// value into the static; that spike must not sit at the base of the EPUB
-/// open call chain's frame.
+/// Kept out of line: first-call initialization constructs `DecompressorOxide`
+/// by value into a static; that temporary stack frame must not sit at the base
+/// of the EPUB open call chain.
 ///
-/// The spike is real and measured — 20,960 bytes, because
-/// `ZipInflateScratch::new()` still returns its 32 KB window by value and
-/// miniz_oxide offers no alloc-free way to build one in place. That is half
-/// the X3's 42,136-byte stack, so this frame is the largest in the binary and
-/// `#[inline(never)]` is what keeps it transient rather than resident under the
-/// EPUB build. `tools/check.sh stack-frames` is the guard on it.
-#[allow(unsafe_code)]
+/// While `EPUB_ZIP_INFLATE`'s 32 KiB window buffer is const-initialized in `.bss`,
+/// `DecompressorOxide::new()` still produces a measured 10,512-byte temporary
+/// frame when initializing the decoder. `#[inline(never)]` keeps this ~10.5 KiB
+/// allocation transient on a shallow frame rather than resident under the deeper
+/// EPUB open call stack, leaving the 13,840-byte EPUB cache builder as the largest
+/// frame in the binary. `tools/check.sh stack-frames` is the guard on it.
 #[inline(never)]
 fn ensure_epub_scratch<'a>(
     epub_scratch: &'a mut Option<&'static mut ReaderCacheScratch<'static>>,
