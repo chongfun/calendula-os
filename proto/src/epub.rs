@@ -3975,6 +3975,70 @@ mod tests {
         assert_eq!(sink.fragments.len(), 4);
     }
 
+    /// A paragraph whose last content is a style run terminates on a fragment
+    /// carrying no text at all, because `</em>` flushes the words and `</p>`
+    /// then flushes what is left, which is nothing.
+    ///
+    /// Sinks have to honour `paragraph_end` on that empty fragment or the next
+    /// paragraph runs into this one. Both shipped sinks got it wrong the same
+    /// way -- they reject empty text before reading the flag -- and neither
+    /// lives anywhere the test suites reach: `fw` has no test modules and is
+    /// excluded from the host runs, and `tools/preview` is its own workspace
+    /// outside CI. So the contract they depend on is pinned here instead.
+    #[test]
+    fn a_paragraph_ending_in_a_style_run_still_terminates() {
+        struct EveryFragment(StdVec<(std::string::String, bool)>);
+
+        impl XhtmlBlockSink for EveryFragment {
+            fn push_block(
+                &mut self,
+                text: &str,
+                _role: TextRole,
+                _style: FontStyle,
+                _align: TextAlign,
+                paragraph_end: bool,
+            ) -> Result<(), XhtmlError> {
+                self.0.push((text.into(), paragraph_end));
+                Ok(())
+            }
+        }
+
+        for markup in [
+            "<body><p>Charlie ends <em>italic</em></p><p>Delta follows.</p></body>",
+            "<body><p>Golf ends <strong>bold</strong></p><p>Hotel follows.</p></body>",
+        ] {
+            let mut sink = EveryFragment(StdVec::new());
+            xhtml_blocks_to_sink(markup, None, &mut sink).expect("xhtml parses");
+
+            let words = sink
+                .0
+                .iter()
+                .position(|(text, _)| text == "italic" || text == "bold");
+            let words = words.expect("the style run is emitted");
+            let next = sink
+                .0
+                .iter()
+                .position(|(text, _)| text.starts_with("Delta") || text.starts_with("Hotel"))
+                .expect("the following paragraph is emitted");
+
+            // The style run does not end the paragraph; something between it
+            // and the next paragraph must, and it carries no text.
+            assert!(!sink.0[words].1, "{markup}: {:?}", sink.0);
+            let terminator = sink.0[words + 1..next]
+                .iter()
+                .find(|(_, paragraph_end)| *paragraph_end)
+                .unwrap_or_else(|| {
+                    panic!("{markup}: nothing terminates the paragraph: {:?}", sink.0)
+                });
+            assert!(
+                terminator.0.is_empty(),
+                "{markup}: the terminator carries text, so a sink that drops empty \
+                 fragments would still see it: {:?}",
+                sink.0
+            );
+        }
+    }
+
     #[test]
     fn xhtml_blocks_skip_head_style_and_script_text() {
         let xhtml = r#"
