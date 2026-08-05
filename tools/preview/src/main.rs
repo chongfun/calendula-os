@@ -448,6 +448,12 @@ fn push_styled_fragment(
     if !sanitize_preview_block(&mut normalized) {
         sink.dropping_paragraph = !paragraph_end;
         sink.pending_space = false;
+        // Mirrors the firmware sink: a rejected block still ends its
+        // paragraph when it says it does, and `</p>` after a style run
+        // carries the terminator on empty text that sanitizing rejects.
+        if paragraph_end {
+            flush_preview_line(sink, true);
+        }
         return;
     }
     if normalized.is_empty() {

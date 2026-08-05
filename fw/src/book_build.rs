@@ -2921,6 +2921,16 @@ fn push_styled_preview_fragment<
     if !sanitize_preview_block(&mut normalized) {
         sink.dropping_paragraph = !paragraph_end;
         sink.pending_space = false;
+        // A rejected block still ends its paragraph when it says it does.
+        // `</p>` after a style run flushes an *empty* block carrying
+        // `paragraph_end`, and sanitizing rejects empty text, so returning
+        // here dropped the only terminator the paragraph had and the next one
+        // ran into it. The `normalized.is_empty()` arm below already flushes
+        // for exactly this reason; it just never sees empty text, because
+        // this arm claims it first.
+        if paragraph_end {
+            flush_styled_preview_line(sink, true);
+        }
         return;
     }
     if normalized.is_empty() {
