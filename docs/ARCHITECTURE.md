@@ -91,7 +91,9 @@ proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pie
 source-store/ M0S source-transaction foundation: commit-sector record framing,
            the durable publication sequence (`durable_sync`), typed authority
            records (source metadata, tombstones, staging markers, idempotency
-           receipts), and startup source selection; host-tested with
+           receipts), startup source selection, the managed SRC namespace,
+           the delete transaction, and resumable source-identity jobs (full
+           SHA-256 plus the quick fingerprint); host-tested with
            fault-injection and simulated power-cut replay
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup-stable Cargo wrapper for firmware builds/checks

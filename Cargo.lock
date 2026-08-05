@@ -1742,6 +1742,7 @@ dependencies = [
  "embedded-sdmmc",
  "fatfs",
  "heapless 0.9.3",
+ "sha2",
 ]
 
 [[package]]
