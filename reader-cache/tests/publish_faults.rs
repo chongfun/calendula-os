@@ -663,8 +663,9 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
     assert!(sections_still_on_card(&root, 5));
 
-    // The same book at a larger type size: the walk produces three sections
-    // and rewrites S000..S002, leaving S003 and S004 behind.
+    // A completed rebuild over the same content with a smaller final section
+    // set, as a change to the capacity constants would produce: it rewrites
+    // S000..S002 and leaves S003 and S004 behind.
     let narrow = &wide[..3];
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
@@ -769,6 +770,51 @@ fn the_prune_leaves_names_it_does_not_recognise() {
     assert!(
         file_in_sections_dir(&root, "NOTES.TXT") && file_in_sections_dir(&root, "S12.BIN"),
         "names this code does not write must be left alone"
+    );
+}
+
+/// Invariant: one refused delete does not strand the orphans behind it.
+///
+/// `remove_file_reclaiming_clusters` opens, truncates, closes and deletes, so a
+/// fault in any of those fails one particular file. An earlier version read
+/// that as "the card is refusing deletes" and returned, which left every later
+/// orphan on the card — and because the prune only runs after a *completed*
+/// rebuild, the next attempt needs another full rebuild, cache clear, or the
+/// book leaving the card. For the capacity-constant change this feature exists
+/// for, that may never come.
+///
+/// Exactly-once is the card model on purpose (see `FaultPlan`): a sticky fault
+/// is a different scenario. This arms one refused write, which lands on the
+/// first orphan's truncate, and asserts the rest still go.
+#[test]
+fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // Five sections, of which S002..S004 are about to become orphans. All
+    // three land in one listing batch (SECTION_SWEEP_BATCH is 16), so this
+    // exercises "kept going after the failure", not "picked it up next pass".
+    build_book(&root, &mut store, 5);
+    assert!(sections_still_on_card(&root, 5));
+
+    disk.fault.fail_write_in.set(Some(0));
+    let removed = files::prune_orphan_sections(&root, KEY, 2);
+
+    assert!(
+        file_in_sections_dir(&root, "S000.BIN") && file_in_sections_dir(&root, "S001.BIN"),
+        "the sections the index still names must survive"
+    );
+    assert_eq!(
+        removed, 3,
+        "every orphan must come off the card, including the one behind the refused write"
+    );
+    assert!(
+        !file_in_sections_dir(&root, "S002.BIN")
+            && !file_in_sections_dir(&root, "S003.BIN")
+            && !file_in_sections_dir(&root, "S004.BIN"),
+        "a refused delete must not strand the orphans after it"
     );
 }
 

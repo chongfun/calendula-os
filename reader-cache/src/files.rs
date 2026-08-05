@@ -1078,15 +1078,31 @@ where
         if names.is_empty() {
             return removed;
         }
+        // Attempt every name in the batch, including the ones after a failure.
+        // `remove_file_reclaiming_clusters` opens, truncates, closes and then
+        // deletes, and a fault in any of those fails that one file without
+        // saying anything about the next — the card model these paths are
+        // tested against injects exactly that, a single refused write followed
+        // by writes that succeed. Abandoning the batch on the first failure
+        // would leave the rest stranded until another completed rebuild, and
+        // for the capacity-constant change this exists for there may never be
+        // one.
+        let mut progressed = false;
         for name in &names {
             if upload_store::remove_file_reclaiming_clusters(sections, name.as_str())
-                == upload_store::RemoveStatus::Failed
+                != upload_store::RemoveStatus::Failed
             {
-                // Leave the rest: a card refusing deletes will refuse the
-                // next one too, and the caller's publish already succeeded.
-                return removed;
+                removed += 1;
+                progressed = true;
             }
-            removed += 1;
+        }
+        if !progressed {
+            // A pass that took nothing is where best-effort stops. The listing
+            // is deterministic, so the next pass would collect the same names
+            // and refuse them again; this is the bound on a card that really
+            // has stopped accepting deletes, while a pass that took anything
+            // still earns the failures beside it one more attempt.
+            return removed;
         }
     }
     removed
