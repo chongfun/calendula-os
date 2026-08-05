@@ -362,17 +362,20 @@ impl Framebuffer {
 
     /// Blit a packed MSB-first bitmap — a glyph — at frame (x, y):
     /// `height` rows of `width` pixels, each row starting at a byte
-    /// boundary. Identical in output to one [`Self::blit_row`] per row,
-    /// which is exactly what the landscape frames do.
+    /// boundary. Identical in output to one [`Self::blit_row`] per row.
     ///
-    /// Portrait takes a transposed path instead, and that is the point of
-    /// this entry: a frame row runs down a native *column*, so the
-    /// row-at-a-time loop can only place one pixel per read-modify-write.
-    /// Eight consecutive frame rows, though, land in eight bits of the
-    /// same native byte — transposing an 8x8 block of the glyph turns
-    /// those 64 masked writes into 8, and amortizes the per-row column
-    /// setup across the whole glyph. Reading pages are almost entirely
-    /// glyph blits, so this is the portrait page's rasterizer cost.
+    /// Both frames take a whole-glyph path rather than that row loop, for
+    /// different reasons. Portrait: a frame row runs down a native
+    /// *column*, so the row-at-a-time loop can only place one pixel per
+    /// read-modify-write — but eight consecutive frame rows land in eight
+    /// bits of the same native byte, so transposing an 8x8 block turns
+    /// those 64 masked writes into 8. Landscape: the byte writes are
+    /// already eight pixels wide, so there is no packing win to take; what
+    /// the row loop wasted was setup, re-derived per row (see
+    /// [`Self::blit_bitmap_landscape`]).
+    ///
+    /// Reading pages are almost entirely glyph blits, so this entry is the
+    /// page's rasterizer cost in either orientation.
     pub fn blit_bitmap(
         &mut self,
         x: i32,
@@ -387,11 +390,7 @@ impl Framebuffer {
             return;
         }
         if self.frame != FbFrame::Portrait {
-            for row in 0..height {
-                let start = (row * row_bytes).min(bits.len());
-                let end = ((row + 1) * row_bytes).min(bits.len());
-                self.blit_row(x, y + row as i32, &bits[start..end], width, white);
-            }
+            self.blit_bitmap_landscape(x, y, bits, width, height, white);
             return;
         }
 
@@ -458,6 +457,116 @@ impl Framebuffer {
                 }
             }
             row += rows;
+        }
+    }
+
+    /// Whole-glyph landscape blit: the same output as one
+    /// [`Self::blit_row`] per row, with everything that does not depend on
+    /// the row hoisted out of the glyph.
+    ///
+    /// A landscape frame row *is* a native row, so unlike portrait there is
+    /// no bit-packing win here — a source byte already covers eight pixels
+    /// of one destination byte pair. What the row-at-a-time loop re-paid
+    /// per row was setup: the frame match, the native-y derivation and its
+    /// multiply, and then per source byte a `div_euclid`/`rem_euclid` pair
+    /// to find the destination byte and the shift into it. None of that
+    /// depends on the row.
+    ///
+    /// So the walk runs byte columns on the outside. Each column resolves
+    /// its destination offset, shift, and padding mask once; the row loop
+    /// underneath is then a load, a mask, a shift and up to two
+    /// read-modify-writes, stepping the destination by one row stride —
+    /// which is a pointer add, because successive frame rows are adjacent
+    /// native rows.
+    fn blit_bitmap_landscape(
+        &mut self,
+        x: i32,
+        y: i32,
+        bits: &[u8],
+        width: usize,
+        height: usize,
+        white: bool,
+    ) {
+        let row_bytes = width.div_ceil(8);
+        // Rows off the top or bottom of the panel are dropped, exactly as
+        // the per-row path's own bounds checks dropped them.
+        let row_start = if y < 0 { (-y) as usize } else { 0 };
+        let row_end = height.min((HEIGHT as i32 - y).max(0) as usize);
+        if row_start >= row_end {
+            return;
+        }
+
+        // Which way native rows run under this frame — the same choice
+        // `blit_row`'s native-y match makes, made once.
+        let descending = match self.frame {
+            FbFrame::Landscape => !cfg!(feature = "device-x3"),
+            FbFrame::LandscapeFlipped => cfg!(feature = "device-x3"),
+            _ => false,
+        };
+        let first_y = (y + row_start as i32) as usize;
+        let native_y = if descending {
+            HEIGHT - 1 - first_y
+        } else {
+            first_y
+        };
+        let base_first = native_y * ROW_BYTES;
+        let row_stride = if descending {
+            ROW_BYTES.wrapping_neg()
+        } else {
+            ROW_BYTES
+        };
+        // Only the flipped frame mirrors, and it mirrors by *not* reversing
+        // the source byte while running the columns the other way.
+        let flipped = self.frame == FbFrame::LandscapeFlipped;
+
+        for byte_col in 0..row_bytes {
+            // Bits past `width` are not part of the row and may hold
+            // anything. Which ones those are is a property of the column.
+            let valid = (width - 8 * byte_col).min(8);
+            let keep = (0xFF00u16 >> valid) as u8;
+
+            let bit_x = if flipped {
+                WIDTH as i32 - x - 8 * (byte_col as i32 + 1)
+            } else {
+                x + 8 * byte_col as i32
+            };
+            if bit_x <= -8 || bit_x >= WIDTH as i32 {
+                continue;
+            }
+            // Where this column lands and how far it straddles the byte
+            // boundary: `blit_native_bits`' arithmetic, lifted out of the
+            // row loop. A column may write the low byte, the high byte, or
+            // both — clipped columns write only one.
+            let index = ROW_BYTES as i32 - 1 - bit_x.div_euclid(8);
+            let shift = bit_x.rem_euclid(8) as u32;
+            let low = (index >= 0 && index < ROW_BYTES as i32).then_some(index as usize);
+            let high = (shift > 0 && index >= 1 && index <= ROW_BYTES as i32)
+                .then_some((index - 1) as usize);
+            if low.is_none() && high.is_none() {
+                continue;
+            }
+
+            let mut base = base_first;
+            for row in row_start..row_end {
+                // `bits` may be short of `height * row_bytes`; the per-row
+                // path clipped its slice and let the byte count shrink. The
+                // index only grows, so the first miss ends the column.
+                let Some(&byte) = bits.get(row * row_bytes + byte_col) else {
+                    break;
+                };
+                let byte = byte & keep;
+                if byte != 0 {
+                    let source = if flipped { byte } else { byte.reverse_bits() };
+                    let aligned = (source as u16) << shift;
+                    if let Some(low) = low {
+                        Self::apply_mask(&mut self.data[base + low], aligned as u8, white);
+                    }
+                    if let Some(high) = high {
+                        Self::apply_mask(&mut self.data[base + high], (aligned >> 8) as u8, white);
+                    }
+                }
+                base = base.wrapping_add(row_stride);
+            }
         }
     }
 
@@ -773,7 +882,14 @@ mod tests {
     fn blit_bitmap_matches_row_at_a_time_in_every_frame() {
         // Heights that straddle the 8-row group boundary and widths that
         // leave padding bits set in the last byte of every row.
-        let glyphs: [(&[u8], usize, usize); 5] = [
+        let glyphs: [(&[u8], usize, usize); 7] = [
+            // `bits` shorter than height * row_bytes, in both a single-byte
+            // and a multi-byte row shape. The per-row path clipped its slice
+            // and let the byte count shrink to nothing; the whole-glyph paths
+            // stop at the first missing byte instead, and these are what pin
+            // the two against each other.
+            (&[0xFF, 0xA5, 0x3C], 8, 8),
+            (&[0xFF, 0xA5, 0x12, 0x3C, 0x00], 17, 4),
             (&[0b1011_0101], 8, 1),
             (&[0b1011_0111, 0b0100_1011, 0b1111_1110], 5, 3),
             (&[0xFF, 0xA5, 0x3C, 0x00, 0x81, 0x7E, 0x18, 0xDB], 8, 8),
