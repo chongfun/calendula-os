@@ -607,6 +607,25 @@ where
     let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
     library.set_cache_key(cache_key.as_str());
     esp_println::println!("epub: stage ResolveCatalogEntry key={}", cache_key.as_str());
+    // Claim this open's layout config as the book's most recently used before
+    // anything reads or writes under it: the per-config index and section
+    // files are named for it, so the registry has to know it, and the least
+    // recently used config's files have to be gone before a build adds a
+    // third set.
+    //
+    // An eviction that would not go through leaves this config unadopted: the
+    // build below still runs and writes under it, but the registry keeps
+    // naming the config whose files are still on the card, so the next open
+    // retries the eviction rather than losing track of a full section set.
+    let adoption = files::adopt_layout_config(root, cache_key.as_str(), library);
+    esp_println::println!(
+        "epub: layout config resident={} evicted={:?} evict_failed={:?} legacy_purged={} registry_write_failed={}",
+        adoption.resident,
+        adoption.evicted,
+        adoption.eviction_failed,
+        adoption.purged_legacy,
+        adoption.registry_write_failed
+    );
     esp_println::println!(
         "epub: stage TryV2BookIndexFast page={}",
         target_pages as u32

@@ -17,18 +17,26 @@
 //! `upload-store`'s public API to avoid ~120 duplicated lines would put test
 //! scaffolding in a shipped crate. If a third crate ever needs it, that is the
 //! point to extract it into a dev-only crate of its own.
+//!
+//! The last section covers the per-config cache layout (B7) rather than a
+//! fault: which files a layout config owns, that a second config does not
+//! overwrite the first, and which one eviction takes. It lives here for the
+//! card harness above — a second integration test would have to copy all of
+//! it, which is the cost this file's header already argues against.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use display::font::FontStyle;
+use display::font::{FontSize, FontStyle, TypeSettings};
 use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Directory, TimeSource, Timestamp, VolumeIdx,
     VolumeManager,
 };
 use proto::cache::{
-    BookV2SectionRecord, CoverCacheHeader, CACHE_COVER_FILE, COVER_BYTES, COVER_HEIGHT,
-    COVER_STRIDE, COVER_WIDTH,
+    book_index_file_name, layout_cache_key, section_file_name, BookV2SectionRecord,
+    CoverCacheHeader, BOOK_INDEX_FILE_BYTES, CACHE_BOOK_FILE, CACHE_CONFIG_FILE, CACHE_COVER_FILE,
+    CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, COVER_BYTES, COVER_HEIGHT, COVER_STRIDE,
+    COVER_WIDTH,
 };
 use proto::text::{TextAlign, TextRole};
 use reader_cache::files::{self, CacheLoadResult};
@@ -297,11 +305,25 @@ fn total_pages(records: &[BookV2SectionRecord]) -> u32 {
 /// Whether the book's cache directory still holds its section files. This is
 /// the question the round-2 finding turned on: a failing publish must not take
 /// the files out from under a reader who is reading them.
-fn sections_still_on_card(root: &Dir<'_>, count: usize) -> bool {
-    (0..count).all(|n| file_in_sections_dir(root, &format!("S{n:03}.BIN")))
+fn sections_still_on_card(root: &Dir<'_>, store: &ReaderStore, count: usize) -> bool {
+    // Named for the store's layout config, the way the writer names them: a
+    // section file belongs to one paginated copy of the book, so a helper
+    // spelling the name itself would pass while the config key drifted.
+    let layout_key = layout_cache_key_for(store);
+    (0..count).all(|n| section_file_present(root, layout_key, n as u16))
 }
 
-/// Whether one named file exists in the book's `SECTIONS/` directory.
+/// The per-config cache key for a store's current type settings and page box.
+fn layout_cache_key_for(store: &ReaderStore) -> u8 {
+    layout_cache_key(layout::reader_layout_config(
+        store.type_settings(),
+        store.portrait(),
+    ))
+}
+
+/// Whether one named file exists in the book's `SECTIONS/` directory. Takes a
+/// raw name, for the cases that are deliberately not this config's: a stray
+/// file, or another config's section.
 fn file_in_sections_dir(root: &Dir<'_>, name: &str) -> bool {
     files::with_v2_sections_dir(root, KEY, |sections| {
         let Some(sections) = sections else {
@@ -436,7 +458,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
         "the walk must report the failure rather than claim it finished"
     );
     assert!(
-        sections_still_on_card(&root, 3),
+        sections_still_on_card(&root, &store, 3),
         "the reader's section files must survive a failed index write"
     );
     assert_eq!(
@@ -470,7 +492,7 @@ fn a_failed_first_open_index_write_clears_the_cache_nobody_is_holding() {
     );
     assert_eq!(result, Err(PublishError::IndexWrite));
     assert!(
-        !sections_still_on_card(&root, 3),
+        !sections_still_on_card(&root, &store, 3),
         "an open that never became readable should leave no debris"
     );
 }
@@ -625,7 +647,7 @@ fn a_clean_publish_leaves_the_requested_page_resident() {
         "the requested page must be renderable from RAM after a clean publish"
     );
     assert!(
-        sections_still_on_card(&root, 3),
+        sections_still_on_card(&root, &store, 3),
         "a clean publish must not delete anything"
     );
 }
@@ -661,11 +683,11 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
     );
     assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
-    assert!(sections_still_on_card(&root, 5));
+    assert!(sections_still_on_card(&root, &store, 5));
 
     // A completed rebuild over the same content with a smaller final section
     // set, as a change to the capacity constants would produce: it rewrites
-    // S000..S002 and leaves S003 and S004 behind.
+    // S<cfg>000..S<cfg>002 and leaves S<cfg>003 and S<cfg>004 behind.
     let narrow = &wide[..3];
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
@@ -683,11 +705,12 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
 
     assert!(
-        sections_still_on_card(&root, 3),
+        sections_still_on_card(&root, &store, 3),
         "the sections the new index names must survive"
     );
+    let layout_key = layout_cache_key_for(&store);
     assert!(
-        !file_in_sections_dir(&root, "S003.BIN") && !file_in_sections_dir(&root, "S004.BIN"),
+        !section_file_present(&root, layout_key, 3) && !section_file_present(&root, layout_key, 4),
         "the sections the new index no longer names must be gone"
     );
 }
@@ -727,7 +750,7 @@ fn a_suspended_walk_keeps_the_sections_past_its_frontier() {
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
 
     assert!(
-        sections_still_on_card(&root, 5),
+        sections_still_on_card(&root, &store, 5),
         "a provisional publish must leave every section the walk will resume into"
     );
 }
@@ -746,6 +769,11 @@ fn the_prune_leaves_names_it_does_not_recognise() {
     write_stray_file(&root, "NOTES.TXT");
     // Two digits, so not a name this code ever writes.
     write_stray_file(&root, "S12.BIN");
+    // A name the *previous* scheme wrote: eight characters, no config key. Its
+    // ordinal is in the range being pruned, so a prune reading ordinals without
+    // the key would take it. Retiring these is the legacy purge's job, which is
+    // gated on BOOK.BIN and knows to look; the prune must leave them.
+    write_stray_file(&root, "S003.BIN");
 
     let narrow = &wide[..1];
     store.begin_book_load();
@@ -764,12 +792,16 @@ fn the_prune_leaves_names_it_does_not_recognise() {
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
 
     assert!(
-        !file_in_sections_dir(&root, "S001.BIN"),
+        !section_file_present(&root, layout_cache_key_for(&store), 1),
         "the orphaned section should still go"
     );
     assert!(
         file_in_sections_dir(&root, "NOTES.TXT") && file_in_sections_dir(&root, "S12.BIN"),
         "names this code does not write must be left alone"
+    );
+    assert!(
+        file_in_sections_dir(&root, "S003.BIN"),
+        "a legacy unkeyed name is not this prune's to take"
     );
 }
 
@@ -797,13 +829,14 @@ fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
     // three land in one listing batch (SECTION_SWEEP_BATCH is 16), so this
     // exercises "kept going after the failure", not "picked it up next pass".
     build_book(&root, &mut store, 5);
-    assert!(sections_still_on_card(&root, 5));
+    assert!(sections_still_on_card(&root, &store, 5));
+    let layout_key = layout_cache_key_for(&store);
 
     disk.fault.fail_write_in.set(Some(0));
-    let removed = files::prune_orphan_sections(&root, KEY, 2);
+    let removed = files::prune_orphan_sections(&root, KEY, &store, 2);
 
     assert!(
-        file_in_sections_dir(&root, "S000.BIN") && file_in_sections_dir(&root, "S001.BIN"),
+        section_file_present(&root, layout_key, 0) && section_file_present(&root, layout_key, 1),
         "the sections the index still names must survive"
     );
     assert_eq!(
@@ -811,11 +844,73 @@ fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
         "every orphan must come off the card, including the one behind the refused write"
     );
     assert!(
-        !file_in_sections_dir(&root, "S002.BIN")
-            && !file_in_sections_dir(&root, "S003.BIN")
-            && !file_in_sections_dir(&root, "S004.BIN"),
+        !section_file_present(&root, layout_key, 2)
+            && !section_file_present(&root, layout_key, 3)
+            && !section_file_present(&root, layout_key, 4),
         "a refused delete must not strand the orphans after it"
     );
+}
+
+/// Invariant: the prune stays inside the config that was just published.
+///
+/// This is the invariant the per-config layout creates and the prune could
+/// silently break. Two resident configs both number their sections from zero, so
+/// their ordinal ranges overlap completely: a prune that went by ordinal alone
+/// would delete the other config's tail past this one's count — a working
+/// paginated copy of the book, and the whole reason for keeping two.
+#[test]
+fn the_prune_leaves_the_other_config_alone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // The config that keeps five sections, and stays untouched throughout.
+    let keeper_key = build_under_current_config(&root, &mut store, 5);
+
+    // A second config publishes a shorter book, which prunes its own tail.
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let shrinking_key = layout_cache_key_for(&store);
+    assert_ne!(
+        shrinking_key, keeper_key,
+        "the flip must land on a different config for this to test anything"
+    );
+    files::adopt_layout_config(&root, KEY, &store);
+    let wide = build_book(&root, &mut store, 5);
+    let narrow = &wide[..2];
+    store.begin_book_load();
+    let outcome = publish::publish_book_cache(
+        &root,
+        KEY,
+        IDENTITY,
+        0,
+        &mut store,
+        narrow,
+        total_pages(narrow),
+        false,
+        0,
+    );
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+
+    for section in 2..5 {
+        assert!(
+            !section_file_present(&root, shrinking_key, section),
+            "section {section} of the shrinking config is stranded and must go"
+        );
+        assert!(
+            section_file_present(&root, keeper_key, section),
+            "section {section} belongs to the other config and must survive"
+        );
+    }
+    for section in 0..2 {
+        assert!(
+            section_file_present(&root, shrinking_key, section)
+                && section_file_present(&root, keeper_key, section),
+            "section {section} is named by both configs' indexes"
+        );
+    }
 }
 
 /// Invariant: a progressive first open adopts the cover, like every other
@@ -933,11 +1028,779 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
         "a refused index write must be reported, not swallowed"
     );
     assert!(
-        sections_still_on_card(&root, sections),
+        sections_still_on_card(&root, &store, sections),
         "a refused index write must not take the reader's sections with it"
     );
     assert!(
         store.covers_global_page(0, reader_page),
         "the reader's page must still be resident after the refused write"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-config caches (B7)
+//
+// A wrap-relevant settings change — type size, weight, family, or the
+// portrait/landscape page box — used to overwrite the book's one cached
+// pagination, so flipping back re-paid the whole rebuild (24-27 s on the
+// measured 11.7 MB book). These pin that each config owns its own files, that
+// the registry orders them by use, and that eviction takes the least recently
+// used one and nothing else.
+// ---------------------------------------------------------------------------
+
+/// The store's layout config, and a second one that differs only in the page
+/// box — the orientation flip, which is the flow that made B7 worth doing.
+fn landscape_of(store: &ReaderStore) -> (TypeSettings, bool) {
+    (store.type_settings(), !store.portrait())
+}
+
+/// A third config: a type-size change, the other flow that re-paid a rebuild.
+fn larger_of(store: &ReaderStore) -> (TypeSettings, bool) {
+    let mut settings = store.type_settings();
+    settings.size = match settings.size {
+        FontSize::Large => FontSize::Small,
+        _ => FontSize::Large,
+    };
+    (settings, store.portrait())
+}
+
+fn section_file_present(root: &Dir<'_>, layout_key: u8, section: u16) -> bool {
+    files::with_v2_sections_dir(root, KEY, |sections| {
+        let Some(sections) = sections else {
+            return false;
+        };
+        let mut name = heapless::String::<CACHE_SECTION_FILE_BYTES>::new();
+        section_file_name(layout_key, section, &mut name);
+        sections
+            .open_file_in_dir(name.as_str(), embedded_sdmmc::Mode::ReadOnly)
+            .is_ok()
+    })
+}
+
+fn book_index_present(root: &Dir<'_>, layout_key: u8) -> bool {
+    let dir = files::open_v2_book_dir(root, KEY).expect("book cache dir");
+    let mut name = heapless::String::<BOOK_INDEX_FILE_BYTES>::new();
+    book_index_file_name(layout_key, &mut name);
+    // Bound rather than returned directly: the `Result` holds a `File` borrowing
+    // `dir`, and as a tail expression that temporary would outlive `dir`.
+    let present = dir
+        .open_file_in_dir(name.as_str(), embedded_sdmmc::Mode::ReadOnly)
+        .is_ok();
+    present
+}
+
+/// Build and publish the whole book under the store's current layout config,
+/// the way an open that misses does: adopt the config, write its sections,
+/// write its index. Returns the config's cache key.
+fn build_under_current_config(root: &Dir<'_>, store: &mut ReaderStore, sections: usize) -> u8 {
+    let layout_key = layout_cache_key_for(store);
+    files::adopt_layout_config(root, KEY, store);
+    let records = build_book(root, store, sections);
+    let pages = total_pages(&records);
+    assert!(
+        files::write_v2_book_index(root, KEY, IDENTITY, pages, &records, store, false, 0),
+        "the index for config {layout_key:#04x} should write"
+    );
+    store.begin_book_load();
+    store.set_book_index(pages, false, &records);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    layout_key
+}
+
+/// Invariant: two layout configs keep separate caches, so returning to one
+/// already built is a hit rather than a rebuild. This is B7's whole point.
+#[test]
+fn a_second_layout_config_does_not_overwrite_the_first() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let portrait_key = build_under_current_config(&root, &mut store, 3);
+
+    // Flip the page box, the way an orientation toggle does, and build again.
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let landscape_key = build_under_current_config(&root, &mut store, 3);
+    assert_ne!(
+        portrait_key, landscape_key,
+        "an orientation flip must land on a different config key, or the caches still collide"
+    );
+
+    // Both configs' files are on the card at once -- the state the
+    // single-file scheme could never hold.
+    for key in [portrait_key, landscape_key] {
+        assert!(
+            book_index_present(&root, key),
+            "index {key:#04x} must survive"
+        );
+        for section in 0..3 {
+            assert!(
+                section_file_present(&root, key, section),
+                "section {section} of config {key:#04x} must survive"
+            );
+        }
+    }
+
+    // Flip back: the config is resident, and its index and section load
+    // without any rebuild.
+    let (settings, portrait) = (store.type_settings(), !store.portrait());
+    store.set_layout(settings, portrait);
+    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    assert!(
+        adoption.resident,
+        "the config just flipped away from must read as already built"
+    );
+    assert_eq!(adoption.evicted, None, "two configs fit; nothing should go");
+    assert!(
+        matches!(
+            files::load_v2_book_index(&root, KEY, IDENTITY, &mut store),
+            files::BookIndexLoadResult::Hit { unfinished: false }
+        ),
+        "the flipped-back config's index must load, not miss"
+    );
+    assert!(
+        matches!(
+            files::load_v2_section_by_global_page(&root, KEY, IDENTITY, 0, &mut store),
+            CacheLoadResult::Hit { .. }
+        ),
+        "the flipped-back config's section must load from its own file"
+    );
+}
+
+/// Invariant: a third config evicts the least recently used one, and takes
+/// only its files -- not the surviving config's, and not the
+/// settings-independent ones.
+#[test]
+fn a_third_layout_config_evicts_the_least_recently_used_one() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let first_key = build_under_current_config(&root, &mut store, 2);
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let second_key = build_under_current_config(&root, &mut store, 2);
+    // COVER.BIN is settings-independent; eviction must not reach it.
+    write_cover(&root);
+
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    let third_key = layout_cache_key_for(&store);
+    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    assert_eq!(
+        adoption.evicted,
+        Some(first_key),
+        "the third config must evict the least recently used one"
+    );
+    assert!(
+        !adoption.resident,
+        "a config never built cannot be resident"
+    );
+    assert_eq!(
+        adoption.eviction_failed, None,
+        "an eviction that took every file has nothing to report as left behind"
+    );
+
+    assert!(
+        !book_index_present(&root, first_key),
+        "the evicted config's index must be gone"
+    );
+    for section in 0..2 {
+        assert!(
+            !section_file_present(&root, first_key, section),
+            "the evicted config's section {section} must be gone"
+        );
+        assert!(
+            section_file_present(&root, second_key, section),
+            "the surviving config's section {section} must not be collateral"
+        );
+    }
+    assert!(
+        book_index_present(&root, second_key),
+        "the surviving config's index must not be collateral"
+    );
+    assert_ne!(third_key, first_key);
+    assert_eq!(
+        files::load_v2_cover_cache(&root, KEY, &mut store),
+        files::CoverLoadResult::Hit,
+        "COVER.BIN does not depend on the layout config and must survive eviction"
+    );
+}
+
+/// Invariant: an eviction that cannot delete the config's index leaves that
+/// config registered, and the next open retries it.
+///
+/// The registry is the only thing that counts a paginated copy of the book
+/// toward the two-config bound. Promoting over a config whose files are still
+/// there would unregister a full section set: no later eviction would look at
+/// it again, and on a card refusing deletes for want of space the build this
+/// open is about to run would be asked for a third set on top of it.
+///
+/// The delete is blocked here by holding the file open, which this
+/// embedded-sdmmc rev refuses to reopen — the same `RemoveStatus::Failed` an
+/// I/O fault produces, but aimed at one named file instead of the Nth write.
+#[test]
+fn an_eviction_that_cannot_delete_keeps_the_evicted_config_registered() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let first_key = build_under_current_config(&root, &mut store, 2);
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let second_key = build_under_current_config(&root, &mut store, 2);
+
+    // A third config arrives with the least recently used one's index
+    // undeletable.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let mut index_name = heapless::String::<BOOK_INDEX_FILE_BYTES>::new();
+    book_index_file_name(first_key, &mut index_name);
+    let held = book
+        .open_file_in_dir(index_name.as_str(), embedded_sdmmc::Mode::ReadOnly)
+        .expect("hold the evicted config's index open");
+
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    let blocked = files::adopt_layout_config(&root, KEY, &store);
+    assert_eq!(
+        blocked.evicted, None,
+        "nothing was deleted, so nothing may be reported evicted"
+    );
+    assert_eq!(
+        blocked.eviction_failed,
+        Some(first_key),
+        "the config that would not go must be named, not silently dropped"
+    );
+
+    drop(held);
+    drop(book);
+    assert!(
+        book_index_present(&root, first_key),
+        "the refused delete leaves the index on the card"
+    );
+    for section in 0..2 {
+        assert!(
+            section_file_present(&root, first_key, section),
+            "the index refusal stops the sweep, so section {section} stays too"
+        );
+        assert!(
+            section_file_present(&root, second_key, section),
+            "the surviving config is untouched either way"
+        );
+    }
+
+    // The whole point of leaving the registry alone: the config is still
+    // named, so the next open under the third config evicts it rather than
+    // walking past files nothing counts.
+    let retry = files::adopt_layout_config(&root, KEY, &store);
+    assert_eq!(
+        retry.evicted,
+        Some(first_key),
+        "the registry must still have named the config it could not delete"
+    );
+    assert_eq!(retry.eviction_failed, None);
+    assert!(
+        !book_index_present(&root, first_key),
+        "the retry takes the index the first attempt could not"
+    );
+    for section in 0..2 {
+        assert!(
+            !section_file_present(&root, first_key, section),
+            "the retry takes section {section} as well"
+        );
+    }
+}
+
+/// Invariant: the same holds when it is a *section* file that will not go,
+/// after the index has already been deleted.
+///
+/// This is the half-deleted case: the config's index is gone, so nothing can
+/// read it, but its section files still occupy the card. Reporting that as an
+/// eviction would leave those files uncounted forever; keeping the config
+/// registered is what sends the next open back for them.
+#[test]
+fn an_eviction_that_cannot_delete_a_section_file_reports_no_eviction() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let first_key = build_under_current_config(&root, &mut store, 2);
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    build_under_current_config(&root, &mut store, 2);
+
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let sections = book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir");
+    let mut section_name = heapless::String::<CACHE_SECTION_FILE_BYTES>::new();
+    section_file_name(first_key, 1, &mut section_name);
+    let held = sections
+        .open_file_in_dir(section_name.as_str(), embedded_sdmmc::Mode::ReadOnly)
+        .expect("hold one of the evicted config's sections open");
+
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    let blocked = files::adopt_layout_config(&root, KEY, &store);
+    assert_eq!(
+        blocked.evicted, None,
+        "a sweep that left a file behind is not an eviction"
+    );
+    assert_eq!(blocked.eviction_failed, Some(first_key));
+
+    drop(held);
+    drop(sections);
+    drop(book);
+    assert!(
+        !book_index_present(&root, first_key),
+        "the index goes first, and that part did succeed"
+    );
+    assert!(
+        section_file_present(&root, first_key, 1),
+        "the section that refused to go is still on the card"
+    );
+
+    let retry = files::adopt_layout_config(&root, KEY, &store);
+    assert_eq!(
+        retry.evicted,
+        Some(first_key),
+        "a config whose index is already gone is still the one owed a sweep"
+    );
+    assert!(
+        !section_file_present(&root, first_key, 1),
+        "the retry finishes the sweep the refusal interrupted"
+    );
+}
+
+/// Invariant: re-reading a resident config moves it off the eviction block.
+/// Without this the registry would be insertion-ordered, and the config the
+/// reader had just come back to would be the next one thrown away.
+#[test]
+fn re_reading_a_config_keeps_it_off_the_eviction_block() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let first_key = build_under_current_config(&root, &mut store, 1);
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let second_key = build_under_current_config(&root, &mut store, 1);
+
+    // Go back to the first config without building: it becomes most recent.
+    let (settings, portrait) = (store.type_settings(), !store.portrait());
+    store.set_layout(settings, portrait);
+    assert!(files::adopt_layout_config(&root, KEY, &store).resident);
+
+    // A third config now takes the *other* one's slot.
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    assert_eq!(
+        files::adopt_layout_config(&root, KEY, &store).evicted,
+        Some(second_key),
+        "eviction must take the config that has not been read since, not the one just re-read"
+    );
+    assert!(
+        book_index_present(&root, first_key),
+        "the re-read config must still be on the card"
+    );
+}
+
+/// Invariant: the first open of a cache written by the single-config firmware
+/// deletes its files, and leaves the settings-independent ones alone.
+///
+/// Without this the old `BOOK.BIN` and unkeyed `S<spine>.BIN` files would sit
+/// on the card forever: nothing reads them under the new names, and the
+/// registry that drives eviction never learns they exist.
+#[test]
+fn the_first_open_after_the_single_config_scheme_purges_its_files() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // A cache exactly as the previous firmware left it: an unkeyed index, an
+    // unkeyed section file, and a cover.
+    files::ensure_v2_cache_dirs(&root, KEY).expect("cache dirs");
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    for name in [CACHE_BOOK_FILE, "S000.BIN"] {
+        let dir = if name == CACHE_BOOK_FILE {
+            None
+        } else {
+            Some(book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir"))
+        };
+        let target = dir.as_ref().unwrap_or(&book);
+        let file = target
+            .open_file_in_dir(name, embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+            .expect("legacy file");
+        file.write(&[0u8; 64]).expect("legacy file body");
+    }
+    write_cover(&root);
+    drop(book);
+
+    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    assert!(
+        adoption.purged_legacy,
+        "an unkeyed BOOK.BIN must be recognized as the previous scheme's"
+    );
+    assert!(
+        !adoption.resident,
+        "the purged cache cannot count as this config's"
+    );
+
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    assert!(
+        book.open_file_in_dir(CACHE_BOOK_FILE, embedded_sdmmc::Mode::ReadOnly)
+            .is_err(),
+        "the unkeyed index must be gone"
+    );
+    let sections = book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir");
+    assert!(
+        sections
+            .open_file_in_dir("S000.BIN", embedded_sdmmc::Mode::ReadOnly)
+            .is_err(),
+        "the unkeyed section file must be gone"
+    );
+    drop(sections);
+    drop(book);
+    assert_eq!(
+        files::load_v2_cover_cache(&root, KEY, &mut store),
+        files::CoverLoadResult::Hit,
+        "the purge must not reach the settings-independent files"
+    );
+
+    // A second open has nothing left to find, so the pass costs one failed
+    // open rather than a sections listing.
+    assert!(!files::adopt_layout_config(&root, KEY, &store).purged_legacy);
+}
+
+/// Invariant: a cache whose registry was lost still identifies its book.
+///
+/// `read_cache_header`'s `Absent` is what licenses the orphan sweep to delete
+/// a cache directory. The source identity now lives inside a per-config index
+/// the registry names, so a lost registry must not be able to make a cache
+/// that is plainly there read as absent.
+#[test]
+fn a_cache_whose_registry_is_lost_still_names_its_book() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    build_under_current_config(&root, &mut store, 2);
+    match files::read_cache_header(&root, KEY) {
+        files::CacheHeader::Present(header) => {
+            assert_eq!((header.source_hash, header.source_size), IDENTITY)
+        }
+        other => panic!("a published cache must identify its book, got {other:?}"),
+    }
+
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    book.delete_file_in_dir(CACHE_CONFIG_FILE)
+        .expect("registry deletes");
+    drop(book);
+
+    match files::read_cache_header(&root, KEY) {
+        files::CacheHeader::Present(header) => {
+            assert_eq!(
+                (header.source_hash, header.source_size),
+                IDENTITY,
+                "the index is still on the card and still says whose it is"
+            )
+        }
+        other => panic!("a lost registry must not make a live cache deletable, got {other:?}"),
+    }
+}
+
+/// Invariant: a corrupt registry reads as `Unreadable`, never `Absent`.
+///
+/// `Absent` is what licenses the orphan sweep to delete a cache directory, so
+/// a registry that is plainly there but says nothing usable must fail closed:
+/// the clear path refuses to delete against a key it cannot prove, and the
+/// sweep's own comment turns on the same distinction.
+#[test]
+fn a_registry_that_says_nothing_usable_fails_closed() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    build_under_current_config(&root, &mut store, 1);
+
+    // Overwrite the registry with bytes that decode to nothing, and take the
+    // index with it so no config can answer for the book.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let mut name = heapless::String::<BOOK_INDEX_FILE_BYTES>::new();
+    book_index_file_name(layout_cache_key_for(&store), &mut name);
+    book.delete_file_in_dir(name.as_str())
+        .expect("index deletes");
+    let file = book
+        .open_file_in_dir(
+            CACHE_CONFIG_FILE,
+            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("registry opens");
+    file.write(b"garbage!!").expect("registry body");
+    drop(file);
+    drop(book);
+
+    assert_eq!(
+        files::read_cache_header(&root, KEY),
+        files::CacheHeader::Unreadable,
+        "a registry that is there and unusable must not read as no cache at all"
+    );
+}
+
+/// Invariant: a `CFG.BIN` write that will not land is reported, not swallowed.
+///
+/// The registry is opened create-or-truncate, so a refused write does not leave
+/// the previous one behind -- it leaves nothing decodable. An open that shrugged
+/// that off would go on to build under a config no registry names.
+#[test]
+fn a_registry_write_that_is_refused_is_reported() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    build_under_current_config(&root, &mut store, 1);
+
+    // Block the registry the same way the eviction tests block a delete: hold
+    // it open, which this embedded-sdmmc rev will not reopen for writing.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let held = book
+        .open_file_in_dir(CACHE_CONFIG_FILE, embedded_sdmmc::Mode::ReadOnly)
+        .expect("hold the registry open");
+
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let blocked = files::adopt_layout_config(&root, KEY, &store);
+    assert!(
+        blocked.registry_write_failed,
+        "a registry that would not take the write must say so"
+    );
+    assert_eq!(
+        blocked.eviction_failed, None,
+        "nothing needed evicting -- this is the write, not the delete"
+    );
+    drop(held);
+    drop(book);
+}
+
+/// Invariant: a registry left unusable by a refused write does not cost the
+/// two-config bound. This is the accumulation the write failure above would
+/// otherwise start.
+///
+/// A `CFG.BIN` that is there and will not decode used to read as an empty
+/// registry, which unregisters every config on the card at once: eviction stops
+/// counting them, so the next open adds a third full section set, and the one
+/// after that a fourth. Rebuilding the registry from the index files that are
+/// really there is what keeps the count honest.
+#[test]
+fn a_registry_left_unusable_is_rebuilt_from_the_index_files_on_the_card() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let first_key = build_under_current_config(&root, &mut store, 2);
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let second_key = build_under_current_config(&root, &mut store, 2);
+
+    // Exactly what a refused write leaves: the file there, its contents gone.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let file = book
+        .open_file_in_dir(
+            CACHE_CONFIG_FILE,
+            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("registry opens");
+    drop(file);
+    drop(book);
+
+    // A third config arrives. Both existing configs are still on the card, so
+    // the bound says one of them goes -- which an empty registry could not know.
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    let evicted = adoption
+        .evicted
+        .expect("a truncated registry must not hide the configs the card still holds");
+    assert!(
+        evicted == first_key || evicted == second_key,
+        "eviction must take one of the two configs that were really there, got {evicted:#04x}"
+    );
+    assert!(
+        !book_index_present(&root, evicted),
+        "the evicted config's index must actually be gone"
+    );
+    for section in 0..2 {
+        assert!(
+            !section_file_present(&root, evicted, section),
+            "section {section} of the evicted config must go with its index"
+        );
+    }
+    let survivor = if evicted == first_key {
+        second_key
+    } else {
+        first_key
+    };
+    assert!(
+        book_index_present(&root, survivor),
+        "eviction must take one config, not both"
+    );
+}
+
+/// Invariant: a legacy purge that cannot finish leaves the marker that brings
+/// the next open back for it.
+///
+/// `BOOK.BIN` is the only thing that makes a later open pay for a sections
+/// listing, so deleting it before the sweep finished would strand the unkeyed
+/// section files for good: nothing reads those names and no registry counts
+/// them, so no later pass would ever look again.
+#[test]
+fn a_legacy_sweep_that_is_blocked_keeps_its_retry_marker() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, KEY).expect("cache dirs");
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let sections = book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir");
+    for (dir, name) in [(None, CACHE_BOOK_FILE), (Some(&sections), "S000.BIN")] {
+        let file = dir
+            .unwrap_or(&book)
+            .open_file_in_dir(name, embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+            .expect("legacy file");
+        file.write(&[0u8; 64]).expect("legacy file body");
+    }
+
+    // The legacy section will not delete while it is held open.
+    let held = sections
+        .open_file_in_dir("S000.BIN", embedded_sdmmc::Mode::ReadOnly)
+        .expect("hold the legacy section open");
+
+    assert!(
+        files::adopt_layout_config(&root, KEY, &store).purged_legacy,
+        "the marker was there, so the purge ran"
+    );
+    assert!(
+        book.open_file_in_dir(CACHE_BOOK_FILE, embedded_sdmmc::Mode::ReadOnly)
+            .is_ok(),
+        "the sweep did not finish, so the marker must survive to bring the next open back"
+    );
+
+    drop(held);
+    drop(sections);
+    drop(book);
+
+    // The block is gone; the retry the marker bought finishes the job.
+    assert!(
+        files::adopt_layout_config(&root, KEY, &store).purged_legacy,
+        "the surviving marker must send the next open back through the purge"
+    );
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let sections = book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir");
+    assert!(
+        sections
+            .open_file_in_dir("S000.BIN", embedded_sdmmc::Mode::ReadOnly)
+            .is_err(),
+        "the retry takes the legacy section the first pass could not"
+    );
+    drop(sections);
+    assert!(
+        book.open_file_in_dir(CACHE_BOOK_FILE, embedded_sdmmc::Mode::ReadOnly)
+            .is_err(),
+        "and the marker goes once there is nothing left to come back for"
+    );
+}
+
+/// Invariant: no single read fault can make a cache that is plainly on the card
+/// read as `Absent`.
+///
+/// `Absent` is the one answer that licenses the clear path to delete a
+/// directory, against a 28-bit key whose collisions the format admits. The
+/// registry is deleted here so the fallback directory listing is the only route
+/// to the index -- and a listing that fails must not be indistinguishable from
+/// one that completed and found nothing.
+#[test]
+fn no_read_fault_can_make_a_cache_that_is_there_read_as_absent() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    build_under_current_config(&root, &mut store, 1);
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    book.delete_file_in_dir(CACHE_CONFIG_FILE)
+        .expect("registry deletes");
+    drop(book);
+
+    // Baseline: with no fault armed, the listing finds the index.
+    let before = disk.reads.get();
+    assert!(
+        matches!(
+            files::read_cache_header(&root, KEY),
+            files::CacheHeader::Present(_)
+        ),
+        "the unlisted-index scan must find a cache whose registry is gone"
+    );
+    let reads = disk.reads.get() - before;
+    assert!(
+        reads > 0,
+        "the read counter must be moving for this to mean anything"
+    );
+
+    // Every read that pass makes, failed one at a time. `Unreadable` is fine --
+    // it fails closed. `Absent` is the one answer that would license a delete.
+    let mut unreadable = 0;
+    for nth in 0..reads {
+        disk.fault.fail_read_in.set(Some(nth));
+        let header = files::read_cache_header(&root, KEY);
+        disk.fault.fail_read_in.set(None);
+        assert_ne!(
+            header,
+            files::CacheHeader::Absent,
+            "read fault {nth} made a cache that is on the card read as deletable"
+        );
+        if header == files::CacheHeader::Unreadable {
+            unreadable += 1;
+        }
+    }
+    assert!(
+        unreadable > 0,
+        "no fault position actually disturbed the read, so this proved nothing"
+    );
+}
+
+/// Invariant: clearing a book with two configs resident leaves nothing behind
+/// -- and says so. The clear reports success on what the directory actually
+/// holds, so a per-config file it did not learn to delete would show up as a
+/// failed clear rather than as silent leftovers.
+#[test]
+fn clearing_a_book_with_two_configs_resident_leaves_nothing_behind() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    build_under_current_config(&root, &mut store, 2);
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    build_under_current_config(&root, &mut store, 2);
+    write_cover(&root);
+
+    assert!(
+        files::empty_cache_dir(&root, KEY),
+        "a clear must reclaim every config's files, not report failure on the ones it missed"
+    );
+    assert_eq!(
+        files::read_cache_header(&root, KEY),
+        files::CacheHeader::Absent,
+        "nothing identifying the book may survive the clear"
     );
 }

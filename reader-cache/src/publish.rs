@@ -147,10 +147,15 @@ where
     // frontier rather than the book's real length; pruning against it would
     // delete the sections that walk is about to need. Only a completed
     // build — which stamps zero — knows the final count.
+    //
+    // The count is this layout config's, so the prune is too: it takes the key
+    // from `library`, the same store whose pagination was just written, and the
+    // other resident config's sections are none of its business.
     if resume_spine == 0 {
         let pruned = files::prune_orphan_sections(
             root,
             cache_key,
+            library,
             sections_slice.len().min(u16::MAX as usize) as u16,
         );
         if pruned > 0 {

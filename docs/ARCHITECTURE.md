@@ -416,6 +416,7 @@ only window crossings re-read it. The currently open book sits in a separate
 scrolled. On boot/refresh, firmware first loads a window from the cached
 snapshot, then refreshes `/BOOKS` and card-root discovery in a storage
 command, streaming the fresh catalog out in batches without ever holding it
+<<<<<<< HEAD
 whole. Discovery skips dot-prefixed entries, so the AppleDouble sidecar
 (`._<book>.epub`) Finder writes beside every file it copies to a FAT card is
 not catalogued as a phantom, unopenable duplicate. The scan reads long
@@ -423,7 +424,7 @@ filenames through a buffer sized to the FAT maximum, because an entry whose
 long name does not fit is presented under its short name, and the sidecar's
 short name (`_BOOK~1.EPU`) no longer carries the dot that identifies it.
 Entries are labeled with the book's real title from its cached
-`BOOK.BIN`, falling back to the stored original-filename label for uploaded
+book index, falling back to the stored original-filename label for uploaded
 8.3-named books, then to the prettified file stem. Each fresh catalog write
 also sweeps `CACHE2` and reclaims caches whose stored source identity no
 longer matches any catalogued book, deleting the data files and the emptied
@@ -433,24 +434,57 @@ cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
 
 ```text
-/XTEINK/CACHE2/E<hash>/BOOK.BIN
+/XTEINK/CACHE2/E<hash>/CFG.BIN
+/XTEINK/CACHE2/E<hash>/BK<cfg>.BIN
 /XTEINK/CACHE2/E<hash>/TOC.BIN
 /XTEINK/CACHE2/E<hash>/COVER.BIN
 /XTEINK/CACHE2/E<hash>/CONT.BIN
-/XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
-/XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
+/XTEINK/CACHE2/E<hash>/SECTIONS/S<cfg>000.BIN
+/XTEINK/CACHE2/E<hash>/SECTIONS/S<cfg>001.BIN
 /XTEINK/CATALOG.BIN
 /XTEINK/LABELS/<stem>.TXT
 /XTEINK/STATEA.BIN
 /XTEINK/STATEB.BIN
 ```
 
-`BOOK.BIN` holds a `BookV2Header`, one `BookV2SectionRecord` per section (spine,
-start page, page count, partial), TOC records, and a string blob for title,
-author, and TOC titles. Section files hold a `SectionV2Header`, page records,
-block records, per-block paragraph flags, and the UTF-8 text blob of that
-section's pre-wrapped lines. `TOC.BIN` is a per-book chapter-list sidecar for
-the Chapters overview, distinct from the TOC records inside `BOOK.BIN`.
+The book index and the section files are per *layout config* — `<cfg>` is two
+hex digits of the wrap-relevant bits of `reader_layout_config` (type size,
+weight, family, and the portrait page box), so a book keeps a separate
+paginated copy per setting it has been read under and flipping back to one is
+a cache hit rather than a full re-wrap. `CFG.BIN` lists the resident configs,
+most recently used first; a book holds at most `CACHE_CONFIG_SLOTS` (2) of
+them and the least recently used one's files are deleted when a third
+arrives. The registry is written only once that deletion has finished: an
+open that cannot remove every file of the config it is evicting leaves the
+registry naming it, so it stays counted and the next open retries, rather
+than unregistering a set of files nothing would ever look at again. A
+`CFG.BIN` that is there and will not decode — which is what a refused write
+leaves behind, the file being opened create-or-truncate — is rebuilt from the
+index files the directory actually holds rather than read as an empty
+registry: reading it empty would stop every config on the card from being
+counted, so no eviction would ever take them and each later open could add
+another full set. It is
+also how the readers that want a book's config-*independent*
+facts — source identity for the orphan sweep, the title for the Library list,
+the TOC for a replay — know which index file is there. The wrap-rule version
+and panel salt deliberately stay out of the name: a bump there has to retire
+every config, which it does by being rejected in each index's own header.
+A completed rebuild that derives fewer sections than the one before it prunes
+the tail it stranded, after its index is on the card and only within its own
+config: both resident configs number their sections from zero, so a prune going
+by ordinal alone would delete the other config's pagination.
+A pre-per-config cache (an unkeyed `BOOK.BIN` and `S<spine>.BIN` files) is
+deleted on the first open that finds it, `BOOK.BIN` last: its presence is the
+only thing that sends a later open back through the purge, so taking it before
+the section sweep has finished would strand whatever the sweep could not. The
+prune leaves those unkeyed names alone — retiring them is the purge's job.
+
+`BK<cfg>.BIN` holds a `BookV2Header`, one `BookV2SectionRecord` per section
+(spine, start page, page count, partial), TOC records, and a string blob for
+title, author, and TOC titles. Section files hold a `SectionV2Header`, page
+records, block records, per-block paragraph flags, and the UTF-8 text blob of
+that section's pre-wrapped lines. `TOC.BIN` is a per-book chapter-list sidecar
+for the Chapters overview, distinct from the TOC records inside the index.
 `CONT.BIN` records the build's `push_block` stream — the settings-independent
 half of the work — so a type-settings or orientation change replays it into the
 same sink instead of re-reading and re-parsing the EPUB. It is purely an
@@ -459,7 +493,7 @@ captured, and any read or decode failure deletes it and falls back to the EPUB.
 
 A cold build does not run to the end before the reader sees the book. It
 publishes as soon as the section holding the requested page is written, marking
-`BOOK.BIN` partial, and finishes the spine in slices from an idle branch of the
+the index partial, and finishes the spine in slices from an idle branch of the
 display task's loop — so the first page arrives in about a second rather than
 after the whole walk, and every other task keeps getting scheduled meanwhile.
 Only the pages built so far are addressable until the walk finishes, and the

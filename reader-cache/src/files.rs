@@ -7,17 +7,20 @@ use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::cache::{
-    decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
-    decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
-    encode_book_v2_header, encode_book_v2_section, encode_content_header,
-    encode_content_record_header, encode_page, encode_section_v2_header, encode_toc,
-    encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord, ContentHeader,
-    ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
-    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE, CACHE_COVER_FILE,
-    CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE,
-    CACHE_V2_DIR, CONTENT_HEADER_BYTES, CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES,
-    PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES,
-    TOC_RECORD_BYTES,
+    book_index_file_name, decode_block, decode_book_v2_header, decode_book_v2_section,
+    decode_cover_header, decode_layout_config_registry, decode_page, decode_section_v2_header,
+    decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block, encode_book_v2_header,
+    encode_book_v2_section, encode_content_header, encode_content_record_header,
+    encode_layout_config_registry, encode_page, encode_section_v2_header, encode_toc,
+    encode_toc_file_header, is_legacy_section_file_name, layout_cache_key,
+    layout_key_of_book_index_file_name, layout_key_of_section_file_name, section_file_name,
+    section_file_name_parts, BookV2Header, BookV2SectionRecord, ContentHeader, ContentRecordHeader,
+    LayoutConfigRegistry, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES,
+    BOOK_INDEX_FILE_BYTES, BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE,
+    CACHE_CONFIG_BYTES, CACHE_CONFIG_FILE, CACHE_CONTENT_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR,
+    CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR,
+    CONTENT_HEADER_BYTES, CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES, PAGE_RECORD_BYTES,
+    SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -600,6 +603,12 @@ where
 /// without loading any section records. Used at boot restore so the Home
 /// progress bar has a denominator before the book is opened. Returns 0 if the
 /// index is missing, stale, or for another book.
+///
+/// Takes the most recently used config's index, which is the one the reader
+/// will open under while the settings stand. Like the check below, it does
+/// not insist on the current config: a count from another one is a better
+/// denominator than none, and always was — the pre-per-config version read
+/// whatever config the single index had been left in.
 pub fn read_v2_book_total_pages<
     D,
     T,
@@ -616,21 +625,18 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_any_v2_book_file(root, key, false, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        if read_exact_file(file, &mut header_bytes).is_err() {
-            return 0;
-        }
-        let Ok(header) = decode_book_v2_header(&header_bytes) else {
-            return 0;
-        };
+        read_exact_file(file, &mut header_bytes).ok()?;
+        let header = decode_book_v2_header(&header_bytes).ok()?;
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.custom_font_identity != library.custom_font_identity()
+            || header.total_pages == 0
         {
-            return 0;
+            return None;
         }
-        header.total_pages
+        Some(header.total_pages)
     })
     .unwrap_or(0)
 }
@@ -761,7 +767,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_book_file(root, key, layout_key_for(library), Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return BookIndexLoadResult::Invalid;
@@ -822,6 +828,12 @@ where
 /// with the title learned the last time the book was opened. Returns false
 /// (leaving `out` untouched) when there is no cache for the book, the cached
 /// identity doesn't match, or the cache holds no title.
+///
+/// The title is settings-independent, so any of the book's per-config
+/// indexes answers; this takes the most recently used one the registry
+/// names. A book whose registry is missing falls through to the label
+/// fallbacks rather than paying a directory listing per row — this runs once
+/// per book at catalog scan.
 pub fn read_cached_book_title<
     D,
     T,
@@ -838,20 +850,16 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_any_v2_book_file(root, key, false, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        if read_exact_file(file, &mut header_bytes).is_err() {
-            return false;
-        }
-        let Ok(header) = decode_book_v2_header(&header_bytes) else {
-            return false;
-        };
+        read_exact_file(file, &mut header_bytes).ok()?;
+        let header = decode_book_v2_header(&header_bytes).ok()?;
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.title_text_bytes == 0
             || header.title_text_bytes as usize > 64
         {
-            return false;
+            return None;
         }
         // The title text sits after the header, the section records, and the
         // TOC block (records + text) -- the same body order write_v2_book_index
@@ -860,20 +868,14 @@ where
             + header.section_count as u32 * BOOK_V2_SECTION_RECORD_BYTES as u32
             + header.toc_count as u32 * TOC_RECORD_BYTES as u32
             + header.toc_text_bytes;
-        if file.seek_from_start(title_offset).is_err() {
-            return false;
-        }
+        file.seek_from_start(title_offset).ok()?;
         let title_len = header.title_text_bytes as usize;
         let mut title = [0u8; 64];
-        if read_exact_file(file, &mut title[..title_len]).is_err() {
-            return false;
-        }
-        let Ok(title_str) = core::str::from_utf8(&title[..title_len]) else {
-            return false;
-        };
+        read_exact_file(file, &mut title[..title_len]).ok()?;
+        let title_str = core::str::from_utf8(&title[..title_len]).ok()?;
         out.clear();
         let _ = out.push_str(title_str);
-        true
+        Some(true)
     })
     .unwrap_or(false)
 }
@@ -899,6 +901,12 @@ pub enum CacheHeader {
 /// count. Used by the orphan sweep to decide whether a cache still belongs to
 /// a book on the card, and by the clear to prove a key names the book it was
 /// asked about.
+///
+/// Source identity is settings-independent, so any of the book's per-config
+/// indexes answers. The registry names them; a cache whose registry was
+/// lost is then searched by listing, because this is the reader whose `Absent`
+/// gets a cache deleted and it must not report one for indexes that are
+/// sitting right there.
 pub fn read_cache_header<
     D,
     T,
@@ -929,15 +937,95 @@ where
     let xteink = open!(root.open_dir(CACHE_ROOT_DIR));
     let cache = open!(xteink.open_dir(CACHE_V2_DIR));
     let book_dir = open!(cache.open_dir(key));
-    let file = open!(book_dir.open_file_in_dir(CACHE_BOOK_FILE, Mode::ReadOnly));
-    let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
-    if read_exact_file(&file, &mut header_bytes).is_err() {
+    let stored = read_layout_registry_in(&book_dir);
+    let registry = stored.unwrap_or_default();
+    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
+    // An index file that opened but did not decode. Held rather than
+    // returned, so a second, readable config still gets to answer `Present`
+    // — but never downgraded to `Absent`, which is what licenses a delete.
+    let mut unreadable = false;
+    for layout_key in registry.keys() {
+        book_index_file_name(*layout_key, &mut name);
+        match read_book_index_header(&book_dir, name.as_str()) {
+            Some(Some(header)) => return CacheHeader::Present(header),
+            Some(None) => unreadable = true,
+            None => {}
+        }
+    }
+    // The registry's slots are exhausted. Anything else in the directory
+    // carrying an index name gets its turn, so a lost registry cannot make a
+    // cache that is plainly there read as absent and get it deleted.
+    //
+    // A listing that would not run is the same hazard as an index that would
+    // not decode: it leaves the directory's owner unestablished. Falling
+    // through to `Absent` would hand the clear path a delete it has not earned,
+    // on a 28-bit key whose collisions the format admits.
+    let Some(unlisted_names) = book_index_names_unlisted_by(&book_dir, &registry) else {
+        return CacheHeader::Unreadable;
+    };
+    for unlisted in unlisted_names {
+        match read_book_index_header(&book_dir, unlisted.as_str()) {
+            Some(Some(header)) => return CacheHeader::Present(header),
+            Some(None) => unreadable = true,
+            None => {}
+        }
+    }
+    // Either an index we could not interpret, or a registry that is there
+    // and says nothing usable: both mean this directory holds something
+    // whose owner we cannot establish, which is exactly what `Unreadable`
+    // stops a delete for.
+    if unreadable || (stored.is_none() && registry_present(&book_dir)) {
         return CacheHeader::Unreadable;
     }
-    match decode_book_v2_header(&header_bytes) {
-        Ok(header) => CacheHeader::Present(header),
-        Err(_) => CacheHeader::Unreadable,
+    CacheHeader::Absent
+}
+
+/// `None` when the named index is not there, `Some(None)` when it is there
+/// and unreadable, `Some(Some(header))` when it decodes.
+fn read_book_index_header<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> Option<Option<BookV2Header>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = match book.open_file_in_dir(name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return None,
+        // A card that would not open the file is not proof the index is
+        // missing, and only "missing" licenses a delete — so it reads as
+        // present-and-unreadable, the distinction this whole function exists
+        // to make.
+        Err(_) => return Some(None),
+    };
+    let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
+    if read_exact_file(&file, &mut header_bytes).is_err() {
+        return Some(None);
     }
+    Some(decode_book_v2_header(&header_bytes).ok())
+}
+
+/// Whether the registry file is there at all, for the one caller that has to
+/// tell "no cache" from "a cache we cannot interpret". Anything but an
+/// outright `NotFound` counts as present, for the same reason as above.
+fn registry_present<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    !matches!(
+        book.open_file_in_dir(CACHE_CONFIG_FILE, Mode::ReadOnly),
+        Err(embedded_sdmmc::Error::NotFound)
+    )
 }
 
 /// Section files deleted per directory-listing pass. embedded-sdmmc will not
@@ -1013,12 +1101,33 @@ where
             CACHE_TOC_FILE,
             CACHE_COVER_FILE,
             CACHE_CONTENT_FILE,
+            CACHE_CONFIG_FILE,
         ] {
             if upload_store::remove_file_reclaiming_clusters(&book, name)
                 == upload_store::RemoveStatus::Failed
             {
                 cleared = false;
             }
+        }
+        // The per-config indexes, by listing rather than by name: the
+        // registry that would name them has just been deleted, and it was
+        // never the authority on what is on the card anyway. A key past the
+        // listing budget survives to fail `book_dir_is_reclaimed` below,
+        // which is what stops this from reporting a clear it did not finish.
+        match book_index_names_unlisted_by(&book, &LayoutConfigRegistry::new()) {
+            Some(names) => {
+                for name in &names {
+                    if upload_store::remove_file_reclaiming_clusters(&book, name.as_str())
+                        == upload_store::RemoveStatus::Failed
+                    {
+                        cleared = false;
+                    }
+                }
+            }
+            // A listing that would not run leaves indexes this pass never got
+            // to name. `book_dir_is_reclaimed` below would refuse the clear
+            // anyway; failing here says so without depending on that.
+            None => cleared = false,
         }
         match book.open_dir(CACHE_SECTIONS_DIR) {
             Ok(sections) => {
@@ -1057,30 +1166,21 @@ where
     cleared
 }
 
-/// The section ordinal a `S###.BIN` name encodes, or `None` for any other
-/// name. Parsed rather than trusted: `SECTIONS/` is on removable media, so a
-/// name that is not one of ours must be left alone, not miscounted into the
-/// prune range.
-fn section_ordinal_from_name(name: &str) -> Option<u16> {
-    let digits = name
-        .strip_prefix(['S', 's'])?
-        .get(..3)
-        .filter(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))?;
-    let suffix = name.get(4..)?;
-    if !suffix.eq_ignore_ascii_case(".BIN") {
-        return None;
-    }
-    digits.parse::<u16>().ok()
-}
-
 /// Delete the section files a freshly published index no longer names.
 ///
 /// Section files are keyed by section *ordinal* — a dense `0..count` counter
 /// the walk assigns as it flushes, distinct from the spine index the record
 /// also carries — so a rebuild producing fewer sections than the one before
-/// it strands `S<count>..` on the card. Nothing references them:
-/// `load_v2_section_by_global_page` indexes off BOOK.BIN. They are unreachable
-/// but not free, and they survive until the whole cache directory is emptied.
+/// it strands `S<cfg><count>..` on the card. Nothing references them:
+/// `load_v2_section_by_global_page` indexes off the config's book index. They
+/// are unreachable but not free, and they survive until the whole cache
+/// directory is emptied.
+///
+/// Scoped to one layout config. The ordinal ranges of two resident configs
+/// overlap by construction — each numbers its own sections from zero — so a
+/// prune that went by ordinal alone would delete the *other* config's
+/// pagination past this one's count, which is a working cached copy of the book
+/// and the whole point of keeping more than one.
 ///
 /// No shipping setting reaches that state today. Sections split on content
 /// volume — `flush_if_full` breaks on block and text capacity long before the
@@ -1109,6 +1209,7 @@ fn prune_orphan_sections_in<
     const MAX_VOLUMES: usize,
 >(
     sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    layout_key: u8,
     keep_count: u16,
 ) -> usize
 where
@@ -1134,8 +1235,12 @@ where
                 if write!(name, "{}", entry.name).is_err() {
                     return;
                 }
-                match section_ordinal_from_name(name.as_str()) {
-                    Some(ordinal) if ordinal >= keep_count => {
+                // Parsed rather than trusted, and matched on the config as well
+                // as the ordinal: `SECTIONS/` is on removable media, so a name
+                // that is not one of ours is left alone, and one that is
+                // another config's is not this prune's to take.
+                match section_file_name_parts(name.as_str()) {
+                    Some((key, ordinal)) if key == layout_key && ordinal >= keep_count => {
                         let _ = names.push(name);
                     }
                     _ => {}
@@ -1178,7 +1283,10 @@ where
     removed
 }
 
-/// [`prune_orphan_sections_in`], opening the book's `SECTIONS/` directory.
+/// [`prune_orphan_sections_in`], opening the book's `SECTIONS/` directory and
+/// taking the layout config from the store whose pagination was just published
+/// — the same derivation every other per-config reader and writer uses, so no
+/// caller can prune one config's range out of another's files.
 pub fn prune_orphan_sections<
     D,
     T,
@@ -1188,14 +1296,16 @@ pub fn prune_orphan_sections<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
+    library: &ReaderStore,
     keep_count: u16,
 ) -> usize
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let layout_key = layout_key_for(library);
     with_v2_sections_dir(root, key, |sections| match sections {
-        Some(sections) => prune_orphan_sections_in(sections, keep_count),
+        Some(sections) => prune_orphan_sections_in(sections, layout_key, keep_count),
         None => 0,
     })
 }
@@ -1369,86 +1479,96 @@ where
     if ensure_v2_cache_dirs(root, key).is_err() {
         return false;
     }
-    with_v2_book_file(root, key, Mode::ReadWriteCreateOrTruncate, |file| {
-        let toc_count = library
-            .toc_count
-            .min(MAX_SD_TOC_ITEMS)
-            .min(u16::MAX as usize);
-        let title_text_bytes = library.title.len().min(64) as u32;
-        let author_text_bytes = library.author.len().min(64) as u32;
-        let header = BookV2Header {
-            source_hash: source_identity.0,
-            source_size: source_identity.1,
-            total_pages,
-            section_count: sections.len().min(u16::MAX as usize) as u16,
-            spine_count: sections
-                .iter()
-                .map(|section| section.spine as usize + 1)
-                .max()
-                .unwrap_or(0)
-                .min(u16::MAX as usize) as u16,
-            toc_count: toc_count as u16,
-            toc_text_bytes: library
-                .toc_text_len
-                .min(MAX_SD_TOC_TEXT_BYTES)
-                .min(u32::MAX as usize) as u32,
-            title_text_bytes,
-            author_text_bytes,
-            viewport_width: 800,
-            viewport_height: 480,
-            font_config: layout::reader_layout_config(library.type_settings(), library.portrait()),
-            custom_font_identity: library.custom_font_identity(),
-            partial,
-            resume_spine,
-        };
-        let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        if encode_book_v2_header(header, &mut bytes).is_err() {
-            return false;
-        }
-        let mut stage = WriteStage::new(file);
-        if stage.push(&bytes).is_err() {
-            return false;
-        }
-        let mut record_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
-        for section in sections {
-            if encode_book_v2_section(*section, &mut record_bytes).is_err()
-                || stage.push(&record_bytes).is_err()
+    let layout_key = layout_key_for(library);
+    with_v2_book_file(
+        root,
+        key,
+        layout_key,
+        Mode::ReadWriteCreateOrTruncate,
+        |file| {
+            let toc_count = library
+                .toc_count
+                .min(MAX_SD_TOC_ITEMS)
+                .min(u16::MAX as usize);
+            let title_text_bytes = library.title.len().min(64) as u32;
+            let author_text_bytes = library.author.len().min(64) as u32;
+            let header = BookV2Header {
+                source_hash: source_identity.0,
+                source_size: source_identity.1,
+                total_pages,
+                section_count: sections.len().min(u16::MAX as usize) as u16,
+                spine_count: sections
+                    .iter()
+                    .map(|section| section.spine as usize + 1)
+                    .max()
+                    .unwrap_or(0)
+                    .min(u16::MAX as usize) as u16,
+                toc_count: toc_count as u16,
+                toc_text_bytes: library
+                    .toc_text_len
+                    .min(MAX_SD_TOC_TEXT_BYTES)
+                    .min(u32::MAX as usize) as u32,
+                title_text_bytes,
+                author_text_bytes,
+                viewport_width: 800,
+                viewport_height: 480,
+                font_config: layout::reader_layout_config(
+                    library.type_settings(),
+                    library.portrait(),
+                ),
+                custom_font_identity: library.custom_font_identity(),
+                partial,
+                resume_spine,
+            };
+            let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
+            if encode_book_v2_header(header, &mut bytes).is_err() {
+                return false;
+            }
+            let mut stage = WriteStage::new(file);
+            if stage.push(&bytes).is_err() {
+                return false;
+            }
+            let mut record_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
+            for section in sections {
+                if encode_book_v2_section(*section, &mut record_bytes).is_err()
+                    || stage.push(&record_bytes).is_err()
+                {
+                    return false;
+                }
+            }
+            let mut toc_bytes = [0u8; TOC_RECORD_BYTES];
+            for record in library.toc.iter().take(toc_count).copied() {
+                if encode_toc(record, &mut toc_bytes).is_err() || stage.push(&toc_bytes).is_err() {
+                    return false;
+                }
+            }
+            if stage.flush().is_err() {
+                return false;
+            }
+            if header.toc_text_bytes > 0
+                && file
+                    .write(&library.toc_text[..header.toc_text_bytes as usize])
+                    .is_err()
             {
                 return false;
             }
-        }
-        let mut toc_bytes = [0u8; TOC_RECORD_BYTES];
-        for record in library.toc.iter().take(toc_count).copied() {
-            if encode_toc(record, &mut toc_bytes).is_err() || stage.push(&toc_bytes).is_err() {
+            if header.title_text_bytes > 0
+                && file
+                    .write(&library.title.as_bytes()[..header.title_text_bytes as usize])
+                    .is_err()
+            {
                 return false;
             }
-        }
-        if stage.flush().is_err() {
-            return false;
-        }
-        if header.toc_text_bytes > 0
-            && file
-                .write(&library.toc_text[..header.toc_text_bytes as usize])
-                .is_err()
-        {
-            return false;
-        }
-        if header.title_text_bytes > 0
-            && file
-                .write(&library.title.as_bytes()[..header.title_text_bytes as usize])
-                .is_err()
-        {
-            return false;
-        }
-        if header.author_text_bytes > 0
-            && file
-                .write(&library.author.as_bytes()[..header.author_text_bytes as usize])
-                .is_err()
-        {
-            return false;
-        }
-        true
-    })
+            if header.author_text_bytes > 0
+                && file
+                    .write(&library.author.as_bytes()[..header.author_text_bytes as usize])
+                    .is_err()
+            {
+                return false;
+            }
+            true
+        },
+    )
     .unwrap_or(false)
 }
 
@@ -1546,48 +1666,59 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_section_file(root, key, section, Mode::ReadOnly, |file| {
-        let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
-        if read_exact_file(file, &mut header_bytes).is_err() {
-            return CacheLoadResult::Invalid;
-        }
-        let Ok(header) = decode_section_v2_header(&header_bytes) else {
-            return CacheLoadResult::Invalid;
-        };
-        if header.source_hash != source_identity.0
-            || header.source_size != source_identity.1
-            || header.spine != expected_spine
-        {
-            return CacheLoadResult::Invalid;
-        }
-        let expected_config =
-            layout::reader_layout_config(library.type_settings(), library.portrait());
-        if header.custom_font_identity != library.custom_font_identity() {
-            return CacheLoadResult::Invalid;
-        }
-        // Cached blocks are pre-wrapped lines: they survive a spacing
-        // change (heights re-walk below) but not a size change, which
-        // alters every wrap point and needs the full EPUB rebuild.
-        if header.font_config & !0b11 != expected_config & !0b11 {
-            return CacheLoadResult::Invalid;
-        }
-        let layout_matches = header.font_config == expected_config;
-        if !load_v2_section_body(file, header, library) {
-            return CacheLoadResult::Invalid;
-        }
-        if !layout_matches {
-            layout::rebuild_page_index(library);
-        }
-        let pages = library.page_count;
-        if pages < target_pages {
-            CacheLoadResult::TooShort { pages }
-        } else {
-            CacheLoadResult::Hit {
-                pages,
-                repaginated: !layout_matches,
+    let expected_config = layout::reader_layout_config(library.type_settings(), library.portrait());
+    with_v2_section_file(
+        root,
+        key,
+        layout_cache_key(expected_config),
+        section,
+        Mode::ReadOnly,
+        |file| {
+            let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
+            if read_exact_file(file, &mut header_bytes).is_err() {
+                return CacheLoadResult::Invalid;
             }
-        }
-    })
+            let Ok(header) = decode_section_v2_header(&header_bytes) else {
+                return CacheLoadResult::Invalid;
+            };
+            if header.source_hash != source_identity.0
+                || header.source_size != source_identity.1
+                || header.spine != expected_spine
+            {
+                return CacheLoadResult::Invalid;
+            }
+            if header.custom_font_identity != library.custom_font_identity() {
+                return CacheLoadResult::Invalid;
+            }
+            // Cached blocks are pre-wrapped lines: they survive a spacing
+            // change (heights re-walk below) but not a size change, which
+            // alters every wrap point and needs the full EPUB rebuild.
+            //
+            // The file name already carries the wrap-relevant bits, so what is
+            // left for this check to catch is a wrap-version or panel-salt bump
+            // — the axes deliberately kept out of the name, so a bump retires
+            // every config's files in place rather than stranding them.
+            if header.font_config & !0b11 != expected_config & !0b11 {
+                return CacheLoadResult::Invalid;
+            }
+            let layout_matches = header.font_config == expected_config;
+            if !load_v2_section_body(file, header, library) {
+                return CacheLoadResult::Invalid;
+            }
+            if !layout_matches {
+                layout::rebuild_page_index(library);
+            }
+            let pages = library.page_count;
+            if pages < target_pages {
+                CacheLoadResult::TooShort { pages }
+            } else {
+                CacheLoadResult::Hit {
+                    pages,
+                    repaginated: !layout_matches,
+                }
+            }
+        },
+    )
     .unwrap_or(CacheLoadResult::Miss)
 }
 
@@ -1615,6 +1746,7 @@ where
     with_v2_section_file(
         root,
         key,
+        layout_key_for(library),
         section,
         Mode::ReadWriteCreateOrTruncate,
         |file| write_v2_section_body(file, source_identity, library.cached_spine, library),
@@ -1684,7 +1816,7 @@ where
     T: TimeSource,
 {
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-    section_file_name(section, &mut name);
+    section_file_name(layout_key_for(library), section, &mut name);
     match sections.open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate) {
         Ok(file) => write_v2_section_body(&file, source_identity, library.cached_spine, library),
         Err(_) => {
@@ -1718,6 +1850,426 @@ where
     dir.change_dir(CACHE_V2_DIR).ok()?;
     dir.change_dir(key).ok()?;
     Some(dir)
+}
+
+/// The layout config `library` is currently reading under, as the key its
+/// cache files are named for. Every per-config reader and writer derives it
+/// here rather than taking it as an argument: the store already carries the
+/// settings and the page box, and a caller that could pass a different key
+/// than the header check compares against would be able to write a file
+/// under one config's name holding another's pagination.
+fn layout_key_for(library: &ReaderStore) -> u8 {
+    layout_cache_key(layout::reader_layout_config(
+        library.type_settings(),
+        library.portrait(),
+    ))
+}
+
+/// How many registry-unlisted index files one directory listing will
+/// collect. Two configs are resident by design, so a third is already a
+/// registry that lost track; past four, whatever wrote them was not this.
+const UNLISTED_INDEX_BUDGET: usize = 4;
+
+/// Read a book's resident-config registry from an already-open book
+/// directory. `None` covers both "no registry" and "a registry that says
+/// nothing usable" — the caller's response to either is to write the config
+/// it is opening, so they need not be told apart.
+fn read_layout_registry_in<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<LayoutConfigRegistry>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = book
+        .open_file_in_dir(CACHE_CONFIG_FILE, Mode::ReadOnly)
+        .ok()?;
+    let mut bytes = [0u8; CACHE_CONFIG_BYTES];
+    read_exact_file(&file, &mut bytes).ok()?;
+    decode_layout_config_registry(&bytes).ok()
+}
+
+fn write_layout_registry_in<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    registry: &LayoutConfigRegistry,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut bytes = [0u8; CACHE_CONFIG_BYTES];
+    if encode_layout_config_registry(registry, &mut bytes).is_err() {
+        return false;
+    }
+    match book.open_file_in_dir(CACHE_CONFIG_FILE, Mode::ReadWriteCreateOrTruncate) {
+        Ok(file) => file.write(&bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// What adopting a layout config found waiting for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutConfigAdoption {
+    /// The registry already listed this config, so a cache built under it
+    /// should be waiting — which is what makes a flip back to a
+    /// previously-read type size or orientation instant instead of a full
+    /// re-wrap. Whether every file really landed is the load's to find out;
+    /// this is what the registry claims, and it is reported, not relied on.
+    pub resident: bool,
+    /// A least-recently-used config whose files this adoption deleted to
+    /// stay inside [`proto::cache::CACHE_CONFIG_SLOTS`]. Set only once every
+    /// one of them is gone; a partial delete reports `eviction_failed`.
+    pub evicted: Option<u8>,
+    /// The least-recently-used config this open had to evict and could not:
+    /// one of its files refused to delete. Nothing was promoted — the
+    /// registry still names that config, so it stays counted and the next
+    /// open under this one retries the same deletes.
+    pub eviction_failed: Option<u8>,
+    /// Pre-per-config artifacts (an unkeyed `BOOK.BIN`, unkeyed section
+    /// files) were found and deleted. One-time, on the first open after the
+    /// firmware that wrote them.
+    pub purged_legacy: bool,
+    /// The registry write did not land, so `CFG.BIN` no longer describes which
+    /// configs are on the card. The open continues — see
+    /// [`adopt_layout_config`] for why refusing it would be worse — and the
+    /// next one repairs the registry by listing the index files that are
+    /// really there, which is what holds the bound. Reported so the log names
+    /// the card that is failing small writes.
+    pub registry_write_failed: bool,
+}
+
+/// Claim the layout config `library` is reading under as this book's most
+/// recently used, and hold the card to at most
+/// [`proto::cache::CACHE_CONFIG_SLOTS`] paginated copies of the book.
+///
+/// Runs once per book open, before anything tries to load or build, because
+/// it is what both of those need to be true: the registry has to name this
+/// config before an index written under it can be found again, and the
+/// least recently used config's files have to be gone before a third one's
+/// arrive. Adopting before the load rather than after means an open that
+/// then fails has evicted for nothing — one rebuild's worth of cost, traded
+/// for never having a build write files no reader can find.
+///
+/// An eviction that cannot delete every one of that config's files abandons
+/// the adoption rather than completing it: the registry is left naming the
+/// config whose files are still there. See the failure path below for why
+/// that ordering is the one that keeps the bound honest.
+pub fn adopt_layout_config<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    library: &ReaderStore,
+) -> LayoutConfigAdoption
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let layout_key = layout_key_for(library);
+    let mut adoption = LayoutConfigAdoption {
+        resident: false,
+        evicted: None,
+        eviction_failed: None,
+        purged_legacy: false,
+        registry_write_failed: false,
+    };
+    // The tree has to exist before the registry can be written into it, and
+    // this is the earliest point in an open that knows the book's key. A
+    // failure here fails the build too, so there is nothing else to do.
+    if ensure_v2_cache_dirs(root, key).is_err() {
+        cache_log!("cache: adopt config ensure dirs failed key={}", key);
+        return adoption;
+    }
+    let Some(book) = open_v2_book_dir(root, key) else {
+        return adoption;
+    };
+    adoption.purged_legacy = purge_legacy_artifacts_in(&book);
+    // A registry file that is there and will not decode gets rebuilt from the
+    // index files that really are on the card, rather than started over from
+    // empty. Starting empty is what loses the bound: the configs already there
+    // stop being counted, so no eviction ever takes them, and every later open
+    // is free to add another full section set on top. One refused `CFG.BIN`
+    // write is enough to reach that state — it truncates on open — and the cost
+    // compounds, because each open that then fails to write leaves one more set
+    // uncounted. Repairing on read is what makes that self-correcting.
+    //
+    // Seeding cannot know which config was most recently used, so the order is
+    // whatever the listing gave. The config being adopted is promoted to the
+    // front below either way, and the worst a wrong order does is evict the
+    // less useful of two survivors.
+    //
+    // A registry that is not there at all is left to start empty: that is a
+    // book being opened for the first time, which is the common case and must
+    // not pay for a directory listing. A `CFG.BIN` deleted outright while index
+    // files remain is the one gap left — the clear still sweeps by listing, and
+    // `read_cache_header`'s fallback still finds the book.
+    let mut registry = match read_layout_registry_in(&book) {
+        Some(registry) => registry,
+        None if registry_present(&book) => layout_registry_from_index_files(&book),
+        None => LayoutConfigRegistry::new(),
+    };
+    adoption.resident = registry.contains(layout_key);
+    let evicted = registry.promote(layout_key);
+    if let Some(evicted) = evicted {
+        // Delete first, then record the shorter registry: a failure between
+        // the two leaves files the registry no longer names, which the next
+        // clear sweeps by listing. Recording first would risk the opposite —
+        // a registry claiming a config whose files are half gone.
+        if !delete_layout_config_artifacts_in(&book, evicted) {
+            // The delete refused, so the promoted registry does not describe
+            // the card and must not be written. Leaving the stored one alone
+            // is what keeps the two-config bound honest: it still names the
+            // config whose files are still there, so eviction keeps counting
+            // them and the next open under this config retries the same
+            // deletes. Writing the promotion here would unregister an intact
+            // cache instead — no later eviction would look at it again, and a
+            // card that has just refused to give space back would be asked
+            // for a third set on top of it.
+            cache_log!(
+                "cache: config evict failed key={} cfg={} kept={}",
+                key,
+                layout_key,
+                evicted
+            );
+            adoption.eviction_failed = Some(evicted);
+            return adoption;
+        }
+        adoption.evicted = Some(evicted);
+    }
+    if !write_layout_registry_in(&book, &registry) {
+        cache_log!(
+            "cache: config registry write failed key={} cfg={}",
+            key,
+            layout_key
+        );
+        // Reported rather than fatal. The build below still writes under this
+        // config and its index is still found — by the next open under the same
+        // config once the registry is repaired, and by the unlisted-index scan
+        // meanwhile — so refusing the open here would cost a readable book to
+        // buy nothing. What the failure does cost is the registry's account of
+        // the card, and the seeding above is what gets that back.
+        adoption.registry_write_failed = true;
+    }
+    adoption
+}
+
+/// Rebuild a registry from the per-config index files a book directory actually
+/// holds, for an open whose `CFG.BIN` is there and unusable.
+///
+/// Ordering is lost — a listing cannot say which config was read last — so this
+/// only restores the *count*, which is the part eviction needs to hold the
+/// two-config bound. A card holding more sets than the bound (which is how it
+/// got here) leaves the extras unnamed for now; the eviction the caller runs
+/// next brings the count down, and later opens converge.
+fn layout_registry_from_index_files<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> LayoutConfigRegistry
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut registry = LayoutConfigRegistry::new();
+    // Every keyed index is "unlisted" by an empty registry, so this is the same
+    // bounded listing `read_cache_header` falls back to. A listing that would
+    // not run leaves the registry empty, which is where it started.
+    let Some(names) = book_index_names_unlisted_by(book, &registry) else {
+        return registry;
+    };
+    for name in &names {
+        if let Some(layout_key) = layout_key_of_book_index_file_name(name.as_str()) {
+            // Seeding, not evicting: nothing is deleted here, so a key pushed
+            // out of the last slot is simply one this pass could not account
+            // for.
+            let _ = registry.promote(layout_key);
+        }
+    }
+    registry
+}
+
+/// Delete one layout config's cache files: its index and every section file
+/// named for it. The other configs' files, and everything
+/// settings-independent (TOC.BIN, COVER.BIN, CONT.BIN, the position), stay.
+///
+/// Returns whether every one of that config's files is now gone — deleted
+/// here or already absent. This is the answer the caller's registry write
+/// hangs on, so anything it cannot account for reads as false: a delete that
+/// refused, a `SECTIONS/` that would not open, a listing that would not
+/// finish. The index goes first, so a sweep that stops partway leaves an
+/// unreadable set (stray sections, no index) rather than an index promising
+/// sections that are gone.
+fn delete_layout_config_artifacts_in<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    layout_key: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
+    book_index_file_name(layout_key, &mut name);
+    if upload_store::remove_file_reclaiming_clusters(book, name.as_str())
+        == upload_store::RemoveStatus::Failed
+    {
+        return false;
+    }
+    match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => sweep_section_files(&sections, |name| {
+            layout_key_of_section_file_name(name) == Some(layout_key)
+        }),
+        // No `SECTIONS/` is the end state this wants, reached without it.
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        // A directory that would not open may still hold the config's files.
+        Err(_) => false,
+    }
+}
+
+/// Delete the artifacts of the single-config scheme this replaced: the
+/// unkeyed `BOOK.BIN` and the unkeyed `S<spine>.BIN` section files.
+///
+/// Gated on `BOOK.BIN` being there, which is the marker: nothing writes it
+/// anymore, so its presence is the only reason to pay for a sections listing.
+/// The marker is therefore deleted only once the sections sweep reports itself
+/// finished — it is the whole retry mechanism, and a purge that took it first
+/// would leave anything it could not delete with nothing to bring a later open
+/// back for it.
+///
+/// Returns whether there was anything to purge — not whether all of it went.
+/// Unlike eviction, no caller needs the stronger answer: no registry ever named
+/// these files, so what refuses to go is retried by the next open, which still
+/// finds `BOOK.BIN`, and swept by the next clear if that one runs first.
+fn purge_legacy_artifacts_in<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if book
+        .open_file_in_dir(CACHE_BOOK_FILE, Mode::ReadOnly)
+        .is_err()
+    {
+        return false;
+    }
+    // Sections first, the marker last. `BOOK.BIN` is the only thing that brings
+    // a later open back here, so taking it before the sweep has finished is
+    // what would strand whatever the sweep could not: nothing reads the unkeyed
+    // names, no registry counts them, and no later pass would look again.
+    // Leaving the marker costs one failed open per later open and buys the
+    // retry. Nothing reads `BOOK.BIN` itself anymore, so a marker outliving its
+    // sections misleads no reader.
+    let swept = match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => sweep_section_files(&sections, is_legacy_section_file_name),
+        // No `SECTIONS/` is the end state the sweep wants, reached without it.
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    };
+    if swept {
+        let _ = upload_store::remove_file_reclaiming_clusters(book, CACHE_BOOK_FILE);
+    }
+    true
+}
+
+/// Delete every file in an open `SECTIONS/` whose name `wanted` accepts, in
+/// the same bounded batches as [`empty_sections_dir`]: names are collected
+/// per pass and deleted with the listing closed, because deleting while
+/// iterating is what the directory walk cannot survive.
+///
+/// Returns whether a listing came back with nothing left for `wanted` — the
+/// only evidence that the sweep is finished. A refused delete, a listing that
+/// would not run, a name that could not be read back to test, or a pass
+/// budget spent before the directory came back clean all read as false; the
+/// caller must not report the files gone on any of them.
+fn sweep_section_files<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    wanted: impl Fn(&str) -> bool,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let max_passes = MAX_BOOK_SECTIONS.div_ceil(SECTION_SWEEP_BATCH) + 1;
+    for _ in 0..max_passes {
+        let mut names: heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH> =
+            heapless::Vec::new();
+        // Something this pass could not put to `wanted`. A full batch is not
+        // that — the next pass re-lists what it left — but a name that would
+        // not read back is: it may be one of the files being swept, and a
+        // sweep cannot claim what it never got to test.
+        let mut blocked = false;
+        if sections
+            .iterate_dir(|entry| {
+                if names.is_full() || entry.attributes.is_directory() {
+                    return;
+                }
+                let mut name = String::<SHORT_NAME_BYTES>::new();
+                if write!(name, "{}", entry.name).is_err() {
+                    blocked = true;
+                    return;
+                }
+                if wanted(name.as_str()) && names.push(name).is_err() {
+                    blocked = true;
+                }
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if names.is_empty() {
+            return !blocked;
+        }
+        for name in &names {
+            if upload_store::remove_file_reclaiming_clusters(sections, name.as_str())
+                == upload_store::RemoveStatus::Failed
+            {
+                // A refusal will repeat on the next pass and spend the whole
+                // budget re-finding the same file. Leaving it costs SD space
+                // until the next clear, which lists rather than names.
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// Open the book's `CONT.BIN` (settings-independent content cache) and run
@@ -2035,6 +2587,12 @@ where
 /// the content replay path runs precisely when the index is layout-invalid,
 /// but its TOC and labels are settings-independent and must survive into
 /// the rewritten index. Deliberately does not touch the section index.
+///
+/// "Any config" is now literal: the index this wants belongs to whichever
+/// config the book was last read under, not the one being built, so it works
+/// through the registry's slots in order. Slot 0 is the config being adopted
+/// and its index is exactly the one that just missed, so in practice the
+/// answer comes from the slot behind it.
 pub fn load_v2_book_labels_and_toc<
     D,
     T,
@@ -2051,28 +2609,23 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_any_v2_book_file(root, key, true, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        if read_exact_file(file, &mut header_bytes).is_err() {
-            return false;
-        }
-        let Ok(header) = decode_book_v2_header(&header_bytes) else {
-            return false;
-        };
+        read_exact_file(file, &mut header_bytes).ok()?;
+        let header = decode_book_v2_header(&header_bytes).ok()?;
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.section_count as usize > MAX_BOOK_SECTIONS
             || !v2_toc_label_bounds_ok(&header)
         {
-            return false;
+            return None;
         }
         let toc_offset =
             BOOK_V2_HEADER_BYTES + header.section_count as usize * BOOK_V2_SECTION_RECORD_BYTES;
-        if file.seek_from_start(toc_offset as u32).is_err() {
-            return false;
-        }
-        read_v2_toc_into_library(file, &header, library)
-            && read_v2_labels_into_library(file, &header, library)
+        file.seek_from_start(toc_offset as u32).ok()?;
+        (read_v2_toc_into_library(file, &header, library)
+            && read_v2_labels_into_library(file, &header, library))
+        .then_some(true)
     })
     .unwrap_or(false)
 }
@@ -2087,6 +2640,7 @@ fn with_v2_section_file<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
+    layout_key: u8,
     spine: u16,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
@@ -2100,7 +2654,7 @@ where
     let book_dir = cache.open_dir(key).ok()?;
     let sections = book_dir.open_dir(CACHE_SECTIONS_DIR).ok()?;
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-    section_file_name(spine, &mut name);
+    section_file_name(layout_key, spine, &mut name);
     let file = sections.open_file_in_dir(name.as_str(), mode).ok()?;
     Some(f(&file))
 }
@@ -2115,6 +2669,7 @@ fn with_v2_book_file<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
+    layout_key: u8,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
 ) -> Option<R>
@@ -2125,8 +2680,114 @@ where
     let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
     let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
     let book_dir = cache.open_dir(key).ok()?;
-    let file = book_dir.open_file_in_dir(CACHE_BOOK_FILE, mode).ok()?;
+    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
+    book_index_file_name(layout_key, &mut name);
+    let file = book_dir.open_file_in_dir(name.as_str(), mode).ok()?;
     Some(f(&file))
+}
+
+/// Run `f` against whichever of the book's per-config indexes is there,
+/// for the readers after facts that do not depend on the layout config: the
+/// source identity, the title, the TOC. They used to open one fixed
+/// `BOOK.BIN`; now the index is per config, so "the book's index" means
+/// asking the registry which configs are resident and taking the first that
+/// opens. `f` returning `None` means "this index did not answer" and moves
+/// on to the next.
+///
+/// `scan_if_unlisted` covers the registry being lost while index files
+/// survive: a bounded directory listing finds them by name. Callers on a
+/// scan-time path leave it off, because for them a miss costs only a
+/// fallback label, not a cache.
+fn with_any_v2_book_file<
+    R,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    scan_if_unlisted: bool,
+    mut f: impl for<'a> FnMut(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> Option<R>,
+) -> Option<R>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let book_dir = open_v2_book_dir(root, key)?;
+    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
+    let registry = read_layout_registry_in(&book_dir).unwrap_or_default();
+    for layout_key in registry.keys() {
+        book_index_file_name(*layout_key, &mut name);
+        if let Ok(file) = book_dir.open_file_in_dir(name.as_str(), Mode::ReadOnly) {
+            if let Some(answer) = f(&file) {
+                return Some(answer);
+            }
+        }
+    }
+    if !scan_if_unlisted {
+        return None;
+    }
+    // A listing that would not run reads as nothing left to try. Every caller
+    // here is after a config-independent fact and treats `None` as a miss it
+    // has a fallback for — unlike `read_cache_header`, whose own loop must tell
+    // a failed listing from an empty directory because a delete hangs on it.
+    for unlisted in book_index_names_unlisted_by(&book_dir, &registry).unwrap_or_default() {
+        if let Ok(file) = book_dir.open_file_in_dir(unlisted.as_str(), Mode::ReadOnly) {
+            if let Some(answer) = f(&file) {
+                return Some(answer);
+            }
+        }
+    }
+    None
+}
+
+/// The per-config index files present in a book's cache directory that the
+/// registry does not name — what is left to try when the registry was lost
+/// or never written. Bounded by [`CACHE_CONFIG_SLOTS`]-plus-slack rather
+/// than by the 64 keys a name could carry: past that, whatever wrote them
+/// was not this firmware.
+fn book_index_names_unlisted_by<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    registry: &LayoutConfigRegistry,
+) -> Option<heapless::Vec<String<BOOK_INDEX_FILE_BYTES>, UNLISTED_INDEX_BUDGET>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let mut found = heapless::Vec::new();
+    // `None` on a listing that would not run, never an empty result. The caller
+    // reads "nothing here" as licence to delete the directory, and a card that
+    // refused to enumerate has not said that.
+    if book
+        .iterate_dir(|entry| {
+            if found.is_full() || entry.attributes.is_directory() {
+                return;
+            }
+            let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
+            if write!(name, "{}", entry.name).is_err() {
+                return;
+            }
+            let Some(layout_key) = layout_key_of_book_index_file_name(name.as_str()) else {
+                return;
+            };
+            if !registry.contains(layout_key) {
+                let _ = found.push(name);
+            }
+        })
+        .is_err()
+    {
+        return None;
+    }
+    Some(found)
 }
 
 fn with_v2_toc_file<

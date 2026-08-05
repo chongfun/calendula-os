@@ -40,7 +40,47 @@ pub const CACHE_BOOK_FILE: &str = "BOOK.BIN";
 pub const CACHE_COVER_FILE: &str = "COVER.BIN";
 pub const CACHE_STATE_FILE: &str = "STATE.BIN";
 pub const CACHE_KEY_BYTES: usize = 8;
-pub const CACHE_SECTION_FILE_BYTES: usize = 8;
+pub const CACHE_SECTION_FILE_BYTES: usize = 10;
+/// Width of the pre-per-config section name (`S<spine>.BIN`). Kept so the
+/// upgrade purge can recognize what an older firmware left behind.
+pub const LEGACY_SECTION_FILE_BYTES: usize = 8;
+pub const BOOK_INDEX_FILE_PREFIX: &str = "BK";
+pub const BOOK_INDEX_FILE_BYTES: usize = 8;
+
+/// The wrap-relevant bits of `ui::reading::reader_layout_config`: size (bits
+/// 2-3), weight (bit 4), family (bits 5-6), and the portrait page box (bit
+/// 7). Spacing (bits 0-1) only re-walks heights over the same wrap points,
+/// and the wrap-version plus panel salt above bit 7 are global — a bump
+/// there has to retire every config, not earn each one its own file. So
+/// neither belongs in a per-config file name.
+pub const LAYOUT_WRAP_CONFIG_MASK: u16 = 0b1111_1100;
+/// How many distinct layout keys the mask can produce, and so the exclusive
+/// upper bound on a valid key.
+pub const LAYOUT_KEY_VALUES: usize = 64;
+
+/// The per-config cache key packed out of a layout config: the six
+/// wrap-relevant bits, right-aligned, so it renders as two hex digits.
+pub fn layout_cache_key(font_config: u16) -> u8 {
+    ((font_config & LAYOUT_WRAP_CONFIG_MASK) >> 2) as u8
+}
+
+/// Resident-config registry (`CFG.BIN`): which layout configs a book keeps
+/// paginated on the card, most recently used first.
+///
+/// Two things need it. Eviction: section files multiply per config, so a
+/// book keeps at most [`CACHE_CONFIG_SLOTS`] of them and the least recently
+/// used one's files are deleted when a third arrives. And the readers that
+/// want a book's *config-independent* facts — its source identity, its
+/// title, its TOC — which live inside a per-config index and so need to be
+/// told which index is there.
+pub const CACHE_CONFIG_FILE: &str = "CFG.BIN";
+pub const CACHE_CONFIG_MAGIC: u32 = 0x5834_4746; // X4GF
+pub const CACHE_CONFIG_VERSION: u16 = 1;
+/// How many paginated copies of one book the card keeps. Two is what the
+/// flows that hurt need: a size or orientation flip and the flip back.
+pub const CACHE_CONFIG_SLOTS: usize = 2;
+pub const CACHE_CONFIG_HEADER_BYTES: usize = 8;
+pub const CACHE_CONFIG_BYTES: usize = CACHE_CONFIG_HEADER_BYTES + CACHE_CONFIG_SLOTS;
 pub const BOOK_HEADER_BYTES: usize = 16;
 pub const SPINE_RECORD_BYTES: usize = 12;
 pub const TOC_RECORD_BYTES: usize = 24;
@@ -617,11 +657,218 @@ pub fn cache_key_for(source_path: &str, source_len: u32) -> String<CACHE_KEY_BYT
     out
 }
 
-pub fn section_file_name<const N: usize>(spine: u16, out: &mut String<N>) {
+/// Section file name for one layout config: `S<key><spine>.BIN`, where
+/// `key` is the two hex digits of [`layout_cache_key`]. Six base characters
+/// plus the extension keeps the name inside FAT's 8.3 budget.
+///
+/// Naming the config is what lets a book keep more than one paginated copy
+/// on the card, so flipping back to a previously-built type size or
+/// orientation is a cache hit instead of a full re-wrap.
+pub fn section_file_name<const N: usize>(layout_key: u8, spine: u16, out: &mut String<N>) {
     out.clear();
     let _ = out.push('S');
+    push_hex(out, layout_key as u32, 2);
     push_dec3(out, spine);
     let _ = out.push_str(".BIN");
+}
+
+/// Book index file name for one layout config: `BK<key>.BIN`. The
+/// pre-per-config [`CACHE_BOOK_FILE`] name is never written anymore; it
+/// survives only so the upgrade path can recognize and delete it.
+pub fn book_index_file_name<const N: usize>(layout_key: u8, out: &mut String<N>) {
+    out.clear();
+    let _ = out.push_str(BOOK_INDEX_FILE_PREFIX);
+    push_hex(out, layout_key as u32, 2);
+    let _ = out.push_str(".BIN");
+}
+
+/// The layout config a per-config book index name carries, or `None` when
+/// `name` is not one — so a directory listing can find a book's indexes
+/// without the registry naming them.
+pub fn layout_key_of_book_index_file_name(name: &str) -> Option<u8> {
+    // Read as bytes, not sliced as a `str`. A FAT short name is raw bytes, and
+    // embedded-sdmmc renders them ISO-8859-1, so a directory entry carrying a
+    // byte >= 0x80 arrives here as a multi-byte char. Slicing at these fixed
+    // offsets would then land inside one and panic, which on the device is a
+    // reset. The field offsets are all ASCII when the name is really ours, so
+    // any name they cannot be read out of simply is not one.
+    let bytes = name.as_bytes();
+    if bytes.len() != BOOK_INDEX_FILE_BYTES
+        || !bytes[..2].eq_ignore_ascii_case(BOOK_INDEX_FILE_PREFIX.as_bytes())
+        || !bytes[4..].eq_ignore_ascii_case(b".BIN")
+    {
+        return None;
+    }
+    parse_hex2(&bytes[2..4]).filter(|key| (*key as usize) < LAYOUT_KEY_VALUES)
+}
+
+/// The layout config a per-config artifact name carries, or `None` when the
+/// name belongs to neither scheme. Used by eviction (which deletes one
+/// config's section files) and by the legacy purge (which deletes the
+/// unkeyed `S<spine>.BIN` files an older firmware wrote).
+pub fn layout_key_of_section_file_name(name: &str) -> Option<u8> {
+    section_file_name_parts(name).map(|(layout_key, _)| layout_key)
+}
+
+/// The layout config *and* section ordinal a per-config section name carries.
+///
+/// The ordinal is the dense `0..count` counter the walk assigns as it flushes,
+/// which is what the orphan prune ranges over: a rebuild producing fewer
+/// sections leaves the tail past its new count on the card. The prune needs
+/// both halves — the ordinal to know what is stranded, and the key so it prunes
+/// only the config it just published and leaves the other resident config's
+/// pagination alone.
+pub fn section_file_name_parts(name: &str) -> Option<(u8, u16)> {
+    // Bytes rather than `str` slices, for the reason above.
+    let bytes = name.as_bytes();
+    if bytes.len() != CACHE_SECTION_FILE_BYTES
+        || !bytes[..1].eq_ignore_ascii_case(b"S")
+        || !bytes[6..].eq_ignore_ascii_case(b".BIN")
+    {
+        return None;
+    }
+    let key = parse_hex2(&bytes[1..3])?;
+    if (key as usize) >= LAYOUT_KEY_VALUES {
+        return None;
+    }
+    let mut ordinal = 0u16;
+    for &byte in &bytes[3..6] {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        ordinal = ordinal * 10 + u16::from(byte - b'0');
+    }
+    Some((key, ordinal))
+}
+
+/// Whether `name` is a section file from the single-config scheme that
+/// preceded [`section_file_name`]'s layout key (`S<spine>.BIN`, eight
+/// characters). Nothing writes these; the upgrade path deletes them.
+pub fn is_legacy_section_file_name(name: &str) -> bool {
+    // Bytes rather than `str` slices, for the reason above.
+    let bytes = name.as_bytes();
+    bytes.len() == LEGACY_SECTION_FILE_BYTES
+        && bytes[..1].eq_ignore_ascii_case(b"S")
+        && bytes[1..4].iter().all(|byte| byte.is_ascii_digit())
+        && bytes[4..].eq_ignore_ascii_case(b".BIN")
+}
+
+/// The resident layout configs for one book, most recently used first.
+///
+/// Ordering is the whole point: slot 0 is the config the book was last read
+/// under (so a reader after config-independent facts knows which index file
+/// exists), and the last slot is what eviction takes when a new config
+/// arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct LayoutConfigRegistry {
+    keys: [u8; CACHE_CONFIG_SLOTS],
+    count: usize,
+}
+
+impl LayoutConfigRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The resident keys, most recently used first.
+    pub fn keys(&self) -> &[u8] {
+        &self.keys[..self.count]
+    }
+
+    /// The config the book was last read under, if it has ever been built.
+    pub fn most_recent(&self) -> Option<u8> {
+        self.keys().first().copied()
+    }
+
+    pub fn contains(&self, layout_key: u8) -> bool {
+        self.keys().contains(&layout_key)
+    }
+
+    /// Move `layout_key` to the front, inserting it if it is new. Returns the
+    /// key pushed out of the last slot, whose files the caller must delete —
+    /// `None` when nothing was evicted, including when `layout_key` was
+    /// already resident.
+    pub fn promote(&mut self, layout_key: u8) -> Option<u8> {
+        if let Some(position) = self.keys().iter().position(|key| *key == layout_key) {
+            self.keys[..=position].rotate_right(1);
+            return None;
+        }
+        let evicted = if self.count == CACHE_CONFIG_SLOTS {
+            Some(self.keys[CACHE_CONFIG_SLOTS - 1])
+        } else {
+            self.count += 1;
+            None
+        };
+        self.keys[..self.count].rotate_right(1);
+        self.keys[0] = layout_key;
+        evicted
+    }
+
+    /// Drop `layout_key` from the registry, for a caller that has just
+    /// deleted its files.
+    pub fn forget(&mut self, layout_key: u8) {
+        if let Some(position) = self.keys().iter().position(|key| *key == layout_key) {
+            self.keys[position..self.count].rotate_left(1);
+            self.count -= 1;
+            self.keys[self.count] = 0;
+        }
+    }
+}
+
+pub fn encode_layout_config_registry(
+    registry: &LayoutConfigRegistry,
+    out: &mut [u8],
+) -> Result<usize, CacheError> {
+    require(out, CACHE_CONFIG_BYTES)?;
+    write_u32(out, 0, CACHE_CONFIG_MAGIC);
+    write_u16(out, 4, CACHE_CONFIG_VERSION);
+    write_u16(out, 6, registry.count as u16);
+    out[CACHE_CONFIG_HEADER_BYTES..CACHE_CONFIG_BYTES].copy_from_slice(&registry.keys);
+    Ok(CACHE_CONFIG_BYTES)
+}
+
+pub fn decode_layout_config_registry(input: &[u8]) -> Result<LayoutConfigRegistry, CacheError> {
+    require(input, CACHE_CONFIG_BYTES)?;
+    if read_u32(input, 0)? != CACHE_CONFIG_MAGIC {
+        return Err(CacheError::BadMagic);
+    }
+    if read_u16(input, 4)? != CACHE_CONFIG_VERSION {
+        return Err(CacheError::BadVersion);
+    }
+    let count = read_u16(input, 6)? as usize;
+    if count > CACHE_CONFIG_SLOTS {
+        return Err(CacheError::BadLength);
+    }
+    let mut keys = [0u8; CACHE_CONFIG_SLOTS];
+    keys[..count].copy_from_slice(&input[CACHE_CONFIG_HEADER_BYTES..][..count]);
+    // Slots past `count` are left zero rather than read: they hold whatever
+    // the last shorter registry wrote there, and carrying that through would
+    // make two registries with identical resident keys compare unequal.
+    //
+    // An out-of-range or repeated key would name a file that cannot exist or
+    // hand eviction a slot that is not really free, so a registry carrying
+    // one is rejected outright rather than repaired: the caller rebuilds it
+    // from the config it is opening.
+    for (index, key) in keys[..count].iter().enumerate() {
+        if (*key as usize) >= LAYOUT_KEY_VALUES || keys[..index].contains(key) {
+            return Err(CacheError::BadLength);
+        }
+    }
+    Ok(LayoutConfigRegistry { keys, count })
+}
+
+fn parse_hex2(bytes: &[u8]) -> Option<u8> {
+    let mut value = 0u8;
+    for &byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        value = (value << 4) | digit;
+    }
+    Some(value)
 }
 
 pub fn encode_book_header(header: BookCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {
@@ -1841,10 +2088,210 @@ mod tests {
         );
 
         let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-        section_file_name(7, &mut name);
-        assert_eq!(name.as_str(), "S007.BIN");
-        section_file_name(1234, &mut name);
-        assert_eq!(name.as_str(), "S999.BIN");
+        section_file_name(0, 7, &mut name);
+        assert_eq!(name.as_str(), "S00007.BIN");
+        section_file_name(0x3F, 1234, &mut name);
+        assert_eq!(name.as_str(), "S3F999.BIN");
+
+        let mut index = String::<BOOK_INDEX_FILE_BYTES>::new();
+        book_index_file_name(0x2A, &mut index);
+        assert_eq!(index.as_str(), "BK2A.BIN");
+    }
+
+    #[test]
+    fn layout_key_takes_the_wrap_relevant_bits_only() {
+        // version 18 << 8 | portrait | family=1 | weight=1 | size=2 | spacing=3
+        let portrait = (18u16 << 8) | (1 << 7) | (1 << 5) | (1 << 4) | (2 << 2) | 3;
+        let landscape = portrait & !(1 << 7);
+        // Spacing is masked off: it re-walks heights over the same wrap
+        // points, so both spacings share one set of section files.
+        let relaxed = portrait & !0b11;
+
+        assert_eq!(layout_cache_key(portrait), 0b10_1110);
+        assert_eq!(layout_cache_key(relaxed), layout_cache_key(portrait));
+        // The orientation flip is the flow B7 exists for: it must land on a
+        // different key, or portrait and landscape overwrite each other.
+        assert_ne!(layout_cache_key(landscape), layout_cache_key(portrait));
+        // The wrap version rides above the mask, so a bump retires every
+        // config's files in place instead of stranding a new name per bump.
+        assert_eq!(
+            layout_cache_key(portrait ^ (1 << 8)),
+            layout_cache_key(portrait)
+        );
+        assert!((layout_cache_key(u16::MAX) as usize) < LAYOUT_KEY_VALUES);
+    }
+
+    #[test]
+    fn per_config_artifact_names_are_recognized_and_keyed() {
+        let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+        for key in [0u8, 1, 0x0A, 0x3F] {
+            section_file_name(key, 42, &mut name);
+            assert_eq!(layout_key_of_section_file_name(name.as_str()), Some(key));
+            assert!(!is_legacy_section_file_name(name.as_str()));
+
+            let mut index = String::<BOOK_INDEX_FILE_BYTES>::new();
+            book_index_file_name(key, &mut index);
+            assert_eq!(
+                layout_key_of_book_index_file_name(index.as_str()),
+                Some(key)
+            );
+        }
+
+        // The old scheme is recognized as legacy and never as keyed, so the
+        // purge and eviction passes cannot mistake one for the other.
+        assert!(is_legacy_section_file_name("S007.BIN"));
+        assert_eq!(layout_key_of_section_file_name("S007.BIN"), None);
+        assert_eq!(layout_key_of_book_index_file_name(CACHE_BOOK_FILE), None);
+
+        // Neither scheme, and nothing that merely looks close.
+        assert_eq!(layout_key_of_section_file_name("SGG007.BIN"), None);
+        assert_eq!(layout_key_of_section_file_name("S4000A.BIN"), None);
+        assert_eq!(layout_key_of_section_file_name("S00007.TXT"), None);
+        assert_eq!(layout_key_of_section_file_name("POSA.BIN"), None);
+        assert!(!is_legacy_section_file_name("POSA.BIN"));
+        assert_eq!(layout_key_of_book_index_file_name("BK40.BIN"), None);
+        assert_eq!(layout_key_of_book_index_file_name("BKZZ.BIN"), None);
+        assert_eq!(layout_key_of_book_index_file_name("BK3F.TXT"), None);
+    }
+
+    /// A directory entry these have to answer for without panicking.
+    ///
+    /// FAT stores short names as raw bytes and embedded-sdmmc renders them
+    /// ISO-8859-1 (`c as char`), so a name carrying a byte >= 0x80 reaches
+    /// these parsers as a multi-byte char. Each of the three below is the exact
+    /// byte length its parser accepts and puts a char boundary *inside* one of
+    /// the fixed offsets that parser reads, which is what a `str` slice cannot
+    /// survive. On the device a panic is a reset, and a foreign or corrupt name
+    /// in a cache directory is not a reason to reboot.
+    #[test]
+    fn a_non_ascii_name_is_rejected_rather_than_panicked_on() {
+        // 8 bytes: 'B','K','1', 2-byte char spanning offset 4, then ".BI"'s
+        // tail — the offset `layout_key_of_book_index_file_name` slices at.
+        let index_name = "BK1\u{e9}.BI";
+        assert_eq!(index_name.len(), BOOK_INDEX_FILE_BYTES);
+        // 10 bytes, with a char spanning offset 6.
+        let section_name = "S1111\u{e9}.BI";
+        assert_eq!(section_name.len(), CACHE_SECTION_FILE_BYTES);
+        // 8 bytes, with a char spanning offset 4.
+        let legacy_name = "S11\u{e9}.BI";
+        assert_eq!(legacy_name.len(), LEGACY_SECTION_FILE_BYTES);
+
+        for name in [index_name, section_name, legacy_name] {
+            assert_eq!(layout_key_of_book_index_file_name(name), None);
+            assert_eq!(layout_key_of_section_file_name(name), None);
+            assert_eq!(section_file_name_parts(name), None);
+            assert!(!is_legacy_section_file_name(name));
+        }
+    }
+
+    /// Both halves of a section name, which is what the orphan prune ranges
+    /// over: the ordinal says what a shrinking rebuild stranded, and the key
+    /// keeps the prune inside the config it just published. Two configs number
+    /// their sections from zero, so dropping the key would have one deleting the
+    /// other's pagination.
+    #[test]
+    fn a_section_name_yields_both_its_config_and_its_ordinal() {
+        let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+        for key in [0u8, 1, 0x0A, 0x3F] {
+            for ordinal in [0u16, 7, 42, 999] {
+                section_file_name(key, ordinal, &mut name);
+                assert_eq!(section_file_name_parts(name.as_str()), Some((key, ordinal)));
+            }
+        }
+
+        // The legacy scheme carries an ordinal but no key, so it must not parse
+        // as a keyed name at all — the prune would otherwise take files the
+        // legacy purge owns.
+        assert_eq!(section_file_name_parts("S003.BIN"), None);
+        assert_eq!(section_file_name_parts("S12.BIN"), None);
+        assert_eq!(section_file_name_parts("NOTES.TXT"), None);
+        // A key past the 64 the config can encode, and a non-digit ordinal.
+        assert_eq!(section_file_name_parts("S40001.BIN"), None);
+        assert_eq!(section_file_name_parts("S3F0A1.BIN"), None);
+    }
+
+    #[test]
+    fn layout_config_registry_orders_by_use_and_evicts_the_oldest() {
+        let mut registry = LayoutConfigRegistry::new();
+        assert_eq!(registry.most_recent(), None);
+
+        assert_eq!(registry.promote(4), None);
+        assert_eq!(registry.promote(9), None);
+        assert_eq!(registry.keys(), &[9, 4]);
+        assert_eq!(registry.most_recent(), Some(9));
+
+        // Re-using a resident config reorders without evicting: that is what
+        // makes the flip back to a previously-built config a cache hit.
+        assert_eq!(registry.promote(4), None);
+        assert_eq!(registry.keys(), &[4, 9]);
+
+        // A third config takes the least recently used one's slot.
+        assert_eq!(registry.promote(17), Some(9));
+        assert_eq!(registry.keys(), &[17, 4]);
+
+        registry.forget(4);
+        assert_eq!(registry.keys(), &[17]);
+        registry.forget(4);
+        assert_eq!(registry.keys(), &[17]);
+    }
+
+    #[test]
+    fn layout_config_registry_round_trips_and_rejects_nonsense() {
+        let mut registry = LayoutConfigRegistry::new();
+        registry.promote(0x3F);
+        registry.promote(0);
+        let mut bytes = [0u8; CACHE_CONFIG_BYTES];
+        assert_eq!(
+            encode_layout_config_registry(&registry, &mut bytes),
+            Ok(CACHE_CONFIG_BYTES)
+        );
+        assert_eq!(decode_layout_config_registry(&bytes), Ok(registry));
+
+        // A shorter registry decodes to exactly its resident keys, so its
+        // unused slot cannot resurrect an already-evicted config.
+        let mut single = LayoutConfigRegistry::new();
+        single.promote(5);
+        encode_layout_config_registry(&single, &mut bytes).expect("registry encodes");
+        bytes[CACHE_CONFIG_BYTES - 1] = 0x2A;
+        assert_eq!(decode_layout_config_registry(&bytes), Ok(single));
+
+        encode_layout_config_registry(&registry, &mut bytes).expect("registry encodes");
+        let mut corrupt = bytes;
+        corrupt[0] = b'?';
+        assert_eq!(
+            decode_layout_config_registry(&corrupt),
+            Err(CacheError::BadMagic)
+        );
+        corrupt = bytes;
+        corrupt[4] = CACHE_CONFIG_VERSION as u8 + 1;
+        assert_eq!(
+            decode_layout_config_registry(&corrupt),
+            Err(CacheError::BadVersion)
+        );
+        corrupt = bytes;
+        corrupt[6] = CACHE_CONFIG_SLOTS as u8 + 1;
+        assert_eq!(
+            decode_layout_config_registry(&corrupt),
+            Err(CacheError::BadLength)
+        );
+        // Out of range for the mask.
+        corrupt = bytes;
+        corrupt[CACHE_CONFIG_HEADER_BYTES] = LAYOUT_KEY_VALUES as u8;
+        assert_eq!(
+            decode_layout_config_registry(&corrupt),
+            Err(CacheError::BadLength)
+        );
+        // A repeat would hand eviction a slot that is not really free.
+        corrupt = bytes;
+        corrupt[CACHE_CONFIG_HEADER_BYTES + 1] = corrupt[CACHE_CONFIG_HEADER_BYTES];
+        assert_eq!(
+            decode_layout_config_registry(&corrupt),
+            Err(CacheError::BadLength)
+        );
+        assert_eq!(
+            decode_layout_config_registry(&bytes[..CACHE_CONFIG_BYTES - 1]),
+            Err(CacheError::BufferTooSmall)
+        );
     }
 
     #[test]
