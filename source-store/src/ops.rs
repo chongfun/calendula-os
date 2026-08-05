@@ -30,7 +30,7 @@
 //! session's loaned memory or a static — never a stack frame (the same
 //! rule as `ReaderStore`); host tests `Box` it.
 
-use embedded_sdmmc::{BlockDevice, Directory, TimeSource};
+use embedded_sdmmc::{BlockDevice, Directory, Mode, TimeSource};
 
 use crate::bodies::{
     SourceMetadata, Tombstone, BOOK_TOKEN_BYTES, DISPLAY_LABEL_MAX_BYTES, LOGICAL_BOOK_ID_BYTES,
@@ -44,6 +44,7 @@ use crate::receipts::{
 };
 use crate::record::{self, RecordState};
 use crate::select::{self, SlotDisposition, SlotEntry, MAX_SOURCE_SLOTS};
+use crate::validate::{QuickFingerprintJob, Sha256Job};
 
 /// Largest record file any operation reads or verifies: the idempotency
 /// state at full receipt capacity.
@@ -248,6 +249,93 @@ fn run_selection(ws: &mut OpsWorkspace) -> Option<()> {
         }
     }
     Some(())
+}
+
+/// What one on-card file actually is: its length, full SHA-256, and
+/// policy-v1 quick fingerprint, all computed from the persisted bytes in
+/// one pass over the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub length: u64,
+    pub sha256: [u8; SHA256_BYTES],
+    pub quick_fingerprint: [u8; SHA256_BYTES],
+}
+
+/// Hash a file's persisted identity. `Ok(None)` when the file does not
+/// exist. Reads in workspace-scratch-sized chunks; the caller compares the
+/// result against whatever identity it needs to prove or disprove.
+pub fn hash_file_identity<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    name: &str,
+    ws: &mut OpsWorkspace,
+) -> Result<Option<FileIdentity>, PublishError>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    let file = match dir.open_file_in_dir(name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+        Err(_) => return Err(PublishError::Io),
+    };
+    let length = u64::from(file.length());
+    let mut sha = Sha256Job::new(length);
+    let mut quick = QuickFingerprintJob::new(length);
+    let mut failed = false;
+    while sha.remaining() > 0 {
+        let want = (sha.remaining() as usize).min(ws.record_scratch.len());
+        if read_exact(&file, &mut ws.record_scratch[..want]).is_err()
+            || sha.update(&ws.record_scratch[..want]).is_err()
+        {
+            failed = true;
+            break;
+        }
+    }
+    while !failed {
+        let Some((offset, remaining)) = quick.next_read() else {
+            break;
+        };
+        let want = (remaining as usize).min(ws.record_scratch.len());
+        let seek = u32::try_from(offset)
+            .ok()
+            .and_then(|offset| file.seek_from_start(offset).ok());
+        if seek.is_none()
+            || read_exact(&file, &mut ws.record_scratch[..want]).is_err()
+            || quick.update(&ws.record_scratch[..want]).is_err()
+        {
+            failed = true;
+        }
+    }
+    let closed = file.close();
+    if failed || closed.is_err() {
+        return Err(PublishError::Io);
+    }
+    match (sha.finish(), quick.finish()) {
+        (Ok(sha256), Ok(quick_fingerprint)) => Ok(Some(FileIdentity {
+            length,
+            sha256,
+            quick_fingerprint,
+        })),
+        _ => Err(PublishError::Io),
+    }
+}
+
+fn read_exact<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    file: &embedded_sdmmc::File<'_, D, T, MD, MF, MV>,
+    buf: &mut [u8],
+) -> Result<(), ()>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    let mut at = 0usize;
+    while at < buf.len() {
+        match file.read(&mut buf[at..]) {
+            Ok(0) | Err(_) => return Err(()),
+            Ok(n) => at += n,
+        }
+    }
+    Ok(())
 }
 
 /// The authoritative entry carrying `book_token`, if any. Superseded,

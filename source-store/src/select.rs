@@ -144,8 +144,14 @@ pub enum MarkerDisposition {
 /// candidate generation, same physical slot. Anything else — including
 /// newer metadata for the same book — leaves the marker's own candidate
 /// unexplained and therefore hidden.
-pub fn marker_disposition(marker: &StagingMarker, entries: &[SlotEntry]) -> MarkerDisposition {
-    let committed = entries.iter().any(|entry| {
+///
+/// Takes an iterator so callers holding `Option`-arrays can pass
+/// `.iter().flatten()` without compacting entries through a stack copy.
+pub fn marker_disposition<'a>(
+    marker: &StagingMarker,
+    entries: impl IntoIterator<Item = &'a SlotEntry>,
+) -> MarkerDisposition {
+    let committed = entries.into_iter().any(|entry| {
         entry.metadata.logical_book_id == marker.logical_book_id
             && entry.metadata.source_generation == marker.candidate_source_generation
             && entry.physical_slot == marker.candidate_physical_slot

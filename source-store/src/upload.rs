@@ -43,14 +43,16 @@ use crate::bodies::{
     STAGING_MARKER_SCHEMA,
 };
 use crate::layout;
-use crate::ops::{find_authoritative_by_token, load_catalog, IdempotencyStore, OpsWorkspace};
+use crate::ops::{
+    find_authoritative_by_token, hash_file_identity, load_catalog, IdempotencyStore, OpsWorkspace,
+};
 use crate::publish::{self, PublishError};
 use crate::receipts::{
     OperationReceipt, ReceiptLookup, ReceiptOperation, RECEIPT_STATUS_SUCCESS, REQUEST_NONCE_BYTES,
 };
 use crate::record::{self, RecordState};
 use crate::select::MAX_SOURCE_SLOTS;
-use crate::validate::{QuickFingerprintJob, Sha256Job, QUICK_FINGERPRINT_POLICY_V1};
+use crate::validate::{Sha256Job, QUICK_FINGERPRINT_POLICY_V1};
 
 /// A parsed create or replace request: the epoch-scoped request ID, the
 /// declared source identity the device must independently confirm, the
@@ -458,72 +460,18 @@ where
         }
     }
 
-    // 3. Independently reread every persisted byte; the card's copy — not
-    //    the received stream — is what metadata will vouch for.
-    let mut reread = Sha256Job::new(request.declared_length);
-    let mut fingerprint = QuickFingerprintJob::new(request.declared_length);
-    {
-        let file = dir
-            .open_file_in_dir(txn.candidate_name.as_str(), Mode::ReadOnly)
-            .map_err(|_| UploadError::Io(PublishError::Io))?;
-        if u64::from(file.length()) != request.declared_length {
-            let _ = file.close();
-            return Err(UploadError::PersistMismatch);
-        }
-        while reread.remaining() > 0 {
-            let want = (reread.remaining() as usize).min(ws.record_scratch.len());
-            let mut at = 0usize;
-            while at < want {
-                match file.read(&mut ws.record_scratch[at..want]) {
-                    Ok(0) | Err(_) => {
-                        let _ = file.close();
-                        return Err(UploadError::PersistMismatch);
-                    }
-                    Ok(n) => at += n,
-                }
-            }
-            if reread.update(&ws.record_scratch[..want]).is_err() {
-                let _ = file.close();
-                return Err(UploadError::PersistMismatch);
-            }
-        }
-        // 4. Quick fingerprint from the same persisted copy, by region.
-        while let Some((offset, remaining)) = fingerprint.next_read() {
-            let Ok(offset32) = u32::try_from(offset) else {
-                let _ = file.close();
-                return Err(UploadError::PersistMismatch);
-            };
-            if file.seek_from_start(offset32).is_err() {
-                let _ = file.close();
-                return Err(UploadError::PersistMismatch);
-            }
-            let want = (remaining as usize).min(ws.record_scratch.len());
-            let mut at = 0usize;
-            while at < want {
-                match file.read(&mut ws.record_scratch[at..want]) {
-                    Ok(0) | Err(_) => {
-                        let _ = file.close();
-                        return Err(UploadError::PersistMismatch);
-                    }
-                    Ok(n) => at += n,
-                }
-            }
-            if fingerprint.update(&ws.record_scratch[..want]).is_err() {
-                let _ = file.close();
-                return Err(UploadError::PersistMismatch);
-            }
-        }
-        if file.close().is_err() {
-            return Err(UploadError::Io(PublishError::Io));
-        }
-    }
-    let persisted = reread.finish().map_err(|_| UploadError::PersistMismatch)?;
-    if persisted != request.declared_sha256 {
+    // 3–4. Independently reread and rehash every persisted byte — the
+    //    card's copy, not the received stream, is what metadata will vouch
+    //    for — and take the quick fingerprint from that same copy.
+    let identity = match hash_file_identity(dir, txn.candidate_name.as_str(), ws) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return Err(UploadError::PersistMismatch),
+        Err(error) => return Err(UploadError::Io(error)),
+    };
+    if identity.length != request.declared_length || identity.sha256 != request.declared_sha256 {
         return Err(UploadError::PersistMismatch);
     }
-    let quick_fingerprint = fingerprint
-        .finish()
-        .map_err(|_| UploadError::PersistMismatch)?;
+    let quick_fingerprint = identity.quick_fingerprint;
 
     // 5. The container gate.
     if !validate_container() {

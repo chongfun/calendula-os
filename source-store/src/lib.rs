@@ -66,11 +66,13 @@
 #![forbid(unsafe_code)]
 
 pub mod bodies;
+pub mod cleanup;
 pub mod layout;
 pub mod ops;
 pub mod publish;
 pub mod receipts;
 pub mod record;
+pub mod recover;
 pub mod select;
 pub mod upload;
 pub mod validate;
