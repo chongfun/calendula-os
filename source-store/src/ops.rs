@@ -33,9 +33,9 @@
 use embedded_sdmmc::{BlockDevice, Directory, Mode, TimeSource};
 
 use crate::bodies::{
-    SourceMetadata, Tombstone, BOOK_TOKEN_BYTES, DISPLAY_LABEL_MAX_BYTES, LOGICAL_BOOK_ID_BYTES,
-    REQUEST_ID_BYTES, SHA256_BYTES, SOURCE_METADATA_SCHEMA, TOMBSTONE_MAGIC, TOMBSTONE_SCHEMA,
-    TOMBSTONE_STATUS_DELETED,
+    OperationKind, SourceMetadata, Tombstone, BOOK_TOKEN_BYTES, DISPLAY_LABEL_MAX_BYTES,
+    LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES, SOURCE_METADATA_SCHEMA, TOMBSTONE_MAGIC,
+    TOMBSTONE_SCHEMA, TOMBSTONE_STATUS_DELETED,
 };
 use crate::layout;
 use crate::publish::{self, PublishError};
@@ -589,10 +589,17 @@ pub fn receipt_is_consistent_with_trace(receipt: &OperationReceipt, trace: Reque
         RequestTrace::None => true,
         RequestTrace::Conflict => false,
         RequestTrace::Metadata(entry) => match receipt.operation {
-            ReceiptOperation::Create
-            | ReceiptOperation::Replace
-            | ReceiptOperation::RecoverExternallyModified => {
-                entry.metadata.logical_book_id == receipt.logical_book_id
+            ReceiptOperation::Create | ReceiptOperation::Replace => {
+                entry.metadata.operation_kind == OperationKind::ManagedUploadRequest
+                    && receipt.binding_digest() == Some(entry.metadata.request_binding_sha256)
+                    && entry.metadata.logical_book_id == receipt.logical_book_id
+                    && entry.metadata.book_token == receipt.result_book_token_or_zero
+                    && entry.metadata.source_generation == receipt.source_generation
+            }
+            ReceiptOperation::RecoverExternallyModified => {
+                entry.metadata.operation_kind == OperationKind::ExternalRecoveryRequest
+                    && receipt.binding_digest() == Some(entry.metadata.request_binding_sha256)
+                    && entry.metadata.logical_book_id == receipt.logical_book_id
                     && entry.metadata.book_token == receipt.result_book_token_or_zero
                     && entry.metadata.source_generation == receipt.source_generation
             }

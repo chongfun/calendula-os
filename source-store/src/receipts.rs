@@ -32,8 +32,9 @@
 use crate::record::{RecordView, BODY_CRC_BYTES, BODY_PREFIX_BYTES};
 
 use crate::bodies::{
-    validate_display_label, DisplayLabel, BOOK_TOKEN_BYTES, DISPLAY_LABEL_MAX_BYTES,
-    LOGICAL_BOOK_ID_BYTES, SHA256_BYTES,
+    validate_display_label, DisplayLabel, RequestBinding, BINDING_TAG_RECOVER, BINDING_TAG_UPLOAD,
+    BOOK_TOKEN_BYTES, DISPLAY_LABEL_MAX_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES,
+    SHA256_BYTES,
 };
 
 pub const IDEMPOTENCY_MAGIC: [u8; 4] = *b"XTID";
@@ -123,6 +124,44 @@ impl OperationReceipt {
         let mut bytes = [0u8; DISPLAY_LABEL_MAX_BYTES];
         bytes[..label.as_bytes().len()].copy_from_slice(label.as_bytes());
         (label.as_bytes().len() as u8, bytes)
+    }
+
+    /// Reconstruct the request ID (`epoch || request_nonce`) bound by this receipt.
+    pub fn request_id(&self) -> [u8; REQUEST_ID_BYTES] {
+        let mut id = [0u8; REQUEST_ID_BYTES];
+        id[..8].copy_from_slice(&self.epoch.to_le_bytes());
+        id[8..].copy_from_slice(&self.request_nonce);
+        id
+    }
+
+    /// Reconstruct the canonical request binding from this receipt and return its digest.
+    /// Returns `None` for delete receipts (which have no source metadata request binding).
+    pub fn binding_digest(&self) -> Option<[u8; SHA256_BYTES]> {
+        let tag = match self.operation {
+            ReceiptOperation::Create | ReceiptOperation::Replace => BINDING_TAG_UPLOAD,
+            ReceiptOperation::RecoverExternallyModified => BINDING_TAG_RECOVER,
+            ReceiptOperation::Delete => return None,
+        };
+        let parsed_label;
+        let label = if self.display_label_len == 0 {
+            None
+        } else {
+            parsed_label = DisplayLabel::from_record(self.display_label_len, &self.display_label)?;
+            Some(&parsed_label)
+        };
+        let request_id = self.request_id();
+        Some(
+            RequestBinding {
+                tag,
+                operation: self.operation as u8,
+                request_id: &request_id,
+                base_book_token_or_zero: &self.base_book_token_or_zero,
+                declared_length: self.source_length_or_zero,
+                declared_sha256: &self.source_sha256_or_zero,
+                label,
+            }
+            .digest(),
+        )
     }
 
     /// Request-ID parameter consistency: everything the client bound,

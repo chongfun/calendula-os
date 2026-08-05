@@ -77,7 +77,7 @@ impl DisplayLabel {
     /// Decode the on-record form: the tail beyond `len` must be canonical
     /// zeros, so equal labels are equal bytes and the CRC pins the whole
     /// field.
-    fn from_record(len: u8, bytes: &[u8; DISPLAY_LABEL_MAX_BYTES]) -> Option<Self> {
+    pub fn from_record(len: u8, bytes: &[u8; DISPLAY_LABEL_MAX_BYTES]) -> Option<Self> {
         let label = bytes.get(..usize::from(len))?;
         if !validate_display_label(label) {
             return None;

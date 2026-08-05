@@ -589,6 +589,172 @@ fn durable_receipt_with_conflicting_fallback_records_is_refused_and_preserved() 
     let _ = created;
 }
 
+/// Sealed card containing one metadata record and one receipt sharing the same
+/// request ID and result identity, but with a mutated receipt field.
+fn card_with_metadata_and_mismatched_receipt(
+    root: &Dir<'_>,
+    _disk: &SharedDisk,
+    mutate_receipt: impl FnOnce(&mut OperationReceipt),
+) -> UploadResult {
+    let bytes = epub_bytes(4_000, 1);
+    let mut ws = workspace();
+    load_catalog(root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(root, &mut ws).expect("idem");
+    let created = upload_book(root, &mut idem, &mut ws, CONTESTED, 10, 20, &bytes);
+
+    let mut receipt = *idem
+        .state
+        .get_receipt(1, &[CONTESTED; 16])
+        .expect("receipt");
+    mutate_receipt(&mut receipt);
+
+    lose_every_receipt(root);
+
+    let mut ws = workspace();
+    load_catalog(root, &mut ws).expect("catalog after reboot");
+    let mut idem = IdempotencyStore::load(root, &mut ws).expect("idem after reboot");
+    idem.state.insert(receipt).expect("insert mutated receipt");
+    idem.publish(root, &mut ws)
+        .expect("publish mutated receipt");
+
+    created
+}
+
+/// A receipt whose operation disagrees with the metadata's operation kind
+/// (e.g. recovery receipt vs upload metadata) must be refused by all endpoints
+/// and preserved by cleanup.
+#[test]
+fn receipt_with_mismatched_operation_against_metadata_is_refused_and_preserved() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let created = card_with_metadata_and_mismatched_receipt(&root, &disk, |r| {
+        r.operation = ReceiptOperation::RecoverExternallyModified;
+    });
+    let before = disk.snapshot();
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+
+    let retried = begin_upload(
+        &root,
+        &mut idem,
+        &create_request(CONTESTED, &epub_bytes(4_000, 1)),
+        fresh(10, 20),
+        &mut ws,
+    );
+    assert!(
+        matches!(retried, UploadBeginOutcome::AmbiguousRequestEvidence),
+        "upload replayed despite mismatched operation kind in receipt: {}",
+        name(&retried)
+    );
+
+    assert_eq!(
+        delete_book(&root, &mut idem, &delete_request(CONTESTED, 20), &mut ws),
+        DeleteOutcome::AmbiguousRequestEvidence,
+        "delete replayed despite mismatched operation kind in receipt"
+    );
+
+    assert_eq!(
+        recover_book(
+            &root,
+            &mut idem,
+            &recovery_request(CONTESTED, 20, &epub_bytes(3_000, 2)),
+            [31; BOOK_TOKEN_BYTES],
+            &mut ws,
+            || true,
+        ),
+        RecoveryOutcome::AmbiguousRequestEvidence,
+        "recovery ran despite mismatched operation kind in receipt"
+    );
+
+    assert!(
+        disk.snapshot() == before,
+        "refusing a contradictory request ID with a receipt wrote to the card"
+    );
+
+    let mut ws = workspace();
+    let report = run_cleanup(&root, &mut ws).expect("cleanup");
+    assert_eq!(
+        report.reclaimed_slots, 0,
+        "cleanup removed metadata for a conflicting request"
+    );
+    assert!(
+        ws.entries[0].is_some(),
+        "cleanup deleted metadata for a conflicting request"
+    );
+
+    let _ = created;
+}
+
+/// A receipt whose parameters disagree with the metadata's request binding
+/// (e.g. source SHA-256) must be refused by all endpoints and preserved by cleanup.
+#[test]
+fn receipt_with_mismatched_source_hash_against_metadata_is_refused_and_preserved() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let created = card_with_metadata_and_mismatched_receipt(&root, &disk, |r| {
+        r.source_sha256_or_zero = [99; SHA256_BYTES];
+    });
+    let before = disk.snapshot();
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+
+    let retried = begin_upload(
+        &root,
+        &mut idem,
+        &create_request(CONTESTED, &epub_bytes(4_000, 1)),
+        fresh(10, 20),
+        &mut ws,
+    );
+    assert!(
+        matches!(retried, UploadBeginOutcome::AmbiguousRequestEvidence),
+        "upload replayed despite mismatched source hash in receipt: {}",
+        name(&retried)
+    );
+
+    assert_eq!(
+        delete_book(&root, &mut idem, &delete_request(CONTESTED, 20), &mut ws),
+        DeleteOutcome::AmbiguousRequestEvidence,
+        "delete replayed despite mismatched source hash in receipt"
+    );
+
+    assert_eq!(
+        recover_book(
+            &root,
+            &mut idem,
+            &recovery_request(CONTESTED, 20, &epub_bytes(3_000, 2)),
+            [31; BOOK_TOKEN_BYTES],
+            &mut ws,
+            || true,
+        ),
+        RecoveryOutcome::AmbiguousRequestEvidence,
+        "recovery ran despite mismatched source hash in receipt"
+    );
+
+    assert!(
+        disk.snapshot() == before,
+        "refusing a contradictory request ID with a receipt wrote to the card"
+    );
+
+    let mut ws = workspace();
+    let report = run_cleanup(&root, &mut ws).expect("cleanup");
+    assert_eq!(
+        report.reclaimed_slots, 0,
+        "cleanup removed metadata for a conflicting request"
+    );
+    assert!(
+        ws.entries[0].is_some(),
+        "cleanup deleted metadata for a conflicting request"
+    );
+
+    let _ = created;
+}
+
 /// Two metadata records carrying one request ID is the same failure with a
 /// different shape — nothing legitimate writes an ID into two slots — and it
 /// must not be resolved by whichever slot is scanned first either.
