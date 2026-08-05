@@ -84,6 +84,20 @@ blessing per `docs/agents/visual-verification.md` — letter positions are
 pixel-identical between old and new, which is the layout invariance visible
 rather than merely asserted.
 
+**Superseded by H5, 2026-08-05.** The device verdict on these tables was
+mixed — some glyphs improved, others unbalanced — and both mechanisms trace
+to rendering each glyph twice: the mono hinter grid-fits every glyph on its
+own, so neighbours can carry different stem weights, and the re-seat that
+placed the mono ink against a separately rendered antialiased reference
+turned every disagreement between the two renders into a one-pixel placement
+lottery. What H1 keeps is the diagnosis (a 50% cut rounds half-covered stem
+edges by grid phase — that is what H5's lower cut fixes directly) and the
+machinery: the specimen goldens, the fingerprint table, and the frozen-box
+discipline all came from this change and are what made H5 cheap to build and
+safe to verify. The lesson is size-dependent, not absolute: mono hinting won
+on rust_ink's 14 px UI face, where the grid is brutal; at 19–26 px reading
+sizes with frozen boxes, it lost.
+
 ### H2 — justified lines were left-heavy (`opt/font-mono-raster`)
 
 `draw_justified_line` divided the line's slack with integer division and spent
@@ -96,6 +110,54 @@ the wider gaps land evenly. The total is unchanged — exactly `remainder` gaps
 still get the extra pixel — so the line ends where it did. Extracted as
 `GapSlack` so it is testable away from the framebuffer; three host tests, and
 the front-loading mutation fails the one that names it.
+
+### H5 — one antialiased render, seated by itself (`opt/font-aa-low-threshold`)
+
+**Ready (a45d548, unpushed). Device A/B verdict 2026-08-05: better overall.
+Supersedes H1's pixels; keeps its diagnosis.**
+
+The shape is crosspoint-reader's: every face it ships comes from a single
+FreeType call, so ink, box and bearings cannot disagree with each other. Here
+that is one `"L"`-mode render per glyph, cut to 1 bit at
+`AA_INK_THRESHOLD = 112`, no mono render, no re-seat. The box stays the
+shipped table's box — frozen cache geometry.
+
+**The cut is measured, not copied.** crosspoint cuts at ~12.5% coverage, but
+its boxes derive from the same render and grow with the ink; ours are frozen,
+so that cut clips whole edge rows off reading glyphs (63k pixels, ASCII
+included). A sweep of every shipped render: ink vs the mono tables runs
++25% / +14% / +8% / **+3.5%** / +0.3% at cuts 32/64/96/112/128, with clipping
+collapsing to noise from 64 up. The trap was per-face: Literata's 22 px stems
+— the default reading configuration — have their antialiased edges at
+coverage 96..112, so any cut ≤ 96 swallows them wholesale (+20–31% ink, a
+weight change). At 112 every face lands at +1–5% except the 22 px italics
+(+11–15%), the direction e-ink wants anyway.
+
+Cache safety verified the same way as H1: all 49,802 metrics byte-identical
+except the dedup pool's `offset`. No repagination. Fingerprints and goldens
+re-blessed after inspection; prose frames are letter-position-identical, and
+the specimen pages reflow only because they enumerate distinct glyphs and the
+dedup classes moved with the pixels.
+
+**Residual to watch on device: bold dashes.** Mono's dropout control was
+doing real work on thin horizontal bars: Merriweather Bold's hyphen/dash/
+equals family lost exactly half its ink (em-dash 38→19 px at 19 px) because
+the bar straddles two rows at ~70/30 coverage and the 30% row now drops.
+Regular weights and Literata are unaffected. If it shows in reading, the fix
+is a targeted rescue rule (keep a stroke's second row when dropping it would
+halve the glyph), not a return to mono.
+
+**The branch also corrects the toolchain pin.** Regenerating under the
+Pillow 10.4.0 / FreeType 2.13.2 pair pinned by #66 does not reproduce the
+shipped tables on this machine — 12.3.0 / 2.14.3 reproduces all five byte
+for byte, which follows from history: the fingerprints were created by #61
+(built on 12.3.0/2.14.3) and #66 pinned without regenerating. #66's
+hinted-vs-unhinted `getlength` numbers do not reproduce here either; both
+Pillow versions return identical hinted advances on this machine, so those
+numbers came from some other environment — likely a raqm-enabled Pillow.
+**Follow-up: run one generator unmodified on the machine that produced #66
+and see what its toolchain actually resolves to.**
+`tools/reseat_generated_glyphs.py` is deleted with its premise.
 
 ## Open
 
@@ -112,9 +174,14 @@ host**: the whole question is how the panel renders it, so the verdict is a
 photograph of an X3 at each shipped size, against the current build. Do not
 tune it against emulator PNGs.
 
-Note the retired lever: `TEXT_RENDER_THRESHOLD` (default 128) no longer does
-anything on the shipped faces, because the mono path has no grey to threshold.
-Only `generate_mockup_fonts.py` still uses it.
+The live lever is now `AA_INK_THRESHOLD` (112), and H5's sweep is the tuning
+curve: each step down toward 96 buys roughly +1–2% ink per face until the
+22 px cliff, and the per-face table in the H5 commit says exactly where each
+face sits. H5 already shipped +3.5% of exactly this effect, so the remaining
+H3 question is narrower than it was: does the panel want *more* than that —
+and H7 (optical sizing) is the designer-drawn version of the same lever,
+worth judging in the same photo session. `TEXT_RENDER_THRESHOLD` remains
+retired; only `generate_mockup_fonts.py` reads it.
 
 ### H4 (M–L, needs a version bump): hyphenation
 
@@ -129,17 +196,62 @@ the image can afford (57% of the slot used, 2.69 MB spare). The cost is that
 it **changes line breaking**, so it needs a `READER_LAYOUT_VERSION` bump and
 every cached book rebuilds once. That is the whole item: the algorithm is well
 understood, the question is whether the typography is worth one 24–27 s replay
-per book.
+per book. **If that bump ever happens, H7 should ride along** — the two
+changes share the one cost that makes each expensive alone.
+
+### H6 (S, no cache cost): per-board default sizes for physical parity
+
+The same pixel size is ~18% physically smaller on the X3 (259 PPI) than the
+X4 (219 PPI), and the shipped ladder happens to encode the ratio: X4 at 22 px
+and X3 at 26 px are both 7.23 physical points, X4@19 ≈ X3@22 within 2%. So
+cross-board physical consistency is a per-board *default-size* constant —
+shift one ladder step — not new tables. All three sizes already ship in both
+builds. Rasterization itself has no PPI input: a 22 px glyph is rendered
+identically whatever panel it lands on, so there is nothing else to "match."
+
+### H7 (M, needs a version bump, pairs with H4): optical-size instances
+
+At 259 PPI the reading sizes are physically 5.3–7.2 pt — small print — and
+the pinned Literata statics are the family's *default* optical cut, drawn for
+nominal text sizes. Literata is an opsz 7–72 optical-size family: instancing
+at the physical point size (≈6–7 for X3, ≈7–8.5 for X4) buys larger x-height,
+opened apertures and heavier hairlines from the typeface designer's own
+drawings — the structural version of H3. This is the one legitimately
+PPI-grounded reason for per-board tables, and since each board ships its own
+binary it costs no flash on any device. Instancing moves advances, so it is a
+`READER_LAYOUT_VERSION` bump — pointless to pay alone, natural alongside H4.
+`fonttools.instancer` does the cutting; crosspoint's `build-sd-fonts.py` has
+the working pattern.
 
 ## Do not re-propose
 
-- **2 bpp / grayscale text.** The second panel plane is the previous-frame
-  buffer for differential update, not a grey channel — `update_control_1` for
-  Full/FastClean is `[0x40, 0x00]`, the RED-bypass bit. Grey would need a
-  multi-pass waveform, so it multiplies the 379 ms BUSY rather than adding to
-  it. This was considered and rejected on that basis, not on effort.
-- **Tuning `TEXT_RENDER_THRESHOLD`.** Superseded by H1: there is no grey left
-  to threshold on the shipped faces.
+- **2 bpp / grayscale text — the impossibility half is dead, the cost half
+  stands.** The original rejection reasoned from the stock waveform (second
+  plane = previous-frame differential buffer). crosspoint-reader ships
+  4-level gray text on this exact controller: community gray LUTs for the
+  UC8253 X3 (`freeink-sdk` `Uc8253X3Luts.h`, plus a scrub bank for the
+  residue), two bitplanes rendered strip-wise after the BW turn, gray pass
+  displayed as an overlay. Our X3 already uploads LUTs per flush, so nothing
+  hardware-side forbids it. What stands is the cost: an extra gray render and
+  waveform pass per page, ghost-cleanup cadence pressure (their #2190), and
+  RAM for strip scratch. If text AA ever matters more than page-turn latency,
+  this is a costed design with working prior art, not a wall — but it is a
+  large project, and H5 just moved the 1-bpp ceiling up for free.
+- **The two-render re-seat.** Rendering mono ink and seating it against a
+  separately rendered antialiased reference turns every disagreement between
+  the renders into a one-pixel placement lottery, dumped into whichever edge
+  the clamp leaves free. Ink and seat must come from one rasterization. This
+  is the defect the device caught as "some glyphs improved, others
+  unbalanced."
+- **Mono-target hinting at reading sizes.** Grid-fitting each glyph
+  independently gives neighbouring letters different stem weights; at
+  19–26 px with frozen boxes it lost the A/B to a single antialiased render
+  with a swept cut. The caveat that keeps this from being absolute: it won on
+  rust_ink's 14 px UI face. If a face ever ships below ~16 px, re-measure.
+- **Re-tuning `AA_INK_THRESHOLD` by eye.** The cut is data-pinned: H5's sweep
+  maps ink and clipping per face per cut, and the 22 px cliff means small
+  moves have wildly uneven per-face effects. Move it only with the sweep and
+  clip analysis rerun, never as a lone constant tweak.
 - **Judging text quality from emulator PNGs alone.** They are the right oracle
   for *layout* — that nothing moved — and the wrong one for *rendering*, which
   is a question about a reflective display under real light.

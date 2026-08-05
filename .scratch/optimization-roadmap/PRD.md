@@ -104,12 +104,13 @@ is the opposite of what was expected when this started.
 
 ### Tier 3 — in-flight branches, ranked by residual work
 
-All six sit on current `main`; none needs a rebase.
+All sit on current `main`; none needs a rebase.
 
 | Branch | State | Residual |
 |---|---|---|
 | `opt/tier0-measurement-integrity` | **Ready**, reviewed and reworked. Rebased onto #56; 56 host tests on both interpreters; clippy clean on X4/X3 × ±default-features. | Merge. Device confirmation of 0d's ~36 ms is still owed but gates nothing — the feature is inert by default |
-| `opt/font-mono-raster` | **Ready.** Rasterizes the shipped faces through FreeType's monochrome target instead of thresholding antialiased output, and spreads justified slack evenly instead of front-loading it. Zero device cost; **zero `GlyphMetric` changes**, so no cache invalidation. Goldens re-blessed on both boards. | Merge; a device photograph would confirm the visual win but gates nothing |
+| ~~`opt/font-mono-raster`~~ | **MERGED as #61, pixels superseded 2026-08-05.** The device verdict was mixed — per-glyph grid-fitting plus the two-render re-seat made some glyphs unbalanced. What survives it: the H2 justification fix, the specimen/fingerprint machinery, and the diagnosis its successor is built on (issue 08, H1/H5). | — |
+| `opt/font-aa-low-threshold` | **Ready (a45d548), device A/B verdict positive** — "better overall" reading on the X3. One antialiased render per glyph, cut at a swept threshold (112); no re-seat; all 49,802 metrics byte-identical sans pool offset, so no cache invalidation. Also corrects the fontgen toolchain pin (#66's pair cannot rebuild the shipped tables; 12.3.0/2.14.3 reproduces byte-for-byte). Full sweep and residuals in issue 08 H5. | Merge; watch bold Merriweather dashes in reading (dropout residual, targeted fix known) |
 | `opt/prune-orphan-sections` | **Ready.** Deletes the section files a shrinking rebuild strands (~360 KB per type change, per book), gated on `resume_spine` so a suspended walk is never pruned against. Three fault-harness tests, each mutation-checked. | Merge — **before B7**, which multiplies the leak |
 | `opt/a11-landscape-glyph-batching` | **Ready.** Differential test against the code it replaces, on both board configs; all goldens pass **unblessed**. | Device measurement only — the author's own merge gate |
 | `opt/upload-session-token` | **Ready.** Complete, gate anchored not scanned, goldens re-blessed and visually verified on both boards. | Device check |
@@ -268,6 +269,14 @@ is X3-only for this reason.
    Suppressing the event instead is how the top-ranked branch reintroduced
    rule 4's one-way trap. A guard placed *below* the reducer — at the flush
    seam — is structurally immune to this and is the safer default.
+11. **A pin protects bytes, not version numbers.** Before regenerating any
+   frozen artifact, run the generator unmodified and require a clean diff;
+   only then does the pinned toolchain mean anything. #66 pinned a
+   Pillow/FreeType pair that could not rebuild the shipped font tables — the
+   fingerprints came from #61's toolchain and the pin was never validated by
+   regeneration — and the mismatch sat under a "reproduction verified" commit
+   message for a week. The prove-first habit is what caught it (issue 08,
+   H5).
 
 ## Workstreams
 
