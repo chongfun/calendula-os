@@ -65,6 +65,15 @@ impl DisplayLabel {
         &self.bytes[..usize::from(self.len)]
     }
 
+    /// A minimal valid label for filler entries in fixed-capacity arrays
+    /// that are sized but never read. Avoids an `unwrap` on the validating
+    /// constructor in panic-free code paths.
+    pub fn placeholder() -> Self {
+        let mut bytes = [0u8; DISPLAY_LABEL_MAX_BYTES];
+        bytes[0] = b'-';
+        Self { len: 1, bytes }
+    }
+
     /// Decode the on-record form: the tail beyond `len` must be canonical
     /// zeros, so equal labels are equal bytes and the CRC pins the whole
     /// field.

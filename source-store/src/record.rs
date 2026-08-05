@@ -92,19 +92,25 @@ fn crc32_with_zeroed_field(bytes: &[u8], hole: Range<usize>) -> Option<u32> {
 }
 
 /// `logical_len` rounded up to the next 512-byte boundary; `None` on
-/// overflow or a length below the framing minimum.
-pub fn padded_body_len(logical_len: usize) -> Option<usize> {
+/// overflow or a length below the framing minimum. `const` so workspace
+/// buffers can be sized from record layouts at compile time.
+pub const fn padded_body_len(logical_len: usize) -> Option<usize> {
     if logical_len < MIN_LOGICAL_BODY_BYTES {
         return None;
     }
-    let up = logical_len.checked_add(COMMIT_ALIGNMENT - 1)?;
-    Some(up & !(COMMIT_ALIGNMENT - 1))
+    match logical_len.checked_add(COMMIT_ALIGNMENT - 1) {
+        None => None,
+        Some(up) => Some(up & !(COMMIT_ALIGNMENT - 1)),
+    }
 }
 
 /// Total record file length for a logical body: padded body plus commit
 /// sector.
-pub fn record_file_len(logical_len: usize) -> Option<usize> {
-    padded_body_len(logical_len)?.checked_add(COMMIT_FOOTER_BYTES)
+pub const fn record_file_len(logical_len: usize) -> Option<usize> {
+    match padded_body_len(logical_len) {
+        None => None,
+        Some(padded) => padded.checked_add(COMMIT_FOOTER_BYTES),
+    }
 }
 
 /// What [`seal_body`] produced: everything the publish path needs to build

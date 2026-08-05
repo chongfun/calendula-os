@@ -66,6 +66,8 @@
 #![forbid(unsafe_code)]
 
 pub mod bodies;
+pub mod layout;
+pub mod ops;
 pub mod publish;
 pub mod receipts;
 pub mod record;

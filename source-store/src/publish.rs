@@ -162,6 +162,35 @@ fn select_summaries(a: SlotSummary, b: SlotSummary) -> Selection {
     select_generations(a.committed_generation(), b.committed_generation())
 }
 
+/// Select and read the pair's committed authority in one step: the record
+/// the startup selector chose, reread and classified, with its body
+/// borrowed out of `scratch` for typed decoding. `Ok(None)` when no
+/// committed authority exists. A record that selected but then failed to
+/// reread as committed — a mid-call surprise the serialization rules
+/// should make impossible — reports `Io` rather than pretending absence.
+pub fn read_committed<'s, D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    pair: SlotPair<'_>,
+    scratch: &'s mut [u8],
+) -> Result<Option<(usize, RecordState<'s>)>, PublishError>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    let Some((slot, generation)) = select_authority(dir, pair, scratch)? else {
+        return Ok(None);
+    };
+    let len = match read_whole_file(dir, pair.names[slot], scratch)? {
+        Some(ReadFile::Read(len)) => len,
+        _ => return Err(PublishError::Io),
+    };
+    let state = classify_record(&scratch[..len], pair.magic);
+    match state.committed_generation() {
+        Some(read_generation) if read_generation == generation => Ok(Some((slot, state))),
+        _ => Err(PublishError::Io),
+    }
+}
+
 /// Publish `sealed` (built by [`crate::record::seal_body`] into
 /// `sealed_buf`) as the pair's next committed generation.
 ///

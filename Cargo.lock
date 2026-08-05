@@ -1741,6 +1741,7 @@ dependencies = [
  "crc",
  "embedded-sdmmc",
  "fatfs",
+ "heapless 0.9.3",
 ]
 
 [[package]]

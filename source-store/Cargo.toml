@@ -10,6 +10,7 @@ workspace = true
 # Body and commit-sector checksums. Same crate proto already compiles for both
 # targets; CRC-32/ISO-HDLC here, distinct from ota.rs's bootloader algorithm.
 crc = "3.2.1"
+heapless = "0.9.0"
 # Same pin as fw's, reader-cache's, and upload-store's; see fw/Cargo.toml for
 # why this exact rev.
 embedded-sdmmc = { git = "https://github.com/rust-embedded-community/embedded-sdmmc-rs.git", rev = "d26892f7405469eba95741763ab39bda2239d5ec", default-features = false }

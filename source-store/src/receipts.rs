@@ -45,6 +45,14 @@ pub const IDEMPOTENCY_SCHEMA: u16 = 1;
 /// between rotations.
 pub const MAX_RECEIPTS: usize = 32;
 
+/// New operations accepted per epoch — the "maximum new operation requests
+/// per epoch" the capabilities response advertises. Half the retained
+/// total, so a full current epoch plus a full previous epoch always fit:
+/// rotation therefore always restores headroom, and
+/// [`IdempotencyState::insert`] can never be wedged by receipts that
+/// retention rules forbid dropping.
+pub const MAX_RECEIPTS_PER_EPOCH: usize = MAX_RECEIPTS / 2;
+
 /// The browser-facing request nonce: 128 random bits.
 pub const REQUEST_NONCE_BYTES: usize = 16;
 
@@ -120,9 +128,13 @@ impl OperationReceipt {
     /// Request-ID parameter consistency: everything the client bound,
     /// nothing the device produced. A retry matching on `(epoch, nonce)`
     /// but not on these is misuse and is rejected, per the PRD.
+    ///
+    /// `logical_book_id` is deliberately absent: the device assigns it, so
+    /// a legitimate replay probe cannot know it (a delete retry carries
+    /// only the token). It is stored in the receipt as result identity,
+    /// not compared as a parameter.
     pub fn matches_parameters(&self, other: &Self) -> bool {
         self.operation == other.operation
-            && self.logical_book_id == other.logical_book_id
             && self.base_book_token_or_zero == other.base_book_token_or_zero
             && self.source_length_or_zero == other.source_length_or_zero
             && self.source_sha256_or_zero == other.source_sha256_or_zero
@@ -283,11 +295,27 @@ impl IdempotencyState {
         }
     }
 
+    /// Receipts already issued against the current epoch. Operations check
+    /// this *before* committing anything: a rejection for an exhausted
+    /// epoch must arrive before the operation runs, never after.
+    pub fn current_epoch_receipts(&self) -> usize {
+        self.receipts()
+            .iter()
+            .filter(|receipt| receipt.epoch == self.current_epoch)
+            .count()
+    }
+
+    /// Whether one more operation may be accepted in the current epoch.
+    pub fn has_epoch_headroom(&self) -> bool {
+        self.current_epoch_receipts() < MAX_RECEIPTS_PER_EPOCH
+    }
+
     /// Record a committed operation's receipt. The caller has already
-    /// resolved the lookup as `Unknown`, verified epoch freshness, and
-    /// *committed the operation itself*; a full table is the signal to
-    /// rotate the epoch and retry. Duplicate `(epoch, nonce)` is a caller
-    /// bug and is refused.
+    /// resolved the lookup as `Unknown`, verified epoch freshness and
+    /// [`has_epoch_headroom`][Self::has_epoch_headroom], and *committed the
+    /// operation itself*. A full epoch here means the caller skipped the
+    /// headroom check. Duplicate `(epoch, nonce)` is a caller bug and is
+    /// refused.
     pub fn insert(&mut self, receipt: OperationReceipt) -> Result<(), ReceiptInsertError> {
         if !receipt.is_valid() || !self.epoch_is_current(receipt.epoch) {
             return Err(ReceiptInsertError::Invalid);
@@ -296,7 +324,7 @@ impl IdempotencyState {
             Ok(_) => return Err(ReceiptInsertError::Duplicate),
             Err(at) => at,
         };
-        if self.is_full() {
+        if self.is_full() || self.current_epoch_receipts() >= MAX_RECEIPTS_PER_EPOCH {
             return Err(ReceiptInsertError::Full);
         }
         self.receipts.copy_within(at..self.count, at + 1);
@@ -529,13 +557,28 @@ mod tests {
             state.insert(receipt(1, 6)),
             Err(ReceiptInsertError::Invalid)
         );
-        for n in 0..MAX_RECEIPTS - 1 {
+        // Fill the current epoch to its cap; the next insert is refused
+        // even though total capacity remains.
+        for n in 0..MAX_RECEIPTS_PER_EPOCH {
             state.insert(receipt(2, n as u8)).unwrap();
+        }
+        assert!(!state.has_epoch_headroom());
+        assert!(!state.is_full());
+        assert_eq!(
+            state.insert(receipt(2, MAX_RECEIPTS_PER_EPOCH as u8)),
+            Err(ReceiptInsertError::Full)
+        );
+        // Rotation restores headroom: the full current epoch becomes the
+        // retained previous epoch, and both together fit in MAX_RECEIPTS.
+        state.rotate_epoch(3).unwrap();
+        assert!(state.has_epoch_headroom());
+        for n in 0..MAX_RECEIPTS_PER_EPOCH {
+            state.insert(receipt(3, n as u8)).unwrap();
         }
         assert!(state.is_full());
         assert_eq!(
-            state.insert(receipt(2, MAX_RECEIPTS as u8)),
-            Err(ReceiptInsertError::Full)
+            state.lookup(&receipt(2, 0)),
+            ReceiptLookup::Replay(receipt(2, 0))
         );
     }
 
