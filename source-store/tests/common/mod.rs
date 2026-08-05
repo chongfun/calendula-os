@@ -241,6 +241,7 @@ pub fn sample_metadata(source_generation: u64) -> SourceMetadata {
         source_origin: SourceOrigin::ManagedUpload,
         operation_kind: OperationKind::ManagedUploadRequest,
         operation_request_id: [2; REQUEST_ID_BYTES],
+        request_binding_sha256: [3; SHA256_BYTES],
         externally_recovered: false,
         physical_slot: 0,
         source_length: 1000 + source_generation,

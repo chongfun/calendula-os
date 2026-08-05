@@ -412,3 +412,97 @@ fn power_cut_during_delete_hides_book_exactly_when_tombstone_committed() {
         }
     }
 }
+
+/// `publish_record` can fail *after* its commit sync — the record lands, the
+/// call still reports failure. The idempotency store must not go on
+/// believing the older generation is authority: proposing that same
+/// generation again is refused as not-above-authority, and the store would
+/// never persist another receipt for the rest of the session.
+#[test]
+fn an_uncertain_idempotency_commit_does_not_wedge_the_store() {
+    let disk = new_card();
+    let base = disk.snapshot();
+    let mut commit_then_fail_seen = 0u32;
+
+    // Sweep read faults for ones that land after the commit sync, in step
+    // 8's verification read: exactly the "committed, but reported failure"
+    // outcome. Faults that land earlier are the ordinary pre-commit failures
+    // the other tests cover, and are skipped here.
+    for fault in 0..400u32 {
+        disk.restore_cut(&base, &[], 0, 0);
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        let mut ws = workspace();
+        let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+        let before = idem.record_generation;
+        idem.state.insert(receipt(1, 50)).expect("insert");
+
+        disk.fault.fail_read_in.set(Some(fault));
+        let outcome = idem.publish(&root, &mut ws);
+        let fired = disk.fault.fail_read_in.get().is_none();
+        disk.fault.fail_read_in.set(None);
+        if !fired {
+            break;
+        }
+        if outcome.is_ok() {
+            continue;
+        }
+        let committed = committed_generation(&root, &mut ws);
+        if committed <= before {
+            continue;
+        }
+        commit_then_fail_seen += 1;
+
+        // The store has to have learned what is actually on the card.
+        assert_eq!(
+            idem.record_generation, committed,
+            "fault {fault}: the store did not adopt the committed generation"
+        );
+        // And it has to be able to keep going: a second receipt must reach
+        // the card rather than being refused forever.
+        idem.state.insert(receipt(1, 51)).expect("second insert");
+        idem.publish(&root, &mut ws)
+            .unwrap_or_else(|error| panic!("fault {fault}: store wedged: {error:?}"));
+        let reloaded = IdempotencyStore::load(&root, &mut ws).expect("reload");
+        assert!(
+            reloaded.state.contains_request(1, &[51; 16]),
+            "fault {fault}: the recovered publication did not persist"
+        );
+    }
+
+    assert!(
+        commit_then_fail_seen > 0,
+        "no read fault produced a commit-then-fail outcome; the test proves nothing"
+    );
+}
+
+fn committed_generation(root: &Dir<'_>, ws: &mut OpsWorkspace) -> u64 {
+    source_store::publish::select_authority(
+        root,
+        layout::idempotency_pair().pair(),
+        &mut ws.record_scratch,
+    )
+    .expect("read idempotency authority")
+    .map(|(_, generation)| generation)
+    .unwrap_or(0)
+}
+
+/// A minimal valid success receipt for epoch `epoch` under `nonce_seed`.
+fn receipt(epoch: u64, nonce_seed: u8) -> source_store::receipts::OperationReceipt {
+    use source_store::bodies::{DISPLAY_LABEL_MAX_BYTES, SHA256_BYTES};
+    use source_store::receipts::{ReceiptOperation, RECEIPT_STATUS_SUCCESS};
+    source_store::receipts::OperationReceipt {
+        epoch,
+        request_nonce: [nonce_seed; 16],
+        operation: ReceiptOperation::Delete,
+        logical_book_id: [1; LOGICAL_BOOK_ID_BYTES],
+        base_book_token_or_zero: [2; BOOK_TOKEN_BYTES],
+        source_generation: 0,
+        source_length_or_zero: 0,
+        source_sha256_or_zero: [0; SHA256_BYTES],
+        display_label_len: 0,
+        display_label: [0; DISPLAY_LABEL_MAX_BYTES],
+        result_book_token_or_zero: [0; BOOK_TOKEN_BYTES],
+        result_status: RECEIPT_STATUS_SUCCESS,
+    }
+}

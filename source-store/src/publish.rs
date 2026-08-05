@@ -306,6 +306,37 @@ enum ReadFile {
     Oversized,
 }
 
+/// Confirm that `name` really is absent, rather than unreadable.
+///
+/// `embedded-sdmmc`'s `open_file_in_dir` collapses *every* directory-lookup
+/// failure into `NotFound` when the mode does not create — a transient read
+/// error included. Absence and "the card could not answer" must never be the
+/// same answer here, because absence is load-bearing: an absent slot means
+/// the pair has no committed authority, which makes it a publication target
+/// and waives the generation-monotonicity guard, and an absent metadata pair
+/// takes a book out of the catalog and frees its slot to be truncated. One
+/// dropped read would be enough to overwrite live authority.
+///
+/// `find_directory_entry` runs the same lookup and keeps the distinction, so
+/// a `NotFound` from the open is re-asked here. Only on the absent path, so
+/// the common case costs nothing.
+pub(crate) fn confirm_absent<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    name: &str,
+) -> Result<(), PublishError>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    match dir.find_directory_entry(name) {
+        Err(embedded_sdmmc::Error::NotFound) => Ok(()),
+        // The lookup found what the open could not: not a state this
+        // single-writer layer can explain, and not one to guess about.
+        Ok(_) => Err(PublishError::Io),
+        Err(_) => Err(PublishError::Io),
+    }
+}
+
 /// Read a whole file into `scratch`. `Ok(None)` when the file does not
 /// exist; oversized files are reported without being read.
 fn read_whole_file<D, T, const MD: usize, const MF: usize, const MV: usize>(
@@ -319,7 +350,10 @@ where
 {
     let file = match dir.open_file_in_dir(name, Mode::ReadOnly) {
         Ok(file) => file,
-        Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+        Err(embedded_sdmmc::Error::NotFound) => {
+            confirm_absent(dir, name)?;
+            return Ok(None);
+        }
         Err(_) => return Err(PublishError::Io),
     };
     let len = file.length() as usize;

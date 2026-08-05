@@ -17,16 +17,27 @@
 //! - **Superseded and deleted generations**: their slot's EPUB and
 //!   metadata pair. The authoritative generation lives elsewhere
 //!   (superseded) or nowhere by design (deleted); either way selection
-//!   already hides these, so deletion changes nothing a reader can see.
+//!   already hides these, so deletion changes nothing a reader can see —
+//!   *unless* the record is still someone's replay evidence, below.
+//! - **Never: the last durable evidence that a request committed.** Every
+//!   operation retains a receipt, but retention is allowed to fail (the
+//!   operation is committed by then, and reporting failure would be a
+//!   lie). Replay then rests on the committed record carrying the
+//!   request's identity — source metadata for uploads and recoveries, the
+//!   tombstone for deletes. Reclaiming that record while its epoch still
+//!   accepts new requests would leave a retry resolving to nothing, and a
+//!   request that resolves to nothing gets *executed again*: a duplicate
+//!   book, or a delete that answers `RejectedUnknownToken`. So a hidden
+//!   record whose receipt is absent and whose epoch is still accepted is
+//!   kept; its bytes are reclaimed, its record waits for the epoch to
+//!   retire. This is the PRD's rule that receipt cleanup can never cause
+//!   delayed re-execution, applied to every operation rather than only to
+//!   deletes.
 //! - **Orphan candidates**: an `.EPB` in a slot with no committed
 //!   metadata and no marker naming it. Managed-namespace provenance says
 //!   this can only be wreckage; it is never adoptable, only removable.
 //! - **Spent tombstones**: only when no metadata for the book survives
-//!   *and* delete-replay safety no longer needs the tombstone — its
-//!   receipt is retained, or its epoch is no longer accepted (a delayed
-//!   retry would be rejected as stale before reaching execution, which is
-//!   a safe answer). This is the PRD's rule that receipt cleanup can
-//!   never cause delayed re-execution.
+//!   *and* the retention rule above releases the delete's own request ID.
 //! - **Ambiguous slots are never touched**: equal-generation duplicates
 //!   are corruption for *recovery* to resolve; cleanup deleting either
 //!   side would be the arbitrary selection the selector refuses to make.
@@ -36,11 +47,11 @@
 
 use embedded_sdmmc::{BlockDevice, Directory, Mode, TimeSource};
 
-use crate::bodies::StagingMarker;
+use crate::bodies::{StagingMarker, REQUEST_ID_BYTES};
 use crate::layout;
 use crate::ops::{load_catalog, IdempotencyStore, OpsWorkspace};
 use crate::publish::{self, PublishError};
-use crate::receipts::{OperationReceipt, ReceiptLookup, ReceiptOperation, RECEIPT_STATUS_SUCCESS};
+use crate::receipts::{IdempotencyState, REQUEST_NONCE_BYTES};
 use crate::record::RecordState;
 use crate::select::{SlotDisposition, MAX_SOURCE_SLOTS};
 
@@ -51,13 +62,25 @@ pub struct CleanupReport {
     pub reclaimed_orphans: usize,
     pub reclaimed_tombstones: usize,
     pub reclaimed_markers: usize,
+    /// Hidden records left in place because they are the only durable
+    /// evidence that their request committed. They cost a slot until their
+    /// epoch retires; a non-zero count here with no progress across passes
+    /// means the owner should rotate the epoch.
+    pub retained_for_replay: usize,
 }
 
 /// One bounded cleanup pass over the whole managed namespace. Loads the
 /// catalog fresh at entry and leaves it reloaded at exit.
+///
+/// The idempotency state is read from the card rather than taken from the
+/// caller, and deliberately so: retention decisions are claims about what
+/// survives a reboot, and a resident [`IdempotencyStore`] can be ahead of
+/// the card — [`IdempotencyState::insert`] runs before the publication that
+/// makes it durable, and that publication is allowed to fail. Judging
+/// "the receipt is retained" from memory would let one failed receipt
+/// publication delete both the receipt-less record and its tombstone.
 pub fn run_cleanup<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
-    idem: &IdempotencyStore,
     ws: &mut OpsWorkspace,
 ) -> Result<CleanupReport, PublishError>
 where
@@ -65,6 +88,9 @@ where
     T: TimeSource,
 {
     let mut report = CleanupReport::default();
+    // Fails closed on an unreadable idempotency record: without committed
+    // idempotency state nothing here can prove a reclamation is safe.
+    let idem = IdempotencyStore::load(dir, ws)?;
     load_catalog(dir, ws)?;
 
     // Staging marker.
@@ -105,7 +131,9 @@ where
     // Superseded and deleted generations. Ambiguous slots are skipped by
     // rule; authoritative ones by definition.
     for slot in 0..MAX_SOURCE_SLOTS {
-        let Some(_) = ws.entries[slot] else { continue };
+        let Some(entry) = ws.entries[slot] else {
+            continue;
+        };
         let reclaim = matches!(
             ws.dispositions[slot],
             SlotDisposition::HiddenSuperseded | SlotDisposition::HiddenDeleted
@@ -114,13 +142,19 @@ where
             continue;
         }
         let slot = slot as u8;
+        // The bytes go either way — a hidden generation's EPUB is dead
+        // weight, and it is the megabytes that matter on a small card.
+        if let Some(name) = layout::source_slot_name(slot) {
+            let _ = dir.delete_file_in_dir(name.as_str());
+        }
+        if replay_evidence_needed(&idem.state, &entry.metadata.operation_request_id) {
+            report.retained_for_replay += 1;
+            continue;
+        }
         if let Some(pair) = layout::metadata_pair(slot) {
             for name in pair.pair().names {
                 let _ = dir.delete_file_in_dir(name);
             }
-        }
-        if let Some(name) = layout::source_slot_name(slot) {
-            let _ = dir.delete_file_in_dir(name.as_str());
         }
         report.reclaimed_slots += 1;
     }
@@ -167,27 +201,8 @@ where
         if book_state_remains {
             continue;
         }
-        // Replay safety: the receipt answers the retry, or the epoch is
-        // retired and the retry is safely rejected as stale.
-        let epoch = u64::from_le_bytes(stone.delete_request_id[..8].try_into().unwrap_or([0u8; 8]));
-        let nonce: [u8; 16] = stone.delete_request_id[8..].try_into().unwrap_or([0u8; 16]);
-        let probe = OperationReceipt {
-            epoch,
-            request_nonce: nonce,
-            operation: ReceiptOperation::Delete,
-            logical_book_id: stone.logical_book_id,
-            base_book_token_or_zero: stone.deleted_book_token,
-            source_generation: 0,
-            source_length_or_zero: 0,
-            source_sha256_or_zero: [0; 32],
-            display_label_len: 0,
-            display_label: [0; 64],
-            result_book_token_or_zero: [0; 16],
-            result_status: RECEIPT_STATUS_SUCCESS,
-        };
-        let receipt_retained = matches!(idem.state.lookup(&probe), ReceiptLookup::Replay(_));
-        let epoch_retired = !idem.state.epoch_is_accepted(epoch);
-        if !(receipt_retained || epoch_retired) {
+        if replay_evidence_needed(&idem.state, &stone.delete_request_id) {
+            report.retained_for_replay += 1;
             continue;
         }
         if let Some(pair) = layout::tombstone_pair(tombstone_slot) {
@@ -200,4 +215,21 @@ where
 
     load_catalog(dir, ws)?;
     Ok(report)
+}
+
+/// Whether this committed record is still the only thing standing between a
+/// delayed retry and a second execution.
+///
+/// True when the request's epoch would still accept new requests *and* no
+/// committed receipt resolves the ID. Either half being false makes the
+/// record reclaimable: a receipt answers the retry directly, and a retired
+/// epoch means the retry is refused as stale before it can reach execution.
+///
+/// A local (epoch-zero) request is never accepted as new by an operation,
+/// so it is never retained — unmanaged adoption's idempotency is intrinsic,
+/// not receipted.
+fn replay_evidence_needed(state: &IdempotencyState, request_id: &[u8; REQUEST_ID_BYTES]) -> bool {
+    let epoch = u64::from_le_bytes(request_id[..8].try_into().unwrap_or([0u8; 8]));
+    let nonce: [u8; REQUEST_NONCE_BYTES] = request_id[8..].try_into().unwrap_or([0u8; 16]);
+    state.epoch_is_accepted(epoch) && !state.contains_request(epoch, &nonce)
 }

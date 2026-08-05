@@ -11,6 +11,7 @@ use source_store::ops::{
     delete_book, find_authoritative_by_token, load_catalog, DeleteOutcome, DeleteRequest,
     IdempotencyStore, OpsWorkspace,
 };
+use source_store::publish::PublishError;
 use source_store::unmanaged::{adopt_or_reidentify, AdoptOutcome};
 use source_store::upload::FreshIdentity;
 
@@ -247,4 +248,55 @@ fn unmanaged_and_managed_coexist_in_the_catalog() {
     assert!(root
         .open_file_in_dir(unmanaged_slot.as_str(), Mode::ReadOnly)
         .is_err());
+}
+
+/// Adoption vouches for an exact digest of a file the *user* owns, so its
+/// last look before committing must rehash rather than re-measure. The
+/// container gate runs inside that window and stands in for the edit.
+#[test]
+fn adoption_refuses_a_same_length_change_inside_the_commit_window() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    root.make_dir_in_dir(BOOKS_DIR).expect("mkdir books");
+    let books = root.open_dir(BOOKS_DIR).expect("open books");
+    let v1 = epub_bytes(5_000, 1);
+    let swapped = epub_bytes(5_000, 9); // same length, different bytes
+
+    write_book(&books, "MOBY.EPU", &v1);
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+
+    let outcome = adopt_or_reidentify(
+        &root,
+        &books,
+        "MOBY.EPU",
+        fresh(5, 10),
+        [1; 16],
+        &mut ws,
+        || {
+            write_book(&books, "MOBY.EPU", &swapped);
+            true
+        },
+    );
+    assert_eq!(
+        outcome,
+        AdoptOutcome::Failed(PublishError::RevalidationRefused),
+        "a same-length change inside the commit window was adopted"
+    );
+    assert!(find_authoritative_by_token(&ws, &[10; BOOK_TOKEN_BYTES]).is_none());
+
+    // The settled bytes adopt on the next look, with their own identity.
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let outcome = adopt(&root, &books, &mut ws, "MOBY.EPU", fresh(5, 11), 2);
+    let AdoptOutcome::Adopted(result) = outcome else {
+        panic!("retry after a refused window failed: {outcome:?}");
+    };
+    assert_eq!(result.book_token, [11; BOOK_TOKEN_BYTES]);
+    let entry = find_authoritative_by_token(&ws, &[11; BOOK_TOKEN_BYTES]).expect("adopted");
+    assert_eq!(
+        entry.metadata.source_sha256,
+        source_store::validate::sha256_of(&swapped)
+    );
 }

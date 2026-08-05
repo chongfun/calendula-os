@@ -22,9 +22,9 @@
 use embedded_sdmmc::{BlockDevice, Directory, TimeSource};
 
 use crate::bodies::{
-    DisplayLabel, OperationKind, SourceMetadata, SourceOrigin, UnmanagedName, BOOK_TOKEN_BYTES,
-    LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES, SOURCE_METADATA_MAGIC,
-    SOURCE_METADATA_SCHEMA,
+    DisplayLabel, OperationKind, RequestBinding, SourceMetadata, SourceOrigin, UnmanagedName,
+    BINDING_TAG_RECOVER, BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES,
+    SOURCE_METADATA_MAGIC, SOURCE_METADATA_SCHEMA,
 };
 use crate::layout;
 use crate::ops::{
@@ -35,7 +35,6 @@ use crate::receipts::{
     OperationReceipt, ReceiptLookup, ReceiptOperation, RECEIPT_STATUS_SUCCESS, REQUEST_NONCE_BYTES,
 };
 use crate::record::{self, RecordState};
-use crate::select::MAX_SOURCE_SLOTS;
 use crate::upload::UploadResult;
 use crate::validate::QUICK_FINGERPRINT_POLICY_V1;
 
@@ -76,6 +75,9 @@ pub enum RecoveryOutcome {
     RejectedIdentityCollision,
     /// The container gate refused the observed bytes.
     RejectedUnsupportedContainer,
+    /// The workspace's catalog view is not a complete load of committed
+    /// state; see [`OpsWorkspace::catalog_is_valid`].
+    CatalogUnavailable,
     Failed(PublishError),
 }
 
@@ -85,6 +87,22 @@ impl RecoveryRequest {
         id[..8].copy_from_slice(&self.epoch.to_le_bytes());
         id[8..].copy_from_slice(&self.nonce);
         id
+    }
+
+    /// Every client-bound parameter of this recovery, digested — the base
+    /// token it is authorized from and the label it may replace included,
+    /// neither of which the observed identity alone pins down.
+    pub fn binding_digest(&self) -> [u8; SHA256_BYTES] {
+        RequestBinding {
+            tag: BINDING_TAG_RECOVER,
+            operation: ReceiptOperation::RecoverExternallyModified as u8,
+            request_id: &self.request_id(),
+            base_book_token_or_zero: &self.book_token,
+            declared_length: self.observed_length,
+            declared_sha256: &self.observed_sha256,
+            label: self.display_label.as_ref(),
+        }
+        .digest()
     }
 
     fn receipt(
@@ -131,6 +149,10 @@ where
     T: TimeSource,
     F: FnOnce() -> bool,
 {
+    if !ws.catalog_is_valid() {
+        return RecoveryOutcome::CatalogUnavailable;
+    }
+
     // 1. Request-ID resolution before ordinary token validation: receipts,
     //    then committed metadata carrying this recovery's identity.
     let probe = req.receipt([1; LOGICAL_BOOK_ID_BYTES], 1, [0; BOOK_TOKEN_BYTES]);
@@ -149,9 +171,7 @@ where
     let request_id = req.request_id();
     for entry in ws.entries.iter().flatten() {
         if entry.metadata.operation_request_id == request_id {
-            let consistent = entry.metadata.source_length == req.observed_length
-                && entry.metadata.source_sha256 == req.observed_sha256;
-            if !consistent {
+            if entry.metadata.request_binding_sha256 != req.binding_digest() {
                 return RecoveryOutcome::RejectedParameterMismatch;
             }
             return RecoveryOutcome::Recovered(UploadResult {
@@ -234,6 +254,7 @@ where
         source_origin: SourceOrigin::ManagedUpload,
         operation_kind: OperationKind::ExternalRecoveryRequest,
         operation_request_id: request_id,
+        request_binding_sha256: req.binding_digest(),
         externally_recovered: true,
         physical_slot: entry.physical_slot,
         source_length: req.observed_length,
@@ -272,6 +293,7 @@ where
     };
     let base_token = req.book_token;
     let observed_length = req.observed_length;
+    let observed_sha256 = req.observed_sha256;
     let revalidate = || {
         let mut scratch = [0u8; META_REVALIDATE_SCRATCH];
         let base_current = match publish::read_committed(dir, meta_names.pair(), &mut scratch) {
@@ -283,16 +305,19 @@ where
         if !base_current {
             return false;
         }
-        // Full rehash already decided identity; owner serialization keeps
-        // it decided. The length recheck is the cheap tripwire for the
-        // "changed again mid-operation" case the PRD names.
-        match dir.open_file_in_dir(slot_name.as_str(), embedded_sdmmc::Mode::ReadOnly) {
-            Ok(file) => {
-                let same = u64::from(file.length()) == observed_length;
-                let _ = file.close();
-                same
-            }
-            Err(_) => false,
+        // Rehash in full, here, immediately before the commit sector lands.
+        // A length check would be the cheap version and is not enough: this
+        // record is about to *vouch* for an exact digest, and a same-length
+        // modification since the earlier hash would leave it vouching for
+        // bytes that are no longer on the card — the "changed again" case
+        // this endpoint exists to refuse. Exact identity is the standard
+        // the PRD sets for mutation authority, so exact identity is what
+        // the last look checks. The cost is a second full pass over the
+        // source on an operation the user invokes by hand.
+        let mut hash_scratch = [0u8; IDENTITY_RECHECK_SCRATCH];
+        match crate::ops::sha256_file_identity(dir, slot_name.as_str(), &mut hash_scratch) {
+            Ok(Some((length, sha256))) => length == observed_length && sha256 == observed_sha256,
+            _ => false,
         }
     };
     match publish::publish_record(
@@ -315,9 +340,7 @@ where
         fresh_token,
     );
     let receipt_durable = idem.state.insert(receipt).is_ok() && idem.publish(dir, ws).is_ok();
-    if load_catalog(dir, ws).is_err() {
-        ws.entries = [None; MAX_SOURCE_SLOTS];
-    }
+    let _ = load_catalog(dir, ws);
 
     RecoveryOutcome::Recovered(UploadResult {
         logical_book_id: metadata.logical_book_id,
@@ -334,3 +357,8 @@ const META_REVALIDATE_SCRATCH: usize =
         None => 0,
     };
 const _: () = assert!(META_REVALIDATE_SCRATCH > 0);
+
+/// Read chunk for the final rehash. One sector: the revalidation closure is
+/// a stack frame inside the publish call, and the whole point is to bound
+/// what it adds there.
+const IDENTITY_RECHECK_SCRATCH: usize = 512;

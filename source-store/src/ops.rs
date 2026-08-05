@@ -72,6 +72,9 @@ pub struct OpsWorkspace {
     pub entries: [Option<SlotEntry>; MAX_SOURCE_SLOTS],
     pub dispositions: [SlotDisposition; MAX_SOURCE_SLOTS],
     pub tombstones: [Option<(u8, Tombstone)>; layout::MAX_TOMBSTONE_SLOTS],
+    /// Whether `entries`/`dispositions`/`tombstones` came from a *complete*
+    /// [`load_catalog`]. See [`catalog_is_valid`][Self::catalog_is_valid].
+    catalog_valid: bool,
 }
 
 impl OpsWorkspace {
@@ -82,7 +85,21 @@ impl OpsWorkspace {
             entries: [None; MAX_SOURCE_SLOTS],
             dispositions: [SlotDisposition::HiddenDeleted; MAX_SOURCE_SLOTS],
             tombstones: [None; layout::MAX_TOMBSTONE_SLOTS],
+            catalog_valid: false,
         }
+    }
+
+    /// Whether the catalog view may be acted on.
+    ///
+    /// A partial or failed load is *not* an empty catalog, and the
+    /// difference is destructive: an empty catalog says every slot is free,
+    /// and the create path opens a free slot's EPUB with
+    /// `ReadWriteCreateOrTruncate`. A workspace whose reload failed would
+    /// therefore truncate a committed book whose records merely could not
+    /// be read. Operations refuse to run until a complete load succeeds; a
+    /// fresh workspace starts invalid for the same reason.
+    pub fn catalog_is_valid(&self) -> bool {
+        self.catalog_valid
     }
 }
 
@@ -156,7 +173,7 @@ impl IdempotencyStore {
         )
         .ok_or(PublishError::BadInput)?;
         let names = layout::idempotency_pair();
-        publish::publish_record(
+        match publish::publish_record(
             dir,
             names.pair(),
             &ws.seal_scratch,
@@ -164,9 +181,44 @@ impl IdempotencyStore {
             0,
             &mut ws.record_scratch,
             || true,
-        )?;
-        self.record_generation = generation;
-        Ok(())
+        ) {
+            Ok(_) => {
+                self.record_generation = generation;
+                Ok(())
+            }
+            Err(error) => {
+                // A failure after the commit sync still leaves the record
+                // committed (`publish_record` says so explicitly), so
+                // "publish failed" does not mean "generation N is still
+                // authority". Keeping the resident counter at N would make
+                // every future publication propose N+1 again, which
+                // `publish_record` refuses as not above authority — one
+                // uncertain commit would wedge receipt retention forever.
+                // Ask the card instead.
+                self.resync_generation(dir, ws);
+                Err(error)
+            }
+        }
+    }
+
+    /// Re-read the pair's committed generation and adopt it. Best effort by
+    /// design: if the card cannot answer, the resident counter stays where
+    /// it was and the next publication tries again — no worse than before,
+    /// and never silently ahead of what is committed.
+    fn resync_generation<D, T, const MD: usize, const MF: usize, const MV: usize>(
+        &mut self,
+        dir: &Directory<'_, D, T, MD, MF, MV>,
+        ws: &mut OpsWorkspace,
+    ) where
+        D: BlockDevice,
+        T: TimeSource,
+    {
+        let names = layout::idempotency_pair();
+        if let Ok(Some((_, generation))) =
+            publish::select_authority(dir, names.pair(), &mut ws.record_scratch)
+        {
+            self.record_generation = generation;
+        }
     }
 }
 
@@ -174,6 +226,11 @@ impl IdempotencyStore {
 /// startup selection. Fills `ws.entries`, `ws.tombstones`, and
 /// `ws.dispositions` (parallel to `entries`); this is the reboot view of
 /// the catalog and the base state of every operation.
+///
+/// The workspace's catalog is marked invalid for the duration and valid
+/// again only on a complete success, so a caller that ignores the `Err` —
+/// or one that keeps using the workspace after it — still cannot act on a
+/// half-loaded view. See [`OpsWorkspace::catalog_is_valid`].
 pub fn load_catalog<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     ws: &mut OpsWorkspace,
@@ -182,6 +239,7 @@ where
     D: BlockDevice,
     T: TimeSource,
 {
+    ws.catalog_valid = false;
     ws.entries = [None; MAX_SOURCE_SLOTS];
     ws.tombstones = [None; layout::MAX_TOMBSTONE_SLOTS];
     for slot in 0..MAX_SOURCE_SLOTS as u8 {
@@ -214,6 +272,7 @@ where
         }
     }
     run_selection(ws).ok_or(PublishError::BadInput)?;
+    ws.catalog_valid = true;
     Ok(())
 }
 
@@ -275,7 +334,13 @@ where
 {
     let file = match dir.open_file_in_dir(name, Mode::ReadOnly) {
         Ok(file) => file,
-        Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+        // See `publish::confirm_absent`: a read-only open reports a card
+        // that could not answer as a file that is not there, and "the
+        // source is gone" is a conclusion this layer acts on.
+        Err(embedded_sdmmc::Error::NotFound) => {
+            publish::confirm_absent(dir, name)?;
+            return Ok(None);
+        }
         Err(_) => return Err(PublishError::Io),
     };
     let length = u64::from(file.length());
@@ -317,6 +382,55 @@ where
             quick_fingerprint,
         })),
         _ => Err(PublishError::Io),
+    }
+}
+
+/// A file's persisted `(length, SHA-256)` using caller-supplied scratch
+/// instead of the workspace.
+///
+/// The final-revalidation closures need this: they run *inside*
+/// [`publish::publish_record`], which already holds the workspace, and they
+/// are the only place that can bind exact identity to the commit itself.
+/// `scratch` may be small — it is a read chunk, not a whole-file buffer —
+/// at the cost of more read calls; the callers use a stack buffer.
+pub fn sha256_file_identity<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    name: &str,
+    scratch: &mut [u8],
+) -> Result<Option<(u64, [u8; SHA256_BYTES])>, PublishError>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    if scratch.is_empty() {
+        return Err(PublishError::BadInput);
+    }
+    let file = match dir.open_file_in_dir(name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => {
+            publish::confirm_absent(dir, name)?;
+            return Ok(None);
+        }
+        Err(_) => return Err(PublishError::Io),
+    };
+    let length = u64::from(file.length());
+    let mut sha = Sha256Job::new(length);
+    let mut failed = false;
+    while sha.remaining() > 0 {
+        let want = (sha.remaining() as usize).min(scratch.len());
+        if read_exact(&file, &mut scratch[..want]).is_err() || sha.update(&scratch[..want]).is_err()
+        {
+            failed = true;
+            break;
+        }
+    }
+    let closed = file.close();
+    if failed || closed.is_err() {
+        return Err(PublishError::Io);
+    }
+    match sha.finish() {
+        Ok(sha256) => Ok(Some((length, sha256))),
+        Err(_) => Err(PublishError::Io),
     }
 }
 
@@ -421,6 +535,10 @@ pub enum DeleteOutcome {
     RejectedEpochExhausted,
     /// Every tombstone slot is occupied; retryable after cleanup.
     RejectedNoTombstoneSlot,
+    /// The workspace's catalog view is not a complete load of committed
+    /// state, so no operation may act on it. Retryable once a reload
+    /// succeeds; see [`OpsWorkspace::catalog_is_valid`].
+    CatalogUnavailable,
     Failed(PublishError),
 }
 
@@ -444,6 +562,10 @@ where
     D: BlockDevice,
     T: TimeSource,
 {
+    if !ws.catalog_is_valid() {
+        return DeleteOutcome::CatalogUnavailable;
+    }
+
     // 1. Receipts first: a known request ID answers from its receipt no
     //    matter how stale its token has become.
     let probe = req.receipt([0; LOGICAL_BOOK_ID_BYTES]);
@@ -560,11 +682,11 @@ where
         .is_ok()
         && idem.publish(dir, ws).is_ok();
 
-    // 8. Reload the catalog view so the caller sees the book hidden.
-    if load_catalog(dir, ws).is_err() {
-        // The deletion stands; a failed reload only stales the view.
-        ws.entries = [None; MAX_SOURCE_SLOTS];
-    }
+    // 8. Reload the catalog view so the caller sees the book hidden. The
+    //    deletion stands either way; a failed reload leaves the workspace
+    //    marked invalid, which blocks the *next* operation rather than
+    //    corrupting it.
+    let _ = load_catalog(dir, ws);
 
     DeleteOutcome::Deleted {
         logical_book_id: stone.logical_book_id,
@@ -591,6 +713,7 @@ fn dummy_entry() -> SlotEntry {
             source_origin: crate::bodies::SourceOrigin::UnmanagedSd,
             operation_kind: crate::bodies::OperationKind::LocalUnmanagedOperation,
             operation_request_id: [0; REQUEST_ID_BYTES],
+            request_binding_sha256: [0; SHA256_BYTES],
             externally_recovered: false,
             physical_slot: 0,
             source_length: 0,

@@ -16,6 +16,7 @@ use source_store::ops::{
     delete_book, find_authoritative_by_token, load_catalog, DeleteOutcome, DeleteRequest,
     IdempotencyStore, OpsWorkspace,
 };
+use source_store::recover::{recover_book, RecoveryOutcome, RecoveryRequest};
 use source_store::select::SlotDisposition;
 use source_store::upload::{
     abort_upload, begin_upload, finish_upload, upload_chunk, FreshIdentity, UploadBeginOutcome,
@@ -81,6 +82,7 @@ fn begin_name(outcome: &UploadBeginOutcome) -> &'static str {
         UploadBeginOutcome::RejectedEpochExhausted => "RejectedEpochExhausted",
         UploadBeginOutcome::RejectedIdentityCollision => "RejectedIdentityCollision",
         UploadBeginOutcome::RejectedNoFreeSlot => "RejectedNoFreeSlot",
+        UploadBeginOutcome::CatalogUnavailable => "CatalogUnavailable",
         UploadBeginOutcome::Failed(_) => "Failed",
     }
 }
@@ -209,6 +211,161 @@ fn create_replays_from_receipt_and_from_metadata() {
         begin_upload(&root, &mut idem, &mismatched, fresh(8, 13), &mut ws),
         UploadBeginOutcome::RejectedParameterMismatch
     ));
+}
+
+/// A catalog that failed to load is not an empty catalog. The difference is
+/// destructive: an empty catalog reports every slot free, and creating into
+/// a "free" slot truncates whatever EPUB is there.
+#[test]
+fn a_failed_catalog_load_blocks_operations_instead_of_emptying_the_catalog() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let bytes = epub_bytes(5_000, 3);
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+    let created = run_upload(
+        &root,
+        &mut idem,
+        &mut ws,
+        &request(1, 9, &bytes, None),
+        fresh(5, 10),
+        &bytes,
+    )
+    .expect("upload");
+    let slot_name = layout::source_slot_name(
+        find_authoritative_by_token(&ws, &created.book_token)
+            .expect("visible")
+            .physical_slot,
+    )
+    .unwrap();
+
+    // A workspace nobody has loaded is not usable, even though its entries
+    // array is all-`None`.
+    let mut unloaded = workspace();
+    assert!(!unloaded.catalog_is_valid());
+    assert!(matches!(
+        begin_upload(
+            &root,
+            &mut idem,
+            &request(1, 30, &bytes, None),
+            fresh(6, 20),
+            &mut unloaded
+        ),
+        UploadBeginOutcome::CatalogUnavailable
+    ));
+
+    // Nor is one whose load failed part-way through.
+    let mut failed = None;
+    for fault in 0..16u32 {
+        let mut ws = workspace();
+        disk.fault.fail_read_in.set(Some(fault));
+        let outcome = load_catalog(&root, &mut ws);
+        disk.fault.fail_read_in.set(None);
+        if outcome.is_err() {
+            failed = Some(ws);
+            break;
+        }
+    }
+    let mut ws = failed.expect("a read fault somewhere in the catalog load");
+    assert!(!ws.catalog_is_valid());
+    assert!(matches!(
+        begin_upload(
+            &root,
+            &mut idem,
+            &request(1, 31, &bytes, None),
+            fresh(7, 21),
+            &mut ws
+        ),
+        UploadBeginOutcome::CatalogUnavailable
+    ));
+
+    // The committed book is untouched, and the catalog recovers on a
+    // successful reload.
+    let file = root
+        .open_file_in_dir(slot_name.as_str(), Mode::ReadOnly)
+        .expect("the book's bytes survive");
+    assert_eq!(u64::from(file.length()), bytes.len() as u64);
+    file.close().expect("close");
+    load_catalog(&root, &mut ws).expect("reload");
+    assert!(ws.catalog_is_valid());
+    assert!(find_authoritative_by_token(&ws, &created.book_token).is_some());
+}
+
+/// Once receipts are gone, the committed metadata is the only thing left to
+/// judge a retry by — so it must bind the *whole* original request, not the
+/// handful of parameters that happen to be metadata fields. Every case here
+/// agrees with the original on length, digest, and label, and differs only
+/// in something metadata does not otherwise record.
+#[test]
+fn metadata_replay_demands_the_whole_original_request() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let bytes = epub_bytes(5_000, 3);
+    let create = request(1, 9, &bytes, None);
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+    let first =
+        run_upload(&root, &mut idem, &mut ws, &create, fresh(5, 10), &bytes).expect("create");
+    // A second book with byte-for-byte identical content, to stand in as a
+    // wrong replace target below.
+    let decoy = request(1, 40, &bytes, None);
+    run_upload(&root, &mut idem, &mut ws, &decoy, fresh(6, 20), &bytes).expect("decoy");
+
+    // Lose the receipts.
+    let idem_names = layout::idempotency_pair();
+    for name in idem_names.pair().names {
+        let _ = root.delete_file_in_dir(name);
+    }
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("fresh idem");
+
+    // The original request still replays: the positive control.
+    let replay =
+        run_upload(&root, &mut idem, &mut ws, &create, fresh(7, 12), &bytes).expect("replay");
+    assert_eq!(replay.book_token, first.book_token);
+
+    // The same request ID reused as a *replace* — of the book it created,
+    // or of the identical-bytes decoy. Neither is the request that
+    // committed, and neither may be answered with its result.
+    for target in [10u8, 20u8] {
+        let as_replace = request(1, 9, &bytes, Some(target));
+        assert!(
+            matches!(
+                begin_upload(&root, &mut idem, &as_replace, fresh(8, 13), &mut ws),
+                UploadBeginOutcome::RejectedParameterMismatch
+            ),
+            "create replayed as a replace of {target}"
+        );
+    }
+
+    // And reused by a different operation family entirely: a recovery
+    // carrying the same epoch and nonce collides on request ID alone.
+    let collision = RecoveryRequest {
+        epoch: 1,
+        nonce: [9; 16],
+        book_token: [10; BOOK_TOKEN_BYTES],
+        observed_length: bytes.len() as u64,
+        observed_sha256: sha256_of(&bytes),
+        display_label: None,
+    };
+    assert_eq!(
+        recover_book(
+            &root,
+            &mut idem,
+            &collision,
+            [60; BOOK_TOKEN_BYTES],
+            &mut ws,
+            || true
+        ),
+        RecoveryOutcome::RejectedParameterMismatch
+    );
 }
 
 #[test]

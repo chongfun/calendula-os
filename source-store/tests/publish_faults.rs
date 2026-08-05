@@ -241,6 +241,60 @@ fn every_read_failure_preserves_authority() {
     }
 }
 
+/// A read that failed must never be reported as a record that is not there.
+///
+/// `embedded-sdmmc`'s read-only `open_file_in_dir` answers `NotFound` for a
+/// device error as readily as for a missing file, and "absent" is the most
+/// dangerous answer this layer can be given: an absent pair has no committed
+/// authority, so it becomes a publication target *and* loses the
+/// generation-monotonicity floor. One dropped read would be enough to
+/// overwrite a live record with a lower generation — or, one layer up, to
+/// take a book out of the catalog and free its slot to be truncated.
+#[test]
+fn a_read_fault_is_never_mistaken_for_an_absent_record() {
+    let disk = new_card();
+    {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        publish_generation(&root, PAIR, 7).expect("baseline");
+    }
+    let base = disk.snapshot();
+
+    let mut faults_seen = 0u32;
+    for fault_index in 0.. {
+        disk.restore_cut(&base, &[], 0, 0);
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        let mut scratch = [0u8; SCRATCH_BYTES];
+        // Armed after mounting, so the budget covers only the selection
+        // itself and every index maps to a read the selector issued.
+        disk.fault.fail_read_in.set(Some(fault_index));
+        let selected = select_authority(&root, PAIR, &mut scratch);
+        let fired = disk.fault.fail_read_in.get().is_none();
+        disk.fault.fail_read_in.set(None);
+        if !fired {
+            break;
+        }
+        faults_seen += 1;
+        match selected {
+            Ok(None) => {
+                panic!("read fault {fault_index}: committed generation 7 reported as absent")
+            }
+            Ok(Some(selection)) => assert_eq!(
+                selection,
+                (0, 7),
+                "read fault {fault_index}: selected something other than the committed record"
+            ),
+            // Refusing to answer is the correct alternative.
+            Err(_) => {}
+        }
+    }
+    assert!(
+        faults_seen > 0,
+        "no read fault fired; the test proves nothing"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Simulated power cuts: every write boundary, plus torn sectors
 // ---------------------------------------------------------------------------

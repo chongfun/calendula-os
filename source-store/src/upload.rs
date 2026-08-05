@@ -38,9 +38,9 @@ use embedded_sdmmc::{BlockDevice, Directory, Mode, TimeSource};
 use heapless::String;
 
 use crate::bodies::{
-    DisplayLabel, OperationKind, SourceMetadata, SourceOrigin, StagedOperation, StagingMarker,
-    UnmanagedName, BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES,
-    STAGING_MARKER_MAGIC, STAGING_MARKER_SCHEMA,
+    DisplayLabel, OperationKind, RequestBinding, SourceMetadata, SourceOrigin, StagedOperation,
+    StagingMarker, UnmanagedName, BINDING_TAG_UPLOAD, BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES,
+    REQUEST_ID_BYTES, SHA256_BYTES, STAGING_MARKER_MAGIC, STAGING_MARKER_SCHEMA,
 };
 use crate::layout;
 use crate::ops::{
@@ -110,6 +110,9 @@ pub enum UploadBeginOutcome {
     RejectedIdentityCollision,
     /// Every managed slot holds committed metadata.
     RejectedNoFreeSlot,
+    /// The workspace's catalog view is not a complete load of committed
+    /// state; see [`OpsWorkspace::catalog_is_valid`].
+    CatalogUnavailable,
     Failed(PublishError),
 }
 
@@ -130,6 +133,9 @@ pub enum UploadError {
     UnsupportedContainer,
     /// The final authority revalidation refused the metadata commit.
     RevalidationRefused,
+    /// The workspace's catalog view is not a complete load of committed
+    /// state; see [`OpsWorkspace::catalog_is_valid`].
+    CatalogUnavailable,
     Io(PublishError),
 }
 
@@ -183,6 +189,23 @@ impl UploadRequest {
         id
     }
 
+    /// The digest of every client-bound parameter, committed into metadata
+    /// so the receipt-less replay path can demand full agreement — including
+    /// create-versus-replace and the exact base token, neither of which any
+    /// other metadata field records.
+    pub fn binding_digest(&self) -> [u8; SHA256_BYTES] {
+        RequestBinding {
+            tag: BINDING_TAG_UPLOAD,
+            operation: self.operation() as u8,
+            request_id: &self.request_id(),
+            base_book_token_or_zero: &self.replace_token.unwrap_or([0; BOOK_TOKEN_BYTES]),
+            declared_length: self.declared_length,
+            declared_sha256: &self.declared_sha256,
+            label: Some(&self.display_label),
+        }
+        .digest()
+    }
+
     /// The receipt-shaped view: client-bound parameters filled, device
     /// results zero (for lookup) or filled by the committer.
     fn receipt(
@@ -222,6 +245,10 @@ where
     D: BlockDevice,
     T: TimeSource,
 {
+    if !ws.catalog_is_valid() {
+        return UploadBeginOutcome::CatalogUnavailable;
+    }
+
     // 1. Receipts first, then committed metadata carrying this request
     //    identity — the durable evidence that this exact request already
     //    committed, resolvable long after its base token went stale.
@@ -241,12 +268,11 @@ where
     let request_id = req.request_id();
     for entry in ws.entries.iter().flatten() {
         if entry.metadata.operation_request_id == request_id {
-            // Same request identity: consistent parameters replay the
-            // recorded result, inconsistent ones are misuse.
-            let consistent = entry.metadata.source_length == req.declared_length
-                && entry.metadata.source_sha256 == req.declared_sha256
-                && entry.metadata.display_label == req.display_label;
-            if !consistent {
+            // Same request identity: full parameter agreement replays the
+            // recorded result, anything else is misuse. The binding digest
+            // is the whole comparison — the metadata fields alone could not
+            // tell a create from a replace, nor which book a replace named.
+            if entry.metadata.request_binding_sha256 != req.binding_digest() {
                 return UploadBeginOutcome::RejectedParameterMismatch;
             }
             return UploadBeginOutcome::Replayed(UploadResult {
@@ -435,6 +461,10 @@ where
     T: TimeSource,
     F: FnOnce() -> bool,
 {
+    if !ws.catalog_is_valid() {
+        return Err(UploadError::CatalogUnavailable);
+    }
+
     // 1. Receive-time identity.
     if txn.hasher.remaining() != 0 {
         return Err(UploadError::LengthMismatch);
@@ -485,6 +515,7 @@ where
         source_origin: SourceOrigin::ManagedUpload,
         operation_kind: OperationKind::ManagedUploadRequest,
         operation_request_id: request.request_id(),
+        request_binding_sha256: request.binding_digest(),
         externally_recovered: false,
         physical_slot: txn.physical_slot,
         source_length: request.declared_length,
@@ -583,10 +614,10 @@ where
         let _ = dir.delete_file_in_dir(name);
     }
 
-    // 9. Refresh the caller's catalog view.
-    if load_catalog(dir, ws).is_err() {
-        ws.entries = [None; MAX_SOURCE_SLOTS];
-    }
+    // 9. Refresh the caller's catalog view. The generation is committed
+    //    either way; a failed reload leaves the workspace invalid, which
+    //    stops the next operation instead of misleading it.
+    let _ = load_catalog(dir, ws);
 
     Ok(UploadResult {
         logical_book_id: txn.logical_book_id,

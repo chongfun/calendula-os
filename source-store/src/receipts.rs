@@ -295,6 +295,19 @@ impl IdempotencyState {
         }
     }
 
+    /// Whether this request ID is recorded at all, regardless of whether
+    /// its parameters would agree.
+    ///
+    /// Retention rules ask this rather than [`lookup`][Self::lookup]: a
+    /// stored receipt answers a retry *either* way — replay or
+    /// `ParameterMismatch` — and both are definitive answers that make
+    /// re-execution impossible. What retention protects against is a
+    /// request ID resolving to *nothing*, which is what turns a retry into
+    /// a second execution.
+    pub fn contains_request(&self, epoch: u64, nonce: &[u8; REQUEST_NONCE_BYTES]) -> bool {
+        self.position(epoch, nonce).is_ok()
+    }
+
     /// Receipts already issued against the current epoch. Operations check
     /// this *before* committing anything: a rejection for an exhausted
     /// epoch must arrive before the operation runs, never after.

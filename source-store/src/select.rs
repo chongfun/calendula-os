@@ -184,6 +184,7 @@ mod tests {
             source_origin: SourceOrigin::ManagedUpload,
             operation_kind: OperationKind::ManagedUploadRequest,
             operation_request_id: [0; REQUEST_ID_BYTES],
+            request_binding_sha256: [1; SHA256_BYTES],
             externally_recovered: false,
             physical_slot: 0,
             source_length: 10,

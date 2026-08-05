@@ -197,6 +197,93 @@ fn provenance_is_valid(
 }
 
 // ---------------------------------------------------------------------------
+// Request binding
+// ---------------------------------------------------------------------------
+
+/// Domain-separation tags, so two operation families can never produce the
+/// same digest from coincidentally equal fields.
+pub const BINDING_TAG_UPLOAD: u8 = 1;
+pub const BINDING_TAG_RECOVER: u8 = 2;
+pub const BINDING_TAG_LOCAL: u8 = 3;
+
+/// The canonical byte image a request binding hashes over.
+pub const REQUEST_BINDING_BYTES: usize = 1 // tag
+    + 1                          // operation
+    + REQUEST_ID_BYTES           // request id (epoch || nonce)
+    + BOOK_TOKEN_BYTES           // base_book_token_or_zero
+    + 8                          // declared_length
+    + SHA256_BYTES               // declared_sha256
+    + 1                          // label_present
+    + 1                          // label_length
+    + DISPLAY_LABEL_MAX_BYTES; // label
+
+/// Every client-bound parameter of one mutation request, in canonical form.
+///
+/// [`SourceMetadata`] stores this binding's [`digest`][Self::digest] so that
+/// a committed generation proves *which exact request* produced it. That
+/// matters when receipts are gone: the metadata is then the only durable
+/// replay evidence, and a replay may only be served to a retry that agrees
+/// with the original request in full. Comparing the handful of fields
+/// metadata happens to store — length, digest, label — would let a reused
+/// request ID replay across a create and a replace, or across two books with
+/// identical bytes, instead of being refused as a parameter mismatch.
+///
+/// `label` is `None` only where the request genuinely omits one (recovery
+/// keeping the committed label); an absent label and an empty one are
+/// distinguished by `label_present`, so they cannot collide.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestBinding<'a> {
+    pub tag: u8,
+    /// The operation discriminant, from `ReceiptOperation` — the field that
+    /// separates a create from a replace when both carry a zero base token.
+    pub operation: u8,
+    pub request_id: &'a [u8; REQUEST_ID_BYTES],
+    pub base_book_token_or_zero: &'a [u8; BOOK_TOKEN_BYTES],
+    pub declared_length: u64,
+    pub declared_sha256: &'a [u8; SHA256_BYTES],
+    pub label: Option<&'a DisplayLabel>,
+}
+
+impl RequestBinding<'_> {
+    /// SHA-256 over the canonical image. Fixed offsets and fixed width: no
+    /// field is length-prefixed into another's territory, so no two distinct
+    /// requests share an image.
+    pub fn digest(&self) -> [u8; SHA256_BYTES] {
+        let mut image = [0u8; REQUEST_BINDING_BYTES];
+        let mut c = Cursor::new(&mut image, 0);
+        let built = (|| {
+            c.put_u8(self.tag)?;
+            c.put_u8(self.operation)?;
+            c.put(self.request_id)?;
+            c.put(self.base_book_token_or_zero)?;
+            c.put_u64(self.declared_length)?;
+            c.put(self.declared_sha256)?;
+            match self.label {
+                Some(label) => {
+                    c.put_u8(1)?;
+                    c.put_u8(label.len)?;
+                    c.put(&label.bytes)
+                }
+                None => {
+                    c.put_u8(0)?;
+                    c.put_u8(0)?;
+                    c.put(&[0u8; DISPLAY_LABEL_MAX_BYTES])
+                }
+            }
+        })();
+        // The cursor is sized by the same constant it writes through; a
+        // short write would be a layout bug, and hashing a partly-zero image
+        // would silently equate distinct requests. Refuse instead: the
+        // all-ones digest matches no metadata, so callers reject rather than
+        // replay.
+        if built.is_none() {
+            return [0xFF; SHA256_BYTES];
+        }
+        crate::validate::sha256_of(&image)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Source metadata
 // ---------------------------------------------------------------------------
 
@@ -210,6 +297,7 @@ const SOURCE_METADATA_FIELD_BYTES: usize = LOGICAL_BOOK_ID_BYTES // logical_book
     + 1                          // source_origin
     + 1                          // source_operation_kind
     + REQUEST_ID_BYTES           // operation request id or local id
+    + SHA256_BYTES               // request_binding_sha256
     + 1                          // externally_recovered
     + 1                          // physical_slot
     + 8                          // source_length
@@ -234,6 +322,11 @@ pub struct SourceMetadata {
     pub source_origin: SourceOrigin,
     pub operation_kind: OperationKind,
     pub operation_request_id: [u8; REQUEST_ID_BYTES],
+    /// [`RequestBinding::digest`] of the request that produced this
+    /// generation. The replay path compares this, not a subset of the
+    /// fields below, so a reused request ID can never be answered with
+    /// another operation's result.
+    pub request_binding_sha256: [u8; SHA256_BYTES],
     pub externally_recovered: bool,
     pub physical_slot: u8,
     pub source_length: u64,
@@ -257,6 +350,10 @@ impl SourceMetadata {
         name_matches_origin
             && self.logical_book_id != [0u8; LOGICAL_BOOK_ID_BYTES]
             && self.book_token != [0u8; BOOK_TOKEN_BYTES]
+            // An all-zero binding is never a digest anything produced; it is
+            // an unset field, and committing one would leave a generation
+            // that no retry can be matched against.
+            && self.request_binding_sha256 != [0u8; SHA256_BYTES]
             && self.source_generation >= 1
             && self.source_length >= 1
             && provenance_is_valid(
@@ -279,6 +376,7 @@ impl SourceMetadata {
         c.put_u8(self.source_origin as u8)?;
         c.put_u8(self.operation_kind as u8)?;
         c.put(&self.operation_request_id)?;
+        c.put(&self.request_binding_sha256)?;
         c.put_u8(u8::from(self.externally_recovered))?;
         c.put_u8(self.physical_slot)?;
         c.put_u64(self.source_length)?;
@@ -315,6 +413,7 @@ impl SourceMetadata {
                 _ => return None,
             },
             operation_request_id: c.take()?,
+            request_binding_sha256: c.take()?,
             externally_recovered: match c.take_u8()? {
                 0 => false,
                 1 => true,
@@ -619,6 +718,7 @@ mod tests {
             source_origin: SourceOrigin::ManagedUpload,
             operation_kind: OperationKind::ManagedUploadRequest,
             operation_request_id: [2; REQUEST_ID_BYTES],
+            request_binding_sha256: [3; SHA256_BYTES],
             externally_recovered: false,
             physical_slot: 4,
             source_length: 123_456,
@@ -687,6 +787,63 @@ mod tests {
         let mut meta = sample_metadata();
         meta.book_token = [0; BOOK_TOKEN_BYTES];
         assert_eq!(meta.encode_into(&mut buf), None);
+        let mut meta = sample_metadata();
+        meta.request_binding_sha256 = [0; SHA256_BYTES];
+        assert_eq!(meta.encode_into(&mut buf), None, "unset request binding");
+    }
+
+    #[test]
+    fn request_binding_separates_every_parameter() {
+        let label = DisplayLabel::new(b"A Book").unwrap();
+        let other = DisplayLabel::new(b"B Book").unwrap();
+        let base = RequestBinding {
+            tag: BINDING_TAG_UPLOAD,
+            operation: 1,
+            request_id: &[9; REQUEST_ID_BYTES],
+            base_book_token_or_zero: &[0; BOOK_TOKEN_BYTES],
+            declared_length: 4096,
+            declared_sha256: &[4; SHA256_BYTES],
+            label: Some(&label),
+        };
+        let digest = base.digest();
+        assert_eq!(digest, base.digest(), "the digest is a pure function");
+
+        // Every field moves the digest — including the ones the replay
+        // fallback used to ignore.
+        let mut variants = Vec::new();
+        let mut variant = base;
+        variant.tag = BINDING_TAG_RECOVER;
+        variants.push(variant.digest());
+        let mut variant = base;
+        variant.operation = 2; // create vs replace
+        variants.push(variant.digest());
+        let mut variant = base;
+        variant.request_id = &[10; REQUEST_ID_BYTES];
+        variants.push(variant.digest());
+        let mut variant = base;
+        variant.base_book_token_or_zero = &[7; BOOK_TOKEN_BYTES]; // replace target
+        variants.push(variant.digest());
+        let mut variant = base;
+        variant.declared_length = 4097;
+        variants.push(variant.digest());
+        let mut variant = base;
+        variant.declared_sha256 = &[5; SHA256_BYTES];
+        variants.push(variant.digest());
+        let mut variant = base;
+        variant.label = Some(&other);
+        variants.push(variant.digest());
+        // An absent label is not an empty one.
+        let mut variant = base;
+        variant.label = None;
+        variants.push(variant.digest());
+
+        for (at, other) in variants.iter().enumerate() {
+            assert_ne!(digest, *other, "variant {at} collided with the base");
+            assert!(
+                variants[..at].iter().all(|earlier| earlier != other),
+                "variant {at} collided with an earlier one"
+            );
+        }
     }
 
     #[test]

@@ -25,8 +25,9 @@
 use embedded_sdmmc::{BlockDevice, Directory, TimeSource};
 
 use crate::bodies::{
-    DisplayLabel, OperationKind, SourceMetadata, SourceOrigin, UnmanagedName, BOOK_TOKEN_BYTES,
-    REQUEST_ID_BYTES, SOURCE_METADATA_MAGIC, SOURCE_METADATA_SCHEMA,
+    DisplayLabel, OperationKind, RequestBinding, SourceMetadata, SourceOrigin, UnmanagedName,
+    BINDING_TAG_LOCAL, BOOK_TOKEN_BYTES, REQUEST_ID_BYTES, SOURCE_METADATA_MAGIC,
+    SOURCE_METADATA_SCHEMA,
 };
 use crate::layout;
 use crate::ops::{hash_file_identity, load_catalog, OpsWorkspace};
@@ -59,6 +60,9 @@ pub enum AdoptOutcome {
     RejectedNoFreeSlot,
     /// The name is not a valid 8.3 books-directory name.
     RejectedNameInvalid,
+    /// The workspace's catalog view is not a complete load of committed
+    /// state; see [`OpsWorkspace::catalog_is_valid`].
+    CatalogUnavailable,
     Failed(PublishError),
 }
 
@@ -84,6 +88,9 @@ where
     T: TimeSource,
     F: FnOnce() -> bool,
 {
+    if !ws.catalog_is_valid() {
+        return AdoptOutcome::CatalogUnavailable;
+    }
     let Some(unmanaged_name) = UnmanagedName::new(name) else {
         return AdoptOutcome::RejectedNameInvalid;
     };
@@ -190,12 +197,28 @@ where
         None => stem_label(name),
     };
 
+    // No client bound these parameters, but the field is the record's
+    // account of what produced the generation and is canonical for every
+    // origin. `operation` is zero: no `ReceiptOperation` uses that value, so
+    // a local binding can never equal a receipted one even before the tag.
+    let request_binding_sha256 = RequestBinding {
+        tag: BINDING_TAG_LOCAL,
+        operation: 0,
+        request_id: &operation_request_id,
+        base_book_token_or_zero: &[0; BOOK_TOKEN_BYTES],
+        declared_length: identity.length,
+        declared_sha256: &identity.sha256,
+        label: Some(&display_label),
+    }
+    .digest();
+
     let metadata = SourceMetadata {
         logical_book_id,
         source_generation,
         source_origin: SourceOrigin::UnmanagedSd,
         operation_kind: OperationKind::LocalUnmanagedOperation,
         operation_request_id,
+        request_binding_sha256,
         externally_recovered: false,
         physical_slot,
         source_length: identity.length,
@@ -233,6 +256,7 @@ where
         return AdoptOutcome::Failed(PublishError::BadInput);
     };
     let observed_length = identity.length;
+    let observed_sha256 = identity.sha256;
     let base_token = existing.map(|entry| entry.metadata.book_token);
     let revalidate = || {
         // Re-identification must still be superseding the generation it
@@ -249,14 +273,14 @@ where
         if !base_ok {
             return false;
         }
-        // The cheap changed-again tripwire, as in recovery.
-        match books_dir.open_file_in_dir(name, embedded_sdmmc::Mode::ReadOnly) {
-            Ok(file) => {
-                let same = u64::from(file.length()) == observed_length;
-                let _ = file.close();
-                same
-            }
-            Err(_) => false,
+        // Exact identity immediately before the commit, as in recovery: the
+        // file belongs to the user, the record is about to vouch for a
+        // specific digest, and a same-length edit since the hash would make
+        // that a lie. See `recover::recover_book` for the full rationale.
+        let mut hash_scratch = [0u8; IDENTITY_RECHECK_SCRATCH];
+        match crate::ops::sha256_file_identity(books_dir, name, &mut hash_scratch) {
+            Ok(Some((length, sha256))) => length == observed_length && sha256 == observed_sha256,
+            _ => false,
         }
     };
     match publish::publish_record(
@@ -272,9 +296,7 @@ where
         Err(error) => return AdoptOutcome::Failed(error),
     }
 
-    if load_catalog(records_dir, ws).is_err() {
-        ws.entries = [None; MAX_SOURCE_SLOTS];
-    }
+    let _ = load_catalog(records_dir, ws);
     let result = UploadResult {
         logical_book_id,
         book_token: fresh.book_token,
@@ -305,3 +327,6 @@ const META_REVALIDATE_SCRATCH: usize =
         None => 0,
     };
 const _: () = assert!(META_REVALIDATE_SCRATCH > 0);
+
+/// Read chunk for the final rehash; see `recover::IDENTITY_RECHECK_SCRATCH`.
+const IDENTITY_RECHECK_SCRATCH: usize = 512;

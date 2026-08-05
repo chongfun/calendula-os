@@ -46,6 +46,30 @@
 //! what the PRD's hardware power-cut gate exists to verify; nothing in
 //! software can substitute for it, and this crate does not claim to.
 //!
+//! One property the library *does not* have, and that this crate therefore
+//! compensates for: `open_file_in_dir` in a non-creating mode answers
+//! `NotFound` for every directory-lookup failure, a device read error
+//! included. Absence is load-bearing here — an absent slot pair has no
+//! committed authority, which makes it a publication target with no
+//! generation floor, and an absent metadata pair takes a book out of the
+//! catalog and frees its slot to be truncated — so a `NotFound` is never
+//! taken at face value. [`publish::confirm_absent`] re-asks through
+//! `find_directory_entry`, which keeps the distinction, and every read path
+//! that can conclude "not there" goes through it.
+//!
+//! ## Reading committed state
+//!
+//! Two rules hold across the operations layer, both of them about refusing
+//! to guess:
+//!
+//! - **A view that failed to load is not an empty view.** A workspace whose
+//!   catalog load did not complete is marked invalid and every operation
+//!   refuses it ([`ops::OpsWorkspace::catalog_is_valid`]).
+//! - **Durability claims come from the card, not from memory.** Cleanup
+//!   decides what is safe to reclaim from the *committed* idempotency
+//!   record, because a resident store can hold receipts whose publication
+//!   failed.
+//!
 //! ## Record framing
 //!
 //! Every authoritative record is one file laid out as:
