@@ -5,8 +5,14 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-import PIL
-from PIL import Image, ImageDraw, features
+try:
+    import PIL
+    from PIL import Image, ImageDraw, features
+except ImportError:
+    PIL = None  # type: ignore[assignment]
+    Image = None  # type: ignore[assignment]
+    ImageDraw = None  # type: ignore[assignment]
+    features = None  # type: ignore[assignment]
 
 # The tables in `display/src/*_generated.rs` reproduce byte for byte on this
 # Pillow and not on later ones. Pillow 11 changed `getlength` from the hinted
@@ -73,6 +79,13 @@ THRESHOLD = text_render_threshold()
 
 def require_pinned_pillow() -> None:
     """Stop before generating anything on a toolchain or threshold configuration that changes metrics."""
+    if PIL is None or features is None:
+        raise SystemExit(
+            f"fontgen needs Pillow {PILLOW_PIN} and FreeType {FREETYPE_PIN}, but Pillow is not installed.\n"
+            f"  Install the pin, ideally into a throwaway environment:\n"
+            f"    python3.12 -m venv .fontgen && .fontgen/bin/pip install 'pillow=={PILLOW_PIN}'\n"
+            f"    .fontgen/bin/python tools/generate_literata.py"
+        )
     freetype_ver = features.version_module("freetype2")
     if PIL.__version__ != PILLOW_PIN or freetype_ver != FREETYPE_PIN:
         raise SystemExit(
