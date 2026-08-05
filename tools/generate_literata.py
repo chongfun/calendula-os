@@ -6,6 +6,7 @@ from PIL import ImageFont
 from fontgen_common import (
     FONT_SHA256,
     LITERATA_BASE,
+    BitmapPool,
     codepoints_from_ranges,
     ensure_font,
     kerning_entries,
@@ -71,13 +72,11 @@ def main():
     for style, filename in FONTS:
         font = ImageFont.truetype(str(FONT_DIR / filename), PX)
         metrics = []
-        bitmap = []
-        offset = 0
+        pool = BitmapPool()
         for code in cps:
             width, height, x_offset, y_offset, advance, rows = rasterize_glyph(font, code)
+            offset = pool.add(rows, width, height)
             metrics.append((offset, len(rows), width, height, x_offset, y_offset, advance))
-            bitmap.extend(rows)
-            offset += len(rows)
 
         out.append(
             f"#[rustfmt::skip]\npub static LITERATA_{style}_METRICS: [GlyphMetric; LITERATA_COUNT] = [\n"
@@ -90,6 +89,7 @@ def main():
             )
         out.append("];\n\n")
 
+        bitmap = pool.data
         out.append(
             f"#[rustfmt::skip]\npub static LITERATA_{style}_BITMAP: [u8; {len(bitmap)}] = [\n"
         )

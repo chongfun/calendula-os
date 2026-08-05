@@ -6,6 +6,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import PIL
+from bitmap_pool import BitmapPool as BitmapPool
 from PIL import Image, ImageDraw, features
 
 # The tables in `display/src/*_generated.rs` reproduce byte for byte on this
