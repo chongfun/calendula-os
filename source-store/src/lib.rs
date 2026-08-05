@@ -67,8 +67,15 @@
 //!   refuses it ([`ops::OpsWorkspace::catalog_is_valid`]).
 //! - **Durability claims come from the card, not from memory.** Cleanup
 //!   decides what is safe to reclaim from the *committed* idempotency
-//!   record, because a resident store can hold receipts whose publication
-//!   failed.
+//!   record, and after an uncertain publication the resident store re-reads
+//!   the card rather than keep a receipt whose fate it does not know
+//!   ([`ops::IdempotencyStore::is_usable`]).
+//! - **A request ID is global, not per-endpoint.** `(epoch, nonce)` names a
+//!   request, not a request to one endpoint, so the receipt-loss fallback
+//!   searches every committed record type rather than the one the endpoint
+//!   happens to write ([`ops::find_request_trace`]). Otherwise an ID spent
+//!   on a delete looks unused to an upload, and the retry becomes a second
+//!   execution.
 //!
 //! ## Record framing
 //!

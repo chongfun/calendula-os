@@ -83,6 +83,7 @@ fn begin_name(outcome: &UploadBeginOutcome) -> &'static str {
         UploadBeginOutcome::RejectedIdentityCollision => "RejectedIdentityCollision",
         UploadBeginOutcome::RejectedNoFreeSlot => "RejectedNoFreeSlot",
         UploadBeginOutcome::CatalogUnavailable => "CatalogUnavailable",
+        UploadBeginOutcome::IdempotencyUnavailable => "IdempotencyUnavailable",
         UploadBeginOutcome::Failed(_) => "Failed",
     }
 }

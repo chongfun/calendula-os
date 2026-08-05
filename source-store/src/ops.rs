@@ -112,12 +112,38 @@ impl Default for OpsWorkspace {
 
 /// The resident idempotency state plus the committed record generation it
 /// was loaded from — what [`publish`][Self::publish] increments.
+///
+/// ## The resident state is a copy of the card's, or the store is unusable
+///
+/// Between a [`load`][Self::load] and the next [`publish`][Self::publish],
+/// callers stage exactly one receipt into `state` and publish it
+/// immediately, so at every *operation boundary* the resident state is
+/// meant to equal the committed record. That equality is what lets a replay
+/// served from `state` report `receipt_durable: true`: the receipt answering
+/// the retry is on the card, so a reboot mid-retry answers the same way.
+///
+/// An uncertain publication is the one thing that can break the equality —
+/// the staged receipt may or may not have landed — so `publish` re-reads the
+/// card on failure and adopts whatever it finds. When even that read fails,
+/// the store cannot say what is committed and marks itself unusable
+/// ([`is_usable`][Self::is_usable]); operations refuse rather than serve
+/// durability claims from a state whose durability is unknown.
 pub struct IdempotencyStore {
     pub state: IdempotencyState,
     pub record_generation: u64,
+    /// Whether `state` is known to be a copy of the committed record. See
+    /// the type docs; only an unrecoverable publication clears it.
+    committed_state_known: bool,
 }
 
 impl IdempotencyStore {
+    /// Whether this store may answer questions about what is committed.
+    /// False after a publication failed *and* the card could not then be
+    /// re-read; a fresh [`load`][Self::load] is the way back.
+    pub fn is_usable(&self) -> bool {
+        self.committed_state_known
+    }
+
     /// Load the committed idempotency record, or start fresh when none
     /// exists. Corruption of *both* slots — or a committed record that no
     /// longer decodes — fails closed: idempotency state must never be
@@ -135,6 +161,7 @@ impl IdempotencyStore {
             None => Ok(Self {
                 state: IdempotencyState::initial(),
                 record_generation: 0,
+                committed_state_known: true,
             }),
             Some((_, RecordState::Committed(view))) => {
                 if view.schema_version != IDEMPOTENCY_SCHEMA {
@@ -144,6 +171,7 @@ impl IdempotencyStore {
                 Ok(Self {
                     state,
                     record_generation: view.generation,
+                    committed_state_known: true,
                 })
             }
             Some(_) => Err(PublishError::Io),
@@ -193,23 +221,33 @@ impl IdempotencyStore {
             Err(error) => {
                 // A failure after the commit sync still leaves the record
                 // committed (`publish_record` says so explicitly), so
-                // "publish failed" does not mean "generation N is still
-                // authority". Keeping the resident counter at N would make
-                // every future publication propose N+1 again, which
-                // `publish_record` refuses as not above authority — one
-                // uncertain commit would wedge receipt retention forever.
-                // Ask the card instead.
-                self.resync_generation(dir, ws);
+                // "publish failed" means neither "generation N is still
+                // authority" nor "the staged receipt is not on the card" —
+                // both are now unknown, and both matter. Keeping the
+                // resident counter at N would make every future publication
+                // propose N+1 again, which `publish_record` refuses as not
+                // above authority; keeping the resident *state* would let a
+                // same-session retry replay a receipt that may exist only in
+                // memory and call it durable. Ask the card for both.
+                self.resync_from_card(dir, ws);
                 Err(error)
             }
         }
     }
 
-    /// Re-read the pair's committed generation and adopt it. Best effort by
-    /// design: if the card cannot answer, the resident counter stays where
-    /// it was and the next publication tries again — no worse than before,
-    /// and never silently ahead of what is committed.
-    fn resync_generation<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    /// Re-read the committed record and adopt it wholesale — state and
+    /// generation together, because after an uncertain publication both are
+    /// in question and only the card can settle either.
+    ///
+    /// This deliberately discards a staged receipt that did not land. Losing
+    /// it costs nothing but reclamation speed: the operation itself
+    /// committed, its metadata or tombstone still carries the request ID, and
+    /// the receipt-loss fallback answers the retry from there — reporting
+    /// `receipt_durable: false`, which is the truth.
+    ///
+    /// A card that cannot be re-read leaves the store unusable rather than
+    /// guessing; see [`is_usable`][Self::is_usable].
+    fn resync_from_card<D, T, const MD: usize, const MF: usize, const MV: usize>(
         &mut self,
         dir: &Directory<'_, D, T, MD, MF, MV>,
         ws: &mut OpsWorkspace,
@@ -217,11 +255,13 @@ impl IdempotencyStore {
         D: BlockDevice,
         T: TimeSource,
     {
-        let names = layout::idempotency_pair();
-        if let Ok(Some((_, generation))) =
-            publish::select_authority(dir, names.pair(), &mut ws.record_scratch)
-        {
-            self.record_generation = generation;
+        match Self::load(dir, ws) {
+            Ok(committed) => {
+                self.state = committed.state;
+                self.record_generation = committed.record_generation;
+                self.committed_state_known = true;
+            }
+            Err(_) => self.committed_state_known = false,
         }
     }
 }
@@ -464,6 +504,60 @@ where
     Ok(())
 }
 
+/// What committed state says about a request ID whose receipt is gone.
+///
+/// See [`find_request_trace`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestTrace {
+    /// No committed record carries this request ID.
+    None,
+    /// A source-metadata record carries it: a create, replace, or recovery.
+    Metadata(SlotEntry),
+    /// A tombstone carries it: a delete.
+    Tombstone(Tombstone),
+}
+
+/// Find the committed record — of *any* type — that carries `request_id`.
+///
+/// The request-ID namespace is global. `(epoch, nonce)` names a request, not
+/// a request-to-one-endpoint, and the receipt table enforces that on its own:
+/// one sorted table across all operations, with
+/// [`OperationReceipt::matches_parameters`] comparing the operation itself,
+/// so a delete's ID reused by an upload resolves to `ParameterMismatch`.
+///
+/// The receipt-loss fallback has to enforce the same namespace, and it reads
+/// durable records — which are per-operation files. An endpoint that
+/// searched only the record type it writes would find nothing for an ID
+/// spent on a different operation, call the request genuinely new, and
+/// execute it: a second execution under a request ID that has already been
+/// answered, with the evidence sitting in a file that endpoint never opens.
+/// So every endpoint asks this one question instead.
+///
+/// Metadata is searched first. A well-formed card cannot have both — the
+/// second use of an ID is exactly what this prevents — so the order only
+/// decides what happens on a card written by a build that lacked this check,
+/// and there the metadata-first answer is the refusing one.
+///
+/// Epoch-zero IDs are outside the namespace and never match: they are local
+/// unmanaged provenance (see [`crate::unmanaged`]), which no client request
+/// can validly carry, and which is not receipted at all.
+pub fn find_request_trace(ws: &OpsWorkspace, request_id: &[u8; REQUEST_ID_BYTES]) -> RequestTrace {
+    if request_id[..8] == [0u8; 8] {
+        return RequestTrace::None;
+    }
+    for entry in ws.entries.iter().flatten() {
+        if entry.metadata.operation_request_id == *request_id {
+            return RequestTrace::Metadata(*entry);
+        }
+    }
+    for (_, stone) in ws.tombstones.iter().flatten() {
+        if stone.delete_request_id == *request_id {
+            return RequestTrace::Tombstone(*stone);
+        }
+    }
+    RequestTrace::None
+}
+
 /// The authoritative entry carrying `book_token`, if any. Superseded,
 /// deleted, and ambiguous slots never match — a stale token is unknown,
 /// not a handle to hidden state.
@@ -551,6 +645,10 @@ pub enum DeleteOutcome {
     /// state, so no operation may act on it. Retryable once a reload
     /// succeeds; see [`OpsWorkspace::catalog_is_valid`].
     CatalogUnavailable,
+    /// The idempotency store cannot say what is committed, so no request may
+    /// be resolved against it. Retryable once a reload succeeds; see
+    /// [`IdempotencyStore::is_usable`].
+    IdempotencyUnavailable,
     Failed(PublishError),
 }
 
@@ -577,6 +675,9 @@ where
     if !ws.catalog_is_valid() {
         return DeleteOutcome::CatalogUnavailable;
     }
+    if !idem.is_usable() {
+        return DeleteOutcome::IdempotencyUnavailable;
+    }
 
     // 1. Receipts first: a known request ID answers from its receipt no
     //    matter how stale its token has become.
@@ -586,19 +687,24 @@ where
             return DeleteOutcome::Deleted {
                 logical_book_id: receipt.logical_book_id,
                 replayed: true,
+                // The guard above is what makes this true rather than
+                // hopeful: a usable store's receipts are the card's.
                 receipt_durable: true,
-            }
+            };
         }
         ReceiptLookup::ParameterMismatch => return DeleteOutcome::RejectedParameterMismatch,
         ReceiptLookup::Unknown => {}
     }
 
-    // 2. Tombstones second: the tombstone carries the delete's request
-    //    identity precisely so a retry that lost its receipt (crash
-    //    between tombstone commit and receipt publication) still replays.
+    // 2. Committed records second, across every operation type: the
+    //    tombstone carries the delete's request identity precisely so a
+    //    retry that lost its receipt (crash between tombstone commit and
+    //    receipt publication) still replays — and a metadata record
+    //    carrying it means the ID was already spent on an upload or a
+    //    recovery, which a delete result is no answer to.
     let request_id = req.request_id();
-    for (_, stone) in ws.tombstones.iter().flatten() {
-        if stone.delete_request_id == request_id {
+    match find_request_trace(ws, &request_id) {
+        RequestTrace::Tombstone(stone) => {
             if stone.deleted_book_token == req.book_token {
                 return DeleteOutcome::Deleted {
                     logical_book_id: stone.logical_book_id,
@@ -608,6 +714,8 @@ where
             }
             return DeleteOutcome::RejectedParameterMismatch;
         }
+        RequestTrace::Metadata(_) => return DeleteOutcome::RejectedParameterMismatch,
+        RequestTrace::None => {}
     }
 
     // 3. Genuinely new: epoch freshness, then budget — both checked before

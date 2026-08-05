@@ -28,7 +28,8 @@ use crate::bodies::{
 };
 use crate::layout;
 use crate::ops::{
-    find_authoritative_by_token, hash_file_identity, load_catalog, IdempotencyStore, OpsWorkspace,
+    find_authoritative_by_token, find_request_trace, hash_file_identity, load_catalog,
+    IdempotencyStore, OpsWorkspace, RequestTrace,
 };
 use crate::publish::{self, PublishError};
 use crate::receipts::{
@@ -78,6 +79,9 @@ pub enum RecoveryOutcome {
     /// The workspace's catalog view is not a complete load of committed
     /// state; see [`OpsWorkspace::catalog_is_valid`].
     CatalogUnavailable,
+    /// The idempotency store cannot say what is committed; see
+    /// [`IdempotencyStore::is_usable`].
+    IdempotencyUnavailable,
     Failed(PublishError),
 }
 
@@ -152,9 +156,12 @@ where
     if !ws.catalog_is_valid() {
         return RecoveryOutcome::CatalogUnavailable;
     }
+    if !idem.is_usable() {
+        return RecoveryOutcome::IdempotencyUnavailable;
+    }
 
     // 1. Request-ID resolution before ordinary token validation: receipts,
-    //    then committed metadata carrying this recovery's identity.
+    //    then any committed record carrying this recovery's identity.
     let probe = req.receipt([1; LOGICAL_BOOK_ID_BYTES], 1, [0; BOOK_TOKEN_BYTES]);
     match idem.state.lookup(&probe) {
         ReceiptLookup::Replay(receipt) => {
@@ -162,15 +169,16 @@ where
                 logical_book_id: receipt.logical_book_id,
                 book_token: receipt.result_book_token_or_zero,
                 source_generation: receipt.source_generation,
+                // True by the guard above; see `IdempotencyStore`.
                 receipt_durable: true,
-            })
+            });
         }
         ReceiptLookup::ParameterMismatch => return RecoveryOutcome::RejectedParameterMismatch,
         ReceiptLookup::Unknown => {}
     }
     let request_id = req.request_id();
-    for entry in ws.entries.iter().flatten() {
-        if entry.metadata.operation_request_id == request_id {
+    match find_request_trace(ws, &request_id) {
+        RequestTrace::Metadata(entry) => {
             if entry.metadata.request_binding_sha256 != req.binding_digest() {
                 return RecoveryOutcome::RejectedParameterMismatch;
             }
@@ -181,6 +189,9 @@ where
                 receipt_durable: false,
             });
         }
+        // The ID was spent on a delete; a recovery result is no answer to it.
+        RequestTrace::Tombstone(_) => return RecoveryOutcome::RejectedParameterMismatch,
+        RequestTrace::None => {}
     }
 
     // 2. Genuinely new: freshness and budget before anything commits.

@@ -44,7 +44,8 @@ use crate::bodies::{
 };
 use crate::layout;
 use crate::ops::{
-    find_authoritative_by_token, hash_file_identity, load_catalog, IdempotencyStore, OpsWorkspace,
+    find_authoritative_by_token, find_request_trace, hash_file_identity, load_catalog,
+    IdempotencyStore, OpsWorkspace, RequestTrace,
 };
 use crate::publish::{self, PublishError};
 use crate::receipts::{
@@ -113,6 +114,9 @@ pub enum UploadBeginOutcome {
     /// The workspace's catalog view is not a complete load of committed
     /// state; see [`OpsWorkspace::catalog_is_valid`].
     CatalogUnavailable,
+    /// The idempotency store cannot say what is committed; see
+    /// [`IdempotencyStore::is_usable`].
+    IdempotencyUnavailable,
     Failed(PublishError),
 }
 
@@ -136,6 +140,9 @@ pub enum UploadError {
     /// The workspace's catalog view is not a complete load of committed
     /// state; see [`OpsWorkspace::catalog_is_valid`].
     CatalogUnavailable,
+    /// The idempotency store cannot say what is committed; see
+    /// [`IdempotencyStore::is_usable`].
+    IdempotencyUnavailable,
     Io(PublishError),
 }
 
@@ -248,8 +255,11 @@ where
     if !ws.catalog_is_valid() {
         return UploadBeginOutcome::CatalogUnavailable;
     }
+    if !idem.is_usable() {
+        return UploadBeginOutcome::IdempotencyUnavailable;
+    }
 
-    // 1. Receipts first, then committed metadata carrying this request
+    // 1. Receipts first, then any committed record carrying this request
     //    identity — the durable evidence that this exact request already
     //    committed, resolvable long after its base token went stale.
     let probe = req.receipt([1; LOGICAL_BOOK_ID_BYTES], 1, [0; BOOK_TOKEN_BYTES]);
@@ -259,15 +269,17 @@ where
                 logical_book_id: receipt.logical_book_id,
                 book_token: receipt.result_book_token_or_zero,
                 source_generation: receipt.source_generation,
+                // True by the guard above: a usable store's receipts are
+                // the card's, so a reboot answers this retry the same way.
                 receipt_durable: true,
-            })
+            });
         }
         ReceiptLookup::ParameterMismatch => return UploadBeginOutcome::RejectedParameterMismatch,
         ReceiptLookup::Unknown => {}
     }
     let request_id = req.request_id();
-    for entry in ws.entries.iter().flatten() {
-        if entry.metadata.operation_request_id == request_id {
+    match find_request_trace(ws, &request_id) {
+        RequestTrace::Metadata(entry) => {
             // Same request identity: full parameter agreement replays the
             // recorded result, anything else is misuse. The binding digest
             // is the whole comparison — the metadata fields alone could not
@@ -282,6 +294,10 @@ where
                 receipt_durable: false,
             });
         }
+        // The ID was spent on a delete. A create's result is not an answer
+        // to it, and the retry must not become a second execution.
+        RequestTrace::Tombstone(_) => return UploadBeginOutcome::RejectedParameterMismatch,
+        RequestTrace::None => {}
     }
 
     // 2. Genuinely new: freshness and budget before anything commits.
@@ -474,6 +490,9 @@ where
 {
     if !ws.catalog_is_valid() {
         return Err(UploadError::CatalogUnavailable);
+    }
+    if !idem.is_usable() {
+        return Err(UploadError::IdempotencyUnavailable);
     }
 
     // 1. Receive-time identity.
