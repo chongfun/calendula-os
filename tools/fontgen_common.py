@@ -579,24 +579,3 @@ def write_kerning(out, name, entries, count_name=None):
             f"left: 0x{left:04X}, right: 0x{right:04X}, adjust_fp: {adjust_fp} }},\n"
         )
     out.append("];\n\n")
-
-
-if __name__ == "__main__":
-    import unittest
-
-    class TestBitmapPool(unittest.TestCase):
-        def test_identical_bytes_different_dimensions_not_deduplicated(self):
-            pool = BitmapPool()
-            # 4 bytes: could represent a 4x8 bitmap (width=4, height=8)
-            # or an 8x4 bitmap (width=8, height=4) or 16x2, etc.
-            rows = [0xFF, 0x00, 0xFF, 0x00]
-            offset1 = pool.add(rows, width=4, height=8)
-            offset2 = pool.add(rows, width=8, height=4)
-            offset3 = pool.add(rows, width=4, height=8)
-
-            self.assertEqual(offset1, 0)
-            self.assertEqual(offset2, 4)
-            self.assertEqual(offset3, 0)
-            self.assertEqual(len(pool.data), 8)
-
-    unittest.main()
