@@ -22,7 +22,7 @@
 use embedded_sdmmc::{BlockDevice, Directory, TimeSource};
 
 use crate::bodies::{
-    DisplayLabel, OperationKind, SourceMetadata, SourceOrigin, BOOK_TOKEN_BYTES,
+    DisplayLabel, OperationKind, SourceMetadata, SourceOrigin, UnmanagedName, BOOK_TOKEN_BYTES,
     LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES, SOURCE_METADATA_MAGIC,
     SOURCE_METADATA_SCHEMA,
 };
@@ -242,6 +242,7 @@ where
         quick_fingerprint_sha256: identity.quick_fingerprint,
         book_token: fresh_token,
         display_label: req.display_label.unwrap_or(entry.metadata.display_label),
+        unmanaged_name: UnmanagedName::none(),
     };
     let Some(meta_names) = layout::metadata_pair(entry.physical_slot) else {
         return RecoveryOutcome::Failed(PublishError::BadInput);

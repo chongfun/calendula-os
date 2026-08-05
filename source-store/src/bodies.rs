@@ -95,6 +95,75 @@ pub enum SourceOrigin {
     UnmanagedSd = 2,
 }
 
+/// Where an unmanaged book's bytes live: its 8.3 file name in the books
+/// directory. Managed sources carry [`UnmanagedName::none`] — their bytes
+/// live in the slot the metadata already names.
+pub const UNMANAGED_NAME_MAX_BYTES: usize = 12;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnmanagedName {
+    len: u8,
+    bytes: [u8; UNMANAGED_NAME_MAX_BYTES],
+}
+
+impl UnmanagedName {
+    pub const fn none() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; UNMANAGED_NAME_MAX_BYTES],
+        }
+    }
+
+    /// A validated 8.3 name: ASCII graphic characters, one dot, stem of
+    /// 1–8, extension of 1–3 — the shape the catalog scan discovers and
+    /// `embedded-sdmmc` reopens.
+    pub fn new(name: &str) -> Option<Self> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() > UNMANAGED_NAME_MAX_BYTES {
+            return None;
+        }
+        if !bytes.iter().all(|byte| byte.is_ascii_graphic()) {
+            return None;
+        }
+        let (stem, ext) = name.split_once('.')?;
+        if stem.is_empty() || stem.len() > 8 || ext.is_empty() || ext.len() > 3 || ext.contains('.')
+        {
+            return None;
+        }
+        let mut stored = [0u8; UNMANAGED_NAME_MAX_BYTES];
+        stored[..bytes.len()].copy_from_slice(bytes);
+        Some(Self {
+            len: bytes.len() as u8,
+            bytes: stored,
+        })
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        if self.is_none() {
+            return None;
+        }
+        core::str::from_utf8(&self.bytes[..usize::from(self.len)]).ok()
+    }
+
+    fn from_record(len: u8, bytes: &[u8; UNMANAGED_NAME_MAX_BYTES]) -> Option<Self> {
+        if len == 0 {
+            if bytes.iter().any(|byte| *byte != 0) {
+                return None;
+            }
+            return Some(Self::none());
+        }
+        let name = core::str::from_utf8(bytes.get(..usize::from(len))?).ok()?;
+        if bytes[usize::from(len)..].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        Self::new(name)
+    }
+}
+
 /// How the current generation came to be — independent of where the bytes
 /// live. `ManagedUpload` origin does not mean the card never changed; the
 /// provenance kind records which *operation* produced the generation.
@@ -149,7 +218,9 @@ const SOURCE_METADATA_FIELD_BYTES: usize = LOGICAL_BOOK_ID_BYTES // logical_book
     + SHA256_BYTES               // quick_fingerprint_sha256
     + BOOK_TOKEN_BYTES           // book_token
     + 1                          // display_label_length
-    + DISPLAY_LABEL_MAX_BYTES; // display_label
+    + DISPLAY_LABEL_MAX_BYTES    // display_label
+    + 1                          // unmanaged_name_length
+    + UNMANAGED_NAME_MAX_BYTES; // unmanaged_name
 pub const SOURCE_METADATA_LOGICAL_BYTES: usize =
     BODY_PREFIX_BYTES + SOURCE_METADATA_FIELD_BYTES + BODY_CRC_BYTES;
 
@@ -171,13 +242,20 @@ pub struct SourceMetadata {
     pub quick_fingerprint_sha256: [u8; SHA256_BYTES],
     pub book_token: [u8; BOOK_TOKEN_BYTES],
     pub display_label: DisplayLabel,
+    /// Where the bytes live for `UnmanagedSd` sources; none for managed.
+    pub unmanaged_name: UnmanagedName,
 }
 
 impl SourceMetadata {
     /// Semantic validity, shared by encode and decode so a record this
     /// firmware writes is always one it would accept back.
     fn is_valid(&self) -> bool {
-        self.logical_book_id != [0u8; LOGICAL_BOOK_ID_BYTES]
+        let name_matches_origin = match self.source_origin {
+            SourceOrigin::ManagedUpload => self.unmanaged_name.is_none(),
+            SourceOrigin::UnmanagedSd => !self.unmanaged_name.is_none(),
+        };
+        name_matches_origin
+            && self.logical_book_id != [0u8; LOGICAL_BOOK_ID_BYTES]
             && self.book_token != [0u8; BOOK_TOKEN_BYTES]
             && self.source_generation >= 1
             && self.source_length >= 1
@@ -210,6 +288,8 @@ impl SourceMetadata {
         c.put(&self.book_token)?;
         c.put_u8(self.display_label.len)?;
         c.put(&self.display_label.bytes)?;
+        c.put_u8(self.unmanaged_name.len)?;
+        c.put(&self.unmanaged_name.bytes)?;
         c.finish_at(SOURCE_METADATA_LOGICAL_BYTES - BODY_CRC_BYTES)
     }
 
@@ -250,6 +330,11 @@ impl SourceMetadata {
                 let len = c.take_u8()?;
                 let bytes: [u8; DISPLAY_LABEL_MAX_BYTES] = c.take()?;
                 DisplayLabel::from_record(len, &bytes)?
+            },
+            unmanaged_name: {
+                let len = c.take_u8()?;
+                let bytes: [u8; UNMANAGED_NAME_MAX_BYTES] = c.take()?;
+                UnmanagedName::from_record(len, &bytes)?
             },
         };
         if !decoded.is_valid() {
@@ -542,6 +627,7 @@ mod tests {
             quick_fingerprint_sha256: [6; SHA256_BYTES],
             book_token: [7; BOOK_TOKEN_BYTES],
             display_label: DisplayLabel::new(b"A Book").unwrap(),
+            unmanaged_name: UnmanagedName::none(),
         }
     }
 
@@ -627,7 +713,10 @@ mod tests {
         );
         // Poke a byte into the label buffer beyond its length, then re-seal
         // so only the semantic check can catch it.
-        let label_tail = SOURCE_METADATA_LOGICAL_BYTES - BODY_CRC_BYTES - 1;
+        // The label buffer sits just ahead of the trailing unmanaged-name
+        // field (1 length byte + buffer) and the CRC.
+        let label_tail =
+            SOURCE_METADATA_LOGICAL_BYTES - BODY_CRC_BYTES - 1 - UNMANAGED_NAME_MAX_BYTES - 1;
         file[label_tail] = b'x';
         seal_body(
             SOURCE_METADATA_MAGIC,
@@ -641,6 +730,43 @@ mod tests {
             panic!("expected prepared");
         };
         assert_eq!(SourceMetadata::decode(&view), None);
+    }
+
+    #[test]
+    fn unmanaged_name_contract_and_roundtrip() {
+        assert!(UnmanagedName::new("MOBY.EPU").is_some());
+        assert!(UnmanagedName::new("A.E").is_some());
+        assert!(UnmanagedName::new("12345678.EPU").is_some());
+        assert!(UnmanagedName::new("").is_none());
+        assert!(UnmanagedName::new("NODOT").is_none());
+        assert!(UnmanagedName::new("TOOLONGXX.EPU").is_none());
+        assert!(UnmanagedName::new("TWO.DOT.S").is_none());
+        assert!(UnmanagedName::new("SP CE.EPU").is_none());
+
+        // An unmanaged record must carry a name and unmanaged provenance.
+        let mut meta = sample_metadata();
+        meta.source_origin = SourceOrigin::UnmanagedSd;
+        meta.operation_kind = OperationKind::LocalUnmanagedOperation;
+        let mut buf = vec![0u8; SOURCE_METADATA_LOGICAL_BYTES];
+        assert_eq!(meta.encode_into(&mut buf), None, "name required");
+        meta.unmanaged_name = UnmanagedName::new("MOBY.EPU").unwrap();
+        assert!(meta.encode_into(&mut buf).is_some());
+        let file = seal_to_file(
+            SOURCE_METADATA_MAGIC,
+            SOURCE_METADATA_SCHEMA,
+            1,
+            SOURCE_METADATA_LOGICAL_BYTES,
+            |buf| meta.encode_into(buf),
+        );
+        let RecordState::Prepared(view) = classify_record(&file, SOURCE_METADATA_MAGIC) else {
+            panic!("expected prepared");
+        };
+        assert_eq!(SourceMetadata::decode(&view), Some(meta));
+
+        // A managed record must not carry one.
+        let mut meta = sample_metadata();
+        meta.unmanaged_name = UnmanagedName::new("MOBY.EPU").unwrap();
+        assert_eq!(meta.encode_into(&mut buf), None);
     }
 
     #[test]

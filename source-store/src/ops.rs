@@ -599,6 +599,7 @@ fn dummy_entry() -> SlotEntry {
             quick_fingerprint_sha256: [0; SHA256_BYTES],
             book_token: [0; BOOK_TOKEN_BYTES],
             display_label: crate::bodies::DisplayLabel::placeholder(),
+            unmanaged_name: crate::bodies::UnmanagedName::none(),
         },
     }
 }

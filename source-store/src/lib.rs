@@ -74,5 +74,6 @@ pub mod receipts;
 pub mod record;
 pub mod recover;
 pub mod select;
+pub mod unmanaged;
 pub mod upload;
 pub mod validate;

@@ -93,9 +93,10 @@ source-store/ M0S source-transaction foundation: commit-sector record framing,
            records (source metadata, tombstones, staging markers, idempotency
            receipts), startup source selection, the managed SRC namespace,
            the delete, create/replace, and explicit-recovery transactions,
-           restartable cleanup, and resumable source-identity jobs (full
-           SHA-256 plus the quick fingerprint); host-tested with
-           fault-injection and simulated power-cut replay
+           unmanaged adoption and re-identification, restartable cleanup,
+           and resumable source-identity jobs (full SHA-256 plus the quick
+           fingerprint); host-tested with fault-injection and simulated
+           power-cut replay
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup-stable Cargo wrapper for firmware builds/checks
 tools/bench/    serial bench harness for hardware timing, storage/cache,

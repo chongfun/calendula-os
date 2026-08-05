@@ -16,7 +16,7 @@ use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Directory, Timestamp, VolumeIdx, VolumeManager,
 };
 use source_store::bodies::{
-    DisplayLabel, OperationKind, SourceMetadata, SourceOrigin, BOOK_TOKEN_BYTES,
+    DisplayLabel, OperationKind, SourceMetadata, SourceOrigin, UnmanagedName, BOOK_TOKEN_BYTES,
     LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES, SOURCE_METADATA_LOGICAL_BYTES,
     SOURCE_METADATA_MAGIC, SOURCE_METADATA_SCHEMA,
 };
@@ -249,6 +249,7 @@ pub fn sample_metadata(source_generation: u64) -> SourceMetadata {
         quick_fingerprint_sha256: [7; SHA256_BYTES],
         book_token: [source_generation as u8 + 1; BOOK_TOKEN_BYTES],
         display_label: DisplayLabel::new(b"Fixture Book").unwrap(),
+        unmanaged_name: UnmanagedName::none(),
     }
 }
 

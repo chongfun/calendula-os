@@ -39,8 +39,8 @@ use heapless::String;
 
 use crate::bodies::{
     DisplayLabel, OperationKind, SourceMetadata, SourceOrigin, StagedOperation, StagingMarker,
-    BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES, STAGING_MARKER_MAGIC,
-    STAGING_MARKER_SCHEMA,
+    UnmanagedName, BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES,
+    STAGING_MARKER_MAGIC, STAGING_MARKER_SCHEMA,
 };
 use crate::layout;
 use crate::ops::{
@@ -493,6 +493,7 @@ where
         quick_fingerprint_sha256: quick_fingerprint,
         book_token: txn.book_token,
         display_label: request.display_label,
+        unmanaged_name: UnmanagedName::none(),
     };
     let Some(meta_names) = layout::metadata_pair(txn.physical_slot) else {
         return Err(UploadError::Io(PublishError::BadInput));

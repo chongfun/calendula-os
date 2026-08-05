@@ -172,8 +172,9 @@ mod tests {
     use std::vec::Vec;
 
     use crate::bodies::{
-        DisplayLabel, OperationKind, SourceOrigin, StagedOperation, BOOK_TOKEN_BYTES,
-        LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES, TOMBSTONE_STATUS_DELETED,
+        DisplayLabel, OperationKind, SourceOrigin, StagedOperation, UnmanagedName,
+        BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES,
+        TOMBSTONE_STATUS_DELETED,
     };
 
     fn meta(book: u8, generation: u64) -> SourceMetadata {
@@ -191,6 +192,7 @@ mod tests {
             quick_fingerprint_sha256: [0; SHA256_BYTES],
             book_token: [generation as u8 + 1; BOOK_TOKEN_BYTES],
             display_label: DisplayLabel::new(b"t").unwrap(),
+            unmanaged_name: UnmanagedName::none(),
         }
     }
 
