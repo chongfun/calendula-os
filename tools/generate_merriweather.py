@@ -114,7 +114,7 @@ def main():
             pool = BitmapPool()
             for code in cps:
                 width, height, x_offset, y_offset, advance, rows = rasterize_glyph(font, code)
-                offset = pool.add(rows)
+                offset = pool.add(rows, width, height)
                 metrics.append((offset, len(rows), width, height, x_offset, y_offset, advance))
 
             name = f"MERRIWEATHER_{px}_{style}"
