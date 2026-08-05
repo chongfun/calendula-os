@@ -147,7 +147,7 @@ where
         if let Some(name) = layout::source_slot_name(slot) {
             let _ = dir.delete_file_in_dir(name.as_str());
         }
-        if replay_evidence_needed(&idem.state, &entry.metadata.operation_request_id) {
+        if replay_evidence_needed(ws, &idem.state, &entry.metadata.operation_request_id) {
             report.retained_for_replay += 1;
             continue;
         }
@@ -193,16 +193,16 @@ where
         let Some((tombstone_slot, stone)) = ws.tombstones[slot] else {
             continue;
         };
+        let needed = replay_evidence_needed(ws, &idem.state, &stone.delete_request_id);
+        if needed {
+            report.retained_for_replay += 1;
+        }
         let book_state_remains = ws
             .entries
             .iter()
             .flatten()
             .any(|entry| entry.metadata.logical_book_id == stone.logical_book_id);
-        if book_state_remains {
-            continue;
-        }
-        if replay_evidence_needed(&idem.state, &stone.delete_request_id) {
-            report.retained_for_replay += 1;
+        if needed || book_state_remains {
             continue;
         }
         if let Some(pair) = layout::tombstone_pair(tombstone_slot) {
@@ -217,19 +217,29 @@ where
     Ok(report)
 }
 
-/// Whether this committed record is still the only thing standing between a
-/// delayed retry and a second execution.
+/// Whether this committed record must be preserved for replay or conflict tracking.
 ///
-/// True when the request's epoch would still accept new requests *and* no
-/// committed receipt resolves the ID. Either half being false makes the
-/// record reclaimable: a receipt answers the retry directly, and a retired
-/// epoch means the retry is refused as stale before it can reach execution.
+/// True when the request's epoch is accepted *and* either no receipt exists for the ID
+/// or the fallback evidence contradicts the receipt (or disagrees with itself).
 ///
 /// A local (epoch-zero) request is never accepted as new by an operation,
 /// so it is never retained — unmanaged adoption's idempotency is intrinsic,
 /// not receipted.
-fn replay_evidence_needed(state: &IdempotencyState, request_id: &[u8; REQUEST_ID_BYTES]) -> bool {
+fn replay_evidence_needed(
+    ws: &OpsWorkspace,
+    state: &IdempotencyState,
+    request_id: &[u8; REQUEST_ID_BYTES],
+) -> bool {
     let epoch = u64::from_le_bytes(request_id[..8].try_into().unwrap_or([0u8; 8]));
     let nonce: [u8; REQUEST_NONCE_BYTES] = request_id[8..].try_into().unwrap_or([0u8; 16]);
-    state.epoch_is_accepted(epoch) && !state.contains_request(epoch, &nonce)
+    if !state.epoch_is_accepted(epoch) {
+        return false;
+    }
+    match state.get_receipt(epoch, &nonce) {
+        Some(receipt) => {
+            let trace = crate::ops::find_request_trace(ws, request_id);
+            !crate::ops::receipt_is_consistent_with_trace(receipt, trace)
+        }
+        None => true,
+    }
 }

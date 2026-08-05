@@ -550,10 +550,10 @@ pub enum RequestTrace {
 /// closed. Duplicate metadata or duplicate tombstones count the same way:
 /// whatever produced them, one request did not commit twice.
 ///
-/// Receipts are still resolved first, ahead of this. A receipt is a stronger
-/// and later record than either file — the operation that wrote it saw the
-/// fallback state and was allowed to proceed — so a card with a receipt has
-/// an unambiguous answer even when its older records disagree.
+/// A receipt only wins when committed fallback evidence is absent or uniquely
+/// consistent with it (see [`receipt_is_consistent_with_trace`]). If committed
+/// fallback evidence contradicts the receipt or disagrees with itself, the card
+/// holds ambiguous request evidence and every endpoint fails closed.
 ///
 /// Epoch-zero IDs are outside the namespace and never match: they are local
 /// unmanaged provenance (see [`crate::unmanaged`]), which no client request
@@ -580,6 +580,34 @@ pub fn find_request_trace(ws: &OpsWorkspace, request_id: &[u8; REQUEST_ID_BYTES]
         }
     }
     found
+}
+
+/// Check whether committed fallback records (`trace`) contradict a receipt (`receipt`).
+/// A receipt only wins when committed fallback evidence is absent or uniquely consistent with it.
+pub fn receipt_is_consistent_with_trace(receipt: &OperationReceipt, trace: RequestTrace) -> bool {
+    match trace {
+        RequestTrace::None => true,
+        RequestTrace::Conflict => false,
+        RequestTrace::Metadata(entry) => match receipt.operation {
+            ReceiptOperation::Create
+            | ReceiptOperation::Replace
+            | ReceiptOperation::RecoverExternallyModified => {
+                entry.metadata.logical_book_id == receipt.logical_book_id
+                    && entry.metadata.book_token == receipt.result_book_token_or_zero
+                    && entry.metadata.source_generation == receipt.source_generation
+            }
+            ReceiptOperation::Delete => false,
+        },
+        RequestTrace::Tombstone(stone) => match receipt.operation {
+            ReceiptOperation::Delete => {
+                stone.logical_book_id == receipt.logical_book_id
+                    && stone.deleted_book_token == receipt.base_book_token_or_zero
+            }
+            ReceiptOperation::Create
+            | ReceiptOperation::Replace
+            | ReceiptOperation::RecoverExternallyModified => false,
+        },
+    }
 }
 
 /// The authoritative entry carrying `book_token`, if any. Superseded,
@@ -707,21 +735,28 @@ where
         return DeleteOutcome::IdempotencyUnavailable;
     }
 
-    // 1. Receipts first: a known request ID answers from its receipt no
-    //    matter how stale its token has become.
-    let probe = req.receipt([0; LOGICAL_BOOK_ID_BYTES]);
-    match idem.state.lookup(&probe) {
-        ReceiptLookup::Replay(receipt) => {
-            return DeleteOutcome::Deleted {
-                logical_book_id: receipt.logical_book_id,
-                replayed: true,
-                // The guard above is what makes this true rather than
-                // hopeful: a usable store's receipts are the card's.
-                receipt_durable: true,
-            };
+    // 1. Receipts first, provided committed fallback evidence is absent or
+    //    uniquely consistent with the receipt.
+    let request_id = req.request_id();
+    let trace = find_request_trace(ws, &request_id);
+    if let Some(receipt) = idem.state.get_receipt(req.epoch, &req.nonce) {
+        if !receipt_is_consistent_with_trace(receipt, trace) {
+            return DeleteOutcome::AmbiguousRequestEvidence;
         }
-        ReceiptLookup::ParameterMismatch => return DeleteOutcome::RejectedParameterMismatch,
-        ReceiptLookup::Unknown => {}
+        let probe = req.receipt([0; LOGICAL_BOOK_ID_BYTES]);
+        match idem.state.lookup(&probe) {
+            ReceiptLookup::Replay(receipt) => {
+                return DeleteOutcome::Deleted {
+                    logical_book_id: receipt.logical_book_id,
+                    replayed: true,
+                    // The guard above is what makes this true rather than
+                    // hopeful: a usable store's receipts are the card's.
+                    receipt_durable: true,
+                };
+            }
+            ReceiptLookup::ParameterMismatch => return DeleteOutcome::RejectedParameterMismatch,
+            ReceiptLookup::Unknown => {}
+        }
     }
 
     // 2. Committed records second, across every operation type: the
@@ -730,8 +765,7 @@ where
     //    receipt publication) still replays — and a metadata record
     //    carrying it means the ID was already spent on an upload or a
     //    recovery, which a delete result is no answer to.
-    let request_id = req.request_id();
-    match find_request_trace(ws, &request_id) {
+    match trace {
         RequestTrace::Tombstone(stone) => {
             if stone.deleted_book_token == req.book_token {
                 return DeleteOutcome::Deleted {

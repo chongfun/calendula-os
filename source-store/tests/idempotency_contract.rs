@@ -21,15 +21,18 @@ mod common;
 
 use common::{new_card, open_mgr, open_root, publish_metadata, sample_metadata, Dir, SharedDisk};
 use source_store::bodies::{
-    DisplayLabel, Tombstone, BOOK_TOKEN_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES,
-    TOMBSTONE_LOGICAL_BYTES, TOMBSTONE_MAGIC, TOMBSTONE_SCHEMA, TOMBSTONE_STATUS_DELETED,
+    DisplayLabel, Tombstone, BOOK_TOKEN_BYTES, DISPLAY_LABEL_MAX_BYTES, LOGICAL_BOOK_ID_BYTES,
+    REQUEST_ID_BYTES, SHA256_BYTES, TOMBSTONE_LOGICAL_BYTES, TOMBSTONE_MAGIC, TOMBSTONE_SCHEMA,
+    TOMBSTONE_STATUS_DELETED,
 };
+use source_store::cleanup::run_cleanup;
 use source_store::layout;
 use source_store::ops::{
     delete_book, find_request_trace, load_catalog, DeleteOutcome, DeleteRequest, IdempotencyStore,
     OpsWorkspace, RequestTrace,
 };
 use source_store::publish::publish_record;
+use source_store::receipts::{OperationReceipt, ReceiptOperation, RECEIPT_STATUS_SUCCESS};
 use source_store::record::{record_file_len, seal_body};
 use source_store::recover::{recover_book, RecoveryOutcome, RecoveryRequest};
 use source_store::select::SlotDisposition;
@@ -472,6 +475,117 @@ fn contradictory_records_for_one_request_id_are_refused_by_every_endpoint() {
         find_request_trace(&ws, &[9; REQUEST_ID_BYTES]),
         RequestTrace::None
     );
+    let _ = created;
+}
+
+/// Identical to `card_with_two_records_for_one_request`, but retains a receipt
+/// for the second operation (the delete).
+fn card_with_two_records_and_receipt_for_one_request(
+    root: &Dir<'_>,
+    disk: &SharedDisk,
+) -> UploadResult {
+    let created = card_with_two_records_for_one_request(root, disk);
+    let mut ws = workspace();
+    load_catalog(root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(root, &mut ws).expect("idem");
+
+    let mut request_id = [0u8; REQUEST_ID_BYTES];
+    request_id[..8].copy_from_slice(&1u64.to_le_bytes());
+    request_id[8..].copy_from_slice(&[CONTESTED; 16]);
+
+    idem.state
+        .insert(OperationReceipt {
+            epoch: 1,
+            request_nonce: [CONTESTED; 16],
+            operation: ReceiptOperation::Delete,
+            logical_book_id: created.logical_book_id,
+            base_book_token_or_zero: created.book_token,
+            source_generation: 0,
+            source_length_or_zero: 0,
+            source_sha256_or_zero: [0; SHA256_BYTES],
+            display_label_len: 0,
+            display_label: [0; DISPLAY_LABEL_MAX_BYTES],
+            result_book_token_or_zero: [0; BOOK_TOKEN_BYTES],
+            result_status: RECEIPT_STATUS_SUCCESS,
+        })
+        .expect("insert delete receipt");
+    idem.publish(root, &mut ws).expect("publish receipt");
+
+    created
+}
+
+/// Even when a receipt exists, contradictory fallback records (upload metadata
+/// plus delete tombstone) must prevent the receipt from resolving the request.
+/// Every endpoint must return `AmbiguousRequestEvidence`, cleanup must
+/// preserve both conflicting records, and refusal must not mutate the card.
+#[test]
+fn durable_receipt_with_conflicting_fallback_records_is_refused_and_preserved() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let created = card_with_two_records_and_receipt_for_one_request(&root, &disk);
+    let before = disk.snapshot();
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+
+    // The upload retry returns AmbiguousRequestEvidence.
+    let retried = begin_upload(
+        &root,
+        &mut idem,
+        &create_request(CONTESTED, &epub_bytes(4_000, 1)),
+        fresh(10, 20),
+        &mut ws,
+    );
+    assert!(
+        matches!(retried, UploadBeginOutcome::AmbiguousRequestEvidence),
+        "an upload replayed despite contradictory fallback records: {}",
+        name(&retried)
+    );
+
+    // The delete retry returns AmbiguousRequestEvidence.
+    assert_eq!(
+        delete_book(&root, &mut idem, &delete_request(CONTESTED, 20), &mut ws),
+        DeleteOutcome::AmbiguousRequestEvidence,
+        "a delete replayed despite contradictory fallback records"
+    );
+
+    // The recovery retry returns AmbiguousRequestEvidence.
+    assert_eq!(
+        recover_book(
+            &root,
+            &mut idem,
+            &recovery_request(CONTESTED, 20, &epub_bytes(3_000, 2)),
+            [31; BOOK_TOKEN_BYTES],
+            &mut ws,
+            || true,
+        ),
+        RecoveryOutcome::AmbiguousRequestEvidence,
+        "a recovery ran despite contradictory fallback records"
+    );
+
+    assert!(
+        disk.snapshot() == before,
+        "refusing a contradictory request ID with a receipt wrote to the card"
+    );
+
+    // Cleanup must not remove either conflicting record.
+    let mut ws = workspace();
+    let report = run_cleanup(&root, &mut ws).expect("cleanup");
+    assert_eq!(
+        report.reclaimed_slots, 0,
+        "cleanup removed metadata for a conflicting request"
+    );
+    assert_eq!(
+        report.reclaimed_tombstones, 0,
+        "cleanup removed tombstone for a conflicting request"
+    );
+    assert_eq!(
+        report.retained_for_replay, 2,
+        "cleanup failed to retain both conflicting records"
+    );
+
     let _ = created;
 }
 

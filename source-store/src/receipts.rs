@@ -308,6 +308,18 @@ impl IdempotencyState {
         self.position(epoch, nonce).is_ok()
     }
 
+    /// Retrieve the stored receipt for a request ID, if present.
+    pub fn get_receipt(
+        &self,
+        epoch: u64,
+        nonce: &[u8; REQUEST_NONCE_BYTES],
+    ) -> Option<&OperationReceipt> {
+        match self.position(epoch, nonce) {
+            Ok(at) => Some(&self.receipts[at]),
+            Err(_) => None,
+        }
+    }
+
     /// Receipts already issued against the current epoch. Operations check
     /// this *before* committing anything: a rejection for an exhausted
     /// epoch must arrive before the operation runs, never after.

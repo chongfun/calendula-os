@@ -29,7 +29,7 @@ use crate::bodies::{
 use crate::layout;
 use crate::ops::{
     find_authoritative_by_token, find_request_trace, hash_file_identity, load_catalog,
-    IdempotencyStore, OpsWorkspace, RequestTrace,
+    receipt_is_consistent_with_trace, IdempotencyStore, OpsWorkspace, RequestTrace,
 };
 use crate::publish::{self, PublishError};
 use crate::receipts::{
@@ -164,23 +164,31 @@ where
     }
 
     // 1. Request-ID resolution before ordinary token validation: receipts,
-    //    then any committed record carrying this recovery's identity.
-    let probe = req.receipt([1; LOGICAL_BOOK_ID_BYTES], 1, [0; BOOK_TOKEN_BYTES]);
-    match idem.state.lookup(&probe) {
-        ReceiptLookup::Replay(receipt) => {
-            return RecoveryOutcome::Recovered(UploadResult {
-                logical_book_id: receipt.logical_book_id,
-                book_token: receipt.result_book_token_or_zero,
-                source_generation: receipt.source_generation,
-                // True by the guard above; see `IdempotencyStore`.
-                receipt_durable: true,
-            });
-        }
-        ReceiptLookup::ParameterMismatch => return RecoveryOutcome::RejectedParameterMismatch,
-        ReceiptLookup::Unknown => {}
-    }
+    //    then any committed record carrying this recovery's identity (provided
+    //    committed fallback evidence is absent or uniquely consistent with the receipt).
     let request_id = req.request_id();
-    match find_request_trace(ws, &request_id) {
+    let trace = find_request_trace(ws, &request_id);
+    if let Some(receipt) = idem.state.get_receipt(req.epoch, &req.nonce) {
+        if !receipt_is_consistent_with_trace(receipt, trace) {
+            return RecoveryOutcome::AmbiguousRequestEvidence;
+        }
+        let probe = req.receipt([1; LOGICAL_BOOK_ID_BYTES], 1, [0; BOOK_TOKEN_BYTES]);
+        match idem.state.lookup(&probe) {
+            ReceiptLookup::Replay(receipt) => {
+                return RecoveryOutcome::Recovered(UploadResult {
+                    logical_book_id: receipt.logical_book_id,
+                    book_token: receipt.result_book_token_or_zero,
+                    source_generation: receipt.source_generation,
+                    // True by the guard above; see `IdempotencyStore`.
+                    receipt_durable: true,
+                });
+            }
+            ReceiptLookup::ParameterMismatch => return RecoveryOutcome::RejectedParameterMismatch,
+            ReceiptLookup::Unknown => {}
+        }
+    }
+
+    match trace {
         RequestTrace::Metadata(entry) => {
             if entry.metadata.request_binding_sha256 != req.binding_digest() {
                 return RecoveryOutcome::RejectedParameterMismatch;
