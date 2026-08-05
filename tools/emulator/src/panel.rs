@@ -135,7 +135,7 @@ impl PanelModel {
         )?;
         self.command(
             CMD_DISPLAY_UPDATE_CTRL2,
-            &[display::epd::update_control_2(mode, true, false)],
+            &[display::epd::update_control_2(mode, true, false, false)],
         )?;
         self.command(CMD_MASTER_ACTIVATION, &[])?;
         if mode == RefreshMode::FastClean {
@@ -157,6 +157,7 @@ impl PanelModel {
             &[display::epd::update_control_2(
                 RefreshMode::PowerDown,
                 true,
+                false,
                 false,
             )],
         )?;
