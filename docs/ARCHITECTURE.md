@@ -496,12 +496,14 @@ same mode so the stored metrics describe the stored bitmap. The box is a
 pagination input — the wrap reads `x_offset + width` — so changing how it is
 derived is a `READER_LAYOUT_VERSION` bump.
 
-Regeneration is pinned on both axes, because both move advances and advances
-are a wrap input. The TTFs are fetched from immutable upstream commits and
-checked against `FONT_SHA256` on every run, and Pillow is pinned to
-`PILLOW_PIN` — release 11 changed `getlength` from the hinted advance to the
-unhinted one, which moves every advance in every face. Both mismatches stop
-the run rather than quietly emitting different tables. Regenerate through a
+Regeneration is pinned across toolchain and configuration, because metrics and rasterization
+are wrap and rendering inputs. The TTFs are fetched from immutable upstream commits and
+checked against `FONT_SHA256` on every run, Pillow and FreeType are pinned to
+`PILLOW_PIN` (`10.4.0`) and `FREETYPE_PIN` (`2.13.2`) — release 11 changed `getlength`
+from the hinted advance to the unhinted one, which moves every advance in every face, and
+different FreeType builds alter glyph rasterization and placement —, and `THRESHOLD` is
+pinned to `128` (overrideable for experiments via `ALLOW_UNPINNED_THRESHOLD=1`). All
+mismatches stop the run rather than quietly emitting different tables. Regenerate through a
 throwaway environment holding the pin:
 
 ```sh

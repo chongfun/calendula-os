@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw
 # makes that call deliberately, the version is pinned and a mismatch stops the
 # run.
 PILLOW_PIN = "10.4.0"
+FREETYPE_PIN = "2.13.2"
 
 # SHA-256 of every TTF the shipped tables were built from, checked on every
 # run because `tools/fonts/` is gitignored and a stale local file is as
@@ -70,21 +71,29 @@ THRESHOLD = text_render_threshold()
 
 
 def require_pinned_pillow() -> None:
-    """Stop before generating anything on a Pillow that changes the metrics."""
-    if PIL.__version__ == PILLOW_PIN:
-        return
-    raise SystemExit(
-        f"fontgen needs Pillow {PILLOW_PIN}, found {PIL.__version__}.\n"
-        f"  Later Pillow returns unhinted advances, which moves every advance in\n"
-        f"  every shipped face and repaginates every cached book on every device.\n"
-        f"  Install the pin, ideally into a throwaway environment:\n"
-        f"    python3.12 -m venv .fontgen && .fontgen/bin/pip install 'pillow=={PILLOW_PIN}'\n"
-        f"    .fontgen/bin/python tools/generate_literata.py\n"
-        f"  If the intent is to adopt the newer metrics, that is a deliberate\n"
-        f"  typography change: bump READER_LAYOUT_VERSION, re-bless the goldens\n"
-        f"  and the fingerprints in display/tests/glyph_tables.rs, and move this\n"
-        f"  pin in the same commit."
-    )
+    """Stop before generating anything on a toolchain or threshold configuration that changes metrics."""
+    freetype_ver = PIL.features.version_module("freetype2")
+    if PIL.__version__ != PILLOW_PIN or freetype_ver != FREETYPE_PIN:
+        raise SystemExit(
+            f"fontgen needs Pillow {PILLOW_PIN} and FreeType {FREETYPE_PIN}, "
+            f"found Pillow {PIL.__version__} / FreeType {freetype_ver}.\n"
+            f"  Later Pillow returns unhinted advances, and different FreeType builds\n"
+            f"  alter glyph rasterization and placement.\n"
+            f"  Install the pin, ideally into a throwaway environment:\n"
+            f"    python3.12 -m venv .fontgen && .fontgen/bin/pip install 'pillow=={PILLOW_PIN}'\n"
+            f"    .fontgen/bin/python tools/generate_literata.py\n"
+            f"  If the intent is to adopt newer metrics or FreeType, that is a deliberate\n"
+            f"  typography change: bump READER_LAYOUT_VERSION, re-bless the goldens\n"
+            f"  and the fingerprints in display/tests/glyph_tables.rs, and move these\n"
+            f"  pins in the same commit."
+        )
+
+    if THRESHOLD != DEFAULT_THRESHOLD and os.environ.get("ALLOW_UNPINNED_THRESHOLD") != "1":
+        raise SystemExit(
+            f"fontgen requires THRESHOLD {DEFAULT_THRESHOLD}, found {THRESHOLD} via TEXT_RENDER_THRESHOLD.\n"
+            f"  Overriding the threshold changes glyph seating and rasterization.\n"
+            f"  For experiments, set ALLOW_UNPINNED_THRESHOLD=1 to bypass."
+        )
 
 
 def ensure_font(path: Path, url: str, sha256: str) -> None:
