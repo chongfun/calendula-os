@@ -8,12 +8,13 @@
 //! Regenerate after intentional typography changes with:
 //! `REGEN_READING_GOLDEN=1 cargo test --manifest-path tools/emulator/Cargo.toml --target <host> --test reading_golden`
 //! (repeat with `--features device-x3` to refresh the X3 frames too).
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use display::fb::Framebuffer;
 use display::font::{
-    style_marker_code, FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings,
-    STYLE_MARKER,
+    style_marker_code, BitmapFont, FontFamily, FontSize, FontStyle, FontWeight, LineSpacing,
+    TypeSettings, STYLE_MARKER,
 };
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
@@ -184,38 +185,149 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
     }
 }
 
+/// The `line_count` a device cache rebuild would store for a block: its own
+/// text wrapped under the fixture's current page box.
+fn wrapped_lines_for(source: &FixtureBlocks, index: usize) -> u8 {
+    // The device sink emits styled runs only as pre-wrapped single-line
+    // blocks, so marker-bearing text stays one line; wrapping it would paint
+    // the markers as glyphs.
+    if source.blocks[index].text.contains(STYLE_MARKER) {
+        return source.blocks[index].record.line_count;
+    }
+    let record = source.blocks[index].record;
+    let font = body_font(source.settings, source.blocks[index].style);
+    let page_box = ReadingBlocks::page_box(source);
+    let max_width = page_box.right
+        - if record.align == TextAlign::Center {
+            page_box.left
+        } else {
+            page_box.x_for(record.role)
+        };
+    let indent = block_first_line_indent(source, index);
+    wrapped_line_count(font, &source.blocks[index].text, max_width, indent)
+        .max(1)
+        .min(u8::MAX as u16) as u8
+}
+
+/// Fill in every block's `line_count` from its text, for fixtures whose
+/// counts are not hand-written.
+fn rewrap(source: &mut FixtureBlocks) {
+    let counts: Vec<u8> = (0..source.blocks.len())
+        .map(|index| wrapped_lines_for(source, index))
+        .collect();
+    for (block, count) in source.blocks.iter_mut().zip(counts) {
+        block.record.line_count = count;
+    }
+}
+
 /// The same fixture laid into the portrait page box. Cached line counts
 /// are wrap products, so they re-wrap under the portrait widths exactly as
 /// a device cache rebuild would.
 fn portrait_fixture() -> FixtureBlocks {
     let mut source = fixture(TypeSettings::DEFAULT);
     source.portrait = true;
-    let counts: Vec<u8> = (0..source.blocks.len())
-        .map(|index| {
-            // The device sink emits styled runs only as pre-wrapped
-            // single-line blocks, so marker-bearing text stays one line;
-            // wrapping it would paint the markers as glyphs.
-            if source.blocks[index].text.contains(STYLE_MARKER) {
-                return source.blocks[index].record.line_count;
-            }
-            let record = source.blocks[index].record;
-            let font = body_font(source.settings, source.blocks[index].style);
-            let page_box = ReadingBlocks::page_box(&source);
-            let max_width = page_box.right
-                - if record.align == TextAlign::Center {
-                    page_box.left
-                } else {
-                    page_box.x_for(record.role)
-                };
-            let indent = block_first_line_indent(&source, index);
-            wrapped_line_count(font, &source.blocks[index].text, max_width, indent)
-                .max(1)
-                .min(u8::MAX as u16) as u8
+    rewrap(&mut source);
+    source
+}
+
+/// One codepoint per distinct glyph the face draws, in shipped order, chunked
+/// into short words so the wrap has somewhere to break.
+///
+/// `fixture` is English prose plus one `café` and one em dash, which leaves
+/// the rest of the shipped coverage — the diacritics, the fractions, the
+/// guillemets, the Latin Extended letters — reaching no pinned pixel
+/// anywhere. Glyph geometry is generated, and a generator change moves it
+/// silently: the monochrome-raster change moved the box on 1,149 codepoints
+/// across the shipped faces, 855 of them in Merriweather's default face
+/// alone, and the reading goldens could not have told the difference.
+///
+/// Read out of [`BitmapFont::codepoints`] rather than frozen into a list, so
+/// that widening the shipped coverage widens the specimen with it.
+fn specimen_words(font: &BitmapFont) -> Vec<String> {
+    const GLYPHS_PER_WORD: usize = 8;
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut seen = HashSet::new();
+    for &codepoint in font.codepoints {
+        let Some(ch) = char::from_u32(codepoint as u32) else {
+            continue;
+        };
+        // Spaces, the soft hyphen and the zero-width and bidi format
+        // characters hold a codepoint but draw nothing, and inside a word
+        // they would only move the wrap around.
+        if ch.is_whitespace()
+            || matches!(
+                codepoint,
+                0xA0 | 0xAD | 0x2000..=0x200F | 0x2028..=0x202F | 0x205F..=0x206F
+            )
+        {
+            continue;
+        }
+        // Coverage is not ink: a codepoint the face maps to an empty box
+        // draws nothing, so pinning it proves nothing.
+        let Some((metric, bitmap)) = font.glyph(codepoint) else {
+            continue;
+        };
+        if metric.width == 0 || metric.height == 0 {
+            continue;
+        }
+        // The shipped ranges run past what the TTFs cover, and every
+        // uncovered codepoint stores the same hollow `.notdef` rectangle —
+        // 792 of the 1,587 drawable entries in Literata's regular face are
+        // that one box, and a page of them proves nothing. Keying on
+        // everything that can move a pixel or a wrap point keeps the first
+        // and drops the repeats, along with any other glyph that would render
+        // and advance identically.
+        if !seen.insert((
+            metric.width,
+            metric.height,
+            metric.x_offset,
+            metric.y_offset,
+            metric.advance_fp,
+            bitmap,
+        )) {
+            continue;
+        }
+        word.push(ch);
+        if word.chars().count() == GLYPHS_PER_WORD {
+            words.push(core::mem::take(&mut word));
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// The specimen as body blocks: short enough that the paginator, which never
+/// splits a block across a page, can pack them tight against the page bottom.
+fn specimen_fixture(settings: TypeSettings) -> FixtureBlocks {
+    const WORDS_PER_BLOCK: usize = 12;
+    let words = specimen_words(body_font(settings, FontStyle::Regular));
+    let chunks: Vec<String> = words
+        .chunks(WORDS_PER_BLOCK)
+        .map(|chunk| chunk.join(" "))
+        .collect();
+    let last = chunks.len().saturating_sub(1);
+    let blocks = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| FixtureBlock {
+            record: record(TextRole::Body, TextAlign::Left, 1),
+            text,
+            style: FontStyle::Regular,
+            page_break_before: false,
+            // Continuations of one paragraph, so only the first block takes
+            // an indent and the rest stay a flush-left grid of glyphs.
+            paragraph_end: index == last,
         })
         .collect();
-    for (block, count) in source.blocks.iter_mut().zip(counts) {
-        block.record.line_count = count;
-    }
+    let mut source = FixtureBlocks {
+        blocks,
+        settings,
+        portrait: false,
+    };
+    rewrap(&mut source);
     source
 }
 
@@ -369,6 +481,46 @@ fn reading_page_bodies_match_goldens_merriweather() {
         family: FontFamily::Merriweather,
     });
     assert_page_matches_golden(&source, 0, "reading-page-merriweather-0");
+}
+
+/// Pin every page of the glyph specimen in the default reading face. Prose
+/// goldens cover the letters English happens to use; this covers the rest of
+/// what the face ships, which is where generated glyph geometry moves without
+/// anything noticing.
+#[test]
+fn reading_specimen_pages_match_goldens() {
+    let source = specimen_fixture(TypeSettings::DEFAULT);
+    let pages = paginate_block_pages(&source);
+    assert!(pages > 1, "specimen should span several pages, got {pages}");
+    for page_index in 0..pages {
+        assert_page_matches_golden(
+            &source,
+            page_index,
+            &format!("reading-specimen-{page_index}"),
+        );
+    }
+}
+
+/// The same specimen in Merriweather, which is where the monochrome-raster
+/// change moved the most geometry: 855 codepoints in the default face against
+/// Literata's eighteen.
+#[test]
+fn reading_specimen_pages_match_goldens_merriweather() {
+    let source = specimen_fixture(TypeSettings {
+        size: FontSize::Medium,
+        spacing: LineSpacing::Normal,
+        weight: FontWeight::Normal,
+        family: FontFamily::Merriweather,
+    });
+    let pages = paginate_block_pages(&source);
+    assert!(pages > 1, "specimen should span several pages, got {pages}");
+    for page_index in 0..pages {
+        assert_page_matches_golden(
+            &source,
+            page_index,
+            &format!("reading-specimen-merriweather-{page_index}"),
+        );
+    }
 }
 
 /// The default grid fills the selected panel height: seventeen body lines on

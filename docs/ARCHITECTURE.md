@@ -490,7 +490,11 @@ host preview tool can generate the sidecar from EPUB JPEG/PNG covers with
 Reading and chapter navigation typography use generated Literata bitmap assets.
 The host generator downloads OFL Literata TTFs and emits Latin-1 glyph
 metrics/bitmaps for Regular, Italic, Bold, and BoldItalic. Firmware does not
-rasterize TTFs on-device.
+rasterize TTFs on-device. Glyphs are rasterized in FreeType's monochrome mode
+rather than antialiased and thresholded, and the glyph box is taken from that
+same mode so the stored metrics describe the stored bitmap. The box is a
+pagination input — the wrap reads `x_offset + width` — so changing how it is
+derived is a `READER_LAYOUT_VERSION` bump.
 
 ## Development emulator
 

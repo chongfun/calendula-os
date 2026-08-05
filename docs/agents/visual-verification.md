@@ -92,6 +92,22 @@ REGEN_READING_GOLDEN=1 ./tools/check.sh test-emulator
 
 The second invocation verifies that the regenerated fixtures pass without regeneration enabled.
 
+### Glyph specimen
+
+`reading-specimen-*` is prose-free: one codepoint per distinct glyph the face
+draws, read out of `BitmapFont::codepoints` at test time and laid down the page
+in Literata and Merriweather. The prose fixtures type English, so without it a
+generated-font change can move the diacritics, fractions, guillemets and Latin
+Extended letters with no frame noticing — which is exactly what happened when
+mono rasterization first shipped against an antialiased glyph box. Font
+generator changes should be read off these frames first.
+
+The specimens render two of the thirty-four shipped tables. The other
+thirty-two are covered by fingerprints in `display/tests/glyph_tables.rs`,
+which run in the ordinary host test job (`tools/check.sh test-host`) and name
+the faces that moved and whether they gained or lost ink. A regeneration has to
+re-bless them; the failure prints the block to paste.
+
 ## Browser emulator
 
 `ui` and `display` changes also feed the wasm emulator, and the device chrome
