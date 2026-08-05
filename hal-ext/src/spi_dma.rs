@@ -144,6 +144,11 @@ where
         self.busy.is_high().ok()
     }
 
+    /// Hold RST pin HIGH during deep sleep to prevent controller current drain.
+    pub fn hold_rst_high(&mut self) {
+        let _ = self.rst.set_high();
+    }
+
     pub fn deselect_display(&mut self) {
         self.deselect();
     }

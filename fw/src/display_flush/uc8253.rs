@@ -95,6 +95,7 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
             SleepStep::PowerOff => power_off(epd, start).await?,
             SleepStep::DeepSleep => {
                 epd.command(CMD_DEEP_SLEEP, &[DEEP_SLEEP_CHECK]).await?;
+                epd.hold_rst_high();
                 bench_log!(
                     "bench: sleep phase=deep_sleep elapsed_ms={} t_ms={}",
                     start.elapsed().as_millis(),

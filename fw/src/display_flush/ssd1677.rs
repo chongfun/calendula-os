@@ -122,7 +122,9 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
         start.elapsed().as_millis(),
         Instant::now().as_millis(),
     );
-    Ok(epd.command(CMD_DEEP_SLEEP, &[0x01]).await?)
+    epd.command(CMD_DEEP_SLEEP, &[0x01]).await?;
+    epd.hold_rst_high();
+    Ok(())
 }
 
 async fn write_ram(epd: &mut Epd, ram_command: u8, fb: &Framebuffer) -> Result<(), PanelError> {
