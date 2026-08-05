@@ -145,8 +145,8 @@ pub const fn update_control_2(
     }
     match mode {
         RefreshMode::Full => value | 0x34,
-        RefreshMode::Fast if fast_du => value | 0x18,
-        RefreshMode::Fast => value | 0x1C,
+        RefreshMode::Fast if fast_du => value | 0x1C,
+        RefreshMode::Fast => value | 0x18,
         // Load LUT (display mode 1) + display, deliberately without the
         // 0x20 load-temperature bit so the FAST_CLEAN_TEMPERATURE override
         // written via 0x1A decides which OTP waveform runs.
@@ -164,4 +164,20 @@ pub const fn update_control_1(mode: RefreshMode) -> [u8; 2] {
 
 pub const fn is_byte_aligned(rect: Rect) -> bool {
     rect.x & 7 == 0 && rect.w & 7 == 0 && rect.w > 0 && rect.h > 0 && rect.x < WIDTH as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_control_2_fast_du() {
+        // Fast with fast_du = true uses 0x1C (the DU shortcut).
+        assert_eq!(update_control_2(RefreshMode::Fast, true, false, true), 0x1C);
+        // Fast with fast_du = false uses 0x18 (the stock temperature-compensated sequence).
+        assert_eq!(
+            update_control_2(RefreshMode::Fast, true, false, false),
+            0x18
+        );
+    }
 }

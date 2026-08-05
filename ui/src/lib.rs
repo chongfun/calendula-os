@@ -37,6 +37,12 @@ pub enum UiRefreshPolicy {
     FullEveryTen,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiRefreshQuality {
+    Normal,
+    Fast,
+}
+
 /// Wireless screen lifecycle, mirrored from app-core so the renderer stays
 /// decoupled from reducer types the way UiView mirrors AppView.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +104,7 @@ pub struct UiShell<'a> {
     /// of it; the key rail's labels follow the buttons.
     pub front_pages_left: bool,
     pub refresh_policy: UiRefreshPolicy,
+    pub refresh_quality: UiRefreshQuality,
     pub font_size: display::font::FontSize,
     pub line_spacing: display::font::LineSpacing,
     pub font_weight: display::font::FontWeight,
@@ -154,6 +161,7 @@ mod tests {
             orientation: UiOrientation::PortraitButtonsRight,
             front_pages_left: false,
             refresh_policy: UiRefreshPolicy::FullEveryTen,
+            refresh_quality: UiRefreshQuality::Normal,
             font_size: Default::default(),
             line_spacing: Default::default(),
             font_weight: Default::default(),

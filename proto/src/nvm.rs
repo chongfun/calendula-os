@@ -27,8 +27,7 @@ impl AppStateRecord {
     const V3_ENCODED_LEN: usize = 32;
     const V1_ENCODED_LEN: usize = 24;
     const MAGIC: u32 = 0x5834_4F53;
-    const VERSION: u8 = 5;
-    const V4_VERSION: u8 = 4;
+    const VERSION: u8 = 4;
     const V3_VERSION: u8 = 3;
     const V2_VERSION: u8 = 2;
     const V1_VERSION: u8 = 1;
@@ -76,8 +75,8 @@ impl AppStateRecord {
         // reserved tail. The font family later took reserved byte 29 and the
         // front-button layout byte 30: records written before either carry
         // zero there, which is the respective default (Literata, pages
-        // right), so no version bump was needed.
-        // V5 adds refresh_quality at byte 31.
+        // right), so no version bump was needed. Byte 31 stores refresh_quality
+        // (default 0).
         out[28] = self.font_weight;
         out[29] = self.font_family;
         out[30] = self.front_buttons;
@@ -95,7 +94,7 @@ impl AppStateRecord {
             return None;
         }
         match bytes[4] {
-            Self::VERSION | Self::V4_VERSION => {
+            Self::VERSION => {
                 if bytes.len() < Self::ENCODED_LEN {
                     return None;
                 }
@@ -103,11 +102,6 @@ impl AppStateRecord {
                 if checksum(&bytes[..32]) != expected {
                     return None;
                 }
-                let refresh_quality = if bytes[4] == Self::VERSION {
-                    bytes[31]
-                } else {
-                    0
-                };
                 Some(Self {
                     book_id: read_u32(bytes, 8),
                     chapter: read_u16(bytes, 12),
@@ -120,7 +114,7 @@ impl AppStateRecord {
                     font_weight: bytes[28],
                     font_family: bytes[29],
                     front_buttons: bytes[30],
-                    refresh_quality,
+                    refresh_quality: bytes[31],
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                 })
@@ -377,9 +371,9 @@ mod tests {
     /// two firmwares, and every compatibility test in this module would still
     /// pass if the whole envelope shifted underneath them in lockstep.
     const STATE_GOLDEN: [u8; AppStateRecord::ENCODED_LEN] = [
-        0x53, 0x4f, 0x34, 0x58, 0x05, 0x02, 0x01, 0x02, 0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x29,
+        0x53, 0x4f, 0x34, 0x58, 0x04, 0x02, 0x01, 0x02, 0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x29,
         0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x40, 0xe2, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
-        0x01, 0x01, 0xb1, 0x1b, 0xaa, 0xd8,
+        0x01, 0x01, 0x14, 0x75, 0x1e, 0x5f,
     ];
 
     #[test]

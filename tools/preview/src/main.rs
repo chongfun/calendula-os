@@ -1820,6 +1820,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         orientation: UiOrientation::PortraitButtonsLeft,
         front_pages_left: false,
         refresh_policy: UiRefreshPolicy::FullOnWake,
+        refresh_quality: ui::UiRefreshQuality::Normal,
         font_size: display::font::FontSize::Medium,
         line_spacing: display::font::LineSpacing::Normal,
         font_weight: display::font::FontWeight::Normal,
