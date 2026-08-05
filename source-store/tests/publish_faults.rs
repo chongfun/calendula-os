@@ -295,6 +295,70 @@ fn a_read_fault_is_never_mistaken_for_an_absent_record() {
     );
 }
 
+/// A read that failed while *opening* a record must never answer with a
+/// second file under the same name.
+///
+/// The pinned `embedded-sdmmc`'s create modes convert any directory-lookup
+/// error into "not there" and create — so a dropped read while reopening an
+/// existing slot returns `Ok` on a duplicate 8.3 entry, and the name stops
+/// identifying one file: writes land on the new entry while lookups may
+/// keep finding the old one. Publication reopens its target on every third
+/// generation (A/B alternation), so this is on the hot path.
+#[test]
+fn a_read_fault_while_opening_never_forks_a_record_into_two_entries() {
+    let disk = new_card();
+    {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        publish_generation(&root, PAIR, 1).expect("baseline");
+        publish_generation(&root, PAIR, 2).expect("other slot");
+    }
+    let base = disk.snapshot();
+
+    let mut faults_seen = 0u32;
+    for fault_index in 0.. {
+        disk.restore_cut(&base, &[], 0, 0);
+        let fault_fired = {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            // Generation 3 reuses the slot generation 1 wrote, so its open
+            // is the reopen-an-existing-file case.
+            disk.fault.fail_read_in.set(Some(fault_index));
+            let _ = publish_generation(&root, PAIR, 3);
+            let fired = disk.fault.fail_read_in.get().is_none();
+            disk.fault.fail_read_in.set(None);
+            fired
+        };
+        if !fault_fired {
+            break;
+        }
+        faults_seen += 1;
+        assert_no_duplicate_names(&disk, &format!("read fault {fault_index}"));
+        assert_old_or_new(&disk, Some(2), 3, &format!("read fault {fault_index}"));
+    }
+    assert!(
+        faults_seen > 0,
+        "no read fault fired; the test proves nothing"
+    );
+}
+
+/// Every directory entry name must appear at most once.
+fn assert_no_duplicate_names(disk: &SharedDisk, context: &str) {
+    let mgr = open_mgr(disk);
+    let root = open_root(&mgr);
+    let mut names: Vec<String> = Vec::new();
+    root.iterate_dir(|entry| names.push(entry.name.to_string()))
+        .expect("iterate root");
+    let mut seen = names.clone();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        names.len(),
+        "{context}: the directory holds a duplicated name: {names:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Simulated power cuts: every write boundary, plus torn sectors
 // ---------------------------------------------------------------------------

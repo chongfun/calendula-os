@@ -400,14 +400,21 @@ where
         return UploadBeginOutcome::Failed(error);
     }
 
-    // 6. Create (or truncate a stale abandoned) candidate.
-    match dir.open_file_in_dir(candidate_name.as_str(), Mode::ReadWriteCreateOrTruncate) {
+    // 6. Create (or truncate a stale abandoned) candidate. Through
+    //    `open_for_write`, so a dropped read cannot answer with a second
+    //    directory entry under the same name — the chunks below would then
+    //    append to whichever entry the scan reaches first.
+    match publish::open_for_write(
+        dir,
+        candidate_name.as_str(),
+        Mode::ReadWriteCreateOrTruncate,
+    ) {
         Ok(file) => {
             if file.close().is_err() {
                 return UploadBeginOutcome::Failed(PublishError::Io);
             }
         }
-        Err(_) => return UploadBeginOutcome::Failed(PublishError::Io),
+        Err(error) => return UploadBeginOutcome::Failed(error),
     }
 
     UploadBeginOutcome::Started(UploadTransaction {
@@ -435,8 +442,12 @@ where
     if txn.hasher.update(chunk).is_err() {
         return Err(UploadError::LengthMismatch);
     }
+    // Plain append, never create: `begin_upload` made the candidate, so a
+    // missing one is a failure to report, not a file to conjure — and a
+    // create mode here would let a dropped read fork the name and scatter
+    // the stream across two entries.
     let file = dir
-        .open_file_in_dir(txn.candidate_name.as_str(), Mode::ReadWriteCreateOrAppend)
+        .open_file_in_dir(txn.candidate_name.as_str(), Mode::ReadWriteAppend)
         .map_err(|_| UploadError::Io(PublishError::Io))?;
     let write = file.write(chunk);
     let closed = file.close();
@@ -481,7 +492,7 @@ where
     // 2. Durably sync the candidate's data and length.
     {
         let file = dir
-            .open_file_in_dir(txn.candidate_name.as_str(), Mode::ReadWriteCreateOrAppend)
+            .open_file_in_dir(txn.candidate_name.as_str(), Mode::ReadWriteAppend)
             .map_err(|_| UploadError::Io(PublishError::Io))?;
         let synced = publish::durable_sync(&file);
         let closed = file.close();

@@ -34,7 +34,8 @@ use embedded_sdmmc::{BlockDevice, Directory, Mode, TimeSource};
 
 use crate::bodies::{
     SourceMetadata, Tombstone, BOOK_TOKEN_BYTES, DISPLAY_LABEL_MAX_BYTES, LOGICAL_BOOK_ID_BYTES,
-    REQUEST_ID_BYTES, SHA256_BYTES, TOMBSTONE_MAGIC, TOMBSTONE_SCHEMA, TOMBSTONE_STATUS_DELETED,
+    REQUEST_ID_BYTES, SHA256_BYTES, SOURCE_METADATA_SCHEMA, TOMBSTONE_MAGIC, TOMBSTONE_SCHEMA,
+    TOMBSTONE_STATUS_DELETED,
 };
 use crate::layout;
 use crate::publish::{self, PublishError};
@@ -136,6 +137,9 @@ impl IdempotencyStore {
                 record_generation: 0,
             }),
             Some((_, RecordState::Committed(view))) => {
+                if view.schema_version != IDEMPOTENCY_SCHEMA {
+                    return Err(PublishError::UnsupportedSchema);
+                }
                 let state = IdempotencyState::decode(&view).ok_or(PublishError::Io)?;
                 Ok(Self {
                     state,
@@ -253,6 +257,11 @@ where
         if let Some((_, RecordState::Committed(view))) =
             publish::read_committed(dir, names.pair(), &mut ws.record_scratch)?
         {
+            // A schema this build does not read is a different answer from
+            // corruption, and the caller can act on the difference.
+            if view.schema_version != SOURCE_METADATA_SCHEMA {
+                return Err(PublishError::UnsupportedSchema);
+            }
             let metadata = SourceMetadata::decode(&view).ok_or(PublishError::Io)?;
             ws.entries[usize::from(slot)] = Some(SlotEntry {
                 physical_slot: slot,
@@ -267,6 +276,9 @@ where
         if let Some((_, RecordState::Committed(view))) =
             publish::read_committed(dir, names.pair(), &mut ws.record_scratch)?
         {
+            if view.schema_version != TOMBSTONE_SCHEMA {
+                return Err(PublishError::UnsupportedSchema);
+            }
             let stone = Tombstone::decode(&view).ok_or(PublishError::Io)?;
             ws.tombstones[usize::from(slot)] = Some((slot, stone));
         }

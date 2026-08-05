@@ -106,6 +106,11 @@ pub enum PublishError {
     /// The caller's final authority revalidation refused the commit. The
     /// prepared record is left for cleanup; no commit sector was written.
     RevalidationRefused,
+    /// A committed record is structurally sound but carries a schema
+    /// version this build does not read. Distinct from [`Io`][Self::Io] on
+    /// purpose: the card is intact and the answer is actionable (it was
+    /// written by a different build), where corruption is neither.
+    UnsupportedSchema,
     /// The record failed startup selection after the commit sync. The
     /// commit may or may not have landed; the caller must treat the pair as
     /// needing the startup selector's verdict, not assume either way.
@@ -244,9 +249,7 @@ where
 
     // Steps 2–3: body, padding, zeroed commit sector, prepared-body sync.
     {
-        let file = dir
-            .open_file_in_dir(pair.names[target], Mode::ReadWriteCreateOrTruncate)
-            .map_err(|_| PublishError::Io)?;
+        let file = open_for_write(dir, pair.names[target], Mode::ReadWriteCreateOrTruncate)?;
         let write = file
             .write(&sealed_buf[..sealed.padded_len])
             .and_then(|()| file.write(&[0u8; COMMIT_FOOTER_BYTES]))
@@ -320,6 +323,53 @@ enum ReadFile {
 /// `find_directory_entry` runs the same lookup and keeps the distinction, so
 /// a `NotFound` from the open is re-asked here. Only on the absent path, so
 /// the common case costs nothing.
+/// Open a file for writing without letting a failed lookup create one.
+///
+/// The counterpart to [`confirm_absent`], and the more dangerous direction.
+/// The pinned `embedded-sdmmc`'s create modes
+/// (`ReadWriteCreate{,OrTruncate,OrAppend}`) treat *any*
+/// `find_directory_entry` error as "the file is not there" and go straight
+/// to `write_new_directory_entry` — the error is never rechecked against
+/// `NotFound`. A dropped read while opening a file that does exist
+/// therefore returns `Ok` on a **second directory entry with the same 8.3
+/// name**, while the original entry keeps the old data. From then on the
+/// name no longer identifies one file: lookups return whichever entry the
+/// directory scan reaches first, so a record slot can be written and read
+/// through different files, and an upload's chunks can land on the entry
+/// its own reread does not see.
+///
+/// So the lookup is done here first, through the one API that keeps the
+/// distinction, and the create mode is only ever handed to the library once
+/// absence is established. When the file does exist, the equivalent
+/// non-creating mode is used — the same rewrite the library's own
+/// `solve_mode_variant` performs — which cannot create anything no matter
+/// what its internal lookup does.
+pub(crate) fn open_for_write<'d, D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &'d Directory<'_, D, T, MD, MF, MV>,
+    name: &str,
+    mode: Mode,
+) -> Result<File<'d, D, T, MD, MF, MV>, PublishError>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    let exists = match dir.find_directory_entry(name) {
+        Ok(_) => true,
+        Err(embedded_sdmmc::Error::NotFound) => false,
+        Err(_) => return Err(PublishError::Io),
+    };
+    let resolved = match (mode, exists) {
+        (Mode::ReadWriteCreateOrTruncate, true) => Mode::ReadWriteTruncate,
+        (Mode::ReadWriteCreateOrAppend, true) => Mode::ReadWriteAppend,
+        // Anything else is already safe: a non-creating mode cannot create,
+        // and a create mode over an absence this call just proved is the
+        // creation the caller asked for.
+        (mode, _) => mode,
+    };
+    dir.open_file_in_dir(name, resolved)
+        .map_err(|_| PublishError::Io)
+}
+
 pub(crate) fn confirm_absent<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     name: &str,

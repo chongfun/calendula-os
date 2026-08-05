@@ -288,7 +288,27 @@ impl RequestBinding<'_> {
 // ---------------------------------------------------------------------------
 
 pub const SOURCE_METADATA_MAGIC: [u8; 4] = *b"XTSM";
-pub const SOURCE_METADATA_SCHEMA: u16 = 1;
+
+/// Schema 2 adds [`request_binding_sha256`][SourceMetadata::request_binding_sha256]
+/// to the v1 layout, which lengthens the logical body. The version moves
+/// with the layout: two incompatible field lists must never share a number,
+/// or a reader loses the only means it has of telling them apart.
+///
+/// **No migration path from v1.** Schema 1 existed only in pre-release M0S
+/// builds on development cards — no device has ever shipped with it — and a
+/// v1 record cannot supply the request binding that v2's replay rules
+/// depend on, so adopting one as authority would mean serving replays that
+/// cannot be fully bound. Pre-v2 media is therefore declared disposable:
+/// [`crate::ops::load_catalog`] refuses such a card with
+/// [`PublishError::UnsupportedSchema`][crate::publish::PublishError::UnsupportedSchema]
+/// — a distinct, actionable answer ("this card was written by an older
+/// build; reset the source store"), never a silent misread and never a
+/// generic corruption error.
+pub const SOURCE_METADATA_SCHEMA: u16 = 2;
+
+/// The retired layout, kept named so the refusal above is traceable to
+/// something rather than to a bare number.
+pub const SOURCE_METADATA_SCHEMA_V1: u16 = 1;
 
 /// Type-specific field bytes; the logical body adds the framing prefix and
 /// CRC around them.
