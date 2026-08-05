@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.request import urlretrieve
 
 import PIL
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, features
 
 # The tables in `display/src/*_generated.rs` reproduce byte for byte on this
 # Pillow and not on later ones. Pillow 11 changed `getlength` from the hinted
@@ -72,7 +72,7 @@ THRESHOLD = text_render_threshold()
 
 def require_pinned_pillow() -> None:
     """Stop before generating anything on a toolchain or threshold configuration that changes metrics."""
-    freetype_ver = PIL.features.version_module("freetype2")
+    freetype_ver = features.version_module("freetype2")
     if PIL.__version__ != PILLOW_PIN or freetype_ver != FREETYPE_PIN:
         raise SystemExit(
             f"fontgen needs Pillow {PILLOW_PIN} and FreeType {FREETYPE_PIN}, "
