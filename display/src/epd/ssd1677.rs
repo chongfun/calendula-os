@@ -58,7 +58,7 @@ pub static INIT_SEQUENCE: &[SpiOp] = &[
     },
     SpiOp::Command {
         cmd: CMD_BOOSTER_SOFT_START,
-        data: &[0xAE, 0xC7, 0xC3, 0xC0, 0x40],
+        data: &[0xAE, 0xC7, 0xC3, 0xC0, 0x80],
     },
     SpiOp::Command {
         cmd: CMD_DRIVER_OUTPUT_CONTROL,
