@@ -505,7 +505,7 @@ the run rather than quietly emitting different tables. Regenerate through a
 throwaway environment holding the pin:
 
 ```sh
-python3 -m venv .fontgen && .fontgen/bin/pip install 'pillow==10.4.0'
+python3.12 -m venv .fontgen && .fontgen/bin/pip install 'pillow==10.4.0'
 .fontgen/bin/python tools/generate_literata.py    # and the other generators
 cargo fmt -p display                              # strips a trailing blank line
 ```

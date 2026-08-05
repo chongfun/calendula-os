@@ -78,7 +78,7 @@ def require_pinned_pillow() -> None:
         f"  Later Pillow returns unhinted advances, which moves every advance in\n"
         f"  every shipped face and repaginates every cached book on every device.\n"
         f"  Install the pin, ideally into a throwaway environment:\n"
-        f"    python3 -m venv .fontgen && .fontgen/bin/pip install 'pillow=={PILLOW_PIN}'\n"
+        f"    python3.12 -m venv .fontgen && .fontgen/bin/pip install 'pillow=={PILLOW_PIN}'\n"
         f"    .fontgen/bin/python tools/generate_literata.py\n"
         f"  If the intent is to adopt the newer metrics, that is a deliberate\n"
         f"  typography change: bump READER_LAYOUT_VERSION, re-bless the goldens\n"
