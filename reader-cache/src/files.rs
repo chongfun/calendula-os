@@ -2014,7 +2014,9 @@ where
         adoption.dirs_failed = true;
         return adoption;
     };
-    match book_dir_ownership(&book, source_identity) {
+    let ownership = book_dir_ownership(&book, source_identity);
+    cache_log!("DEBUG adopt_layout_config ownership={:?}", ownership);
+    match ownership {
         BookDirOwnership::Match => {
             adoption.purged_legacy = purge_legacy_artifacts_in(&book);
         }
@@ -2045,7 +2047,13 @@ where
     // whatever the listing gave. The config being adopted is promoted to the
     // front below either way, and the worst a wrong order does is evict the
     // less useful of two survivors.
-    let mut registry = match read_layout_registry_in(&book) {
+    let read_reg = read_layout_registry_in(&book);
+    cache_log!(
+        "DEBUG adopt_layout_config key={} count={:?}",
+        key,
+        read_reg.map(|r| r.len())
+    );
+    let mut registry = match read_reg {
         Some(registry) => registry,
         None => match layout_registry_from_index_files(&book) {
             Some(registry) if !registry.is_empty() || registry_present(&book) => registry,
@@ -2207,74 +2215,73 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let stored = read_layout_registry_in(book);
-    let registry = stored.unwrap_or_default();
+    use core::fmt::Write;
+
     let mut saw_mismatch = false;
     let mut saw_unreadable = false;
-    let mut saw_match = false;
-    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
-    for layout_key in registry.keys() {
-        book_index_file_name(*layout_key, &mut name);
+    let mut index_names = heapless::Vec::<String<SHORT_NAME_BYTES>, 16>::new();
+    let mut has_toc = false;
+
+    let err = book.iterate_dir(|entry| {
+        if entry.attributes.is_directory() {
+            return;
+        }
+        let mut name = String::<SHORT_NAME_BYTES>::new();
+        if write!(name, "{}", entry.name).is_err() {
+            saw_unreadable = true;
+            return;
+        }
+        if name.as_str() == CACHE_TOC_FILE {
+            has_toc = true;
+        } else if layout_key_of_book_index_file_name(name.as_str()).is_some()
+            && index_names.push(name).is_err()
+        {
+            saw_unreadable = true;
+        }
+    });
+
+    if err.is_err() {
+        saw_unreadable = true;
+    }
+
+    if has_toc {
+        match book.open_file_in_dir(CACHE_TOC_FILE, Mode::ReadOnly) {
+            Ok(file) => {
+                let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
+                if read_exact_file(&file, &mut header_bytes).is_ok() {
+                    if let Ok(header) = decode_toc_file_header(&header_bytes) {
+                        if header.source_hash != source_identity.0
+                            || header.source_size != source_identity.1
+                        {
+                            saw_mismatch = true;
+                        }
+                    } else {
+                        saw_unreadable = true;
+                    }
+                } else {
+                    saw_unreadable = true;
+                }
+            }
+            Err(_) => saw_unreadable = true,
+        }
+    }
+
+    for name in &index_names {
         match read_book_index_header(book, name.as_str()) {
             Some(Some(header)) => {
                 if header.source_hash != source_identity.0
                     || header.source_size != source_identity.1
                 {
                     saw_mismatch = true;
-                } else {
-                    saw_match = true;
                 }
             }
             Some(None) => saw_unreadable = true,
             None => {}
         }
     }
-    match book_index_names_unlisted_by(book, &registry) {
-        Some(unlisted_names) => {
-            for unlisted in unlisted_names {
-                match read_book_index_header(book, unlisted.as_str()) {
-                    Some(Some(header)) => {
-                        if header.source_hash != source_identity.0
-                            || header.source_size != source_identity.1
-                        {
-                            saw_mismatch = true;
-                        } else {
-                            saw_match = true;
-                        }
-                    }
-                    Some(None) => saw_unreadable = true,
-                    None => {}
-                }
-            }
-        }
-        None => saw_unreadable = true,
-    }
-    match book.open_file_in_dir(CACHE_TOC_FILE, Mode::ReadOnly) {
-        Ok(file) => {
-            let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
-            if read_exact_file(&file, &mut header_bytes).is_ok() {
-                if let Ok(header) = decode_toc_file_header(&header_bytes) {
-                    if header.source_hash != source_identity.0
-                        || header.source_size != source_identity.1
-                    {
-                        saw_mismatch = true;
-                    } else {
-                        saw_match = true;
-                    }
-                } else {
-                    saw_unreadable = true;
-                }
-            } else {
-                saw_unreadable = true;
-            }
-        }
-        Err(embedded_sdmmc::Error::NotFound) => {}
-        Err(_) => saw_unreadable = true,
-    }
+
     if saw_mismatch {
         BookDirOwnership::Mismatch
-    } else if saw_match {
-        BookDirOwnership::Match
     } else if saw_unreadable {
         BookDirOwnership::Unreadable
     } else {
@@ -2308,16 +2315,23 @@ where
     if !sections_ok {
         return false;
     }
-    let mut cleared = true;
+    // Non-marker content files (BOOK.BIN, COVER.BIN, CONT.BIN) go next. If any
+    // fail to delete, stop before removing identity markers (BK*.BIN, TOC.BIN) or
+    // CFG.BIN so durable identity markers remain intact on disk for retry.
+    let mut non_markers_ok = true;
     for name in [CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_CONTENT_FILE] {
         if upload_store::remove_file_reclaiming_clusters(book, name)
             == upload_store::RemoveStatus::Failed
         {
-            cleared = false;
+            non_markers_ok = false;
         }
+    }
+    if !non_markers_ok {
+        return false;
     }
     // Repeatedly sweep per-config index files until a pass proves no unlisted
     // index files remain (draining all batches for >4 index files).
+    let mut indexes_ok = true;
     for _ in 0..64 {
         match book_index_names_unlisted_by(book, &LayoutConfigRegistry::new()) {
             Some(names) if names.is_empty() => break,
@@ -2326,25 +2340,29 @@ where
                     if upload_store::remove_file_reclaiming_clusters(book, name.as_str())
                         == upload_store::RemoveStatus::Failed
                     {
-                        cleared = false;
+                        indexes_ok = false;
                     }
                 }
             }
             None => {
-                cleared = false;
+                indexes_ok = false;
                 break;
             }
         }
     }
+    if !indexes_ok {
+        return false;
+    }
     // Identity markers (TOC.BIN) and the registry (CFG.BIN) go last.
+    let mut final_ok = true;
     for name in [CACHE_TOC_FILE, CACHE_CONFIG_FILE] {
         if upload_store::remove_file_reclaiming_clusters(book, name)
             == upload_store::RemoveStatus::Failed
         {
-            cleared = false;
+            final_ok = false;
         }
     }
-    cleared
+    final_ok
 }
 
 /// Delete the artifacts of the single-config scheme this replaced: the
