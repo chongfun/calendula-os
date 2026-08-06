@@ -380,6 +380,7 @@ impl Emulator {
             Some(StorageCommand::StoreProgress(_)) => Some("StoreProgress"),
             Some(StorageCommand::LoanSyncMemory) => Some("LoanSyncMemory"),
             Some(StorageCommand::StoreWifiCredentials(_)) => Some("StoreWifiCredentials"),
+            Some(StorageCommand::StoreWifiApHint { .. }) => Some("StoreWifiApHint"),
             Some(StorageCommand::ForgetWifiCredentials) => Some("ForgetWifiCredentials"),
             Some(StorageCommand::ReceiveUpload) => Some("ReceiveUpload"),
             Some(StorageCommand::LoadChapters { .. }) => Some("LoadChapters"),

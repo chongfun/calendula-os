@@ -52,6 +52,10 @@ pub struct SyncLoan {
     /// Credentials from /XTEINK/WIFI.BIN; `None` sends the wifi task into
     /// the onboarding portal unless the build carries compile-time ones.
     pub wifi: Option<app_core::WifiCredentials>,
+    /// Which AP to try first, already proven to belong to `wifi`'s network.
+    /// `None` means this session joins by scanning, which is also what a
+    /// stale or unreadable hint degrades to.
+    pub wifi_hint: Option<app_core::WifiApHint>,
     /// Bytes of catalog listing written into `http_b` by the display task
     /// (`flag|open_name|label` lines) for the shelf page to serve.
     pub catalog_len: usize,

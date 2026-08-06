@@ -235,6 +235,83 @@ impl WifiCredentialsRecord {
     }
 }
 
+/// Where the station last associated: the AP a directed join should try
+/// first, so a repeat session skips the all-channel scan.
+///
+/// Deliberately **not** part of [`WifiCredentialsRecord`]. The hint is a pure
+/// accelerator — wrong, stale or missing, the join falls back to the scan and
+/// nothing is lost — while the credentials are the one thing a user would
+/// hate to lose. Widening that record to carry this would couple them: the
+/// durable layer checks payload length exactly, so a longer record reads as
+/// absent to any firmware expecting the old one, and a rollback would take
+/// the saved password with it. A separate file costs one small read per
+/// wireless session and keeps the accelerator disposable.
+///
+/// `ssid_hash` is what makes a stale hint safe: a hint learned on one network
+/// must not steer a join to another, and the hash is enough to tell them
+/// apart without storing the SSID twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WifiApHintRecord {
+    pub ssid_hash: u32,
+    pub bssid: [u8; 6],
+    /// 1-14. Zero is not a valid Wi-Fi channel and never decodes.
+    pub channel: u8,
+}
+
+impl WifiApHintRecord {
+    pub const ENCODED_LEN: usize = 4 + 1 + 4 + 6 + 1 + 4;
+    const MAGIC: u32 = 0x5834_4148; // "X4AH"
+    const VERSION: u8 = 1;
+    /// Above this, the value is not a channel number and the record is a
+    /// decode failure rather than something to clamp.
+    const MAX_CHANNEL: u8 = 14;
+
+    /// Hash an SSID the same way both writers and readers must.
+    pub fn hash_ssid(ssid: &[u8]) -> u32 {
+        checksum(ssid)
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        write_u32(&mut out, 0, Self::MAGIC);
+        out[4] = Self::VERSION;
+        write_u32(&mut out, 5, self.ssid_hash);
+        out[9..15].copy_from_slice(&self.bssid);
+        out[15] = self.channel;
+        let checksum = checksum(&out[..16]);
+        write_u32(&mut out, 16, checksum);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::ENCODED_LEN
+            || read_u32(bytes, 0) != Self::MAGIC
+            || bytes[4] != Self::VERSION
+            || read_u32(bytes, 16) != checksum(&bytes[..16])
+        {
+            return None;
+        }
+        let mut bssid = [0u8; 6];
+        bssid.copy_from_slice(&bytes[9..15]);
+        let channel = bytes[15];
+        // A hint that names no channel steers nothing, and an out-of-range
+        // one would be handed straight to the radio.
+        if channel == 0 || channel > Self::MAX_CHANNEL || bssid == [0u8; 6] {
+            return None;
+        }
+        Some(Self {
+            ssid_hash: read_u32(bytes, 5),
+            bssid,
+            channel,
+        })
+    }
+
+    /// Whether this hint was learned for `ssid`, and so may steer its join.
+    pub fn matches_ssid(&self, ssid: &[u8]) -> bool {
+        self.ssid_hash == Self::hash_ssid(ssid)
+    }
+}
+
 /// Per-book reading position, stored as POS.BIN beside that book's cache.
 ///
 /// The authoritative record of where the reader is in a book: the global
@@ -335,6 +412,60 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ap_hint_round_trips_and_rejects_nonsense() {
+        let hint = WifiApHintRecord {
+            ssid_hash: WifiApHintRecord::hash_ssid(b"home-network"),
+            bssid: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01],
+            channel: 11,
+        };
+        let bytes = hint.encode();
+        assert_eq!(WifiApHintRecord::decode(&bytes), Some(hint));
+        assert!(hint.matches_ssid(b"home-network"));
+        // The hash is the whole guard against a hint steering the wrong
+        // network's join.
+        assert!(!hint.matches_ssid(b"cafe-wifi"));
+
+        let mut corrupt = bytes;
+        corrupt[0] ^= 0xFF;
+        assert_eq!(WifiApHintRecord::decode(&corrupt), None);
+        corrupt = bytes;
+        corrupt[4] = WifiApHintRecord::VERSION + 1;
+        assert_eq!(WifiApHintRecord::decode(&corrupt), None);
+        // A flipped payload byte must fail the checksum, not ride through.
+        corrupt = bytes;
+        corrupt[10] ^= 0x01;
+        assert_eq!(WifiApHintRecord::decode(&corrupt), None);
+        assert_eq!(
+            WifiApHintRecord::decode(&bytes[..WifiApHintRecord::ENCODED_LEN - 1]),
+            None
+        );
+    }
+
+    #[test]
+    fn ap_hint_rejects_values_that_would_steer_a_join_nowhere() {
+        // Both of these are what a zeroed or half-written record looks like,
+        // and both would be handed straight to the radio.
+        for (bssid, channel) in [
+            ([0u8; 6], 6u8),
+            ([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01], 0),
+            ([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01], 15),
+            ([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01], 255),
+        ] {
+            let bytes = WifiApHintRecord {
+                ssid_hash: 1,
+                bssid,
+                channel,
+            }
+            .encode();
+            assert_eq!(
+                WifiApHintRecord::decode(&bytes),
+                None,
+                "bssid {bssid:?} channel {channel} must not decode"
+            );
+        }
+    }
 
     fn record() -> AppStateRecord {
         AppStateRecord {

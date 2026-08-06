@@ -283,6 +283,7 @@ pub(crate) fn dismantle_scratch(
             http_a: core::slice::from_raw_parts_mut(container_ptr, READER_CONTAINER_SCRATCH),
             http_b: core::slice::from_raw_parts_mut(tail_ptr, READER_TAIL_SCRATCH),
             wifi: None,
+            wifi_hint: None,
             catalog_len: 0,
         }
     }
@@ -877,6 +878,31 @@ pub(crate) fn store_wifi_credentials(
         files::write_wifi_file(root, record).is_ok()
     })
     .unwrap_or(false)
+}
+
+#[inline(never)]
+pub(crate) fn store_wifi_ap_hint(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    record: proto::nvm::WifiApHintRecord,
+) -> bool {
+    sd_session::with_root(epd, sd_cs, |root| {
+        files::write_wifi_hint_file(root, record).is_ok()
+    })
+    .unwrap_or(false)
+}
+
+#[inline(never)]
+pub(crate) fn load_wifi_ap_hint(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+) -> Option<proto::nvm::WifiApHintRecord> {
+    // Not point-free: passing the function directly fixes its `Directory`
+    // lifetime to one region, and `with_root` needs a `for<'a>` caller.
+    #[allow(clippy::redundant_closure)]
+    sd_session::with_root(epd, sd_cs, |root| files::read_wifi_hint_file(root))
+        .ok()
+        .flatten()
 }
 
 #[inline(never)]

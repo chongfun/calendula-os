@@ -37,6 +37,22 @@ use proto::captive;
 
 // Measured first-association joins ran ~21 s; give them headroom.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
+/// A directed join talks to one AP on one channel and does no scanning, so
+/// it either associates quickly or the hint is wrong. Bounded well below
+/// [`JOIN_TIMEOUT`] so a stale hint costs seconds before the scan fallback,
+/// not most of the budget the fallback still needs.
+const DIRECTED_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Grace on top of a join deadline for the radio to report a terminal
+/// result.
+///
+/// A deadline here can only stop this task waiting; it cannot stop the
+/// radio. esp-radio has no way to cancel an association in flight —
+/// `disconnect_async` refuses while the station is still connecting, and
+/// `set_config` only stops the controller when the *mode* changes, which
+/// Directed->Scan does not — so the attempt has to be seen through to a
+/// terminal event before another plan is applied. Also bounds the
+/// disconnect that retires a leftover association.
+const RADIO_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
 /// The hotspot beacons the SSID the join QR names; `ui::join_qr` is the
 /// single source, so the QR a phone scans cannot drift from the AP.
@@ -125,6 +141,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
         http_a,
         http_b,
         wifi: stored_credentials,
+        wifi_hint,
         catalog_len,
         ..
     } = loan;
@@ -186,14 +203,25 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
     let mut session = Session {
         controller,
         stack,
-        started: false,
+        configured: None,
     };
+    // Compile-time credentials never came from a join this device made, so
+    // a stored hint cannot belong to them.
+    let stored_hint = stored_credentials.and(wifi_hint);
+    // The route the next attempt aims at. It starts as the card's copy but
+    // moves with what this session learns: retired once it has missed, and
+    // replaced by whatever a scan actually associated through. `stored_hint`
+    // stays as the card's copy so the write only happens on a real change.
+    let mut hint = stored_hint;
 
     // First Start already consumed; later Starts are Confirm retries
     // from the error screen. A successful join falls through to the
     // book server, which runs until the session's reset.
     let ip = loop {
-        match session.attempt(creds.ssid(), creds.password()).await {
+        match session
+            .attempt(creds.ssid(), creds.password(), &mut hint, stored_hint)
+            .await
+        {
             Ok(ip) => break ip,
             Err(error) => send_event(SyncEvent::Failed(error)),
         }
@@ -1069,17 +1097,101 @@ fn send_event(event: SyncEvent) {
     }
 }
 
+/// Which route a join attempt takes to the access point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinPlan {
+    /// Straight at one AP on one channel: no scan at all, which is the
+    /// whole saving. Only ever built from a hint the storage task has
+    /// already matched to this network.
+    Directed { bssid: [u8; 6], channel: u8 },
+    /// Sweep every channel and let the radio's always-on sort-by-signal
+    /// pick the strongest match. The default fast scan joins the first
+    /// BSSID that answers, which on multi-AP and mesh networks can be a
+    /// weak far node.
+    Scan,
+}
+
+/// Why a join attempt did not associate, in the only terms the next plan
+/// cares about: whether the radio is quiet enough to reconfigure.
+enum JoinMiss {
+    /// The radio reported a terminal result, or the attempt never got past
+    /// configuring the controller. Either way nothing is in flight, so
+    /// another plan can be applied on top.
+    Settled,
+    /// The association is still in flight past its deadline. Nothing here
+    /// can cancel it (see [`RADIO_SETTLE_TIMEOUT`]), so no other plan may
+    /// be applied and the attempt ends instead.
+    InFlight,
+}
+
 struct Session {
     controller: WifiController<'static>,
     stack: Stack<'static>,
-    started: bool,
+    /// The plan the controller is currently configured for, or `None` when
+    /// the controller matches no plan — before the first join, and after
+    /// any `set_config` that failed. Reconfiguring restarts the radio, so
+    /// it happens only when the plan actually changes — which on a retry at
+    /// the same plan is never.
+    configured: Option<JoinPlan>,
 }
 
 impl Session {
     /// One join attempt: associate, wait for DHCP, report the address.
-    async fn attempt(&mut self, ssid: &str, password: &str) -> Result<[u8; 4], SyncError> {
+    ///
+    /// A hint is tried first and the scan is the fallback, so a router that
+    /// moved channel or an AP that went away costs
+    /// [`DIRECTED_JOIN_TIMEOUT`] and then behaves exactly as it did before
+    /// hints existed — once. `hint` is this session's working copy and is
+    /// written through: a directed miss retires it, and an association
+    /// replaces it, so no later Confirm pays that cost for the same
+    /// already-disproven target. `stored` is the card's copy and stays put,
+    /// so it is still what decides whether a write is worth making.
+    async fn attempt(
+        &mut self,
+        ssid: &str,
+        password: &str,
+        hint: &mut Option<app_core::WifiApHint>,
+        stored: Option<app_core::WifiApHint>,
+    ) -> Result<[u8; 4], SyncError> {
         send_event(SyncEvent::Connecting);
-        self.join(ssid, password).await?;
+        self.retire_association().await?;
+
+        let directed = hint.map(|hint| JoinPlan::Directed {
+            bssid: hint.bssid,
+            channel: hint.channel,
+        });
+        let mut associated = None;
+        for plan in directed.into_iter().chain(core::iter::once(JoinPlan::Scan)) {
+            match self.join(ssid, password, plan).await {
+                Ok(learned) => {
+                    associated = Some(learned);
+                    break;
+                }
+                Err(JoinMiss::InFlight) => return Err(SyncError::Join),
+                Err(JoinMiss::Settled) => {
+                    if matches!(plan, JoinPlan::Directed { .. }) {
+                        // The saved route has now been proven wrong. Retiring
+                        // it keeps every later Confirm in this session from
+                        // spending DIRECTED_JOIN_TIMEOUT on it again before
+                        // reaching the scan that does work.
+                        esp_println::println!("wifi: directed join missed; falling back to scan");
+                        *hint = None;
+                    }
+                }
+            }
+        }
+        let Some(associated) = associated else {
+            return Err(SyncError::Join);
+        };
+        // A channel outside 1-14 is useless to both sides: the storage record
+        // refuses it, and a directed plan cannot be aimed at it.
+        let learned = (1..=14).contains(&associated.channel).then_some(associated);
+        // Adopt the AP the radio actually associated through before DHCP gets
+        // a chance to fail, so a retry aims at the one that just answered
+        // rather than reverting to a target that did not.
+        if let Some(learned) = learned {
+            *hint = Some(learned);
+        }
 
         let config = with_timeout(DHCP_TIMEOUT, async {
             loop {
@@ -1098,40 +1210,160 @@ impl Session {
             esp_alloc::HEAP.used(),
             esp_alloc::HEAP.free()
         );
+        if let Some(learned) = learned {
+            record_ap_hint(ssid, learned, stored).await;
+        }
         send_event(SyncEvent::Connected(ip));
         Ok(ip)
     }
 
-    async fn join(&mut self, ssid: &str, password: &str) -> Result<(), SyncError> {
-        if !self.started {
-            let config = WifiConfig::Station(
-                StationConfig::default()
-                    .with_ssid(ssid)
-                    .with_password(password.into())
-                    // The default fast scan joins the first BSSID that answers,
-                    // which on multi-AP/mesh networks can be a weak far node.
-                    // All-channels makes the radio's always-on sort-by-signal
-                    // pick the strongest match, costing one full sweep (~1-2 s)
-                    // per join against JOIN_TIMEOUT's ~14 s of headroom.
-                    .with_scan_method(ScanMethod::AllChannels)
-                    .with_auth_method(if password.is_empty() {
-                        AuthenticationMethod::None
-                    } else {
-                        AuthenticationMethod::Wpa2Personal
-                    }),
-            );
-            self.controller
-                .set_config(&config)
-                .map_err(|_| SyncError::Join)?;
-            self.started = true;
+    /// Drop an association left over from an earlier attempt.
+    ///
+    /// A DHCP failure returns from [`Self::attempt`] with the station still
+    /// associated, and the Confirm that follows starts a fresh attempt that
+    /// wants to configure and connect from a quiet radio. Retiring the old
+    /// association first is what makes that true.
+    async fn retire_association(&mut self) -> Result<(), SyncError> {
+        if !self.controller.is_connected() {
+            return Ok(());
         }
-        with_timeout(JOIN_TIMEOUT, self.controller.connect_async())
-            .await
-            .map_err(|_| SyncError::Join)?
-            .map(|_| ())
-            .map_err(|err| {
-                esp_println::println!("wifi: join failed: {:?}", err);
-                SyncError::Join
-            })
+        match with_timeout(RADIO_SETTLE_TIMEOUT, self.controller.disconnect_async()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => {
+                esp_println::println!("wifi: disconnect failed: {:?}", err);
+                Err(SyncError::Join)
+            }
+            Err(_) => {
+                esp_println::println!("wifi: disconnect did not settle");
+                Err(SyncError::Join)
+            }
+        }
     }
+
+    /// Associate under `plan`, reporting the AP that answered.
+    async fn join(
+        &mut self,
+        ssid: &str,
+        password: &str,
+        plan: JoinPlan,
+    ) -> Result<app_core::WifiApHint, JoinMiss> {
+        self.configure(ssid, password, plan)?;
+
+        let deadline = match plan {
+            JoinPlan::Directed { .. } => DIRECTED_JOIN_TIMEOUT,
+            JoinPlan::Scan => JOIN_TIMEOUT,
+        };
+        let outcome = {
+            let mut connect = core::pin::pin!(self.controller.connect_async());
+            match select(&mut connect, Timer::after(deadline)).await {
+                Either::First(result) => Some(result),
+                // The deadline is this task's, not the radio's. Dropping the
+                // future here would leave esp-radio inside
+                // `esp_wifi_connect`, and the next plan's `set_config` would
+                // then race an association still in flight. Hold the same
+                // future — and with it the same event subscription, so no
+                // event can slip through a gap — until the driver reports
+                // one way or the other.
+                Either::Second(()) => {
+                    esp_println::println!("wifi: join deadline reached; settling");
+                    with_timeout(RADIO_SETTLE_TIMEOUT, connect).await.ok()
+                }
+            }
+        };
+
+        match outcome {
+            Some(Ok(info)) => Ok(app_core::WifiApHint {
+                bssid: info.bssid,
+                channel: info.channel,
+            }),
+            Some(Err(err)) => {
+                esp_println::println!("wifi: join failed: {:?}", err);
+                Err(JoinMiss::Settled)
+            }
+            None => {
+                // The controller is neither connected nor idle, so it no
+                // longer matches any plan this session can name. Clearing the
+                // record is all that can be done: it at least makes a later
+                // retry reapply the configuration rather than assume one.
+                self.configured = None;
+                esp_println::println!("wifi: join did not settle");
+                Err(JoinMiss::InFlight)
+            }
+        }
+    }
+
+    /// Apply `plan` to the controller unless it is already the configured
+    /// one.
+    ///
+    /// A `set_config` failure is a [`JoinMiss::Settled`]: esp-radio's own
+    /// guard has already reset the mode to NULL and stopped the controller,
+    /// so the next plan's `set_config` restarts it from a known state. The
+    /// record is cleared before the call rather than only on success, so
+    /// that failure cannot leave this task believing in a plan the
+    /// controller no longer holds.
+    fn configure(&mut self, ssid: &str, password: &str, plan: JoinPlan) -> Result<(), JoinMiss> {
+        if self.configured == Some(plan) {
+            return Ok(());
+        }
+        let auth = if password.is_empty() {
+            AuthenticationMethod::None
+        } else {
+            AuthenticationMethod::Wpa2Personal
+        };
+        let station = StationConfig::default()
+            .with_ssid(ssid)
+            .with_password(password.into())
+            .with_auth_method(auth);
+        let station = match plan {
+            JoinPlan::Directed { bssid, channel } => station
+                .with_bssid(bssid)
+                .with_channel(channel)
+                // Naming the BSSID and channel is the point; a sweep
+                // would throw the saving away.
+                .with_scan_method(ScanMethod::Fast),
+            JoinPlan::Scan => station.with_scan_method(ScanMethod::AllChannels),
+        };
+        self.configured = None;
+        self.controller
+            .set_config(&WifiConfig::Station(station))
+            .map_err(|err| {
+                esp_println::println!("wifi: set_config failed: {:?}", err);
+                JoinMiss::Settled
+            })?;
+        self.configured = Some(plan);
+        Ok(())
+    }
+}
+
+/// Persist the AP this session actually associated through, when it is not
+/// already what the card holds.
+///
+/// Taken from what the radio reported on association rather than assumed
+/// from the plan, because the scan path chooses an AP this task never names
+/// — that choice is exactly what is worth remembering. Comparing against
+/// the card's copy rather than the session's working hint keeps a repeat
+/// session from spending an SD write to store what is already there, while
+/// still writing after a scan corrected a stale hint.
+async fn record_ap_hint(
+    ssid: &str,
+    learned: app_core::WifiApHint,
+    stored: Option<app_core::WifiApHint>,
+) {
+    if stored == Some(learned) {
+        return;
+    }
+    let Some(ssid) = app_core::WifiSsid::new(ssid) else {
+        return;
+    };
+    esp_println::println!(
+        "wifi: learned ap channel={} bssid={:02x?}",
+        learned.channel,
+        learned.bssid
+    );
+    STORAGE_COMMANDS
+        .send(StorageCommand::StoreWifiApHint {
+            ssid,
+            hint: learned,
+        })
+        .await;
 }
