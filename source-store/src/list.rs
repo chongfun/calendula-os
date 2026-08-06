@@ -81,40 +81,51 @@ pub enum ListError {
     OutputTooSmall,
 }
 
-/// Fill `out` with every listable book, returning how many were written.
-/// Slot order — stable across calls that see the same committed state.
-pub fn list_books(ws: &OpsWorkspace, out: &mut [BookListEntry]) -> Result<usize, ListError> {
+/// The list entry for one physical slot, or `None` when that slot holds
+/// nothing listable. The per-slot form exists for callers that must
+/// stream entries one at a time — a firmware task cannot afford a
+/// [`MAX_SOURCE_SLOTS`]-sized array on its stack — and it requires the
+/// same valid catalog the whole-list form does, for the same reason.
+pub fn listed_book_at(ws: &OpsWorkspace, slot: usize) -> Result<Option<BookListEntry>, ListError> {
     if !ws.catalog_is_valid() {
         return Err(ListError::CatalogUnavailable);
     }
+    let Some(Some(entry)) = ws.entries.get(slot) else {
+        return Ok(None);
+    };
+    if ws.dispositions[slot] != SlotDisposition::Authoritative {
+        return Ok(None);
+    }
+    let meta = &entry.metadata;
+    let level = ws
+        .session
+        .level(&meta.logical_book_id, meta.source_generation);
+    let status = integrity_status(level);
+    let observed = ws
+        .session
+        .observed_identity(&meta.logical_book_id, meta.source_generation);
+    Ok(Some(BookListEntry {
+        display_label: meta.display_label,
+        logical_book_id: meta.logical_book_id,
+        book_token: meta.book_token,
+        source_generation: meta.source_generation,
+        source_origin: meta.source_origin,
+        externally_recovered: meta.externally_recovered,
+        source_integrity_status: status,
+        source_length: meta.source_length,
+        observed_source_length: observed.map(|(length, _)| length),
+        observed_source_sha256: observed.map(|(_, sha256)| sha256),
+        allowed_operations: allowed_operations(meta.source_origin, status),
+    }))
+}
+
+/// Fill `out` with every listable book, returning how many were written.
+/// Slot order — stable across calls that see the same committed state.
+pub fn list_books(ws: &OpsWorkspace, out: &mut [BookListEntry]) -> Result<usize, ListError> {
     let mut written = 0usize;
     for slot in 0..MAX_SOURCE_SLOTS {
-        let Some(entry) = &ws.entries[slot] else {
+        let Some(listed) = listed_book_at(ws, slot)? else {
             continue;
-        };
-        if ws.dispositions[slot] != SlotDisposition::Authoritative {
-            continue;
-        }
-        let meta = &entry.metadata;
-        let level = ws
-            .session
-            .level(&meta.logical_book_id, meta.source_generation);
-        let status = integrity_status(level);
-        let observed = ws
-            .session
-            .observed_identity(&meta.logical_book_id, meta.source_generation);
-        let listed = BookListEntry {
-            display_label: meta.display_label,
-            logical_book_id: meta.logical_book_id,
-            book_token: meta.book_token,
-            source_generation: meta.source_generation,
-            source_origin: meta.source_origin,
-            externally_recovered: meta.externally_recovered,
-            source_integrity_status: status,
-            source_length: meta.source_length,
-            observed_source_length: observed.map(|(length, _)| length),
-            observed_source_sha256: observed.map(|(_, sha256)| sha256),
-            allowed_operations: allowed_operations(meta.source_origin, status),
         };
         let Some(target) = out.get_mut(written) else {
             return Err(ListError::OutputTooSmall);

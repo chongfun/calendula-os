@@ -97,7 +97,9 @@ pub struct MountSession {
 }
 
 impl MountSession {
-    pub fn new() -> Self {
+    /// `const` for the same reason as `OpsWorkspace::new`: the session
+    /// table is embedded in the workspace static.
+    pub const fn new() -> Self {
         Self {
             entries: [None; MAX_SOURCE_SLOTS],
         }

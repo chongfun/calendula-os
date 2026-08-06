@@ -91,7 +91,11 @@ pub struct OpsWorkspace {
 }
 
 impl OpsWorkspace {
-    pub fn new() -> Self {
+    /// `const` so firmware can place the ~36 KB workspace in a
+    /// `ConstStaticCell` initialized at compile time: a value this size
+    /// must never exist on the ~43 KB stack, and no-alloc firmware has no
+    /// heap to build it on outside the wireless session.
+    pub const fn new() -> Self {
         Self {
             record_scratch: [0; OPS_SCRATCH_BYTES],
             seal_scratch: [0; OPS_SEAL_BYTES],
@@ -281,6 +285,51 @@ impl IdempotencyStore {
             Err(_) => self.committed_state_known = false,
         }
     }
+}
+
+/// Rotate the idempotency epoch when the current one has no headroom
+/// left, publishing the rotated state durably. Returns whether a rotation
+/// happened.
+///
+/// This is the call site the PRD's rule "rotation occurs before accepting
+/// more requests than the current receipt capacity can retain" names: the
+/// storage owner runs it before advertising the epoch in a capabilities
+/// response, so a client never receives an epoch that cannot accept a
+/// request. Rotation makes in-flight client epochs stale — those requests
+/// get a stale-epoch rejection and re-fetch capabilities, which is the
+/// protocol working, not a failure. Epochs step by exactly one from the
+/// committed record, so they stay monotonic and are never reused; the
+/// receipts of the newly previous epoch remain replayable through the
+/// bounded migration window [`IdempotencyState::rotate_epoch`] enforces.
+///
+/// A failed publication follows [`IdempotencyStore::publish`]'s contract:
+/// the resident state re-syncs from the card or the store marks itself
+/// unusable — the advertised epoch always comes from committed state.
+pub fn ensure_epoch_headroom<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    idem: &mut IdempotencyStore,
+    ws: &mut OpsWorkspace,
+) -> Result<bool, PublishError>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    if !idem.is_usable() {
+        return Err(PublishError::Io);
+    }
+    if idem.state.has_epoch_headroom() {
+        return Ok(false);
+    }
+    let next = idem
+        .state
+        .current_epoch
+        .checked_add(1)
+        .ok_or(PublishError::BadInput)?;
+    idem.state
+        .rotate_epoch(next)
+        .map_err(|_| PublishError::BadInput)?;
+    idem.publish(dir, ws)?;
+    Ok(true)
 }
 
 /// Load every committed source-metadata record and tombstone, then run

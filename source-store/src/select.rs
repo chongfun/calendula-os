@@ -26,8 +26,11 @@ use crate::bodies::{SourceMetadata, StagingMarker, Tombstone};
 
 /// Managed physical source slots. Provisional v1 constant (a PRD
 /// measurement gate, alongside the catalog's own limits): bounds every
-/// selection scratch array at a size the firmware can afford.
-pub const MAX_SOURCE_SLOTS: usize = 64;
+/// selection scratch array at a size the firmware can afford. Thirty-two
+/// is that size today — the catalog view and mount-session table live in
+/// firmware `.bss`, where 64 slots overflowed the X4's DRAM at link
+/// time. Revisit alongside unmanaged adoption, which shares the pool.
+pub const MAX_SOURCE_SLOTS: usize = 32;
 
 /// One physical slot's committed metadata, as the I/O layer found it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

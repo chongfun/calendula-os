@@ -136,8 +136,12 @@ mod tests {
     #[test]
     fn names_are_expected_shape() {
         assert_eq!(source_slot_name(0).unwrap().as_str(), "S00.EPB");
-        assert_eq!(source_slot_name(63).unwrap().as_str(), "S63.EPB");
-        assert!(source_slot_name(64).is_none());
+        let last = MAX_SOURCE_SLOTS as u8 - 1;
+        assert_eq!(
+            source_slot_name(last).unwrap().as_str(),
+            std::format!("S{last:02}.EPB")
+        );
+        assert!(source_slot_name(MAX_SOURCE_SLOTS as u8).is_none());
         let pair = metadata_pair(7).unwrap();
         assert_eq!(pair.pair().names, ["M07A.BIN", "M07B.BIN"]);
         let pair = tombstone_pair(15).unwrap();

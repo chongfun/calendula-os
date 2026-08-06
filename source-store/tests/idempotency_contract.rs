@@ -960,3 +960,61 @@ fn committed_receipt(root: &Dir<'_>, nonce_seed: u8) -> Option<bool> {
         .ok()
         .map(|store| store.state.contains_request(1, &[nonce_seed; 16]))
 }
+
+#[test]
+fn ensure_epoch_headroom_rotates_durably_and_keeps_replays() {
+    use source_store::ops::ensure_epoch_headroom;
+    use source_store::receipts::MAX_RECEIPTS_PER_EPOCH;
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+
+    // With headroom, nothing rotates and nothing is published.
+    assert_eq!(ensure_epoch_headroom(&root, &mut idem, &mut ws), Ok(false));
+    assert_eq!(idem.state.current_epoch, 1);
+    assert_eq!(idem.record_generation, 0, "no publication happened");
+
+    // Exhaust the current epoch's budget with retained receipts.
+    for n in 0..MAX_RECEIPTS_PER_EPOCH as u8 {
+        idem.state
+            .insert(OperationReceipt {
+                epoch: 1,
+                request_nonce: [n + 1; 16],
+                operation: ReceiptOperation::Delete,
+                logical_book_id: [n + 1; LOGICAL_BOOK_ID_BYTES],
+                base_book_token_or_zero: [n + 1; BOOK_TOKEN_BYTES],
+                source_generation: 0,
+                source_length_or_zero: 0,
+                source_sha256_or_zero: [0; SHA256_BYTES],
+                display_label_len: 0,
+                display_label: [0; DISPLAY_LABEL_MAX_BYTES],
+                result_book_token_or_zero: [0; BOOK_TOKEN_BYTES],
+                result_status: RECEIPT_STATUS_SUCCESS,
+            })
+            .expect("insert receipt");
+    }
+    idem.publish(&root, &mut ws).expect("publish full epoch");
+    assert!(!idem.state.has_epoch_headroom());
+
+    // Now the helper rotates, durably.
+    assert_eq!(ensure_epoch_headroom(&root, &mut idem, &mut ws), Ok(true));
+    assert_eq!(idem.state.current_epoch, 2);
+    assert!(idem.state.has_epoch_headroom());
+
+    // Durably: a reboot-fresh load sees the rotated epoch, and the
+    // previous epoch's receipts still replay through the migration window.
+    let mut fresh_ws = workspace();
+    load_catalog(&root, &mut fresh_ws).expect("catalog");
+    let reloaded = IdempotencyStore::load(&root, &mut fresh_ws).expect("reload");
+    assert_eq!(reloaded.state.current_epoch, 2);
+    assert!(reloaded.state.epoch_is_accepted(1));
+    assert!(reloaded.state.get_receipt(1, &[1; 16]).is_some());
+
+    // Genuinely new epoch-1 requests are now stale — the client re-fetches
+    // capabilities; that is the designed outcome, not a regression.
+    assert!(!reloaded.state.epoch_is_current(1));
+}
