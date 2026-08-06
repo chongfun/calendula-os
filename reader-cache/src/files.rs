@@ -1058,9 +1058,10 @@ const SHORT_NAME_BYTES: usize = 12;
 /// forever. `SECTIONS/` is enumerated instead, so what is on the card decides
 /// what gets deleted.
 ///
-/// BOOK.BIN goes first, deliberately. It is the cache's liveness marker, so an
-/// interrupted delete leaves a cache that reads as absent and gets rebuilt,
-/// rather than a header advertising sections that are no longer there.
+/// Per-config index files (`BK*.BIN`) and section files are removed first, and
+/// `CFG.BIN` goes last once all artifacts are cleared. Keeping `CFG.BIN` until
+/// the end ensures an interrupted clear preserves the registry so surviving
+/// per-config files remain accounted for on subsequent opens.
 ///
 /// The global reading position in XTEINK/STATE.BIN is never touched.
 pub fn empty_cache_dir<
@@ -1985,6 +1986,7 @@ pub fn adopt_layout_config<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
+    source_identity: (u32, u32),
     library: &ReaderStore,
 ) -> LayoutConfigAdoption
 where
@@ -2012,7 +2014,16 @@ where
         adoption.dirs_failed = true;
         return adoption;
     };
-    adoption.purged_legacy = purge_legacy_artifacts_in(&book);
+    if !book_dir_belongs_to_source_identity(&book, source_identity) {
+        cache_log!("cache: adopt config identity mismatch key={}", key);
+        if !purge_colliding_cache_artifacts_in(&book) {
+            adoption.dirs_failed = true;
+            return adoption;
+        }
+        adoption.purged_legacy = true;
+    } else {
+        adoption.purged_legacy = purge_legacy_artifacts_in(&book);
+    }
     // A registry file that is there and will not decode gets rebuilt from the
     // index files that really are on the card, rather than started over from
     // empty. Starting empty is what loses the bound: the configs already there
@@ -2160,6 +2171,117 @@ where
     book_index_file_name(layout_key, &mut name);
     upload_store::remove_file_reclaiming_clusters(book, name.as_str())
         != upload_store::RemoveStatus::Failed
+}
+
+/// Check whether every readable index file or TOC file in a book cache directory
+/// matches the expected source identity. Returns false if any readable header
+/// identifies a different source book (a 28-bit key collision).
+fn book_dir_belongs_to_source_identity<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    source_identity: (u32, u32),
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let stored = read_layout_registry_in(book);
+    let registry = stored.unwrap_or_default();
+    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
+    for layout_key in registry.keys() {
+        book_index_file_name(*layout_key, &mut name);
+        if let Some(Some(header)) = read_book_index_header(book, name.as_str()) {
+            if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
+                return false;
+            }
+        }
+    }
+    if let Some(unlisted_names) = book_index_names_unlisted_by(book, &registry) {
+        for unlisted in unlisted_names {
+            if let Some(Some(header)) = read_book_index_header(book, unlisted.as_str()) {
+                if header.source_hash != source_identity.0
+                    || header.source_size != source_identity.1
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    if let Ok(file) = book.open_file_in_dir(CACHE_TOC_FILE, Mode::ReadOnly) {
+        let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
+        if read_exact_file(&file, &mut header_bytes).is_ok() {
+            if let Ok(header) = decode_toc_file_header(&header_bytes) {
+                if header.source_hash != source_identity.0
+                    || header.source_size != source_identity.1
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Remove all cache files (indexes, sections, TOC/COVER/CONT, CFG.BIN) in a
+/// directory that was occupied by a colliding book identity.
+fn purge_colliding_cache_artifacts_in<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut cleared = true;
+    for name in [
+        CACHE_BOOK_FILE,
+        CACHE_TOC_FILE,
+        CACHE_COVER_FILE,
+        CACHE_CONTENT_FILE,
+    ] {
+        if upload_store::remove_file_reclaiming_clusters(book, name)
+            == upload_store::RemoveStatus::Failed
+        {
+            cleared = false;
+        }
+    }
+    match book_index_names_unlisted_by(book, &LayoutConfigRegistry::new()) {
+        Some(names) => {
+            for name in &names {
+                if upload_store::remove_file_reclaiming_clusters(book, name.as_str())
+                    == upload_store::RemoveStatus::Failed
+                {
+                    cleared = false;
+                }
+            }
+        }
+        None => cleared = false,
+    }
+    match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => {
+            if !empty_sections_dir(&sections) {
+                cleared = false;
+            }
+        }
+        Err(embedded_sdmmc::Error::NotFound) => {}
+        Err(_) => cleared = false,
+    }
+    if upload_store::remove_file_reclaiming_clusters(book, CACHE_CONFIG_FILE)
+        == upload_store::RemoveStatus::Failed
+    {
+        cleared = false;
+    }
+    cleared
 }
 
 /// Delete the artifacts of the single-config scheme this replaced: the

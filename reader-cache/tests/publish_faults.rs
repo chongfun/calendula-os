@@ -876,7 +876,7 @@ fn the_prune_leaves_the_other_config_alone() {
         shrinking_key, keeper_key,
         "the flip must land on a different config for this to test anything"
     );
-    files::adopt_layout_config(&root, KEY, &store);
+    files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     let wide = build_book(&root, &mut store, 5);
     let narrow = &wide[..2];
     store.begin_book_load();
@@ -1094,7 +1094,7 @@ fn book_index_present(root: &Dir<'_>, layout_key: u8) -> bool {
 /// write its index. Returns the config's cache key.
 fn build_under_current_config(root: &Dir<'_>, store: &mut ReaderStore, sections: usize) -> u8 {
     let layout_key = layout_cache_key_for(store);
-    files::adopt_layout_config(root, KEY, store);
+    files::adopt_layout_config(root, KEY, IDENTITY, store);
     let records = build_book(root, store, sections);
     let pages = total_pages(&records);
     assert!(
@@ -1146,7 +1146,7 @@ fn a_second_layout_config_does_not_overwrite_the_first() {
     // without any rebuild.
     let (settings, portrait) = (store.type_settings(), !store.portrait());
     store.set_layout(settings, portrait);
-    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert!(
         adoption.resident,
         "the config just flipped away from must read as already built"
@@ -1188,7 +1188,7 @@ fn a_third_layout_config_evicts_the_least_recently_used_one() {
     let (settings, portrait) = larger_of(&store);
     store.set_layout(settings, portrait);
     let third_key = layout_cache_key_for(&store);
-    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert_eq!(
         adoption.evicted,
         Some(first_key),
@@ -1264,7 +1264,7 @@ fn an_eviction_that_cannot_delete_keeps_the_evicted_config_registered() {
 
     let (settings, portrait) = larger_of(&store);
     store.set_layout(settings, portrait);
-    let blocked = files::adopt_layout_config(&root, KEY, &store);
+    let blocked = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert_eq!(
         blocked.evicted, None,
         "nothing was deleted, so nothing may be reported evicted"
@@ -1291,7 +1291,7 @@ fn an_eviction_that_cannot_delete_keeps_the_evicted_config_registered() {
     // The whole point of leaving the registry alone: the config is still
     // named, so the next open under the third config evicts it rather than
     // walking past files nothing counts.
-    let retry = files::adopt_layout_config(&root, KEY, &store);
+    let retry = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert_eq!(
         retry.evicted,
         Some(first_key),
@@ -1339,7 +1339,7 @@ fn an_eviction_that_cannot_delete_a_section_file_reports_no_eviction() {
 
     let (settings, portrait) = larger_of(&store);
     store.set_layout(settings, portrait);
-    let blocked = files::adopt_layout_config(&root, KEY, &store);
+    let blocked = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert_eq!(
         blocked.evicted, None,
         "a sweep that left a file behind is not an eviction"
@@ -1358,7 +1358,7 @@ fn an_eviction_that_cannot_delete_a_section_file_reports_no_eviction() {
         "the section that refused to go is still on the card"
     );
 
-    let retry = files::adopt_layout_config(&root, KEY, &store);
+    let retry = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert_eq!(
         retry.evicted,
         Some(first_key),
@@ -1388,13 +1388,13 @@ fn re_reading_a_config_keeps_it_off_the_eviction_block() {
     // Go back to the first config without building: it becomes most recent.
     let (settings, portrait) = (store.type_settings(), !store.portrait());
     store.set_layout(settings, portrait);
-    assert!(files::adopt_layout_config(&root, KEY, &store).resident);
+    assert!(files::adopt_layout_config(&root, KEY, IDENTITY, &store).resident);
 
     // A third config now takes the *other* one's slot.
     let (settings, portrait) = larger_of(&store);
     store.set_layout(settings, portrait);
     assert_eq!(
-        files::adopt_layout_config(&root, KEY, &store).evicted,
+        files::adopt_layout_config(&root, KEY, IDENTITY, &store).evicted,
         Some(second_key),
         "eviction must take the config that has not been read since, not the one just re-read"
     );
@@ -1436,7 +1436,7 @@ fn the_first_open_after_the_single_config_scheme_purges_its_files() {
     write_cover(&root);
     drop(book);
 
-    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert!(
         adoption.purged_legacy,
         "an unkeyed BOOK.BIN must be recognized as the previous scheme's"
@@ -1469,7 +1469,7 @@ fn the_first_open_after_the_single_config_scheme_purges_its_files() {
 
     // A second open has nothing left to find, so the pass costs one failed
     // open rather than a sections listing.
-    assert!(!files::adopt_layout_config(&root, KEY, &store).purged_legacy);
+    assert!(!files::adopt_layout_config(&root, KEY, IDENTITY, &store).purged_legacy);
 }
 
 /// Invariant: a cache whose registry was lost still identifies its book.
@@ -1572,7 +1572,7 @@ fn a_registry_write_that_is_refused_is_reported() {
 
     let (settings, portrait) = landscape_of(&store);
     store.set_layout(settings, portrait);
-    let blocked = files::adopt_layout_config(&root, KEY, &store);
+    let blocked = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert!(
         blocked.registry_write_failed,
         "a registry that would not take the write must say so"
@@ -1621,7 +1621,7 @@ fn a_registry_left_unusable_is_rebuilt_from_the_index_files_on_the_card() {
     // the bound says one of them goes -- which an empty registry could not know.
     let (settings, portrait) = larger_of(&store);
     store.set_layout(settings, portrait);
-    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     let evicted = adoption
         .evicted
         .expect("a truncated registry must not hide the configs the card still holds");
@@ -1681,8 +1681,8 @@ fn a_legacy_sweep_that_is_blocked_keeps_its_retry_marker() {
         .expect("hold the legacy section open");
 
     assert!(
-        files::adopt_layout_config(&root, KEY, &store).purged_legacy,
-        "the marker was there, so the purge ran"
+        files::adopt_layout_config(&root, KEY, IDENTITY, &store).purged_legacy,
+        "the purge marker must survive a single-config sweep"
     );
     assert!(
         book.open_file_in_dir(CACHE_BOOK_FILE, embedded_sdmmc::Mode::ReadOnly)
@@ -1696,7 +1696,7 @@ fn a_legacy_sweep_that_is_blocked_keeps_its_retry_marker() {
 
     // The block is gone; the retry the marker bought finishes the job.
     assert!(
-        files::adopt_layout_config(&root, KEY, &store).purged_legacy,
+        files::adopt_layout_config(&root, KEY, IDENTITY, &store).purged_legacy,
         "the surviving marker must send the next open back through the purge"
     );
     let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
@@ -1883,7 +1883,7 @@ fn reconstruct_registry_removes_excess_configs_and_succeeds() {
     drop(book);
 
     // Rebuilding will find 3 index files on disk (_k1, _k2, _k3). It must evict & delete the 3rd one found.
-    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert!(
         adoption.succeeded(),
         "reconstruction from index files with excess configs must succeed"
@@ -1931,7 +1931,7 @@ fn reconstruct_registry_handles_overflowing_inventory_with_five_configs() {
     drop(cfg_file);
     drop(book);
 
-    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert!(
         adoption.succeeded(),
         "reconstructing from 5 index files must succeed by looping passes"
@@ -1986,7 +1986,7 @@ fn reconstruct_retries_cleanup_when_excess_section_delete_fails() {
         .open_file_in_dir(sname.as_str(), embedded_sdmmc::Mode::ReadOnly)
         .expect("hold k1 section file open");
 
-    let blocked = files::adopt_layout_config(&root, KEY, &store);
+    let blocked = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert!(
         !blocked.succeeded(),
         "adoption must fail when excess section deletion fails"
@@ -2000,7 +2000,7 @@ fn reconstruct_retries_cleanup_when_excess_section_delete_fails() {
     drop(sections);
     drop(book);
 
-    let retry = files::adopt_layout_config(&root, KEY, &store);
+    let retry = files::adopt_layout_config(&root, KEY, IDENTITY, &store);
     assert!(
         retry.succeeded(),
         "adoption must succeed on retry once section block is cleared"
@@ -2009,4 +2009,68 @@ fn reconstruct_retries_cleanup_when_excess_section_delete_fails() {
         !book_index_present(&root, k1),
         "BK<k1>.BIN must be removed after successful section deletion"
     );
+}
+
+/// Invariant: adopting a cache key occupied by a different source identity
+/// (a 28-bit hash collision) clears the old owner's cache files before adopting
+/// the new book under its own layout configuration.
+#[test]
+fn adopting_colliding_key_clears_old_owner_cache_and_adopts_new_owner() {
+    const IDENTITY_A: (u32, u32) = (0x1111_2222, 1000);
+    const IDENTITY_B: (u32, u32) = (0x3333_4444, 2000);
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // Book A builds under Layout 1 (default store layout)
+    files::ensure_v2_cache_dirs(&root, KEY).expect("dirs");
+    files::adopt_layout_config(&root, KEY, IDENTITY_A, &store);
+    let records_a = build_book(&root, &mut store, 1);
+    let pages_a = total_pages(&records_a);
+    let k1 = layout_cache_key_for(&store);
+    assert!(files::write_v2_book_index(
+        &root, KEY, IDENTITY_A, pages_a, &records_a, &store, false, 0
+    ));
+
+    assert!(book_index_present(&root, k1));
+    let files::CacheHeader::Present(header_a) = files::read_cache_header(&root, KEY) else {
+        panic!("expected header A");
+    };
+    assert_eq!((header_a.source_hash, header_a.source_size), IDENTITY_A);
+
+    // Book B opens under a colliding key with Layout 2 (landscape)
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let k2 = layout_cache_key_for(&store);
+    assert_ne!(k1, k2, "test requires two different layout keys");
+
+    let adoption_b = files::adopt_layout_config(&root, KEY, IDENTITY_B, &store);
+    assert!(
+        adoption_b.purged_legacy,
+        "adopting a colliding key must report legacy/colliding purge"
+    );
+
+    let records_b = build_book(&root, &mut store, 1);
+    let pages_b = total_pages(&records_b);
+    assert!(files::write_v2_book_index(
+        &root, KEY, IDENTITY_B, pages_b, &records_b, &store, false, 0
+    ));
+
+    // Book A's index is gone; Book B's index is present.
+    assert!(
+        !book_index_present(&root, k1),
+        "Book A's index must be purged when Book B adopts the colliding key"
+    );
+    assert!(
+        book_index_present(&root, k2),
+        "Book B's index must be present after build"
+    );
+
+    // read_cache_header now reports Book B's identity.
+    let files::CacheHeader::Present(header_b) = files::read_cache_header(&root, KEY) else {
+        panic!("expected header B");
+    };
+    assert_eq!((header_b.source_hash, header_b.source_size), IDENTITY_B);
 }

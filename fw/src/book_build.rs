@@ -617,7 +617,7 @@ where
     // unadopted. An existing cache hit can still be read, but any non-fast-hit
     // build or replay is refused below so unadopted layout files are never
     // published to disk.
-    let adoption = files::adopt_layout_config(root, cache_key.as_str(), library);
+    let adoption = files::adopt_layout_config(root, cache_key.as_str(), source_identity, library);
     esp_println::println!(
         "epub: layout config resident={} evicted={:?} evict_failed={:?} legacy_purged={} registry_write_failed={} dirs_failed={}",
         adoption.resident,
