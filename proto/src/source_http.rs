@@ -144,6 +144,13 @@ enum FlatValue<'a> {
 /// does not break older firmware; garbage instead of an object always
 /// rejects.
 fn for_each_flat_field(body: &[u8], mut field: impl FnMut(&[u8], FlatValue<'_>) -> bool) -> bool {
+    // Interchange JSON is UTF-8 (RFC 8259 §8.1): a stray byte, a bare
+    // continuation, an overlong encoding, or a truncated sequence is not
+    // JSON anywhere in the body — ignored fields included — so the whole
+    // envelope is checked before any scanning.
+    if core::str::from_utf8(body).is_err() {
+        return false;
+    }
     let mut at = skip_ws(body, 0);
     if body.get(at) != Some(&b'{') {
         return false;
@@ -210,9 +217,14 @@ fn skip_ws(bytes: &[u8], mut at: usize) -> usize {
 }
 
 /// Plain decimal digits into a `u64`, overflow-checked. The PRD's lengths
-/// are exact byte counts — never signed, fractional, or exponent-form.
+/// are exact byte counts — never signed, fractional, or exponent-form —
+/// and JSON's number grammar has no leading zeros, so a zero-padded
+/// integer rejects as the malformed JSON it is.
 fn parse_u64_digits(digits: &[u8]) -> Option<u64> {
     if digits.is_empty() || digits.len() > 20 {
+        return None;
+    }
+    if digits.len() > 1 && digits[0] == b'0' {
         return None;
     }
     let mut value: u64 = 0;
@@ -828,6 +840,61 @@ mod tests {
             "{{\"future\":\"a\\\"b\\\\c\\/d \u{e9}\x7f\",\"book_token\":\"{token_hex}\"}}"
         );
         assert!(parse_delete_body(body.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn json_numbers_and_utf8_are_enforced_even_in_ignored_fields() {
+        let token_hex = "00112233445566778899aabbccddeeff";
+
+        // JSON's number grammar has no leading zeros; an unknown numeric
+        // field must not smuggle one past the envelope.
+        let body = std::format!("{{\"future\":01,\"book_token\":\"{token_hex}\"}}");
+        assert!(parse_delete_body(body.as_bytes()).is_none(), "leading zero");
+        let body = std::format!("{{\"future\":0,\"book_token\":\"{token_hex}\"}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_some(),
+            "a lone zero is a number"
+        );
+
+        // The same grammar binds consumed fields.
+        let sha_hex = "a".repeat(64);
+        let body = std::format!(
+            "{{\"book_token\":\"{token_hex}\",\"observed_source_length\":01,\
+             \"observed_source_sha256\":\"{sha_hex}\"}}"
+        );
+        assert!(parse_recover_body(body.as_bytes()).is_none());
+
+        // Interchange JSON is UTF-8: malformed byte sequences reject no
+        // matter which field carries them.
+        let with_ignored_value = |value: &[u8]| {
+            let mut body = std::vec::Vec::new();
+            body.extend_from_slice(b"{\"future\":\"");
+            body.extend_from_slice(value);
+            body.extend_from_slice(b"\",\"book_token\":\"");
+            body.extend_from_slice(token_hex.as_bytes());
+            body.extend_from_slice(b"\"}");
+            body
+        };
+        assert!(
+            parse_delete_body(&with_ignored_value(&[0xFF])).is_none(),
+            "lone 0xff"
+        );
+        assert!(
+            parse_delete_body(&with_ignored_value(&[0x80])).is_none(),
+            "bare continuation byte"
+        );
+        assert!(
+            parse_delete_body(&with_ignored_value(&[0xC0, 0xAF])).is_none(),
+            "overlong encoding"
+        );
+        assert!(
+            parse_delete_body(&with_ignored_value(&[0xE2, 0x82])).is_none(),
+            "truncated sequence"
+        );
+        assert!(
+            parse_delete_body(&with_ignored_value("caf\u{e9} \u{2014} 本".as_bytes())).is_some(),
+            "well-formed UTF-8 still passes"
+        );
     }
 
     #[test]

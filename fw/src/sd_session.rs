@@ -555,65 +555,60 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
         let _ = upload_store::remove_file_reclaiming_clusters(&xteink, "CATALOG.BIN");
         esp_println::println!("upload: catalog snapshot invalidated");
     }
-    // The books handle lives inside this block so every FAT handle is dead
-    // by scope before the close-and-acknowledge tail below: UPLOAD_STOPPED
-    // must not be sent (nor Sleep re-queued) while the volume is mounted.
-    // A missing/uncreatable BOOKS directory refuses only the legacy shelf
-    // (`books` stays `None` into the serve loop, which answers every begin
-    // with failure) — the logical-book endpoints live under XTEINK/SRC and
-    // keep working, and every request still gets an answer instead of a
-    // hang.
-    let exit = {
-        let books = match root.open_dir("BOOKS") {
-            Ok(books) => Some(books),
-            Err(_) => root
-                .make_dir_in_dir("BOOKS")
-                .and_then(|()| root.open_dir("BOOKS"))
-                .ok(),
-        };
-        if books.is_none() {
-            esp_println::println!("upload: BOOKS setup failed");
-        }
-        // The managed source namespace, XTEINK/SRC. Failure refuses only
-        // the logical-book endpoints (`src` stays `None`), never the
-        // legacy shelf, so a card without the directory tree still
-        // serves uploads the old way. The parent handle must outlive the
-        // child, so both bindings live for the serve loop.
-        let xteink = root
-            .open_dir("XTEINK")
-            .or_else(|_| {
-                root.make_dir_in_dir("XTEINK")
-                    .and_then(|()| root.open_dir("XTEINK"))
-            })
-            .ok();
-        let src = xteink.as_ref().and_then(|xteink| {
-            let opened = xteink
-                .open_dir(source_store::layout::SOURCE_DIR)
-                .or_else(|_| {
-                    xteink
-                        .make_dir_in_dir(source_store::layout::SOURCE_DIR)
-                        .and_then(|()| xteink.open_dir(source_store::layout::SOURCE_DIR))
-                });
-            if opened.is_err() {
-                esp_println::println!("source: SRC setup failed");
-            }
-            opened.ok()
-        });
-        serve_uploads(&root, books.as_ref(), src.as_ref(), source_owner).await
-    };
+    // The namespace directories (/BOOKS, XTEINK/SRC) are opened per
+    // request inside the serve loop — created only on a proven NotFound —
+    // so a transient lookup failure costs one refused request, retryably,
+    // not the namespace for the rest of the mounted session. Every handle
+    // the loop opens dies inside it, so by the close-and-acknowledge tail
+    // below only `root` remains: UPLOAD_STOPPED must not be sent (nor
+    // Sleep re-queued) while the volume is mounted.
+    let exit = serve_uploads(&root, source_owner).await;
     drop(root);
     let _ = volume_mgr.close_volume(raw_volume);
     drop(volume_mgr);
     finish_upload_session(epd, exit).await;
 }
 
+/// Open `name` under `parent`, creating it only when the lookup itself
+/// proved `NotFound`. Every other open error propagates: falling back to
+/// creation on, say, a transient card-read error would misread the
+/// `DirAlreadyExists` that `make_dir_in_dir`'s own existence recheck then
+/// returns as "no such directory". `DirAlreadyExists` from the create is
+/// still answered by opening what is there — the lookup and the recheck
+/// disagreeing means the first read lied.
+fn open_or_create_dir<
+    'p,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    parent: &'p Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> Result<Directory<'p, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>, embedded_sdmmc::Error<D::Error>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match parent.open_dir(name) {
+        Err(embedded_sdmmc::Error::NotFound) => {}
+        outcome => return outcome,
+    }
+    match parent.make_dir_in_dir(name) {
+        Ok(()) | Err(embedded_sdmmc::Error::DirAlreadyExists) => parent.open_dir(name),
+        Err(error) => Err(error),
+    }
+}
+
 /// The serving loop of a mounted session: writes and deletes books as
-/// begins arrive, until Sleep or wireless Exit ends the session. Either
-/// namespace may have failed setup independently — `books: None` fails
-/// every /BOOKS write and delete (the response the browser already
-/// handles), `src: None` refuses every logical-book operation — so a
-/// partially usable card still serves what it can, and no request is
-/// left waiting on a channel nothing reads.
+/// begins arrive, until Sleep or wireless Exit ends the session. The
+/// /BOOKS shelf and the XTEINK/SRC namespace are each opened per request:
+/// a directory that cannot be opened fails only that request — legacy
+/// begins answer failure (draining any streaming body), logical-book
+/// operations refuse `storage_unavailable`, which stays honestly
+/// retryable because the next request re-attempts the open — and a
+/// partially usable card still serves whatever namespace works.
 async fn serve_uploads<
     D,
     T,
@@ -622,8 +617,6 @@ async fn serve_uploads<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    books: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
-    src: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
     mut source_owner: Option<&mut SourceOwnerState>,
 ) -> UploadSessionExit
 where
@@ -639,7 +632,17 @@ where
         {
             Either::First(Either::First(begin)) => begin,
             Either::First(Either::Second(op)) => {
-                match serve_source_op(op, src, source_owner.as_deref_mut()).await {
+                // Opened fresh for this operation and dead again after
+                // it. The child directory borrows the parent handle, so
+                // both bindings live for the operation.
+                let xteink = open_or_create_dir(root, "XTEINK").ok();
+                let src = xteink.as_ref().and_then(|xteink| {
+                    open_or_create_dir(xteink, source_store::layout::SOURCE_DIR).ok()
+                });
+                if src.is_none() {
+                    esp_println::println!("source: SRC namespace unavailable");
+                }
+                match serve_source_op(op, src.as_ref(), source_owner.as_deref_mut()).await {
                     Ok(()) => continue,
                     Err(exit) => return exit,
                 }
@@ -654,12 +657,12 @@ where
         };
         let ok = if begin.delete {
             if begin.in_books {
-                // A delete begin is never followed by chunks, so a missing
-                // BOOKS directory answers failure directly.
-                match books {
-                    Some(books) => {
+                // A delete begin is never followed by chunks, so a failed
+                // BOOKS lookup answers failure directly.
+                match open_or_create_dir(root, "BOOKS") {
+                    Ok(books) => {
                         let removed = upload_store::remove_file_reclaiming_clusters(
-                            books,
+                            &books,
                             begin.name.as_str(),
                         ) == upload_store::RemoveStatus::Removed;
                         if removed {
@@ -667,24 +670,27 @@ where
                         }
                         removed
                     }
-                    None => false,
+                    Err(_) => false,
                 }
             } else {
                 upload_store::remove_file_reclaiming_clusters(root, begin.name.as_str())
                     == upload_store::RemoveStatus::Removed
             }
         } else {
-            match books {
-                Some(books) => match write_one_book(root, books, &begin).await {
+            match open_or_create_dir(root, "BOOKS") {
+                Ok(books) => match write_one_book(root, &books, &begin).await {
                     UploadWrite::Finished(name) => name.is_some(),
                     UploadWrite::Interrupted(exit) => return exit,
                 },
                 // The body is already streaming; consume it and fail the
                 // request, exactly as a refused begin does.
-                None => match drain_until_end().await {
-                    Ok(()) => false,
-                    Err(exit) => return exit,
-                },
+                Err(_) => {
+                    esp_println::println!("upload: BOOKS unavailable");
+                    match drain_until_end().await {
+                        Ok(()) => false,
+                        Err(exit) => return exit,
+                    }
+                }
             }
         };
         esp_println::println!(
