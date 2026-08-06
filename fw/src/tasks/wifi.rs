@@ -8,11 +8,16 @@
 //! `SyncCommand::Exit`. With no saved network the session runs the
 //! AP-mode onboarding portal instead.
 
+use crate::source_owner::{
+    integrity_status_str, SourceCommit, SourceDeleteOp, SourceEvent, SourceOp, SourceRecoverOp,
+    SourceUploadOp, BOARD_PROFILE,
+};
 use crate::sync_mem::{self, SyncLoan};
 use crate::upload::{sanitized_name, UploadBegin, UploadChunk};
 use crate::{
-    StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
-    SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_INTERRUPTS, UPLOAD_RESULTS, UPLOAD_RETURNS,
+    StorageCommand, SyncCommand, SyncEvent, SOURCE_EVENTS, SOURCE_OPS, STORAGE_COMMANDS,
+    SYNC_COMMANDS, SYNC_EVENTS, SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_INTERRUPTS,
+    UPLOAD_RESULTS, UPLOAD_RETURNS,
 };
 use app_core::{SyncError, WifiCredentials};
 use embassy_executor::Spawner;
@@ -34,6 +39,8 @@ use esp_radio::wifi::{
     AuthenticationMethod, Config as WifiConfig, ControllerConfig, Interface, WifiController,
 };
 use proto::captive;
+use proto::source_http;
+use source_store::bodies::DisplayLabel;
 
 // Measured first-association joins ran ~21 s; give them headroom.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
@@ -422,14 +429,54 @@ async fn upload_server(
                 .unwrap_or(false);
 
         let path = request_buf.get(path_at..path_at + path_len).unwrap_or(b"/");
-        let is_list = path.starts_with(b"/list");
-        let is_delete = request_buf
+        let is_post = request_buf
             .get(..method_len)
             .map(|m| m == b"POST")
-            .unwrap_or(false)
-            && path.starts_with(b"/delete");
+            .unwrap_or(false);
+        // M0S logical-book endpoints. `/list` vs `/list-books` and
+        // `/delete` vs `/delete-book` must disambiguate before the legacy
+        // prefixes match.
+        let is_list_books = path.starts_with(b"/list-books");
+        let is_capabilities = path.starts_with(b"/capabilities");
+        let is_delete_book = is_post && path.starts_with(b"/delete-book");
+        let is_recover_book = is_post && path.starts_with(b"/recover-book");
+        // A request ID on `/upload` selects the M0S transaction; without
+        // it the legacy shelf path keeps working unchanged.
+        let m0s_upload_id = source_http::header_value(
+            request_buf.get(..body_start).unwrap_or(b""),
+            "X-Upload-Request-Id",
+        )
+        .and_then(source_http::parse_request_id);
+        let is_list = !is_list_books && path.starts_with(b"/list");
+        let is_delete = is_post && !is_delete_book && path.starts_with(b"/delete");
 
-        if is_list {
+        if is_capabilities {
+            serve_capabilities(&mut socket, &mut pool, &mut session_started).await;
+        } else if is_list_books {
+            serve_list_books(&mut socket, &mut pool, &mut session_started).await;
+        } else if is_delete_book {
+            serve_delete_book(
+                &mut socket,
+                request_buf,
+                body_start,
+                filled,
+                content_length,
+                &mut pool,
+                &mut session_started,
+            )
+            .await;
+        } else if is_recover_book {
+            serve_recover_book(
+                &mut socket,
+                request_buf,
+                body_start,
+                filled,
+                content_length,
+                &mut pool,
+                &mut session_started,
+            )
+            .await;
+        } else if is_list {
             let listing =
                 core::str::from_utf8(&catalog[..catalog_len.min(catalog.len())]).unwrap_or("");
             let _ = write_http_response(&mut socket, "200 OK", listing).await;
@@ -475,6 +522,20 @@ async fn upload_server(
                 &mut socket,
                 if ok { "200 OK" } else { "404 Not Found" },
                 if ok { "deleted" } else { "failed" },
+            )
+            .await;
+        } else if let (true, Some(request_id)) = (is_upload_post, m0s_upload_id) {
+            serve_m0s_upload(
+                &mut socket,
+                request_buf,
+                path_at,
+                path_len,
+                body_start,
+                filled,
+                content_length,
+                request_id,
+                &mut pool,
+                &mut session_started,
             )
             .await;
         } else if is_upload_post {
@@ -561,6 +622,8 @@ fn reclaim_upload_pipeline(pool: &mut heapless::Vec<&'static mut [u8], 2>) {
         let _ = pool.push(buffer);
     }
     while UPLOAD_RESULTS.try_receive().is_ok() {}
+    while SOURCE_OPS.try_receive().is_ok() {}
+    while SOURCE_EVENTS.try_receive().is_ok() {}
     crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
 }
 
@@ -672,6 +735,567 @@ async fn stream_book(
         }
     }
     StreamOutcome::Done(result && !failed)
+}
+
+// ------------------------------------------------------------------
+// M0S logical-book endpoints
+// ------------------------------------------------------------------
+
+/// Send `ReceiveUpload` once per session so the storage owner is parked
+/// on the upload/source channels before the first operation is queued.
+async fn ensure_upload_session(session_started: &mut bool) {
+    if !*session_started {
+        crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
+        STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
+        *session_started = true;
+    }
+}
+
+/// One storage-owner event, or the session dying underneath the wait.
+enum EventWait {
+    Event(SourceEvent),
+    Interrupted,
+}
+
+async fn next_source_event() -> EventWait {
+    match select(SOURCE_EVENTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
+        Either::First(event) => EventWait::Event(event),
+        Either::Second(()) => EventWait::Interrupted,
+    }
+}
+
+/// `write_http_response` for the JSON contract: same framing, JSON
+/// content type, byte body.
+async fn write_json_response(
+    socket: &mut TcpSocket<'_>,
+    status: &str,
+    body: &[u8],
+) -> Result<(), embassy_net::tcp::Error> {
+    let mut length = [0u8; 8];
+    let mut at = length.len();
+    let mut value = body.len();
+    loop {
+        at -= 1;
+        length[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    write_all(socket, b"HTTP/1.1 ").await?;
+    write_all(socket, status.as_bytes()).await?;
+    write_all(
+        socket,
+        b"\r\ncache-control: no-store\r\ncontent-type: application/json\r\ncontent-length: ",
+    )
+    .await?;
+    write_all(socket, &length[at..]).await?;
+    write_all(socket, b"\r\nconnection: close\r\n\r\n").await?;
+    write_all(socket, body).await
+}
+
+/// A refusal event as its documented JSON error and HTTP status.
+async fn respond_refusal(socket: &mut TcpSocket<'_>, refusal: crate::source_owner::Refusal) {
+    let mut buf = [0u8; 160];
+    if let Some(len) = source_http::write_error(&mut buf, refusal.code(), refusal.retryable()) {
+        let _ = write_json_response(socket, refusal.http_status(), &buf[..len]).await;
+    }
+}
+
+/// A request the contract layer itself refused (bad hex, bad JSON, bad
+/// label): always 400, never retryable as sent.
+async fn respond_bad_request(socket: &mut TcpSocket<'_>, code: &str) {
+    let mut buf = [0u8; 160];
+    if let Some(len) = source_http::write_error(&mut buf, code, false) {
+        let _ = write_json_response(socket, "400 Bad Request", &buf[..len]).await;
+    }
+}
+
+/// The session died under an in-flight operation: reclaim the pipeline
+/// and answer 503 in case the socket still hears.
+async fn respond_interrupted(
+    socket: &mut TcpSocket<'_>,
+    pool: &mut heapless::Vec<&'static mut [u8], 2>,
+    session_started: &mut bool,
+) {
+    reclaim_upload_pipeline(pool);
+    *session_started = false;
+    respond_refusal(socket, crate::source_owner::Refusal::StorageUnavailable).await;
+}
+
+/// Read a small JSON body fully into `request_buf` behind the parsed
+/// head. `None` for anything oversized, truncated, or interrupted — the
+/// two M0S bodies fit hundreds of bytes, so 512 is already generous.
+async fn read_small_body<'a>(
+    socket: &mut TcpSocket<'_>,
+    request_buf: &'a mut [u8],
+    body_start: usize,
+    mut filled: usize,
+    content_length: usize,
+) -> Option<&'a [u8]> {
+    let body_end = body_start.checked_add(content_length)?;
+    if content_length > 512 || body_end > request_buf.len() {
+        return None;
+    }
+    while filled < body_end {
+        match select(
+            socket.read(&mut request_buf[filled..body_end]),
+            UPLOAD_INTERRUPTS.wait(),
+        )
+        .await
+        {
+            Either::First(Ok(0)) | Either::First(Err(_)) => return None,
+            Either::First(Ok(read)) => filled += read,
+            Either::Second(()) => return None,
+        }
+    }
+    Some(&request_buf[body_start..body_end])
+}
+
+/// Stream one M0S upload body to the storage owner. The transaction is
+/// already begun on the owner side (this runs only after
+/// `SourceEvent::UploadStarted`), so unlike the legacy path there is no
+/// begin message and no boolean result — the verdict arrives as the next
+/// source event.
+async fn stream_source_body(
+    socket: &mut TcpSocket<'_>,
+    request_buf: &[u8],
+    leftover: core::ops::Range<usize>,
+    content_length: usize,
+    pool: &mut heapless::Vec<&'static mut [u8], 2>,
+) -> StreamOutcome {
+    crate::upload::UPLOAD_IN_FLIGHT.store(true, portable_atomic::Ordering::SeqCst);
+    let mut leftover = &request_buf[leftover];
+    if leftover.len() > content_length {
+        leftover = &leftover[..content_length];
+    }
+    let mut remaining = content_length;
+    let mut failed = false;
+    while remaining > 0 && !failed {
+        let buffer = match pool.pop() {
+            Some(buffer) => buffer,
+            None => match select(UPLOAD_RETURNS.receive(), UPLOAD_INTERRUPTS.wait()).await {
+                Either::First(buffer) => buffer,
+                Either::Second(()) => {
+                    reclaim_upload_pipeline(pool);
+                    return StreamOutcome::Interrupted;
+                }
+            },
+        };
+        let mut len = 0;
+        if !leftover.is_empty() {
+            let take = leftover.len().min(buffer.len());
+            buffer[..take].copy_from_slice(&leftover[..take]);
+            leftover = &leftover[take..];
+            len = take;
+        }
+        while len < buffer.len() && len < remaining {
+            let window = buffer.len().min(remaining);
+            match select(
+                socket.read(&mut buffer[len..window]),
+                UPLOAD_INTERRUPTS.wait(),
+            )
+            .await
+            {
+                Either::First(Ok(0)) | Either::First(Err(_)) => {
+                    failed = true;
+                    break;
+                }
+                Either::First(Ok(read)) => len += read,
+                Either::Second(()) => {
+                    let _ = pool.push(buffer);
+                    reclaim_upload_pipeline(pool);
+                    return StreamOutcome::Interrupted;
+                }
+            }
+        }
+        remaining -= len.min(remaining);
+        UPLOAD_CHUNKS
+            .send(UploadChunk {
+                buffer: Some(buffer),
+                len,
+                last: remaining == 0 && !failed,
+                abort: failed,
+            })
+            .await;
+    }
+    if content_length == 0 {
+        // No bytes will flow; the owner finishes the empty candidate and
+        // the container gate refuses it deterministically.
+        UPLOAD_CHUNKS
+            .send(UploadChunk {
+                buffer: None,
+                len: 0,
+                last: true,
+                abort: false,
+            })
+            .await;
+    }
+    crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
+    while pool.len() < 2 {
+        match UPLOAD_RETURNS.try_receive() {
+            Ok(buffer) => {
+                let _ = pool.push(buffer);
+            }
+            Err(_) => break,
+        }
+    }
+    StreamOutcome::Done(!failed)
+}
+
+/// The commit response shared by M0S upload and recovery.
+async fn respond_commit(
+    socket: &mut TcpSocket<'_>,
+    commit: &SourceCommit,
+    request_id: source_http::RequestId,
+) {
+    let mut buf = [0u8; 768];
+    let reply = source_http::OperationSuccess {
+        logical_book_id: &commit.logical_book_id,
+        book_token: &commit.book_token,
+        request_epoch: request_id.epoch,
+        request_nonce: &request_id.nonce,
+        source_length: commit.source_length,
+        source_sha256: &commit.source_sha256,
+        source_generation: commit.source_generation,
+        display_label: commit.display_label.as_bytes(),
+        board_profile: BOARD_PROFILE,
+    };
+    if let Some(len) = source_http::write_operation_success(&mut buf, &reply) {
+        let _ = write_json_response(socket, "200 OK", &buf[..len]).await;
+    }
+}
+
+/// `POST /upload` with the M0S headers: parse, hand the operation to the
+/// storage owner, stream the body on `UploadStarted`, answer from the
+/// commit or refusal event.
+#[allow(clippy::too_many_arguments)] // The request's parsed coordinates.
+async fn serve_m0s_upload(
+    socket: &mut TcpSocket<'_>,
+    request_buf: &mut [u8],
+    path_at: usize,
+    path_len: usize,
+    body_start: usize,
+    filled: usize,
+    content_length: usize,
+    request_id: source_http::RequestId,
+    pool: &mut heapless::Vec<&'static mut [u8], 2>,
+    session_started: &mut bool,
+) {
+    // Everything read before the in-place label decode mutates the path.
+    let head = request_buf.get(..body_start).unwrap_or(b"");
+    let Some(declared_sha256) =
+        source_http::header_value(head, "X-Source-SHA256").and_then(source_http::parse_sha256)
+    else {
+        respond_bad_request(socket, "invalid_digest").await;
+        return;
+    };
+    let path = request_buf.get(path_at..path_at + path_len).unwrap_or(b"");
+    let replace_param = source_http::query_param(path, b"replace").map(|raw| {
+        let mut copy = [0u8; source_http::BOOK_TOKEN_HEX];
+        let len = raw.len().min(copy.len());
+        copy[..len].copy_from_slice(&raw[..len]);
+        (copy, raw.len())
+    });
+    let replace_token = match replace_param {
+        None => None,
+        Some((raw, len)) => match source_http::parse_book_token(&raw[..len.min(raw.len())]) {
+            Some(token) => Some(token),
+            None => {
+                respond_bad_request(socket, "invalid_token").await;
+                return;
+            }
+        },
+    };
+    let label = request_buf
+        .get_mut(path_at..path_at + path_len)
+        .and_then(proto::upload::raw_query_name)
+        .and_then(|decoded| DisplayLabel::new(decoded));
+    let Some(display_label) = label else {
+        respond_bad_request(socket, "invalid_label").await;
+        return;
+    };
+
+    ensure_upload_session(session_started).await;
+    SOURCE_OPS
+        .send(SourceOp::Upload(SourceUploadOp {
+            epoch: request_id.epoch,
+            nonce: request_id.nonce,
+            declared_length: content_length as u64,
+            declared_sha256,
+            display_label,
+            replace_token,
+        }))
+        .await;
+
+    match next_source_event().await {
+        EventWait::Event(SourceEvent::UploadStarted) => {}
+        EventWait::Event(SourceEvent::Committed(commit)) => {
+            // A replay: the original result answers without a byte
+            // streamed; the unread request body dies with the socket.
+            respond_commit(socket, &commit, request_id).await;
+            return;
+        }
+        EventWait::Event(SourceEvent::Refused(refusal)) => {
+            respond_refusal(socket, refusal).await;
+            return;
+        }
+        EventWait::Event(_) | EventWait::Interrupted => {
+            respond_interrupted(socket, pool, session_started).await;
+            return;
+        }
+    }
+
+    let outcome = stream_source_body(
+        socket,
+        request_buf,
+        body_start..filled,
+        content_length,
+        pool,
+    )
+    .await;
+    if matches!(outcome, StreamOutcome::Interrupted) {
+        *session_started = false;
+        return;
+    }
+    // Committed, or refused (a client abort included): one event either way.
+    match next_source_event().await {
+        EventWait::Event(SourceEvent::Committed(commit)) => {
+            respond_commit(socket, &commit, request_id).await;
+        }
+        EventWait::Event(SourceEvent::Refused(refusal)) => {
+            respond_refusal(socket, refusal).await;
+        }
+        EventWait::Event(_) | EventWait::Interrupted => {
+            respond_interrupted(socket, pool, session_started).await;
+        }
+    }
+}
+
+/// `POST /delete-book`.
+async fn serve_delete_book(
+    socket: &mut TcpSocket<'_>,
+    request_buf: &mut [u8],
+    body_start: usize,
+    filled: usize,
+    content_length: usize,
+    pool: &mut heapless::Vec<&'static mut [u8], 2>,
+    session_started: &mut bool,
+) {
+    let Some(request_id) = source_http::header_value(
+        request_buf.get(..body_start).unwrap_or(b""),
+        "X-Delete-Request-Id",
+    )
+    .and_then(source_http::parse_request_id) else {
+        respond_bad_request(socket, "invalid_request_id").await;
+        return;
+    };
+    let Some(book_token) = read_small_body(socket, request_buf, body_start, filled, content_length)
+        .await
+        .and_then(source_http::parse_delete_body)
+    else {
+        respond_bad_request(socket, "invalid_body").await;
+        return;
+    };
+    ensure_upload_session(session_started).await;
+    SOURCE_OPS
+        .send(SourceOp::Delete(SourceDeleteOp {
+            epoch: request_id.epoch,
+            nonce: request_id.nonce,
+            book_token,
+        }))
+        .await;
+    match next_source_event().await {
+        EventWait::Event(SourceEvent::Deleted { logical_book_id }) => {
+            let mut buf = [0u8; 96];
+            let mut json = source_http::JsonOut::new(&mut buf);
+            json.raw("{\"status\":\"ok\",\"logical_book_id\":")
+                .hex(&logical_book_id)
+                .raw("}");
+            if let Some(len) = json.finish() {
+                let _ = write_json_response(socket, "200 OK", &buf[..len]).await;
+            }
+        }
+        EventWait::Event(SourceEvent::Refused(refusal)) => {
+            respond_refusal(socket, refusal).await;
+        }
+        EventWait::Event(_) | EventWait::Interrupted => {
+            respond_interrupted(socket, pool, session_started).await;
+        }
+    }
+}
+
+/// `POST /recover-book`.
+async fn serve_recover_book(
+    socket: &mut TcpSocket<'_>,
+    request_buf: &mut [u8],
+    body_start: usize,
+    filled: usize,
+    content_length: usize,
+    pool: &mut heapless::Vec<&'static mut [u8], 2>,
+    session_started: &mut bool,
+) {
+    let Some(request_id) = source_http::header_value(
+        request_buf.get(..body_start).unwrap_or(b""),
+        "X-Recovery-Request-Id",
+    )
+    .and_then(source_http::parse_request_id) else {
+        respond_bad_request(socket, "invalid_request_id").await;
+        return;
+    };
+    let Some(body) = read_small_body(socket, request_buf, body_start, filled, content_length).await
+    else {
+        respond_bad_request(socket, "invalid_body").await;
+        return;
+    };
+    let Some(parsed) = source_http::parse_recover_body(body) else {
+        respond_bad_request(socket, "invalid_body").await;
+        return;
+    };
+    let display_label = match &parsed.display_label {
+        None => None,
+        Some(raw) => match DisplayLabel::new(raw) {
+            Some(label) => Some(label),
+            None => {
+                respond_bad_request(socket, "invalid_label").await;
+                return;
+            }
+        },
+    };
+    ensure_upload_session(session_started).await;
+    SOURCE_OPS
+        .send(SourceOp::Recover(SourceRecoverOp {
+            epoch: request_id.epoch,
+            nonce: request_id.nonce,
+            book_token: parsed.book_token,
+            observed_length: parsed.observed_length,
+            observed_sha256: parsed.observed_sha256,
+            display_label,
+        }))
+        .await;
+    match next_source_event().await {
+        EventWait::Event(SourceEvent::Committed(commit)) => {
+            respond_commit(socket, &commit, request_id).await;
+        }
+        EventWait::Event(SourceEvent::Refused(refusal)) => {
+            respond_refusal(socket, refusal).await;
+        }
+        EventWait::Event(_) | EventWait::Interrupted => {
+            respond_interrupted(socket, pool, session_started).await;
+        }
+    }
+}
+
+/// `GET /list-books`: the authoritative catalog as a streamed JSON array.
+/// The head is written only after the first event, so a refusal can still
+/// carry its proper status; a socket that dies mid-stream keeps draining
+/// events so the storage owner never blocks on a full channel.
+async fn serve_list_books(
+    socket: &mut TcpSocket<'_>,
+    pool: &mut heapless::Vec<&'static mut [u8], 2>,
+    session_started: &mut bool,
+) {
+    ensure_upload_session(session_started).await;
+    SOURCE_OPS.send(SourceOp::List).await;
+    let mut head_written = false;
+    let mut socket_ok = true;
+    let mut first_entry = true;
+    loop {
+        match next_source_event().await {
+            EventWait::Event(SourceEvent::ListEntry(entry)) => {
+                if !head_written {
+                    socket_ok = write_all(
+                        socket,
+                        b"HTTP/1.1 200 OK\r\ncache-control: no-store\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n[",
+                    )
+                    .await
+                    .is_ok();
+                    head_written = true;
+                }
+                if !socket_ok {
+                    continue;
+                }
+                let mut buf = [0u8; 768];
+                let observed_sha = entry.observed_source_sha256;
+                let wire = source_http::ListEntryWire {
+                    display_label: entry.display_label.as_bytes(),
+                    logical_book_id: &entry.logical_book_id,
+                    book_token: &entry.book_token,
+                    source_generation: entry.source_generation,
+                    source_origin: match entry.source_origin {
+                        source_store::bodies::SourceOrigin::ManagedUpload => "managed",
+                        source_store::bodies::SourceOrigin::UnmanagedSd => "unmanaged",
+                    },
+                    externally_recovered: entry.externally_recovered,
+                    source_integrity_status: integrity_status_str(entry.source_integrity_status),
+                    source_length: entry.source_length,
+                    observed_source_length: entry.observed_source_length,
+                    observed_source_sha256: observed_sha.as_ref(),
+                    may_replace: entry.allowed_operations.replace,
+                    may_delete: entry.allowed_operations.delete,
+                    may_recover_current_bytes: entry.allowed_operations.recover_current_bytes,
+                };
+                if let Some(len) = source_http::write_list_entry(&mut buf, &wire) {
+                    if !first_entry {
+                        socket_ok &= write_all(socket, b",").await.is_ok();
+                    }
+                    socket_ok &= write_all(socket, &buf[..len]).await.is_ok();
+                }
+                first_entry = false;
+            }
+            EventWait::Event(SourceEvent::ListEnd { .. }) => {
+                if !head_written {
+                    let _ = write_json_response(socket, "200 OK", b"[]").await;
+                } else if socket_ok {
+                    let _ = write_all(socket, b"]").await;
+                }
+                return;
+            }
+            EventWait::Event(SourceEvent::Refused(refusal)) => {
+                if !head_written {
+                    respond_refusal(socket, refusal).await;
+                }
+                return;
+            }
+            EventWait::Event(_) | EventWait::Interrupted => {
+                respond_interrupted(socket, pool, session_started).await;
+                return;
+            }
+        }
+    }
+}
+
+/// `GET /capabilities`: the M0S handshake — idempotency epoch (rotated
+/// first if it lacks headroom) and the source-container limits.
+async fn serve_capabilities(
+    socket: &mut TcpSocket<'_>,
+    pool: &mut heapless::Vec<&'static mut [u8], 2>,
+    session_started: &mut bool,
+) {
+    ensure_upload_session(session_started).await;
+    SOURCE_OPS.send(SourceOp::Capabilities).await;
+    match next_source_event().await {
+        EventWait::Event(SourceEvent::Capabilities(caps)) => {
+            let mut buf = [0u8; 320];
+            let reply = source_http::SourceCapabilities {
+                idempotency_epoch: caps.idempotency_epoch,
+                max_new_requests_this_epoch: caps.max_new_requests_this_epoch,
+                retained_previous_epoch: caps.retained_previous_epoch,
+                max_epub_bytes: source_store::upload::MAX_SOURCE_BYTES,
+                zip64_supported: proto::epub::ZIP64_SUPPORTED,
+                board_profile: BOARD_PROFILE,
+            };
+            if let Some(len) = source_http::write_capabilities(&mut buf, &reply) {
+                let _ = write_json_response(socket, "200 OK", &buf[..len]).await;
+            }
+        }
+        EventWait::Event(SourceEvent::Refused(refusal)) => {
+            respond_refusal(socket, refusal).await;
+        }
+        EventWait::Event(_) | EventWait::Interrupted => {
+            respond_interrupted(socket, pool, session_started).await;
+        }
+    }
 }
 
 // ------------------------------------------------------------------

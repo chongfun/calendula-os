@@ -1,8 +1,14 @@
 use crate::display_flush::Epd;
+use crate::source_owner::{
+    refusal_for_begin, refusal_for_delete, refusal_for_publish, refusal_for_recovery,
+    refusal_for_upload_error, Refusal, SourceCaps, SourceCommit, SourceEvent, SourceOp,
+    SourceOwnerState, SourceUploadOp,
+};
+
 use crate::upload::{UploadBegin, UploadChunk, UploadName};
 use crate::{
-    DISPLAY_COMMANDS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS, UPLOAD_STOPPED,
-    UPLOAD_STOP_REQUESTS,
+    DISPLAY_COMMANDS, SOURCE_EVENTS, SOURCE_OPS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS,
+    UPLOAD_RETURNS, UPLOAD_STOPPED, UPLOAD_STOP_REQUESTS,
 };
 use app_core::DisplayCommand;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -17,6 +23,18 @@ use esp_hal::gpio::Output;
 use esp_hal::spi::master::{Config as SpiConfig, SpiDmaBus};
 use esp_hal::time::Rate;
 use esp_hal::Async;
+use source_store::list::listed_book_at;
+use source_store::ops::{
+    delete_book, ensure_epoch_headroom, load_catalog, DeleteOutcome, DeleteRequest,
+    IdempotencyStore,
+};
+use source_store::receipts::MAX_RECEIPTS_PER_EPOCH;
+use source_store::recover::{recover_book, RecoveryOutcome, RecoveryRequest};
+use source_store::select::MAX_SOURCE_SLOTS;
+use source_store::upload::{
+    abort_upload, begin_upload, upload_chunk as source_upload_chunk, FreshIdentity,
+    UploadBeginOutcome, UploadResult,
+};
 
 /// SD SPI-mode identification must run at 100-400 kHz; data transfer is
 /// specced to 25 MHz. The shared bus otherwise runs at the active panel's
@@ -478,6 +496,11 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     epd.deselect_display();
     sd_cs.set_high();
     esp_println::println!("upload: session enter");
+    // The M0S owner state lives in the loaned session heap, claimed here
+    // — after the wifi task's donation, before the first operation. The
+    // claimed image arrives pristine: this mount's proofs start empty and
+    // the catalog loads lazily on the first logical-book operation.
+    let source_owner = crate::source_owner::claim_session_owner();
 
     {
         let spi = epd.spi_mut();
@@ -546,8 +569,33 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
                 Err(error) => Err(error),
             },
         };
+        // The managed source namespace, XTEINK/SRC. Failure refuses only
+        // the logical-book endpoints (`src` stays `None`), never the
+        // legacy shelf, so a card without the directory tree still
+        // serves uploads the old way. The parent handle must outlive the
+        // child, so both bindings live for the serve loop.
+        let xteink = root
+            .open_dir("XTEINK")
+            .or_else(|_| {
+                root.make_dir_in_dir("XTEINK")
+                    .and_then(|()| root.open_dir("XTEINK"))
+            })
+            .ok();
+        let src = xteink.as_ref().and_then(|xteink| {
+            let opened = xteink
+                .open_dir(source_store::layout::SOURCE_DIR)
+                .or_else(|_| {
+                    xteink
+                        .make_dir_in_dir(source_store::layout::SOURCE_DIR)
+                        .and_then(|()| xteink.open_dir(source_store::layout::SOURCE_DIR))
+                });
+            if opened.is_err() {
+                esp_println::println!("source: SRC setup failed");
+            }
+            opened.ok()
+        });
         match books {
-            Ok(books) => serve_uploads(&root, &books).await,
+            Ok(books) => serve_uploads(&root, &books, src.as_ref(), source_owner).await,
             Err(_) => {
                 esp_println::println!("upload: BOOKS setup failed");
                 refuse_uploads_until_exit().await
@@ -571,6 +619,8 @@ async fn serve_uploads<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    src: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+    mut source_owner: Option<&mut SourceOwnerState>,
 ) -> UploadSessionExit
 where
     D: embedded_sdmmc::BlockDevice,
@@ -578,12 +628,18 @@ where
 {
     loop {
         let begin = match select(
-            UPLOAD_BEGINS.receive(),
+            select(UPLOAD_BEGINS.receive(), SOURCE_OPS.receive()),
             select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
         )
         .await
         {
-            Either::First(begin) => begin,
+            Either::First(Either::First(begin)) => begin,
+            Either::First(Either::Second(op)) => {
+                match serve_source_op(op, src, source_owner.as_deref_mut()).await {
+                    Ok(()) => continue,
+                    Err(exit) => return exit,
+                }
+            }
             Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
             Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
                 return UploadSessionExit::Sleep { generation }
@@ -795,6 +851,423 @@ async fn recycle(chunk: UploadChunk) {
     if let Some(buffer) = chunk.buffer {
         UPLOAD_RETURNS.send(buffer).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// M0S logical-book operations (the storage-owner side)
+// ---------------------------------------------------------------------------
+
+/// Send one event to the Wi-Fi task without deafening the session-exit
+/// signals: a stalled consumer must never wedge the storage owner past a
+/// Sleep or wireless Exit. Events are `Copy`, so a send abandoned by an
+/// interleaved `Render` command retries with the same value.
+async fn send_source_event(event: SourceEvent) -> Result<(), UploadSessionExit> {
+    loop {
+        match select(
+            SOURCE_EVENTS.send(event),
+            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+        )
+        .await
+        {
+            Either::First(()) => return Ok(()),
+            Either::Second(Either::First(())) => return Err(UploadSessionExit::Wireless),
+            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
+                return Err(UploadSessionExit::Sleep { generation })
+            }
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
+        }
+    }
+}
+
+/// Load the catalog and idempotency state for this session if not yet
+/// loaded. `idem: None` marks a fresh session (the caller reset it at
+/// session entry); a load that failed retries here on the next operation.
+fn ensure_source_ready<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    src: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &mut SourceOwnerState,
+) -> Result<(), Refusal>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if owner.idem.is_none() || !owner.ws.catalog_is_valid() {
+        load_catalog(src, &mut owner.ws).map_err(refusal_for_publish)?;
+    }
+    if owner.idem.is_none() {
+        owner.idem = Some(IdempotencyStore::load(src, &mut owner.ws).map_err(refusal_for_publish)?);
+    }
+    Ok(())
+}
+
+/// Device-minted identity for a new generation, from the hardware RNG.
+fn mint_identity() -> FreshIdentity {
+    let rng = esp_hal::rng::Rng::new();
+    let mut logical_book_id = [0u8; 16];
+    let mut book_token = [0u8; 16];
+    for chunk in logical_book_id.chunks_mut(4) {
+        chunk.copy_from_slice(&rng.random().to_le_bytes());
+    }
+    for chunk in book_token.chunks_mut(4) {
+        chunk.copy_from_slice(&rng.random().to_le_bytes());
+    }
+    FreshIdentity {
+        logical_book_id,
+        book_token,
+    }
+}
+
+/// The classic-ZIP/ZIP64 gate over a persisted candidate: the real
+/// implementation behind `source-store`'s `validate_container` hook.
+/// Bounded stack (a 512-byte scratch plus the gate's fixed state); the
+/// gate reads only zip structure, never payloads.
+fn container_gate_passes<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(file) = dir.open_file_in_dir(name, embedded_sdmmc::Mode::ReadOnly) else {
+        return false;
+    };
+    let len = file.length();
+    let mut reader = GateReadAt { file, len };
+    let mut scratch = [0u8; 512];
+    let verdict = proto::epub::validate_source_container(
+        &mut reader,
+        proto::epub::SourceContainerLimits::V1,
+        &mut scratch,
+    );
+    let closed = reader.file.close();
+    if let Err(error) = &verdict {
+        esp_println::println!("source: container gate refused: {:?}", error);
+    }
+    verdict.is_ok() && closed.is_ok()
+}
+
+struct GateReadAt<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    file: embedded_sdmmc::File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    len: u32,
+}
+
+impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    proto::epub::ReadAt for GateReadAt<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    type Error = ();
+
+    fn len(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.len)
+    }
+
+    fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
+        self.file.seek_from_start(offset).map_err(|_| ())?;
+        self.file.read(out).map_err(|_| ())
+    }
+}
+
+/// Execute one logical-book operation and answer on `SOURCE_EVENTS`.
+/// `Err` propagates a session-ending interrupt, exactly like the legacy
+/// writer; every refusal is an event, never a hang.
+async fn serve_source_op<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    op: SourceOp,
+    src: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+    owner: Option<&mut SourceOwnerState>,
+) -> Result<(), UploadSessionExit>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let (Some(src), Some(owner)) = (src, owner) else {
+        return send_source_event(SourceEvent::Refused(Refusal::StorageUnavailable)).await;
+    };
+    if let Err(refusal) = ensure_source_ready(src, owner) {
+        return send_source_event(SourceEvent::Refused(refusal)).await;
+    }
+    match op {
+        SourceOp::Upload(upload) => serve_source_upload(src, owner, &upload).await,
+        SourceOp::Delete(delete) => {
+            let SourceOwnerState { ws, idem } = owner;
+            let Some(idem) = idem.as_mut() else {
+                return send_source_event(SourceEvent::Refused(Refusal::StorageUnavailable)).await;
+            };
+            let request = DeleteRequest {
+                epoch: delete.epoch,
+                nonce: delete.nonce,
+                book_token: delete.book_token,
+            };
+            let event = match delete_book(src, idem, &request, ws) {
+                DeleteOutcome::Deleted {
+                    logical_book_id, ..
+                } => SourceEvent::Deleted { logical_book_id },
+                outcome => SourceEvent::Refused(refusal_for_delete(&outcome)),
+            };
+            send_source_event(event).await
+        }
+        SourceOp::Recover(recover) => {
+            let request = RecoveryRequest {
+                epoch: recover.epoch,
+                nonce: recover.nonce,
+                book_token: recover.book_token,
+                observed_length: recover.observed_length,
+                observed_sha256: recover.observed_sha256,
+                display_label: recover.display_label,
+            };
+            // The gate validates the slot file of the book being
+            // recovered; resolve it up front. An unknown token leaves the
+            // gate a no-op — recovery rejects it before the gate runs.
+            let slot_name =
+                source_store::ops::find_authoritative_by_token(&owner.ws, &recover.book_token)
+                    .and_then(|entry| source_store::layout::source_slot_name(entry.physical_slot));
+            // Token collisions re-mint rather than surface: the client
+            // cannot act on a collision between two random values.
+            let mut outcome = RecoveryOutcome::RejectedIdentityCollision;
+            for _ in 0..4 {
+                let SourceOwnerState { ws, idem } = owner;
+                let Some(idem) = idem.as_mut() else {
+                    break;
+                };
+                outcome = recover_book(src, idem, &request, mint_identity().book_token, ws, || {
+                    slot_name
+                        .as_ref()
+                        .is_some_and(|name| container_gate_passes(src, name.as_str()))
+                });
+                if !matches!(outcome, RecoveryOutcome::RejectedIdentityCollision) {
+                    break;
+                }
+            }
+            let event = match outcome {
+                RecoveryOutcome::Recovered(result) => SourceEvent::Committed(commit_for(
+                    &result,
+                    recover.observed_length,
+                    recover.observed_sha256,
+                    recovered_label(owner, &result),
+                )),
+                outcome => SourceEvent::Refused(refusal_for_recovery(&outcome)),
+            };
+            send_source_event(event).await
+        }
+        SourceOp::List => {
+            let mut count: u16 = 0;
+            for slot in 0..MAX_SOURCE_SLOTS {
+                match listed_book_at(&owner.ws, slot) {
+                    Ok(Some(entry)) => {
+                        send_source_event(SourceEvent::ListEntry(entry)).await?;
+                        count += 1;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return send_source_event(SourceEvent::Refused(
+                            Refusal::StorageUnavailable,
+                        ))
+                        .await;
+                    }
+                }
+            }
+            send_source_event(SourceEvent::ListEnd { count }).await
+        }
+        SourceOp::Capabilities => {
+            let SourceOwnerState { ws, idem } = owner;
+            let Some(idem) = idem.as_mut() else {
+                return send_source_event(SourceEvent::Refused(Refusal::StorageUnavailable)).await;
+            };
+            if ensure_epoch_headroom(src, idem, ws).is_err() {
+                return send_source_event(SourceEvent::Refused(Refusal::StorageUnavailable)).await;
+            }
+            let state = &idem.state;
+            let current = state.current_epoch_receipts() as u64;
+            let caps = SourceCaps {
+                idempotency_epoch: state.current_epoch,
+                max_new_requests_this_epoch: (MAX_RECEIPTS_PER_EPOCH as u64)
+                    .saturating_sub(current),
+                retained_previous_epoch: state.receipts().len() as u64 - current,
+            };
+            send_source_event(SourceEvent::Capabilities(caps)).await
+        }
+    }
+}
+
+/// The commit event for an upload or recovery result. Length, digest, and
+/// label come from the request that the transaction just proved exact.
+fn commit_for(
+    result: &UploadResult,
+    source_length: u64,
+    source_sha256: [u8; 32],
+    display_label: source_store::bodies::DisplayLabel,
+) -> SourceCommit {
+    SourceCommit {
+        logical_book_id: result.logical_book_id,
+        book_token: result.book_token,
+        source_generation: result.source_generation,
+        source_length,
+        source_sha256,
+        display_label,
+    }
+}
+
+/// The label a recovery actually committed: the request's replacement if
+/// one was supplied, else the label already in the (reloaded) catalog.
+fn recovered_label(
+    owner: &SourceOwnerState,
+    result: &UploadResult,
+) -> source_store::bodies::DisplayLabel {
+    owner
+        .ws
+        .entries
+        .iter()
+        .flatten()
+        .find(|entry| entry.metadata.book_token == result.book_token)
+        .map(|entry| entry.metadata.display_label)
+        .unwrap_or_else(source_store::bodies::DisplayLabel::placeholder)
+}
+
+/// One M0S create/replace: begin (with collision re-mint), stream the
+/// body from the shared ping-pong, finish with the container gate over
+/// the persisted candidate.
+async fn serve_source_upload<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    src: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &mut SourceOwnerState,
+    upload: &SourceUploadOp,
+) -> Result<(), UploadSessionExit>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let request = source_store::upload::UploadRequest {
+        epoch: upload.epoch,
+        nonce: upload.nonce,
+        declared_length: upload.declared_length,
+        declared_sha256: upload.declared_sha256,
+        display_label: upload.display_label,
+        replace_token: upload.replace_token,
+    };
+    let mut txn = None;
+    for _ in 0..4 {
+        let SourceOwnerState { ws, idem } = owner;
+        let Some(idem) = idem.as_mut() else {
+            return send_source_event(SourceEvent::Refused(Refusal::StorageUnavailable)).await;
+        };
+        match begin_upload(src, idem, &request, mint_identity(), ws) {
+            UploadBeginOutcome::Started(started) => {
+                txn = Some(started);
+                break;
+            }
+            UploadBeginOutcome::Replayed(result) => {
+                // The original result, re-served; the client's body is
+                // never streamed (the Wi-Fi side answers on this event).
+                let commit = commit_for(
+                    &result,
+                    upload.declared_length,
+                    upload.declared_sha256,
+                    upload.display_label,
+                );
+                return send_source_event(SourceEvent::Committed(commit)).await;
+            }
+            UploadBeginOutcome::RejectedIdentityCollision => continue,
+            outcome => {
+                return send_source_event(SourceEvent::Refused(refusal_for_begin(&outcome))).await;
+            }
+        }
+    }
+    let Some(mut txn) = txn else {
+        return send_source_event(SourceEvent::Refused(Refusal::Conflict)).await;
+    };
+    send_source_event(SourceEvent::UploadStarted).await?;
+
+    // Stream the body. A failed SD write keeps draining chunks so the
+    // Wi-Fi side never blocks on a full channel, exactly like the legacy
+    // writer.
+    let mut failed = false;
+    let mut aborted = false;
+    loop {
+        let chunk = match next_upload_chunk().await {
+            Ok(chunk) => chunk,
+            Err(exit) => {
+                abort_upload(src, txn);
+                return Err(exit);
+            }
+        };
+        if !failed && !aborted && !chunk.abort {
+            if let Some(buffer) = &chunk.buffer {
+                if source_upload_chunk(src, &mut txn, &buffer[..chunk.len.min(buffer.len())])
+                    .is_err()
+                {
+                    failed = true;
+                }
+            }
+        }
+        aborted |= chunk.abort;
+        let last = chunk.last;
+        recycle(chunk).await;
+        if last || aborted {
+            break;
+        }
+    }
+    if aborted || failed {
+        abort_upload(src, txn);
+        let refusal = if aborted {
+            Refusal::ClientAborted
+        } else {
+            Refusal::StorageIo
+        };
+        return send_source_event(SourceEvent::Refused(refusal)).await;
+    }
+
+    // Finish: durable sync, independent reread, container gate, metadata
+    // publication with final revalidation.
+    let candidate: heapless::String<12> = {
+        let mut name = heapless::String::new();
+        let _ = name.push_str(txn.candidate_name());
+        name
+    };
+    let SourceOwnerState { ws, idem } = owner;
+    let Some(idem) = idem.as_mut() else {
+        abort_upload(src, txn);
+        return send_source_event(SourceEvent::Refused(Refusal::StorageUnavailable)).await;
+    };
+    let event = match source_store::upload::finish_upload(src, idem, txn, ws, || {
+        container_gate_passes(src, candidate.as_str())
+    }) {
+        Ok(result) => SourceEvent::Committed(commit_for(
+            &result,
+            upload.declared_length,
+            upload.declared_sha256,
+            upload.display_label,
+        )),
+        Err(error) => SourceEvent::Refused(refusal_for_upload_error(error)),
+    };
+    send_source_event(event).await
 }
 
 /// Session setup stalled short of an upload-capable BOOKS directory:

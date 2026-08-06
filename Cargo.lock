@@ -1113,6 +1113,7 @@ dependencies = [
  "portable-atomic",
  "proto",
  "reader-cache",
+ "source-store",
  "static_cell",
  "ui",
  "upload-store",

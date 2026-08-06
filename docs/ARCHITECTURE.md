@@ -91,7 +91,10 @@ proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser
            pieces, including the classic-ZIP container gate (`ContainerGate`):
            the resumable bounded validator behind source-store's
            `validate_container` hooks, enforcing `SourceContainerLimits` and
-           rejecting ZIP64 and multi-disk archives deterministically
+           rejecting ZIP64 and multi-disk archives deterministically; and
+           `proto::source_http`, the parsing/formatting layer of the M0S
+           logical-book HTTP contract (request IDs, headers, JSON bodies
+           and responses), host-tested like `captive` and `upload`
 source-store/ M0S source-transaction foundation: commit-sector record framing,
            the durable publication sequence (`durable_sync`), typed authority
            records (source metadata, tombstones, staging markers, idempotency

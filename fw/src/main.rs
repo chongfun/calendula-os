@@ -138,6 +138,7 @@ mod mmu;
 mod ota_update;
 mod sd_session;
 mod sleep_marker;
+pub mod source_owner;
 mod sync_mem;
 pub mod tasks;
 pub mod upload;
@@ -211,6 +212,12 @@ pub static UPLOAD_STOP_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Chann
 /// Acknowledges the stop: every FAT handle is closed and the volume is
 /// unmounted, so the session-ending reset cannot race an open writer.
 pub static UPLOAD_STOPPED: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+/// M0S logical-book operations from the Wi-Fi endpoints to the storage
+/// owner; create/replace bodies ride UPLOAD_CHUNKS after UploadStarted.
+pub static SOURCE_OPS: Channel<CriticalSectionRawMutex, source_owner::SourceOp, 1> = Channel::new();
+/// Typed answers back: commit results, refusals, streamed list entries.
+pub static SOURCE_EVENTS: Channel<CriticalSectionRawMutex, source_owner::SourceEvent, 2> =
+    Channel::new();
 /// A Sleep exit closed the upload session while the book server may be
 /// mid-request. The server consumes this to fail the interrupted request,
 /// reclaim the loaned buffers, and restart the session on the next request.
