@@ -28,6 +28,8 @@ from fontgen_common import (
     kerning_entries,
     rasterize_glyph,
     require_pinned_pillow,
+    set_clip_face,
+    write_clip_report,
     write_kerning,
 )
 
@@ -110,6 +112,7 @@ def main():
     for px, line_height, baseline in SIZES:
         for style, source, axes in FONTS:
             font = load_font(source, axes, px)
+            set_clip_face(f"Merriweather-{style}")
             metrics = []
             pool = BitmapPool()
             for code in cps:
@@ -154,6 +157,7 @@ def main():
             out.append("};\n\n")
 
     OUT.write_text("".join(out))
+    write_clip_report(ROOT / "tools" / "clip-reports" / "merriweather.txt")
     print(f"wrote {OUT}")
 
 
