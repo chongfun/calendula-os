@@ -87,16 +87,27 @@ hal-ext/   thin async wrappers over ESP HAL peripherals
 fw/        boot, Embassy executor, task wiring, board-owned peripherals
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
-proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
+proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser
+           pieces, including the classic-ZIP container gate (`ContainerGate`):
+           the resumable bounded validator behind source-store's
+           `validate_container` hooks, enforcing `SourceContainerLimits` and
+           rejecting ZIP64 and multi-disk archives deterministically
 source-store/ M0S source-transaction foundation: commit-sector record framing,
            the durable publication sequence (`durable_sync`), typed authority
            records (source metadata, tombstones, staging markers, idempotency
-           receipts), startup source selection, the managed SRC namespace,
-           the delete, create/replace, and explicit-recovery transactions,
-           unmanaged adoption and re-identification, restartable cleanup,
-           and resumable source-identity jobs (full SHA-256 plus the quick
-           fingerprint); host-tested with fault-injection and simulated
-           power-cut replay
+           receipts), strict fail-closed authority loading (decayed committed
+           records never read as absent), startup source selection, the
+           managed SRC namespace, the delete, create/replace, and
+           explicit-recovery transactions, the request-ID lookup order
+           (receipts, committed records, staging markers), unmanaged adoption
+           and re-identification, restartable cleanup, resumable
+           source-identity jobs (full SHA-256 plus the quick fingerprint),
+           the mount-session validation contract (quick check, provisional
+           cached-open gating, background full validation, external-
+           modification quarantine), and the list-books view with
+           per-book integrity status and allowed operations; host-tested
+           with fault-injection and simulated power-cut replay over every
+           authoritative record class
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup-stable Cargo wrapper for firmware builds/checks
 tools/bench/    serial bench harness for hardware timing, storage/cache,

@@ -45,7 +45,8 @@ use crate::bodies::{
 use crate::layout;
 use crate::ops::{
     find_authoritative_by_token, find_request_trace, hash_file_identity, load_catalog,
-    receipt_is_consistent_with_trace, IdempotencyStore, OpsWorkspace, RequestTrace,
+    marker_claims_request, no_committed_tombstone_for, receipt_is_consistent_with_trace,
+    IdempotencyStore, OpsWorkspace, RequestTrace,
 };
 use crate::publish::{self, PublishError};
 use crate::receipts::{
@@ -54,6 +55,15 @@ use crate::receipts::{
 use crate::record::{self, RecordState};
 use crate::select::MAX_SOURCE_SLOTS;
 use crate::validate::{Sha256Job, QUICK_FINGERPRINT_POLICY_V1};
+
+/// Whole-source byte ceiling: the PRD's `MAX_EPUB_BYTES`, enforced against
+/// the declared length *before* any staging so an oversized upload never
+/// costs a marker publication or a byte of streaming. The capabilities
+/// handshake advertises this number, and
+/// `proto::epub::SourceContainerLimits::V1.max_epub_bytes` must carry the
+/// same value — this crate deliberately does not depend on `proto`, so the
+/// firmware wiring that owns both is where the equality gets asserted.
+pub const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A parsed create or replace request: the epoch-scoped request ID, the
 /// declared source identity the device must independently confirm, the
@@ -104,6 +114,16 @@ pub enum UploadBeginOutcome {
     Replayed(UploadResult),
     /// Replace with a token that names no authoritative generation.
     RejectedUnknownToken,
+    /// The declared length exceeds [`MAX_SOURCE_BYTES`]. Checked before the
+    /// idempotency search: an oversized request can never have committed,
+    /// and the PRD requires the rejection to land before staging.
+    RejectedTooLarge,
+    /// Replace against a base generation whose committed bytes this mount
+    /// has proved are gone or changed (`Mismatch`, `Unavailable`, or
+    /// `UnsupportedContainer`). Ordinary replacement is not offered over a
+    /// broken authority chain — explicit recovery and delete are the
+    /// repairs, and both stay available.
+    RejectedExternallyModified,
     RejectedStaleEpoch,
     RejectedParameterMismatch,
     RejectedEpochExhausted,
@@ -261,6 +281,13 @@ where
     if !idem.is_usable() {
         return UploadBeginOutcome::IdempotencyUnavailable;
     }
+    // 0. Declared-length ceiling, at request-syntax level. Nothing this
+    //    large ever staged or committed, so there is no idempotency state
+    //    it could shadow, and rejecting here keeps the marker pair and the
+    //    candidate slot untouched.
+    if req.declared_length > MAX_SOURCE_BYTES {
+        return UploadBeginOutcome::RejectedTooLarge;
+    }
 
     // 1. Receipts first, provided committed fallback evidence is absent or
     //    uniquely consistent with the receipt.
@@ -311,6 +338,25 @@ where
         RequestTrace::Conflict => return UploadBeginOutcome::AmbiguousRequestEvidence,
         RequestTrace::None => {}
     }
+    // The staging-marker station of the lookup order. A committed marker
+    // carrying this ID is this request's own interrupted staging: with the
+    // same bound parameters the transaction below *is* the resume — the
+    // superseding marker restages the same request, and nothing had
+    // committed, so single execution holds. Different parameters under the
+    // spent ID are misuse, exactly as they would be against a receipt.
+    if marker_claims_request(ws, &request_id) {
+        let resumable = ws.marker.as_ref().is_some_and(|marker| {
+            marker.operation == req.staged_operation()
+                && marker.base_book_token_or_zero
+                    == req.replace_token.unwrap_or([0; BOOK_TOKEN_BYTES])
+                && marker.expected_source_length == req.declared_length
+                && marker.expected_source_sha256 == req.declared_sha256
+                && marker.display_label == req.display_label
+        });
+        if !resumable {
+            return UploadBeginOutcome::RejectedParameterMismatch;
+        }
+    }
 
     // 2. Genuinely new: freshness and budget before anything commits.
     if !idem.state.epoch_is_current(req.epoch) {
@@ -324,6 +370,22 @@ where
     let (logical_book_id, source_generation) = match req.replace_token {
         Some(token) => match find_authoritative_by_token(ws, &token) {
             Some(entry) => {
+                // A base this mount has proved broken — bytes changed,
+                // vanished, or unsupported — is not replaceable through
+                // the ordinary path; the client must go through explicit
+                // recovery or delete, which both re-prove state.
+                let level = ws.session.level(
+                    &entry.metadata.logical_book_id,
+                    entry.metadata.source_generation,
+                );
+                if matches!(
+                    level,
+                    crate::session::IntegrityLevel::Mismatch
+                        | crate::session::IntegrityLevel::Unavailable
+                        | crate::session::IntegrityLevel::UnsupportedContainer
+                ) {
+                    return UploadBeginOutcome::RejectedExternallyModified;
+                }
                 let Some(next) = entry.metadata.source_generation.checked_add(1) else {
                     return UploadBeginOutcome::Failed(PublishError::BadInput);
                 };
@@ -427,6 +489,10 @@ where
     ) {
         return UploadBeginOutcome::Failed(error);
     }
+    // Keep the workspace's marker view current with what was just
+    // committed, so a retry arriving before any catalog reload still
+    // resolves this request's staging.
+    ws.marker = Some(marker);
 
     // 6. Create (or truncate a stale abandoned) candidate. Through
     //    `open_for_write`, so a dropped read cannot answer with a second
@@ -619,6 +685,12 @@ where
         if !marker_current {
             return false;
         }
+        // No committed tombstone may name this logical book: deleted
+        // identities are burned, and committing a generation above a
+        // tombstone would resurrect one.
+        if !no_committed_tombstone_for(dir, &txn.logical_book_id) {
+            return false;
+        }
         // For replace: the base generation must still be authoritative.
         let Some((token, base_names)) = &base else {
             return true;
@@ -645,18 +717,25 @@ where
         Err(error) => return Err(UploadError::Io(error)),
     }
 
-    // 7. Retain the receipt; failure degrades replay to the committed
+    // 7. Seed this mount's exact-validation set: the persisted-file reread
+    //    above proved exact identity, and the publish just confirmed the
+    //    generation through startup selection — the PRD's condition for
+    //    letting the new book open without immediately rehashing it.
+    ws.session
+        .seed_full_validation(&txn.logical_book_id, txn.source_generation);
+
+    // 8. Retain the receipt; failure degrades replay to the committed
     //    metadata's request identity, never the outcome.
     let receipt = request.receipt(txn.logical_book_id, txn.source_generation, txn.book_token);
     let receipt_durable = idem.state.insert(receipt).is_ok() && idem.publish(dir, ws).is_ok();
 
-    // 8. The marker's job is done; its removal is cleanup.
+    // 9. The marker's job is done; its removal is cleanup.
     let marker_names = layout::marker_pair();
     for name in marker_names.pair().names {
         let _ = dir.delete_file_in_dir(name);
     }
 
-    // 9. Refresh the caller's catalog view. The generation is committed
+    // 10. Refresh the caller's catalog view. The generation is committed
     //    either way; a failed reload leaves the workspace invalid, which
     //    stops the next operation instead of misleading it.
     let _ = load_catalog(dir, ws);

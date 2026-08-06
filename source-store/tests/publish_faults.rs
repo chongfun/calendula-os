@@ -25,11 +25,20 @@ use common::{
     new_card, open_mgr, open_root, publish_generation, sample_metadata, sealed_metadata, SharedDisk,
 };
 use embedded_sdmmc::Mode;
-use source_store::bodies::{SourceMetadata, SOURCE_METADATA_MAGIC};
+use source_store::bodies::{
+    DisplayLabel, SourceMetadata, StagedOperation, StagingMarker, Tombstone, BOOK_TOKEN_BYTES,
+    LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES, SOURCE_METADATA_MAGIC,
+    SOURCE_METADATA_SCHEMA, STAGING_MARKER_MAGIC, STAGING_MARKER_SCHEMA, TOMBSTONE_MAGIC,
+    TOMBSTONE_SCHEMA, TOMBSTONE_STATUS_DELETED,
+};
 use source_store::publish::{
     publish_record, select_authority, summarize_slot, PublishError, SlotPair, SlotSummary,
 };
-use source_store::record::{classify_record, encode_commit_sector, RecordState};
+use source_store::receipts::{
+    IdempotencyState, OperationReceipt, ReceiptOperation, IDEMPOTENCY_MAGIC, IDEMPOTENCY_SCHEMA,
+    RECEIPT_STATUS_SUCCESS, REQUEST_NONCE_BYTES,
+};
+use source_store::record::{classify_record, encode_commit_sector, seal_body, RecordState};
 
 const PAIR: SlotPair<'_> = SlotPair {
     names: ["SRCMETA.A", "SRCMETA.B"],
@@ -484,7 +493,9 @@ fn oversized_slot_file_is_corrupt_and_recoverable() {
     let mut scratch = [0u8; SCRATCH_BYTES];
     assert_eq!(
         summarize_slot(&root, PAIR.names[0], PAIR.magic, &mut scratch),
-        Ok(SlotSummary::Corrupt)
+        Ok(SlotSummary::Corrupt {
+            claims_commit: false
+        })
     );
 
     publish_generation(&root, PAIR, 1).expect("publication over corrupt slot");
@@ -522,4 +533,257 @@ fn ambiguous_equal_generations_refuse_selection_and_publication() {
         publish_generation(&root, PAIR, 2),
         Err(PublishError::AmbiguousAuthority)
     );
+}
+
+// ---------------------------------------------------------------------------
+// The cut sweep, run against every authoritative record class
+// ---------------------------------------------------------------------------
+
+/// One authoritative record class: its real layout pair and a
+/// generation-dependent body, so a cut reconstruction proves not only that
+/// selection lands on a whole generation but that the selected *content*
+/// is that generation's.
+struct RecordClass {
+    label: &'static str,
+    pair: SlotPair<'static>,
+    schema: u16,
+    encode: fn(u64, &mut [u8]) -> usize,
+}
+
+fn encode_metadata_body(generation: u64, buf: &mut [u8]) -> usize {
+    sample_metadata(generation)
+        .encode_into(buf)
+        .expect("encode metadata body")
+}
+
+fn encode_tombstone_body(generation: u64, buf: &mut [u8]) -> usize {
+    Tombstone {
+        logical_book_id: [4; LOGICAL_BOOK_ID_BYTES],
+        deleted_source_generation: generation,
+        deleted_book_token: [generation as u8 + 1; BOOK_TOKEN_BYTES],
+        delete_request_id: [2; REQUEST_ID_BYTES],
+        delete_result_status: TOMBSTONE_STATUS_DELETED,
+    }
+    .encode_into(buf)
+    .expect("encode tombstone body")
+}
+
+fn encode_idempotency_body(generation: u64, buf: &mut [u8]) -> usize {
+    let mut state = IdempotencyState::initial();
+    // One receipt per generation beyond the first, so bodies differ by
+    // generation and a mixed old-body/new-sector record cannot hide.
+    for n in 1..generation {
+        state
+            .insert(OperationReceipt {
+                epoch: 1,
+                request_nonce: [n as u8; REQUEST_NONCE_BYTES],
+                operation: ReceiptOperation::Delete,
+                logical_book_id: [n as u8; LOGICAL_BOOK_ID_BYTES],
+                base_book_token_or_zero: [n as u8; BOOK_TOKEN_BYTES],
+                source_generation: 0,
+                source_length_or_zero: 0,
+                source_sha256_or_zero: [0; SHA256_BYTES],
+                display_label_len: 0,
+                display_label: [0; 64],
+                result_book_token_or_zero: [0; BOOK_TOKEN_BYTES],
+                result_status: RECEIPT_STATUS_SUCCESS,
+            })
+            .expect("insert fixture receipt");
+    }
+    state.encode_into(buf).expect("encode idempotency body")
+}
+
+fn encode_marker_body(generation: u64, buf: &mut [u8]) -> usize {
+    StagingMarker {
+        operation: StagedOperation::Create,
+        operation_request_id: [generation as u8 + 1; REQUEST_ID_BYTES],
+        logical_book_id: [5; LOGICAL_BOOK_ID_BYTES],
+        base_book_token_or_zero: [0; BOOK_TOKEN_BYTES],
+        candidate_source_generation: generation,
+        candidate_physical_slot: 3,
+        expected_source_length: 100 + generation,
+        expected_source_sha256: [generation as u8; SHA256_BYTES],
+        display_label: DisplayLabel::new(b"m").unwrap(),
+    }
+    .encode_into(buf)
+    .expect("encode marker body")
+}
+
+fn record_classes() -> [RecordClass; 4] {
+    [
+        RecordClass {
+            label: "source metadata",
+            pair: SlotPair {
+                names: ["M00A.BIN", "M00B.BIN"],
+                magic: SOURCE_METADATA_MAGIC,
+            },
+            schema: SOURCE_METADATA_SCHEMA,
+            encode: encode_metadata_body,
+        },
+        RecordClass {
+            label: "tombstone",
+            pair: SlotPair {
+                names: ["T00A.BIN", "T00B.BIN"],
+                magic: TOMBSTONE_MAGIC,
+            },
+            schema: TOMBSTONE_SCHEMA,
+            encode: encode_tombstone_body,
+        },
+        RecordClass {
+            label: "idempotency state",
+            pair: SlotPair {
+                names: ["IDEMA.BIN", "IDEMB.BIN"],
+                magic: IDEMPOTENCY_MAGIC,
+            },
+            schema: IDEMPOTENCY_SCHEMA,
+            encode: encode_idempotency_body,
+        },
+        RecordClass {
+            label: "staging marker",
+            pair: SlotPair {
+                names: ["MARKA.BIN", "MARKB.BIN"],
+                magic: STAGING_MARKER_MAGIC,
+            },
+            schema: STAGING_MARKER_SCHEMA,
+            encode: encode_marker_body,
+        },
+    ]
+}
+
+fn publish_class_generation(root: &common::Dir<'_>, class: &RecordClass, generation: u64) {
+    let mut buf = vec![0u8; 16 * 1024];
+    let logical = (class.encode)(generation, &mut buf);
+    let sealed = seal_body(
+        class.pair.magic,
+        class.schema,
+        generation,
+        logical,
+        &mut buf,
+    )
+    .expect("seal class body");
+    let mut scratch = vec![0u8; 16 * 1024];
+    publish_record(root, class.pair, &buf, &sealed, 0, &mut scratch, || true)
+        .unwrap_or_else(|error| panic!("{}: publish gen {generation}: {error:?}", class.label));
+}
+
+/// Class-generic old-or-new assertion, with a byte-exact content check
+/// against the generation's canonical body.
+fn assert_class_old_or_new(
+    disk: &SharedDisk,
+    class: &RecordClass,
+    old: Option<u64>,
+    new: u64,
+    context: &str,
+) {
+    let mgr = open_mgr(disk);
+    let root = open_root(&mgr);
+    let mut scratch = vec![0u8; 16 * 1024];
+    let selected =
+        select_authority(&root, class.pair, &mut scratch).expect("selection must not error");
+    let Some((slot, generation)) = selected else {
+        assert_eq!(old, None, "{}: {context}: authority vanished", class.label);
+        return;
+    };
+    assert!(
+        Some(generation) == old || generation == new,
+        "{}: {context}: selected generation {generation}, expected {old:?} or {new}",
+        class.label
+    );
+    let file = root
+        .open_file_in_dir(class.pair.names[slot], Mode::ReadOnly)
+        .expect("selected slot must open");
+    let len = file.length() as usize;
+    assert!(len <= scratch.len(), "selected record impossibly large");
+    let mut at = 0usize;
+    while at < len {
+        let n = file.read(&mut scratch[at..len]).expect("read selected");
+        assert!(n > 0, "short read of selected record");
+        at += n;
+    }
+    file.close().expect("close selected");
+    let RecordState::Committed(view) = classify_record(&scratch[..len], class.pair.magic) else {
+        panic!(
+            "{}: {context}: selected slot must classify committed",
+            class.label
+        );
+    };
+    assert_eq!(view.generation, generation);
+    let mut expected = vec![0u8; 16 * 1024];
+    let expected_len = (class.encode)(generation, &mut expected);
+    // Stamp the framing prefix and CRC the encode helpers leave to
+    // seal_body, so the comparison covers the exact committed bytes.
+    seal_body(
+        class.pair.magic,
+        class.schema,
+        generation,
+        expected_len,
+        &mut expected,
+    )
+    .expect("seal expected body");
+    assert_eq!(
+        view.logical_body,
+        &expected[..expected_len],
+        "{}: {context}: selected content does not match its generation",
+        class.label
+    );
+}
+
+/// The PRD's "run against all authoritative record classes": the full
+/// cut-point-times-torn-sector sweep, for the first publication and a
+/// replacement, over each class's real layout pair. One record protocol,
+/// proved once per class rather than assumed to generalize.
+#[test]
+fn every_record_class_survives_every_cut_point() {
+    for class in record_classes() {
+        // First publication: absent or generation 1 at every cut.
+        let disk = new_card();
+        let base = disk.snapshot();
+        disk.start_logging();
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            publish_class_generation(&root, &class, 1);
+        }
+        let log = disk.take_log();
+        assert!(
+            log.len() > 4,
+            "{}: publication should write several blocks",
+            class.label
+        );
+        for cut in 0..=log.len() {
+            for torn in [0, 1, 128, 511] {
+                disk.restore_cut(&base, &log, cut, torn);
+                assert_class_old_or_new(
+                    &disk,
+                    &class,
+                    None,
+                    1,
+                    &format!("first publication, cut {cut} + {torn} torn bytes"),
+                );
+            }
+        }
+
+        // Replacement: old or new at every cut, never absent, never mixed.
+        disk.restore_cut(&base, &log, log.len(), 0);
+        let committed = disk.snapshot();
+        disk.start_logging();
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            publish_class_generation(&root, &class, 2);
+        }
+        let log = disk.take_log();
+        for cut in 0..=log.len() {
+            for torn in [0, 1, 128, 511] {
+                disk.restore_cut(&committed, &log, cut, torn);
+                assert_class_old_or_new(
+                    &disk,
+                    &class,
+                    Some(1),
+                    2,
+                    &format!("replacement, cut {cut} + {torn} torn bytes"),
+                );
+            }
+        }
+    }
 }

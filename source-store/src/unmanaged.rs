@@ -105,6 +105,13 @@ where
         // A zero-length file is not a book and not adoptable.
         return AdoptOutcome::RejectedNameInvalid;
     }
+    // Oversized direct-SD sources are never adopted as ordinary books, and
+    // an existing book whose file grew past the ceiling keeps its committed
+    // identity (which now reads as a mismatch) rather than re-identifying
+    // to bytes no reader path may open.
+    if identity.length > crate::upload::MAX_SOURCE_BYTES {
+        return AdoptOutcome::RejectedUnsupportedContainer;
+    }
 
     // The live entry for this name, if any. Only the authoritative
     // generation counts: a deleted book's lingering records never make its
@@ -273,6 +280,12 @@ where
         if !base_ok {
             return false;
         }
+        // Deletion state, rechecked from the card: a committed tombstone
+        // for this logical book means the identity is burned, and this
+        // commit would resurrect it.
+        if !crate::ops::no_committed_tombstone_for(records_dir, &logical_book_id) {
+            return false;
+        }
         // Exact identity immediately before the commit, as in recovery: the
         // file belongs to the user, the record is about to vouch for a
         // specific digest, and a same-length edit since the hash would make
@@ -296,6 +309,11 @@ where
         Err(error) => return AdoptOutcome::Failed(error),
     }
 
+    // The adoption hash (re-proved inside the revalidation closure) is an
+    // exact-identity proof of exactly these bytes; seed the mount's
+    // validation set so the fresh book opens without a second full pass.
+    ws.session
+        .seed_full_validation(&logical_book_id, source_generation);
     let _ = load_catalog(records_dir, ws);
     let result = UploadResult {
         logical_book_id,

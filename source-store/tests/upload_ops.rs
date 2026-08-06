@@ -77,6 +77,8 @@ fn begin_name(outcome: &UploadBeginOutcome) -> &'static str {
         UploadBeginOutcome::Started(_) => "Started",
         UploadBeginOutcome::Replayed(_) => "Replayed",
         UploadBeginOutcome::RejectedUnknownToken => "RejectedUnknownToken",
+        UploadBeginOutcome::RejectedTooLarge => "RejectedTooLarge",
+        UploadBeginOutcome::RejectedExternallyModified => "RejectedExternallyModified",
         UploadBeginOutcome::RejectedStaleEpoch => "RejectedStaleEpoch",
         UploadBeginOutcome::RejectedParameterMismatch => "RejectedParameterMismatch",
         UploadBeginOutcome::RejectedEpochExhausted => "RejectedEpochExhausted",
@@ -640,4 +642,155 @@ fn abandoned_transaction_is_superseded_by_the_next() {
     let mut tokens = visible_tokens(&disk);
     tokens.sort();
     assert_eq!(tokens, vec![[10; BOOK_TOKEN_BYTES], [40; BOOK_TOKEN_BYTES]]);
+}
+
+#[test]
+fn oversized_declared_length_rejects_before_staging() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+
+    let before = disk.snapshot();
+    let req = UploadRequest {
+        epoch: 1,
+        nonce: [9; 16],
+        declared_length: source_store::upload::MAX_SOURCE_BYTES + 1,
+        declared_sha256: [1; 32],
+        display_label: DisplayLabel::new(b"Way Too Big").unwrap(),
+        replace_token: None,
+    };
+    let outcome = begin_upload(&root, &mut idem, &req, fresh(5, 10), &mut ws);
+    assert!(
+        matches!(outcome, UploadBeginOutcome::RejectedTooLarge),
+        "got {}",
+        begin_name(&outcome)
+    );
+    // Before staging means before *anything*: no marker, no candidate, no
+    // block written.
+    assert_eq!(
+        disk.snapshot(),
+        before,
+        "an oversized request must not touch the card"
+    );
+}
+
+#[test]
+fn interrupted_staging_resumes_the_same_request_and_rejects_misuse() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let bytes = epub_bytes(4_000, 3);
+    let req = request(1, 9, &bytes, None);
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+
+    // Stage, then lose the connection: the committed marker survives.
+    let txn = match begin_upload(&root, &mut idem, &req, fresh(5, 10), &mut ws) {
+        UploadBeginOutcome::Started(txn) => txn,
+        outcome => panic!("begin: {}", begin_name(&outcome)),
+    };
+    abort_upload(&root, txn);
+
+    // The spent ID at another endpoint is misuse, not a fresh request.
+    let delete = DeleteRequest {
+        epoch: 1,
+        nonce: [9; 16],
+        book_token: [10; BOOK_TOKEN_BYTES],
+    };
+    assert!(matches!(
+        delete_book(&root, &mut idem, &delete, &mut ws),
+        DeleteOutcome::RejectedParameterMismatch
+    ));
+    let recovery = RecoveryRequest {
+        epoch: 1,
+        nonce: [9; 16],
+        book_token: [10; BOOK_TOKEN_BYTES],
+        observed_length: 4,
+        observed_sha256: [2; 32],
+        display_label: None,
+    };
+    assert!(matches!(
+        recover_book(
+            &root,
+            &mut idem,
+            &recovery,
+            [77; BOOK_TOKEN_BYTES],
+            &mut ws,
+            || true
+        ),
+        RecoveryOutcome::RejectedParameterMismatch
+    ));
+
+    // The same ID with different bound parameters is rejected even though
+    // nothing committed — the marker remembers what it staged.
+    let different = request(1, 9, &epub_bytes(5_000, 4), None);
+    let outcome = begin_upload(&root, &mut idem, &different, fresh(6, 11), &mut ws);
+    assert!(
+        matches!(outcome, UploadBeginOutcome::RejectedParameterMismatch),
+        "got {}",
+        begin_name(&outcome)
+    );
+
+    // The same ID with the same parameters resumes: one execution, one
+    // committed result.
+    let result = run_upload(&root, &mut idem, &mut ws, &req, fresh(5, 10), &bytes).expect("resume");
+    assert_eq!(result.source_generation, 1);
+    assert_eq!(visible_tokens(&disk), vec![[10; BOOK_TOKEN_BYTES]]);
+}
+
+#[test]
+fn a_delete_committed_mid_upload_refuses_the_finish() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let bytes = epub_bytes(4_000, 3);
+
+    let mut ws = workspace();
+    load_catalog(&root, &mut ws).expect("catalog");
+    let mut idem = IdempotencyStore::load(&root, &mut ws).expect("idem");
+    let first = request(1, 9, &bytes, None);
+    run_upload(&root, &mut idem, &mut ws, &first, fresh(5, 10), &bytes).expect("baseline book");
+
+    // A replace begins and streams fully...
+    let replacement = epub_bytes(4_000, 4);
+    let req = request(1, 20, &replacement, Some(10));
+    let mut txn = match begin_upload(&root, &mut idem, &req, fresh(6, 30), &mut ws) {
+        UploadBeginOutcome::Started(txn) => txn,
+        outcome => panic!("begin: {}", begin_name(&outcome)),
+    };
+    for chunk in replacement.chunks(1000) {
+        upload_chunk(&root, &mut txn, chunk).expect("chunk");
+    }
+
+    // ...but a delete commits its tombstone before the finish. (The
+    // storage owner serializes operations, so this interleaving should be
+    // impossible — the final revalidation is what turns "should be" into
+    // a refused commit instead of a resurrected book.)
+    let delete = DeleteRequest {
+        epoch: 1,
+        nonce: [21; 16],
+        book_token: [10; BOOK_TOKEN_BYTES],
+    };
+    assert!(matches!(
+        delete_book(&root, &mut idem, &delete, &mut ws),
+        DeleteOutcome::Deleted {
+            replayed: false,
+            ..
+        }
+    ));
+
+    // The base's metadata record still exists on the card (cleanup has
+    // not run), so only the tombstone check can catch this.
+    let outcome = finish_upload(&root, &mut idem, txn, &mut ws, || true);
+    assert_eq!(outcome, Err(UploadError::RevalidationRefused));
+    assert!(
+        visible_tokens(&disk).is_empty(),
+        "the deleted book must not resurrect through the in-flight replace"
+    );
 }

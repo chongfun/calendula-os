@@ -101,12 +101,14 @@
 pub mod bodies;
 pub mod cleanup;
 pub mod layout;
+pub mod list;
 pub mod ops;
 pub mod publish;
 pub mod receipts;
 pub mod record;
 pub mod recover;
 pub mod select;
+pub mod session;
 pub mod unmanaged;
 pub mod upload;
 pub mod validate;

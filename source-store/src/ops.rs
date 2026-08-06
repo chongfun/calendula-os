@@ -33,9 +33,10 @@
 use embedded_sdmmc::{BlockDevice, Directory, Mode, TimeSource};
 
 use crate::bodies::{
-    OperationKind, SourceMetadata, Tombstone, BOOK_TOKEN_BYTES, DISPLAY_LABEL_MAX_BYTES,
-    LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES, SOURCE_METADATA_SCHEMA, TOMBSTONE_MAGIC,
-    TOMBSTONE_SCHEMA, TOMBSTONE_STATUS_DELETED,
+    OperationKind, SourceMetadata, StagingMarker, Tombstone, BOOK_TOKEN_BYTES,
+    DISPLAY_LABEL_MAX_BYTES, LOGICAL_BOOK_ID_BYTES, REQUEST_ID_BYTES, SHA256_BYTES,
+    SOURCE_METADATA_SCHEMA, STAGING_MARKER_SCHEMA, TOMBSTONE_MAGIC, TOMBSTONE_SCHEMA,
+    TOMBSTONE_STATUS_DELETED,
 };
 use crate::layout;
 use crate::publish::{self, PublishError};
@@ -73,6 +74,17 @@ pub struct OpsWorkspace {
     pub entries: [Option<SlotEntry>; MAX_SOURCE_SLOTS],
     pub dispositions: [SlotDisposition; MAX_SOURCE_SLOTS],
     pub tombstones: [Option<(u8, Tombstone)>; layout::MAX_TOMBSTONE_SLOTS],
+    /// The committed staging marker, if any. Part of the catalog view
+    /// because the request-ID lookup order runs through it: a marker
+    /// carrying a request's ID is that request's interrupted staging, and
+    /// the same ID arriving at a different endpoint — or with different
+    /// parameters — is misuse to reject, not a fresh request to execute.
+    pub marker: Option<StagingMarker>,
+    /// This mount's validation proofs. Deliberately *not* reset by
+    /// [`load_catalog`] — catalog reloads happen after every mutation,
+    /// while these claims hold until unmount/remount/reboot; the mount
+    /// owner calls [`MountSession::reset`] on those events.
+    pub session: crate::session::MountSession,
     /// Whether `entries`/`dispositions`/`tombstones` came from a *complete*
     /// [`load_catalog`]. See [`catalog_is_valid`][Self::catalog_is_valid].
     catalog_valid: bool,
@@ -86,6 +98,8 @@ impl OpsWorkspace {
             entries: [None; MAX_SOURCE_SLOTS],
             dispositions: [SlotDisposition::HiddenDeleted; MAX_SOURCE_SLOTS],
             tombstones: [None; layout::MAX_TOMBSTONE_SLOTS],
+            marker: None,
+            session: crate::session::MountSession::new(),
             catalog_valid: false,
         }
     }
@@ -145,9 +159,12 @@ impl IdempotencyStore {
     }
 
     /// Load the committed idempotency record, or start fresh when none
-    /// exists. Corruption of *both* slots — or a committed record that no
-    /// longer decodes — fails closed: idempotency state must never be
-    /// silently reset while retries may be in flight, per the PRD.
+    /// exists. Fresh means the record has *never* committed: the strict
+    /// read refuses a pair whose corrupt bytes still carry a CRC-valid
+    /// commit sector, because reading a decayed committed record as
+    /// "absent" would silently reset the epoch to 1 — exactly the reset
+    /// the PRD forbids while delayed retries may be in flight. A committed
+    /// record that no longer decodes fails closed the same way.
     pub fn load<D, T, const MD: usize, const MF: usize, const MV: usize>(
         dir: &Directory<'_, D, T, MD, MF, MV>,
         ws: &mut OpsWorkspace,
@@ -157,7 +174,7 @@ impl IdempotencyStore {
         T: TimeSource,
     {
         let names = layout::idempotency_pair();
-        match publish::read_committed(dir, names.pair(), &mut ws.record_scratch)? {
+        match publish::read_committed_strict(dir, names.pair(), &mut ws.record_scratch)? {
             None => Ok(Self {
                 state: IdempotencyState::initial(),
                 record_generation: 0,
@@ -286,6 +303,7 @@ where
     ws.catalog_valid = false;
     ws.entries = [None; MAX_SOURCE_SLOTS];
     ws.tombstones = [None; layout::MAX_TOMBSTONE_SLOTS];
+    ws.marker = None;
     for slot in 0..MAX_SOURCE_SLOTS as u8 {
         let Some(names) = layout::metadata_pair(slot) else {
             break;
@@ -293,9 +311,12 @@ where
         // A slot whose pair is ambiguous or unreadable poisons the whole
         // catalog load rather than being skipped: skipping would present a
         // book as absent while its records still exist, which is exactly
-        // the misreading the selector rules prohibit.
+        // the misreading the selector rules prohibit. The strict read
+        // extends the same stance to decay — corrupt bytes that still
+        // carry a valid commit sector must not read as a free slot, since
+        // a free slot is a truncation target for the next create.
         if let Some((_, RecordState::Committed(view))) =
-            publish::read_committed(dir, names.pair(), &mut ws.record_scratch)?
+            publish::read_committed_strict(dir, names.pair(), &mut ws.record_scratch)?
         {
             // A schema this build does not read is a different answer from
             // corruption, and the caller can act on the difference.
@@ -303,6 +324,14 @@ where
                 return Err(PublishError::UnsupportedSchema);
             }
             let metadata = SourceMetadata::decode(&view).ok_or(PublishError::Io)?;
+            // A record is selectable only for the physical slot its body
+            // names. Committed metadata sitting in another slot's pair is
+            // authority whose provenance cannot be explained — rebinding
+            // it to the pair it sits in would let one decayed directory
+            // entry silently move a book onto another book's source file.
+            if metadata.physical_slot != slot {
+                return Err(PublishError::CorruptAuthority);
+            }
             ws.entries[usize::from(slot)] = Some(SlotEntry {
                 physical_slot: slot,
                 metadata,
@@ -314,7 +343,7 @@ where
             break;
         };
         if let Some((_, RecordState::Committed(view))) =
-            publish::read_committed(dir, names.pair(), &mut ws.record_scratch)?
+            publish::read_committed_strict(dir, names.pair(), &mut ws.record_scratch)?
         {
             if view.schema_version != TOMBSTONE_SCHEMA {
                 return Err(PublishError::UnsupportedSchema);
@@ -322,6 +351,20 @@ where
             let stone = Tombstone::decode(&view).ok_or(PublishError::Io)?;
             ws.tombstones[usize::from(slot)] = Some((slot, stone));
         }
+    }
+    // The committed staging marker joins the view for request-ID
+    // resolution. Deliberately *not* strict: a decayed marker pair must
+    // not wedge the catalog, because the namespace already quarantines
+    // whatever candidate it staged, and the next transaction's marker
+    // overwrites the pair — the marker's one recovery path.
+    if let Some((_, RecordState::Committed(view))) =
+        publish::read_committed(dir, layout::marker_pair().pair(), &mut ws.record_scratch)?
+    {
+        if view.schema_version != STAGING_MARKER_SCHEMA {
+            return Err(PublishError::UnsupportedSchema);
+        }
+        let marker = StagingMarker::decode(&view).ok_or(PublishError::Io)?;
+        ws.marker = Some(marker);
     }
     run_selection(ws).ok_or(PublishError::BadInput)?;
     ws.catalog_valid = true;
@@ -617,6 +660,72 @@ pub fn receipt_is_consistent_with_trace(receipt: &OperationReceipt, trace: Reque
     }
 }
 
+/// Whether the committed staging marker carries `request_id` — the
+/// staging-marker station of the PRD's request-ID lookup order. A hit
+/// means the ID was spent starting an upload whose metadata never
+/// committed: the upload endpoint may resume it (by restaging under the
+/// same ID, with matching parameters), and every other endpoint must
+/// reject it as parameter misuse rather than treat the ID as fresh.
+pub fn marker_claims_request(ws: &OpsWorkspace, request_id: &[u8; REQUEST_ID_BYTES]) -> bool {
+    ws.marker
+        .as_ref()
+        .is_some_and(|marker| marker.operation_request_id == *request_id)
+}
+
+/// Revalidation building block: true when *no* committed tombstone names
+/// `logical_book_id`. Read from the card, not the workspace, because this
+/// runs inside publication closures — the last look before a commit
+/// sector, where the loaded view is exactly what cannot be trusted
+/// anymore.
+///
+/// All-or-nothing on purpose: a tombstone for any generation burns the
+/// logical identity forever (deleted IDs are never reused), so a commit
+/// that would put a *newer* generation above an existing tombstone is a
+/// resurrection, and a delete that finds any sibling tombstone for its
+/// book is re-deleting something already decided. A pair that cannot be
+/// read answers `false` — refusing a commit is recoverable, committing
+/// against unknown deletion state is not.
+pub(crate) fn no_committed_tombstone_for<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    logical_book_id: &[u8; LOGICAL_BOOK_ID_BYTES],
+) -> bool
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    let mut scratch = [0u8; TOMBSTONE_RECORD_SCRATCH];
+    for slot in 0..layout::MAX_TOMBSTONE_SLOTS as u8 {
+        let Some(names) = layout::tombstone_pair(slot) else {
+            return false;
+        };
+        match publish::read_committed(dir, names.pair(), &mut scratch) {
+            Ok(None) => {}
+            Ok(Some((_, RecordState::Committed(view)))) => {
+                if view.schema_version != TOMBSTONE_SCHEMA {
+                    return false;
+                }
+                let Some(stone) = Tombstone::decode(&view) else {
+                    return false;
+                };
+                if stone.logical_book_id == *logical_book_id {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Tombstone record files are exactly one padded sector plus the commit
+/// sector; the revalidation sweep rereads them on a stack scratch because
+/// it runs inside publish calls that already borrow the workspace.
+const TOMBSTONE_RECORD_SCRATCH: usize =
+    match record::record_file_len(crate::bodies::TOMBSTONE_LOGICAL_BYTES) {
+        Some(len) => len,
+        None => 0,
+    };
+
 /// The authoritative entry carrying `book_token`, if any. Superseded,
 /// deleted, and ambiguous slots never match — a stale token is unknown,
 /// not a handle to hidden state.
@@ -787,6 +896,11 @@ where
         RequestTrace::Conflict => return DeleteOutcome::AmbiguousRequestEvidence,
         RequestTrace::None => {}
     }
+    // The staging-marker station of the lookup order: an ID spent staging
+    // an upload is not a fresh ID, and a delete result is no answer to it.
+    if marker_claims_request(ws, &request_id) {
+        return DeleteOutcome::RejectedParameterMismatch;
+    }
 
     // 3. Genuinely new: epoch freshness, then budget — both checked before
     //    anything commits, so a rejection is always a clean no-op.
@@ -838,19 +952,25 @@ where
     let expected_token = req.book_token;
     let expected_generation = entry.metadata.source_generation;
     let book_slot = entry.physical_slot;
+    let book_id = entry.metadata.logical_book_id;
     let revalidate = || {
         let Some(meta_names) = layout::metadata_pair(book_slot) else {
             return false;
         };
         let mut scratch = [0u8; TOMBSTONE_REVALIDATE_SCRATCH];
-        match publish::read_committed(dir, meta_names.pair(), &mut scratch) {
+        let base_current = match publish::read_committed(dir, meta_names.pair(), &mut scratch) {
             Ok(Some((_, RecordState::Committed(view)))) => SourceMetadata::decode(&view)
                 .is_some_and(|meta| {
                     meta.book_token == expected_token
                         && meta.source_generation == expected_generation
                 }),
             _ => false,
-        }
+        };
+        // And no committed tombstone may already cover the book: this
+        // delete's own tombstone is still prepared at this point, so any
+        // committed one is a different, earlier decision this commit must
+        // not double.
+        base_current && no_committed_tombstone_for(dir, &book_id)
     };
     if let Err(error) = publish::publish_record(
         dir,

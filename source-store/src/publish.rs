@@ -27,8 +27,8 @@
 use embedded_sdmmc::{BlockDevice, Directory, File, Mode, TimeSource};
 
 use crate::record::{
-    classify_record, encode_commit_sector, select_generations, RecordState, SealedBody, Selection,
-    COMMIT_FOOTER_BYTES,
+    classify_record, commit_sector_claims_commit, encode_commit_sector, select_generations,
+    RecordState, SealedBody, Selection, COMMIT_FOOTER_BYTES,
 };
 
 /// The one primitive behind every authoritative commit. Delegates to
@@ -61,30 +61,41 @@ pub struct SlotPair<'n> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotSummary {
     Absent,
-    Prepared { generation: u64 },
-    Committed { generation: u64 },
-    Corrupt,
+    Prepared {
+        generation: u64,
+    },
+    Committed {
+        generation: u64,
+    },
+    /// Structurally inconsistent bytes. `claims_commit` distinguishes decay
+    /// from debris: true means a CRC-valid commit sector sits at the end of
+    /// the file (see [`commit_sector_claims_commit`]), which no interrupted
+    /// publication can produce over a body it does not name — committed
+    /// bytes stopped being readable. Strict authority loading fails closed
+    /// on that; sector-less debris stays invisible, as the residue of a cut
+    /// publication must.
+    Corrupt {
+        claims_commit: bool,
+    },
 }
 
 impl SlotSummary {
-    fn from_state(state: &RecordState<'_>) -> Self {
-        match state {
-            RecordState::Absent => SlotSummary::Absent,
-            RecordState::Prepared(view) => SlotSummary::Prepared {
-                generation: view.generation,
-            },
-            RecordState::Committed(view) => SlotSummary::Committed {
-                generation: view.generation,
-            },
-            RecordState::Corrupt => SlotSummary::Corrupt,
-        }
-    }
-
     pub fn committed_generation(&self) -> Option<u64> {
         match self {
             SlotSummary::Committed { generation } => Some(*generation),
             _ => None,
         }
+    }
+
+    /// Whether strict authority loading must refuse to call the pair holding
+    /// this slot "no committed authority".
+    fn poisons_absence(&self) -> bool {
+        matches!(
+            self,
+            SlotSummary::Corrupt {
+                claims_commit: true
+            }
+        )
     }
 }
 
@@ -111,6 +122,14 @@ pub enum PublishError {
     /// purpose: the card is intact and the answer is actionable (it was
     /// written by a different build), where corruption is neither.
     UnsupportedSchema,
+    /// A slot holds corrupt bytes whose commit sector is CRC-valid — a
+    /// record that was committed and stopped being readable — and no
+    /// committed sibling supersedes it. Strict authority loading refuses to
+    /// read such a pair as "absent": absence resets idempotency epochs and
+    /// frees metadata slots for truncation, and the PRD forbids corruption
+    /// to decay into either silently. Not retryable; the card needs repair,
+    /// not another attempt.
+    CorruptAuthority,
     /// The record failed startup selection after the commit sync. The
     /// commit may or may not have landed; the caller must treat the pair as
     /// needing the startup selector's verdict, not assume either way.
@@ -134,11 +153,29 @@ where
 {
     match read_whole_file(dir, name, scratch)? {
         None => Ok(SlotSummary::Absent),
-        Some(ReadFile::Oversized) => Ok(SlotSummary::Corrupt),
-        Some(ReadFile::Read(len)) => Ok(SlotSummary::from_state(&classify_record(
-            &scratch[..len],
-            magic,
-        ))),
+        // An oversized file cannot be read whole, so its trailing sector
+        // cannot be inspected; it reads as debris, which keeps it
+        // reclaimable. Every legitimate record class is far smaller than
+        // any workspace scratch, so a decayed committed record cannot
+        // *grow* into this case — only foreign bytes land here.
+        Some(ReadFile::Oversized) => Ok(SlotSummary::Corrupt {
+            claims_commit: false,
+        }),
+        Some(ReadFile::Read(len)) => {
+            let bytes = &scratch[..len];
+            Ok(match classify_record(bytes, magic) {
+                RecordState::Absent => SlotSummary::Absent,
+                RecordState::Prepared(view) => SlotSummary::Prepared {
+                    generation: view.generation,
+                },
+                RecordState::Committed(view) => SlotSummary::Committed {
+                    generation: view.generation,
+                },
+                RecordState::Corrupt => SlotSummary::Corrupt {
+                    claims_commit: commit_sector_claims_commit(bytes),
+                },
+            })
+        }
     }
 }
 
@@ -165,6 +202,63 @@ where
 /// [`select_generations`] lifted onto summaries.
 fn select_summaries(a: SlotSummary, b: SlotSummary) -> Selection {
     select_generations(a.committed_generation(), b.committed_generation())
+}
+
+/// [`select_authority`], except that a pair with no committed record and a
+/// corrupt slot whose commit sector is CRC-valid fails closed with
+/// [`PublishError::CorruptAuthority`] instead of answering "absent".
+///
+/// Authority-*loading* paths (the catalog, the idempotency store) use this;
+/// publication target-picking deliberately does not, because overwriting a
+/// corrupt slot beside live committed authority is the normal repair, and
+/// a candidate cut mid-body-write must keep reading as no-new-authority for
+/// the power-loss semantics to hold.
+pub fn select_authority_strict<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    pair: SlotPair<'_>,
+    scratch: &mut [u8],
+) -> Result<Option<(usize, u64)>, PublishError>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    let a = summarize_slot(dir, pair.names[0], pair.magic, scratch)?;
+    let b = summarize_slot(dir, pair.names[1], pair.magic, scratch)?;
+    match select_summaries(a, b) {
+        Selection::None => {
+            if a.poisons_absence() || b.poisons_absence() {
+                return Err(PublishError::CorruptAuthority);
+            }
+            Ok(None)
+        }
+        Selection::Selected { slot, generation } => Ok(Some((slot, generation))),
+        Selection::Ambiguous => Err(PublishError::AmbiguousAuthority),
+    }
+}
+
+/// [`read_committed`] over [`select_authority_strict`]: the committed
+/// authority of a pair, failing closed when corruption may have eaten it.
+pub fn read_committed_strict<'s, D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    pair: SlotPair<'_>,
+    scratch: &'s mut [u8],
+) -> Result<Option<(usize, RecordState<'s>)>, PublishError>
+where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    let Some((slot, generation)) = select_authority_strict(dir, pair, scratch)? else {
+        return Ok(None);
+    };
+    let len = match read_whole_file(dir, pair.names[slot], scratch)? {
+        Some(ReadFile::Read(len)) => len,
+        _ => return Err(PublishError::Io),
+    };
+    let state = classify_record(&scratch[..len], pair.magic);
+    match state.committed_generation() {
+        Some(read_generation) if read_generation == generation => Ok(Some((slot, state))),
+        _ => Err(PublishError::Io),
+    }
 }
 
 /// Select and read the pair's committed authority in one step: the record

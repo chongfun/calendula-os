@@ -29,7 +29,8 @@ use crate::bodies::{
 use crate::layout;
 use crate::ops::{
     find_authoritative_by_token, find_request_trace, hash_file_identity, load_catalog,
-    receipt_is_consistent_with_trace, IdempotencyStore, OpsWorkspace, RequestTrace,
+    marker_claims_request, no_committed_tombstone_for, receipt_is_consistent_with_trace,
+    IdempotencyStore, OpsWorkspace, RequestTrace,
 };
 use crate::publish::{self, PublishError};
 use crate::receipts::{
@@ -205,6 +206,11 @@ where
         RequestTrace::Conflict => return RecoveryOutcome::AmbiguousRequestEvidence,
         RequestTrace::None => {}
     }
+    // The staging-marker station of the lookup order: an ID spent staging
+    // an upload is not a fresh ID, and a recovery result is no answer to it.
+    if marker_claims_request(ws, &request_id) {
+        return RecoveryOutcome::RejectedParameterMismatch;
+    }
 
     // 2. Genuinely new: freshness and budget before anything commits.
     if !idem.state.epoch_is_current(req.epoch) {
@@ -245,7 +251,12 @@ where
         return RecoveryOutcome::RejectedObservedMismatch;
     }
 
-    // 5. The observed bytes must be an acceptable container.
+    // 5. The observed bytes must be an acceptable container — the size
+    //    ceiling deterministically here, the ZIP structure through the
+    //    caller's gate.
+    if identity.length > crate::upload::MAX_SOURCE_BYTES {
+        return RecoveryOutcome::RejectedUnsupportedContainer;
+    }
     if !validate_container() {
         return RecoveryOutcome::RejectedUnsupportedContainer;
     }
@@ -328,6 +339,12 @@ where
         if !base_current {
             return false;
         }
+        // No committed tombstone may name this logical book: deleted
+        // identities are burned, and a recovery commit above a tombstone
+        // would resurrect one.
+        if !no_committed_tombstone_for(dir, &metadata.logical_book_id) {
+            return false;
+        }
         // Rehash in full, here, immediately before the commit sector lands.
         // A length check would be the cheap version and is not enough: this
         // record is about to *vouch* for an exact digest, and a same-length
@@ -356,7 +373,11 @@ where
         Err(error) => return RecoveryOutcome::Failed(error),
     }
 
-    // 8. Receipt, then refresh the caller's view.
+    // 8. Seed this mount's exact-validation set — the in-closure rehash
+    //    proved exact identity one commit ago — then the receipt, then the
+    //    caller's view.
+    ws.session
+        .seed_full_validation(&metadata.logical_book_id, metadata.source_generation);
     let receipt = req.receipt(
         metadata.logical_book_id,
         metadata.source_generation,

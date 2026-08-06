@@ -154,6 +154,8 @@ fn name(outcome: &UploadBeginOutcome) -> &'static str {
         UploadBeginOutcome::Started(_) => "Started",
         UploadBeginOutcome::Replayed(_) => "Replayed",
         UploadBeginOutcome::RejectedUnknownToken => "RejectedUnknownToken",
+        UploadBeginOutcome::RejectedTooLarge => "RejectedTooLarge",
+        UploadBeginOutcome::RejectedExternallyModified => "RejectedExternallyModified",
         UploadBeginOutcome::RejectedStaleEpoch => "RejectedStaleEpoch",
         UploadBeginOutcome::RejectedParameterMismatch => "RejectedParameterMismatch",
         UploadBeginOutcome::RejectedEpochExhausted => "RejectedEpochExhausted",

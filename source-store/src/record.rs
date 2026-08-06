@@ -176,6 +176,37 @@ pub fn encode_commit_sector(sealed: &SealedBody, nonce: u64) -> Option<[u8; COMM
     Some(sector)
 }
 
+/// Whether a record file's final sector is a CRC-valid commit sector —
+/// regardless of whether it names the body it sits behind.
+///
+/// [`classify_record`] answers "is this record committed?"; this answers
+/// the narrower forensic question "did a commit ever land here?". The
+/// distinction lets authority loading tell crash debris from decay: no
+/// interrupted publication can leave a CRC-valid sector over a body it
+/// does not name (the sector is written only after its body's durable
+/// sync, from the validated body's own values), so a valid sector on a
+/// file that classifies [`Corrupt`][RecordState::Corrupt] means committed
+/// bytes stopped being readable. That is state to fail closed on — a
+/// silently "absent" committed record resets epochs and frees slots the
+/// PRD says must never be silently reset or freed — where sector-less
+/// debris is the normal residue of a cut publication and stays invisible.
+pub fn commit_sector_claims_commit(record: &[u8]) -> bool {
+    if record.len() < COMMIT_FOOTER_BYTES || !record.len().is_multiple_of(COMMIT_ALIGNMENT) {
+        return false;
+    }
+    let sector = &record[record.len() - COMMIT_FOOTER_BYTES..];
+    if sector[CS_MAGIC] != COMMIT_MAGIC {
+        return false;
+    }
+    let stored = u32::from_le_bytes([
+        sector[CS_CRC.start],
+        sector[CS_CRC.start + 1],
+        sector[CS_CRC.start + 2],
+        sector[CS_CRC.start + 3],
+    ]);
+    crc32_with_zeroed_field(sector, CS_CRC) == Some(stored)
+}
+
 /// A structurally valid logical body, borrowed out of the record file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecordView<'a> {
