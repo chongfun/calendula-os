@@ -1422,19 +1422,15 @@ fn the_first_open_after_the_single_config_scheme_purges_its_files() {
     // A cache exactly as the previous firmware left it: an unkeyed index, an
     // unkeyed section file, and a cover.
     files::ensure_v2_cache_dirs(&root, KEY).expect("cache dirs");
+    write_legacy_book_index(&root, IDENTITY);
     let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
-    for name in [CACHE_BOOK_FILE, "S000.BIN"] {
-        let dir = if name == CACHE_BOOK_FILE {
-            None
-        } else {
-            Some(book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir"))
-        };
-        let target = dir.as_ref().unwrap_or(&book);
-        let file = target
-            .open_file_in_dir(name, embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
-            .expect("legacy file");
-        file.write(&[0u8; 64]).expect("legacy file body");
-    }
+    let sections = book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir");
+    let file = sections
+        .open_file_in_dir("S000.BIN", embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+        .expect("legacy section file");
+    file.write(&[0u8; 64]).expect("legacy file body");
+    drop(file);
+    drop(sections);
     write_cover(&root);
     drop(book);
 
@@ -1667,15 +1663,14 @@ fn a_legacy_sweep_that_is_blocked_keeps_its_retry_marker() {
     let store = new_store();
 
     files::ensure_v2_cache_dirs(&root, KEY).expect("cache dirs");
+    write_legacy_book_index(&root, IDENTITY);
     let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
     let sections = book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir");
-    for (dir, name) in [(None, CACHE_BOOK_FILE), (Some(&sections), "S000.BIN")] {
-        let file = dir
-            .unwrap_or(&book)
-            .open_file_in_dir(name, embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
-            .expect("legacy file");
-        file.write(&[0u8; 64]).expect("legacy file body");
-    }
+    let file = sections
+        .open_file_in_dir("S000.BIN", embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+        .expect("legacy section file");
+    file.write(&[0u8; 64]).expect("legacy file body");
+    drop(file);
 
     // The legacy section will not delete while it is held open.
     let held = sections
@@ -2455,5 +2450,116 @@ fn collision_purge_retries_cleanup_when_old_owner_cover_delete_fails() {
         )
         .is_err(),
         "COVER.BIN must be gone after successful retry"
+    );
+}
+
+fn write_legacy_book_index(root: &Dir<'_>, identity: (u32, u32)) {
+    let book = files::open_v2_book_dir(root, KEY).expect("book cache dir");
+    let file = book
+        .open_file_in_dir(
+            CACHE_BOOK_FILE,
+            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("legacy BOOK.BIN");
+    let mut header_bytes = [0u8; proto::cache::BOOK_V2_HEADER_BYTES];
+    proto::cache::encode_book_v2_header(
+        proto::cache::BookV2Header {
+            partial: false,
+            source_hash: identity.0,
+            source_size: identity.1,
+            total_pages: 10,
+            section_count: 1,
+            spine_count: 1,
+            toc_count: 0,
+            toc_text_bytes: 0,
+            title_text_bytes: 0,
+            author_text_bytes: 0,
+            viewport_width: 800,
+            viewport_height: 480,
+            font_config: 0,
+            custom_font_identity: 0,
+            resume_spine: 0,
+        },
+        &mut header_bytes,
+    )
+    .expect("encode header");
+    file.write(&header_bytes).expect("write header");
+}
+
+/// Invariant: adopting a layout config against a legacy-only cache belonging to a
+/// colliding source purges the colliding BOOK.BIN, legacy sections, AND COVER.BIN.
+#[test]
+fn adopting_colliding_key_purges_legacy_owner_cache_and_cover() {
+    const IDENTITY_A: (u32, u32) = (0x1111_2222, 1000);
+    const IDENTITY_B: (u32, u32) = (0x3333_4444, 2000);
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, KEY).expect("cache dirs");
+    write_legacy_book_index(&root, IDENTITY_B);
+
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let sections = book.open_dir(CACHE_SECTIONS_DIR).expect("sections dir");
+    let sfile = sections
+        .open_file_in_dir("S000.BIN", embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+        .expect("legacy section");
+    sfile.write(&[0u8; 64]).expect("section body");
+    drop(sfile);
+    drop(sections);
+    drop(book);
+
+    write_cover(&root);
+
+    // Book A adopts KEY. It must detect Book B's legacy BOOK.BIN identity mismatch,
+    // run collision purge, and remove BOOK.BIN, S000.BIN, and COVER.BIN!
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY_A, &store);
+    assert!(
+        adoption.purged_legacy,
+        "adopting colliding key against legacy cache must run collision purge"
+    );
+
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    assert!(
+        book.open_file_in_dir(CACHE_BOOK_FILE, embedded_sdmmc::Mode::ReadOnly)
+            .is_err(),
+        "legacy BOOK.BIN of colliding owner must be purged"
+    );
+    assert!(
+        book.open_file_in_dir(CACHE_COVER_FILE, embedded_sdmmc::Mode::ReadOnly)
+            .is_err(),
+        "colliding owner's COVER.BIN must be purged so incoming book does not reuse it"
+    );
+}
+
+/// Invariant: read_cache_header discovers legacy BOOK.BIN identity, so attempts to
+/// clear a colliding book's legacy cache are refused.
+#[test]
+fn clearing_colliding_key_against_legacy_cache_refuses_deletion() {
+    const IDENTITY_A: (u32, u32) = (0x1111_2222, 1000);
+    const IDENTITY_B: (u32, u32) = (0x3333_4444, 2000);
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    files::ensure_v2_cache_dirs(&root, KEY).expect("cache dirs");
+    write_legacy_book_index(&root, IDENTITY_B);
+    write_cover(&root);
+
+    // read_cache_header must report Book B's identity from legacy BOOK.BIN
+    let header = files::read_cache_header(&root, KEY);
+    let files::CacheHeader::Present(h) = header else {
+        panic!("read_cache_header must report Present for legacy BOOK.BIN, got {header:?}");
+    };
+    assert_eq!(h.source_hash, IDENTITY_B.0);
+    assert_eq!(h.source_size, IDENTITY_B.1);
+
+    // A clear operation for Book A must see the identity mismatch and refuse deletion!
+    assert!(
+        h.source_hash != IDENTITY_A.0 || h.source_size != IDENTITY_A.1,
+        "identity must mismatch for Book A"
     );
 }

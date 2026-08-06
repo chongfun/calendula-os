@@ -971,6 +971,11 @@ where
             None => {}
         }
     }
+    match read_book_index_header(&book_dir, CACHE_BOOK_FILE) {
+        Some(Some(header)) => return CacheHeader::Present(header),
+        Some(None) => unreadable = true,
+        None => {}
+    }
     // Either an index we could not interpret, or a registry that is there
     // and says nothing usable: both mean this directory holds something
     // whose owner we cannot establish, which is exactly what `Unreadable`
@@ -2221,6 +2226,7 @@ where
     let mut saw_unreadable = false;
     let mut index_names = heapless::Vec::<String<SHORT_NAME_BYTES>, 16>::new();
     let mut has_toc = false;
+    let mut has_legacy_book = false;
 
     let err = book.iterate_dir(|entry| {
         if entry.attributes.is_directory() {
@@ -2233,6 +2239,8 @@ where
         }
         if name.as_str() == CACHE_TOC_FILE {
             has_toc = true;
+        } else if name.as_str() == CACHE_BOOK_FILE {
+            has_legacy_book = true;
         } else if layout_key_of_book_index_file_name(name.as_str()).is_some()
             && index_names.push(name).is_err()
         {
@@ -2263,6 +2271,20 @@ where
                 }
             }
             Err(_) => saw_unreadable = true,
+        }
+    }
+
+    if has_legacy_book {
+        match read_book_index_header(book, CACHE_BOOK_FILE) {
+            Some(Some(header)) => {
+                if header.source_hash != source_identity.0
+                    || header.source_size != source_identity.1
+                {
+                    saw_mismatch = true;
+                }
+            }
+            Some(None) => saw_unreadable = true,
+            None => {}
         }
     }
 
