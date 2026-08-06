@@ -278,10 +278,25 @@ Current code status:
   (measured: 19 KB total free refused a 12.5 KB claim). At 16 slots /
   8 receipts / 8 tombstones the image is 12,464 B and the session runs
   with ~6.7 KB free under upload load.
+- The abrupt-reset half of the PRD's M0S power-cut gate ran on the X3
+  (2026-08-06): the `powercut-selftest` feature (auto-started wireless
+  session + `POST /test-powercut`, an armed never-fed RTC watchdog that
+  fires inside blocking SD writes) driven by `tools/powercut_campaign.py`.
+  37 cut/reboot/verify cycles across create/replace/delete, 26 landing
+  mid-operation; every one converged — the interrupted operation fully
+  committed or fully didn't, its request ID replayed to a definitive
+  outcome, and the book list matched expectation exactly. The
+  session-start cleanup pass (wired the same day: firmware previously
+  never invoked it, so 8 uncleaned deletions would have exhausted the
+  tombstone table) reclaimed slots, tombstones, and abandoned staging
+  markers throughout. This proves write ordering on a real card; the
+  card's own power-loss physics still need a rig that cuts VBUS with the
+  battery out.
 - Next: kosync account onboarding via the portal form, TLS for the
-  official sync server, the PRD's hardware power-cut gate for M0S (needs
-  a bench rig that can cut power mid-write), and the reading-path
-  integration that makes managed books visible.
+  official sync server, the true power-cut rig for M0S (card-level
+  power-loss physics; a `uhubctl`-capable hub plus a battery-less device
+  turns the campaign's kill mechanism into a real cut), and the
+  reading-path integration that makes managed books visible.
 
 ## Verification commands
 
