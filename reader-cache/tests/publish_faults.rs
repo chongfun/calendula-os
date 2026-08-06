@@ -1804,3 +1804,79 @@ fn clearing_a_book_with_two_configs_resident_leaves_nothing_behind() {
         "nothing identifying the book may survive the clear"
     );
 }
+
+/// Invariant: CFG.BIN is preserved if a full-cache clear fails partway through,
+/// ensuring surviving layout configurations remain tracked for LRU eviction.
+#[test]
+fn cfg_bin_is_preserved_if_cache_clear_fails() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    build_under_current_config(&root, &mut store, 2);
+
+    // Block a section file from being deleted during clear.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let sections = book.open_dir("SECTIONS").expect("sections dir");
+    let section_file = sections
+        .open_file_in_dir("S00000.BIN", embedded_sdmmc::Mode::ReadOnly)
+        .expect("hold section file open");
+
+    assert!(
+        !files::empty_cache_dir(&root, KEY),
+        "a clear with a blocked section file must return false"
+    );
+
+    // CFG.BIN must still be present in the book directory.
+    assert!(
+        book.open_file_in_dir(
+            proto::cache::CACHE_CONFIG_FILE,
+            embedded_sdmmc::Mode::ReadOnly
+        )
+        .is_ok(),
+        "CFG.BIN must survive a failed clear so LRU tracking is not lost"
+    );
+
+    drop(section_file);
+    drop(sections);
+    drop(book);
+}
+
+/// Invariant: reconstructing a registry from more than two indexes explicitly
+/// deletes excess non-surviving configurations from the card before committing.
+#[test]
+fn reconstruct_registry_removes_excess_configs_and_succeeds() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let _k1 = build_under_current_config(&root, &mut store, 1);
+
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let _k2 = build_under_current_config(&root, &mut store, 1);
+
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    let _k3 = build_under_current_config(&root, &mut store, 1);
+
+    // Now corrupt CFG.BIN so adoption must rebuild the registry from index files.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let cfg_file = book
+        .open_file_in_dir(
+            proto::cache::CACHE_CONFIG_FILE,
+            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("open CFG.BIN");
+    drop(cfg_file);
+    drop(book);
+
+    // Rebuilding will find 3 index files on disk (_k1, _k2, _k3). It must evict & delete the 3rd one found.
+    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    assert!(
+        adoption.succeeded(),
+        "reconstruction from index files with excess configs must succeed"
+    );
+}

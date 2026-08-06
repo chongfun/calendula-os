@@ -619,12 +619,13 @@ where
     // retries the eviction rather than losing track of a full section set.
     let adoption = files::adopt_layout_config(root, cache_key.as_str(), library);
     esp_println::println!(
-        "epub: layout config resident={} evicted={:?} evict_failed={:?} legacy_purged={} registry_write_failed={}",
+        "epub: layout config resident={} evicted={:?} evict_failed={:?} legacy_purged={} registry_write_failed={} dirs_failed={}",
         adoption.resident,
         adoption.evicted,
         adoption.eviction_failed,
         adoption.purged_legacy,
-        adoption.registry_write_failed
+        adoption.registry_write_failed,
+        adoption.dirs_failed
     );
     esp_println::println!(
         "epub: stage TryV2BookIndexFast page={}",
@@ -658,6 +659,11 @@ where
         // so no failure path can leave a resume describing records that have
         // already been overwritten.
         scratch.resume = None;
+    }
+    if !fast_hit && !adoption.succeeded() {
+        esp_println::println!("epub: adoption failed, refusing to publish new layout cache");
+        set_preview_error(library, "ADOPT");
+        return BookLoadStatus::Error;
     }
     let replayed = !fast_hit
         && try_replay_content_cache(

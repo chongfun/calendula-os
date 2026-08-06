@@ -775,6 +775,14 @@ impl LayoutConfigRegistry {
         &self.keys[..self.count]
     }
 
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// The config the book was last read under, if it has ever been built.
     pub fn most_recent(&self) -> Option<u8> {
         self.keys().first().copied()

@@ -856,6 +856,7 @@ where
         let header = decode_book_v2_header(&header_bytes).ok()?;
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
+            || !v2_toc_label_bounds_ok(&header)
             || header.title_text_bytes == 0
             || header.title_text_bytes as usize > 64
         {
@@ -1101,7 +1102,6 @@ where
             CACHE_TOC_FILE,
             CACHE_COVER_FILE,
             CACHE_CONTENT_FILE,
-            CACHE_CONFIG_FILE,
         ] {
             if upload_store::remove_file_reclaiming_clusters(&book, name)
                 == upload_store::RemoveStatus::Failed
@@ -1110,10 +1110,11 @@ where
             }
         }
         // The per-config indexes, by listing rather than by name: the
-        // registry that would name them has just been deleted, and it was
-        // never the authority on what is on the card anyway. A key past the
-        // listing budget survives to fail `book_dir_is_reclaimed` below,
-        // which is what stops this from reporting a clear it did not finish.
+        // registry that names them stays until they are gone, so an
+        // interrupted clear leaves surviving indexes accounted for. A key
+        // past the listing budget survives to fail `book_dir_is_reclaimed`
+        // below, which is what stops this from reporting a clear it did not
+        // finish.
         match book_index_names_unlisted_by(&book, &LayoutConfigRegistry::new()) {
             Some(names) => {
                 for name in &names {
@@ -1144,6 +1145,11 @@ where
             // leaves an empty directory, not cache data, so it does not make
             // the clear a failure.
             let _ = book.delete_file_in_dir(CACHE_SECTIONS_DIR);
+            if upload_store::remove_file_reclaiming_clusters(&book, CACHE_CONFIG_FILE)
+                == upload_store::RemoveStatus::Failed
+            {
+                cleared = false;
+            }
         }
         // Everything above worked from a list of names. This is the part that
         // does not: it asks the directory what is actually left, which is the
@@ -1919,7 +1925,6 @@ where
     }
 }
 
-/// What adopting a layout config found waiting for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayoutConfigAdoption {
     /// The registry already listed this config, so a cache built under it
@@ -1942,12 +1947,17 @@ pub struct LayoutConfigAdoption {
     /// firmware that wrote them.
     pub purged_legacy: bool,
     /// The registry write did not land, so `CFG.BIN` no longer describes which
-    /// configs are on the card. The open continues — see
-    /// [`adopt_layout_config`] for why refusing it would be worse — and the
-    /// next one repairs the registry by listing the index files that are
-    /// really there, which is what holds the bound. Reported so the log names
-    /// the card that is failing small writes.
+    /// configs are on the card. Reported so the log names the card that is
+    /// failing small writes.
     pub registry_write_failed: bool,
+    /// Directory access or creation failed on the way in.
+    pub dirs_failed: bool,
+}
+
+impl LayoutConfigAdoption {
+    pub fn succeeded(&self) -> bool {
+        !self.dirs_failed && self.eviction_failed.is_none() && !self.registry_write_failed
+    }
 }
 
 /// Claim the layout config `library` is reading under as this book's most
@@ -1988,15 +1998,18 @@ where
         eviction_failed: None,
         purged_legacy: false,
         registry_write_failed: false,
+        dirs_failed: false,
     };
     // The tree has to exist before the registry can be written into it, and
     // this is the earliest point in an open that knows the book's key. A
     // failure here fails the build too, so there is nothing else to do.
     if ensure_v2_cache_dirs(root, key).is_err() {
         cache_log!("cache: adopt config ensure dirs failed key={}", key);
+        adoption.dirs_failed = true;
         return adoption;
     }
     let Some(book) = open_v2_book_dir(root, key) else {
+        adoption.dirs_failed = true;
         return adoption;
     };
     adoption.purged_legacy = purge_legacy_artifacts_in(&book);
@@ -2013,16 +2026,16 @@ where
     // whatever the listing gave. The config being adopted is promoted to the
     // front below either way, and the worst a wrong order does is evict the
     // less useful of two survivors.
-    //
-    // A registry that is not there at all is left to start empty: that is a
-    // book being opened for the first time, which is the common case and must
-    // not pay for a directory listing. A `CFG.BIN` deleted outright while index
-    // files remain is the one gap left — the clear still sweeps by listing, and
-    // `read_cache_header`'s fallback still finds the book.
     let mut registry = match read_layout_registry_in(&book) {
         Some(registry) => registry,
-        None if registry_present(&book) => layout_registry_from_index_files(&book),
-        None => LayoutConfigRegistry::new(),
+        None => match layout_registry_from_index_files(&book) {
+            Some(registry) if !registry.is_empty() || registry_present(&book) => registry,
+            Some(_) => LayoutConfigRegistry::new(),
+            None => {
+                adoption.registry_write_failed = true;
+                return adoption;
+            }
+        },
     };
     adoption.resident = registry.contains(layout_key);
     let evicted = registry.promote(layout_key);
@@ -2058,25 +2071,22 @@ where
             key,
             layout_key
         );
-        // Reported rather than fatal. The build below still writes under this
-        // config and its index is still found — by the next open under the same
-        // config once the registry is repaired, and by the unlisted-index scan
-        // meanwhile — so refusing the open here would cost a readable book to
-        // buy nothing. What the failure does cost is the registry's account of
-        // the card, and the seeding above is what gets that back.
         adoption.registry_write_failed = true;
     }
     adoption
 }
 
 /// Rebuild a registry from the per-config index files a book directory actually
-/// holds, for an open whose `CFG.BIN` is there and unusable.
+/// holds.
 ///
 /// Ordering is lost — a listing cannot say which config was read last — so this
 /// only restores the *count*, which is the part eviction needs to hold the
-/// two-config bound. A card holding more sets than the bound (which is how it
-/// got here) leaves the extras unnamed for now; the eviction the caller runs
-/// next brings the count down, and later opens converge.
+/// two-config bound.
+///
+/// When more than two configurations exist, any excess key evicted during
+/// promotion is explicitly deleted from the card before returning. If directory
+/// enumeration or an excess file deletion fails, `None` is returned to prevent
+/// an incomplete or corrupt registry from being committed.
 fn layout_registry_from_index_files<
     D,
     T,
@@ -2085,27 +2095,27 @@ fn layout_registry_from_index_files<
     const MAX_VOLUMES: usize,
 >(
     book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-) -> LayoutConfigRegistry
+) -> Option<LayoutConfigRegistry>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let mut registry = LayoutConfigRegistry::new();
-    // Every keyed index is "unlisted" by an empty registry, so this is the same
-    // bounded listing `read_cache_header` falls back to. A listing that would
-    // not run leaves the registry empty, which is where it started.
-    let Some(names) = book_index_names_unlisted_by(book, &registry) else {
-        return registry;
-    };
+    let names = book_index_names_unlisted_by(book, &registry)?;
     for name in &names {
         if let Some(layout_key) = layout_key_of_book_index_file_name(name.as_str()) {
-            // Seeding, not evicting: nothing is deleted here, so a key pushed
-            // out of the last slot is simply one this pass could not account
-            // for.
-            let _ = registry.promote(layout_key);
+            if let Some(evicted) = registry.promote(layout_key) {
+                if !delete_layout_config_artifacts_in(book, evicted) {
+                    cache_log!(
+                        "cache: reconstruct registry failed to delete excess key {}",
+                        evicted
+                    );
+                    return None;
+                }
+            }
         }
     }
-    registry
+    Some(registry)
 }
 
 /// Delete one layout config's cache files: its index and every section file

@@ -416,7 +416,6 @@ only window crossings re-read it. The currently open book sits in a separate
 scrolled. On boot/refresh, firmware first loads a window from the cached
 snapshot, then refreshes `/BOOKS` and card-root discovery in a storage
 command, streaming the fresh catalog out in batches without ever holding it
-<<<<<<< HEAD
 whole. Discovery skips dot-prefixed entries, so the AppleDouble sidecar
 (`._<book>.epub`) Finder writes beside every file it copies to a FAT card is
 not catalogued as a phantom, unopenable duplicate. The scan reads long
