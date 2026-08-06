@@ -2,10 +2,24 @@ use crate::{
     AppView, DisplayCommand, PowerEvent, DISPLAY_COMMANDS, DISPLAY_RESUME, POWER_EVENTS,
     WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
 };
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::peripherals::{GPIO3, LPWR};
 use esp_hal::rtc_cntl::Rtc;
+
+/// Resolves to an armed abrupt-reset deadline (ms) in `powercut-selftest`
+/// builds; never resolves otherwise, leaving the select below the plain
+/// two-way wait release builds always had.
+async fn powercut_arm() -> u64 {
+    #[cfg(feature = "powercut-selftest")]
+    {
+        crate::powercut::POWERCUT_ARM.wait().await
+    }
+    #[cfg(not(feature = "powercut-selftest"))]
+    {
+        core::future::pending().await
+    }
+}
 
 /// Idle time with no input before the device puts itself into deep sleep,
 /// tiered by the view the last input left the app in. Reading keeps the
@@ -41,8 +55,8 @@ pub async fn run(lpwr: LPWR<'static>) {
     let mut sleep_generation: u32 = 0;
 
     loop {
-        match select(POWER_EVENTS.receive(), Timer::at(deadline)).await {
-            Either::First(event) => match event {
+        match select3(POWER_EVENTS.receive(), Timer::at(deadline), powercut_arm()).await {
+            Either3::First(event) => match event {
                 // Any input pushes the idle deadline back out, at the leash
                 // of the view the input landed in.
                 PowerEvent::Activity(view) => {
@@ -63,11 +77,29 @@ pub async fn run(lpwr: LPWR<'static>) {
                 | PowerEvent::DisplaySleepFailed(_) => {}
             },
             // Idle timeout elapsed with no activity.
-            Either::Second(_) => {
+            Either3::Second(_) => {
                 esp_println::println!("power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
                 idle = enter_sleep(&mut rtc, sleep_generation).await;
                 deadline = Instant::now() + idle;
+            }
+            // Test-only abrupt reset: arm the RTC watchdog and never feed
+            // it. The reset fires from RTC hardware at the deadline no
+            // matter what is running — including a blocking SD write —
+            // which is the entire point of the durability campaign.
+            Either3::Third(after_ms) => {
+                #[cfg(feature = "powercut-selftest")]
+                {
+                    rtc.rwdt.enable();
+                    rtc.rwdt.set_timeout(
+                        esp_hal::rtc_cntl::RwdtStage::Stage0,
+                        esp_hal::time::Duration::from_millis(after_ms),
+                    );
+                    rtc.rwdt.feed();
+                    esp_println::println!("powercut: armed {} ms", after_ms);
+                }
+                #[cfg(not(feature = "powercut-selftest"))]
+                let _ = after_ms;
             }
         }
     }

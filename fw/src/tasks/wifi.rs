@@ -463,8 +463,41 @@ async fn upload_server(
         .and_then(source_http::parse_request_id);
         let is_list = !is_list_books && path.starts_with(b"/list");
         let is_delete = is_post && !is_delete_book && path.starts_with(b"/delete");
+        // Test-only: the abrupt-reset arm for the M0S durability campaign.
+        // Compiles to `false` (and the branch below to nothing) outside
+        // `powercut-selftest` builds.
+        let is_powercut = {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                is_post && path.starts_with(b"/test-powercut")
+            }
+            #[cfg(not(feature = "powercut-selftest"))]
+            {
+                false
+            }
+        };
 
-        if is_capabilities {
+        if is_powercut {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                let after_ms = source_http::query_param(path, b"after_ms")
+                    .and_then(|raw| core::str::from_utf8(raw).ok())
+                    .and_then(|text| text.parse::<u64>().ok());
+                match after_ms {
+                    // Bounded so a typo cannot arm a reset weeks out (the
+                    // watchdog would still be live) or one so short the
+                    // response cannot leave the socket.
+                    Some(ms) if (10..=600_000).contains(&ms) => {
+                        crate::powercut::POWERCUT_ARM.signal(ms);
+                        let _ = write_http_response(&mut socket, "200 OK", "armed").await;
+                    }
+                    _ => {
+                        let _ = write_http_response(&mut socket, "400 Bad Request", "bad after_ms")
+                            .await;
+                    }
+                }
+            }
+        } else if is_capabilities {
             serve_capabilities(&mut socket, &mut pool, &mut session_started).await;
         } else if is_list_books {
             serve_list_books(&mut socket, &mut pool, &mut session_started).await;

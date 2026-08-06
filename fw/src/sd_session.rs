@@ -925,6 +925,34 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if owner.idem.is_none() {
+        // One restartable cleanup pass per session, before the first
+        // operation: spent markers, superseded generations, reclaimable
+        // tombstones. Without this sweep the tombstone table fills after
+        // MAX_TOMBSTONE_SLOTS uncleaned deletions and every later delete
+        // refuses. Best-effort by design — cleanup never publishes, a cut
+        // or failed pass just reruns next session, and a failure's cause
+        // surfaces through the loads below, which read the same records.
+        match source_store::cleanup::run_cleanup(src, &mut owner.ws) {
+            Ok(report) => {
+                let reclaimed = report.reclaimed_slots
+                    + report.reclaimed_orphans
+                    + report.reclaimed_tombstones
+                    + report.reclaimed_markers;
+                if reclaimed > 0 || report.retained_for_replay > 0 {
+                    esp_println::println!(
+                        "source: cleanup slots={} orphans={} tombstones={} markers={} retained={}",
+                        report.reclaimed_slots,
+                        report.reclaimed_orphans,
+                        report.reclaimed_tombstones,
+                        report.reclaimed_markers,
+                        report.retained_for_replay
+                    );
+                }
+            }
+            Err(_) => esp_println::println!("source: cleanup pass failed"),
+        }
+    }
     if owner.idem.is_none() || !owner.ws.catalog_is_valid() {
         load_catalog(src, &mut owner.ws).map_err(refusal_for_publish)?;
     }
