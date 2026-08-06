@@ -186,13 +186,29 @@ class Device:
             return False
 
     def capabilities(self):
-        return self.get_json("/capabilities", timeout=45)
+        # Read-only and safe to retry: the listener arms a beat after the
+        # boot's "serving" line, and a reboot can land between any two
+        # requests of a cycle.
+        return self._retrying(lambda: self.get_json("/capabilities", timeout=45))
 
     def list_books(self):
-        status, body = self._request("GET", "/list-books", timeout=45)
-        if status != 200:
-            raise AssertionError(f"list-books -> {status}: {body}")
-        return json.loads(body)
+        def once():
+            status, body = self._request("GET", "/list-books", timeout=45)
+            if status != 200:
+                raise AssertionError(f"list-books -> {status}: {body}")
+            return json.loads(body)
+
+        return self._retrying(once)
+
+    def _retrying(self, call, attempts=10, delay=2):
+        for attempt in range(attempts):
+            try:
+                return call()
+            except OSError:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(delay)
+        raise AssertionError("unreachable")
 
     def arm(self, after_ms):
         status, body = self._request(
@@ -240,7 +256,9 @@ class Campaign:
         m = self.serial.wait_for(mark, r"upload: serving at (\d+\.\d+\.\d+\.\d+)", timeout)
         if m:
             self.device = Device(m.group(1))
-        # Serial can lag or miss; fall back to polling the known address.
+        # Always poll until a request actually succeeds: the serial line
+        # prints a beat before the listener is armed, and serial can also
+        # lag or miss the line entirely.
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self.device.alive():
