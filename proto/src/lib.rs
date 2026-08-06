@@ -10,6 +10,7 @@ pub mod epub;
 pub mod font_pack;
 pub mod nvm;
 pub mod ota;
+pub mod source_http;
 pub mod storage;
 pub mod text;
 pub mod upload;
