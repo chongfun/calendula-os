@@ -940,50 +940,86 @@ where
     let book_dir = open!(cache.open_dir(key));
     let stored = read_layout_registry_in(&book_dir);
     let registry = stored.unwrap_or_default();
-    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
-    // An index file that opened but did not decode. Held rather than
-    // returned, so a second, readable config still gets to answer `Present`
-    // — but never downgraded to `Absent`, which is what licenses a delete.
+
+    let mut candidate_identity: Option<(u32, u32)> = None;
+    let mut first_full_header: Option<BookV2Header> = None;
     let mut unreadable = false;
+    let mut mismatch = false;
+
+    let mut update_identity = |h: BookV2Header| {
+        if let Some((chash, csize)) = candidate_identity {
+            if chash != h.source_hash || csize != h.source_size {
+                mismatch = true;
+            }
+        } else {
+            candidate_identity = Some((h.source_hash, h.source_size));
+        }
+        if first_full_header.is_none() {
+            first_full_header = Some(h);
+        }
+    };
+
+    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
     for layout_key in registry.keys() {
         book_index_file_name(*layout_key, &mut name);
         match read_book_index_header(&book_dir, name.as_str()) {
-            Some(Some(header)) => return CacheHeader::Present(header),
+            Some(Some(header)) => update_identity(header),
             Some(None) => unreadable = true,
             None => {}
         }
     }
-    // The registry's slots are exhausted. Anything else in the directory
-    // carrying an index name gets its turn, so a lost registry cannot make a
-    // cache that is plainly there read as absent and get it deleted.
-    //
-    // A listing that would not run is the same hazard as an index that would
-    // not decode: it leaves the directory's owner unestablished. Falling
-    // through to `Absent` would hand the clear path a delete it has not earned,
-    // on a 28-bit key whose collisions the format admits.
+
     let Some(unlisted_names) = book_index_names_unlisted_by(&book_dir, &registry) else {
         return CacheHeader::Unreadable;
     };
     for unlisted in unlisted_names {
         match read_book_index_header(&book_dir, unlisted.as_str()) {
-            Some(Some(header)) => return CacheHeader::Present(header),
+            Some(Some(header)) => update_identity(header),
             Some(None) => unreadable = true,
             None => {}
         }
     }
+
     match read_book_index_header(&book_dir, CACHE_BOOK_FILE) {
-        Some(Some(header)) => return CacheHeader::Present(header),
+        Some(Some(header)) => update_identity(header),
         Some(None) => unreadable = true,
         None => {}
     }
-    // Either an index we could not interpret, or a registry that is there
-    // and says nothing usable: both mean this directory holds something
-    // whose owner we cannot establish, which is exactly what `Unreadable`
-    // stops a delete for.
-    if unreadable || (stored.is_none() && registry_present(&book_dir)) {
+
+    match book_dir.open_file_in_dir(CACHE_TOC_FILE, Mode::ReadOnly) {
+        Ok(file) => {
+            let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
+            if read_exact_file(&file, &mut header_bytes).is_ok() {
+                if let Ok(toc_header) = decode_toc_file_header(&header_bytes) {
+                    if let Some((chash, csize)) = candidate_identity {
+                        if chash != toc_header.source_hash || csize != toc_header.source_size {
+                            mismatch = true;
+                        }
+                    } else {
+                        candidate_identity = Some((toc_header.source_hash, toc_header.source_size));
+                    }
+                } else {
+                    unreadable = true;
+                }
+            } else {
+                unreadable = true;
+            }
+        }
+        Err(embedded_sdmmc::Error::NotFound) => {}
+        Err(_) => unreadable = true,
+    }
+
+    if unreadable || mismatch || (stored.is_none() && registry_present(&book_dir)) {
         return CacheHeader::Unreadable;
     }
-    CacheHeader::Absent
+
+    if let Some(header) = first_full_header {
+        CacheHeader::Present(header)
+    } else if candidate_identity.is_some() {
+        CacheHeader::Unreadable
+    } else {
+        CacheHeader::Absent
+    }
 }
 
 /// `None` when the named index is not there, `Some(None)` when it is there
@@ -2019,9 +2055,7 @@ where
         adoption.dirs_failed = true;
         return adoption;
     };
-    let ownership = book_dir_ownership(&book, source_identity);
-    cache_log!("DEBUG adopt_layout_config ownership={:?}", ownership);
-    match ownership {
+    match book_dir_ownership(&book, source_identity) {
         BookDirOwnership::Match => {
             adoption.purged_legacy = purge_legacy_artifacts_in(&book);
         }
@@ -2052,13 +2086,7 @@ where
     // whatever the listing gave. The config being adopted is promoted to the
     // front below either way, and the worst a wrong order does is evict the
     // less useful of two survivors.
-    let read_reg = read_layout_registry_in(&book);
-    cache_log!(
-        "DEBUG adopt_layout_config key={} count={:?}",
-        key,
-        read_reg.map(|r| r.len())
-    );
-    let mut registry = match read_reg {
+    let mut registry = match read_layout_registry_in(&book) {
         Some(registry) => registry,
         None => match layout_registry_from_index_files(&book) {
             Some(registry) if !registry.is_empty() || registry_present(&book) => registry,
@@ -2337,11 +2365,18 @@ where
     if !sections_ok {
         return false;
     }
-    // Non-marker content files (BOOK.BIN, COVER.BIN, CONT.BIN) go next. If any
-    // fail to delete, stop before removing identity markers (BK*.BIN, TOC.BIN) or
-    // CFG.BIN so durable identity markers remain intact on disk for retry.
+    // Non-marker content files (COVER.BIN, CONT.BIN, POS.BIN, POSA/B.BIN) go next.
+    // If any fail to delete, stop before removing identity markers (BK*.BIN,
+    // BOOK.BIN, TOC.BIN) or CFG.BIN so durable identity markers remain intact
+    // on disk for retry.
     let mut non_markers_ok = true;
-    for name in [CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_CONTENT_FILE] {
+    for name in [
+        CACHE_COVER_FILE,
+        CACHE_CONTENT_FILE,
+        POSITION_FILE,
+        POSITION_GENERATIONS[0],
+        POSITION_GENERATIONS[1],
+    ] {
         if upload_store::remove_file_reclaiming_clusters(book, name)
             == upload_store::RemoveStatus::Failed
         {
@@ -2375,9 +2410,9 @@ where
     if !indexes_ok {
         return false;
     }
-    // Identity markers (TOC.BIN) and the registry (CFG.BIN) go last.
+    // Identity markers (BOOK.BIN, TOC.BIN) and the registry (CFG.BIN) go last.
     let mut final_ok = true;
-    for name in [CACHE_TOC_FILE, CACHE_CONFIG_FILE] {
+    for name in [CACHE_BOOK_FILE, CACHE_TOC_FILE, CACHE_CONFIG_FILE] {
         if upload_store::remove_file_reclaiming_clusters(book, name)
             == upload_store::RemoveStatus::Failed
         {
