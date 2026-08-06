@@ -440,8 +440,16 @@ async fn upload_server(
         let is_capabilities = path.starts_with(b"/capabilities");
         let is_delete_book = is_post && path.starts_with(b"/delete-book");
         let is_recover_book = is_post && path.starts_with(b"/recover-book");
-        // A request ID on `/upload` selects the M0S transaction; without
-        // it the legacy shelf path keeps working unchanged.
+        // A request ID on `/upload` selects the M0S transaction; only a
+        // genuinely *absent* header keeps the legacy shelf path. Present
+        // and valid must stay distinguishable from present and malformed:
+        // collapsing the latter into "absent" would store an intended
+        // managed upload as a legacy /BOOKS file and answer 200.
+        let m0s_upload_header = source_http::header_value(
+            request_buf.get(..body_start).unwrap_or(b""),
+            "X-Upload-Request-Id",
+        )
+        .is_some();
         let m0s_upload_id = source_http::header_value(
             request_buf.get(..body_start).unwrap_or(b""),
             "X-Upload-Request-Id",
@@ -524,20 +532,28 @@ async fn upload_server(
                 if ok { "deleted" } else { "failed" },
             )
             .await;
-        } else if let (true, Some(request_id)) = (is_upload_post, m0s_upload_id) {
-            serve_m0s_upload(
-                &mut socket,
-                request_buf,
-                path_at,
-                path_len,
-                body_start,
-                filled,
-                content_length,
-                request_id,
-                &mut pool,
-                &mut session_started,
-            )
-            .await;
+        } else if is_upload_post && m0s_upload_header {
+            match m0s_upload_id {
+                Some(request_id) => {
+                    serve_m0s_upload(
+                        &mut socket,
+                        request_buf,
+                        path_at,
+                        path_len,
+                        body_start,
+                        filled,
+                        content_length,
+                        request_id,
+                        &mut pool,
+                        &mut session_started,
+                    )
+                    .await;
+                }
+                // The client asked for the M0S contract and got the ID
+                // wrong; answering through the legacy writer would be a
+                // silent misfile, not a fallback.
+                None => respond_bad_request(&mut socket, "invalid_request_id").await,
+            }
         } else if is_upload_post {
             let client_name = request_buf
                 .get_mut(path_at..path_at + path_len)
@@ -823,19 +839,33 @@ async fn respond_interrupted(
     respond_refusal(socket, crate::source_owner::Refusal::StorageUnavailable).await;
 }
 
+/// How reading a small JSON body ended. `Interrupted` must stay distinct
+/// from `Invalid`: it means the session-exit signal was *consumed* here,
+/// so the caller owes the same pipeline reclaim the streaming path does —
+/// answering 400 and moving on would leave `session_started` pointing at
+/// a storage owner that already exited, and the next operation would wait
+/// forever on it.
+enum BodyRead<'a> {
+    Complete(&'a [u8]),
+    Invalid,
+    Interrupted,
+}
+
 /// Read a small JSON body fully into `request_buf` behind the parsed
-/// head. `None` for anything oversized, truncated, or interrupted — the
-/// two M0S bodies fit hundreds of bytes, so 512 is already generous.
+/// head. The two M0S bodies fit hundreds of bytes, so 512 is already
+/// generous; oversized or truncated bodies are `Invalid`.
 async fn read_small_body<'a>(
     socket: &mut TcpSocket<'_>,
     request_buf: &'a mut [u8],
     body_start: usize,
     mut filled: usize,
     content_length: usize,
-) -> Option<&'a [u8]> {
-    let body_end = body_start.checked_add(content_length)?;
+) -> BodyRead<'a> {
+    let Some(body_end) = body_start.checked_add(content_length) else {
+        return BodyRead::Invalid;
+    };
     if content_length > 512 || body_end > request_buf.len() {
-        return None;
+        return BodyRead::Invalid;
     }
     while filled < body_end {
         match select(
@@ -844,12 +874,12 @@ async fn read_small_body<'a>(
         )
         .await
         {
-            Either::First(Ok(0)) | Either::First(Err(_)) => return None,
+            Either::First(Ok(0)) | Either::First(Err(_)) => return BodyRead::Invalid,
             Either::First(Ok(read)) => filled += read,
-            Either::Second(()) => return None,
+            Either::Second(()) => return BodyRead::Interrupted,
         }
     }
-    Some(&request_buf[body_start..body_end])
+    BodyRead::Complete(&request_buf[body_start..body_end])
 }
 
 /// Stream one M0S upload body to the storage owner. The transaction is
@@ -1090,13 +1120,24 @@ async fn serve_delete_book(
         respond_bad_request(socket, "invalid_request_id").await;
         return;
     };
-    let Some(book_token) = read_small_body(socket, request_buf, body_start, filled, content_length)
-        .await
-        .and_then(source_http::parse_delete_body)
-    else {
-        respond_bad_request(socket, "invalid_body").await;
-        return;
-    };
+    let book_token =
+        match read_small_body(socket, request_buf, body_start, filled, content_length).await {
+            BodyRead::Complete(body) => match source_http::parse_delete_body(body) {
+                Some(token) => token,
+                None => {
+                    respond_bad_request(socket, "invalid_body").await;
+                    return;
+                }
+            },
+            BodyRead::Invalid => {
+                respond_bad_request(socket, "invalid_body").await;
+                return;
+            }
+            BodyRead::Interrupted => {
+                respond_interrupted(socket, pool, session_started).await;
+                return;
+            }
+        };
     ensure_upload_session(session_started).await;
     SOURCE_OPS
         .send(SourceOp::Delete(SourceDeleteOp {
@@ -1143,10 +1184,17 @@ async fn serve_recover_book(
         respond_bad_request(socket, "invalid_request_id").await;
         return;
     };
-    let Some(body) = read_small_body(socket, request_buf, body_start, filled, content_length).await
-    else {
-        respond_bad_request(socket, "invalid_body").await;
-        return;
+    let body = match read_small_body(socket, request_buf, body_start, filled, content_length).await
+    {
+        BodyRead::Complete(body) => body,
+        BodyRead::Invalid => {
+            respond_bad_request(socket, "invalid_body").await;
+            return;
+        }
+        BodyRead::Interrupted => {
+            respond_interrupted(socket, pool, session_started).await;
+            return;
+        }
     };
     let Some(parsed) = source_http::parse_recover_body(body) else {
         respond_bad_request(socket, "invalid_body").await;

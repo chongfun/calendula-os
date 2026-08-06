@@ -121,56 +121,105 @@ pub fn query_param<'a>(path: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 // JSON request bodies
 // ---------------------------------------------------------------------------
 
-/// The value bytes of `"key": <value>` in a flat JSON object: a borrowed
-/// raw string body (escapes intact) or a bare number/keyword slice. This
-/// deliberately parses only the PRD's two request shapes — one flat
-/// object, string and integer values — and rejects by returning `None`
-/// rather than guessing at anything richer.
-fn json_raw_field<'a>(body: &'a [u8], key: &str) -> Option<&'a [u8]> {
-    let mut at = 0usize;
-    while at < body.len() {
-        // Find the next string, and check whether it is our key in key
-        // position (followed by a colon).
-        let open = at + body[at..].iter().position(|&byte| byte == b'"')?;
-        let close = open + 1 + raw_string_len(&body[open + 1..])?;
-        let name = &body[open + 1..close];
-        let mut after = close + 1;
-        while body.get(after) == Some(&b' ') || body.get(after) == Some(&b'\t') {
-            after += 1;
-        }
-        if body.get(after) != Some(&b':') {
-            // A value string; skip it.
-            at = close + 1;
-            continue;
-        }
-        let mut value_at = after + 1;
-        while body.get(value_at) == Some(&b' ') || body.get(value_at) == Some(&b'\t') {
-            value_at += 1;
-        }
-        if name == key.as_bytes() {
-            return match body.get(value_at) {
-                Some(b'"') => {
-                    let len = raw_string_len(&body[value_at + 1..])?;
-                    Some(&body[value_at + 1..value_at + 1 + len])
-                }
-                Some(_) => {
-                    let end = body[value_at..]
-                        .iter()
-                        .position(|&byte| matches!(byte, b',' | b'}' | b' ' | b'\r' | b'\n'))
-                        .map(|end| value_at + end)
-                        .unwrap_or(body.len());
-                    Some(&body[value_at..end])
-                }
-                None => None,
-            };
-        }
-        // Not our key: skip past its value and continue scanning.
-        at = match body.get(value_at) {
-            Some(b'"') => value_at + 1 + raw_string_len(&body[value_at + 1..])? + 1,
-            _ => value_at + 1,
-        };
+/// One field value in a flat JSON object: a raw string body (escapes
+/// intact) or an unsigned integer. The only two value kinds the PRD's
+/// request bodies use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlatValue<'a> {
+    Str(&'a [u8]),
+    UInt(u64),
+}
+
+/// Walk `body` as exactly one flat JSON object — `{ "key": value, ... }`
+/// with string or unsigned-integer values, JSON whitespace, and nothing
+/// but whitespace after the closing brace — calling `field` for each
+/// pair. Returns `false` for any structural violation or when `field`
+/// does.
+///
+/// These bodies authorize mutations, so the envelope is validated
+/// whole rather than key-hunted: a deletion must never execute because
+/// token-shaped bytes happened to appear in something that is not the
+/// documented request. Unknown *keys* are still passed through to
+/// `field` (which tolerates them), so adding an optional field later
+/// does not break older firmware; garbage instead of an object always
+/// rejects.
+fn for_each_flat_field(body: &[u8], mut field: impl FnMut(&[u8], FlatValue<'_>) -> bool) -> bool {
+    let mut at = skip_ws(body, 0);
+    if body.get(at) != Some(&b'{') {
+        return false;
     }
-    None
+    at = skip_ws(body, at + 1);
+    if body.get(at) == Some(&b'}') {
+        return skip_ws(body, at + 1) == body.len();
+    }
+    loop {
+        // Key: a string, then a colon.
+        if body.get(at) != Some(&b'"') {
+            return false;
+        }
+        let Some(key_len) = raw_string_len(&body[at + 1..]) else {
+            return false;
+        };
+        let key = &body[at + 1..at + 1 + key_len];
+        at = skip_ws(body, at + 1 + key_len + 1);
+        if body.get(at) != Some(&b':') {
+            return false;
+        }
+        at = skip_ws(body, at + 1);
+        // Value: a string or an unsigned integer, nothing else.
+        let value = match body.get(at) {
+            Some(b'"') => {
+                let Some(value_len) = raw_string_len(&body[at + 1..]) else {
+                    return false;
+                };
+                let value = FlatValue::Str(&body[at + 1..at + 1 + value_len]);
+                at += 1 + value_len + 1;
+                value
+            }
+            Some(byte) if byte.is_ascii_digit() => {
+                let digits_end = at
+                    + body[at..]
+                        .iter()
+                        .position(|byte| !byte.is_ascii_digit())
+                        .unwrap_or(body.len() - at);
+                let Some(value) = parse_u64_digits(&body[at..digits_end]) else {
+                    return false;
+                };
+                at = digits_end;
+                FlatValue::UInt(value)
+            }
+            _ => return false,
+        };
+        if !field(key, value) {
+            return false;
+        }
+        at = skip_ws(body, at);
+        match body.get(at) {
+            Some(b',') => at = skip_ws(body, at + 1),
+            Some(b'}') => return skip_ws(body, at + 1) == body.len(),
+            _ => return false,
+        }
+    }
+}
+
+fn skip_ws(bytes: &[u8], mut at: usize) -> usize {
+    while matches!(bytes.get(at), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        at += 1;
+    }
+    at
+}
+
+/// Plain decimal digits into a `u64`, overflow-checked. The PRD's lengths
+/// are exact byte counts — never signed, fractional, or exponent-form.
+fn parse_u64_digits(digits: &[u8]) -> Option<u64> {
+    if digits.is_empty() || digits.len() > 20 {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &byte in digits {
+        value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(value)
 }
 
 /// Length of a JSON string's raw contents starting just past its opening
@@ -187,16 +236,12 @@ fn raw_string_len(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-/// A string field's bytes with JSON escapes resolved, written into `out`.
-/// Only `\"`, `\\`, and `\/` are accepted: every other escape either
-/// encodes a control character (invalid in a display label anyway) or is
-/// `\uXXXX`, which protocol v1 has no need to accept — a browser sending
-/// labels as UTF-8 text never needs it.
-pub fn json_string_field(body: &[u8], key: &str, out: &mut [u8]) -> Option<usize> {
-    let raw = json_raw_field(body, key)?;
-    if raw.first() == Some(&b'{') {
-        return None;
-    }
+/// Resolve a raw string body's escapes into `out`. Only `\"`, `\\`, and
+/// `\/` are accepted: every other escape either encodes a control
+/// character (invalid in a display label anyway) or is `\uXXXX`, which
+/// protocol v1 has no need to accept — a browser sending labels as UTF-8
+/// text never needs it.
+fn unescape_into(raw: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut written = 0usize;
     let mut at = 0usize;
     while at < raw.len() {
@@ -219,28 +264,37 @@ pub fn json_string_field(body: &[u8], key: &str, out: &mut [u8]) -> Option<usize
     Some(written)
 }
 
-/// An unsigned integer field. Rejects anything but plain decimal digits —
-/// the PRD's lengths are exact byte counts, never floats or signs.
-pub fn json_u64_field(body: &[u8], key: &str) -> Option<u64> {
-    let raw = json_raw_field(body, key)?;
-    if raw.is_empty() || raw.len() > 20 {
-        return None;
-    }
-    let mut value: u64 = 0;
-    for &byte in raw {
-        if !byte.is_ascii_digit() {
-            return None;
+/// A required-once field slot: setting it twice is a duplicate, which
+/// rejects — two values under one key means the request contradicts
+/// itself, and this layer refuses rather than letting order decide.
+fn set_once<T>(slot: &mut Option<T>, value: Option<T>) -> bool {
+    match value {
+        Some(value) if slot.is_none() => {
+            *slot = Some(value);
+            true
         }
-        value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+        _ => false,
     }
-    Some(value)
 }
 
-/// A parsed `POST /delete-book` body.
+/// A parsed `POST /delete-book` body: `{"book_token": "<32 hex>"}`.
 pub fn parse_delete_body(body: &[u8]) -> Option<[u8; 16]> {
-    let mut token_hex = [0u8; BOOK_TOKEN_HEX];
-    let len = json_string_field(body, "book_token", &mut token_hex)?;
-    parse_book_token(&token_hex[..len])
+    let mut token: Option<[u8; 16]> = None;
+    let well_formed = for_each_flat_field(body, |key, value| match (key, value) {
+        (b"book_token", FlatValue::Str(raw)) => {
+            let mut hex = [0u8; BOOK_TOKEN_HEX];
+            let parsed = unescape_into(raw, &mut hex).and_then(|len| parse_book_token(&hex[..len]));
+            set_once(&mut token, parsed)
+        }
+        (b"book_token", _) => false,
+        // Unknown keys of either value kind are tolerated for forward
+        // compatibility; their values were already structurally checked.
+        _ => true,
+    });
+    if !well_formed {
+        return None;
+    }
+    token
 }
 
 /// A parsed `POST /recover-book` body. The label is returned as raw bytes
@@ -254,28 +308,48 @@ pub struct RecoverBody {
 }
 
 pub fn parse_recover_body(body: &[u8]) -> Option<RecoverBody> {
-    let mut token_hex = [0u8; BOOK_TOKEN_HEX];
-    let len = json_string_field(body, "book_token", &mut token_hex)?;
-    let book_token = parse_book_token(&token_hex[..len])?;
-    let observed_length = json_u64_field(body, "observed_source_length")?;
-    let mut sha_hex = [0u8; SHA256_HEX];
-    let len = json_string_field(body, "observed_source_sha256", &mut sha_hex)?;
-    let observed_sha256 = parse_sha256(&sha_hex[..len])?;
-    let display_label = match json_raw_field(body, "display_label") {
-        None => None,
-        Some(_) => {
-            let mut label = [0u8; 64];
-            let len = json_string_field(body, "display_label", &mut label)?;
-            let mut owned = Vec::new();
-            owned.extend_from_slice(&label[..len]).ok()?;
-            Some(owned)
+    let mut token: Option<[u8; 16]> = None;
+    let mut length: Option<u64> = None;
+    let mut sha256: Option<[u8; 32]> = None;
+    let mut label: Option<Vec<u8, 64>> = None;
+    let well_formed = for_each_flat_field(body, |key, value| match (key, value) {
+        (b"book_token", FlatValue::Str(raw)) => {
+            let mut hex = [0u8; BOOK_TOKEN_HEX];
+            let parsed = unescape_into(raw, &mut hex).and_then(|len| parse_book_token(&hex[..len]));
+            set_once(&mut token, parsed)
         }
-    };
+        (b"observed_source_length", FlatValue::UInt(value)) => set_once(&mut length, Some(value)),
+        (b"observed_source_sha256", FlatValue::Str(raw)) => {
+            let mut hex = [0u8; SHA256_HEX];
+            let parsed = unescape_into(raw, &mut hex).and_then(|len| parse_sha256(&hex[..len]));
+            set_once(&mut sha256, parsed)
+        }
+        (b"display_label", FlatValue::Str(raw)) => {
+            let mut bytes = [0u8; 64];
+            let parsed = unescape_into(raw, &mut bytes).and_then(|len| {
+                let mut owned = Vec::new();
+                owned.extend_from_slice(&bytes[..len]).ok()?;
+                Some(owned)
+            });
+            set_once(&mut label, parsed)
+        }
+        (
+            b"book_token"
+            | b"observed_source_length"
+            | b"observed_source_sha256"
+            | b"display_label",
+            _,
+        ) => false,
+        _ => true,
+    });
+    if !well_formed {
+        return None;
+    }
     Some(RecoverBody {
-        book_token,
-        observed_length,
-        observed_sha256,
-        display_label,
+        book_token: token?,
+        observed_length: length?,
+        observed_sha256: sha256?,
+        display_label: label,
     })
 }
 
@@ -642,6 +716,64 @@ mod tests {
         let body = b"{\"display_label\":\"book_token\",\"book_token\":\"00112233445566778899aabbccddeeff\"}";
         let token = parse_delete_body(body).expect("real key wins");
         assert_eq!(token[0], 0x00);
+    }
+
+    #[test]
+    fn mutating_bodies_must_be_whole_well_formed_objects() {
+        let token_hex = "00112233445566778899aabbccddeeff";
+
+        // Whitespace-rich but well-formed: accepted.
+        let body = std::format!(" {{\r\n  \"book_token\" : \"{token_hex}\"\n}} \r\n");
+        assert!(parse_delete_body(body.as_bytes()).is_some());
+
+        // Token-shaped bytes inside something that is not the documented
+        // object must never authorize a deletion.
+        let body = std::format!("garbage \"book_token\":{token_hex} trailing");
+        assert!(parse_delete_body(body.as_bytes()).is_none(), "no envelope");
+        let body = std::format!("\"book_token\":\"{token_hex}\"");
+        assert!(parse_delete_body(body.as_bytes()).is_none(), "no braces");
+        let body = std::format!("{{\"book_token\":\"{token_hex}\"}} trailing");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "trailing junk"
+        );
+        let body = std::format!("{{\"book_token\":{token_hex}}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "unquoted value"
+        );
+        let body = std::format!("{{\"book_token\":\"{token_hex}\",}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "trailing comma"
+        );
+        let body = std::format!("{{\"book_token\":\"{token_hex}\"");
+        assert!(parse_delete_body(body.as_bytes()).is_none(), "unterminated");
+        let body =
+            std::format!("{{\"book_token\":\"{token_hex}\",\"book_token\":\"{token_hex}\"}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "duplicate key"
+        );
+        assert!(parse_delete_body(b"{}").is_none(), "required field absent");
+        assert!(
+            parse_delete_body(b"{\"book_token\":[1]}").is_none(),
+            "wrong value kind"
+        );
+
+        // Unknown keys of the accepted value kinds stay tolerated, so a
+        // newer client field does not break older firmware.
+        let body = std::format!("{{\"future\":\"x\",\"book_token\":\"{token_hex}\",\"n\":7}}");
+        assert!(parse_delete_body(body.as_bytes()).is_some());
+
+        // The same envelope rules hold for recovery, and a duplicated
+        // required field rejects rather than letting order decide.
+        let sha_hex = "a".repeat(64);
+        let body = std::format!(
+            "{{\"book_token\":\"{token_hex}\",\"observed_source_length\":1,\
+             \"observed_source_length\":2,\"observed_source_sha256\":\"{sha_hex}\"}}"
+        );
+        assert!(parse_recover_body(body.as_bytes()).is_none());
     }
 
     #[test]
