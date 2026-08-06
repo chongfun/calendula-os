@@ -841,6 +841,488 @@ where
     }
 }
 
+/// Source-container bounds the firmware advertises and the container gate
+/// enforces (PRD "Source-container bounds"). All four are provisional v1
+/// constants pending the PRD's measurement gates; the point is that every
+/// build has *one* set of numbers, advertised and enforced from the same
+/// place, so a browser and the device can never disagree about what fits.
+///
+/// The limits are `u32` because [`ReadAt`] itself is: nothing behind that
+/// trait can address a fifth gigabyte, so a wider limit would advertise
+/// support the readers do not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceContainerLimits {
+    /// Whole-file ceiling. Uploads beyond it are rejected before staging;
+    /// direct-SD files beyond it are never adopted as books.
+    pub max_epub_bytes: u32,
+    /// Highest byte offset any zip structure may name.
+    pub max_zip_offset: u32,
+    /// Per-entry compressed ceiling.
+    pub max_entry_compressed_bytes: u32,
+    /// Per-entry uncompressed ceiling. Larger than the compressed ceiling
+    /// because the reading path only ever inflates bounded prefixes and
+    /// windows, never a whole entry into RAM.
+    pub max_entry_uncompressed_bytes: u32,
+}
+
+/// Required ZIP64 interpretation is unsupported in protocol v1, full stop.
+/// Advertised so hosts can refuse before uploading rather than after.
+pub const ZIP64_SUPPORTED: bool = false;
+
+impl SourceContainerLimits {
+    /// Protocol-v1 numbers. 64 MiB comfortably covers real EPUBs (large
+    /// image-heavy books run tens of MB) while keeping every derived
+    /// offset far from `u32` edge cases.
+    pub const V1: Self = Self {
+        max_epub_bytes: 64 * 1024 * 1024,
+        max_zip_offset: 64 * 1024 * 1024,
+        max_entry_compressed_bytes: 64 * 1024 * 1024,
+        max_entry_uncompressed_bytes: 256 * 1024 * 1024,
+    };
+}
+
+/// Why a container was refused. Every variant is deterministic for given
+/// bytes and limits: the same file gets the same answer on every device
+/// and every retry, which is what lets an upload rejection be final
+/// rather than "try again and hope".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerError {
+    /// The file exceeds `max_epub_bytes`.
+    TooLarge,
+    /// No end-of-central-directory record within the classic-ZIP search
+    /// bound (22 bytes + a 65,535-byte comment), or the file is smaller
+    /// than an empty zip.
+    MissingEndOfCentralDirectory,
+    /// The file requires ZIP64 interpretation: a ZIP64 end-of-central-
+    /// directory locator is present, or a mandatory field carries the
+    /// sentinel that defers its real value to a ZIP64 record.
+    Zip64Unsupported,
+    /// Multi-disk archives are not containers this protocol reads.
+    MultiDiskUnsupported,
+    /// Central-directory structure is inconsistent: bad signatures, sizes
+    /// that do not add up, entries past their directory, local headers
+    /// that cannot fit where they claim to be.
+    BadCentralDirectory,
+    /// A structurally valid entry exceeds a per-entry or offset limit.
+    BoundsExceeded,
+    /// The underlying reader failed.
+    Io,
+    /// The caller's scratch buffer is below [`CONTAINER_GATE_MIN_SCRATCH`].
+    ScratchTooSmall,
+}
+
+/// What an accepted container proved, for callers that log or budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContainerSummary {
+    pub file_len: u32,
+    pub entry_count: u16,
+}
+
+/// Smallest scratch the gate accepts: one central-directory header (46
+/// bytes) with room to also hold an EOCD candidate (22 bytes) plus the
+/// ZIP64 locator probe. Callers hand larger buffers to cut tail-scan
+/// round-trips; the verdict never changes with scratch size.
+pub const CONTAINER_GATE_MIN_SCRATCH: usize = 64;
+
+/// EOCD offset 20 holds the archive comment length; the comment is the
+/// last thing in a classic zip, which bounds how far from the end the
+/// EOCD can sit.
+const EOCD_MAX_COMMENT_BYTES: u32 = 65_535;
+const EOCD_SEARCH_BOUND: u32 = ZIP_EOCD_MIN_BYTES + EOCD_MAX_COMMENT_BYTES;
+
+/// Central-directory entries validated per [`ContainerGate::step`] call.
+/// Sixteen 46-byte header reads keeps a step's software work and SD
+/// traffic bounded regardless of how many entries the archive declares.
+const CONTAINER_ENTRIES_PER_STEP: u16 = 16;
+
+/// One bounded unit of container validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerStep {
+    /// More steps remain; call again.
+    Pending,
+    /// The container is an acceptable classic zip within limits.
+    Accepted(ContainerSummary),
+    /// The container is refused; the error is deterministic and final.
+    Rejected(ContainerError),
+}
+
+#[derive(Clone, Copy)]
+enum GatePhase {
+    /// Check the whole-file ceiling, then start the tail scan.
+    Start,
+    /// Scanning backwards for a self-consistent EOCD, one scratch-sized
+    /// chunk per step. `chunk_end` is the exclusive end of the next chunk.
+    FindEocd { file_len: u32, chunk_end: u32 },
+    /// Walking central-directory entries, a bounded batch per step.
+    WalkCentral {
+        file_len: u32,
+        entry_count: u16,
+        /// First byte of the central directory; local entries end here.
+        directory_start: u32,
+        /// Exclusive end of the central directory == the EOCD offset.
+        directory_end: u32,
+        cursor: u32,
+        remaining: u16,
+    },
+    /// A verdict was returned; further steps repeat it.
+    Done(ContainerStep),
+}
+
+/// The classic-ZIP container gate: the resumable bounded job behind the
+/// `validate_container` hook of the source-transaction layer (PRD
+/// "Source-container bounds", "Cooperative long-running work").
+///
+/// Each [`step`][Self::step] performs one bounded unit — a single tail
+/// chunk scan or [`CONTAINER_ENTRIES_PER_STEP`] entry validations — and
+/// returns to the caller, so the storage owner can run the gate across
+/// executor turns without starving other tasks. The gate reads only zip
+/// *structure* (EOCD and central-directory headers), never entry names or
+/// payloads: acceptance means "classic zip whose declared shape is
+/// self-consistent, addressable with checked 32-bit arithmetic, and
+/// within advertised limits", not "valid EPUB" — content rules belong to
+/// the semantic layers above.
+///
+/// ZIP64 is rejected, not ignored: a ZIP64 EOCD locator, a `0xFFFF` /
+/// `0xFFFF_FFFF` sentinel in any mandatory field, or a central directory
+/// that does not end exactly at the EOCD (where the ZIP64 records would
+/// live) all answer [`ContainerError::Zip64Unsupported`] or
+/// [`ContainerError::BadCentralDirectory`] deterministically.
+pub struct ContainerGate {
+    limits: SourceContainerLimits,
+    phase: GatePhase,
+}
+
+impl ContainerGate {
+    pub fn new(limits: SourceContainerLimits) -> Self {
+        Self {
+            limits,
+            phase: GatePhase::Start,
+        }
+    }
+
+    /// Run one bounded unit of validation. `scratch` must be at least
+    /// [`CONTAINER_GATE_MIN_SCRATCH`] bytes; its size affects only how
+    /// many steps the tail scan takes, never the verdict.
+    pub fn step<R>(&mut self, reader: &mut R, scratch: &mut [u8]) -> ContainerStep
+    where
+        R: ReadAt,
+    {
+        if scratch.len() < CONTAINER_GATE_MIN_SCRATCH {
+            return self.finish(ContainerStep::Rejected(ContainerError::ScratchTooSmall));
+        }
+        match self.phase {
+            GatePhase::Start => {
+                let file_len = match reader.len() {
+                    Ok(len) => len,
+                    Err(_) => return self.finish(ContainerStep::Rejected(ContainerError::Io)),
+                };
+                if file_len > self.limits.max_epub_bytes {
+                    return self.finish(ContainerStep::Rejected(ContainerError::TooLarge));
+                }
+                if file_len < ZIP_EOCD_MIN_BYTES {
+                    return self.finish(ContainerStep::Rejected(
+                        ContainerError::MissingEndOfCentralDirectory,
+                    ));
+                }
+                self.phase = GatePhase::FindEocd {
+                    file_len,
+                    chunk_end: file_len,
+                };
+                ContainerStep::Pending
+            }
+            GatePhase::FindEocd {
+                file_len,
+                chunk_end,
+            } => self.step_find_eocd(reader, scratch, file_len, chunk_end),
+            GatePhase::WalkCentral {
+                file_len,
+                entry_count,
+                directory_start,
+                directory_end,
+                cursor,
+                remaining,
+            } => self.step_walk_central(
+                reader,
+                scratch,
+                file_len,
+                entry_count,
+                directory_start,
+                directory_end,
+                cursor,
+                remaining,
+            ),
+            GatePhase::Done(verdict) => verdict,
+        }
+    }
+
+    fn finish(&mut self, verdict: ContainerStep) -> ContainerStep {
+        self.phase = GatePhase::Done(verdict);
+        verdict
+    }
+
+    fn step_find_eocd<R>(
+        &mut self,
+        reader: &mut R,
+        scratch: &mut [u8],
+        file_len: u32,
+        chunk_end: u32,
+    ) -> ContainerStep
+    where
+        R: ReadAt,
+    {
+        let search_floor = file_len.saturating_sub(EOCD_SEARCH_BOUND);
+        let available = chunk_end.saturating_sub(search_floor) as usize;
+        let chunk_len = available.min(scratch.len());
+        if chunk_len < ZIP_EOCD_MIN_BYTES as usize {
+            return self.finish(ContainerStep::Rejected(
+                ContainerError::MissingEndOfCentralDirectory,
+            ));
+        }
+        let chunk_start = chunk_end - chunk_len as u32;
+        let chunk = &mut scratch[..chunk_len];
+        if read_exact_at(reader, chunk_start, chunk).is_err() {
+            return self.finish(ContainerStep::Rejected(ContainerError::Io));
+        }
+        // Scan backwards for a *self-consistent* candidate: its comment
+        // must run exactly to the end of the file. Signature-only matching
+        // (what `find_eocd` does) would let EOCD-shaped bytes inside an
+        // archive comment shadow the real record.
+        let mut cursor = chunk_len - ZIP_EOCD_MIN_BYTES as usize;
+        loop {
+            if chunk[cursor..cursor + 4] == [0x50, 0x4b, 0x05, 0x06] {
+                let comment_len = match read_u16(chunk, cursor + 20) {
+                    Ok(len) => u32::from(len),
+                    Err(_) => return self.finish(ContainerStep::Rejected(ContainerError::Io)),
+                };
+                let eocd_offset = chunk_start + cursor as u32;
+                if eocd_offset + ZIP_EOCD_MIN_BYTES + comment_len == file_len {
+                    return self.accept_eocd(reader, chunk, cursor, file_len, eocd_offset);
+                }
+            }
+            if cursor == 0 {
+                break;
+            }
+            cursor -= 1;
+        }
+        if chunk_start <= search_floor {
+            return self.finish(ContainerStep::Rejected(
+                ContainerError::MissingEndOfCentralDirectory,
+            ));
+        }
+        // Overlap the next chunk so a record straddling the boundary is
+        // still seen whole.
+        self.phase = GatePhase::FindEocd {
+            file_len,
+            chunk_end: chunk_start + ZIP_EOCD_OVERLAP_BYTES,
+        };
+        ContainerStep::Pending
+    }
+
+    fn accept_eocd<R>(
+        &mut self,
+        reader: &mut R,
+        chunk: &[u8],
+        eocd_in_chunk: usize,
+        file_len: u32,
+        eocd_offset: u32,
+    ) -> ContainerStep
+    where
+        R: ReadAt,
+    {
+        let field_u16 = |offset: usize| read_u16(chunk, eocd_in_chunk + offset);
+        let field_u32 = |offset: usize| read_u32(chunk, eocd_in_chunk + offset);
+        let (Ok(disk_number), Ok(directory_disk), Ok(disk_entries), Ok(entry_count)) =
+            (field_u16(4), field_u16(6), field_u16(8), field_u16(10))
+        else {
+            return self.finish(ContainerStep::Rejected(ContainerError::Io));
+        };
+        let (Ok(directory_size), Ok(directory_offset)) = (field_u32(12), field_u32(16)) else {
+            return self.finish(ContainerStep::Rejected(ContainerError::Io));
+        };
+        // A `0xFFFF`/`0xFFFF_FFFF` in a mandatory field is the ZIP64
+        // sentinel: the real value lives in a record this protocol does
+        // not read. That is required ZIP64 interpretation, not a large
+        // classic archive.
+        if disk_number == 0xFFFF
+            || directory_disk == 0xFFFF
+            || disk_entries == 0xFFFF
+            || entry_count == 0xFFFF
+            || directory_size == 0xFFFF_FFFF
+            || directory_offset == 0xFFFF_FFFF
+        {
+            return self.finish(ContainerStep::Rejected(ContainerError::Zip64Unsupported));
+        }
+        if disk_number != 0 || directory_disk != 0 || disk_entries != entry_count {
+            return self.finish(ContainerStep::Rejected(
+                ContainerError::MultiDiskUnsupported,
+            ));
+        }
+        if directory_offset > self.limits.max_zip_offset {
+            return self.finish(ContainerStep::Rejected(ContainerError::BoundsExceeded));
+        }
+        // The central directory must end exactly at the EOCD. The gap a
+        // looser check would allow is exactly where ZIP64 EOCD records
+        // live, so probe for the locator to name the refusal precisely.
+        let directory_end = u64::from(directory_offset) + u64::from(directory_size);
+        if directory_end != u64::from(eocd_offset) {
+            let mut locator_sig = [0u8; 4];
+            let locator_present = eocd_offset >= 20
+                && read_exact_at(reader, eocd_offset - 20, &mut locator_sig).is_ok()
+                && locator_sig == [0x50, 0x4b, 0x06, 0x07];
+            if locator_present {
+                return self.finish(ContainerStep::Rejected(ContainerError::Zip64Unsupported));
+            }
+            return self.finish(ContainerStep::Rejected(ContainerError::BadCentralDirectory));
+        }
+        // Each entry is at least a 46-byte header; a directory too small
+        // for its own count cannot be walked and is rejected before any
+        // per-entry I/O is spent on it.
+        if u64::from(directory_size) < 46 * u64::from(entry_count) {
+            return self.finish(ContainerStep::Rejected(ContainerError::BadCentralDirectory));
+        }
+        self.phase = GatePhase::WalkCentral {
+            file_len,
+            entry_count,
+            directory_start: directory_offset,
+            directory_end: eocd_offset,
+            cursor: directory_offset,
+            remaining: entry_count,
+        };
+        ContainerStep::Pending
+    }
+
+    #[allow(clippy::too_many_arguments)] // Private phase unpacking, not API.
+    fn step_walk_central<R>(
+        &mut self,
+        reader: &mut R,
+        scratch: &mut [u8],
+        file_len: u32,
+        entry_count: u16,
+        directory_start: u32,
+        directory_end: u32,
+        mut cursor: u32,
+        mut remaining: u16,
+    ) -> ContainerStep
+    where
+        R: ReadAt,
+    {
+        let header = &mut scratch[..46];
+        for _ in 0..CONTAINER_ENTRIES_PER_STEP {
+            if remaining == 0 {
+                break;
+            }
+            // The header must lie entirely inside the declared directory.
+            if u64::from(cursor) + 46 > u64::from(directory_end) {
+                return self.finish(ContainerStep::Rejected(ContainerError::BadCentralDirectory));
+            }
+            if read_exact_at(reader, cursor, header).is_err() {
+                return self.finish(ContainerStep::Rejected(ContainerError::Io));
+            }
+            match self.check_entry(header, file_len, directory_start) {
+                Ok(entry_span) => {
+                    let Some(next) = cursor.checked_add(entry_span) else {
+                        return self
+                            .finish(ContainerStep::Rejected(ContainerError::BadCentralDirectory));
+                    };
+                    cursor = next;
+                }
+                Err(error) => return self.finish(ContainerStep::Rejected(error)),
+            }
+            remaining -= 1;
+        }
+        if remaining == 0 {
+            // The walked entries must consume the directory exactly:
+            // declared size, declared count, and actual records all have
+            // to tell the same story.
+            if cursor != directory_end {
+                return self.finish(ContainerStep::Rejected(ContainerError::BadCentralDirectory));
+            }
+            return self.finish(ContainerStep::Accepted(ContainerSummary {
+                file_len,
+                entry_count,
+            }));
+        }
+        self.phase = GatePhase::WalkCentral {
+            file_len,
+            entry_count,
+            directory_start,
+            directory_end,
+            cursor,
+            remaining,
+        };
+        ContainerStep::Pending
+    }
+
+    /// Validate one central-directory header; on success return the full
+    /// record span (header + name + extra + comment) for cursor advance.
+    fn check_entry(
+        &self,
+        header: &[u8],
+        file_len: u32,
+        directory_start: u32,
+    ) -> Result<u32, ContainerError> {
+        let field_u16 = |offset: usize| read_u16(header, offset).map_err(|_| ContainerError::Io);
+        let field_u32 = |offset: usize| read_u32(header, offset).map_err(|_| ContainerError::Io);
+        if field_u32(0)? != 0x0201_4b50 {
+            return Err(ContainerError::BadCentralDirectory);
+        }
+        let compressed = field_u32(20)?;
+        let uncompressed = field_u32(24)?;
+        let name_len = u32::from(field_u16(28)?);
+        let extra_len = u32::from(field_u16(30)?);
+        let comment_len = u32::from(field_u16(32)?);
+        let disk_start = field_u16(34)?;
+        let local_offset = field_u32(42)?;
+        if compressed == 0xFFFF_FFFF || uncompressed == 0xFFFF_FFFF || local_offset == 0xFFFF_FFFF {
+            return Err(ContainerError::Zip64Unsupported);
+        }
+        if disk_start == 0xFFFF {
+            return Err(ContainerError::Zip64Unsupported);
+        }
+        if disk_start != 0 {
+            return Err(ContainerError::MultiDiskUnsupported);
+        }
+        if compressed > self.limits.max_entry_compressed_bytes
+            || uncompressed > self.limits.max_entry_uncompressed_bytes
+            || local_offset > self.limits.max_zip_offset
+        {
+            return Err(ContainerError::BoundsExceeded);
+        }
+        // Local entries precede the central directory, and the local
+        // header plus name plus payload must fit inside the file. The
+        // local extra field's length is not knowable from here, so this
+        // is the tightest bound available without another read per entry.
+        if local_offset >= directory_start {
+            return Err(ContainerError::BadCentralDirectory);
+        }
+        let local_span = u64::from(local_offset) + 30 + u64::from(name_len) + u64::from(compressed);
+        if local_span > u64::from(file_len) {
+            return Err(ContainerError::BadCentralDirectory);
+        }
+        Ok(46 + name_len + extra_len + comment_len)
+    }
+}
+
+/// Drive a [`ContainerGate`] to completion in one call — hosts, tests, and
+/// callers that already are a bounded background step.
+pub fn validate_source_container<R>(
+    reader: &mut R,
+    limits: SourceContainerLimits,
+    scratch: &mut [u8],
+) -> Result<ContainerSummary, ContainerError>
+where
+    R: ReadAt,
+{
+    let mut gate = ContainerGate::new(limits);
+    loop {
+        match gate.step(reader, scratch) {
+            ContainerStep::Pending => {}
+            ContainerStep::Accepted(summary) => return Ok(summary),
+            ContainerStep::Rejected(error) => return Err(error),
+        }
+    }
+}
+
 /// Narrow zip-entry interface shared by the EPUB loaders: find an entry by
 /// name, then read it whole, as a bounded prefix, or streamed into a sink.
 /// Both zip front-ends implement it so cache-building code does not care
@@ -5616,5 +6098,241 @@ mod tests {
         );
         assert!(res_full.is_ok());
         assert_eq!(opf_path_buf.as_str(), "OEBPS/content.opf");
+    }
+
+    // -----------------------------------------------------------------
+    // Container gate
+    // -----------------------------------------------------------------
+
+    fn gate_verdict(bytes: &[u8], limits: SourceContainerLimits) -> ContainerStep {
+        let mut reader = SliceReader { bytes };
+        let mut scratch = [0u8; 512];
+        let mut gate = ContainerGate::new(limits);
+        loop {
+            match gate.step(&mut reader, &mut scratch) {
+                ContainerStep::Pending => {}
+                verdict => return verdict,
+            }
+        }
+    }
+
+    fn accepts(bytes: &[u8]) -> bool {
+        matches!(
+            gate_verdict(bytes, SourceContainerLimits::V1),
+            ContainerStep::Accepted(_)
+        )
+    }
+
+    fn rejects_with(bytes: &[u8], expected: ContainerError) {
+        assert_eq!(
+            gate_verdict(bytes, SourceContainerLimits::V1),
+            ContainerStep::Rejected(expected)
+        );
+    }
+
+    /// Byte offset of the EOCD record in a comment-free fixture zip.
+    fn eocd_offset(bytes: &[u8]) -> usize {
+        bytes.len() - 22
+    }
+
+    #[test]
+    fn container_gate_accepts_classic_zips_of_any_scratch_size() {
+        let zip = stored_zip(&[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", b"<container/>"),
+            ("OEBPS/ch1.xhtml", &[b'x'; 4000]),
+        ]);
+        let summary = match gate_verdict(&zip, SourceContainerLimits::V1) {
+            ContainerStep::Accepted(summary) => summary,
+            verdict => panic!("expected acceptance, got {verdict:?}"),
+        };
+        assert_eq!(summary.entry_count, 3);
+        assert_eq!(summary.file_len, zip.len() as u32);
+
+        // The verdict must not depend on scratch size — only the number of
+        // steps may. Minimal scratch forces the multi-chunk tail scan.
+        let mut reader = SliceReader { bytes: &zip };
+        let mut minimal = [0u8; CONTAINER_GATE_MIN_SCRATCH];
+        assert_eq!(
+            validate_source_container(&mut reader, SourceContainerLimits::V1, &mut minimal),
+            Ok(summary)
+        );
+
+        // Below the floor the gate refuses to guess.
+        let mut reader = SliceReader { bytes: &zip };
+        let mut too_small = [0u8; CONTAINER_GATE_MIN_SCRATCH - 1];
+        assert_eq!(
+            validate_source_container(&mut reader, SourceContainerLimits::V1, &mut too_small),
+            Err(ContainerError::ScratchTooSmall)
+        );
+
+        // An archive comment moves the EOCD away from the file end and
+        // must still be found and accepted.
+        let mut commented = stored_zip(&[("a.txt", b"hello")]);
+        let eocd = eocd_offset(&commented);
+        commented[eocd + 20] = 9;
+        commented.extend_from_slice(b"a comment");
+        assert!(accepts(&commented));
+    }
+
+    #[test]
+    fn container_gate_walk_is_resumable_and_bounded() {
+        // 40 entries: more than two per-step batches of 16.
+        let payloads: StdVec<StdVec<u8>> = (0..40u8).map(|n| std::vec![n; 10]).collect();
+        let names: StdVec<std::string::String> =
+            (0..40u8).map(|n| std::format!("f{n:02}.txt")).collect();
+        let entries: StdVec<(&str, &[u8])> = names
+            .iter()
+            .zip(payloads.iter())
+            .map(|(name, payload)| (name.as_str(), payload.as_slice()))
+            .collect();
+        let zip = stored_zip(&entries);
+
+        let mut reader = SliceReader { bytes: &zip };
+        let mut scratch = [0u8; CONTAINER_GATE_MIN_SCRATCH];
+        let mut gate = ContainerGate::new(SourceContainerLimits::V1);
+        let mut steps = 0usize;
+        let verdict = loop {
+            steps += 1;
+            assert!(steps < 10_000, "gate failed to terminate");
+            match gate.step(&mut reader, &mut scratch) {
+                ContainerStep::Pending => {}
+                verdict => break verdict,
+            }
+        };
+        assert!(matches!(verdict, ContainerStep::Accepted(_)));
+        // Start + at least one tail chunk + ceil(40/16) = 3 walk batches.
+        assert!(steps >= 5, "expected a multi-step run, got {steps}");
+        // A finished gate keeps answering the same verdict.
+        assert_eq!(gate.step(&mut reader, &mut scratch), verdict);
+    }
+
+    #[test]
+    fn container_gate_rejects_zip64_sentinels_and_locator() {
+        // EOCD entry-count sentinel.
+        let mut sentinel_count = stored_zip(&[("a.txt", b"x")]);
+        let eocd = eocd_offset(&sentinel_count);
+        sentinel_count[eocd + 8..eocd + 10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        sentinel_count[eocd + 10..eocd + 12].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        rejects_with(&sentinel_count, ContainerError::Zip64Unsupported);
+
+        // EOCD central-directory-offset sentinel.
+        let mut sentinel_offset = stored_zip(&[("a.txt", b"x")]);
+        let eocd = eocd_offset(&sentinel_offset);
+        sentinel_offset[eocd + 16..eocd + 20].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        rejects_with(&sentinel_offset, ContainerError::Zip64Unsupported);
+
+        // Per-entry uncompressed-size sentinel in the central directory.
+        let mut sentinel_entry = stored_zip(&[("a.txt", b"x")]);
+        let eocd = eocd_offset(&sentinel_entry);
+        let central_offset =
+            u32::from_le_bytes(sentinel_entry[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        sentinel_entry[central_offset + 24..central_offset + 28]
+            .copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        rejects_with(&sentinel_entry, ContainerError::Zip64Unsupported);
+
+        // A ZIP64-shaped file: 56-byte ZIP64 EOCD record plus 20-byte
+        // locator between the central directory and the EOCD, which the
+        // EOCD's own size/offset fields do not cover.
+        let zip = stored_zip(&[("a.txt", b"x")]);
+        let eocd = eocd_offset(&zip);
+        let mut zip64 = zip[..eocd].to_vec();
+        let mut zip64_record = std::vec![0u8; 56];
+        zip64_record[..4].copy_from_slice(&0x0606_4b50u32.to_le_bytes());
+        zip64.extend_from_slice(&zip64_record);
+        let mut locator = std::vec![0u8; 20];
+        locator[..4].copy_from_slice(&0x0706_4b50u32.to_le_bytes());
+        zip64.extend_from_slice(&locator);
+        zip64.extend_from_slice(&zip[eocd..]);
+        rejects_with(&zip64, ContainerError::Zip64Unsupported);
+    }
+
+    #[test]
+    fn container_gate_rejects_multi_disk() {
+        let mut split = stored_zip(&[("a.txt", b"x")]);
+        let eocd = eocd_offset(&split);
+        split[eocd + 4..eocd + 6].copy_from_slice(&1u16.to_le_bytes());
+        rejects_with(&split, ContainerError::MultiDiskUnsupported);
+    }
+
+    #[test]
+    fn container_gate_enforces_limits() {
+        let zip = stored_zip(&[("a.txt", &[b'x'; 1000])]);
+
+        // Whole-file ceiling, checked before any read.
+        let tiny_file = SourceContainerLimits {
+            max_epub_bytes: 100,
+            ..SourceContainerLimits::V1
+        };
+        assert_eq!(
+            gate_verdict(&zip, tiny_file),
+            ContainerStep::Rejected(ContainerError::TooLarge)
+        );
+
+        // Per-entry compressed ceiling.
+        let tiny_entry = SourceContainerLimits {
+            max_entry_compressed_bytes: 999,
+            ..SourceContainerLimits::V1
+        };
+        assert_eq!(
+            gate_verdict(&zip, tiny_entry),
+            ContainerStep::Rejected(ContainerError::BoundsExceeded)
+        );
+
+        // Offset ceiling, hit by the central directory itself.
+        let tiny_offset = SourceContainerLimits {
+            max_zip_offset: 10,
+            ..SourceContainerLimits::V1
+        };
+        assert_eq!(
+            gate_verdict(&zip, tiny_offset),
+            ContainerStep::Rejected(ContainerError::BoundsExceeded)
+        );
+    }
+
+    #[test]
+    fn container_gate_rejects_malformed_directories() {
+        // No EOCD at all.
+        rejects_with(&[0u8; 200], ContainerError::MissingEndOfCentralDirectory);
+        rejects_with(b"PK", ContainerError::MissingEndOfCentralDirectory);
+
+        // Trailing bytes the EOCD's comment length does not account for:
+        // no self-consistent EOCD exists.
+        let mut trailing = stored_zip(&[("a.txt", b"x")]);
+        trailing.extend_from_slice(&[0u8; 40]);
+        rejects_with(&trailing, ContainerError::MissingEndOfCentralDirectory);
+
+        // Entry count lies high: the directory is too small to hold it.
+        let mut count_high = stored_zip(&[("a.txt", b"x")]);
+        let eocd = eocd_offset(&count_high);
+        count_high[eocd + 8..eocd + 10].copy_from_slice(&2u16.to_le_bytes());
+        count_high[eocd + 10..eocd + 12].copy_from_slice(&2u16.to_le_bytes());
+        rejects_with(&count_high, ContainerError::BadCentralDirectory);
+
+        // Entry count lies low: the walk does not consume the directory.
+        let mut count_low = stored_zip(&[("a.txt", b"x"), ("b.txt", b"y")]);
+        let eocd = eocd_offset(&count_low);
+        count_low[eocd + 8..eocd + 10].copy_from_slice(&1u16.to_le_bytes());
+        count_low[eocd + 10..eocd + 12].copy_from_slice(&1u16.to_le_bytes());
+        rejects_with(&count_low, ContainerError::BadCentralDirectory);
+
+        // A local header claimed beyond the file end.
+        let mut phantom_local = stored_zip(&[("a.txt", b"x")]);
+        let eocd = eocd_offset(&phantom_local);
+        let central_offset =
+            u32::from_le_bytes(phantom_local[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        // Keep the offset below the directory start but claim a payload
+        // that cannot fit inside the file.
+        phantom_local[central_offset + 20..central_offset + 24]
+            .copy_from_slice(&500_000u32.to_le_bytes());
+        rejects_with(&phantom_local, ContainerError::BadCentralDirectory);
+
+        // A broken entry signature.
+        let mut bad_sig = stored_zip(&[("a.txt", b"x")]);
+        let eocd = eocd_offset(&bad_sig);
+        let central_offset =
+            u32::from_le_bytes(bad_sig[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        bad_sig[central_offset] = 0;
+        rejects_with(&bad_sig, ContainerError::BadCentralDirectory);
     }
 }
