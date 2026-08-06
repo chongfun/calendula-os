@@ -2074,3 +2074,215 @@ fn adopting_colliding_key_clears_old_owner_cache_and_adopts_new_owner() {
     };
     assert_eq!((header_b.source_hash, header_b.source_size), IDENTITY_B);
 }
+
+/// Invariant: adoption fails closed (`dirs_failed = true`) when an existing index
+/// file is corrupt or unreadable, preventing a colliding book from publishing
+/// over an unproven directory.
+#[test]
+fn adopt_fails_closed_when_registered_index_is_unreadable() {
+    const IDENTITY_A: (u32, u32) = (0x1111_2222, 1000);
+    const IDENTITY_B: (u32, u32) = (0x3333_4444, 2000);
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, KEY).expect("dirs");
+    files::adopt_layout_config(&root, KEY, IDENTITY_A, &store);
+    let records = build_book(&root, &mut store, 1);
+    let pages = total_pages(&records);
+    let k1 = layout_cache_key_for(&store);
+    assert!(files::write_v2_book_index(
+        &root, KEY, IDENTITY_A, pages, &records, &store, false, 0
+    ));
+
+    // Corrupt BK<k1>.BIN to 0 bytes so read_book_index_header returns Some(None).
+    let book = files::open_v2_book_dir(&root, KEY).expect("book dir");
+    let mut iname = heapless::String::<BOOK_INDEX_FILE_BYTES>::new();
+    book_index_file_name(k1, &mut iname);
+    let ifile = book
+        .open_file_in_dir(
+            iname.as_str(),
+            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("open index file");
+    drop(ifile);
+    drop(book);
+
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY_B, &store);
+    assert!(
+        adoption.dirs_failed,
+        "adoption must fail closed when an index file is unreadable"
+    );
+}
+
+/// Invariant: adoption fails closed (`dirs_failed = true`) when TOC.BIN is
+/// unreadable or corrupt, preventing publication over unverified directory state.
+#[test]
+fn adopt_fails_closed_when_toc_is_unreadable() {
+    const IDENTITY_A: (u32, u32) = (0x1111_2222, 1000);
+    const IDENTITY_B: (u32, u32) = (0x3333_4444, 2000);
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, KEY).expect("dirs");
+    files::adopt_layout_config(&root, KEY, IDENTITY_A, &store);
+    let records = build_book(&root, &mut store, 1);
+    let _pages = total_pages(&records);
+    assert!(files::write_v2_toc_file(
+        &root, KEY, IDENTITY_A, 1, &[0u8; 32]
+    ));
+
+    // Delete CFG.BIN and BK*.BIN so TOC.BIN is the remaining identity source,
+    // then truncate TOC.BIN to 2 bytes so decode_toc_file_header fails.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book dir");
+    let _ = book.delete_file_in_dir(proto::cache::CACHE_CONFIG_FILE);
+    let mut iname = heapless::String::<BOOK_INDEX_FILE_BYTES>::new();
+    book_index_file_name(layout_cache_key_for(&store), &mut iname);
+    let _ = book.delete_file_in_dir(iname.as_str());
+
+    let toc_file = book
+        .open_file_in_dir(
+            proto::cache::CACHE_TOC_FILE,
+            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("truncate TOC.BIN");
+    let _ = toc_file.write(&[0x01, 0x02]);
+    drop(toc_file);
+    drop(book);
+
+    let adoption = files::adopt_layout_config(&root, KEY, IDENTITY_B, &store);
+    assert!(
+        adoption.dirs_failed,
+        "adoption must fail closed when TOC.BIN is unreadable"
+    );
+}
+
+/// Invariant: an interrupted collision section deletion preserves the old owner's
+/// index/TOC markers on disk so subsequent opens continue to see a Mismatch and retry
+/// the collision purge before adopting the new owner.
+#[test]
+fn collision_purge_retries_cleanup_when_old_owner_section_delete_fails() {
+    const IDENTITY_A: (u32, u32) = (0x1111_2222, 1000);
+    const IDENTITY_B: (u32, u32) = (0x3333_4444, 2000);
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, KEY).expect("dirs");
+    files::adopt_layout_config(&root, KEY, IDENTITY_A, &store);
+    let records_a = build_book(&root, &mut store, 1);
+    let pages_a = total_pages(&records_a);
+    let k1 = layout_cache_key_for(&store);
+    assert!(files::write_v2_book_index(
+        &root, KEY, IDENTITY_A, pages_a, &records_a, &store, false, 0
+    ));
+
+    // Hold Book A's section file open so section deletion during collision purge fails.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book dir");
+    let sections = book.open_dir("SECTIONS").expect("sections dir");
+    let mut sname = heapless::String::<CACHE_SECTION_FILE_BYTES>::new();
+    section_file_name(k1, 0, &mut sname);
+    let held_section = sections
+        .open_file_in_dir(sname.as_str(), embedded_sdmmc::Mode::ReadOnly)
+        .expect("hold section file open");
+
+    // Book B attempts to adopt the colliding key.
+    let blocked = files::adopt_layout_config(&root, KEY, IDENTITY_B, &store);
+    assert!(
+        !blocked.succeeded(),
+        "adoption must fail when old-owner section deletion fails"
+    );
+    assert!(
+        book_index_present(&root, k1),
+        "Book A's index marker must be preserved when section deletion fails"
+    );
+
+    drop(held_section);
+    drop(sections);
+    drop(book);
+
+    // Second attempt retries collision purge and succeeds.
+    let retry = files::adopt_layout_config(&root, KEY, IDENTITY_B, &store);
+    assert!(
+        retry.succeeded(),
+        "adoption must succeed on retry once section block is cleared"
+    );
+    assert!(
+        !book_index_present(&root, k1),
+        "Book A's index marker must be purged after retry completes"
+    );
+}
+
+/// Helper to build an index file under a specific source identity without registry adoption.
+fn build_raw_config_index_for_identity(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    identity: (u32, u32),
+    sections: usize,
+) -> u8 {
+    let layout_key = layout_cache_key_for(store);
+    files::ensure_v2_cache_dirs(root, KEY).expect("dirs");
+    let records = build_book(root, store, sections);
+    let pages = total_pages(&records);
+    assert!(
+        files::write_v2_book_index(root, KEY, identity, pages, &records, store, false, 0),
+        "the index for config {layout_key:#04x} should write"
+    );
+    layout_key
+}
+
+/// Invariant: collision cleanup drains all old-owner index files across multiple
+/// listing passes when more than four index files are present on disk.
+#[test]
+fn adopting_colliding_key_purges_all_five_old_owner_indexes() {
+    const IDENTITY_A: (u32, u32) = (0x1111_2222, 1000);
+    const IDENTITY_B: (u32, u32) = (0x3333_4444, 2000);
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // Create 5 raw config indexes for Book A
+    let k1 = build_raw_config_index_for_identity(&root, &mut store, IDENTITY_A, 1);
+
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let k2 = build_raw_config_index_for_identity(&root, &mut store, IDENTITY_A, 1);
+
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    let k3 = build_raw_config_index_for_identity(&root, &mut store, IDENTITY_A, 1);
+
+    let mut settings = store.type_settings();
+    settings.size = display::font::FontSize::Small;
+    store.set_layout(settings, store.portrait());
+    let k4 = build_raw_config_index_for_identity(&root, &mut store, IDENTITY_A, 1);
+
+    let mut settings = store.type_settings();
+    settings.weight = display::font::FontWeight::Heavy;
+    store.set_layout(settings, store.portrait());
+    let k5 = build_raw_config_index_for_identity(&root, &mut store, IDENTITY_A, 1);
+
+    // Book B adopts colliding key
+    let adoption_b = files::adopt_layout_config(&root, KEY, IDENTITY_B, &store);
+    assert!(
+        adoption_b.succeeded(),
+        "collision purge of 5 old-owner indexes must succeed"
+    );
+
+    // All 5 old-owner index files must be gone.
+    for k in [k1, k2, k3, k4, k5] {
+        assert!(
+            !book_index_present(&root, k),
+            "old-owner index {k:#04x} must be purged"
+        );
+    }
+}

@@ -2014,15 +2014,23 @@ where
         adoption.dirs_failed = true;
         return adoption;
     };
-    if !book_dir_belongs_to_source_identity(&book, source_identity) {
-        cache_log!("cache: adopt config identity mismatch key={}", key);
-        if !purge_colliding_cache_artifacts_in(&book) {
+    match book_dir_ownership(&book, source_identity) {
+        BookDirOwnership::Match => {
+            adoption.purged_legacy = purge_legacy_artifacts_in(&book);
+        }
+        BookDirOwnership::Mismatch => {
+            cache_log!("cache: adopt config identity mismatch key={}", key);
+            if !purge_colliding_cache_artifacts_in(&book) {
+                adoption.dirs_failed = true;
+                return adoption;
+            }
+            adoption.purged_legacy = true;
+        }
+        BookDirOwnership::Unreadable => {
+            cache_log!("cache: adopt config identity unreadable key={}", key);
             adoption.dirs_failed = true;
             return adoption;
         }
-        adoption.purged_legacy = true;
-    } else {
-        adoption.purged_legacy = purge_legacy_artifacts_in(&book);
     }
     // A registry file that is there and will not decode gets rebuilt from the
     // index files that really are on the card, rather than started over from
@@ -2173,10 +2181,19 @@ where
         != upload_store::RemoveStatus::Failed
 }
 
-/// Check whether every readable index file or TOC file in a book cache directory
-/// matches the expected source identity. Returns false if any readable header
-/// identifies a different source book (a 28-bit key collision).
-fn book_dir_belongs_to_source_identity<
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BookDirOwnership {
+    Match,
+    Mismatch,
+    Unreadable,
+}
+
+/// Check whether existing headers in a book cache directory match the expected
+/// source identity. Returns `Mismatch` if any readable header identifies a
+/// different source book (a 28-bit key collision), `Unreadable` if any file or
+/// directory listing could not be safely inspected, or `Match` if all readable
+/// headers match (or none exist).
+fn book_dir_ownership<
     D,
     T,
     const MAX_DIRS: usize,
@@ -2185,49 +2202,87 @@ fn book_dir_belongs_to_source_identity<
 >(
     book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     source_identity: (u32, u32),
-) -> bool
+) -> BookDirOwnership
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let stored = read_layout_registry_in(book);
     let registry = stored.unwrap_or_default();
+    let mut saw_mismatch = false;
+    let mut saw_unreadable = false;
+    let mut saw_match = false;
     let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
     for layout_key in registry.keys() {
         book_index_file_name(*layout_key, &mut name);
-        if let Some(Some(header)) = read_book_index_header(book, name.as_str()) {
-            if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
-                return false;
-            }
-        }
-    }
-    if let Some(unlisted_names) = book_index_names_unlisted_by(book, &registry) {
-        for unlisted in unlisted_names {
-            if let Some(Some(header)) = read_book_index_header(book, unlisted.as_str()) {
+        match read_book_index_header(book, name.as_str()) {
+            Some(Some(header)) => {
                 if header.source_hash != source_identity.0
                     || header.source_size != source_identity.1
                 {
-                    return false;
+                    saw_mismatch = true;
+                } else {
+                    saw_match = true;
+                }
+            }
+            Some(None) => saw_unreadable = true,
+            None => {}
+        }
+    }
+    match book_index_names_unlisted_by(book, &registry) {
+        Some(unlisted_names) => {
+            for unlisted in unlisted_names {
+                match read_book_index_header(book, unlisted.as_str()) {
+                    Some(Some(header)) => {
+                        if header.source_hash != source_identity.0
+                            || header.source_size != source_identity.1
+                        {
+                            saw_mismatch = true;
+                        } else {
+                            saw_match = true;
+                        }
+                    }
+                    Some(None) => saw_unreadable = true,
+                    None => {}
                 }
             }
         }
+        None => saw_unreadable = true,
     }
-    if let Ok(file) = book.open_file_in_dir(CACHE_TOC_FILE, Mode::ReadOnly) {
-        let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
-        if read_exact_file(&file, &mut header_bytes).is_ok() {
-            if let Ok(header) = decode_toc_file_header(&header_bytes) {
-                if header.source_hash != source_identity.0
-                    || header.source_size != source_identity.1
-                {
-                    return false;
+    match book.open_file_in_dir(CACHE_TOC_FILE, Mode::ReadOnly) {
+        Ok(file) => {
+            let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
+            if read_exact_file(&file, &mut header_bytes).is_ok() {
+                if let Ok(header) = decode_toc_file_header(&header_bytes) {
+                    if header.source_hash != source_identity.0
+                        || header.source_size != source_identity.1
+                    {
+                        saw_mismatch = true;
+                    } else {
+                        saw_match = true;
+                    }
+                } else {
+                    saw_unreadable = true;
                 }
+            } else {
+                saw_unreadable = true;
             }
         }
+        Err(embedded_sdmmc::Error::NotFound) => {}
+        Err(_) => saw_unreadable = true,
     }
-    true
+    if saw_mismatch {
+        BookDirOwnership::Mismatch
+    } else if saw_match {
+        BookDirOwnership::Match
+    } else if saw_unreadable {
+        BookDirOwnership::Unreadable
+    } else {
+        BookDirOwnership::Match
+    }
 }
 
-/// Remove all cache files (indexes, sections, TOC/COVER/CONT, CFG.BIN) in a
+/// Remove all cache files (sections, TOC/COVER/CONT, indexes, CFG.BIN) in a
 /// directory that was occupied by a colliding book identity.
 fn purge_colliding_cache_artifacts_in<
     D,
@@ -2242,44 +2297,52 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // Section files go first. If section deletion fails or is interrupted, the
+    // old owner's index files or TOC.BIN remain on disk as durable identity
+    // markers so subsequent opens continue to see a Mismatch and retry.
+    let sections_ok = match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => empty_sections_dir(&sections),
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    };
+    if !sections_ok {
+        return false;
+    }
     let mut cleared = true;
-    for name in [
-        CACHE_BOOK_FILE,
-        CACHE_TOC_FILE,
-        CACHE_COVER_FILE,
-        CACHE_CONTENT_FILE,
-    ] {
+    for name in [CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_CONTENT_FILE] {
         if upload_store::remove_file_reclaiming_clusters(book, name)
             == upload_store::RemoveStatus::Failed
         {
             cleared = false;
         }
     }
-    match book_index_names_unlisted_by(book, &LayoutConfigRegistry::new()) {
-        Some(names) => {
-            for name in &names {
-                if upload_store::remove_file_reclaiming_clusters(book, name.as_str())
-                    == upload_store::RemoveStatus::Failed
-                {
-                    cleared = false;
+    // Repeatedly sweep per-config index files until a pass proves no unlisted
+    // index files remain (draining all batches for >4 index files).
+    for _ in 0..64 {
+        match book_index_names_unlisted_by(book, &LayoutConfigRegistry::new()) {
+            Some(names) if names.is_empty() => break,
+            Some(names) => {
+                for name in &names {
+                    if upload_store::remove_file_reclaiming_clusters(book, name.as_str())
+                        == upload_store::RemoveStatus::Failed
+                    {
+                        cleared = false;
+                    }
                 }
             }
-        }
-        None => cleared = false,
-    }
-    match book.open_dir(CACHE_SECTIONS_DIR) {
-        Ok(sections) => {
-            if !empty_sections_dir(&sections) {
+            None => {
                 cleared = false;
+                break;
             }
         }
-        Err(embedded_sdmmc::Error::NotFound) => {}
-        Err(_) => cleared = false,
     }
-    if upload_store::remove_file_reclaiming_clusters(book, CACHE_CONFIG_FILE)
-        == upload_store::RemoveStatus::Failed
-    {
-        cleared = false;
+    // Identity markers (TOC.BIN) and the registry (CFG.BIN) go last.
+    for name in [CACHE_TOC_FILE, CACHE_CONFIG_FILE] {
+        if upload_store::remove_file_reclaiming_clusters(book, name)
+            == upload_store::RemoveStatus::Failed
+        {
+            cleared = false;
+        }
     }
     cleared
 }

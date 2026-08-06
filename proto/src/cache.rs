@@ -2241,6 +2241,17 @@ mod tests {
         assert_eq!(registry.keys(), &[17]);
         registry.forget(4);
         assert_eq!(registry.keys(), &[17]);
+
+        // Forgetting key 0 when absent, or forgetting on an empty registry,
+        // searches only active slots and has no effect.
+        registry.forget(0);
+        assert_eq!(registry.keys(), &[17]);
+
+        let mut empty = LayoutConfigRegistry::new();
+        empty.forget(0);
+        assert_eq!(empty.keys(), &[]);
+        empty.forget(4);
+        assert_eq!(empty.keys(), &[]);
     }
 
     #[test]
