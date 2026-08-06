@@ -142,6 +142,12 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
         }
     };
     sync_mem::donate_heap(loan.heap_a, loan.heap_b, loan.heap_c);
+    // The storage owner's ~12 KB state is carved out first, while the
+    // donated regions are pristine: it needs one contiguous block, and
+    // radio init plus the upload server's buffers fragment the regions
+    // beyond that within milliseconds (measured on X3; see
+    // `source_owner::claim_session_owner_early`).
+    crate::source_owner::claim_session_owner_early();
     let SyncLoan {
         tcp_rx,
         tcp_tx,

@@ -255,26 +255,33 @@ Current code status:
   (the catalog filter accepts .epu alongside .epub). Books appear after the
   session-ending reset's rescan. Stack region ~36.7 KB after the upload
   futures; the EPUB-open chain's ~30 KB watermark is the floor to respect.
-- M0S logical-book endpoints are wired end to end but not yet
-  hardware-validated: `POST /upload` with `X-Upload-Request-Id` +
-  `X-Source-SHA256` runs the source-store create/replace transaction into
-  `XTEINK/SRC` (staging marker, streamed SHA-256, persisted reread,
-  classic-ZIP gate, A/B metadata commit); `POST /delete-book`,
-  `POST /recover-book`, `GET /list-books`, and `GET /capabilities` (which
-  rotates the idempotency epoch when out of headroom) complete the
-  contract, all answering `proto::source_http` JSON. The legacy
-  `/upload`//`/delete`//`/list` shelf flow is untouched and remains what
-  the served page uses — managed SRC books are invisible to the reader
-  until the reading-path integration lands. The storage owner's ~22 KB
-  workspace is claimed from the loaned session heap at upload-session
-  start (flash-image copy; graceful `storage_unavailable` refusal if the
-  heap can't afford it) — measure heap slack and endpoint behavior on
-  hardware before relying on it.
+- M0S logical-book endpoints are wired end to end and hardware-validated
+  on the X3 (2026-08-06, curl over LAN): `POST /upload` with
+  `X-Upload-Request-Id` + `X-Source-SHA256` runs the source-store
+  create/replace transaction into `XTEINK/SRC` (staging marker, streamed
+  SHA-256, persisted reread, classic-ZIP gate, A/B metadata commit);
+  `POST /delete-book`, `POST /recover-book`, `GET /list-books`, and
+  `GET /capabilities` (which rotates the idempotency epoch when out of
+  headroom) complete the contract, all answering `proto::source_http`
+  JSON. Validated on device: create (3.1 s for 935 B), receipt replay in
+  16 ms (including across an epoch rotation), replace to generation 2,
+  a 2.5 MB upload committing in 28.4 s with no watchdog trouble through
+  the finish reread+gate, epoch exhaustion at the advertised budget with
+  429 + rotation recovery, and the refusal battery (malformed request ID,
+  garbage container, wrong digest, malformed JSON body, unknown token).
+  The legacy `/upload`//`/delete`//`/list` shelf flow was re-verified
+  untouched — managed SRC books are invisible to the reader until the
+  reading-path integration lands. RAM: the owner state must be carved
+  from the loaned session heap *immediately after donation* (wifi task,
+  `claim_session_owner_early`) — it needs one contiguous block, and radio
+  init fragments the three donated regions beyond any image-sized hole
+  (measured: 19 KB total free refused a 12.5 KB claim). At 16 slots /
+  8 receipts / 8 tombstones the image is 12,464 B and the session runs
+  with ~6.7 KB free under upload load.
 - Next: kosync account onboarding via the portal form, TLS for the
-  official sync server, hardware validation of the M0S endpoints (heap
-  headroom, curl-driven create/replace/delete/recover/list, power-cut
-  runs), and the reading-path integration that makes managed books
-  visible.
+  official sync server, the PRD's hardware power-cut gate for M0S (needs
+  a bench rig that can cut power mid-write), and the reading-path
+  integration that makes managed books visible.
 
 ## Verification commands
 

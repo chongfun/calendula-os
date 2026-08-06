@@ -507,8 +507,15 @@ fn power_cut_during_cleanup_preserves_authority_and_converges() {
             delete_book(&root, &mut idem, &delete, &mut ws),
             DeleteOutcome::Deleted { .. }
         ));
+        // The setup above may have spent the whole per-epoch budget;
+        // rotate the way a real client would (via capabilities) so this
+        // begin is judged on its own merits, not on headroom.
+        if !idem.state.has_epoch_headroom() {
+            idem.state.rotate_epoch(2).expect("rotate");
+            idem.publish(&root, &mut ws).expect("publish rotation");
+        }
         let abandoned = UploadRequest {
-            epoch: 1,
+            epoch: idem.state.current_epoch,
             nonce: [60; 16],
             declared_length: bytes.len() as u64,
             declared_sha256: sha256_of(&bytes),

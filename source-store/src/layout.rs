@@ -32,11 +32,14 @@ use crate::select::MAX_SOURCE_SLOTS;
 /// created under the firmware's existing `XTEINK` root.
 pub const SOURCE_DIR: &str = "SRC";
 
-/// Tombstone slots. Sixteen books can sit deleted-but-uncleaned at once;
-/// cleanup reclaims slots long before a seventeenth accumulates, and a
-/// full table rejects further deletions with a stable retryable error
-/// rather than dropping replay safety.
-pub const MAX_TOMBSTONE_SLOTS: usize = 16;
+/// Tombstone slots. Eight books can sit deleted-but-uncleaned at once;
+/// cleanup reclaims slots long before a ninth accumulates, and a full
+/// table rejects further deletions with a stable retryable error rather
+/// than dropping replay safety. Half of `MAX_SOURCE_SLOTS`, the same
+/// 1:2 ratio the 32-slot layout carried — shrunk with the other
+/// capacities when the owner image outgrew the X3's session heap
+/// (2026-08-06); each tombstone also rides in the resident workspace.
+pub const MAX_TOMBSTONE_SLOTS: usize = 8;
 
 /// An owned A/B file-name pair, built once and borrowed as a
 /// [`SlotPair`] for the publish layer. 12 bytes covers every 8.3 name.
@@ -144,9 +147,16 @@ mod tests {
         assert!(source_slot_name(MAX_SOURCE_SLOTS as u8).is_none());
         let pair = metadata_pair(7).unwrap();
         assert_eq!(pair.pair().names, ["M07A.BIN", "M07B.BIN"]);
-        let pair = tombstone_pair(15).unwrap();
-        assert_eq!(pair.pair().names, ["T15A.BIN", "T15B.BIN"]);
-        assert!(tombstone_pair(16).is_none());
+        let last_stone = MAX_TOMBSTONE_SLOTS as u8 - 1;
+        let pair = tombstone_pair(last_stone).unwrap();
+        assert_eq!(
+            pair.pair().names,
+            [
+                std::format!("T{last_stone:02}A.BIN").as_str(),
+                std::format!("T{last_stone:02}B.BIN").as_str()
+            ]
+        );
+        assert!(tombstone_pair(MAX_TOMBSTONE_SLOTS as u8).is_none());
         assert_eq!(idempotency_pair().pair().names, ["IDEMA.BIN", "IDEMB.BIN"]);
         assert_eq!(marker_pair().pair().names, ["MARKA.BIN", "MARKB.BIN"]);
     }

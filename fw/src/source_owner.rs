@@ -338,20 +338,23 @@ pub struct SourceOwnerState {
 }
 
 /// The initial owner state as a flash-resident image (an immutable static
-/// lands in `.rodata`, which the C3 maps from flash). ~22 KB: the
+/// lands in `.rodata`, which the C3 maps from flash). ~12 KB: the
 /// workspace's record scratch, catalog view, and mount session, plus the
 /// receipt table. It exists because no sound path builds a value this
 /// size at runtime — the stack budget is 27 KB and `ptr::write` would
 /// transit it — while an untyped copy of a linker-materialized image
 /// costs nothing but flash.
 ///
-/// This is the M0S RAM budget decision, made twice over: a permanent
-/// `.bss` static was tried first and failed the X4 link (DRAM overflow,
-/// then the reader's stack-headroom assertion), which is the measurement
-/// behind both this placement and the shrunken capacity constants. The
-/// state is only ever touched between `ReceiveUpload` and the
-/// session-ending reset — exactly the lifetime of the loaned session
-/// heap, so that heap is where the live copy belongs.
+/// This is the M0S RAM budget decision, made three times over: a
+/// permanent `.bss` static was tried first and failed the X4 link (DRAM
+/// overflow, then the reader's stack-headroom assertion); then the ~23 KB
+/// image at 32 slots/16 receipts did not fit the X3's wireless session
+/// heap at all (27,264 B free); and even the shrunken image must be
+/// carved out *before* the radio fragments the donated regions — total
+/// free is meaningless when no single hole is image-sized. The state is
+/// only ever touched between `ReceiveUpload` and the session-ending
+/// reset — exactly the lifetime of the loaned session heap, so that heap
+/// is where the live copy belongs.
 static OWNER_INIT: SourceOwnerState = SourceOwnerState {
     ws: OpsWorkspace::new(),
     idem: None,
@@ -359,18 +362,26 @@ static OWNER_INIT: SourceOwnerState = SourceOwnerState {
 
 static OWNER_CLAIMED: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
 
-/// Carve the owner state out of the wireless session's loaned heap,
-/// exactly once per boot. `None` when the heap cannot afford it (the
-/// logical-book endpoints then answer `storage_unavailable`; the legacy
-/// shelf is unaffected) or when a second session of one boot asks again —
-/// sessions end in a software reset, so a second session only follows a
-/// non-terminal sleep, and refusing beats aliasing. The allocation is
-/// deliberately never freed: the session heap dies with the reset.
-pub fn claim_session_owner() -> Option<&'static mut SourceOwnerState> {
+/// The parked claim, between the wifi task's early carve-out and the
+/// storage owner's pickup at upload-session entry. Null when unclaimed,
+/// already taken, or the claim failed.
+static OWNER_HANDOFF: portable_atomic::AtomicPtr<SourceOwnerState> =
+    portable_atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Carve the owner state out of the wireless session's loaned heap and
+/// park it for the storage owner, exactly once per boot. The wifi task
+/// calls this immediately after `sync_mem::donate_heap`, while the
+/// donated regions are still pristine: the image needs one *contiguous*
+/// block, and once radio init and the upload server's stream pool have
+/// carved the regions up, no image-sized hole survives — measured on X3
+/// hardware 2026-08-06, where 19 KB of total free heap refused a 12.5 KB
+/// claim. A failed claim only logs: the logical-book endpoints then
+/// answer `storage_unavailable`, and the legacy shelf is unaffected.
+pub fn claim_session_owner_early() {
     use portable_atomic::Ordering;
 
     if OWNER_CLAIMED.swap(true, Ordering::SeqCst) {
-        return None;
+        return;
     }
     let layout = core::alloc::Layout::new::<SourceOwnerState>();
     // SAFETY: the layout is non-zero-sized; a null return is handled. The
@@ -379,19 +390,46 @@ pub fn claim_session_owner() -> Option<&'static mut SourceOwnerState> {
     // only live pointer to it. `copy_nonoverlapping` is an untyped copy,
     // so the image's padding bytes transfer without being read as values,
     // and the destination afterwards holds a valid `SourceOwnerState`
-    // because the source is one. The allocation is leaked by design.
+    // because the source is one. The allocation is leaked by design: the
+    // session heap dies with the session-ending reset.
     #[allow(unsafe_code)]
     unsafe {
         let ptr = alloc::alloc::alloc(layout);
         if ptr.is_null() {
             esp_println::println!("source: owner state allocation refused (heap exhausted)");
-            return None;
+            return;
         }
         core::ptr::copy_nonoverlapping(
             core::ptr::from_ref(&OWNER_INIT).cast::<u8>(),
             ptr,
             layout.size(),
         );
-        Some(&mut *ptr.cast::<SourceOwnerState>())
+        esp_println::println!(
+            "source: owner claimed {} B, heap used={} free={}",
+            layout.size(),
+            esp_alloc::HEAP.used(),
+            esp_alloc::HEAP.free()
+        );
+        OWNER_HANDOFF.store(ptr.cast::<SourceOwnerState>(), Ordering::SeqCst);
+    }
+}
+
+/// Take the parked owner state, exactly once. The display task's upload
+/// session calls this at entry; `None` means the early claim failed, the
+/// wireless session never donated, or a second session of one boot asks
+/// again — sessions end in a software reset, so a second session only
+/// follows a non-terminal sleep, whose stale mount proofs must not be
+/// reused; refusing beats aliasing.
+pub fn take_session_owner() -> Option<&'static mut SourceOwnerState> {
+    use portable_atomic::Ordering;
+
+    let ptr = OWNER_HANDOFF.swap(core::ptr::null_mut(), Ordering::SeqCst);
+    // SAFETY: the swap-to-null makes this call the only extraction of the
+    // parked pointer, which (when non-null) is the leaked, initialized
+    // allocation made by `claim_session_owner_early` — uniquely referenced
+    // and 'static by design.
+    #[allow(unsafe_code)]
+    unsafe {
+        ptr.as_mut()
     }
 }

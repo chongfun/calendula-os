@@ -496,11 +496,13 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     epd.deselect_display();
     sd_cs.set_high();
     esp_println::println!("upload: session enter");
-    // The M0S owner state lives in the loaned session heap, claimed here
-    // — after the wifi task's donation, before the first operation. The
-    // claimed image arrives pristine: this mount's proofs start empty and
-    // the catalog loads lazily on the first logical-book operation.
-    let source_owner = crate::source_owner::claim_session_owner();
+    // The M0S owner state lives in the loaned session heap, carved out by
+    // the wifi task right after donation (contiguity: see
+    // `claim_session_owner_early`) and picked up here, before the first
+    // operation. The image arrives pristine: this mount's proofs start
+    // empty and the catalog loads lazily on the first logical-book
+    // operation.
+    let source_owner = crate::source_owner::take_session_owner();
 
     {
         let spi = epd.spi_mut();

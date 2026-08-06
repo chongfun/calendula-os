@@ -41,14 +41,15 @@ pub const IDEMPOTENCY_MAGIC: [u8; 4] = *b"XTID";
 pub const IDEMPOTENCY_SCHEMA: u16 = 1;
 
 /// Retained receipts across the current and previous epochs. Provisional
-/// v1 constant (a PRD measurement gate), and 16 is the measured answer:
-/// the storage owner's resident state plus its record-sized scratch
-/// buffers live in firmware `.bss`, and 32 receipts overflowed the X4's
-/// DRAM at link time (the receipt table is counted three times over —
-/// resident state, read scratch, seal scratch). Sixteen still gives a
-/// browser session eight new operations between rotations, and rotation
-/// is one cheap publication away via the capabilities endpoint.
-pub const MAX_RECEIPTS: usize = 16;
+/// v1 constant (a PRD measurement gate), and 8 is the measured answer,
+/// twice down: 32 receipts overflowed the X4's DRAM at link time when
+/// the owner state was `.bss`-resident, and at 16 the ~23 KB owner image
+/// did not fit the X3's wireless session heap (measured 2026-08-06; the
+/// receipt table is counted three times over — resident state, read
+/// scratch, seal scratch — so it is the heaviest dial). Eight still
+/// gives a browser session four new operations between rotations, and
+/// rotation is one cheap publication away via the capabilities endpoint.
+pub const MAX_RECEIPTS: usize = 8;
 
 /// New operations accepted per epoch — the "maximum new operation requests
 /// per epoch" the capabilities response advertises. Half the retained
