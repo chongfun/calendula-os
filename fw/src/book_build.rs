@@ -607,6 +607,26 @@ where
     let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
     library.set_cache_key(cache_key.as_str());
     esp_println::println!("epub: stage ResolveCatalogEntry key={}", cache_key.as_str());
+    // Claim this open's layout config as the book's most recently used before
+    // anything reads or writes under it: the per-config index and section
+    // files are named for it, so the registry has to know it, and the least
+    // recently used config's files have to be gone before a build adds a
+    // third set.
+    //
+    // An eviction or registry write that does not succeed leaves this config
+    // unadopted. An existing cache hit can still be read, but any non-fast-hit
+    // build or replay is refused below so unadopted layout files are never
+    // published to disk.
+    let adoption = files::adopt_layout_config(root, cache_key.as_str(), source_identity, library);
+    esp_println::println!(
+        "epub: layout config resident={} evicted={:?} evict_failed={:?} legacy_purged={} registry_write_failed={} dirs_failed={}",
+        adoption.resident,
+        adoption.evicted,
+        adoption.eviction_failed,
+        adoption.purged_legacy,
+        adoption.registry_write_failed,
+        adoption.dirs_failed
+    );
     esp_println::println!(
         "epub: stage TryV2BookIndexFast page={}",
         target_pages as u32
@@ -639,6 +659,11 @@ where
         // so no failure path can leave a resume describing records that have
         // already been overwritten.
         scratch.resume = None;
+    }
+    if !fast_hit && !adoption.succeeded() {
+        esp_println::println!("epub: adoption failed, refusing to publish new layout cache");
+        set_preview_error(library, "ADOPT");
+        return BookLoadStatus::Error;
     }
     let replayed = !fast_hit
         && try_replay_content_cache(
