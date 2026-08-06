@@ -557,18 +557,23 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     }
     // The books handle lives inside this block so every FAT handle is dead
     // by scope before the close-and-acknowledge tail below: UPLOAD_STOPPED
-    // must not be sent (nor Sleep re-queued) while the volume is mounted,
-    // which is also why a missing/uncreatable BOOKS directory refuses
-    // uploads until an exit arrives instead of parking in a forever loop
-    // that would acknowledge over live handles.
+    // must not be sent (nor Sleep re-queued) while the volume is mounted.
+    // A missing/uncreatable BOOKS directory refuses only the legacy shelf
+    // (`books` stays `None` into the serve loop, which answers every begin
+    // with failure) — the logical-book endpoints live under XTEINK/SRC and
+    // keep working, and every request still gets an answer instead of a
+    // hang.
     let exit = {
         let books = match root.open_dir("BOOKS") {
-            Ok(books) => Ok(books),
-            Err(_) => match root.make_dir_in_dir("BOOKS") {
-                Ok(()) => root.open_dir("BOOKS"),
-                Err(error) => Err(error),
-            },
+            Ok(books) => Some(books),
+            Err(_) => root
+                .make_dir_in_dir("BOOKS")
+                .and_then(|()| root.open_dir("BOOKS"))
+                .ok(),
         };
+        if books.is_none() {
+            esp_println::println!("upload: BOOKS setup failed");
+        }
         // The managed source namespace, XTEINK/SRC. Failure refuses only
         // the logical-book endpoints (`src` stays `None`), never the
         // legacy shelf, so a card without the directory tree still
@@ -594,13 +599,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
             }
             opened.ok()
         });
-        match books {
-            Ok(books) => serve_uploads(&root, &books, src.as_ref(), source_owner).await,
-            Err(_) => {
-                esp_println::println!("upload: BOOKS setup failed");
-                refuse_uploads_until_exit().await
-            }
-        }
+        serve_uploads(&root, books.as_ref(), src.as_ref(), source_owner).await
     };
     drop(root);
     let _ = volume_mgr.close_volume(raw_volume);
@@ -608,8 +607,13 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     finish_upload_session(epd, exit).await;
 }
 
-/// The serving loop of a fully set-up session: writes and deletes books as
-/// begins arrive, until Sleep or wireless Exit ends the session.
+/// The serving loop of a mounted session: writes and deletes books as
+/// begins arrive, until Sleep or wireless Exit ends the session. Either
+/// namespace may have failed setup independently — `books: None` fails
+/// every /BOOKS write and delete (the response the browser already
+/// handles), `src: None` refuses every logical-book operation — so a
+/// partially usable card still serves what it can, and no request is
+/// left waiting on a channel nothing reads.
 async fn serve_uploads<
     D,
     T,
@@ -618,7 +622,7 @@ async fn serve_uploads<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    books: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
     src: Option<&Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
     mut source_owner: Option<&mut SourceOwnerState>,
 ) -> UploadSessionExit
@@ -649,21 +653,38 @@ where
             Either::Second(Either::Second(DisplayCommand::Render(_))) => continue,
         };
         let ok = if begin.delete {
-            let removed = if begin.in_books {
-                upload_store::remove_file_reclaiming_clusters(books, begin.name.as_str())
-                    == upload_store::RemoveStatus::Removed
+            if begin.in_books {
+                // A delete begin is never followed by chunks, so a missing
+                // BOOKS directory answers failure directly.
+                match books {
+                    Some(books) => {
+                        let removed = upload_store::remove_file_reclaiming_clusters(
+                            books,
+                            begin.name.as_str(),
+                        ) == upload_store::RemoveStatus::Removed;
+                        if removed {
+                            upload_store::delete_upload_sidecars(root, begin.name.as_str());
+                        }
+                        removed
+                    }
+                    None => false,
+                }
             } else {
                 upload_store::remove_file_reclaiming_clusters(root, begin.name.as_str())
                     == upload_store::RemoveStatus::Removed
-            };
-            if removed && begin.in_books {
-                upload_store::delete_upload_sidecars(root, begin.name.as_str());
             }
-            removed
         } else {
-            match write_one_book(root, books, &begin).await {
-                UploadWrite::Finished(name) => name.is_some(),
-                UploadWrite::Interrupted(exit) => return exit,
+            match books {
+                Some(books) => match write_one_book(root, books, &begin).await {
+                    UploadWrite::Finished(name) => name.is_some(),
+                    UploadWrite::Interrupted(exit) => return exit,
+                },
+                // The body is already streaming; consume it and fail the
+                // request, exactly as a refused begin does.
+                None => match drain_until_end().await {
+                    Ok(()) => false,
+                    Err(exit) => return exit,
+                },
             }
         };
         esp_println::println!(
@@ -1270,22 +1291,44 @@ where
     send_source_event(event).await
 }
 
-/// Session setup stalled short of an upload-capable BOOKS directory:
-/// answer every upload attempt with failure until Sleep or wireless Exit
-/// ends the session, and report which one did. Touches no SD state — the
-/// caller closes whatever handles it still holds before acknowledging.
+/// Session setup stalled before a filesystem existed (card, volume, or
+/// root failed): answer every request with failure until Sleep or
+/// wireless Exit ends the session, and report which one did. Every
+/// channel a request can arrive on is served — legacy begins fail, and
+/// logical-book operations are refused `storage_unavailable` — because
+/// an unanswered request leaves the Wi-Fi task waiting on an event that
+/// would never come. Touches no SD state — the caller closes whatever
+/// handles it still holds before acknowledging.
 async fn refuse_uploads_until_exit() -> UploadSessionExit {
     loop {
         match select(
-            UPLOAD_BEGINS.receive(),
+            select(UPLOAD_BEGINS.receive(), SOURCE_OPS.receive()),
             select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
         )
         .await
         {
-            Either::First(_) => match drain_until_end().await {
-                Ok(()) => UPLOAD_RESULTS.send(false).await,
-                Err(exit) => return exit,
-            },
+            Either::First(Either::First(begin)) => {
+                // A delete begin is never followed by chunks; draining for
+                // one would trade the refusal for a deadlock.
+                let drained = if begin.delete {
+                    Ok(())
+                } else {
+                    drain_until_end().await
+                };
+                match drained {
+                    Ok(()) => UPLOAD_RESULTS.send(false).await,
+                    Err(exit) => return exit,
+                }
+            }
+            // No byte may follow a refused source op — the Wi-Fi task
+            // streams an upload body only after `UploadStarted`.
+            Either::First(Either::Second(_)) => {
+                if let Err(exit) =
+                    send_source_event(SourceEvent::Refused(Refusal::StorageUnavailable)).await
+                {
+                    return exit;
+                }
+            }
             Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
             Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
                 return UploadSessionExit::Sleep { generation }

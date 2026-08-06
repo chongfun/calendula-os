@@ -223,13 +223,24 @@ fn parse_u64_digits(digits: &[u8]) -> Option<u64> {
 }
 
 /// Length of a JSON string's raw contents starting just past its opening
-/// quote — the index of the closing quote, escape-aware.
+/// quote — the index of the closing quote. Validates while it locates:
+/// unescaped control bytes (below 0x20) reject, and every escape must be
+/// one protocol v1 accepts (`\"`, `\\`, `\/`; see [`unescape_into`]).
+/// This runs on every scanned string — ignored unknown fields included —
+/// because the envelope's claim is "a well-formed object", not
+/// "well-formed where a consumed field happened to look".
 fn raw_string_len(bytes: &[u8]) -> Option<usize> {
     let mut at = 0usize;
     while at < bytes.len() {
         match bytes[at] {
             b'"' => return Some(at),
-            b'\\' => at += 2,
+            b'\\' => {
+                if !matches!(bytes.get(at + 1), Some(b'"' | b'\\' | b'/')) {
+                    return None;
+                }
+                at += 2;
+            }
+            byte if byte < 0x20 => return None,
             _ => at += 1,
         }
     }
@@ -774,6 +785,49 @@ mod tests {
              \"observed_source_length\":2,\"observed_source_sha256\":\"{sha_hex}\"}}"
         );
         assert!(parse_recover_body(body.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn ignored_strings_are_still_validated_json() {
+        let token_hex = "00112233445566778899aabbccddeeff";
+
+        // A literal control character inside an unknown value must not
+        // ride an otherwise-valid required field into execution.
+        let body = std::format!("{{\"future\":\"line\nbreak\",\"book_token\":\"{token_hex}\"}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "raw newline in ignored value"
+        );
+
+        // Unsupported escapes reject wherever they appear: unknown
+        // values, unknown keys, and the v1-excluded forms alike.
+        let body = std::format!("{{\"future\":\"\\q\",\"book_token\":\"{token_hex}\"}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "bad escape in ignored value"
+        );
+        let body = std::format!("{{\"fu\\qture\":\"x\",\"book_token\":\"{token_hex}\"}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "bad escape in ignored key"
+        );
+        let body = std::format!("{{\"future\":\"\\u0041\",\"book_token\":\"{token_hex}\"}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "unicode escape unsupported in v1"
+        );
+        let body = std::format!("{{\"future\":\"a\\tb\",\"book_token\":\"{token_hex}\"}}");
+        assert!(
+            parse_delete_body(body.as_bytes()).is_none(),
+            "escaped tab unsupported in v1"
+        );
+
+        // What JSON allows still passes in ignored fields: the supported
+        // escapes, UTF-8 text, and DEL (JSON bars only bytes below 0x20).
+        let body = std::format!(
+            "{{\"future\":\"a\\\"b\\\\c\\/d \u{e9}\x7f\",\"book_token\":\"{token_hex}\"}}"
+        );
+        assert!(parse_delete_body(body.as_bytes()).is_some());
     }
 
     #[test]
