@@ -3,10 +3,12 @@
 
 Emits display/src/literata_sizes_generated.rs: the 19px and 26px reading
 sets (4 styles each) behind the Type Size setting. The default 22px set
-stays in literata_generated.rs via tools/generate_literata.py — that file
-is deliberately not regenerated here because glyph rasterization differs
-across Pillow/freetype builds and regenerating it would churn every
-checked-in golden frame that uses the default size.
+stays in literata_generated.rs via tools/generate_literata.py — one
+generator per output file, nothing more. (This used to warn that the 22px
+file must not be regenerated because rasterization drifted across
+Pillow/FreeType builds; `require_pinned_pillow` now enforces the toolchain
+that reproduces every shipped table byte for byte, so regenerating any of
+them is safe and provably a no-op when nothing changed.)
 """
 
 from pathlib import Path
@@ -22,6 +24,7 @@ from fontgen_common import (
     kerning_entries,
     rasterize_glyph,
     require_pinned_pillow,
+    write_clip_report,
     write_kerning,
 )
 
@@ -130,6 +133,7 @@ def main():
             out.append("};\n\n")
 
     OUT.write_text("".join(out))
+    write_clip_report(ROOT / "tools" / "clip-reports" / "literata_sizes.txt")
     print(f"wrote {OUT}")
 
 

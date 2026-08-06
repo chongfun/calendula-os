@@ -1,0 +1,8 @@
+# Ink clipped by the frozen glyph boxes, in pixels of >= AA_INK_THRESHOLD
+# coverage per render. Rewritten by the generator on every run; review the
+# diff of this file whenever the fonts, the cut, or the toolchain change.
+# An empty section means no render in it clips anything.
+
+[ascii]
+
+[non-ascii]

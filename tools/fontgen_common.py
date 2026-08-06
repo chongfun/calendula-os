@@ -78,7 +78,7 @@ THRESHOLD = text_render_threshold()
 
 
 def require_pinned_pillow() -> None:
-    """Stop before generating anything on a toolchain or threshold configuration that changes metrics."""
+    """Stop before generating anything on a toolchain that changes metrics or pixels."""
     freetype_ver = features.version_module("freetype2")
     if PIL.__version__ != PILLOW_PIN or freetype_ver != FREETYPE_PIN:
         raise SystemExit(
@@ -95,10 +95,16 @@ def require_pinned_pillow() -> None:
             f"  pins in the same commit."
         )
 
+
+def require_pinned_threshold() -> None:
+    """Mockup-only guard. The shipped faces cut at `AA_INK_THRESHOLD` and never
+    read `TEXT_RENDER_THRESHOLD`, so only `generate_mockup_fonts.py` calls this."""
     if THRESHOLD != DEFAULT_THRESHOLD and os.environ.get("ALLOW_UNPINNED_THRESHOLD") != "1":
         raise SystemExit(
-            f"fontgen requires THRESHOLD {DEFAULT_THRESHOLD}, found {THRESHOLD} via TEXT_RENDER_THRESHOLD.\n"
-            f"  Overriding the threshold changes glyph seating and rasterization.\n"
+            f"generate_mockup_fonts requires THRESHOLD {DEFAULT_THRESHOLD}, "
+            f"found {THRESHOLD} via TEXT_RENDER_THRESHOLD.\n"
+            f"  The mockup fonts cut antialiased coverage at this value, so overriding\n"
+            f"  it changes their pixels. It has no effect on the shipped faces.\n"
             f"  For experiments, set ALLOW_UNPINNED_THRESHOLD=1 to bypass."
         )
 
@@ -159,6 +165,62 @@ def advance_fp(font, text: str) -> int:
 # darkening slightly is the direction e-ink wants anyway.
 AA_INK_THRESHOLD = 112
 
+# Clip audit. The boxes are frozen cache geometry, so ink the antialiased
+# raster puts outside them is cut off -- silently, unless someone counts it.
+# `rasterize_glyph` renders on a padded canvas and records every thresholded
+# pixel that falls outside the box; each shipped generator writes the tally
+# to `tools/clip-reports/<name>.txt`, which is checked in. A regeneration
+# rewrites the report alongside the table, so the git diff -- not anyone's
+# memory of a scratch analysis -- is where new clipping shows up for review
+# when the fonts, the cut, or the toolchain move.
+CLIP_AUDIT_PAD = 8
+# Tripwire, not a budget: the committed report is the allowlist, and every
+# entry in it was accepted by the commit that blessed it. The hard failure
+# below is only the absurdity backstop -- a render that loses more than
+# CLIP_LIMIT_PER_GLYPH pixels AND more than twice what it keeps is a glyph
+# rendering mostly outside its box, which no report review should wave
+# through. Both arms are needed: U+25A0 at 22 px loses 17 px that are just
+# the faint border ring of a 200+ px solid body, and Merriweather's 26 px
+# em-dash legitimately loses as much as it keeps (25 px / 25 px) because its
+# frozen box is one row shorter than the antialiased bar -- the same one-row
+# dash the monochrome tables shipped, documented in the report, and exactly
+# the kind of entry the report exists to keep visible.
+CLIP_LIMIT_PER_GLYPH = 16
+_clip_records = []
+_clip_face = None
+
+
+def set_clip_face(label) -> None:
+    """Name the face being rasterized in clip records.
+
+    Only needed where the font file does not identify the face: Merriweather's
+    styles are axis instances of two variable TTFs, so path plus size collides.
+    The static-cut generators never call this and key by filename.
+    """
+    global _clip_face
+    _clip_face = label
+
+
+def write_clip_report(path: Path) -> None:
+    """Write this run's clipped-ink tally, ASCII first because it matters most."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Ink clipped by the frozen glyph boxes, in pixels of >= AA_INK_THRESHOLD",
+        "# coverage per render. Rewritten by the generator on every run; review the",
+        "# diff of this file whenever the fonts, the cut, or the toolchain change.",
+        "# An empty section means no render in it clips anything.",
+        "",
+        "[ascii]",
+    ]
+    records = sorted(set(_clip_records))
+    for section, keep in (("ascii", lambda cp: cp < 0x80), ("non-ascii", lambda cp: cp >= 0x80)):
+        if section == "non-ascii":
+            lines.extend(["", "[non-ascii]"])
+        for font_file, size, code, clipped in records:
+            if keep(code):
+                lines.append(f"{font_file} {size}px U+{code:04X} {chr(code)!r} {clipped}px")
+    path.write_text("\n".join(lines) + "\n")
+
 
 def rasterize_glyph(font, code: int):
     ch = chr(code)
@@ -183,17 +245,41 @@ def rasterize_glyph(font, code: int):
     # dropping columns, the failure the mono experiment was meant to fix.
     #
     # The box stays the shipped table's box -- cache geometry, frozen. Ink
-    # the antialiased raster puts outside it clips where it falls.
-    image = Image.new("L", (width, height), 0)
-    ImageDraw.Draw(image).text((-left, -top), ch, font=font, fill=255, anchor="ls")
+    # the antialiased raster puts outside it clips where it falls, but never
+    # silently: the canvas is padded so the clipped pixels can be counted,
+    # recorded for the clip report, and capped. The padding cannot change the
+    # kept pixels -- rendering at an integer offset shifts the raster without
+    # re-hinting it -- which the byte-identical regeneration check proves.
+    pad = CLIP_AUDIT_PAD
+    image = Image.new("L", (width + 2 * pad, height + 2 * pad), 0)
+    ImageDraw.Draw(image).text((pad - left, pad - top), ch, font=font, fill=255, anchor="ls")
 
     pixels = image.load()
+    clipped = kept = 0
+    for y in range(height + 2 * pad):
+        inside_rows = pad <= y < pad + height
+        for x in range(width + 2 * pad):
+            if pixels[x, y] >= AA_INK_THRESHOLD:
+                if inside_rows and pad <= x < pad + width:
+                    kept += 1
+                else:
+                    clipped += 1
+    if clipped:
+        _clip_records.append((_clip_face or Path(font.path).name, font.size, code, clipped))
+        if clipped > CLIP_LIMIT_PER_GLYPH and clipped > 2 * kept:
+            raise SystemExit(
+                f"U+{code:04X} {ch!r} at {font.size}px in {Path(font.path).name} would lose "
+                f"{clipped} thresholded pixels to its frozen box while keeping only {kept}.\n"
+                f"  That is a disfigured glyph, not halo trimming. Something moved the ink\n"
+                f"  relative to the box: the font file, AA_INK_THRESHOLD, or the toolchain."
+            )
+
     rows = []
     for y in range(height):
         byte = 0
         bits = 0
         for x in range(width):
-            if pixels[x, y] >= AA_INK_THRESHOLD:
+            if pixels[pad + x, pad + y] >= AA_INK_THRESHOLD:
                 byte |= 0x80 >> bits
             bits += 1
             if bits == 8:

@@ -12,6 +12,7 @@ from fontgen_common import (
     kerning_entries,
     rasterize_glyph,
     require_pinned_pillow,
+    write_clip_report,
     write_kerning,
 )
 
@@ -114,6 +115,7 @@ def main():
         out.append("};\n\n")
 
     OUT.write_text("".join(out))
+    write_clip_report(ROOT / "tools" / "clip-reports" / "literata.txt")
 
 
 if __name__ == "__main__":
