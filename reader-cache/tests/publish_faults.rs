@@ -1283,10 +1283,6 @@ fn an_eviction_that_cannot_delete_keeps_the_evicted_config_registered() {
     );
     for section in 0..2 {
         assert!(
-            section_file_present(&root, first_key, section),
-            "the index refusal stops the sweep, so section {section} stays too"
-        );
-        assert!(
             section_file_present(&root, second_key, section),
             "the surviving config is untouched either way"
         );
@@ -1354,8 +1350,8 @@ fn an_eviction_that_cannot_delete_a_section_file_reports_no_eviction() {
     drop(sections);
     drop(book);
     assert!(
-        !book_index_present(&root, first_key),
-        "the index goes first, and that part did succeed"
+        book_index_present(&root, first_key),
+        "sections go first, so the index remains when a section delete fails"
     );
     assert!(
         section_file_present(&root, first_key, 1),
@@ -1366,7 +1362,7 @@ fn an_eviction_that_cannot_delete_a_section_file_reports_no_eviction() {
     assert_eq!(
         retry.evicted,
         Some(first_key),
-        "a config whose index is already gone is still the one owed a sweep"
+        "a config whose sections failed to delete is still the one owed a sweep"
     );
     assert!(
         !section_file_present(&root, first_key, 1),
@@ -1843,6 +1839,19 @@ fn cfg_bin_is_preserved_if_cache_clear_fails() {
     drop(book);
 }
 
+/// Helper to build an index and section files without adopting into the registry.
+fn build_raw_config_index(root: &Dir<'_>, store: &mut ReaderStore, sections: usize) -> u8 {
+    let layout_key = layout_cache_key_for(store);
+    files::ensure_v2_cache_dirs(root, KEY).expect("dirs");
+    let records = build_book(root, store, sections);
+    let pages = total_pages(&records);
+    assert!(
+        files::write_v2_book_index(root, KEY, IDENTITY, pages, &records, store, false, 0),
+        "the index for config {layout_key:#04x} should write"
+    );
+    layout_key
+}
+
 /// Invariant: reconstructing a registry from more than two indexes explicitly
 /// deletes excess non-surviving configurations from the card before committing.
 #[test]
@@ -1852,15 +1861,15 @@ fn reconstruct_registry_removes_excess_configs_and_succeeds() {
     let root = open_root(&mgr);
     let mut store = new_store();
 
-    let _k1 = build_under_current_config(&root, &mut store, 1);
+    let _k1 = build_raw_config_index(&root, &mut store, 1);
 
     let (settings, portrait) = landscape_of(&store);
     store.set_layout(settings, portrait);
-    let _k2 = build_under_current_config(&root, &mut store, 1);
+    let _k2 = build_raw_config_index(&root, &mut store, 1);
 
     let (settings, portrait) = larger_of(&store);
     store.set_layout(settings, portrait);
-    let _k3 = build_under_current_config(&root, &mut store, 1);
+    let _k3 = build_raw_config_index(&root, &mut store, 1);
 
     // Now corrupt CFG.BIN so adoption must rebuild the registry from index files.
     let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
@@ -1878,5 +1887,126 @@ fn reconstruct_registry_removes_excess_configs_and_succeeds() {
     assert!(
         adoption.succeeded(),
         "reconstruction from index files with excess configs must succeed"
+    );
+}
+
+/// Invariant: registry reconstruction handles an overflowing inventory containing
+/// five keyed indexes across multiple listing passes, deleting all excess configs
+/// and committing a 2-slot registry.
+#[test]
+fn reconstruct_registry_handles_overflowing_inventory_with_five_configs() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let k1 = build_raw_config_index(&root, &mut store, 1);
+
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let k2 = build_raw_config_index(&root, &mut store, 1);
+
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    let k3 = build_raw_config_index(&root, &mut store, 1);
+
+    let mut settings = store.type_settings();
+    settings.size = display::font::FontSize::Small;
+    store.set_layout(settings, store.portrait());
+    let k4 = build_raw_config_index(&root, &mut store, 1);
+
+    let mut settings = store.type_settings();
+    settings.weight = display::font::FontWeight::Heavy;
+    store.set_layout(settings, store.portrait());
+    let k5 = build_raw_config_index(&root, &mut store, 1);
+
+    // Corrupt CFG.BIN so adoption must reconstruct from 5 index files on disk.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let cfg_file = book
+        .open_file_in_dir(
+            proto::cache::CACHE_CONFIG_FILE,
+            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("open CFG.BIN");
+    drop(cfg_file);
+    drop(book);
+
+    let adoption = files::adopt_layout_config(&root, KEY, &store);
+    assert!(
+        adoption.succeeded(),
+        "reconstructing from 5 index files must succeed by looping passes"
+    );
+
+    // Verify exactly 2 of the 5 configs remain present on disk.
+    let present_count = [k1, k2, k3, k4, k5]
+        .iter()
+        .filter(|&&k| book_index_present(&root, k))
+        .count();
+    assert_eq!(
+        present_count, 2,
+        "reconstruction must leave exactly two config indexes on disk"
+    );
+}
+
+/// Invariant: section files of an excess config are deleted before its index.
+/// An interrupted section deletion leaves the index intact as a durable marker
+/// so the next open retries the cleanup before committing CFG.BIN.
+#[test]
+fn reconstruct_retries_cleanup_when_excess_section_delete_fails() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let k1 = build_raw_config_index(&root, &mut store, 1);
+
+    let (settings, portrait) = landscape_of(&store);
+    store.set_layout(settings, portrait);
+    let _k2 = build_raw_config_index(&root, &mut store, 1);
+
+    let (settings, portrait) = larger_of(&store);
+    store.set_layout(settings, portrait);
+    let _k3 = build_raw_config_index(&root, &mut store, 1);
+
+    // Corrupt CFG.BIN so adoption must reconstruct.
+    let book = files::open_v2_book_dir(&root, KEY).expect("book cache dir");
+    let cfg_file = book
+        .open_file_in_dir(
+            proto::cache::CACHE_CONFIG_FILE,
+            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("open CFG.BIN");
+    drop(cfg_file);
+
+    // Hold a section file of k1 open so its section deletion fails.
+    let sections = book.open_dir("SECTIONS").expect("sections dir");
+    let mut sname = heapless::String::<CACHE_SECTION_FILE_BYTES>::new();
+    section_file_name(k1, 0, &mut sname);
+    let held_section = sections
+        .open_file_in_dir(sname.as_str(), embedded_sdmmc::Mode::ReadOnly)
+        .expect("hold k1 section file open");
+
+    let blocked = files::adopt_layout_config(&root, KEY, &store);
+    assert!(
+        !blocked.succeeded(),
+        "adoption must fail when excess section deletion fails"
+    );
+    assert!(
+        book_index_present(&root, k1),
+        "BK<k1>.BIN must survive when section deletion fails so it can be retried"
+    );
+
+    drop(held_section);
+    drop(sections);
+    drop(book);
+
+    let retry = files::adopt_layout_config(&root, KEY, &store);
+    assert!(
+        retry.succeeded(),
+        "adoption must succeed on retry once section block is cleared"
+    );
+    assert!(
+        !book_index_present(&root, k1),
+        "BK<k1>.BIN must be removed after successful section deletion"
     );
 }

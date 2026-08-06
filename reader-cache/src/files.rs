@@ -2101,34 +2101,35 @@ where
     T: TimeSource,
 {
     let mut registry = LayoutConfigRegistry::new();
-    let names = book_index_names_unlisted_by(book, &registry)?;
-    for name in &names {
-        if let Some(layout_key) = layout_key_of_book_index_file_name(name.as_str()) {
-            if let Some(evicted) = registry.promote(layout_key) {
-                if !delete_layout_config_artifacts_in(book, evicted) {
-                    cache_log!(
-                        "cache: reconstruct registry failed to delete excess key {}",
-                        evicted
-                    );
-                    return None;
+    for _ in 0..64 {
+        let names = book_index_names_unlisted_by(book, &registry)?;
+        if names.is_empty() {
+            return Some(registry);
+        }
+        for name in &names {
+            if let Some(layout_key) = layout_key_of_book_index_file_name(name.as_str()) {
+                if let Some(evicted) = registry.promote(layout_key) {
+                    if !delete_layout_config_artifacts_in(book, evicted) {
+                        cache_log!(
+                            "cache: reconstruct registry failed to delete excess key {}",
+                            evicted
+                        );
+                        return None;
+                    }
                 }
             }
         }
     }
-    Some(registry)
+    None
 }
 
-/// Delete one layout config's cache files: its index and every section file
-/// named for it. The other configs' files, and everything
-/// settings-independent (TOC.BIN, COVER.BIN, CONT.BIN, the position), stay.
+/// Delete one layout config's cache files: its section files and its index.
+/// The other configs' files, and everything settings-independent (TOC.BIN,
+/// COVER.BIN, CONT.BIN, the position), stay.
 ///
-/// Returns whether every one of that config's files is now gone — deleted
-/// here or already absent. This is the answer the caller's registry write
-/// hangs on, so anything it cannot account for reads as false: a delete that
-/// refused, a `SECTIONS/` that would not open, a listing that would not
-/// finish. The index goes first, so a sweep that stops partway leaves an
-/// unreadable set (stray sections, no index) rather than an index promising
-/// sections that are gone.
+/// Section files go first and the index last. Keeping the index until all of
+/// its section files are gone ensures that an interrupted deletion leaves the
+/// index on disk as the durable marker for reconstruction on the next open.
 fn delete_layout_config_artifacts_in<
     D,
     T,
@@ -2143,14 +2144,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
-    book_index_file_name(layout_key, &mut name);
-    if upload_store::remove_file_reclaiming_clusters(book, name.as_str())
-        == upload_store::RemoveStatus::Failed
-    {
-        return false;
-    }
-    match book.open_dir(CACHE_SECTIONS_DIR) {
+    let sections_ok = match book.open_dir(CACHE_SECTIONS_DIR) {
         Ok(sections) => sweep_section_files(&sections, |name| {
             layout_key_of_section_file_name(name) == Some(layout_key)
         }),
@@ -2158,7 +2152,14 @@ where
         Err(embedded_sdmmc::Error::NotFound) => true,
         // A directory that would not open may still hold the config's files.
         Err(_) => false,
+    };
+    if !sections_ok {
+        return false;
     }
+    let mut name = String::<BOOK_INDEX_FILE_BYTES>::new();
+    book_index_file_name(layout_key, &mut name);
+    upload_store::remove_file_reclaiming_clusters(book, name.as_str())
+        != upload_store::RemoveStatus::Failed
 }
 
 /// Delete the artifacts of the single-config scheme this replaced: the

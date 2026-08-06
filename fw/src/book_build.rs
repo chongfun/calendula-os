@@ -613,10 +613,10 @@ where
     // recently used config's files have to be gone before a build adds a
     // third set.
     //
-    // An eviction that would not go through leaves this config unadopted: the
-    // build below still runs and writes under it, but the registry keeps
-    // naming the config whose files are still on the card, so the next open
-    // retries the eviction rather than losing track of a full section set.
+    // An eviction or registry write that does not succeed leaves this config
+    // unadopted. An existing cache hit can still be read, but any non-fast-hit
+    // build or replay is refused below so unadopted layout files are never
+    // published to disk.
     let adoption = files::adopt_layout_config(root, cache_key.as_str(), library);
     esp_println::println!(
         "epub: layout config resident={} evicted={:?} evict_failed={:?} legacy_purged={} registry_write_failed={} dirs_failed={}",
