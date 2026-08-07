@@ -9,6 +9,14 @@ Scope is deliberately independent of the on-device image-rendering PRD.
 Nothing here depends on render bundles, and nothing here blocks them; the
 two meet only at the point where a book has an identity.
 
+This document **absorbs the `cache3-architecture` draft** (commit
+`49b2c0a`), which is superseded. The two cannot be delivered separately:
+they share one identity contract, they rewrite the same on-disk layout,
+and the headline acceptance criterion — move a book from a computer and
+keep your place — cannot be demonstrated by either alone. Splitting them
+would also mean writing the reading-position format twice and breaking
+card compatibility twice.
+
 ---
 
 ## 1. Problem
@@ -21,7 +29,18 @@ SD driver can only create short filenames. The device shows a real title
 a computer: a card of uploaded books cannot be organized by hand, because
 the files cannot be identified by name.
 
-That is the whole problem. Reading long filenames already works.
+Reading long filenames already works, so the gap is narrow and specific.
+
+Two further defects share the same root — derived state keyed to where a
+book *is* rather than what it *is* — and are in scope because fixing them
+separately would mean writing the same formats twice:
+
+- Reorganizing the card from a computer discards a book's cache and its
+  reading position, because both are keyed by a hash of its path.
+- Changing type settings moves the reader's place, because the position is
+  stored as a page index and a settings change reflows the text. It also
+  rebuilds pagination for a configuration the reader may switch straight
+  back to.
 
 ## 2. Goals
 
@@ -130,11 +149,9 @@ casually movable: later upstream revisions fail cold card init on the X4
 - R15. Uploaded and sideloaded books appear together, indistinguishable to
   the reader except where integrity state differs.
 
-### 5.5 Cache and reading position
+### 5.5 Derived state: cache and reading position
 
-The companion `CACHE3 + POS3` draft (`.scratch/cache3-architecture/`,
-commit `49b2c0a`) covers the cache layout itself. These are the
-requirements this PRD places on it, because they follow from R6 and R8.
+Absorbed from the `CACHE3 + POS3` draft, with identity corrected per R6.
 
 - R16. Cache and position records are addressed by **content identity**,
   not by a path-derived hash. The current `source_hash` is
@@ -154,6 +171,15 @@ requirements this PRD places on it, because they follow from R6 and R8.
 - R19. Position survives cache clearing, cache eviction, and any number of
   layout changes. Losing cached pages is an inconvenience; losing the
   reader's place is not.
+- R20. Two type-setting configurations coexist on card, so alternating
+  between them does not rebuild pagination each time.
+- R21. A cache generation is valid only once fully written. Interruption
+  leaves it ignorable and reclaimable, never partially loadable.
+- R22. Cache directories carry a book's full identity in their path, so
+  distinct books cannot collide on a truncated key.
+- R23. Superseded cache layouts are removed on a best-effort background
+  sweep. No in-place migration is attempted; rebuilding is cheap and
+  correct, migrating is neither.
 
 ## 6. Design sketch
 
@@ -239,7 +265,34 @@ stops being stored at all. This is the change that fixes the settings
 bug, and `POS3`'s separation from the cache is what keeps it durable
 across eviction.
 
-### 6.6 Library scan
+### 6.6 Derived-state layout
+
+From the absorbed draft, with `<identity>` now content-derived (R16)
+rather than `FNV(display_path, size)`:
+
+```text
+/XTEINK/
+  CACHE3/<identity>/
+    COMMON/            layout-independent: TOC.BIN, COVER.BIN, CONT.BIN
+    SLOT0/ SLOT1/      one per type-setting configuration (R20)
+      BOOK.BIN         written last; the slot's commit record (R21)
+      SECTIONS/S<nnn>.BIN
+    RECENTA.BIN RECENTB.BIN   advisory recency for eviction
+  POS3/<identity>/
+    POSA.BIN POSB.BIN  reading position, isolated from cache (R19)
+```
+
+Publication empties the victim slot, writes sections, then writes
+`BOOK.BIN` last, so an interrupted publication leaves a slot that fails
+validation and is reclaimed rather than half-loaded. Recency is advisory:
+losing it costs a wrong eviction choice, never correctness.
+
+`<identity>` is split across two directory levels so no single directory
+accumulates an entry per book — the same reason §4.5 makes folders a
+performance property. The components come from the content identity R6
+already computes.
+
+### 6.7 Library scan
 
 Per-directory catalogs rather than one flat file, so entering a folder
 reads only that folder's records and cached titles (R13, R14).
@@ -259,6 +312,10 @@ reads only that folder's records and cached titles (R13, R14).
 - Changing type settings on an open book leaves the reader on the same
   text, not the same page number, and does not rebuild the parsed spine,
   TOC, or cover.
+- Alternating between two type-setting configurations does not rebuild
+  pagination on each switch.
+- A cache publication interrupted at any point leaves no slot that loads
+  partially; the next open reclaims it.
 - A 1000-book library browses with resident memory bounded by folder size.
 - No watchdog or responsiveness limit is violated; no request blocks on a
   whole-library operation.
@@ -276,13 +333,15 @@ reads only that folder's records and cached titles (R13, R14).
 
 ## 9. Open questions
 
-1. Anchor granularity for R18: is a block index sufficient, or does the
-   anchor need a character offset within the block to land the reader on
-   the same sentence rather than the same paragraph?
-2. What happens to a book whose file the user deletes from a computer — is
+1. What happens to a book whose file the user deletes from a computer — is
    the record reclaimed automatically, or does the book show as unavailable
    until the user acts?
-3. Does the browser pick from existing folders only, or may it create new
+2. Does the browser pick from existing folders only, or may it create new
    ones at upload time?
-4. Should sideloaded books receive records at all in this milestone, or
+3. Should sideloaded books receive records at all in this milestone, or
    only when a later milestone needs to persist something derived from them?
+4. Sequencing: long-filename write support (§6.1) is the only change that
+   makes the card manageable by hand, and it is also the riskiest — it
+   writes directory-entry structures on a dependency pinned to a specific
+   commit. Does it land first, on its own, behind fault-injection tests
+   against a simulated block device, or as a phase of the whole?
