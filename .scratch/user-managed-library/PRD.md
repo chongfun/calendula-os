@@ -68,10 +68,15 @@ separately would mean writing the same formats twice:
 
 ## 4. Verified constraints
 
-These are properties of the pinned `embedded-sdmmc`
-(`d26892f7405469eba95741763ab39bda2239d5ec`) unless noted. The pin is not
-casually movable: later upstream revisions fail cold card init on the X4
-(see the note in `fw/Cargo.toml`).
+These are properties of the `embedded-sdmmc` revision *this repository
+currently pins* (`d26892f`) unless noted — see §4.7, which supersedes
+several of them.
+
+On the pin comment: it warns that newer upstream SD rewrites "fail cold
+card init on the X4." That observation is **inherited from upstream**
+(`Jon-Vii/xteink-x4-os`, whose device the X4 is) and was never reproduced
+here; this project develops on the X3 and has no X4 hardware. Treat it as
+upstream's finding on upstream's board, not as a local measurement.
 
 1. **Long filenames can be read, not written.** *(verified)*
    `Directory::iterate_dir_lfn` walks the long-name chain, but
@@ -95,6 +100,19 @@ casually movable: later upstream revisions fail cold card init on the X4
    `find_directory_entry` and the delete path walk directory blocks, so
    cost grows with entries per directory. Folders are a performance
    property, not only an organizational one.
+7. **Long-name creation already exists upstream, and we have not synced
+   it.** *(verified)* Upstream commit `7f9856d`, "Write wireless uploads as
+   EPUB long names", replaces the dependency with a fork
+   (`Jon-Vii/embedded-sdmmc-rs`, rev `329b3a5`) described as "based exactly
+   on the proven #210 revision, adding allocation-free VFAT long-name
+   creation/deletion" — the same revision we pin, so it avoids the rewrites
+   the pin comment warns about. It adds `create_file_in_dir_lfn`, a
+   deterministic probeable short-alias generator
+   (`proto::upload::upload_short_alias`), a long-name sanitizer
+   (`wireless_epub_filename`), and LFN-aware deletion, which is constraint
+   4's defect. It does **not** add rename. Our `fw` has diverged 87 commits
+   since, so this is a port rather than a cherry-pick — but the driver fork
+   is reusable as-is.
 6. **Upload throughput is ~88 KB/s end to end** (2.5 MB committed in
    28.4 s, X3, 2026-08-06), with the network itself near 160 KB/s. *(verified)*
    Nothing has yet established what caps it; see §8.
@@ -185,38 +203,45 @@ Absorbed from the `CACHE3 + POS3` draft, with identity corrected per R6.
 
 ### 6.1 Long-filename write support
 
-Add to the driver (fork or upstream contribution, respecting the pin):
+**Port upstream's implementation rather than writing one** (§4.7). It
+already covers R2, R3, and R5 — creation, deterministic alias generation
+with a uniqueness probe, and LFN-aware deletion — and is built on the same
+driver revision we pin, so it does not walk into the cold-init question.
 
-- create a file/directory with a long name: write the LFN entry chain in
-  reverse sequence order, each entry carrying the checksum byte of its
-  short alias, followed by the 8.3 entry;
-- generate a unique short alias — numeric `~N` suffixes are cheap only
-  while the directory is small, and R13's folders keep directories small,
-  but a hash-derived alias avoids the O(directory) probe entirely and is
-  what the existing `proto::upload::sanitized_name` already computes;
-- delete a long-named file by clearing its chain and its short entry (R5);
-- rename within a directory (needed by §6.2), which for a long-named file
-  means rewriting the chain.
+Remaining work is the port itself: our `fw` has moved 87 commits since,
+and the upload path in particular was rewritten. Verify on the X3, which
+is the only hardware this project has.
 
-Risk: this writes directory-entry structures. A bug corrupts directories,
-not just our files. It wants its own fault-injection tests against a
-simulated block device before it touches a real card.
+Not provided upstream, and therefore still open: **rename**. §6.2 avoids
+needing it.
+
+Residual risk is much lower than writing this from scratch, but not zero —
+it still writes directory-entry structures, and a bug corrupts directories
+rather than only our files. The fork carries upstream's own testing; the
+acceptance criterion about leaving no orphan entries (§7) is what proves
+it here.
 
 ### 6.2 Upload staging
 
-1. Create the destination folder if needed.
-2. Create the staged file **in the destination folder** under a name the
-   library scan ignores (extension outside the accepted set).
-3. Stream, verifying declared length and SHA-256 as bytes arrive.
-4. Reread the persisted file and confirm identity independently.
-5. Rename to the final long filename.
-6. Publish the metadata record naming the final path.
+No rename exists (§4.3, §4.7), so staging cannot mean "write under a
+temporary name and rename on commit." It does not need to: the durable
+**staging marker** already carries exactly this meaning — a committed
+marker with no matching committed metadata keeps its candidate hidden —
+and that machinery is already implemented and power-cut validated.
 
-The two crash windows are both benign, which is what makes this simpler
-than the reserved-slot staging it replaces: before step 5 an ignorable
-staged file remains, for cleanup; after step 5 but before step 6 the card
-holds an ordinary, readable, correctly-named book with no record — which
-is exactly the sideloaded case that must work anyway (goal 3).
+1. Create the destination folder if needed.
+2. Publish the staging marker naming the intended path.
+3. Create the file **under its final long name** and stream, verifying
+   declared length and SHA-256 as bytes arrive.
+4. Reread the persisted file and confirm identity independently.
+5. Publish the metadata record; the marker's candidate becomes the book.
+
+The library scan must consult the marker so a candidate is hidden while it
+is staging — the one new coupling this introduces. Crash windows: before
+step 5 the marker explains the file, which stays hidden and is reclaimable
+by cleanup; after step 5 the book is live. A user who pulls the card
+mid-upload sees a truncated `.epub` on their computer, which is what an
+interrupted copy looks like anywhere.
 
 ### 6.3 Records
 
@@ -340,8 +365,9 @@ reads only that folder's records and cached titles (R13, R14).
    ones at upload time?
 3. Should sideloaded books receive records at all in this milestone, or
    only when a later milestone needs to persist something derived from them?
-4. Sequencing: long-filename write support (§6.1) is the only change that
-   makes the card manageable by hand, and it is also the riskiest — it
-   writes directory-entry structures on a dependency pinned to a specific
-   commit. Does it land first, on its own, behind fault-injection tests
-   against a simulated block device, or as a phase of the whole?
+4. Sequencing: the upstream long-name port (§6.1) is self-contained and
+   delivers a visible improvement on its own — uploads stop being cryptic —
+   without any of the identity or cache work. Land it first as its own
+   slice?
+5. Is there anything else unsynced from upstream that this PRD would
+   otherwise reinvent? `7f9856d` was found only by tracing a comment.
