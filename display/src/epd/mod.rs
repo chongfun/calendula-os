@@ -7,6 +7,15 @@
 //! math, waveform handling — lives in the per-panel module re-exported
 //! here, so firmware and tools import `display::epd::…` regardless of the
 //! selected device.
+//!
+//! `probe` is the exception that stays named rather than glob-exported: it
+//! decides *which* controller a unit carries, so it belongs to no single one
+//! of them.
+
+/// Runtime fingerprint of the panel controller, for the production runs that
+/// swap in an UltraChip sibling behind identical glass. Sans-IO: the pins and
+/// timing live in `hal_ext::epd_probe`.
+pub mod probe;
 
 /// Xteink X4: GDEQ0426T82 panel, SSD1677 controller. Also the panel the
 /// desktop emulator simulates.

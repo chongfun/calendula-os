@@ -23,10 +23,10 @@ flowchart TD
     app_core["app-core<br/>Copy message contracts<br/>ReaderState reducer<br/>RefreshPlanner"]
     display_crate["display<br/>1 bpp framebuffer<br/>drawing + fonts<br/>EPD transforms"]
     proto["proto<br/>bounded book/storage/text/cache models<br/>ZIP/EPUB/XHTML parser pieces"]
-    hal_ext["hal-ext<br/>SPI DMA, RTC, NVM helpers"]
+    hal_ext["hal-ext<br/>SPI DMA, RTC, NVM helpers<br/>boot panel-controller probe"]
     ui["ui<br/>bounded layout/render helpers"]
 
-    epd["EPD panel (X4: SSD1677, X3: UC8253)<br/>framebuffer / previous-frame RAM"]
+    epd["EPD panel (X4: SSD1677/UC8179, X3: UC8253/UC8279d)<br/>framebuffer / previous-frame RAM"]
     sd["microSD FAT<br/>/BOOKS + card root EPUBs<br/>/XTEINK cache + catalog + state"]
     sleep["ESP32-C3 deep sleep"]
 
@@ -83,7 +83,8 @@ flowchart TD
 ```text
 app-core/ app state reducer and Copy message contracts shared by firmware/tools
 display/   framebuffer, drawing primitives, EPD controller constants and address math
-hal-ext/   thin async wrappers over ESP HAL peripherals
+hal-ext/   thin async wrappers over ESP HAL peripherals, plus the boot
+           panel-controller probe's pin/timing half
 fw/        boot, Embassy executor, task wiring, board-owned peripherals
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
@@ -251,6 +252,76 @@ Geometry and fast-refresh timing depend on the board:
 
 - **X4**: SSD1677, 100-byte rows, ~421 ms fast waveform.
 - **X3**: UC8253, 99-byte rows, ~379 ms fast waveform.
+
+### Which controller is on the bus
+
+The board is a compile-time choice; the controller on it is not entirely. Newer
+production runs of both devices swap the panel controller for an UltraChip
+sibling that shares the UC81xx KW-mode command set — the X3's UC8253 for a
+UC8279d, the X4's SSD1677 for a UC8179 — behind identical glass, pinout and
+packaging. Nothing outside the device says which one a unit carries.
+
+So boot asks the silicon. Before SPI2 is configured, `fw::main` bit-bangs a
+VER (`0x70`) / FLG (`0x71`) read on the panel's own pins through
+`hal_ext::epd_probe`; only a UC81xx returns a structured version block.
+`display::epd::probe` — sans-IO, and the only part with host tests, since no
+sibling hardware exists to bench — turns the bytes into a verdict under three
+rules that a datasheet reading would not produce:
+
+1. **Two passes that agree**, never one read. A floating bus can produce one
+   plausible answer, not the same non-trivial answer twice. A single stray
+   match is `Inconclusive`.
+2. **FLG must be driven** — not `0x00`, not `0xFF`, and `BUSY_N` set.
+3. **The MTP key rescues a blank VER.** Field UC8279d units answer VER with
+   `FF FF FF FF FF`, which rule 2 rejects; the RMTP (`0xA2`) dump opening with
+   the `0xA5` refresh-enable key is the positive evidence that recovers them.
+
+Rule 3 is the load-bearing one, and the bench says so. A shipping UC8253 X3
+answers the probe with `VER = FF FF FF FF FF` and a genuinely driven
+`FLG = 0x13` — byte for byte the field UC8279d signature, clearing every gate
+except the last. Its MTP reads all `FF`, and that absence is the only thing
+that keeps it on the UC8253 driver. The `0xA5` check is not belt-and-braces;
+without it this firmware misidentifies the installed base.
+
+The read never gates on BUSY: which controller is present is the unknown, so
+its BUSY polarity is too (SSD1677 active-high, UC8253 two-phase and idle-high).
+A flat post-reset delay covers either. The OEM's NVS `hw_calib/screenType` is
+*not* consulted — a full-flash from another unit overwrites that namespace, so
+it can name the wrong panel; the live bus is ground truth.
+
+`fw::display_flush` stores the verdict in an `AtomicU8` and routes `init_panel`,
+`flush`, `prestage_previous` and `sleep_panel` through it. Only the default
+backends exist today, so a confirmed sibling still runs them; the UC8179 and
+UC8279 backends plug into that dispatch when they land.
+
+A live probe costs ~70 ms on the X4 and ~150 ms on the X3, whose UC8279d is not
+bench-proven to answer the short reset pulse and so retries a missed screening
+pass at the vendor's 50 ms identification timing. It answers a question about
+soldered hardware, so the scope of one probe is one *power cycle*, not one
+boot: `fw::probe_cache` retains the result in RTC fast RAM beside
+`sleep_marker`'s, and a deep-sleep wake, an OTA reset, or a crash reboot reuses
+it and pays nothing.
+
+RTC RAM is the store precisely because it is volatile. Flash, NVS and the SD
+card all survive being copied onto another unit — the failure mode that makes
+the OEM's `hw_calib/screenType` untrustworthy — so a verdict cached there can
+outlive the hardware it describes. This one cannot: it is zeroed on first
+power-on, which is also the earliest moment the panel could have changed. A
+magic word and a rejected-on-unknown verdict byte keep brownout garbage from
+decoding as a cache.
+
+The section is 64 bytes with `sleep_marker` sitting in the middle of the
+probe cache's two statics, which is how retention across deep sleep is
+witnessed rather than assumed: a wake that renders as one quick flicker
+instead of a multi-flash full refresh means `SLEEP_IMAGE` came back holding
+what the sleep handshake wrote, and the bytes on either side of it cannot have
+been treated differently. *Bench note:* a software reset now reuses the
+verdict; re-running the probe takes a power cycle, and `main` logs which path
+it took.
+
+The verdict, the raw VER/FLG bytes and the MTP header are written to
+`/XTEINK/PROBE.TXT` on every boot, so a locked unit with no serial console is
+still diagnosable.
 
 The full refresh (the only mode that reliably clears unknown pixels) and normal
 page turns differ by controller:
@@ -441,6 +512,7 @@ has no EPUBs.
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
 /XTEINK/CATALOG.BIN
 /XTEINK/LABELS/<stem>.TXT
+/XTEINK/PROBE.TXT
 /XTEINK/STATEA.BIN
 /XTEINK/STATEB.BIN
 ```
