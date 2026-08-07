@@ -141,9 +141,9 @@ pub struct ProbePins<'d> {
 /// A part whose status line answered pays for the long confirm even when its
 /// VER came back blank, because that blank VER is precisely the case the MTP
 /// dump has to settle and the dump is taken on the bus pass 2's reset leaves
-/// behind. A UC8253 X3 is in that class, which is why the X3 spends ~201 ms
-/// here rather than ~154; it is once per power cycle, and the alternative is
-/// timing the discriminator out on a real UC8279d.
+/// behind. A UC8253 X3 is in that class, which is why the X3 spends ~200 ms
+/// here against the X4's ~68; it is once per power cycle, and the
+/// alternative is timing the discriminator out on a real UC8279d.
 pub fn probe(pins: ProbePins<'_>, escalation: ResetEscalation) -> ProbeDiag {
     let mut bus = ProbeBus {
         pins,

@@ -297,9 +297,12 @@ fn recovery_combo_confirmed(
 /// only borrowed, so their real drivers are built from the same singletons a
 /// few lines later, and on the cached path they are not touched at all.
 ///
-/// A live probe costs about 70 ms on the X4 and about 150 ms on the X3, whose
-/// UC8279d is not bench-proven to answer the short reset pulse and so gets
-/// `ResetEscalation::OnMiss` (see `hal_ext::epd_probe`). It answers a question
+/// A live probe costs about 70 ms on the X4 and about 200 ms on the X3
+/// (203 ms measured). The X3's UC8279d is not bench-proven to answer the
+/// short reset pulse, so it gets `ResetEscalation::OnMiss`, and a UC8253
+/// presents the blank-VER shape, so its confirming pass runs at vendor
+/// timing too — two 50 ms pulses rather than none (see
+/// `hal_ext::epd_probe`). It answers a question
 /// about soldered hardware, so `probe_cache` retains the answer for the rest
 /// of the power cycle and a deep-sleep wake pays nothing. The extra reset
 /// pulse a live probe puts on the panel is harmless — the driver's own init

@@ -1,6 +1,6 @@
 //! The panel-controller probe's result, retained across the deep-sleep reboot.
 //!
-//! The probe costs 70–150 ms and answers a question about soldered hardware.
+//! The probe costs 70–200 ms and answers a question about soldered hardware.
 //! Nothing short of a soldering iron changes that answer, and nothing reaches
 //! the soldering iron without disconnecting the battery — so the honest scope
 //! of one probe is *one power cycle*, not one boot. This caches the result in
