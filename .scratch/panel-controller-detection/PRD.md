@@ -12,6 +12,61 @@ The UC81xx controllers expose version registers that can be read over the data b
 
 The probe result is stored in a static `AtomicU8` for the flush module to dispatch on. The dispatch layer in `fw/src/display_flush/mod.rs` routes `init_panel`, `flush`, `prestage_previous`, and `sleep_panel` to the detected controller's backend.
 
+### Probe protocol, from the FreeInk reference
+
+`libs/hardware/XteinkDetect/` implements this in production. Six details there
+are load-bearing and are not derivable from the datasheets:
+
+1. **Two passes with agreement, not one read.** Confirm the sibling controller
+   only when two independent passes agree. A single stray answer is
+   `Inconclusive` and resolves to the device's default controller. A one-shot
+   timeout fallback is weaker than this and will misclassify on a marginal bus.
+2. **FLG must be a *driven* status, not merely readable.** Reject `0x00` and
+   `0xFF` as floating-bus artifacts, and require `BUSY_N` (bit 0) asserted —
+   idle. Without this check a floating bus produces plausible-looking bytes and
+   the probe confirms a controller that is not there.
+3. **Do not gate on BUSY during the probe.** Which controller is present is the
+   unknown, so its BUSY polarity is also unknown — the two families are opposite
+   (SSD1677 active-high; UC8253 two-phase, idle high). Use a flat delay after a
+   50 ms reset pulse, sized to cover every UC81xx power-up.
+4. **RMTP (0xA2) is the escalation path, not just a third register.** When VER
+   reads as floating with `ver[0] == 0xFF` but FLG is driven and both passes
+   agree, dump the MTP and confirm on `mtp[0] == 0xA5`, the refresh-enable key.
+   This recovers parts that do not answer VER cleanly.
+5. **`VER` byte 2 (`LUT_VER`) tells UC8179 from UC8279.** Not needed while the
+   device build already implies which sibling is possible (X3 → UC8279d,
+   X4 → UC8179), but it is the discriminator if a device ever ships both, and
+   worth capturing in diagnostics regardless.
+6. **NVS `hw_calib/screenType` is diagnostics only.** The OEM records a panel
+   type per unit there, and FreeInk's comment states it can describe the wrong
+   panel entirely. The live bus probe is ground truth. Do not dispatch on NVS —
+   it is the obvious-looking shortcut and it is wrong.
+
+### Field diagnosis without a serial cable
+
+FreeInk keeps a `XteinkDisplayProbeDiag` snapshot — raw VER bytes, FLG, verdict,
+whether the driver was promoted, and the first 48 MTP bytes — explicitly so
+firmware can persist it "somewhere a user can retrieve WITHOUT serial access
+(locked units): e.g. a file on the SD card."
+
+Calendula should do the same. A user reporting "my screen looks wrong" cannot be
+asked for `esp-println` output, and the probe's verdict is the single most useful
+fact for answering them. Writing it to the SD card on every boot costs one small
+file and makes the failure remotely diagnosable.
+
+### Pin sourcing
+
+Take the probe's pins from the board layer rather than hardcoding them. FreeInk
+carries two variants for exactly this reason — one that hardcodes the X3 C3
+pinout and a board-agnostic one that reads `BoardConfig::ACTIVE` — because the
+hardcoded probe is unsafe on any other board. If `reterminal-sticky-support`
+issue 02 (board-profile extraction) lands first, source the pins from
+`BoardHardware`; otherwise leave a clear seam so it can move later.
+
+The probe must **not** compile into the ESP32-S3 Sticky build: there is no
+evidence the Sticky ships multiple controllers, and these GPIOs mean different
+things on that board. See `reterminal-sticky-support` non-goals.
+
 ## Scope
 
 ### Files
@@ -24,17 +79,38 @@ The probe result is stored in a static `AtomicU8` for the flush module to dispat
 ### Dependencies
 
 - Blocks: `uc8179-x4-driver`, `uc8279-x3-driver` (those drivers need this dispatch layer)
+- Sequenced after `board-identity-guard`, if that lands: it answers "which board", this answers "which controller on that board", and a wrong-board verdict makes this question moot. Both are early-boot probes competing for the same pins-before-peripherals budget.
 
 ### Notes
 
 - Can be developed and tested on existing hardware — probe should return `DefaultAssumed` on SSD1677/UC8253 panels.
+- No UC8179 or UC8279d hardware is available, so the *confirming* path cannot be exercised locally. That makes the negative path — a correct `DefaultAssumed` on every existing unit — the only thing this can prove, and it makes rules 1 and 2 above the difference between a safe probe and one that promotes a driver on a floating bus.
 
 ## Done when
 
 - `epd_probe.rs` implements the GPIO bit-bang read of VER/FLG/RMTP registers and returns a `ProbeVerdict`.
-- The probe runs at boot after GPIO init but before SPI2 peripheral configuration.
+- The verdict is two-pass with agreement; a single stray answer resolves to `DefaultAssumed`.
+- FLG is validated as driven (not `0x00`/`0xFF`) with `BUSY_N` asserted before any confirmation.
+- The probe does not wait on BUSY; a flat post-reset delay covers power-up for either controller family.
+- The RMTP `mtp[0] == 0xA5` escalation is implemented for the floating-VER case.
+- The probe runs at boot after GPIO init but before SPI2 peripheral configuration, and releases its pins afterwards.
 - The result is stored in a `static AtomicU8` accessible to the flush module.
 - `display_flush/mod.rs` dispatches `init_panel`/`flush`/`prestage_previous`/`sleep_panel` based on the detected controller.
-- On existing SSD1677/UC8253 hardware, the probe returns `DefaultAssumed` and the existing driver path is taken with no behavioral change.
+- Raw VER/FLG/verdict are persisted somewhere retrievable without a serial cable.
+- NVS `hw_calib/screenType`, if read at all, is recorded as diagnostics and never dispatched on.
+- The probe is absent from the ESP32-S3 build.
+- On existing SSD1677/UC8253 hardware, the probe returns `DefaultAssumed` and the existing driver path is taken with no behavioral change — verified across repeated cold boots, not a single run.
 - `tools/check.sh fast` passes.
 - `tools/check.sh emulator` passes (emulator path unchanged for default controllers).
+
+## Comments
+
+**2026-08-06** — Enriched from the FreeInk reference (`libs/hardware/XteinkDetect/`,
+standalone checkout at `e52d480`) while researching the reTerminal Sticky port.
+The original Context described a single-shot probe with a timeout fallback; the
+production implementation is two-pass-with-agreement plus a floating-bus
+rejection on FLG, and treats RMTP as an escalation path rather than a third
+register to read. Added the pin-sourcing and S3-exclusion notes so this probe and
+`reterminal-sticky-support` do not collide, and a cross-reference to the new
+`board-identity-guard` PRD, which owns the adjacent "which board am I" question.
+Scope and intent are unchanged.
