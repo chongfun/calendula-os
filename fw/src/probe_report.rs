@@ -61,11 +61,23 @@ fn render<const N: usize>(out: &mut heapless::String<N>, diag: &ProbeDiag) {
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "result:  {}", diag.verdict.as_str());
-    let _ = writeln!(
-        out,
-        "driver:  {}",
-        display_flush::detected_controller().name()
-    );
+    // Two fields, not one. What the probe found and what is actually driving
+    // the panel are the same today only because the sibling backends do not
+    // exist yet, and the gap between them is the first thing worth knowing
+    // when a unit renders wrong on a correctly identified controller.
+    let detected = display_flush::detected_controller();
+    let active = display_flush::active_backend();
+    let _ = writeln!(out, "controller: {}", detected.name());
+    if active == detected {
+        let _ = writeln!(out, "driver:  {}", active.name());
+    } else {
+        let _ = writeln!(
+            out,
+            "driver:  {} (fallback: no {} backend in this build)",
+            active.name(),
+            detected.name()
+        );
+    }
     let _ = write!(out, "ver:    ");
     for byte in diag.ver {
         let _ = write!(out, " {byte:02X}");

@@ -21,7 +21,7 @@
 use core::sync::atomic::Ordering;
 use display::epd::probe::{ProbeVerdict, MTP_BYTES, VER_BYTES};
 use hal_ext::epd_probe::ProbeDiag;
-use portable_atomic::{AtomicU32, AtomicU8};
+use portable_atomic::{fence, AtomicU32, AtomicU8};
 
 /// Byte layout of [`PAYLOAD`]: verdict, FLG, the MTP-valid flag, then VER and
 /// the MTP dump.
@@ -68,10 +68,18 @@ static PAYLOAD: [AtomicU8; PAYLOAD_BYTES] = [const { AtomicU8::new(0) }; PAYLOAD
 /// firmware writes. A cache that fails either is no cache, and the caller
 /// probes.
 pub(crate) fn load() -> Option<ProbeDiag> {
-    if VALID.load(Ordering::Relaxed) != CACHE_MAGIC {
+    // Acquire pairs with the Release commit in `store`: the payload writes it
+    // published must not be read before the magic that vouches for them.
+    if VALID.load(Ordering::Acquire) != CACHE_MAGIC {
         return None;
     }
     let verdict = ProbeVerdict::from_code(byte(OFF_VERDICT))?;
+    if !is_cacheable(verdict) {
+        // `store` never writes one, so this is firmware that predates the rule
+        // leaving a verdict behind across an OTA. Re-probe rather than inherit
+        // an answer the probe itself would not stand behind.
+        return None;
+    }
     let mut diag = ProbeDiag {
         verdict,
         ver: [0; VER_BYTES],
@@ -88,11 +96,41 @@ pub(crate) fn load() -> Option<ProbeDiag> {
     Some(diag)
 }
 
-/// Record a live probe's result for the rest of this power cycle.
+/// Whether a verdict is worth keeping for the rest of the power cycle.
 ///
-/// The magic goes down last, so a reset landing mid-write leaves a cache that
-/// reads as absent rather than as half of one.
+/// The two definitive answers are; [`ProbeVerdict::Inconclusive`] is not.
+/// That verdict means the passes disagreed and the bus looked marginal, which
+/// makes it the one result worth taking again — caching it would let a single
+/// noisy boot fix an uncertain answer in place until the battery is pulled,
+/// with every wake and reset inheriting it. A marginal unit re-probes instead,
+/// and pays the 70–200 ms for it.
+fn is_cacheable(verdict: ProbeVerdict) -> bool {
+    match verdict {
+        ProbeVerdict::DefaultAssumed | ProbeVerdict::Uc81xxConfirmed => true,
+        ProbeVerdict::Inconclusive => false,
+    }
+}
+
+/// Record a live probe's result for the rest of this power cycle, if it is one
+/// worth standing behind.
+///
+/// Invalidate, write, commit — in that order, and the first step is not
+/// redundant. `store` usually follows a magic mismatch, but it also follows a
+/// `load` that found the magic intact and the payload not (brownout-retained
+/// RAM is arbitrary, which is the whole reason the verdict byte is checked).
+/// On that path, rewriting the payload under a magic that still reads valid
+/// would let a reset mid-write expose half of this result spliced onto half of
+/// the last one.
 pub(crate) fn store(diag: &ProbeDiag) {
+    if !is_cacheable(diag.verdict) {
+        // Leave whatever was there invalid: this boot has nothing to publish,
+        // and the next one should probe.
+        VALID.store(0, Ordering::Relaxed);
+        return;
+    }
+    VALID.store(0, Ordering::Relaxed);
+    // The invalidation must land before the payload it protects is touched.
+    fence(Ordering::Release);
     set_byte(OFF_VERDICT, diag.verdict.code());
     set_byte(OFF_FLG, diag.flg);
     set_byte(OFF_MTP_VALID, u8::from(diag.mtp_valid));
@@ -102,7 +140,9 @@ pub(crate) fn store(diag: &ProbeDiag) {
     for (index, value) in diag.mtp.iter().enumerate() {
         set_byte(OFF_MTP + index, *value);
     }
-    VALID.store(CACHE_MAGIC, Ordering::Relaxed);
+    // Release: every payload store above lands before the magic that
+    // vouches for it, so a reset can leave no cache or a whole one.
+    VALID.store(CACHE_MAGIC, Ordering::Release);
 }
 
 fn byte(offset: usize) -> u8 {

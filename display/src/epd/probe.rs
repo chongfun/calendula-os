@@ -51,6 +51,14 @@
 //!    controller in the installed base it was written for. See
 //!    `a_shipping_uc8253_is_only_told_apart_by_its_mtp`.
 //!
+//!    Rule 3 also constrains *timing*, which is easy to miss because the
+//!    condition lives here and the consequence lives in the caller. A blank-VER
+//!    part never satisfies [`PassReading::matches_uc81xx`], so a caller that
+//!    schedules its confirming pass off a signature match alone gives this path
+//!    the short screening reset — and with it the MTP read that decides the
+//!    case. [`needs_identify_confirm`] is the predicate that keeps the two in
+//!    step; a caller must use it rather than a bare match.
+//!
 //! A fourth rule is the caller's, because it is about timing rather than
 //! bytes: never gate the read on BUSY. Which controller is present is exactly
 //! the unknown, so its BUSY polarity is unknown too.
@@ -176,17 +184,49 @@ pub fn should_read_mtp(pass1: &PassReading, pass2: &PassReading) -> bool {
     agrees_on_uc81xx(pass1, pass2) || pass1.flg_is_driven()
 }
 
+/// The blank-VER shape rule 3 recovers: a driven status over a VER that read
+/// back as an all-`FF` bus.
+///
+/// Split out because it is not the same question as [`PassReading::matches_uc81xx`]
+/// and the difference decides timing. A part in this state has told us
+/// something — the status line answered — but not enough, so its MTP dump is
+/// the discriminator and that dump has to be worth trusting.
+pub fn is_blank_ver_candidate(pass: &PassReading) -> bool {
+    pass.flg_is_driven() && pass.ver_is_floating() && pass.ver[0] == 0xFF
+}
+
+/// Whether pass 2 must be taken at the vendor's identification timing.
+///
+/// True when pass 1 produced anything worth confirming: a full signature, or
+/// the blank-VER shape above. The blank-VER half is the one that matters and
+/// the one that is easy to miss — [`PassReading::matches_uc81xx`] is false for
+/// it *by construction*, so keying the confirming pass off a match alone runs
+/// pass 2, and the RMTP read that follows it, at the short screening reset.
+/// For the very part the escalation exists to serve — a UC8279d that answers
+/// only at vendor timing — that produces a floating second pass and an MTP
+/// dump with no key, and the probe concludes `DefaultAssumed` on a controller
+/// that is really there. See
+/// `a_part_that_only_answers_at_vendor_timing_is_still_confirmed`.
+pub fn needs_identify_confirm(pass1: &PassReading) -> bool {
+    pass1.matches_uc81xx() || is_blank_ver_candidate(pass1)
+}
+
 /// Rule 3: the blank-VER recovery, which needs the MTP key as positive
 /// evidence before it will overrule the floating-bus test.
+///
+/// Both passes must show a driven status. Requiring it of pass 1 alone would
+/// hand rule 1's two-pass agreement away on exactly this path: a pass 2 that
+/// answered nothing reads back an all-`FF` VER, which equals a blank pass 1's
+/// VER, so the equality check below would be satisfied by a bus that supplied
+/// no evidence at all.
 pub fn mtp_key_confirms(
     pass1: &PassReading,
     pass2: &PassReading,
     mtp: Option<&[u8; MTP_BYTES]>,
 ) -> bool {
-    pass1.flg_is_driven()
+    is_blank_ver_candidate(pass1)
+        && pass2.flg_is_driven()
         && pass1.ver == pass2.ver
-        && pass1.ver_is_floating()
-        && pass1.ver[0] == 0xFF
         && mtp.is_some_and(|mtp| mtp[0] == MTP_REFRESH_ENABLE_KEY)
 }
 
@@ -289,6 +329,57 @@ mod tests {
         assert_eq!(
             resolve(&observed, &observed, Some(&mtp_with_key())),
             ProbeVerdict::Uc81xxConfirmed
+        );
+    }
+
+    /// The part the X3 escalation exists for: a UC8279d that answers only at
+    /// the vendor's identification reset.
+    ///
+    /// Its blank VER never satisfies the plain signature, so if the confirming
+    /// pass is scheduled off `matches_uc81xx` it runs at the short screening
+    /// reset — and so does the RMTP read taken on the bus that reset leaves.
+    /// The part then answers nothing on pass 2, the MTP has no key, and a real
+    /// UC8279d resolves as `DefaultAssumed`. [`needs_identify_confirm`] is what
+    /// keeps pass 2 on the timing the part requires.
+    #[test]
+    fn a_part_that_only_answers_at_vendor_timing_is_still_confirmed() {
+        // What the short screening reset gets: nothing.
+        let screened = FLOATING_HIGH;
+        assert!(
+            !needs_identify_confirm(&screened),
+            "a bus that answered nothing earns no long confirm"
+        );
+
+        // What the escalated 50 ms pass 1 gets, and what pass 2 must repeat.
+        let identified = BLANK_VER_DRIVEN_FLG;
+        assert!(
+            !identified.matches_uc81xx(),
+            "the blank VER is why scheduling off a signature match fails"
+        );
+        assert!(
+            needs_identify_confirm(&identified),
+            "but it is still worth confirming at vendor timing"
+        );
+        assert_eq!(
+            resolve(&identified, &identified, Some(&mtp_with_key())),
+            ProbeVerdict::Uc81xxConfirmed
+        );
+    }
+
+    /// Rule 1 must survive the blank-VER path. A pass 2 that answered nothing
+    /// reads back an all-`FF` VER, which equals a blank pass 1's VER for free —
+    /// so VER equality alone is not agreement, and the second pass has to show
+    /// a driven status of its own.
+    #[test]
+    fn a_silent_second_pass_cannot_stand_in_for_agreement() {
+        assert_eq!(
+            BLANK_VER_DRIVEN_FLG.ver, FLOATING_HIGH.ver,
+            "the two are indistinguishable by VER, which is the trap"
+        );
+        assert_eq!(
+            resolve(&BLANK_VER_DRIVEN_FLG, &FLOATING_HIGH, Some(&mtp_with_key())),
+            ProbeVerdict::DefaultAssumed,
+            "a pass that supplied no evidence must not complete a confirmation"
         );
     }
 

@@ -121,13 +121,20 @@ pub struct ProbePins<'d> {
 /// |---------------|------------------------------------|------------------------------------------|
 /// | 1 (screen)    | [`SCREENING_RESET_MS`]             | always                                   |
 /// | 1 (escalate)  | [`IDENTIFY_RESET_MS`]              | screen missed **and** [`ResetEscalation::OnMiss`] |
-/// | 2 (confirm)   | identify if pass 1 matched, else screen | always                              |
+/// | 2 (confirm)   | identify if [`probe::needs_identify_confirm`], else screen | always   |
 ///
 /// Two vendor-timing pulses would cost ~166 ms on every unit in the installed
-/// base — the SSD1677s and UC8253s that will never answer `0x70` and gain
-/// nothing from the longer reset. Tiering makes that case ~68 ms of two cheap
-/// passes, and spends the vendor timing only where there is a hit to confirm,
-/// which also makes pass 2's VER the authoritative readback.
+/// base — the SSD1677s that will never answer `0x70` and gain nothing from the
+/// longer reset. Tiering makes that case ~68 ms of two cheap passes, and
+/// spends the vendor timing only where pass 1 left something to confirm, which
+/// also makes pass 2's VER the authoritative readback.
+///
+/// A part whose status line answered pays for the long confirm even when its
+/// VER came back blank, because that blank VER is precisely the case the MTP
+/// dump has to settle and the dump is taken on the bus pass 2's reset leaves
+/// behind. A UC8253 X3 is in that class, which is why the X3 spends ~201 ms
+/// here rather than ~154; it is once per power cycle, and the alternative is
+/// timing the discriminator out on a real UC8279d.
 pub fn probe(pins: ProbePins<'_>, escalation: ResetEscalation) -> ProbeDiag {
     let mut bus = ProbeBus {
         pins,
@@ -144,10 +151,13 @@ pub fn probe(pins: ProbePins<'_>, escalation: ResetEscalation) -> ProbeDiag {
         pass1 = bus.run_pass(IDENTIFY_RESET_MS);
     }
 
-    // A pass 1 with something to confirm makes pass 2 the doc-timing read, so
-    // the VER the report carries was taken under vendor conditions.
+    // A pass 1 with anything worth confirming makes pass 2 the doc-timing read,
+    // so both the confirming VER and the RMTP dump below are taken under vendor
+    // conditions. `needs_identify_confirm` — not a bare signature match — is
+    // what decides that, because the blank-VER part this most matters for never
+    // matches the plain signature.
     bus.delay.delay_millis(INTER_PASS_MS);
-    let reset2 = if pass1.matches_uc81xx() {
+    let reset2 = if probe::needs_identify_confirm(&pass1) {
         IDENTIFY_RESET_MS
     } else {
         SCREENING_RESET_MS

@@ -108,19 +108,35 @@ pub(crate) fn detected_controller() -> DetectedController {
     }
 }
 
-// The four operations, each routed by the boot probe's verdict.
-//
-// Only the device's default backend exists today. The UltraChip sibling
-// backends are separate work (`.scratch/uc8179-x4-driver`,
-// `.scratch/uc8279-x3-driver`), and both of those wait on this dispatch layer
-// to have somewhere to plug into — so until one lands, a confirmed sibling
-// runs the default sequence. That is the same thing it would get with no probe
-// at all, and better than refusing to drive the panel; the probe's value in
-// the meantime is that the verdict is recorded and reported. Split the arm
-// when a backend arrives; nothing else here needs to move.
+/// Which backend the four operations below actually execute.
+///
+/// Deliberately not the same question as [`detected_controller`], and the gap
+/// is the point. The UltraChip sibling backends are separate work
+/// (`.scratch/uc8179-x4-driver`, `.scratch/uc8279-x3-driver`) and both wait on
+/// this dispatch layer to have somewhere to plug into, so until one lands a
+/// confirmed sibling runs the default sequence. That is the same thing it
+/// would get with no probe at all, and better than refusing to drive the
+/// panel.
+///
+/// It is a separate function because `probe_report` must print both. A
+/// diagnostics file that names a UC8279d as the driver while the UC8253
+/// sequence is running would mislead precisely the person it exists to help —
+/// someone whose screen renders wrong on a controller the probe identified
+/// correctly.
+///
+/// When a sibling backend lands, return the detected controller here and give
+/// the four `match`es below their second arm; they follow this function.
+pub(crate) fn active_backend() -> DetectedController {
+    match detected_controller() {
+        // No sibling backend to route to yet.
+        DetectedController::Default | DetectedController::UltraChipSibling => {
+            DetectedController::Default
+        }
+    }
+}
 
 pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
-    match detected_controller() {
+    match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::init_panel(epd).await
         }
@@ -135,7 +151,7 @@ pub(crate) async fn flush(
     mode: RefreshMode,
     prev_staged: bool,
 ) -> Result<(), PanelError> {
-    match detected_controller() {
+    match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::flush(epd, fb, prev_fb, screen_on, mode, prev_staged).await
         }
@@ -143,7 +159,7 @@ pub(crate) async fn flush(
 }
 
 pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result<(), PanelError> {
-    match detected_controller() {
+    match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::prestage_previous(epd, fb).await
         }
@@ -151,7 +167,7 @@ pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result
 }
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
-    match detected_controller() {
+    match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::sleep_panel(epd).await
         }

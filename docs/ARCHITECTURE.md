@@ -294,9 +294,12 @@ it can name the wrong panel; the live bus is ground truth.
 backends exist today, so a confirmed sibling still runs them; the UC8179 and
 UC8279 backends plug into that dispatch when they land.
 
-A live probe costs ~70 ms on the X4 and ~150 ms on the X3, whose UC8279d is not
+A live probe costs ~70 ms on the X4 and ~200 ms on the X3, whose UC8279d is not
 bench-proven to answer the short reset pulse and so retries a missed screening
-pass at the vendor's 50 ms identification timing. It answers a question about
+pass at the vendor's 50 ms identification timing. The X3 also pays a second
+vendor-timing pulse for its confirming pass, because a UC8253 presents the
+blank-VER shape and that shape has to be settled by an MTP read taken on a bus
+the part could actually have answered. It answers a question about
 soldered hardware, so the scope of one probe is one *power cycle*, not one
 boot: `fw::probe_cache` retains the result in RTC fast RAM beside
 `sleep_marker`'s, and a deep-sleep wake, an OTA reset, or a crash reboot reuses
