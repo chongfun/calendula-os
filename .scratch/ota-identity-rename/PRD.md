@@ -1,6 +1,7 @@
 # Drop the MarigoldOS lineage from the firmware identity
 
-Status: ready-for-agent
+Status: implemented on `feature/ota-identity-rename` (2026-08-07), with one
+scope change recorded below.
 
 ## Problem
 
@@ -22,7 +23,18 @@ Rename all three, bumping the two existing boards' updater generation:
 |---|---|---|
 | X4 | `CalendulaOS X4 u1 (MarigoldOS)` | `CalendulaOS X4 u2` |
 | X3 | `CalendulaOS X3 u1 (MarigoldOS)` | `CalendulaOS X3 u2` |
-| Sticky | — | `CalendulaOS Sticky u1` |
+| Sticky | — | `CalendulaOS Sticky u1`, **added by the Sticky milestone** |
+
+**Scope change (2026-08-07).** `IDENTITY_STICKY` is *not* part of this
+change; the Sticky milestone adds it. This document's dependency is that the
+*format* be settled before a Sticky identity is chosen, and deleting
+`IDENTITY_SUFFIX` settles it — shipping the constant here would have added an
+API surface with no consumer to a change whose value is being a narrow,
+reviewable rename. Confirmed while implementing: there is no `device-sticky`
+feature and no Sticky board arm in `fw/src/main.rs`, so the arm this document
+lists under Scope did not exist to modify. The rule below is instead recorded
+as a doc comment on `IDENTITY_X4`, stated generally, so the Sticky milestone
+inherits it without this change naming Sticky at all.
 
 **Why bump to u2.** The digit's documented rule is that it moves "whenever the
 trigger filename or the update hand-off changes." A rename produces exactly that
@@ -87,13 +99,13 @@ covers the pre-board `"CalendulaOS (MarigoldOS)"` form that way and
 
 ### Files
 
-- **[MODIFY]** `proto/src/ota.rs` — `IDENTITY_X4` / `IDENTITY_X3`; add
-  `IDENTITY_STICKY`; delete `IDENTITY_SUFFIX` and its `strip_suffix` in
+- **[MODIFY]** `proto/src/ota.rs` — `IDENTITY_X4` / `IDENTITY_X3`; delete
+  `IDENTITY_SUFFIX` and its `strip_suffix` in
   `parse_identity`; update the format doc comment at :661 and :701; ~15 identity
   literals across the tests, plus cases pinning the renamed forms and refusing
   the superseded ones
 - **[MODIFY]** `fw/src/main.rs` — the `PROJECT_NAME` doc comment at :44 (format
-  string), and the Sticky arm of the identity selection
+  string) only; there is no Sticky arm to modify (see the scope change above)
 - **[MODIFY]** `docs/FLASHING.md` — the format at :224, and a note on crossing
   the rename by USB
 - **[UNCHANGED, deliberately]** `README.md`, `web/index.html` attribution;
@@ -103,7 +115,8 @@ covers the pre-board `"CalendulaOS (MarigoldOS)"` form that way and
 ### Dependencies
 
 - Should land **before** `reterminal-sticky-support` issue 01, so that milestone
-  adds `IDENTITY_STICKY` in a settled format rather than choosing one.
+  adds `IDENTITY_STICKY` in a settled format rather than choosing one. That
+  milestone owns the constant; this one owns the format.
 - Feeds `board-identity-guard`, which reads the compiled-in board through
   `parse_identity` and benefits from the legacy forms parsing.
 
@@ -119,8 +132,9 @@ covers the pre-board `"CalendulaOS (MarigoldOS)"` form that way and
 
 ## Done when
 
-- The three identity constants read `CalendulaOS X4 u2`, `CalendulaOS X3 u2`,
-  `CalendulaOS Sticky u1`.
+- The two shipped identity constants read `CalendulaOS X4 u2` and
+  `CalendulaOS X3 u2`, and the per-board generation rule is documented so the
+  Sticky milestone can add `CalendulaOS Sticky u1` without re-deciding it.
 - `parse_identity` returns the board and generation for the renamed forms, and
   still rejects foreign, truncated, and malformed names — including the
   superseded `u1 (MarigoldOS)` and pre-board forms.
