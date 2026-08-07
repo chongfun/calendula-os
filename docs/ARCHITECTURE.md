@@ -122,6 +122,14 @@ power_task
   takes GPIO3 off input_task before arming it as the wake source, so the pin
   has a single owner when it is re-materialised
 
+board_guard refuse task
+  spawned INSTEAD of every task above, and only when the boot-time board probe
+  confirms this image is running on the other board (see Board identity guard)
+  owns EpdBus and SD CS outright, since no display task exists on this path
+  attempts /BOARDID.TXT, reports on serial whether it landed, then parks
+  forever; never touches the panel, because a mismatched image cannot drive it
+  (see Board identity guard)
+
 wifi_task
   parked until SyncCommand::Start arrives from the Wireless screen
   requests StorageCommand::LoanSyncMemory, receives the dismantled EPUB
@@ -242,6 +250,95 @@ between sessions while the device is awake, so only the first session runs the
 full CMD0/ACMD41 init; later ones reuse the remembered card type and skip the
 handshake, falling back to a cold init if a reused session cannot open the
 volume. Deep sleep resets the chip and clears that state.
+
+## Board identity guard
+
+Geometry is a compile-time choice (see Display model below), so an X3 image and
+an X4 image are different binaries for the same ESP32-C3. Nothing in the boot
+chain separates them: the image header's chip id catches an ESP32-S3 image but
+not a sibling-board one, so a wrong-board flash boots and then drives the wrong
+panel controller at the wrong geometry. `proto::ota` already refuses a
+wrong-board *update* by comparing descriptor identities; the guard closes the
+same hole on an initial flash.
+
+```text
+esp_hal::init
+  -> deep-sleep wake?  yes: skip everything below, boot on
+  -> hal_ext::board_probe::fingerprint(I2C0, sda GPIO20, scl GPIO0)
+       two read-only address sweeps for the X3-only I2C parts
+       (BQ27220 0x55, DS3231 0x68, QMI8658 0x6B/0x6A); the X4 has none
+       both pins handed back as inputs before anything else claims them
+  -> BoardVerdict::{X3Confirmed, X4Confirmed, Inconclusive}
+  -> fw::board_guard::evaluate(verdict, PROJECT_NAME)
+       compares against proto::ota::identity_board(this image's identity)
+  -> Some(mismatch): spawn ONLY fw::board_guard::refuse and halt
+     None:           normal bring-up
+```
+
+Rules that make the guard safer than the failure it replaces:
+
+- **Only a confirmed mismatch refuses.** X3 needs at least two of the *same*
+  peripherals answering in both passes — the intersection of the two masks, not
+  two independent counts, so that two different pairs of spurious ACKs
+  (`0b011` then `0b110`) cannot add up to a board. X4 needs a clean, unfaulted
+  nothing in both. Passes that disagree, a single stray ACK, or a bus that timed
+  out rather than answering are all `Inconclusive` and boot normally — a flaky
+  probe must never brick a correctly flashed device. The truth table, including
+  the disagreeing-pairs case, is pinned by const assertions in `board_probe`.
+- **The message never depends on the panel.** A mismatched image has the wrong
+  controller driver compiled in, so the refusal *attempts* `/BOARDID.TXT` — the
+  detected board, the firmware's board, and the release asset to flash instead —
+  and never touches the panel. The card is the channel a user without a serial
+  cable can reach, not a guaranteed one: `write_diagnostic` reports whether
+  every write and the close landed, and an absent, full, or unreadable card
+  leaves no file. The refusal is therefore *always* emitted on serial first
+  (`board: REFUSING TO BOOT …`, then the card's outcome as one of
+  `board: wrote /BOARDID.TXT`, `could not write`, or `no SD card for
+  diagnostic`), so the two channels together degrade rather than fail. An
+  on-screen version
+  was built and then removed on the evidence: measured on an X3 running the X4
+  build, `init_panel` fails with `Busy(TimedOut)` after 15 s and draws nothing,
+  because the two controllers read BUSY in opposite senses and the SSD1677
+  driver's wait for a falling edge never fires. It was a quarter-minute stall
+  and a framebuffer render in exchange for a blank screen. Worth restoring only
+  for a future board pair that shares a controller.
+- **The wake path pays nothing.** A deep-sleep wake skips the probe and the
+  guard outright: it is the same power-on continuing, the board cannot have
+  changed, and the boot that armed the sleep already passed. Only a cold boot
+  probes — which is every boot that follows a flash, since flashing ends in a
+  reset rather than a wake. No cached verdict is involved, so there is no
+  stored state a halt decision could rest on.
+- **It halts rather than resets.** A boot loop looks identical to a dead device
+  and would rewrite the diagnostic endlessly. The recovery combo (Back + Up)
+  still runs before the guard, so the slot-0 anchor remains reachable.
+- **C3 only.** The probe pins are the battery divider and U0RXD on the ESP32-C3
+  but native USB D+ and a strapping pin on an ESP32-S3, so the pin-touching half
+  of `board_probe` is compiled out off RISC-V rather than guarded at runtime.
+
+The clean-absence half of that rule has been exercised on hardware too, by
+substitution rather than by an X4: an X3 running a build whose probe table
+points at unpopulated addresses answers `found=0b0/0b0 fault=false/false ->
+X4Confirmed` in 5 ms, and then refuses in the *other* direction ("detected
+Xteink X4, firmware built for Xteink X3", naming `firmware-x4.bin`). So the
+found-nothing branch, the absence of phantom ACKs on a bare address set, and
+both directions of the mismatch message are all covered. What no X3 can cover
+is the X4's GPIO0 battery divider under the probe's open-drain pull-up; if that
+misbehaves it yields a faulted pass, which is `Inconclusive` and a normal boot.
+
+Measured on an X3 (2026-08-06): the probe answers `X3Confirmed` with all three
+parts found in both passes (`found=0b111/0b111`) in **6 ms**, and costs **+9 ms**
+to the pre-task boot stage — `display: started` moves 816 → 825 ms — of which
+6 ms is the probe and the rest its two always-on log lines. Boot-to-first-paint
+lands at 3001–3075 ms across repeat boots of the same image, a spread wider than
+the change itself, so the added cost is not visible in first paint. The BQ27220
+reads normally afterward (`input: battery seeded (4309 mV, 99%)`), confirming
+the probe leaves the gauge and the pins as it found them.
+
+A single unified X3/X4 binary would remove the problem instead of guarding it,
+and is deliberately not the answer here: statically sized framebuffers would
+have to be sized for the larger panel, costing the X4 ~8.5 KB of main stack
+against a 27 KB floor, and the byte-run rasterizer and portrait glyph transpose
+are both specialized against constant dimensions.
 
 ## Display model
 
@@ -757,6 +854,7 @@ The deeper modules keep implementation complexity behind narrow data-oriented
 interfaces:
 
 ```text
+fw::board_guard         wrong-board refusal: SD diagnostic, then halt
 fw::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sleep
 fw::library_sd          FAT scan, SD chip-select handling, and file discovery
 fw::sd_session          SD session open/close and the upload write pump

@@ -442,6 +442,23 @@
   .dev:hover{ background:color-mix(in srgb,var(--cal) 9%,var(--well)); }
   .dev.on{ background:color-mix(in srgb,var(--cal) 15%,var(--card));
     box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--cal) 60%,transparent); }
+  /* The tint and the ring are the only thing marking the chosen device, and
+     color alone cannot carry that -- this is the choice a mis-flash turns on.
+     The word appears only on the selected card. */
+  .dev .pick{ display:none; }
+  .dev.on .pick{ display:block; margin-top:7px; font-size:11px; font-weight:600;
+    letter-spacing:.07em; text-transform:uppercase; color:var(--cal); }
+  .detect{ margin-top:13px; }
+  .detectbtn{ font-family:var(--body); font-size:13.5px; color:var(--ink); cursor:pointer;
+    background:var(--well); border:0; border-radius:12px; padding:10px 18px; transition:.14s; }
+  .detectbtn:hover{ color:var(--cal); background:color-mix(in srgb,var(--cal) 12%,var(--card)); }
+  .detectbtn[disabled]{ opacity:.55; cursor:default; }
+  .detectnote{ font-size:12.5px; color:var(--label); margin-top:10px; line-height:1.6; max-width:56ch; }
+  .detectnote.bad{ color:#b4632a; }
+  .afterflash{ font-size:12.5px; color:var(--label); margin-top:10px; line-height:1.6; max-width:60ch; }
+  .afterflash b{ font-family:var(--mono); font-size:12px; color:var(--ink); }
+  /* Inert until a device is chosen: the wrong file is the failure mode. */
+  .ghost.off, .dl2.off{ opacity:.5; pointer-events:none; }
   .asset{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; padding:15px 16px; background:var(--well); border-radius:12px; margin-bottom:16px; }
   .asset .k{ display:block; font-size:10.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--label); margin-bottom:4px; }
   .asset b{ font-weight:600; font-size:13.5px; font-family:var(--mono); }
@@ -549,8 +566,12 @@
     <div class="stage">
       <p class="stitle"><span class="no">1</span>Choose your device</p>
       <div class="devs">
-        <button type="button" class="dev on" data-dev="x3"><b>Xteink X3</b><span>528 × 792 · pogo pins</span></button>
-        <button type="button" class="dev" data-dev="x4"><b>Xteink X4</b><span>480 × 800 · USB-C</span></button>
+        <button type="button" class="dev" data-dev="x3" aria-pressed="false"><b>Xteink X3</b><span>528 × 792 · pogo pins</span><span class="pick">Selected</span></button>
+        <button type="button" class="dev" data-dev="x4" aria-pressed="false"><b>Xteink X4</b><span>480 × 800 · USB-C</span><span class="pick">Selected</span></button>
+      </div>
+      <div class="detect">
+        <button type="button" class="detectbtn" id="detect">Check my reader over USB</button>
+        <p class="detectnote" id="detectnote" role="status" aria-live="polite">Not sure which one you have? If CalendulaOS is already installed, the reader can tell us itself.</p>
       </div>
     </div>
     <div class="stage">
@@ -560,12 +581,19 @@
         <div><span class="k">Image</span><b id="img">firmware-x3.bin</b></div>
         <div><span class="k">Size</span><b>~3.5 MB</b></div>
       </div>
-      <div class="status" id="status"><span class="dot"></span><span id="st">Ready. You’ll choose the USB port when you flash.</span></div>
+      <!-- Announced: a disabled button leaves the tab order, so without this a
+           keyboard user meets an unreachable control and no reason why. -->
+      <div class="status" id="status" role="status" aria-live="polite"><span class="dot"></span><span id="st">Choose your device above to continue.</span></div>
       <div class="acts">
-        <esp-web-install-button id="flasher" manifest="manifest-x3.json"><button type="button" slot="activate" class="flashbtn" id="flash">Flash</button><span slot="unsupported" class="ewt-note"></span><span slot="not-allowed" class="ewt-note">Web flashing needs a secure (https) connection.</span></esp-web-install-button>
-        <a class="ghost" href="#" id="dl">Download .bin</a>
+        <!-- `disabled` is the real gate: the installer listens for a bubbling
+             click, and `pointer-events:none` stops the mouse but not Enter or
+             Space. No `manifest` until a board is picked either -- it is read
+             inside the click handler, so an unset one arms nothing. -->
+        <esp-web-install-button id="flasher"><button type="button" slot="activate" class="flashbtn off" id="flash" disabled>Flash</button><span slot="unsupported" class="ewt-note"></span><span slot="not-allowed" class="ewt-note">Web flashing needs a secure (https) connection.</span></esp-web-install-button>
+        <a class="ghost off" href="#" id="dl" aria-disabled="true" tabindex="-1">Download .bin</a>
       </div>
-      <p class="req">Uses WebSerial, in Chrome or Edge on the desktop. Wake the reader to its home screen and connect it; after flashing, replug USB to boot.</p>
+      <p class="req">Uses WebSerial, in Chrome or Edge on the desktop. Wake the reader to its home screen and connect it; after flashing, replug USB to boot. If you checked your reader above, you will be asked to pick it again here — that is normal.</p>
+      <p class="afterflash">The reader restarts on its own when flashing finishes. If the screen then stays blank or looks scrambled, the image was probably for the other device. Nothing is damaged. Take out the SD card, open <b>BOARDID.TXT</b> on it, and flash the file it names.</p>
       <p class="devnote">Prefer the command line? Download the .bin and flash it with esptool over USB. See the <a href="https://github.com/chongfun/calendula-os/blob/main/docs/FLASHING.md">docs</a>.</p>
     </div>
   </div>
@@ -578,7 +606,7 @@
       <li><span class="n">2</span> Copy it to the root of the SD card as <b>update.bin</b>.</li>
       <li><span class="n">3</span> Power on holding <b>Power + Up</b> to flash.</li>
     </ul>
-    <a class="dl2" href="#" id="sd">Download SD image &#8595;</a>
+    <a class="dl2 off" href="#" id="sd" aria-disabled="true" tabindex="-1">Download SD image &#8595;</a>
     <p class="txt">Already running Calendula? Use <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDX3.BIN">FWUPDX3.BIN</a> on X3 or <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> on X4 and reboot normally.</p>
   </div>
 
@@ -917,28 +945,178 @@
   const FW={x4:R+"firmware-x4.bin", x3:R+"firmware-x3.bin"};
   const SD={x4:R+"update.bin", x3:R+"update-x3.bin"};
   const IMG={x4:"firmware-x4.bin", x3:"firmware-x3.bin"};
+  const NAME={x4:"Xteink X4", x3:"Xteink X3"};
+
   const btns=document.querySelectorAll(".dev");
   const img=document.getElementById("img"), dl=document.getElementById("dl"), sd=document.getElementById("sd");
-  function set(dev){ const fl=document.getElementById("flasher"); if(fl) fl.manifest=dev==="x3"?"manifest-x3.json":"manifest-x4.json"; if(img)img.textContent=IMG[dev]; if(dl)dl.href=FW[dev]; if(sd)sd.href=SD[dev]; }
-  btns.forEach(b=>b.addEventListener("click",()=>{
-    btns.forEach(x=>x.classList.remove("on")); b.classList.add("on"); set(b.dataset.dev);
-  }));
-  const qBoard = new URLSearchParams(window.location.search).get("board");
-  const selectedBoard = qBoard === "x4" ? "x4" : "x3";
-  btns.forEach(b=>{
-    if(b.dataset.dev === selectedBoard) b.classList.add("on");
-    else b.classList.remove("on");
-  });
-  set(selectedBoard);
+  const flash=document.getElementById("flash"), status=document.getElementById("status"), st=document.getElementById("st");
+  const detectBtn=document.getElementById("detect"), note=document.getElementById("detectnote");
+  const hasSerial="serial" in navigator;
+  let chosen=null;
+
+  function gate(){
+    const ready=hasSerial&&chosen;
+    // `disabled`, not `aria-disabled`: the latter is advisory, and the
+    // installer acts on any click that reaches it.
+    if(flash){ flash.disabled=!ready; flash.classList.toggle("off",!ready); }
+    if(!hasSerial) return;  // the unsupported-browser message below owns the status line
+    if(st) st.textContent = chosen
+      ? "Ready to flash the "+NAME[chosen]+". You’ll choose the USB port next."
+      : "Choose your device above to continue.";
+    if(status) status.classList.toggle("no",!chosen);
+  }
+
+  // `.off` stops the pointer, but an anchor with an href stays focusable and
+  // Enter still follows it. The href is only "#" while disabled, so nothing
+  // wrong could be fetched -- this is about the tab order, not the file.
+  function enableDownload(link, href){
+    if(!link) return;
+    link.href=href;
+    link.classList.remove("off");
+    link.removeAttribute("aria-disabled");
+    link.removeAttribute("tabindex");
+  }
+
+  function set(dev){
+    chosen=dev;
+    const fl=document.getElementById("flasher");
+    if(fl) fl.manifest = dev==="x3" ? "manifest-x3.json" : "manifest-x4.json";
+    if(img) img.textContent=IMG[dev];
+    enableDownload(dl, FW[dev]);
+    enableDownload(sd, SD[dev]);
+    btns.forEach(b=>{
+      const on=b.dataset.dev===dev;
+      b.classList.toggle("on",on);
+      b.setAttribute("aria-pressed",on?"true":"false");
+    });
+    gate();
+  }
+
+  btns.forEach(b=>b.addEventListener("click",()=>set(b.dataset.dev)));
+
+  // No default device. `?board=` counts as a choice (the board switch links
+  // here with it), but an unset param no longer becomes an X3 -- which made
+  // flashing the wrong image one missed click for every X4 owner.
+  const qBoard=new URLSearchParams(window.location.search).get("board");
+  if(qBoard==="x3"||qBoard==="x4") set(qBoard); else gate();
+
+  // --- Ask the reader which board it is -----------------------------------
+  //
+  // The firmware prints its board at boot from a hardware probe, so a
+  // mis-flashed reader still reports the truth. Reading the installed image's
+  // identity would instead answer "what was flashed last" -- the wrong board,
+  // confidently offered a second time.
+  // Both match firmware boot output verbatim, so they are a contract:
+  //   VERDICT   <- the "board: probe verdict=" println in fw/src/main.rs. The
+  //                capture is the whole `BoardVerdict` variant name `{:?}`
+  //                renders (hal-ext/src/board_probe.rs) -- matched loosely on
+  //                purpose, so `Inconclusive` is recognised as a real answer
+  //                from current firmware rather than falling through to the
+  //                "older CalendulaOS" case, and a variant added later reads
+  //                as unknown rather than as absent. The trailing \s is
+  //                load-bearing: bytes arrive a chunk at a time, and without a
+  //                terminator the pattern matches a half-received token (`X`
+  //                out of `X3Confirmed`) and returns it as the answer.
+  //   CALENDULA <- the first line main() prints. Tells "ours, but too old" from
+  //                "nothing answered", so the two get different advice.
+  const VERDICT=/board: probe verdict=(\w+)\s/;
+  const CALENDULA=/calendula-os: boot/;
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+  function say(text,bad){
+    if(!note) return;
+    note.textContent=text;
+    note.classList.toggle("bad",!!bad);
+  }
+
+  async function readVerdict(port,ms){
+    const reader=port.readable.getReader();
+    const decoder=new TextDecoder();
+    let text="", timer=null;
+    const deadline=new Promise(r=>{ timer=setTimeout(r,ms); });
+    try{
+      for(;;){
+        const chunk=await Promise.race([reader.read(), deadline.then(()=>null)]);
+        if(!chunk||chunk.done) break;
+        text+=decoder.decode(chunk.value,{stream:true});
+        const m=text.match(VERDICT);
+        if(m) return {verdict:m[1], text:text};
+      }
+    }catch(e){ /* a canceled read lands here; `text` still holds what arrived */ }
+    finally{
+      clearTimeout(timer);
+      try{ await reader.cancel(); }catch(e){}
+      try{ reader.releaseLock(); }catch(e){}
+    }
+    return {verdict:null, text:text};
+  }
+
+  async function detect(){
+    let port=null;
+    detectBtn.disabled=true;
+    say("Checking the reader…");
+    try{
+      port=await navigator.serial.requestPort();
+      await port.open({baudRate:115200});
+      // The board line is printed at startup and nowhere else, and opening the
+      // port does not restart anything -- so pulse the reset line.
+      //
+      // DTR, not RTS. On a USB-UART bridge RTS is the reset line and that is
+      // what every ESP reset snippet reaches for, but these readers are the
+      // ESP32-C3's *native* USB-Serial-JTAG, where the roles land the other way
+      // round. Measured on an X3: pulsing RTS does nothing at all, while
+      // pulsing DTR gives a clean `rst:0x15 (USB_UART_CHIP_RESET)` into a
+      // normal flash boot, with the board line arriving about 0.9 s later. Do
+      // not "correct" this to RTS. Both signals are driven low first because
+      // the API does not promise a known state after open, and the esptool
+      // DTR/RTS dance is deliberately avoided -- it lands in the ROM download
+      // loader, which never prints a board line at all.
+      try{
+        await port.setSignals({dataTerminalReady:false, requestToSend:false});
+        await sleep(50);
+        await port.setSignals({dataTerminalReady:true,  requestToSend:false});
+        await sleep(120);
+        await port.setSignals({dataTerminalReady:false, requestToSend:false});
+      }catch(e){ /* some platforms refuse signal control; a reader the user
+                    restarts by hand still lands in the read below. */ }
+      const found=await readVerdict(port,8000);
+      const board={X3Confirmed:"x3", X4Confirmed:"x4"}[found.verdict];
+      if(board){
+        set(board);
+        say("Found an "+NAME[board]+", and selected it above.");
+      }else if(found.verdict){
+        // The reader answered, and the answer was "I am not sure" -- which is
+        // a real verdict from current firmware, not an old one. It boots
+        // normally in this state, so nothing is wrong with the device.
+        say("This reader could not tell which board it is. That is not a fault — it starts up normally. Please choose your device above.",true);
+      }else if(CALENDULA.test(found.text)){
+        say("This reader runs an older CalendulaOS that cannot report its board. Please choose it above.",true);
+      }else{
+        say("Nothing came back from the reader. Unplug it, plug it in again, then try once more — or choose your device above.",true);
+      }
+    }catch(e){
+      say(e&&e.name==="NotFoundError"
+        ? "No reader was picked. Try again, or choose your device above."
+        : "Could not open the reader over USB. Close any other program using it, then try again.",true);
+    }finally{
+      // The port is exclusive and the Flash button reopens it for itself.
+      if(port){ try{ await port.close(); }catch(e){} }
+      detectBtn.disabled=false;
+    }
+  }
+
+  if(detectBtn){
+    if(hasSerial) detectBtn.addEventListener("click",detect);
+    else{ detectBtn.disabled=true; detectBtn.hidden=true; }
+  }
 
   // Web Serial support gate: no serial API -> steer to Download / SD instead.
-  if(!("serial" in navigator)){
-    const flash=document.getElementById("flash"), status=document.getElementById("status"),
-          st=document.getElementById("st"), dl=document.getElementById("dl");
+  if(!hasSerial){
     if(flash) flash.classList.add("off");
     if(status) status.classList.add("no");
     if(st) st.textContent="Web flashing needs Chrome or Edge on desktop. Otherwise download the .bin and flash it with esptool, or use the SD card below.";
     if(dl) dl.classList.add("lead");
+    say("Choose your device above. Checking it over USB needs Chrome or Edge on the desktop.");
   }
 })();
 </script>
