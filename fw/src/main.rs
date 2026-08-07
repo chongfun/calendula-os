@@ -136,6 +136,8 @@ mod display_flush;
 mod library_sd;
 mod mmu;
 mod ota_update;
+mod probe_cache;
+mod probe_report;
 mod sd_session;
 mod sleep_marker;
 mod sync_mem;
@@ -279,13 +281,89 @@ fn recovery_combo_confirmed(
     }
 }
 
+/// Work out which panel controller this unit carries, fingerprinting it if
+/// this power cycle has not already done so, and hand every pin back.
+///
+/// This is the board layer's half of `hal_ext::epd_probe`: the probe itself
+/// knows nothing about pin numbers, and this function is the only place that
+/// says which GPIO is the panel's clock, data, chip select, D/C and reset. If
+/// a board-profile layer lands later, it supplies these five and the probe is
+/// untouched.
+///
+/// The probe has to run *here* — after `esp_hal::init` gives out the pin
+/// singletons, before `Spi::new` configures SPI2 onto the clock and data lines
+/// — because the read is bit-banged: the SPI peripheral cannot turn its own
+/// MOSI pin around mid-transfer to let the controller answer. The pins are
+/// only borrowed, so their real drivers are built from the same singletons a
+/// few lines later, and on the cached path they are not touched at all.
+///
+/// A live probe costs about 70 ms on the X4 and about 200 ms on the X3
+/// (203 ms measured). The X3's UC8279d is not bench-proven to answer the
+/// short reset pulse, so it gets `ResetEscalation::OnMiss`, and a UC8253
+/// presents the blank-VER shape, so its confirming pass runs at vendor
+/// timing too — two 50 ms pulses rather than none (see
+/// `hal_ext::epd_probe`). It answers a question
+/// about soldered hardware, so `probe_cache` retains the answer for the rest
+/// of the power cycle and a deep-sleep wake pays nothing. The extra reset
+/// pulse a live probe puts on the panel is harmless — the driver's own init
+/// sequence opens with a reset, and e-paper holds its image through both.
+fn resolve_panel_controller(
+    sclk: esp_hal::peripherals::GPIO8<'_>,
+    sda: esp_hal::peripherals::GPIO10<'_>,
+    cs: esp_hal::peripherals::GPIO21<'_>,
+    dc: esp_hal::peripherals::GPIO4<'_>,
+    rst: esp_hal::peripherals::GPIO5<'_>,
+) -> hal_ext::epd_probe::ProbeDiag {
+    use esp_hal::gpio::Flex;
+    use hal_ext::epd_probe::{ProbePins, ResetEscalation};
+
+    if let Some(cached) = probe_cache::load() {
+        esp_println::println!("display: controller probe reused from this power-on");
+        return cached;
+    }
+
+    // The X4's UC8179 answers the cheap screening pulse on every unit benched
+    // so far; the X3's UC8279d has no such evidence behind it, so a missed
+    // screening pass there is retried at the vendor identification timing
+    // rather than written off.
+    let escalation = if cfg!(feature = "device-x3") {
+        ResetEscalation::OnMiss
+    } else {
+        ResetEscalation::Off
+    };
+    let start = Instant::now();
+    let diag = hal_ext::epd_probe::probe(
+        ProbePins {
+            sclk: Flex::new(sclk),
+            sda: Flex::new(sda),
+            cs: Flex::new(cs),
+            dc: Flex::new(dc),
+            rst: Flex::new(rst),
+        },
+        escalation,
+    );
+    // The tiering in `epd_probe` exists to keep this number small on the units
+    // that will never answer, so the number belongs in the telemetry that
+    // proves it rather than in a comment claiming it.
+    bench_log!(
+        "bench: panel_probe verdict={} elapsed_ms={} t_ms={}",
+        diag.verdict.as_str(),
+        start.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
+    probe_cache::store(&diag);
+    diag
+}
+
 #[esp_hal::main]
 fn main() -> ! {
     // Config::default() leaves the ESP32-C3 at 80 MHz; layout, panel byte
     // transforms, and EPUB inflate are all CPU-bound, so run at full speed
     // and rely on race-to-idle for power.
     let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::_160MHz);
-    let peripherals = esp_hal::init(config);
+    // `mut` for the panel-controller probe below, which borrows five pin
+    // singletons and hands them back before their real drivers are built.
+    let mut peripherals = esp_hal::init(config);
     esp_println::println!("calendula-os: boot");
 
     // Deep sleep is terminal, so waking is this cold boot; the RTC wake
@@ -311,11 +389,28 @@ fn main() -> ! {
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
 
+    // The card's chip select comes up first, and before the panel probe below:
+    // that probe bit-bangs the shared SPI bus by hand, and a card left with a
+    // floating CS would see every clock it sends.
+    let sd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
+
+    // The pins are borrowed, not consumed: their real drivers are built from
+    // the same singletons a few lines down. SCK and MOSI have to be probed
+    // before `Spi::new` claims them, and the panel's CS/DC/RST before their
+    // `Output`s exist.
+    let probe_diag = resolve_panel_controller(
+        peripherals.GPIO8.reborrow(),
+        peripherals.GPIO10.reborrow(),
+        peripherals.GPIO21.reborrow(),
+        peripherals.GPIO4.reborrow(),
+        peripherals.GPIO5.reborrow(),
+    );
+    display_flush::record_probe_verdict(probe_diag.verdict);
+
     let epd_cs = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
     let epd_dc = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
     let epd_rst = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
     let epd_busy = Input::new(peripherals.GPIO6, InputConfig::default());
-    let sd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
     let power_button = Input::new(
         peripherals.GPIO3,
         InputConfig::default().with_pull(Pull::Up),
@@ -428,7 +523,7 @@ fn main() -> ! {
             spawner.spawn(tasks::input::battery_run(battery_gauge).unwrap());
         }
         esp_println::println!("main: spawn display t_ms={}", Instant::now().as_millis());
-        spawner.spawn(tasks::display::run(epd_bus, sd_cs, deep_sleep_wake).unwrap());
+        spawner.spawn(tasks::display::run(epd_bus, sd_cs, deep_sleep_wake, probe_diag).unwrap());
         esp_println::println!("main: spawn power t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
         esp_println::println!("main: spawn app t_ms={}", Instant::now().as_millis());

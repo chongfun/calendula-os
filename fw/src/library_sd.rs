@@ -8,7 +8,9 @@ use reader_cache::store::{
     derive_catalog_label, source_hash, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW,
 };
 
-const CATALOG_ROOT_DIR: &str = "XTEINK";
+/// Every file this firmware owns on the card lives here, catalog and
+/// diagnostics alike (see `crate::probe_report`).
+pub(crate) const CATALOG_ROOT_DIR: &str = "XTEINK";
 const CATALOG_FILE: &str = "CATALOG.BIN";
 use proto::catalog::{
     catalog_file_len, catalog_identity_staged, catalog_record_identity, decode_catalog_record,
@@ -967,7 +969,7 @@ pub(crate) fn write_catalog_listing(
     .unwrap_or(0)
 }
 
-fn open_or_make_dir<
+pub(crate) fn open_or_make_dir<
     'a,
     D,
     T,

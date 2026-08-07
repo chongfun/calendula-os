@@ -61,6 +61,15 @@ changes are host-verified.
 The board is a compile-time feature (workspace default is X4); X3 commands carry
 `--features device-x3`.
 
+Newer production runs of both readers ship a different panel controller behind
+the same glass and case — a UC8279d in place of the X3's UC8253, a UC8179 in
+place of the X4's SSD1677 — and nothing on the outside tells you which one you
+have. The reader asks the panel directly once per power-on — waking from sleep
+reuses the answer — and writes it to `/XTEINK/PROBE.TXT` on the card, so a unit
+that renders wrong can be diagnosed without a serial cable. Drivers for the two
+newer controllers are not written yet; a unit carrying one runs the existing
+driver, exactly as it did before the check existed.
+
 ## Development
 
 Install Rust with `rustup`, then the firmware target and the flashing tool:

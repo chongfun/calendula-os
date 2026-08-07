@@ -70,7 +70,12 @@ static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
 #[embassy_executor::task]
-pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool) {
+pub async fn run(
+    mut epd: Epd,
+    mut sd_cs: Output<'static>,
+    deep_sleep_wake: bool,
+    probe_diag: hal_ext::epd_probe::ProbeDiag,
+) {
     esp_println::println!("display: started t_ms={}", Instant::now().as_millis());
 
     static FB: static_cell::StaticCell<Framebuffer> = static_cell::StaticCell::new();
@@ -147,6 +152,13 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
         Ok(_) => {}
         Err(e) => esp_println::println!("display: update check skipped: {:?}", e),
     }
+
+    // Park the boot probe's verdict on the card. It goes here, on the storage
+    // task, because SD access lives behind this task's shared SPI bus — and
+    // after the update check, so a boot that is about to reflash and reset
+    // does not spend a card write on a report the new image will rewrite. The
+    // card is warm by now, so this is a file write, not another cold acquire.
+    crate::probe_report::write(&mut epd, &mut sd_cs, &probe_diag);
 
     // Flash-path self-test (feature `ota-selftest` only, off in release): copy
     // the running image into the inactive slot and boot into it, once. A card-

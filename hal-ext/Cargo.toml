@@ -7,6 +7,10 @@ edition = "2021"
 workspace = true
 
 [dependencies]
+# For `display::epd::probe`, the sans-IO half of the panel-controller
+# fingerprint. This crate drives the pins; the decision rules live where the
+# host can test them.
+display = { path = "../display" }
 esp-hal = { version = "1.1.1", features = ["esp32c3", "unstable"] }
 embassy-time = "0.5.1"
 embassy-sync = "0.8.0"
