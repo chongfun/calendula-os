@@ -369,5 +369,8 @@ reads only that folder's records and cached titles (R13, R14).
    delivers a visible improvement on its own — uploads stop being cryptic —
    without any of the identity or cache work. Land it first as its own
    slice?
-5. Is there anything else unsynced from upstream that this PRD would
-   otherwise reinvent? `7f9856d` was found only by tracing a comment.
+5. *(answered)* Eight upstream commits are unsynced as of 2026-08-07. Two
+   bear on this PRD: `7f9856d` (long names, §4.7) and `9b0123d` "Preserve
+   UTF-8 in catalog labels". The rest are OTA partition layout and SD
+   firmware-picker work. Worth a deliberate sync pass before implementing,
+   since `7f9856d` was found only by tracing a stale comment.
