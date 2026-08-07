@@ -25,10 +25,33 @@ are load-bearing and are not derivable from the datasheets:
    `0xFF` as floating-bus artifacts, and require `BUSY_N` (bit 0) asserted —
    idle. Without this check a floating bus produces plausible-looking bytes and
    the probe confirms a controller that is not there.
-3. **Do not gate on BUSY during the probe.** Which controller is present is the
-   unknown, so its BUSY polarity is also unknown — the two families are opposite
-   (SSD1677 active-high; UC8253 two-phase, idle high). Use a flat delay after a
-   50 ms reset pulse, sized to cover every UC81xx power-up.
+3. **Do not gate on BUSY during the probe, and tier the reset pulse.** Which
+   controller is present is the unknown, so its BUSY polarity is also unknown —
+   the two families are opposite (SSD1677 active-high; UC8253 two-phase, idle
+   high). Use a flat delay after the reset pulse instead, sized to cover every
+   UC81xx power-up (upstream: 2 ms high, the pulse low, then 30 ms settle).
+
+   The pulse length is **tiered, not a flat 50 ms**. The vendor identification
+   path holds RST_N low for 50 ms — far beyond the datasheet's 50 µs minimum,
+   because the ID readback is less forgiving than normal operation — but paying
+   that on both passes costs ~100 ms on every boot *and every wake* of the
+   SSD1677 and UC8253 units that are the entire installed base, which gain
+   nothing from it. Upstream `ca93e3d` therefore screens with a **1 ms** pulse on
+   pass 1 and spends the 50 ms only as the confirm pass after a UC81xx hit,
+   whose VER bytes become the authoritative readback:
+
+   | Pass | Pulse | Condition |
+   |---|---|---|
+   | 1 (screen) | 1 ms | always |
+   | 1 (escalate) | 50 ms | only if the screen failed **and** the board is X3-family |
+   | 2 (confirm) | 50 ms if pass 1 matched, else 1 ms | always |
+
+   The escalation is deliberately X3-only: upstream's comment is that "the X4
+   family keeps the cheap path — its UC8179 is bench-proven to answer the 1 ms
+   pulse", while an X3 sibling that answers only at vendor timing is still
+   possible and that board's boot budget tolerates the retry. That asymmetry is a
+   bench finding, not a datasheet reading, and it is the whole reason the timing
+   is not uniform.
 4. **RMTP (0xA2) is the escalation path, not just a third register.** When VER
    reads as floating with `ver[0] == 0xFF` but FLG is driven and both passes
    agree, dump the MTP and confirm on `mtp[0] == 0xA5`, the refresh-enable key.
@@ -92,6 +115,7 @@ things on that board. See `reterminal-sticky-support` non-goals.
 - The verdict is two-pass with agreement; a single stray answer resolves to `DefaultAssumed`.
 - FLG is validated as driven (not `0x00`/`0xFF`) with `BUSY_N` asserted before any confirmation.
 - The probe does not wait on BUSY; a flat post-reset delay covers power-up for either controller family.
+- The reset pulse is tiered per the table in rule 3: a 1 ms screening pass, the 50 ms vendor timing spent only on the confirm pass after a match, and the 50 ms escalation compiled only into X3 builds. Measured against the pre-probe baseline, the added boot cost on an SSD1677 or UC8253 unit is the screening pass plus its settle, not two vendor-timing pulses.
 - The RMTP `mtp[0] == 0xA5` escalation is implemented for the floating-VER case.
 - The probe runs at boot after GPIO init but before SPI2 peripheral configuration, and releases its pins afterwards.
 - The result is stored in a `static AtomicU8` accessible to the flush module.
@@ -114,3 +138,13 @@ register to read. Added the pin-sourcing and S3-exclusion notes so this probe an
 `reterminal-sticky-support` do not collide, and a cross-reference to the new
 `board-identity-guard` PRD, which owns the adjacent "which board am I" question.
 Scope and intent are unchanged.
+
+**2026-08-06 (later)** — Corrected rule 3 from the upstream sweep. The rule said
+a flat 50 ms reset pulse, which was the reference implementation's behaviour up to
+freeink `ca93e3d` (2026-08-02) and is now two passes' worth of vendor timing that
+commit exists to avoid — ~100 ms on every boot and every wake of exactly the
+SSD1677/UC8253 units this probe is supposed to leave untouched. Replaced with the
+tiered scheme and its X3-only escalation, and added the matching acceptance line.
+Nothing else about the probe changed: two-pass agreement, the FLG driven-status
+check, the RMTP escalation, and the NVS-is-diagnostics rule all still hold as
+written.

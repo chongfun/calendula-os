@@ -92,7 +92,7 @@ is the opposite of what was expected when this started.
 | 1 | **A13 — FastClean's 200 ms trailing settle** | A | Measured: `flush_ms` 686 against `busy_ms` 455, and the 204 ms tail is a `DelayMs(200)` whose only job is to precede the *next* RAM write — which already happens after `Settled`. Pure reordering. **−200 ms (−29%) on every view change, every wake, every menu step.** | S |
 | 2 | **A12 — the 136 ms that is not waveform drive** | A | `busy_ms = 136.0 + 12.79 × frames` fits three modes to under 1 ms. 136 ms is **36% of every Fast BUSY** and is controller interval, not drive. Prime suspect is a CDI nibble never varied since the reference driver. **One byte, one capture; potentially ~77–100 ms off every refresh = 18–24% of a page turn.** Test before building. | S to test |
 | 3 | **A14 — frame-identity guard at the flush seam** | A | **G2 shipped as #56**, so the double repaint is gone. A14 remains worth landing: `fb == prev_fb` catches an identical frame from *any* cause — the 62-refresh end-of-book case, the loading plate's duplicate flush, six no-op input sites — and being below the reducer it cannot strand the reader the way an event-layer suppression can. Measure the hit rate first (`identical=<bool>` on `bench: render`); under ~2% outside the known cases, drop it. | S–M |
-| 4 | **C2** — measure sleep current with the fuel gauge, then hold GPIOs if it indicts them | C | **Unblocked 2026-07-30: the first-line experiment needs no meter and no disassembly.** The X3's BQ27220 sits on the battery and keeps integrating while the SoC is in deep sleep, so a charge-register read, a 24–72 h sleep, and a second read give average standby draw. Over 48 h, 15 µA is 0.72 mAh against 300 µA's 14.4 mAh — decisive even at 1 mAh resolution, and a null result *is* the answer. Cost is one register and one `println!`. The series meter drops to a follow-up for if it comes back high. | S |
+| 4 | **C2** — measure sleep current with the fuel gauge, then hold GPIOs if it indicts them | C | **Unblocked 2026-07-30: the first-line experiment needs no meter and no disassembly.** The X3's BQ27220 sits on the battery and keeps integrating while the SoC is in deep sleep, so a charge-register read, a 24–72 h sleep, and a second read give average standby draw. Over 48 h, 15 µA is 0.72 mAh against 300 µA's 14.4 mAh — decisive even at 1 mAh resolution, and a null result *is* the answer. Cost is one register and one `println!`. The series meter drops to a follow-up for if it comes back high. **The "which GPIOs" half now has two named suspects from the 2026-08-06 upstream sweep, so a high reading has somewhere to go: (a) the X3 SD rail on GPIO13 — we drive that pin nowhere and so never cut the card for sleep, and freeink confirmed the pin by factory-firmware RE (`x3-sd-rail-sleep-power`); and (b) the panel RST line floating in deep sleep, closed unmerged as PR #70, which upstream reports as ~36 h-to-dead on a UC8179 while calling the SSD1677 tolerant. Neither is confirmed on our hardware and the gauge cannot separate them, but the card can be removed outright for a control run, making (a) the cheaper one to isolate.** | S |
 
 ### Tier 2 — gated on a Tier 0 measurement
 
@@ -428,11 +428,34 @@ matters — without it the idea comes back.
   `.bss` byte trades **1:1** against the main stack. Hoisting is neutral at
   best and a net loss when the temporary was not on the peak call chain. Only
   deleting `.bss`, or shrinking a frame on the peak chain, buys margin.
+- **Holding the panel RST line through deep sleep, on the hardware we ship.**
+  Closed unmerged as PR #70 — the one entry here that was decided rather than
+  measured, so the condition matters more than usual. Upstream's ~36 h-to-dead
+  field report names the **UC8179**, whose DC-DC booster is host-programmed via
+  BTST and restarts off a drifting RST; it calls the SSD1677 tolerant, having no
+  external booster and a deep sleep that actively discharges. Two separate
+  reasons not to re-propose it as written: today's units are SSD1677 and UC8253,
+  and #70's `rst.set_high()` would not have worked anyway, because a C3 pad goes
+  high-Z in deep sleep whatever level it was last driven to. It comes back only
+  with `uc8179-x4-driver` or `uc8279-x3-driver`, and then as a pad hold armed
+  before sleep and released before the wake reset pulse — both halves, or the
+  reset pulse bounces off the latch. Tracked on those two PRDs. The separate SD
+  rail suspect is `x3-sd-rail-sleep-power`; do not conflate them.
 
 ## Doc drift to fold into whichever PR touches the area
 
 - `hal_ext::rtc::enter_light_sleep_timer` has zero call sites. Either wire it
   up behind C4's successor tier or delete it.
+- `docs/FLASHING.md`'s open "Locked-unit confirmation" box describes only the
+  stock **bootloader's** descriptor gate. It does not mention the separate risk
+  that a locked X3's OEM SD updater rejects `update.bin` through the buggy
+  app-side validator in the stock firmware — garbage eFuse block revisions read
+  via a misaligned `bootloader_mmap`, which CrossPoint documents and works around
+  in its own shipped app. Nothing we ship can change that outcome, since the bug
+  is in the firmware being replaced, which is exactly why it belongs in the doc
+  next to the existing box rather than in a PRD. (The PRD that asked whether we
+  needed CrossPoint's linker wrap was removed: we link no ESP-IDF, so there is no
+  such symbol in our image.)
 
 The other two entries that lived here are resolved: `ARCHITECTURE.md` no
 longer claims a 1.5 s wake unconditionally (C1 landed and the doc now states
