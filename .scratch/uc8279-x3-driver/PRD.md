@@ -99,3 +99,35 @@ a porter following the doc would build the version that leaves the panel dark.
 The RST-hold cross-reference is here because this controller's host-programmed
 BTST rails put it in the UC8179's class, not the SSD1677's, which is what made
 closing PR #70 safe for today's hardware.
+
+**2026-08-07** — The dispatch dependency is satisfied:
+`panel-controller-detection` is implemented on
+`feature/runtime-display-controller-detection` (58f5fa0). `fw::display_flush`
+now routes `init_panel`/`flush`/`prestage_previous`/`sleep_panel` through a
+`DetectedController`, and the arm this driver plugs into is marked in the
+source. Until it lands, a confirmed UC8279d runs the UC8253 backend — no worse
+than before the probe existed, and it means shipping this driver is the moment
+the probe's verdict starts changing behaviour rather than just being recorded.
+
+**Read this before trusting the probe's verdict on X3.** Bench-validating the
+probe turned up something that lands squarely on this PRD: a *shipping UC8253*
+answers the fingerprint with `VER = FF FF FF FF FF` and `FLG = 0x13` — byte for
+byte the field-UC8279d signature the detection PRD's rule 4 exists to recover.
+Its status line is genuinely driven; only its VER and MTP come back blank. The
+single discriminator between the two controllers this PRD spans is the RMTP
+dump opening with the `0xA5` key.
+
+Two consequences for the port. First, "the panel answered `0x71`, so it is a
+UC8279" is false on this hardware, and any bring-up shortcut resting on it will
+drive UC8253 units with the wrong protocol. Second, the UC8279d units that
+motivate this driver are described upstream as sometimes shipping with a *blank
+MTP* (hence PSR REG=1 and the external LUTs above) — so it is worth checking on
+first real hardware whether a blank-MTP UC8279d can also produce a dump without
+the `0xA5` key. If it can, the probe would classify that unit as a UC8253 and
+this driver would never be selected for it. That is a safe failure today and a
+silent one once this driver exists, so it belongs in this PRD's bring-up list
+rather than the detection PRD's.
+
+The host test `a_shipping_uc8253_is_only_told_apart_by_its_mtp` in
+`display::epd::probe` pins the observed bytes and is the fastest way to see the
+shape of the problem.

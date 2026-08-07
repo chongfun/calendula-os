@@ -70,3 +70,22 @@ mistaken for arbitrary, and scoped the latter two out. The substantive addition 
 the deep-sleep RST hold: this is the controller upstream's ~36 h battery-drain
 field report names, so the dependency belongs on this PRD even though PR #70 was
 closed unmerged for the SSD1677 units we actually ship.
+
+**2026-08-07** — The dispatch dependency is satisfied:
+`panel-controller-detection` is implemented on
+`feature/runtime-display-controller-detection` (58f5fa0). `fw::display_flush`
+routes the four panel operations through a `DetectedController` read from the
+boot probe, and the arm this backend plugs into is marked in the source. Until
+it lands, a confirmed UC8179 runs the SSD1677 backend — unchanged behaviour,
+not a dark panel.
+
+The probe was bench-validated on an X3 only; no X4 hardware exists here, so the
+SSD1677 side of the negative path is host-verified rather than measured. Two
+details from that work matter to this port. The X4 build deliberately does
+*not* compile the 50 ms reset escalation (the UC8179 is bench-proven upstream
+to answer the 1 ms screening pulse), so if a real UC8179 ever fails to be
+detected, that asymmetry is the first thing to revisit. And `VER` byte 2
+(`LUT_VER`) is captured in the probe's diagnostics and written to
+`/XTEINK/PROBE.TXT`: it is what separates a UC8179 (`0x01`) from a UC8279 in
+X4 clothing (`0x02`/`0x68`/`0x69`), which is the discriminator this PRD will
+need if X4 units turn out to carry either.

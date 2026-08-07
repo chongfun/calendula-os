@@ -1,6 +1,7 @@
 # Runtime display controller detection
 
-Status: ready-for-agent
+Status: implemented on `feature/runtime-display-controller-detection` (58f5fa0),
+X3-validated; awaiting review and merge
 
 ## Problem
 
@@ -148,3 +149,77 @@ tiered scheme and its X3-only escalation, and added the matching acceptance line
 Nothing else about the probe changed: two-pass agreement, the FLG driven-status
 check, the RMTP escalation, and the NVS-is-diagnostics rule all still hold as
 written.
+
+**2026-08-07** — Implemented and bench-validated on an X3. Every acceptance
+line above is met except the three named at the end of this entry.
+
+**The bench found the guard that carries this feature.** A shipping UC8253 X3
+answers the probe with `VER = FF FF FF FF FF` and `FLG = 0x13` — byte for byte
+the signature rule 4 attributes to a *field UC8279d*. Its status line is
+genuinely driven, so the driven-FLG check admits it; its VER is blank and both
+passes agree, so the blank-VER recovery is fully armed. The only thing between
+that unit and a false sibling confirmation is its MTP dump reading all `FF`
+instead of opening with `0xA5`.
+
+So rule 4 is not a third register read and not defence in depth. Relax it and
+this firmware misidentifies the installed base it was written for, on hardware
+we have in hand. Pinned as the host test
+`a_shipping_uc8253_is_only_told_apart_by_its_mtp`, built from the observed
+bytes. This also invalidates a claim the Context made in passing: the UC8253
+does *not* leave the bus floating. It answers `0x71` with a real status and
+only its VER and MTP come back blank, which is a much narrower difference than
+"does not respond" suggests. Anyone touching this matcher should read that
+test first.
+
+**Deviations from Scope, all deliberate.** The decision rules did not stay in
+`hal-ext/src/epd_probe.rs`; they live in a new sans-IO `display::epd::probe`,
+with `epd_probe` reduced to pins, reset timing and the bit-bang. `hal-ext` has
+no host tests, and with no UC8179 or UC8279d hardware in existence the
+confirming path's only possible evidence is host tests — so the rules had to go
+where they could be exercised. Fourteen of them now cover the two-pass
+agreement, the floating-bus rejections, the MTP escalation and the byte
+encoding. The cost is a `display` path dependency on `hal-ext`, which is the
+one architectural call in this change worth a second opinion.
+
+NVS `hw_calib/screenType` is not read at all. The acceptance line permits this
+("if read at all"), and an ESP-IDF NVS parser is a large addition for a value
+that must never be dispatched on; `PROBE.TXT` explains what it is instead. The
+S3 exclusion is `#[cfg(target_arch = "riscv32")]` on the module, which is
+compile-checked but unrunnable until an Xtensa build exists.
+
+**One addition the PRD did not ask for.** The probe answers a question about
+soldered hardware, and nothing reaches a soldering iron without disconnecting
+the battery, so the scope of one probe is one *power cycle* rather than one
+boot. `fw::probe_cache` retains the verdict in RTC fast RAM; a deep-sleep wake,
+OTA reset or crash reboot reuses it and pays nothing. RTC RAM specifically, and
+for the same reason rule 6 refuses to dispatch on NVS: flash, NVS and the SD
+card all survive being copied onto another unit, so a verdict cached there can
+outlive the hardware it describes. RTC RAM is zeroed on first power-on, which
+is also the earliest moment the panel could have changed. *Bench note:* a
+software reset now reuses the verdict, so re-running the probe takes a power
+cycle; `main` logs which path each boot took.
+
+**Measured, X3, 2026-08-07.** Twelve consecutive live probes (temporary
+cache-bypass build), all `default-assumed -> UC8253`, no `Inconclusive` on any
+run. 154 ms against 152 ms computed from the constants, the difference being
+the actual bit-banging. The full X3 tier ladder runs — 1 ms screen, 50 ms
+escalation on the miss, 1 ms confirm — and the escalation is dead-code
+eliminated from the X4 binary outright (three `run_pass` call sites there
+against four on X3, confirmed by disassembly), so "compiled only into X3
+builds" holds literally. Home renders unchanged at 929 + 379 ms with a 24 ms
+prestage. `PROBE.TXT` was read back off the device: 447 bytes, correct.
+Deep-sleep retention is witnessed rather than assumed — the linker packs
+`sleep_marker` between the cache's two statics in one 64-byte
+`.rtc_fast.persistent` region, so a wake rendering as one quick flicker proves
+the bytes either side of `SLEEP_IMAGE` were retained too.
+
+RAM +112 B `.bss` and +60 B RTC fast RAM; flash +6.1 KB `.text`, +808 B
+`.rodata`. Worst stack frame unchanged. `tools/check.sh all` passes, as do
+`ota-selftest` for both devices.
+
+**Not proven, and not provable here.** The confirming path, which has no
+hardware to run on. The ESP32-S3 exclusion, until an Xtensa build exists. The
+`page-turn` and `sleep-sync` bench suites, which need an operator on the
+buttons — the render path is untouched by this change (the dispatch lands on
+the same backend) and a normal Home render was observed, but that is an
+observation, not those suites.
