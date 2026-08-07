@@ -173,15 +173,21 @@ pub fn agrees_on_uc81xx(pass1: &PassReading, pass2: &PassReading) -> bool {
     pass1.matches_uc81xx() && pass2.matches_uc81xx() && pass1.ver == pass2.ver
 }
 
-/// Whether the MTP dump is worth taking, given two passes.
+/// Whether the MTP dump is worth taking.
 ///
 /// Read it whenever *something* was driving the status line: on a confirmed
 /// part it is diagnostics, and on the blank-VER path of rule 3 it is the
 /// discriminator itself. A part without RMTP (UC8253, the SSD family) floats
 /// the line and reads uniform garbage here, which is exactly what the key test
 /// rejects.
-pub fn should_read_mtp(pass1: &PassReading, pass2: &PassReading) -> bool {
-    agrees_on_uc81xx(pass1, pass2) || pass1.flg_is_driven()
+///
+/// Pass 1 alone decides, and pass 2 is not a parameter because it cannot
+/// change the answer: [`agrees_on_uc81xx`] entails
+/// [`PassReading::matches_uc81xx`] for pass 1, which entails the driven status
+/// tested here, so an `agrees || driven` form would only restate its own second
+/// operand.
+pub fn should_read_mtp(pass1: &PassReading) -> bool {
+    pass1.flg_is_driven()
 }
 
 /// The blank-VER shape rule 3 recovers: a driven status over a VER that read
@@ -317,7 +323,7 @@ mod tests {
         // Every precondition of the recovery holds...
         assert!(observed.flg_is_driven(), "0x13 is a real idle status");
         assert!(observed.ver_is_floating());
-        assert!(should_read_mtp(&observed, &observed), "so the MTP is read");
+        assert!(should_read_mtp(&observed), "so the MTP is read");
 
         // ...and the dump is the only thing that refuses it.
         assert_eq!(
@@ -517,13 +523,10 @@ mod tests {
     /// status line — that is what makes the rule 3 recovery reachable at all.
     #[test]
     fn the_mtp_is_read_whenever_the_status_line_is_driven() {
-        assert!(should_read_mtp(&UC8179, &UC8179));
-        assert!(should_read_mtp(
-            &BLANK_VER_DRIVEN_FLG,
-            &BLANK_VER_DRIVEN_FLG
-        ));
-        assert!(!should_read_mtp(&FLOATING_HIGH, &FLOATING_HIGH));
-        assert!(!should_read_mtp(&FLOATING_LOW, &FLOATING_LOW));
+        assert!(should_read_mtp(&UC8179));
+        assert!(should_read_mtp(&BLANK_VER_DRIVEN_FLG));
+        assert!(!should_read_mtp(&FLOATING_HIGH));
+        assert!(!should_read_mtp(&FLOATING_LOW));
     }
 
     /// The report should carry the VER read under the vendor's identification

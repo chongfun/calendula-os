@@ -54,6 +54,15 @@ const IDENTIFY_RESET_MS: u32 = 50;
 /// the two families are opposite (SSD1677 active-high, UC8253 two-phase and
 /// idle-high). A flat delay is the only handshake available.
 const POST_RESET_SETTLE_MS: u32 = 30;
+/// RST_N is driven high and allowed to settle before the pulse, so the low
+/// edge the controller sees is a real transition rather than the tail of
+/// whatever level the pin came up at.
+///
+/// Deliberately its own constant despite sharing a value with
+/// [`INTER_PASS_MS`]: one is a property of the reset waveform and the other
+/// of the gap between passes, and folding them together would couple two
+/// timings that have no reason to move in step.
+const PRE_RESET_HIGH_MS: u32 = 2;
 /// Quiet gap between passes, so the next one starts from a settled bus.
 const INTER_PASS_MS: u32 = 2;
 /// Half a bit period at ~500 kHz — slow enough to be timing-safe on a bus
@@ -165,7 +174,7 @@ pub fn probe(pins: ProbePins<'_>, escalation: ResetEscalation) -> ProbeDiag {
     let pass2 = bus.run_pass(reset2);
 
     let mut mtp = [0u8; MTP_BYTES];
-    let mtp_valid = probe::should_read_mtp(&pass1, &pass2);
+    let mtp_valid = probe::should_read_mtp(&pass1);
     if mtp_valid {
         // RMTP answers with one dummy byte before the MTP image itself.
         let mut raw = [0u8; MTP_BYTES + 1];
@@ -226,7 +235,7 @@ impl ProbeBus<'_> {
     /// Hardware reset, flat settle, then FLG and VER.
     fn run_pass(&mut self, reset_low_ms: u32) -> PassReading {
         self.pins.rst.set_high();
-        self.delay.delay_millis(2);
+        self.delay.delay_millis(PRE_RESET_HIGH_MS);
         self.pins.rst.set_low();
         self.delay.delay_millis(reset_low_ms);
         self.pins.rst.set_high();

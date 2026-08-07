@@ -89,9 +89,9 @@ fn render<const N: usize>(out: &mut heapless::String<N>, diag: &ProbeDiag) {
     if diag.mtp_valid {
         let _ = writeln!(out, "mtp[0x000..0x{:03X}]:", MTP_BYTES - 1);
         for (index, byte) in diag.mtp.iter().enumerate() {
-            let separator = if index % 16 == 0 { "" } else { " " };
+            let separator = if index.is_multiple_of(16) { "" } else { " " };
             let _ = write!(out, "{separator}{byte:02X}");
-            if index % 16 == 15 {
+            if (index + 1).is_multiple_of(16) {
                 let _ = writeln!(out);
             }
         }
