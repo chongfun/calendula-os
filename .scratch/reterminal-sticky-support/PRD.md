@@ -173,6 +173,34 @@ Validate electrically if practical, or at minimum with repeated battery-only dee
 
 A power-on reset after the wake button is not acceptable evidence of successful deep-sleep wake.
 
+### Global hold reconciliation
+
+The global digital deep-sleep hold is distinct, sticky state: individual pad holds choose which pads participate, while the global enable arms their retention across deep sleep — and it stays armed for every subsequent deep sleep until explicitly disabled.
+
+Early boot must therefore also normalize the global state. After the required latch and rail output states have been established and their inherited individual holds have been reconciled, disable the global deep-sleep hold. Individual rail pads intentionally kept held while powered off may remain individually held; disabling the global deep-sleep hold does not require releasing them during active execution.
+
+In ESP-IDF terms this corresponds conceptually to `gpio_deep_sleep_hold_dis()`.
+
+The normal sleep path re-enables the global deep-sleep hold only after all latch and rail pads that must survive deep sleep have been individually placed into their intended sleep state and held.
+
+The resulting lifecycle:
+
+```text
+boot
+  ->
+reconcile latch/rail pin states
+  ->
+release/retain individual holds as intended
+  ->
+disable global deep-sleep hold
+  ->
+normal runtime
+  ->
+terminal sleep re-enables it as the last step before the sleep instruction
+```
+
+Without this, a later individual hold — including one introduced by future platform code — silently becomes deep-sleep persistent before the deliberate sleep sequence ever arms it.
+
 ### Strapping-pin caution
 
 GPIO45 and GPIO46 are ESP32-S3 strapping pins.
@@ -583,6 +611,7 @@ No full app integration requirement.
 - 50 battery cold boots pass
 - latch survives button release
 - flashing/resetting from a state where latch and rail pads were deliberately left held recovers on the next boot without full power removal
+- after boot reconciliation the global digital deep-sleep hold is disabled for normal runtime
 - display full/fast modes work and are timed
 - SD works
 - hundreds of SD/display alternations pass
@@ -710,7 +739,7 @@ If SSD1677 configuration changes shared code, prove X4 emits the same existing c
 3. `hal-ext` GT911/BQ27220 remain MCU-neutral.
 4. `fw-s3` owns concrete peripherals.
 5. GPIO45/46 latch handling and held rail-enable pads use the S3 digital deep-sleep hold mechanism rather than an RTC-GPIO assumption.
-6. held latch and rail-enable outputs are restored to their intended GPIO configuration before hold release on every boot, regardless of reset/wakeup cause.
+6. every boot reconciles both individual pad holds and the global digital deep-sleep-hold state before entering normal runtime, restoring held latch and rail-enable outputs to their intended configuration before any hold release.
 7. genuine deep-sleep wake is distinguished from cold boot.
 8. touch pin-mode switching remains platform-owned.
 9. input converges at the semantic application boundary.
