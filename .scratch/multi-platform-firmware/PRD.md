@@ -703,6 +703,7 @@ Use thin concrete task wrappers when needed.
 - C3 behavior remains unchanged
 - channel extraction retains `CriticalSectionRawMutex`
 - all C3 checks remain green
+- C3 release flash/RAM size and stack-frame results are re-compared against the pre-extraction baseline; material deltas caused by the crate split are investigated (fat LTO usually restores cross-crate inlining, but measurement decides)
 
 ### Milestone 3: Clean platform ownership
 
@@ -722,6 +723,7 @@ Scope:
 - no shared task type contains a concrete ESP peripheral
 - dependency checks enforce the architecture
 - X3/X4 remain unchanged
+- C3 flash/RAM/stack measurements are re-compared after the moves; a source-only relocation is not assumed free
 
 ### Milestone 4: S3 platform proof
 

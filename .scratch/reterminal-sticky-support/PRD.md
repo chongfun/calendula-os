@@ -145,6 +145,8 @@ The Rust implementation should use the appropriate `esp-hal`/low-level mechanism
 
 The behavioral requirement is normative.
 
+If the pinned `esp-hal` does not expose this digital pad-hold path, implement it as a narrow, documented register-level helper inside `fw-s3`. Do not silently skip the hold because a convenient API is missing.
+
 ### Wake handoff
 
 A held digital GPIO may retain its pre-sleep physical state while its normal GPIO configuration has reset.
@@ -608,6 +610,8 @@ Add:
 - every existing screen is navigable
 - post-wake GT911 initialization is reliable
 - repeated gestures produce no stuck/duplicate state
+- touch activity resets the shared idle timer, and an in-progress touch cannot trigger sleep
+- touch rail cycling does not destabilize I²C or battery sampling
 
 ## Final validation
 
@@ -690,6 +694,14 @@ If SSD1677 configuration changes shared code, prove X4 emits the same existing c
 7. **GT911 orientation.** Center taps can work while edges remain mirrored/offset.
 8. **S3 memory overengineering.** Measure before importing C3 workarounds.
 9. **Premature multicore.** Explicitly deferred.
+
+## References
+
+- Seeed reTerminal Sticky hardware documentation and V01 schematic/pinout (latch wiring, rails, buttons, touch).
+- FreeInk SDK Sticky `BoardConfig` (pin map including `PWR_HOLD` GPIO45 / `PWR_LOCK` GPIO46), SSD1677 update-control/border-waveform values, GT911 initialization, and power-management/rail shutdown behavior.
+- CrossPoint Reader v1.5+ Sticky support as a second independently working implementation.
+- ESP32-S3 Technical Reference Manual and ESP-IDF GPIO documentation for the digital pad-hold path (`gpio_hold_en`, `gpio_deep_sleep_hold_en`) and the strapping roles of GPIO45/46.
+- CalendulaOS Multi-platform firmware architecture PRD for `fw-common`/`fw-s3`/`hal-ext` ownership boundaries and the S3 toolchain contract.
 
 ## Done when
 
