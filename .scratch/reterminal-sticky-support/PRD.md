@@ -147,22 +147,29 @@ The behavioral requirement is normative.
 
 If the pinned `esp-hal` does not expose this digital pad-hold path, implement it as a narrow, documented register-level helper inside `fw-s3`. Do not silently skip the hold because a convenient API is missing.
 
-### Wake handoff
+### Early-boot hold reconciliation
 
-A held digital GPIO may retain its pre-sleep physical state while its normal GPIO configuration has reset.
+A held digital GPIO may retain its physical state while its normal GPIO configuration has reset — and pad hold is not exclusively a deep-sleep mechanism. Hold can survive system reset, watchdog reset, and reflashing, and a previous firmware may have left latch or rail pads held.
 
-Therefore **do not simply disable the latch hold immediately on wake**.
+The boot path must therefore survive at minimum:
 
-The wake boot path must:
+- deep-sleep wake with holds active;
+- watchdog/software reset while a pad is held;
+- USB-powered reset after sleep;
+- reflashing while a prior firmware left a pad held;
+- booting after another Sticky firmware that uses pad hold.
 
-1. detect/assume that latch pads may still be held from deep sleep;
-2. restore the latch GPIO configuration to output/asserted HIGH while physical hold remains active;
-3. only then release the individual/global hold as appropriate;
-4. continue normal boot.
+On every boot, regardless of reset/wakeup cause, assume latch and switched-rail pads may retain a previous hold state.
+
+For PWR_HOLD/PWR_LOCK: configure the desired asserted output state while any existing hold remains active, then release the individual hold so the physical pin transitions directly to the asserted state without a glitch.
+
+For switched rails: establish the desired early-boot state while held. Rails intended to remain off may stay individually held until their peripheral is initialized. Before enabling a peripheral, configure its enable pin to the required ON state and only then release that pad's hold.
+
+Do not rely on the recorded wake cause to decide whether this reconciliation is necessary.
 
 The latch output must never glitch LOW during this handoff.
 
-Validate this electrically if practical, or at minimum with repeated battery-only deep-sleep cycles designed to expose accidental power loss.
+Validate electrically if practical, or at minimum with repeated battery-only deep-sleep cycles designed to expose accidental power loss.
 
 A power-on reset after the wake button is not acceptable evidence of successful deep-sleep wake.
 
@@ -213,13 +220,11 @@ Before deep sleep, drive every switched peripheral rail to its intended sleep le
 
 Only after the required rail pads and power-latch pads are individually held may the platform enable the global digital deep-sleep hold.
 
-### Rail wake handoff
+### Rail hold release
 
-On wake, do not release a held rail pad into its reset/default configuration.
+Rail pads follow the early-boot hold reconciliation contract in the power-latch section: on every boot, establish each pad's desired state while any hold remains active, and release a pad's hold only after its output configuration is established.
 
-While hold remains active, configure each rail GPIO to the desired post-wake output state. Rails that should remain off during early boot may remain held off until their peripheral is intentionally initialized.
-
-Release the individual hold only after the desired output configuration has been established.
+Rails that should remain off during early boot may remain held off until their peripheral is intentionally initialized; configure the enable pin to its required ON state before releasing that pad's hold.
 
 ## Display
 
@@ -561,6 +566,7 @@ Add:
 - Sticky board selection
 - latch boot behavior
 - digital pad-hold primitives for latch and rail pads
+- unconditional boot-time hold reconciliation
 - deterministic rail setup
 - SSD1677 configuration
 - display SPI
@@ -576,6 +582,7 @@ No full app integration requirement.
 
 - 50 battery cold boots pass
 - latch survives button release
+- flashing/resetting from a state where latch and rail pads were deliberately left held recovers on the next boot without full power removal
 - display full/fast modes work and are timed
 - SD works
 - hundreds of SD/display alternations pass
@@ -599,7 +606,7 @@ Add:
 - S3 wake source
 - complete digital-latch deep-sleep hold
 - switched-rail sleep levels with per-pad hold
-- wake-time latch and rail restoration before hold release
+- wake-path exercise of the boot-time hold reconciliation
 
 #### Done when
 
@@ -703,7 +710,7 @@ If SSD1677 configuration changes shared code, prove X4 emits the same existing c
 3. `hal-ext` GT911/BQ27220 remain MCU-neutral.
 4. `fw-s3` owns concrete peripherals.
 5. GPIO45/46 latch handling and held rail-enable pads use the S3 digital deep-sleep hold mechanism rather than an RTC-GPIO assumption.
-6. held latch and rail-enable outputs are restored to their intended GPIO configuration before hold release after wake.
+6. held latch and rail-enable outputs are restored to their intended GPIO configuration before hold release on every boot, regardless of reset/wakeup cause.
 7. genuine deep-sleep wake is distinguished from cold boot.
 8. touch pin-mode switching remains platform-owned.
 9. input converges at the semantic application boundary.
@@ -713,7 +720,7 @@ If SSD1677 configuration changes shared code, prove X4 emits the same existing c
 ## Risks
 
 1. **Power-latch sequencing.** A mistake can turn normal boot, sleep, or wake into apparent random shutdown.
-2. **Wake hold release.** Releasing a held pad before restoring its output configuration can glitch it to its reset/default level — on GPIO45/46 that removes board power; on a rail pad it can pulse a peripheral rail.
+2. **Hold release.** Releasing a held pad before restoring its output configuration — on any boot, not only deep-sleep wake — can glitch it to its reset/default level: on GPIO45/46 that removes board power; on a rail pad it can pulse a peripheral rail. A stale hold left by a previous boot or firmware can likewise pin a rail off and make peripheral initialization fail despite correct writes.
 3. **Unheld rail pads.** The global digital deep-sleep hold preserves only individually held pads. A rail-enable pin written low but not held can revert or float in deep sleep, leaving a peripheral powered or destabilizing wake.
 4. **Shared SPI.** Display and SD may work alone while failing under repeated alternation.
 5. **SSD1677 waveform selection.** Incorrect fast mode can look correct but actually perform full refresh.
@@ -738,7 +745,7 @@ Sticky support is complete when:
 1. battery cold boot is reliable;
 2. PWR_HOLD/PWR_LOCK are established early;
 3. the required latch and switched-rail states survive deep sleep;
-4. wake releases latch and rail holds without a power-dropping or rail-pulsing glitch;
+4. every boot reconciles and releases latch and rail holds without a power-dropping or rail-pulsing glitch;
 5. recorded wake cause proves genuine S3 deep-sleep wake;
 6. SSD1677 full/fast refresh works correctly;
 7. SD and display reliably share SPI;

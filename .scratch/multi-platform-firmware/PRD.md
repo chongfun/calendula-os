@@ -712,6 +712,7 @@ Use thin concrete task wrappers when needed.
 - C3 uses `fw-common`
 - C3 behavior remains unchanged
 - channel extraction retains `CriticalSectionRawMutex`
+- Host tests can execute representative `Runtime` channel operations, and timer-based common workflows where present, using test-only synchronization/time providers; neither provider appears in the production C3 or S3 dependency graph.
 - all C3 checks remain green
 - C3 release flash/RAM size and stack-frame results are re-compared against the pre-extraction baseline; material deltas caused by the crate split are investigated (fat LTO usually restores cross-crate inlining, but measurement decides)
 
@@ -778,7 +779,6 @@ No OTA.
 - C3 builds do not enable S3 chip features
 - S3 builds do not enable C3 chip features
 - C3 behavior remains unchanged
-- Host tests can execute representative `Runtime` channel operations, and timer-based common workflows where present, using test-only synchronization/time providers; neither provider appears in the production C3 or S3 dependency graph.
 
 ## Risks
 
