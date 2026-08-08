@@ -197,7 +197,29 @@ Deep sleep explicitly powers down unused rails.
 
 Do not access a peripheral while its rail is off.
 
-If a rail is held through deep sleep, treat its hold/release lifecycle with the same care as the power latch; release a held pad only after configuring the desired post-wake state.
+Known board mapping uses:
+
+- EPD power: GPIO47
+- SD power: GPIO10
+- touch power: GPIO42
+
+All are ordinary digital GPIOs. Confirm the mapping and each rail's inactive level from the schematic.
+
+### Switched-rail deep-sleep hold
+
+The global S3 digital deep-sleep hold preserves only pads whose individual hold is enabled. Writing a rail-enable pin low before sleep is not sufficient: an unheld digital pad can revert or float once the digital domain powers down, leaving a peripheral powered, draining standby, or making wake behavior intermittent.
+
+Before deep sleep, drive every switched peripheral rail to its intended sleep level and individually enable digital pad hold on every rail-enable GPIO whose level must survive deep sleep. For Sticky this includes the EPD, SD, and touch power-enable pads.
+
+Only after the required rail pads and power-latch pads are individually held may the platform enable the global digital deep-sleep hold.
+
+### Rail wake handoff
+
+On wake, do not release a held rail pad into its reset/default configuration.
+
+While hold remains active, configure each rail GPIO to the desired post-wake output state. Rails that should remain off during early boot may remain held off until their peripheral is intentionally initialized.
+
+Release the individual hold only after the desired output configuration has been established.
 
 ## Display
 
@@ -442,9 +464,13 @@ SD settled
   ->
 Wi-Fi stopped
   ->
-unused peripheral rails off
+EPD / SD / touch rails driven inactive
+  ->
+rail-enable pads individually held
   ->
 wake source configured
+  ->
+PWR_HOLD / PWR_LOCK asserted
   ->
 power-latch pads individually held
   ->
@@ -534,7 +560,7 @@ Add:
 
 - Sticky board selection
 - latch boot behavior
-- latch deep-sleep hold primitives
+- digital pad-hold primitives for latch and rail pads
 - deterministic rail setup
 - SSD1677 configuration
 - display SPI
@@ -572,7 +598,8 @@ Add:
 - sleep handshake
 - S3 wake source
 - complete digital-latch deep-sleep hold
-- wake-time latch restoration before hold release
+- switched-rail sleep levels with per-pad hold
+- wake-time latch and rail restoration before hold release
 
 #### Done when
 
@@ -585,7 +612,7 @@ Add:
 - wakeup cause confirms actual deep-sleep wake
 - no latch glitch/power-off occurs
 - 50 battery-only sleep/wake cycles pass
-- unused rails are off during sleep
+- EPD, SD, and touch rails are verified off during genuine deep sleep, measured at the rail or enable pad rather than inferred from pre-sleep writes
 
 Full navigation is not required because Back still requires touch.
 
@@ -675,8 +702,8 @@ If SSD1677 configuration changes shared code, prove X4 emits the same existing c
 2. `fw-common` contains no Sticky GPIOs.
 3. `hal-ext` GT911/BQ27220 remain MCU-neutral.
 4. `fw-s3` owns concrete peripherals.
-5. GPIO45/46 latch handling uses the S3 digital deep-sleep hold mechanism rather than an RTC-GPIO assumption.
-6. held latch outputs are restored to asserted GPIO configuration before hold release after wake.
+5. GPIO45/46 latch handling and held rail-enable pads use the S3 digital deep-sleep hold mechanism rather than an RTC-GPIO assumption.
+6. held latch and rail-enable outputs are restored to their intended GPIO configuration before hold release after wake.
 7. genuine deep-sleep wake is distinguished from cold boot.
 8. touch pin-mode switching remains platform-owned.
 9. input converges at the semantic application boundary.
@@ -686,19 +713,20 @@ If SSD1677 configuration changes shared code, prove X4 emits the same existing c
 ## Risks
 
 1. **Power-latch sequencing.** A mistake can turn normal boot, sleep, or wake into apparent random shutdown.
-2. **Wake hold release.** Releasing GPIO45/46 before restoring their asserted output configuration can create a low pulse and remove board power.
-3. **Shared SPI.** Display and SD may work alone while failing under repeated alternation.
-4. **SSD1677 waveform selection.** Incorrect fast mode can look correct but actually perform full refresh.
-5. **Deep sleep versus power-off.** A cold boot after latch loss can masquerade as wake unless reset/wakeup cause is checked.
-6. **GT911 reset/address sequencing.** INT must be output during selection and input afterwards.
-7. **GT911 orientation.** Center taps can work while edges remain mirrored/offset.
-8. **S3 memory overengineering.** Measure before importing C3 workarounds.
-9. **Premature multicore.** Explicitly deferred.
+2. **Wake hold release.** Releasing a held pad before restoring its output configuration can glitch it to its reset/default level — on GPIO45/46 that removes board power; on a rail pad it can pulse a peripheral rail.
+3. **Unheld rail pads.** The global digital deep-sleep hold preserves only individually held pads. A rail-enable pin written low but not held can revert or float in deep sleep, leaving a peripheral powered or destabilizing wake.
+4. **Shared SPI.** Display and SD may work alone while failing under repeated alternation.
+5. **SSD1677 waveform selection.** Incorrect fast mode can look correct but actually perform full refresh.
+6. **Deep sleep versus power-off.** A cold boot after latch loss can masquerade as wake unless reset/wakeup cause is checked.
+7. **GT911 reset/address sequencing.** INT must be output during selection and input afterwards.
+8. **GT911 orientation.** Center taps can work while edges remain mirrored/offset.
+9. **S3 memory overengineering.** Measure before importing C3 workarounds.
+10. **Premature multicore.** Explicitly deferred.
 
 ## References
 
 - Seeed reTerminal Sticky hardware documentation and V01 schematic/pinout (latch wiring, rails, buttons, touch).
-- FreeInk SDK Sticky `BoardConfig` (pin map including `PWR_HOLD` GPIO45 / `PWR_LOCK` GPIO46), SSD1677 update-control/border-waveform values, GT911 initialization, and power-management/rail shutdown behavior.
+- FreeInk SDK Sticky `BoardConfig` (pin map including `PWR_HOLD` GPIO45 / `PWR_LOCK` GPIO46 and rail enables EPD GPIO47 / SD GPIO10 / touch GPIO42), SSD1677 update-control/border-waveform values, GT911 initialization, and power-management behavior (rails driven inactive and individually held before the global deep-sleep hold).
 - CrossPoint Reader v1.5+ Sticky support as a second independently working implementation.
 - ESP32-S3 Technical Reference Manual and ESP-IDF GPIO documentation for the digital pad-hold path (`gpio_hold_en`, `gpio_deep_sleep_hold_en`) and the strapping roles of GPIO45/46.
 - CalendulaOS Multi-platform firmware architecture PRD for `fw-common`/`fw-s3`/`hal-ext` ownership boundaries and the S3 toolchain contract.
@@ -709,8 +737,8 @@ Sticky support is complete when:
 
 1. battery cold boot is reliable;
 2. PWR_HOLD/PWR_LOCK are established early;
-3. the required latch state survives deep sleep;
-4. wake releases latch holds without a power-dropping glitch;
+3. the required latch and switched-rail states survive deep sleep;
+4. wake releases latch and rail holds without a power-dropping or rail-pulsing glitch;
 5. recorded wake cause proves genuine S3 deep-sleep wake;
 6. SSD1677 full/fast refresh works correctly;
 7. SD and display reliably share SPI;
