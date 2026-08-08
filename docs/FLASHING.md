@@ -124,6 +124,50 @@ are published to cover both bootloader conventions.
 > USB-C. The 2-pin variant of that cable is charge-only and will not enumerate
 > as a serial port. Serial is behind the same native USB-Serial-JTAG as the X4.
 
+### If you flashed the wrong board's image
+
+The X3 and X4 are the same ESP32-C3, so the bootloader cannot tell an X4 image
+apart from an X3 one — it boots either, and then drives the wrong panel. Since
+the board identity guard landed, that no longer looks like a dead device:
+
+1. Firmware probes the X3-only I2C parts at startup (BQ27220, DS3231, QMI8658 on
+   SDA `GPIO20` / SCL `GPIO0`) and compares the result with its own descriptor
+   identity.
+2. On a **confirmed** mismatch it stops before panel bring-up and tries to write
+   **`/BOARDID.TXT`** to the SD card root, naming the detected board, the
+   firmware's board, and the image to flash instead (`firmware-x3.bin` or
+   `firmware-x4.bin`). When the write succeeds, pull the card and read it on any
+   computer — no serial cable needed.
+
+   The file exists only if that write succeeded. With no card in the slot, a full
+   or unreadable card, or a FAT error there is nothing to pull, and the answer is
+   on serial instead — the refusal always prints there first, followed by the
+   card's outcome:
+
+   ```text
+   board: REFUSING TO BOOT -- detected Xteink X3, firmware built for Xteink X4
+   board: flash firmware-x3.bin to fix this
+   board: wrote /BOARDID.TXT        # or: could not write /BOARDID.TXT
+                                   # or: no SD card for diagnostic: CardInit
+   ```
+
+   So a blank screen and no `BOARDID.TXT` does not mean the guard did not fire.
+   Attach USB and read the boot output before assuming anything else is wrong.
+3. The screen stays blank, by design. The firmware does not try to draw the
+   message: with the wrong controller driver compiled in it cannot, and an
+   earlier attempt was measured failing after 15 s having drawn nothing. Do not
+   read a blank screen as a failed guard — check the card.
+4. It halts rather than rebooting, so the symptom is a device that does nothing
+   rather than one that loops.
+
+Reflashing the named image is the whole fix; nothing is damaged. Holding
+**Back + Up** at reset still reaches the slot-0 anchor, because the recovery
+combo is sampled before the guard runs.
+
+An **inconclusive** probe — passes disagreeing, one stray ACK, or an I2C
+timeout — boots normally and is only logged (`board: probe verdict=...` on
+serial). The guard never stops a device it is not certain about.
+
 When testing, **capture the serial log** (`cargo run` or `espflash monitor`):
 panel init, BUSY-wait completions, per-refresh timings, and `bq27220` battery
 reads are the key bring-up signals.

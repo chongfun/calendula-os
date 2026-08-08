@@ -669,6 +669,13 @@ pub const IDENTITY_X4: &str = "CalendulaOS X4 u1 (MarigoldOS)";
 /// See [`IDENTITY_X4`].
 pub const IDENTITY_X3: &str = "CalendulaOS X3 u1 (MarigoldOS)";
 
+/// The `<board>` field of each identity above, so code deciding which hardware
+/// an image is for compares against a constant rather than a literal.
+/// `the_shipped_identities_name_their_board` keeps these in step.
+pub const BOARD_X4: &str = "X4";
+/// See [`BOARD_X4`].
+pub const BOARD_X3: &str = "X3";
+
 /// The NUL-terminated name inside a fixed-width descriptor `project_name`
 /// field. An unterminated field is taken whole, matching how the bootloader
 /// treats a name that exactly fills the space.
@@ -720,6 +727,17 @@ pub fn parse_identity(name: &[u8]) -> Option<(&[u8], u32)> {
             .checked_add(d.checked_sub(b'0').filter(|v| *v < 10)? as u32)?;
     }
     Some((board, n))
+}
+
+/// The board an identity is for, as text.
+///
+/// Several unrelated questions turn on this — may an update apply, is this the
+/// hardware the image is running on — so it is derived here once rather than
+/// re-spelled at each. `None` if the name is not ours, or its board field is
+/// not UTF-8, which another vendor's descriptor may well not be.
+pub fn identity_board(identity: &str) -> Option<&str> {
+    let (board, _generation) = parse_identity(identity.as_bytes())?;
+    core::str::from_utf8(board).ok()
 }
 
 /// Whether a *staged* image may be installed by this firmware.
@@ -2077,6 +2095,23 @@ mod tests {
     fn the_shipped_identities_parse() {
         assert_eq!(parse_identity(X4), Some((&b"X4"[..], 1)));
         assert_eq!(parse_identity(X3), Some((&b"X3"[..], 1)));
+    }
+
+    /// The board constants are cut from the identities by hand, so this is what
+    /// keeps them from drifting apart: rename a board in one and this fails.
+    #[test]
+    fn the_shipped_identities_name_their_board() {
+        assert_eq!(identity_board(IDENTITY_X4), Some(BOARD_X4));
+        assert_eq!(identity_board(IDENTITY_X3), Some(BOARD_X3));
+        assert_ne!(BOARD_X4, BOARD_X3);
+    }
+
+    #[test]
+    fn a_name_that_is_not_ours_names_no_board() {
+        assert_eq!(identity_board("Xteink Reader"), None);
+        assert_eq!(identity_board(""), None);
+        // Ours in shape, but with no updater generation to split on.
+        assert_eq!(identity_board("CalendulaOS X4 (MarigoldOS)"), None);
     }
 
     #[test]

@@ -129,6 +129,7 @@ use tasks::input::InputPins;
 #[macro_use]
 mod log;
 
+mod board_guard;
 mod book_build;
 pub mod catalog;
 mod custom_font;
@@ -361,8 +362,8 @@ fn main() -> ! {
     // transforms, and EPUB inflate are all CPU-bound, so run at full speed
     // and rely on race-to-idle for power.
     let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::_160MHz);
-    // `mut` for the panel-controller probe below, which borrows five pin
-    // singletons and hands them back before their real drivers are built.
+    // `mut` for the two boot probes below: both borrow pin singletons and hand
+    // them back before the real drivers are built.
     let mut peripherals = esp_hal::init(config);
     esp_println::println!("calendula-os: boot");
 
@@ -389,23 +390,107 @@ fn main() -> ! {
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
 
+    // Two probes run here, and the order between them is deliberate. This one
+    // answers "which board is this"; `resolve_panel_controller` below answers
+    // Which board is this? An image built for the other one boots happily and
+    // then drives the wrong controller at the wrong geometry, and nothing
+    // earlier can see it. `board_probe` reads the X3-only I2C parts over the
+    // gauge pins and hands both back, so it must run before the ADC claims
+    // GPIO0 (X4) or the gauge driver claims both (X3). The verdict is spent
+    // further down, once the SPI bus the refusal needs exists.
+    //
+    // Before `resolve_panel_controller`, deliberately: a wrong-board verdict
+    // makes "which controller" moot, and that probe costs ~70 ms on the X4 and
+    // ~200 ms on the X3 (its own doc comment has the breakdown), plus reset
+    // pulses, on a device about to halt. They share no pins, so this is about
+    // wasted work, not correctness.
+    //
+    // Not on a fast wake. A deep-sleep wake is the same power-on continuing:
+    // the board cannot have changed, and the boot that armed the sleep already
+    // passed this guard. `deep_sleep_wake` needs *both* the RTC GPIO cause and
+    // a settled sleep frame, so everything else — a flash, a battery pull, a
+    // crash, a software or USB reset — takes the full probe. Flashing always
+    // ends in a reset, never a deep-sleep wake, so a wrong-board image cannot
+    // reach the reader by a path that skips this.
+    let board_mismatch = if deep_sleep_wake {
+        esp_println::println!("board: probe skipped, deep-sleep wake");
+        None
+    } else {
+        let probe_start = Instant::now();
+        let board_fingerprint = hal_ext::board_probe::fingerprint(
+            peripherals.I2C0.reborrow(),
+            /* sda */ peripherals.GPIO20.reborrow(),
+            /* scl */ peripherals.GPIO0.reborrow(),
+        );
+        let board_verdict = board_fingerprint.verdict();
+        // Boot-identity output, so not behind `serial-log`: on a device that
+        // will not paint, this and the SD diagnostic are the whole story.
+        //
+        // COMPATIBILITY: web/index.html's "Check my reader over USB" matches
+        // /board: probe verdict=(\w+)\s/ against this and maps the captured
+        // token by name. It reads the probe rather than the installed
+        // descriptor because the probe reports hardware — a mis-flashed reader
+        // still tells the truth here. So the wording, and the `BoardVerdict`
+        // variant names `{:?}` renders, are load-bearing outside this file, and
+        // breaking either fails silently. A variant added here reads as unknown
+        // there until taught; change both together. The site resets the reader
+        // over DTR, which is a chip reset rather than a deep-sleep wake, so
+        // this line is always printed for it.
+        esp_println::println!(
+            "board: probe verdict={:?} found={:#b}/{:#b} fault={}/{} elapsed_ms={}",
+            board_verdict,
+            board_fingerprint.first.found,
+            board_fingerprint.second.found,
+            board_fingerprint.first.faulted,
+            board_fingerprint.second.faulted,
+            probe_start.elapsed().as_millis()
+        );
+        for index in 0..hal_ext::board_probe::TARGET_COUNT {
+            let bit = 1u8 << index;
+            bench_log!(
+                "board: {} pass1={} pass2={}",
+                hal_ext::board_probe::target_name(index),
+                board_fingerprint.first.found & bit != 0,
+                board_fingerprint.second.found & bit != 0
+            );
+        }
+        board_guard::evaluate(board_verdict, PROJECT_NAME)
+    };
+
+    // Decided above, executed much later: refusing needs the SPI bus and the SD
+    // chip select, and those cannot exist yet — the panel probe below has to
+    // read SCK and MOSI before `Spi::new` claims them. Deciding early is what
+    // lets everything between here and the refusal be skipped.
+
     // The card's chip select comes up first, and before the panel probe below:
     // that probe bit-bangs the shared SPI bus by hand, and a card left with a
     // floating CS would see every clock it sends.
     let sd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
 
-    // The pins are borrowed, not consumed: their real drivers are built from
-    // the same singletons a few lines down. SCK and MOSI have to be probed
-    // before `Spi::new` claims them, and the panel's CS/DC/RST before their
+    // Skipped outright on a confirmed mismatch. The probe is not passive — it
+    // drives the panel pins, resets the controller once per pass, and may pay
+    // the vendor-timing reset and an MTP read — and on this path its answer is
+    // never read, because the refusal never initialises a panel. Running it
+    // anyway would cost ~70 ms (X4) or ~200 ms (X3) and two reset pulses to
+    // identify a controller nothing will drive.
+    //
+    // Otherwise: the pins are borrowed, not consumed. Their real drivers are
+    // built from the same singletons a few lines down, and SCK/MOSI have to be
+    // probed before `Spi::new` claims them, the panel's CS/DC/RST before their
     // `Output`s exist.
-    let probe_diag = resolve_panel_controller(
-        peripherals.GPIO8.reborrow(),
-        peripherals.GPIO10.reborrow(),
-        peripherals.GPIO21.reborrow(),
-        peripherals.GPIO4.reborrow(),
-        peripherals.GPIO5.reborrow(),
-    );
-    display_flush::record_probe_verdict(probe_diag.verdict);
+    let probe_diag = if board_mismatch.is_none() {
+        let diag = resolve_panel_controller(
+            peripherals.GPIO8.reborrow(),
+            peripherals.GPIO10.reborrow(),
+            peripherals.GPIO21.reborrow(),
+            peripherals.GPIO4.reborrow(),
+            peripherals.GPIO5.reborrow(),
+        );
+        display_flush::record_probe_verdict(diag.verdict);
+        Some(diag)
+    } else {
+        None
+    };
 
     let epd_cs = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
     let epd_dc = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
@@ -461,7 +546,20 @@ fn main() -> ! {
         esp_hal::system::software_reset();
     }
 
-    ota_update::mark_running_slot_valid();
+    // Not on a refusal. Marking the running slot valid asserts "this image
+    // works", and the guard is about to say it does not — blessing a trial
+    // image immediately before refusing it would cement the very install the
+    // refusal exists to reject, and take automatic rollback with it. Left
+    // unblessed, a rollback-enabled bootloader can return the device to the
+    // other slot on the next power-up. The recovery combo above stays ahead of
+    // this either way.
+    if board_mismatch.is_none() {
+        ota_update::mark_running_slot_valid();
+    } else {
+        // Said out loud so a refusing boot's trace does not just go quiet here;
+        // FLASHING.md sends people to these lines.
+        esp_println::println!("ota: not marking this slot valid; the board guard is refusing");
+    }
 
     // One display band must fit a single TX DMA buffer (X4 fills it
     // exactly; the X3's 99-byte rows leave 80 bytes slack). The RX side
@@ -487,6 +585,19 @@ fn main() -> ! {
     .with_buffers(dma_rx, dma_tx)
     .into_async();
     let epd_bus = hal_ext::spi_dma::EpdBus::new(epd_spi, epd_cs, epd_dc, epd_busy, epd_rst);
+
+    let executor = EXECUTOR.init(Executor::new());
+
+    // Wrong-board refusal, placed at the first point where everything it needs
+    // exists (SPI bus, SD chip select) and the last before anything
+    // board-specific starts: nothing spawned, no panel init, no geometry work.
+    // The recovery combo stays ahead of it, so Back + Up still reaches the
+    // slot-0 anchor on a device this would otherwise stop.
+    if let Some(mismatch) = board_mismatch {
+        executor.run(|spawner: Spawner| {
+            spawner.spawn(board_guard::refuse(epd_bus, sd_cs, mismatch).unwrap());
+        });
+    }
 
     // Input polls from an interrupt-priority executor on both boards, so
     // button sampling keeps running while the thread executor blocks on
@@ -515,7 +626,6 @@ fn main() -> ! {
         );
     }
 
-    let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner: Spawner| {
         #[cfg(feature = "device-x3")]
         {
@@ -523,6 +633,8 @@ fn main() -> ! {
             spawner.spawn(tasks::input::battery_run(battery_gauge).unwrap());
         }
         esp_println::println!("main: spawn display t_ms={}", Instant::now().as_millis());
+        // Some unless the guard refused, and that path diverges above.
+        let probe_diag = probe_diag.expect("panel probe runs on every non-refusing boot");
         spawner.spawn(tasks::display::run(epd_bus, sd_cs, deep_sleep_wake, probe_diag).unwrap());
         esp_println::println!("main: spawn power t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());

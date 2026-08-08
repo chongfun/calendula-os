@@ -50,6 +50,11 @@ books.
   shipped with USB flashing disabled in eFuse, or an in-app update from the card
 - **A recovery anchor** — updates install to the far OTA slot and slot 0 stays
   pinned as the anchor, so holding **Back + Up** at reset boots back into it
+- **A wrong-board guard** — the X3 and X4 are the same chip, so flashing one
+  board's image onto the other used to boot into a blank or scrambled screen
+  with no explanation. The device now detects the board at startup, stops, and
+  tries to write `BOARDID.TXT` to the SD card naming the image to flash
+  instead. With no card in the slot it says the same thing over serial
 
 ## Devices
 

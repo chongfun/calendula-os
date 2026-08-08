@@ -1,6 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod board_probe;
 pub mod bq27220;
 // The panel-controller probe bit-bangs the display bus by hand on GPIO numbers
 // that only mean what it assumes on the Xteink ESP32-C3 boards. The reTerminal
