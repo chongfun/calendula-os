@@ -129,10 +129,11 @@ GPIO45/46 require the ESP32-S3 **digital GPIO deep-sleep hold path**.
 Before deep sleep:
 
 1. latch outputs are configured in their asserted state;
-2. enable per-pad hold for every latch pad that must remain asserted;
-3. enable the S3 global digital deep-sleep hold;
-4. verify the wake source is configured;
-5. enter deep sleep.
+2. individual latch holds are enabled;
+3. all required switched-rail pads are already at their sleep levels and individually held;
+4. the wake source is configured and verified;
+5. the global digital deep-sleep hold is enabled;
+6. deep sleep is entered immediately.
 
 In ESP-IDF terms this corresponds conceptually to:
 
@@ -203,9 +204,21 @@ Without this, a later individual hold — including one introduced by future pla
 
 ### Strapping-pin caution
 
-GPIO45 and GPIO46 are ESP32-S3 strapping pins.
+GPIO45 and GPIO46 are ESP32-S3 strapping pins, and the BQ27220 bus places SCL on GPIO0 — a third strapping pin.
 
 Their strapping values are sampled before firmware runs, but software must not introduce unnecessary pull configuration or startup behavior that conflicts with the board's boot circuit.
+
+GPIO0 and `PWR_LOCK` GPIO46 jointly control ESP32-S3 boot mode, and the ROM samples them before any firmware executes, so early-boot reconciliation cannot repair a bad strap combination:
+
+- GPIO0 HIGH: normal SPI boot; GPIO46 is ignored.
+- GPIO0 LOW with GPIO46 LOW/floating: ROM serial-download mode.
+- GPIO0 LOW while GPIO46 is held HIGH: not a valid download entry.
+
+GPIO0 must not acquire an internal pull or other software-controlled state that interferes with its required reset strap level.
+
+The Sticky implementation must explicitly validate the wired firmware-download/recovery path while GPIO46 may retain a HIGH pad hold from deep sleep. Do not assume the ordinary GPIO0-low serial-download sequence is valid while GPIO46 is held HIGH.
+
+If entering the selected recovery/download mechanism requires GPIO46 LOW, provide a cooperative reboot-to-download path that safely releases the GPIO46 hold before reset, or document and validate the required power-cycle recovery procedure. Do not promise recovery without full power removal until the actual Sticky flashing path proves it.
 
 Verify repeated:
 
@@ -313,6 +326,18 @@ There must be no:
 Reuse the generic BQ27220 driver.
 
 `fw-s3` owns battery sampling policy and its concrete I²C bus.
+
+Known board mapping:
+
+```text
+BQ27220:
+  SDA = GPIO1
+  SCL = GPIO0
+  address = 0x55
+  separate S3 I2C controller from GT911
+```
+
+GPIO0 is an S3 strapping pin that participates in ROM boot-mode selection (see Strapping-pin caution). The battery bus implementation must not introduce an internal pull or idle drive on GPIO0 that interferes with its required reset strap level.
 
 Do not copy X3 task implementation merely because the gauge model matches.
 
@@ -610,7 +635,7 @@ No full app integration requirement.
 
 - 50 battery cold boots pass
 - latch survives button release
-- flashing/resetting from a state where latch and rail pads were deliberately left held recovers on the next boot without full power removal
+- the documented Sticky reset/reflash path is validated from a state where latch and rail pads were left held; strap levels are verified compatible with that path, and any case requiring a power cycle is explicitly documented
 - after boot reconciliation the global digital deep-sleep hold is disabled for normal runtime
 - display full/fast modes work and are timed
 - SD works
@@ -751,18 +776,19 @@ If SSD1677 configuration changes shared code, prove X4 emits the same existing c
 1. **Power-latch sequencing.** A mistake can turn normal boot, sleep, or wake into apparent random shutdown.
 2. **Hold release.** Releasing a held pad before restoring its output configuration — on any boot, not only deep-sleep wake — can glitch it to its reset/default level: on GPIO45/46 that removes board power; on a rail pad it can pulse a peripheral rail. A stale hold left by a previous boot or firmware can likewise pin a rail off and make peripheral initialization fail despite correct writes.
 3. **Unheld rail pads.** The global digital deep-sleep hold preserves only individually held pads. A rail-enable pin written low but not held can revert or float in deep sleep, leaving a peripheral powered or destabilizing wake.
-4. **Shared SPI.** Display and SD may work alone while failing under repeated alternation.
-5. **SSD1677 waveform selection.** Incorrect fast mode can look correct but actually perform full refresh.
-6. **Deep sleep versus power-off.** A cold boot after latch loss can masquerade as wake unless reset/wakeup cause is checked.
-7. **GT911 reset/address sequencing.** INT must be output during selection and input afterwards.
-8. **GT911 orientation.** Center taps can work while edges remain mirrored/offset.
-9. **S3 memory overengineering.** Measure before importing C3 workarounds.
-10. **Premature multicore.** Explicitly deferred.
+4. **Strap/download interaction.** GPIO0 (BQ27220 SCL) and GPIO46 (`PWR_LOCK`) jointly select ROM boot mode before firmware runs; GPIO46 held HIGH blocks the ordinary GPIO0-low download entry, so the recovery/reflash path must be proven, not assumed.
+5. **Shared SPI.** Display and SD may work alone while failing under repeated alternation.
+6. **SSD1677 waveform selection.** Incorrect fast mode can look correct but actually perform full refresh.
+7. **Deep sleep versus power-off.** A cold boot after latch loss can masquerade as wake unless reset/wakeup cause is checked.
+8. **GT911 reset/address sequencing.** INT must be output during selection and input afterwards.
+9. **GT911 orientation.** Center taps can work while edges remain mirrored/offset.
+10. **S3 memory overengineering.** Measure before importing C3 workarounds.
+11. **Premature multicore.** Explicitly deferred.
 
 ## References
 
 - Seeed reTerminal Sticky hardware documentation and V01 schematic/pinout (latch wiring, rails, buttons, touch).
-- FreeInk SDK Sticky `BoardConfig` (pin map including `PWR_HOLD` GPIO45 / `PWR_LOCK` GPIO46 and rail enables EPD GPIO47 / SD GPIO10 / touch GPIO42), SSD1677 update-control/border-waveform values, GT911 initialization, and power-management behavior (rails driven inactive and individually held before the global deep-sleep hold).
+- FreeInk SDK Sticky `BoardConfig` (pin map including `PWR_HOLD` GPIO45 / `PWR_LOCK` GPIO46, rail enables EPD GPIO47 / SD GPIO10 / touch GPIO42, and BQ27220 on SDA GPIO1 / SCL GPIO0 with its GPIO0-strap warning), SSD1677 update-control/border-waveform values, GT911 initialization, and power-management behavior (rails driven inactive and individually held before the global deep-sleep hold).
 - CrossPoint Reader v1.5+ Sticky support as a second independently working implementation.
 - ESP32-S3 Technical Reference Manual and ESP-IDF GPIO documentation for the digital pad-hold path (`gpio_hold_en`, `gpio_deep_sleep_hold_en`) and the strapping roles of GPIO45/46.
 - CalendulaOS Multi-platform firmware architecture PRD for `fw-common`/`fw-s3`/`hal-ext` ownership boundaries and the S3 toolchain contract.
