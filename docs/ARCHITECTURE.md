@@ -70,7 +70,10 @@ flowchart TD
 - Two framebuffer allocations: active drawing buffer in main DRAM, previous-frame
   buffer in DRAM2. Each is 48,000 pixel bytes on X4 (800×480) or 52,272 on X3
   (792×528), 1 bpp.
-- Display ownership is single-writer: only `display_task` touches the EPD bus.
+- Display ownership is single-writer: only `display_task` touches the EPD bus —
+  except on the board-identity refusal path, where `board_guard`'s refuse task
+  owns it because `display_task` is never spawned. One writer either way,
+  never two (see Board identity guard).
 - Reader state ownership is single-writer: only `app_task` mutates page/menu state.
 - Messages are small `Copy` values. Bulk bytes stay in caller-owned buffers.
 - Power requests display sleep through `display_task`; it never touches SPI.
@@ -838,7 +841,8 @@ static text arrays.
 ## Current module map
 
 `fw/src/tasks/display.rs` is intentionally the only task touching the EPD bus and
-coordinating SD access. It is now the orchestration layer:
+coordinating SD access on a normal boot — the refusal path replaces it rather
+than running beside it. It is the orchestration layer:
 
 ```text
 display task orchestration
