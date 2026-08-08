@@ -56,6 +56,11 @@ gh release view v<version> --json assets -q '.assets[] | .name + " " + (.size|to
 # `main` moves the identity on (a v0.5.0 built as `u1 (MarigoldOS)` re-checked
 # from a `u2` tree), and would compare against the wrong expected value from a
 # stale checkout. Needs the tag locally: `git fetch --tags` first.
+desc_field() { # <image> <byte offset> <field width> -- as prepare-release.sh
+  local raw
+  raw=$(dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | tr '\000' '\n')
+  printf '%s' "${raw%%$'\n'*}"  # cut at the first NUL here rather than piping
+}                               # to `head`, which can SIGPIPE `tr` under pipefail
 check_asset() { # <asset> <identity const>
   local want ver id
   want=$(git show "v<version>:proto/src/ota.rs" |
@@ -63,8 +68,8 @@ check_asset() { # <asset> <identity const>
   [ -n "$want" ] || { echo "error: could not read $2 at v<version>" >&2; return 1; }
   curl -fsSL "https://github.com/chongfun/calendula-os/releases/download/v<version>/$1" \
     -o "/tmp/$1" || { echo "error: $1 not published under v<version>" >&2; return 1; }
-  ver=$(dd if="/tmp/$1" bs=1 skip=48 count=32 2>/dev/null | tr '\000' '\n' | head -1)
-  id=$(dd  if="/tmp/$1" bs=1 skip=80 count=32 2>/dev/null | tr '\000' '\n' | head -1)
+  ver=$(desc_field "/tmp/$1" 48 32)
+  id=$(desc_field  "/tmp/$1" 80 32)
   [ "$ver" = "<version>" ] || { echo "error: $1 carries version '$ver'" >&2; return 1; }
   [ "$id" = "$want" ] || {
     echo "error: $1 carries identity '$id', expected '$want'" >&2; return 1; }
