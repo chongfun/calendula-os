@@ -220,6 +220,10 @@ The Sticky implementation must explicitly validate the wired firmware-download/r
 
 If entering the selected recovery/download mechanism requires GPIO46 LOW, provide a cooperative reboot-to-download path that safely releases the GPIO46 hold before reset, or document and validate the required power-cycle recovery procedure. Do not promise recovery without full power removal until the actual Sticky flashing path proves it.
 
+GPIO45 also has an ESP32-S3 strapping role: on generic S3 parts it selects the VDD_SPI voltage at reset (LOW: 3.3 V, HIGH: 1.8 V) when `VDD_SPI_FORCE` is not programmed. Sticky uses an ESP32-S3R8, whose VDD_SPI configuration is expected to be eFuse-forced to 3.3 V, so GPIO45 is ignored for that purpose and may serve as the asserted `PWR_HOLD` signal across reset.
+
+During initial hardware bring-up, verify the actual chip variant and read the relevant VDD_SPI eFuse state (`VDD_SPI_FORCE` / voltage selection) once on the target Sticky. Do not generalize the GPIO45-high latch strategy to another S3 board or chip variant without making the same check.
+
 Verify repeated:
 
 - battery cold boot
@@ -636,6 +640,7 @@ No full app integration requirement.
 - 50 battery cold boots pass
 - latch survives button release
 - the documented Sticky reset/reflash path is validated from a state where latch and rail pads were left held; strap levels are verified compatible with that path, and any case requiring a power cycle is explicitly documented
+- the target identifies as the expected ESP32-S3R8 and its VDD_SPI eFuse configuration confirms GPIO45 does not control flash/PSRAM voltage
 - after boot reconciliation the global digital deep-sleep hold is disabled for normal runtime
 - display full/fast modes work and are timed
 - SD works
@@ -790,7 +795,7 @@ If SSD1677 configuration changes shared code, prove X4 emits the same existing c
 - Seeed reTerminal Sticky hardware documentation and V01 schematic/pinout (latch wiring, rails, buttons, touch).
 - FreeInk SDK Sticky `BoardConfig` (pin map including `PWR_HOLD` GPIO45 / `PWR_LOCK` GPIO46, rail enables EPD GPIO47 / SD GPIO10 / touch GPIO42, and BQ27220 on SDA GPIO1 / SCL GPIO0 with its GPIO0-strap warning), SSD1677 update-control/border-waveform values, GT911 initialization, and power-management behavior (rails driven inactive and individually held before the global deep-sleep hold).
 - CrossPoint Reader v1.5+ Sticky support as a second independently working implementation.
-- ESP32-S3 Technical Reference Manual and ESP-IDF GPIO documentation for the digital pad-hold path (`gpio_hold_en`, `gpio_deep_sleep_hold_en`) and the strapping roles of GPIO45/46.
+- ESP32-S3 Technical Reference Manual and ESP-IDF GPIO documentation for the digital pad-hold path (`gpio_hold_en`, `gpio_deep_sleep_hold_en`) and the strapping roles of GPIO0/45/46; the ESP32-S3 datasheet/eFuse documentation for the S3R8 VDD_SPI forcing that frees GPIO45 for `PWR_HOLD`.
 - CalendulaOS Multi-platform firmware architecture PRD for `fw-common`/`fw-s3`/`hal-ext` ownership boundaries and the S3 toolchain contract.
 
 ## Done when
