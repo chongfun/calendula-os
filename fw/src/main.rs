@@ -41,7 +41,7 @@ const fn desc_field<const N: usize>(s: &str) -> [u8; N] {
 /// The app descriptor's `project_name`, and the identity `ota_update` reads
 /// back out of flash to decide whether the slot-0 anchor can apply an update.
 ///
-/// Format: `CalendulaOS <board> u<updater-generation> (MarigoldOS)`.
+/// Format: `CalendulaOS <board> u<updater-generation>`.
 ///
 /// The product name alone is not enough to answer that question. The X4 and X3
 /// builds are the same product but take different OTA trigger filenames
@@ -51,7 +51,8 @@ const fn desc_field<const N: usize>(s: &str) -> [u8; N] {
 /// never looks for this board's trigger. The board is therefore part of the
 /// identity. So is a generation digit, bumped whenever the trigger filename or
 /// the update hand-off changes, so an anchor too old to recognise this trigger
-/// is refused rather than booted into.
+/// is refused rather than booted into. The digit counts per board, since the
+/// board is already in the string.
 ///
 /// The strings themselves live in [`proto::ota`], beside the comparison that
 /// reads them back and the tests that pin them, so the firmware cannot stamp
