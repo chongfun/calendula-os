@@ -391,6 +391,8 @@ Do not put concrete GPIO, RTC, Wi-Fi, DMA, or other HAL types in `Runtime`.
 
 The C3 power-button GPIO handoff, for example, remains private to `fw-c3`.
 
+The existing channel statics already use `CriticalSectionRawMutex`. Keep that choice when they move into `Runtime`: it is sound on both MCU families, including a future multicore S3 topology. Do not downgrade shared channels to a single-core-only mutex as an extraction-time optimization.
+
 ## Input architecture
 
 `InputEvent` remains the shared boundary.
@@ -669,6 +671,33 @@ out of repository-global configuration and into the C3 build/check path.
 
 S3 starts from its own HAL defaults until measurements justify changes.
 
+### Rust toolchains
+
+The two MCU families do not share a compiler.
+
+`riscv32imc-unknown-none-elf` is an upstream Rust target. C3 and host builds stay on the toolchain pinned in `rust-toolchain.toml`.
+
+`xtensa-esp32s3-none-elf` is not an upstream Rust target. Building `fw-s3` requires the Espressif `esp` toolchain — the espup-distributed rustc fork carrying the Xtensa backend.
+
+Rules:
+
+- The repository default toolchain remains upstream Rust. Do not move `rust-toolchain.toml` to the `esp` channel for convenience; host crates, the wasm emulator, and C3 keep building on upstream.
+- The S3 build path selects the esp toolchain explicitly, for example `cargo +esp` inside the sticky check/flash commands. rustup resolves `rust-toolchain.toml` from the invocation directory, not from the package being built, so a per-package toolchain file is not a reliable mechanism.
+- Pin the esp toolchain version in the S3 tooling and CI the same way the upstream toolchain is pinned. Two machines must not silently build S3 firmware with different compiler forks.
+- Shared crates are now compiled by two rustc versions, and the esp fork trails upstream. Shared code must not adopt language or library features newer than the pinned esp toolchain supports, and CI must compile the shared crates through both paths.
+- S3 binary analysis (size, stack, disassembly) uses the esp toolchain's llvm-tools. The upstream toolchain's tools do not understand Xtensa objects.
+
+### Workspace invocations
+
+Once the default target is gone, a bare `cargo check` or `cargo test` at the workspace root would try to build the firmware executables for the host and fail. No single Cargo invocation can build both firmware packages either: they need different `--target` values and different toolchains, and resolving both in one feature-unified graph would combine mutually exclusive Espressif chip features.
+
+Therefore:
+
+- Set `workspace.default-members` to the host-buildable crates, so bare root-level `cargo check`/`cargo test` remains meaningful.
+- Firmware packages build only through explicit `-p fw-c3 --target ...` and `-p fw-s3 --target ...` invocations owned by the project tooling.
+- `--workspace` invocations that include both firmware packages are unsupported. CI and tooling must not rely on them.
+- The workspace keeps one shared `Cargo.lock`. Both platforms resolve shared dependencies from the same lock, so a shared crate cannot silently run different dependency versions on C3 and S3.
+
 ## Package features
 
 MCU choice is represented by package choice, not by features.
@@ -736,12 +765,15 @@ fw-common -> esp-rtos
 fw-common -> esp-storage
 fw-common -> esp-backtrace
 fw-common -> esp-println
+fw-common -> esp-alloc
 
 hal-ext -> esp-hal
 
 fw-c3 -> fw-s3
 fw-s3 -> fw-c3
 ```
+
+`esp-alloc` carries no chip feature, but it does not build on the host and installing the global allocator is platform policy. Each firmware executable owns its allocator setup; `fw-common` must stay allocator-agnostic.
 
 Add an automated dependency-boundary check so future changes cannot casually reintroduce an ESP dependency into `fw-common` or `hal-ext`.
 
@@ -782,9 +814,11 @@ Scope:
 - update flash commands
 - update documentation and path references
 - remove the workspace-wide default embedded target
+- define `workspace.default-members` as the host-buildable crates so bare root cargo commands stay usable
 - make X3/X4 commands select the C3 target explicitly
 - scope the single-core atomic cfg to C3
 - scope C3-only HAL environment configuration to C3 builds
+- update AGENTS.md and other docs whose instructions assume the repository-wide firmware default target (the "pass an explicit host `--target`" rule inverts)
 
 Do not extract common code yet.
 
@@ -800,6 +834,7 @@ Do not change runtime behavior.
 - an X3 hardware smoke test passes.
 - an X4 build and upstream/hardware verification path remains unchanged.
 - release artifact naming changes, if any, are explicit and accounted for.
+- the OTA app-descriptor identity and update hand-off are byte-identical across the rename: the identity comes from `proto::ota::IDENTITY_*`, not the package name, and fielded updaters validate it — verify nothing stamps `CARGO_PKG_NAME` or a changed artifact name into anything an updater checks.
 
 ### Milestone 2: Create `fw-common`
 
@@ -872,6 +907,7 @@ Scope:
 
 - ESP32-S3 dependency configuration
 - Xtensa toolchain entry point
+- pinned esp (Xtensa) toolchain selection wired into tooling and CI
 - standard S3 linker/memory configuration
 - S3 panic/backtrace output
 - reliable diagnostic output
@@ -899,6 +935,7 @@ Those belong to subsequent platform/device work.
 #### Done when
 
 - `fw-s3` builds using the S3 toolchain independently of `fw-c3`.
+- the esp toolchain is pinned and selected explicitly by tooling; host and C3 builds remain on the upstream toolchain.
 - it flashes to the available S3 development hardware.
 - it boots repeatedly.
 - diagnostics are reliable.
@@ -1066,6 +1103,14 @@ The S3 will invite immediate use of:
 Do none of these during the architecture proof.
 
 First establish a boring, correct S3 platform. Optimize later from measurements.
+
+### 6. Toolchain split
+
+C3 and S3 compile with different rustc distributions: upstream Rust for RISC-V, the espup-managed `esp` fork for Xtensa.
+
+The fork trails upstream, so a shared-crate change accepted by one compiler can fail the other, and the two toolchains update on independent schedules.
+
+Pin both, select the esp toolchain explicitly in tooling, and have CI compile the shared crates through both paths.
 
 ## Future direction
 

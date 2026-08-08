@@ -15,6 +15,7 @@ Before Sticky implementation begins:
 - `fw-s3` does not inherit C3 linker, memory, RTC, OTA/MMU, single-core, or Wi-Fi memory policy.
 - board identity is logically separate from MCU identity even if Sticky is initially the only `fw-s3` board.
 - an S3 image can already boot, log reliably, and execute a minimal path through `fw-common`.
+- the pinned Xtensa (`esp`) toolchain is installed and selected explicitly by tooling and CI, per the architecture PRD's toolchain policy.
 
 This PRD does **not** introduce ESP32-S3 support. It adds the Seeed reTerminal Sticky as a device on the existing S3 platform.
 
@@ -202,6 +203,8 @@ It must not depend on:
 - screen orientation policy
 - UI widgets
 
+One boundary detail needs care. The GT911 samples its INT line during reset to select its I2C address, so INT is driven as an output during reset and only afterwards used as an input or interrupt source. `embedded-hal` has no pin-mode-change trait. Express the generic reset/address-selection sequence over plain output pins — a two-phase construction is fine — and let the platform physically reconfigure the pin between phases. Do not invent a dynamic-mode pin abstraction for this.
+
 The Sticky `fw-s3` input implementation owns:
 
 - concrete I2C peripheral
@@ -256,6 +259,8 @@ before asserting the latch.
 
 Failure to establish the latch is a boot-critical failure.
 
+The latch must also survive deep sleep. An ordinary S3 GPIO output does not hold its level once the digital domain powers down; if PWR_HOLD is firmware-driven, the pad must be explicitly held through deep sleep using the S3 pad-hold/RTC-domain mechanism, otherwise "deep sleep" is actually power-off. Confirm against the schematic which signal keeps the board powered while asleep, and verify the behavior on hardware.
+
 ### Switched peripheral rails
 
 The Sticky has independently switched power for hardware including:
@@ -293,6 +298,8 @@ The actual sleep instruction and wake-source configuration belong to `fw-s3`.
 Use the S3 wake mechanism appropriate to the Sticky's physical power-button GPIO.
 
 Do not reuse the C3 RTC GPIO helper.
+
+Configure the power latch to remain asserted across deep sleep before executing the sleep instruction. A latch that drops when the digital domain powers down silently converts sleep into power-off, and the subsequent button press cold-boots the device in a way casual testing cannot distinguish from wake.
 
 Wake validation must distinguish:
 
@@ -822,6 +829,8 @@ EPD rail off
     ->
 wake source configured
     ->
+power latch held for sleep
+    ->
 deep sleep
 ```
 
@@ -860,6 +869,7 @@ Distinguish genuine deep-sleep wake from:
 - sleep reaches genuine S3 deep sleep.
 - unused peripheral rails are off during deep sleep.
 - physical power button wakes the device.
+- the recorded wakeup cause is a genuine deep-sleep wake, not power-on.
 - previous safe persistent state is restored after wake.
 - at least 50 sleep/wake cycles pass.
 - unplugged standby behavior shows no obvious power regression.
@@ -1278,6 +1288,8 @@ Refresh timing is part of validation, not merely a performance benchmark.
 The Sticky's latch and switched rails make it possible to confuse deep sleep, reset, brownout, and actual power removal.
 
 Record reset/wake reasons during bring-up.
+
+The most likely silent failure is the latch dropping during deep sleep: every subsequent "wake" is really a cold power-on, and casual testing cannot tell the difference. The recorded wakeup cause is what catches it.
 
 ### 5. GT911 orientation
 
