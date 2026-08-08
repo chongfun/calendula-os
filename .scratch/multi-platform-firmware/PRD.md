@@ -236,6 +236,16 @@ The S3 platform must use a critical-section implementation that remains safe if 
 
 Any future multicore PRD must explicitly revalidate this invariant.
 
+**Host test runtime providers**
+
+`fw-common` is a portable library and must not select the production `critical-section` implementation or Embassy time driver. Those are executable/platform responsibilities.
+
+Host tests that execute shared channels or timer-based async workflows must supply test-only providers. Use the standard host `critical-section` implementation through dev/test configuration, and use an Embassy host or mock time driver where timer execution is required.
+
+These test-only features must not leak into the normal `fw-common` dependency graph or either firmware executable. CI must continue verifying the resolved C3 and S3 production graphs independently.
+
+Do not solve host-test linker failures by adding a production critical-section implementation to `fw-common`, by enabling a single-core implementation globally, or by making the shared crate depend on a platform package.
+
 ## Espressif dependency ownership
 
 MCU selection is by firmware package, not Cargo feature.
@@ -768,6 +778,7 @@ No OTA.
 - C3 builds do not enable S3 chip features
 - S3 builds do not enable C3 chip features
 - C3 behavior remains unchanged
+- Host tests can execute representative `Runtime` channel operations, and timer-based common workflows where present, using test-only synchronization/time providers; neither provider appears in the production C3 or S3 dependency graph.
 
 ## Risks
 
