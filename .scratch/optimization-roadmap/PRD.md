@@ -42,9 +42,7 @@ item:
 Nothing below this line can be honestly ranked until these land. Three rounds
 of misranking — A10, A7, the retired 354 ms baseline — came from this layer.
 
-**DONE, on `opt/tier0-measurement-integrity`** (1 commit over `main`, not
-merged; rebased onto #56, clippy clean on X4/X3 × ±default-features, 56 host
-tests on both interpreters). What each item turned out to be:
+**MERGED as #58**. What each item turned out to be:
 
 | # | Item | Outcome |
 |---|---|---|
@@ -108,14 +106,14 @@ All sit on current `main`; none needs a rebase.
 
 | Branch | State | Residual |
 |---|---|---|
-| `opt/tier0-measurement-integrity` | **Ready**, reviewed and reworked. Rebased onto #56; 56 host tests on both interpreters; clippy clean on X4/X3 × ±default-features. | Merge. Device confirmation of 0d's ~36 ms is still owed but gates nothing — the feature is inert by default |
+| ~~`opt/tier0-measurement-integrity`~~ | **MERGED as #58**. | — |
 | ~~`opt/font-mono-raster`~~ | **MERGED as #61, pixels superseded 2026-08-05.** The device verdict was mixed — per-glyph grid-fitting plus the two-render re-seat made some glyphs unbalanced. What survives it: the H2 justification fix, the specimen/fingerprint machinery, and the diagnosis its successor is built on (issue 08, H1/H5). | — |
-| `opt/font-aa-low-threshold` | **Ready (a45d548), device A/B verdict positive** — "better overall" reading on the X3. One antialiased render per glyph, cut at a swept threshold (112); no re-seat; all 49,802 metrics byte-identical sans pool offset, so no cache invalidation. Also corrects the fontgen toolchain pin (#66's pair cannot rebuild the shipped tables; 12.3.0/2.14.3 reproduces byte-for-byte). Full sweep and residuals in issue 08 H5. | Merge; watch bold Merriweather dashes in reading (dropout residual, targeted fix known) |
-| `opt/prune-orphan-sections` | **Ready.** Deletes the section files a shrinking rebuild strands (~360 KB per type change, per book), gated on `resume_spine` so a suspended walk is never pruned against. Three fault-harness tests, each mutation-checked. | Merge — **before B7**, which multiplies the leak |
-| `opt/a11-landscape-glyph-batching` | **Ready.** Differential test against the code it replaces, on both board configs; all goldens pass **unblessed**. | Device measurement only — the author's own merge gate |
+| ~~`opt/font-aa-low-threshold`~~ | **MERGED as #72**. | — |
+| ~~`opt/prune-orphan-sections`~~ | **MERGED as #59**. | — |
+| ~~`opt/a11-landscape-glyph-batching`~~ | **MERGED as #57**. | — |
 | `opt/upload-session-token` | **Ready.** Complete, gate anchored not scanned, goldens re-blessed and visually verified on both boards. | Device check |
-| `opt/inflate-caller-owned-window` | **One-line fix.** Silently cuts the Wi-Fi session heap ~10,504 B (67,856 → 57,352) because `heap_a` is literally `size_of::<ZipInflateScratch>()` and the type shrank. `.data`/`.bss` are unchanged, so every gate stays green. | Donate the new decompressor as the third heap region, then a `sleep-sync` run |
-| `opt/d4-directed-wifi-join` | Complete, well-argued (see issue 04 — its separate-file design is better than this PRD's spec). | Four device checks |
+| ~~`opt/inflate-caller-owned-window`~~ | **MERGED as #63**. | — |
+| ~~`opt/d4-directed-wifi-join`~~ | **MERGED as #73**. | — |
 | ~~`opt/single-repaint-per-page-turn`~~ | **MERGED as #56**, reworked first. The audit found it suppressed the `Loaded` *event* rather than the render, freezing the app's page count during a background build and stranding the reader at the frontier — rule 4 through a door rule 4 does not name. #56 moved the decision into `app_core::loaded_repaints` and kept the event unconditional, and picked up an open-gate latch and a failed-refresh retry on the way. | — |
 | `opt/b7-per-config-section-caches` | **Three defects** (issue 02): `&str` byte-slicing that aborts on SD-derived filenames — reproduced end-to-end, reachable from the orphan sweep on every catalog write; a cross-config cache wipe at three sites, not the one admitted; `BookBuildResume` not keyed by layout config. Still the best-structured large change in the queue. | The three fixes, plus prune orphaned sections first |
 
@@ -171,6 +169,15 @@ only as the honest home for prestage overlap.
 | D3 — portal PSK | #19 | Shipped as a per-session runtime PSK, not the build-time one this PRD proposed |
 | E1+E2+E3 — flash and stack budget | — | ~246 KB flash freed, ~7 KB stack headroom both boards, `.data` 52 → 5 KB |
 | F1–F4+F6 — web emulator and CI | #13 | Initial transfer −49% gz; reading goldens now run in CI |
+| Tier 0 — measurement integrity | #58 | `--strict` works, dead telemetry deleted |
+| Font AA low threshold | #72 | Cut shipped faces from one AA render |
+| Prune orphan sections | #59 | Deletes section files stranded by shrinking rebuild |
+| A11 — landscape glyph batching | #57 | Blit a whole glyph at a time |
+| Inflate caller-owned window | #63 | Decode zip entries against caller-owned inflate window |
+| D4 — directed wifi join | #73 | Join access point this device last associated through |
+| Drop MarigoldOS lineage | #78 | Firmware identity OTA rename |
+| Board identity guard | #77 | Refuse to boot on wrong board |
+| Panel controller detection | #76 | Probe panel controller before driving |
 
 B7 is committed but not merged; everything else above is on `main`.
 
