@@ -658,16 +658,29 @@ pub const APP_DESC_PROJECT_NAME_LEN: usize = 32;
 /// The firmware identity each device build stamps into its app descriptor, and
 /// compares an anchor against before bouncing an update into it.
 ///
-/// Format: `CalendulaOS <board> u<updater-generation> (MarigoldOS)`. Both
-/// builds are the same product at the same version, so the product name alone
-/// cannot answer "could this anchor apply my update?" — the board decides which
-/// trigger filename and which panel the image is for, and the generation digit
+/// Format: `CalendulaOS <board> u<updater-generation>`. Both builds are the
+/// same product at the same version, so the product name alone cannot answer
+/// "could this anchor apply my update?" — the board decides which trigger
+/// filename and which panel the image is for, and the generation digit
 /// is bumped whenever the trigger filename or the update hand-off changes.
 /// `fw` selects one of these by feature; they live here so the strings the
 /// firmware stamps and the strings the tests check are the same constants.
-pub const IDENTITY_X4: &str = "CalendulaOS X4 u1 (MarigoldOS)";
+///
+/// The generation is per-board. The board is already in the string, so
+/// identities for different boards never match each other whatever their
+/// digits; the digit only ever answers "is this anchor an older updater *for
+/// this board*." A board added later therefore starts at `u1` regardless of
+/// where the existing boards have got to — a shared counter would name
+/// generations that board never had.
+///
+/// Both current boards are at `u2` because dropping the ` (MarigoldOS)`
+/// fork-lineage suffix is itself the kind of discontinuity the digit records:
+/// [`staged_image_is_installable`] is exact equality, so firmware still
+/// carrying the old name refuses a renamed image outright. Crossing that break
+/// needs a USB or OEM reflash of the slot-0 anchor; see `docs/FLASHING.md`.
+pub const IDENTITY_X4: &str = "CalendulaOS X4 u2";
 /// See [`IDENTITY_X4`].
-pub const IDENTITY_X3: &str = "CalendulaOS X3 u1 (MarigoldOS)";
+pub const IDENTITY_X3: &str = "CalendulaOS X3 u2";
 
 /// The `<board>` field of each identity above, so code deciding which hardware
 /// an image is for compares against a constant rather than a literal.
@@ -705,15 +718,19 @@ pub fn project_name(field: &[u8; APP_DESC_PROJECT_NAME_LEN]) -> &[u8] {
 /// foreign firmware — CrossPoint or the stock app — parked in the anchor. A
 /// bounce is automatic and unrequested, so it has to be sure the anchor will
 /// finish the job.
-/// The fixed parts of an identity: `CalendulaOS <board> u<gen> (MarigoldOS)`.
+/// The fixed part of an identity: `CalendulaOS <board> u<gen>`.
 const IDENTITY_PREFIX: &[u8] = b"CalendulaOS ";
-const IDENTITY_SUFFIX: &[u8] = b" (MarigoldOS)";
 
 /// Split an identity into its board and updater generation, or `None` if it is
 /// not one of ours at all.
+///
+/// The superseded `... (MarigoldOS)` forms are not one of ours: they fail the
+/// shape and yield `None`, as the pre-board `CalendulaOS (MarigoldOS)` always
+/// did. Nothing is lost by that, because refusing a superseded image has never
+/// gone through this parser — [`anchor_can_apply_update`] and
+/// [`staged_image_is_installable`] compare the raw descriptor field.
 pub fn parse_identity(name: &[u8]) -> Option<(&[u8], u32)> {
     let rest = name.strip_prefix(IDENTITY_PREFIX)?;
-    let rest = rest.strip_suffix(IDENTITY_SUFFIX)?;
     let sep = rest.iter().rposition(|&b| b == b' ')?;
     let (board, generation) = rest.split_at(sep);
     let digits = generation.strip_prefix(b" u")?;
@@ -1646,7 +1663,7 @@ mod tests {
     /// Same product, same board, older updater: it may not know this trigger.
     #[test]
     fn an_anchor_of_an_older_updater_generation_cannot_apply_the_update() {
-        let older = b"CalendulaOS X4 u0 (MarigoldOS)";
+        let older = b"CalendulaOS X4 u1";
         assert!(!anchor_can_apply_update(&descriptor_field(older), X4));
     }
 
@@ -1655,6 +1672,23 @@ mod tests {
     fn an_anchor_predating_the_board_identity_cannot_apply_the_update() {
         let legacy = b"CalendulaOS (MarigoldOS)";
         assert!(!anchor_can_apply_update(&descriptor_field(legacy), X4));
+    }
+
+    /// The `u1 (MarigoldOS)` identities the rename superseded. They are refused
+    /// by the same route every other refusal takes — exact equality on the raw
+    /// descriptor field, not [`parse_identity`], which legacy handling has
+    /// never gone through. Crossing the rename is a USB or OEM reflash of slot
+    /// 0, not a bounce.
+    #[test]
+    fn an_anchor_of_the_superseded_lineage_cannot_apply_the_update() {
+        assert!(!anchor_can_apply_update(
+            &descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)"),
+            X4
+        ));
+        assert!(!anchor_can_apply_update(
+            &descriptor_field(b"CalendulaOS X3 u1 (MarigoldOS)"),
+            X3
+        ));
     }
 
     #[test]
@@ -2091,10 +2125,29 @@ mod tests {
 
     // --- Which staged images may be installed --------------------------------
 
+    /// Pins the exact strings the descriptor carries. The release script reads
+    /// these constants out of this file and compares them against the built
+    /// image, so a stray edit here would silently redefine what ships.
+    #[test]
+    fn the_shipped_identities_are_the_renamed_forms() {
+        assert_eq!(IDENTITY_X4, "CalendulaOS X4 u2");
+        assert_eq!(IDENTITY_X3, "CalendulaOS X3 u2");
+    }
+
     #[test]
     fn the_shipped_identities_parse() {
-        assert_eq!(parse_identity(X4), Some((&b"X4"[..], 1)));
-        assert_eq!(parse_identity(X3), Some((&b"X3"[..], 1)));
+        assert_eq!(parse_identity(X4), Some((&b"X4"[..], 2)));
+        assert_eq!(parse_identity(X3), Some((&b"X3"[..], 2)));
+    }
+
+    /// The parser handles `CalendulaOS <board> u<gen>` and nothing else, so the
+    /// superseded lineage forms read as foreign — the same answer the parser
+    /// has always given for the pre-board form.
+    #[test]
+    fn the_superseded_lineage_identities_do_not_parse() {
+        assert_eq!(parse_identity(b"CalendulaOS X4 u1 (MarigoldOS)"), None);
+        assert_eq!(parse_identity(b"CalendulaOS X3 u1 (MarigoldOS)"), None);
+        assert_eq!(parse_identity(b"CalendulaOS (MarigoldOS)"), None);
     }
 
     /// The board constants are cut from the identities by hand, so this is what
@@ -2131,12 +2184,26 @@ mod tests {
     #[test]
     fn an_image_that_would_overwrite_the_anchor_is_not_installable() {
         assert!(!staged_image_is_installable(
-            &descriptor_field(b"CalendulaOS X4 u0 (MarigoldOS)"),
+            &descriptor_field(b"CalendulaOS X4 u1"),
             X4
         ));
         assert!(!staged_image_is_installable(
             &descriptor_field(b"CalendulaOS (MarigoldOS)"),
             X4
+        ));
+    }
+
+    /// The superseded `u1 (MarigoldOS)` images, refused through the same
+    /// exact-equality path — the reason crossing the rename needs a computer.
+    #[test]
+    fn an_image_of_the_superseded_lineage_is_not_installable() {
+        assert!(!staged_image_is_installable(
+            &descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)"),
+            X4
+        ));
+        assert!(!staged_image_is_installable(
+            &descriptor_field(b"CalendulaOS X3 u1 (MarigoldOS)"),
+            X3
         ));
     }
 
@@ -2146,10 +2213,10 @@ mod tests {
             &b"CrossPoint"[..],
             b"esp-idf",
             b"",
-            b"CalendulaOS X4 u (MarigoldOS)",
-            b"CalendulaOS X4 uX (MarigoldOS)",
-            b"CalendulaOS X4 u1",
-            b"X4 u1 (MarigoldOS)",
+            b"CalendulaOS X4 u",
+            b"CalendulaOS X4 uX",
+            b"CalendulaOS X4 u2 (MarigoldOS)",
+            b"X4 u2",
         ] {
             assert!(
                 !staged_image_is_installable(&descriptor_field(name), X4),
@@ -2160,89 +2227,95 @@ mod tests {
     }
 
     /// An image with a different updater generation must be rejected because an
-    /// immutable slot-0 anchor of generation u1 cannot service future updates
-    /// for a u2 image.
+    /// immutable slot-0 anchor of generation u2 cannot service future updates
+    /// for an image of any other generation, older or newer.
     #[test]
     fn a_different_updater_generation_is_not_installable() {
         assert!(!staged_image_is_installable(
-            &descriptor_field(b"CalendulaOS X4 u2 (MarigoldOS)"),
+            &descriptor_field(b"CalendulaOS X4 u1"),
             X4
         ));
         assert!(!staged_image_is_installable(
-            &descriptor_field(b"CalendulaOS X4 u17 (MarigoldOS)"),
+            &descriptor_field(b"CalendulaOS X4 u17"),
             X4
         ));
     }
 
-    /// Regression test for [P1]: An identity alias like `u01` with leading zeros
-    /// parses to generation 1 but does not byte-match the canonical `u1` identity.
-    /// It must be rejected by `staged_image_is_installable` to prevent a one-way
-    /// upgrade where slot 1 running `u01` fails anchor validation on future updates.
+    /// Regression test for [P1]: an identity alias like `u02` with leading zeros
+    /// parses to the running generation but does not byte-match the canonical
+    /// identity. It must be rejected by `staged_image_is_installable` to prevent
+    /// a one-way upgrade where slot 1 running the alias fails anchor validation
+    /// on future updates.
     #[test]
-    fn u01_generation_alias_is_rejected_and_canonical_u1_is_accepted() {
-        let alias_u01 = descriptor_field(b"CalendulaOS X4 u01 (MarigoldOS)");
-        let canonical_u1 = descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)");
-        let running_identity = X4; // "CalendulaOS X4 u1 (MarigoldOS)"
+    fn a_leading_zero_generation_alias_is_rejected_and_the_canonical_form_is_accepted() {
+        let alias = descriptor_field(b"CalendulaOS X4 u02");
+        let canonical = descriptor_field(b"CalendulaOS X4 u2");
+        let running_identity = X4; // "CalendulaOS X4 u2"
 
-        assert!(
-            !staged_image_is_installable(&alias_u01, running_identity),
-            "u01 alias must be rejected"
+        assert_eq!(
+            parse_identity(b"CalendulaOS X4 u02"),
+            parse_identity(running_identity),
+            "the alias parses to the same generation, which is what makes it a trap"
         );
         assert!(
-            staged_image_is_installable(&canonical_u1, running_identity),
-            "canonical u1 candidate must be accepted"
+            !staged_image_is_installable(&alias, running_identity),
+            "u02 alias must be rejected"
+        );
+        assert!(
+            staged_image_is_installable(&canonical, running_identity),
+            "canonical u2 candidate must be accepted"
         );
     }
 
-    /// Asserts that candidate images with a different updater generation (such as `u2`)
+    /// Asserts that candidate images with a different updater generation (such as `u3`)
     /// are rejected directly by `staged_image_is_installable`, and proves that
     /// same-generation updates succeed across the full multi-boot lifecycle.
     #[test]
     fn differing_generation_staged_image_is_rejected_and_same_generation_lifecycle_succeeds() {
-        let u1_anchor_identity = descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)");
-        let u2_candidate_identity = descriptor_field(b"CalendulaOS X4 u2 (MarigoldOS)");
+        let u2_anchor_identity = descriptor_field(b"CalendulaOS X4 u2");
+        let u3_candidate_identity = descriptor_field(b"CalendulaOS X4 u3");
 
-        // 1. Starts with a u1 anchor (running u1).
-        let running_identity = X4; // "CalendulaOS X4 u1 (MarigoldOS)"
+        // 1. Starts with a u2 anchor (running u2).
+        let running_identity = X4; // "CalendulaOS X4 u2"
 
-        // 2. Direct check: candidate with generation u2 must be rejected.
+        // 2. Direct check: candidate with generation u3 must be rejected.
         assert!(
-            !staged_image_is_installable(&u2_candidate_identity, running_identity),
-            "u1 firmware must reject u2 staged image to avoid losing anchor compatibility"
+            !staged_image_is_installable(&u3_candidate_identity, running_identity),
+            "u2 firmware must reject u3 staged image to avoid losing anchor compatibility"
         );
 
-        // 3. Same-generation (u1) candidate is accepted.
-        let u1_candidate_identity = descriptor_field(b"CalendulaOS X4 u1 (MarigoldOS)");
+        // 3. Same-generation (u2) candidate is accepted.
+        let u2_candidate_identity = descriptor_field(b"CalendulaOS X4 u2");
         assert!(staged_image_is_installable(
-            &u1_candidate_identity,
+            &u2_candidate_identity,
             running_identity
         ));
 
-        // 4. Same-generation (u1) update lifecycle through Device:
-        let mut dev = Device::new(ANCHOR_SLOT, ["u1-anchor", "old-fw"], true);
-        dev.trigger = Some("u1-image");
+        // 4. Same-generation (u2) update lifecycle through Device:
+        let mut dev = Device::new(ANCHOR_SLOT, ["u2-anchor", "old-fw"], true);
+        dev.trigger = Some("u2-image");
         assert_eq!(dev.boot(), Boot::Acted(UpdateAction::WriteUpdateSlot));
 
-        // Boots the resulting slot-1 image (running u1).
+        // Boots the resulting slot-1 image (running u2).
         assert_eq!(dev.boot(), Boot::Ran(UPDATE_SLOT));
 
         // Stages another update while running from slot 1.
-        dev.trigger = Some("u1-image-2");
-        let anchor_usable = anchor_can_apply_update(&u1_anchor_identity, running_identity);
+        dev.trigger = Some("u2-image-2");
+        let anchor_usable = anchor_can_apply_update(&u2_anchor_identity, running_identity);
         assert!(
             anchor_usable,
-            "u1 anchor must be usable by u1 running image"
+            "u2 anchor must be usable by u2 running image"
         );
         assert_eq!(dev.boot(), Boot::Acted(UpdateAction::BounceToAnchor));
         assert_eq!(
             dev.trigger,
-            Some("u1-image-2"),
+            Some("u2-image-2"),
             "trigger survives the bounce"
         );
 
         // The anchor boots from slot 0, sees the trigger, writes slot 1, and selects it.
         assert_eq!(dev.boot(), Boot::Acted(UpdateAction::WriteUpdateSlot));
-        assert_eq!(dev.slots[UPDATE_SLOT as usize], "u1-image-2");
+        assert_eq!(dev.slots[UPDATE_SLOT as usize], "u2-image-2");
         assert_eq!(dev.trigger, None, "trigger is consumed by the anchor write");
 
         // The device reboots and runs from slot 1 with the new image.

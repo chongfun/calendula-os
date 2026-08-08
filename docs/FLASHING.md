@@ -265,7 +265,7 @@ see two reboots instead of one; slot 0 still never gets written.
 
 Calendula only bounces into an anchor that could actually finish the job. Each
 build stamps a firmware identity into its app descriptor —
-`CalendulaOS <board> u<updater-generation> (MarigoldOS)` — and the anchor's must
+`CalendulaOS <board> u<updater-generation>` — and the anchor's identity must
 match exactly. That rules out four cases which would otherwise leave you on a
 firmware that ignores your trigger file, with no way back (the hatch is a no-op
 once you are *on* slot 0):
@@ -298,7 +298,7 @@ at. The anchor check above answers something else — whether a bounce could
 finish the job — and both boot log lines are printed on every boot.
 
 The image on the card is checked the same way before it is installed: it must be
-for **this board** and retain the current **updater generation** (such as `u1`).
+for **this board** and retain the current **updater generation** (such as `u2`).
 An in-app update must retain the current updater generation so that the permanent
 slot-0 anchor remains capable of servicing future updates for the installed
 firmware. Moving to a new updater generation requires first replacing or
@@ -361,6 +361,40 @@ If you already took the in-app path and updates are now being refused, the
 firmware itself is fine; reflashing to `0x10000` by either route restores the
 anchor. Release notes for the first anchor build should say so, rather than
 presenting it as an ordinary in-app update.
+
+### Crossing the identity rename (u1 to u2)
+
+Builds up to and including v0.5.0 stamped a fork-lineage suffix:
+`CalendulaOS X4 u1 (MarigoldOS)`, and the X3 equivalent. Later builds drop the
+suffix and move the generation digit to `u2`: `CalendulaOS X4 u2`,
+`CalendulaOS X3 u2`.
+
+That is a change of identity, and the identity check is exact. **A `u1` device
+will refuse a `u2` image over the in-app updater**, whichever way round you try
+it, and it is meant to: the `u1` anchor in slot 0 could not service the `u2`
+firmware's later updates, so accepting the image would strand you.
+
+**To cross it, flash with a computer or the OEM updater** — the web flasher,
+`esptool` at `0x10000`, or `update.bin` on the card. All of them write slot 0,
+which the in-app updater never does.
+
+**Flash both slots.** Writing slot 0 alone leaves a `u1` image sitting in slot
+1, and the device may still be booting it — none of these routes touch
+`otadata`. Confirm you are on the anchor exactly as the section above describes
+(hold **Back + Up** at the first reset, then check the `ota:` line reads
+*requests 0, executing 0*). From there, one ordinary in-app update writes slot
+1, and both slots are on `u2`.
+
+> [!WARNING]
+> Do **not** erase the chip before any of the three routes above. All of them
+> write only the app slot at `0x10000`, so an erase takes the bootloader and
+> partition table with the stale `u1` image and leaves nothing to restore them
+> — the device stops booting until it gets a full flash. On an **unlocked bench
+> unit** an erase does clear both slots at once, but only paired with
+> `full-flash*.bin` at `0x0`, never with an app-only image.
+
+This is a one-time step. Once both slots read `u2`, in-app updates work as
+normal again.
 
 ### Backing out a bad update
 

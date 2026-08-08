@@ -43,9 +43,39 @@ blocks Pages. If notes beyond the workflow's generic line are wanted, add them
 # all five assets present, with sizes
 gh release view v<version> --json assets -q '.assets[] | .name + " " + (.size|tostring) + "B"'
 
-# the published binary really carries the stamps
-curl -sL https://github.com/chongfun/calendula-os/releases/latest/download/firmware-x4.bin \
-  | strings | grep -E "CalendulaOS \(MarigoldOS\)|<version>"
+# the published binaries really carry the stamps -- descriptor fields read out
+# and compared exactly, the way prepare-release.sh checks the images it builds.
+# A `strings | grep` over the whole binary is not equivalent: the superseded
+# `CalendulaOS X4 u1 (MarigoldOS)` contains a substring that any loose identity
+# pattern accepts, so a stale artifact would pass. Both boards are checked, and
+# every mismatch exits non-zero -- this is meant to be chained, not eyeballed.
+# The tag is named explicitly rather than using `latest`, which moves. Both
+# sides of the comparison come from `v<version>`: the expected identity is read
+# out of the tagged `ota.rs`, not the working tree, so the check is self-
+# contained. Reading the tree instead would fail a valid older release once
+# `main` moves the identity on (a v0.5.0 built as `u1 (MarigoldOS)` re-checked
+# from a `u2` tree), and would compare against the wrong expected value from a
+# stale checkout. Needs the tag locally: `git fetch --tags` first.
+desc_field() { # <image> <byte offset> <field width> -- as prepare-release.sh
+  local raw
+  raw=$(dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | tr '\000' '\n')
+  printf '%s' "${raw%%$'\n'*}"  # cut at the first NUL here rather than piping
+}                               # to `head`, which can SIGPIPE `tr` under pipefail
+check_asset() { # <asset> <identity const>
+  local want ver id
+  want=$(git show "v<version>:proto/src/ota.rs" |
+    sed -n "s/^pub const $2: &str = \"\(.*\)\";\$/\1/p")
+  [ -n "$want" ] || { echo "error: could not read $2 at v<version>" >&2; return 1; }
+  curl -fsSL "https://github.com/chongfun/calendula-os/releases/download/v<version>/$1" \
+    -o "/tmp/$1" || { echo "error: $1 not published under v<version>" >&2; return 1; }
+  ver=$(desc_field "/tmp/$1" 48 32)
+  id=$(desc_field  "/tmp/$1" 80 32)
+  [ "$ver" = "<version>" ] || { echo "error: $1 carries version '$ver'" >&2; return 1; }
+  [ "$id" = "$want" ] || {
+    echo "error: $1 carries identity '$id', expected '$want'" >&2; return 1; }
+  echo "==> $1: v$ver, $id"
+}
+check_asset firmware-x4.bin IDENTITY_X4 && check_asset firmware-x3.bin IDENTITY_X3
 
 # Pages deployed and serves the firmware it embedded
 curl -sI https://chongfun.github.io/calendula-os/firmware-x4.bin | grep -i "HTTP/\|content-length"

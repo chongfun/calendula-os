@@ -608,6 +608,19 @@
     </ul>
     <a class="dl2 off" href="#" id="sd" aria-disabled="true" tabindex="-1">Download SD image &#8595;</a>
     <p class="txt">Already running Calendula? Use <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDX3.BIN">FWUPDX3.BIN</a> on X3 or <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> on X4 and reboot normally.</p>
+    <!-- Reworded when the identity dropped its `(MarigoldOS)` suffix and moved
+         to u2: a v0.5.0-or-older reader refuses the newer trigger file on
+         purpose, and does so silently, so the line above is wrong for exactly
+         the people most likely to read it. -->
+    <p class="txt">On <b>v0.5.0 or older</b>, that will not work — the reader
+    will ignore the file and carry on as before. Nothing is broken; those builds
+    check for a name this release no longer uses.</p>
+    <p class="txt">Fixing it takes two steps, once. Flash from a computer using
+    the button above, or with the SD image: that replaces one of the reader's
+    two copies of the firmware. Then hold <b>Back</b> + <b>Up</b> while it
+    restarts, and run one more update from the card to replace the second copy.
+    After that, card updates work normally again.
+    <a href="https://github.com/chongfun/calendula-os/blob/main/docs/FLASHING.md#crossing-the-identity-rename-u1-to-u2">The full steps are here.</a></p>
   </div>
 
   <p class="rel"><a href="https://github.com/chongfun/calendula-os/releases/latest">v0.5.0 release notes &#8599;</a></p>
