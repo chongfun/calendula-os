@@ -3,6 +3,7 @@ use crate::store::{
     ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS, MAX_SD_TOC_ITEMS,
     MAX_SD_TOC_TEXT_BYTES,
 };
+use core::ops::ControlFlow;
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
@@ -1034,7 +1035,7 @@ where
             // (a directory entry has no chain to reclaim). A refusal here
             // leaves an empty directory, not cache data, so it does not make
             // the clear a failure.
-            let _ = book.delete_file_in_dir(CACHE_SECTIONS_DIR);
+            let _ = book.delete_entry_in_dir(CACHE_SECTIONS_DIR);
         }
         // Everything above worked from a list of names. This is the part that
         // does not: it asks the directory what is actually left, which is the
@@ -1052,7 +1053,7 @@ where
     if cleared && !position_kept {
         // Likewise the book handle: closed by the scope above, deletable here
         // (a directory entry has no chain to reclaim).
-        let _ = cache.delete_file_in_dir(key);
+        let _ = cache.delete_entry_in_dir(key);
     }
     cleared
 }
@@ -1127,12 +1128,17 @@ where
             heapless::Vec::new();
         if sections
             .iterate_dir(|entry| {
-                if entry.attributes.is_directory() || names.is_full() {
-                    return;
+                // A full batch is this pass's whole quota; the next pass
+                // starts the scan again and picks up the rest.
+                if names.is_full() {
+                    return ControlFlow::Break(());
+                }
+                if entry.attributes.is_directory() {
+                    return ControlFlow::Continue(());
                 }
                 let mut name = String::<SHORT_NAME_BYTES>::new();
                 if write!(name, "{}", entry.name).is_err() {
-                    return;
+                    return ControlFlow::Continue(());
                 }
                 match section_ordinal_from_name(name.as_str()) {
                     Some(ordinal) if ordinal >= keep_count => {
@@ -1140,6 +1146,7 @@ where
                     }
                     _ => {}
                 }
+                ControlFlow::Continue(())
             })
             .is_err()
         {
@@ -1235,10 +1242,10 @@ where
                     // A name this pass cannot reproduce is a name it cannot
                     // delete; say so rather than silently leaving it.
                     blocked = true;
-                    return;
+                    return ControlFlow::Continue(());
                 }
                 if name.as_str() == "." || name.as_str() == ".." {
-                    return;
+                    return ControlFlow::Continue(());
                 }
                 if entry.attributes.is_directory() {
                     // Nothing here writes directories. Whatever it is, this
@@ -1246,11 +1253,12 @@ where
                     // a `SECTIONS/` holding only a subdirectory reported
                     // itself emptied.
                     blocked = true;
-                    return;
+                    return ControlFlow::Continue(());
                 }
                 if names.push(name).is_err() {
                     blocked = true;
                 }
+                ControlFlow::Continue(())
             })
             .is_err()
         {
@@ -1303,16 +1311,19 @@ where
         let mut name = String::<SHORT_NAME_BYTES>::new();
         if write!(name, "{}", entry.name).is_err() {
             reclaimed = false;
-            return;
+            return ControlFlow::Break(());
         }
         if name.as_str() == "." || name.as_str() == ".." {
-            return;
+            return ControlFlow::Continue(());
         }
         // A surviving `SECTIONS/` lands here too: it is not a position file,
         // so it fails the check like any other leftover.
         if !is_kept_after_clear(name.as_str()) {
             reclaimed = false;
+            // One leftover settles the question.
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(())
     });
     walked.is_ok() && reclaimed
 }

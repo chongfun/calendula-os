@@ -4,7 +4,9 @@
 //! the display task (the single SD owner) through a two-buffer
 //! ping-pong: chunks carry loaned 4 KB buffers one way, the buffers
 //! come back on the return channel once written. The display task holds
-//! one SD session for the whole upload phase and writes /BOOKS/<8.3>.
+//! one SD session for the whole upload phase and writes /BOOKS/<name>,
+//! where <name> is the browser's filename as a VFAT long name with a
+//! hashed 8.3 alias beside it.
 //!
 //! The pure pieces — name derivation, label shaping, identity-sidecar
 //! parsing — live in `proto::upload` so host `cargo test` covers them
@@ -13,9 +15,7 @@
 // riscv32imc has no CAS; portable-atomic provides it on single-core.
 use portable_atomic::AtomicBool;
 
-pub use proto::upload::{
-    hash_identity, readable_filename, sanitized_name, UploadLabel, UploadName,
-};
+pub use proto::upload::{hash_identity, sanitized_name, UploadName};
 
 /// True while a book body is streaming; the session-ending reset waits
 /// for it so a done press cannot truncate a file mid-write.
@@ -28,21 +28,23 @@ pub static UPLOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 pub static UPLOAD_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub struct UploadBegin {
+    /// The 8.3 name to delete. Empty for uploads: which alias a book lands
+    /// under is the installer's to choose, once the file is complete and it
+    /// can see which aliases are free.
     pub name: UploadName,
+    /// The VFAT long name the book is installed under — the name a computer
+    /// shows, and the one an upload of the same book replaces. Empty for
+    /// deletions.
+    pub long_name: proto::upload::UploadFilename,
     /// True removes the named book instead of writing one.
     pub delete: bool,
     /// Whether the name lives in /BOOKS (uploads always do; deletions
     /// follow the catalog's location flag).
     pub in_books: bool,
-    /// The client's original filename, decoded but otherwise untouched.
-    /// The 8.3 `name` can't carry a real title, so this is stashed in a
-    /// label sidecar and shown in the Library until the book is first opened
-    /// (which learns the EPUB title). Empty for deletions.
-    pub label: UploadLabel,
-    /// A 64-bit FNV-1a hash of the full decoded filename, used to uniquely
-    /// identify this upload during collision resolution so long filenames with
-    /// identical 64-byte truncated display labels don't overwrite each other.
-    pub identity_hash: u64,
+    /// How the same book would have been stored before uploads carried a
+    /// long name, so re-uploading one of those replaces it instead of
+    /// landing beside it. `None` for deletions.
+    pub legacy: Option<upload_store::install::LegacyKey>,
 }
 
 pub struct UploadChunk {

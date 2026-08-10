@@ -9,7 +9,7 @@
 //! AP-mode onboarding portal instead.
 
 use crate::sync_mem::{self, SyncLoan};
-use crate::upload::{sanitized_name, UploadBegin, UploadChunk};
+use crate::upload::{UploadBegin, UploadChunk};
 use crate::{
     StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
     SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_INTERRUPTS, UPLOAD_RESULTS, UPLOAD_RETURNS,
@@ -454,10 +454,10 @@ async fn upload_server(
                     UPLOAD_BEGINS
                         .send(UploadBegin {
                             name,
+                            long_name: proto::upload::UploadFilename::new(),
                             delete: true,
                             in_books,
-                            label: crate::upload::UploadLabel::new(),
-                            identity_hash: 0,
+                            legacy: None,
                         })
                         .await;
                     match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
@@ -483,16 +483,23 @@ async fn upload_server(
                 .and_then(proto::upload::raw_query_name)
                 .map(|s| &*s)
                 .unwrap_or(b"book");
-            let name = sanitized_name(client_name);
-            let label = crate::upload::readable_filename(client_name);
-            let identity_hash = crate::upload::hash_identity(client_name);
-
+            // The long name is the whole of what this layer decides. The
+            // 8.3 alias FAT needs alongside it is chosen by the installer,
+            // which is the only place that can see which aliases are free.
+            // Where the same book would be if it were uploaded before long
+            // names existed: that alias plus the identity its sidecar
+            // carries. The installer uses it only when nothing on the shelf
+            // holds the long name.
+            let legacy = Some(upload_store::install::LegacyKey {
+                alias: crate::upload::sanitized_name(client_name),
+                identity: crate::upload::hash_identity(client_name),
+            });
             let begin = UploadBegin {
-                name,
+                name: crate::upload::UploadName::new(),
+                long_name: proto::upload::wireless_epub_filename(client_name),
                 delete: false,
                 in_books: true,
-                label,
-                identity_hash,
+                legacy,
             };
 
             if !session_started {

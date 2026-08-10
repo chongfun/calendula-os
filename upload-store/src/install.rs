@@ -1,0 +1,1458 @@
+//! Installing a finished file under its real name, crash-safely.
+//!
+//! Uploads stream into a scratch file under `/XTEINK/UPLOAD`, opaque and with
+//! no long name, so an interrupted one leaves a stray file and nothing a
+//! catalog scan will trip over.
+//!
+//! What needs a protocol is what follows: the finished file has to become
+//! `/BOOKS/Some Book.epub` and whatever held that name has to go. FAT cannot
+//! do it in one write, so it is two moves and a delete under one durable
+//! record:
+//!
+//! ```text
+//! /BOOKS/<old>          --move-->  /XTEINK/ROLLBACK/<txn>
+//! /XTEINK/UPLOAD/<txn>  --move-->  /BOOKS/, under the long name
+//! /XTEINK/ROLLBACK/<txn> --delete, reclaiming its clusters
+//! ```
+//!
+//! Each move rewrites directory entries and leaves the cluster chain alone,
+//! so it costs two directory writes rather than a copy of the book.
+//!
+//! # Intent, not progress
+//!
+//! The record says which scratch file, which long name, which predecessor. It
+//! is written before anything is touched and cleared when everything is done,
+//! never updated in between; [`IntentState`] covers what a record that cannot
+//! be read means.
+//!
+//! Progress is not stored because the card holds it. The four places a file
+//! can be at rest — old name, rollback, scratch, shelf — say how far the
+//! sequence got, and [`plan`] maps every combination to one next action. No
+//! phase field can disagree with the card.
+//!
+//! # The one rule that matters
+//!
+//! A move puts two names on one chain for a moment, and both work. Cleanup
+//! there must **unlink** the name it does not want, never reclaim it:
+//! reclaiming frees clusters the survivor is still reading from. [`Step`]
+//! keeps the two apart so a caller cannot pick the wrong one.
+//!
+//! # What this is safe against
+//!
+//! Power loss, at any point, while this device is the only thing writing to
+//! the card. That is the whole promise.
+//!
+//! Not a card edited elsewhere while a record stands. FAT counts no references
+//! and identifies a file by nothing but its directory entry, so a chain freed
+//! by another writer looks exactly like one still held, and its number goes to
+//! whatever is written next. No journal survives concurrent outside writers;
+//! this one is not special.
+//!
+//! Where it can, it refuses rather than destroys: someone else's file under
+//! the destination name is left alone ([`Presence::foreign`]), a book deleted
+//! from a computer mid-transaction reads as a lost install so the predecessor
+//! goes back, and a record this build cannot read stops the card. That makes
+//! the likely accidents survivable; it does not make outside edits supported.
+//!
+//! It is also why [`Step::InstallStage`] is a move, not a link: the move takes
+//! the scratch name as it publishes, so that name still standing means the
+//! upload has not landed. A link would keep it — proving the shelf entry is
+//! ours while both names live, but losing that signal, so that deleting a book
+//! from `/BOOKS` would re-link a dangling entry and free the predecessor.
+use heapless::String;
+
+/// Scratch files being streamed, and finished ones awaiting install.
+pub const UPLOAD_DIR: &str = "UPLOAD";
+/// Predecessors held until the install that replaced them is complete.
+pub const ROLLBACK_DIR: &str = "ROLLBACK";
+/// The intent record, directly under the cache root.
+pub const JOURNAL_FILE: &str = "INSTALL.JNL";
+
+/// Bytes on disk for one intent record. One block, so the write the card
+/// performs is the write the record needs.
+pub const RECORD_BYTES: usize = 128;
+
+const MAGIC: &[u8; 4] = b"CIJ1";
+/// Bumped when the clusters joined the record. Versions 1 and 2 name their
+/// files by alias alone, and a development 3 named only the predecessor by
+/// chain; all of them are weaker claims than this build acts on, so they are
+/// refused rather than replayed under assumptions the build that wrote them
+/// could not make.
+const VERSION: u16 = 4;
+const LFN_BYTES: usize = 64;
+
+const OFF_VERSION: usize = 4;
+const OFF_FLAGS: usize = 6;
+const OFF_STAGE: usize = 8;
+const OFF_OLD: usize = 20;
+const OFF_ROLLBACK: usize = 32;
+const OFF_OLD_CLUSTER: usize = 44;
+const OFF_STAGE_CLUSTER: usize = 48;
+const OFF_LFN_LEN: usize = 56;
+const OFF_LFN: usize = 58;
+/// Last four bytes, so the checksum covers every other byte in the record
+/// and no part of it can change unnoticed.
+const OFF_CRC: usize = RECORD_BYTES - 4;
+
+/// The long name has to end before the checksum. Widening either it or the
+/// layout past this point is a build failure rather than an encode that
+/// writes over the checksum it is about to compute.
+const _: () = assert!(OFF_LFN + LFN_BYTES <= OFF_CRC);
+/// And the fields before it may not run into each other.
+const _: () = assert!(OFF_OLD_CLUSTER + 4 <= OFF_STAGE_CLUSTER);
+const _: () = assert!(OFF_STAGE_CLUSTER + 4 <= OFF_LFN_LEN);
+
+const FLAG_HAS_OLD: u8 = 1 << 0;
+
+const FNV_OFFSET: u32 = 0x811c_9dc5;
+const FNV_PRIME: u32 = 0x0100_0193;
+
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// An 8.3 name. Short enough that the record is fixed-size, which is what
+/// lets it be written in one block.
+pub type ShortName = String<12>;
+
+/// A file the record has to find again after a reset: the name it stood under,
+/// and the chain that name pointed at.
+///
+/// Both, because neither works alone. Names are what this transaction changes,
+/// and a freed 8.3 alias goes to whatever the driver writes next. The chain is
+/// what a move never touches.
+///
+/// Two limits. Every zero-length file starts at cluster 0, so there the chain
+/// says nothing the name did not — such a transaction is refused outright
+/// ([`InstallError::Empty`]). And a chain identifies a file only while it stays
+/// allocated: free it and the number goes back to the pool. See
+/// [`Step::ReclaimRollback`] for where that still bites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located {
+    /// The 8.3 name the entry stood under when the record was written.
+    pub alias: ShortName,
+    /// The first cluster of its data.
+    pub chain: u32,
+}
+
+/// What an install is trying to achieve, in full, before it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallIntent {
+    /// The finished file under `/XTEINK/UPLOAD`. Its chain is what identifies
+    /// the book once installed — the scratch name is gone by then.
+    pub stage: Located,
+    /// The long name the book is installed under. A directory holds at most one
+    /// entry under a long name, so this says which entry to ask about;
+    /// [`Located::chain`] says whether the answer is ours. Bounded by the
+    /// record's field so `encode` cannot overrun it.
+    pub long_name: String<LFN_BYTES>,
+    /// The book being replaced, if any.
+    pub old: Option<Located>,
+    /// Where the predecessor is parked while the swap happens.
+    pub rollback: ShortName,
+}
+
+impl InstallIntent {
+    /// Serialise into one block. The trailing bytes are zero, so a record
+    /// reads the same whether it was written to a fresh file or over an old
+    /// one.
+    pub fn encode(&self) -> [u8; RECORD_BYTES] {
+        let mut out = [0u8; RECORD_BYTES];
+        out[..4].copy_from_slice(MAGIC);
+        out[OFF_VERSION..OFF_VERSION + 2].copy_from_slice(&VERSION.to_le_bytes());
+        out[OFF_FLAGS] = if self.old.is_some() { FLAG_HAS_OLD } else { 0 };
+
+        write_name(
+            &mut out[OFF_STAGE..OFF_STAGE + 12],
+            self.stage.alias.as_str(),
+        );
+        out[OFF_STAGE_CLUSTER..OFF_STAGE_CLUSTER + 4]
+            .copy_from_slice(&self.stage.chain.to_le_bytes());
+        write_name(
+            &mut out[OFF_OLD..OFF_OLD + 12],
+            self.old.as_ref().map_or("", |old| old.alias.as_str()),
+        );
+        out[OFF_OLD_CLUSTER..OFF_OLD_CLUSTER + 4]
+            .copy_from_slice(&self.old.as_ref().map_or(0, |old| old.chain).to_le_bytes());
+        write_name(
+            &mut out[OFF_ROLLBACK..OFF_ROLLBACK + 12],
+            self.rollback.as_str(),
+        );
+
+        let long = self.long_name.as_bytes();
+        out[OFF_LFN_LEN] = long.len() as u8;
+        out[OFF_LFN..OFF_LFN + long.len()].copy_from_slice(long);
+
+        let crc = fnv1a(&out[..OFF_CRC]);
+        out[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// Read a record back, or `None` if these bytes are not one.
+    ///
+    /// A rejection here is not "no transaction": these are whole-record
+    /// bytes, so the transaction had started. What it means to a caller is
+    /// decided in [`IntentState`], which keeps such a record rather than
+    /// discarding it.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < RECORD_BYTES || &bytes[..4] != MAGIC {
+            return None;
+        }
+        let version = u16::from_le_bytes([bytes[OFF_VERSION], bytes[OFF_VERSION + 1]]);
+        if version != VERSION {
+            return None;
+        }
+        let stored = u32::from_le_bytes([
+            bytes[OFF_CRC],
+            bytes[OFF_CRC + 1],
+            bytes[OFF_CRC + 2],
+            bytes[OFF_CRC + 3],
+        ]);
+        if stored != fnv1a(&bytes[..OFF_CRC]) {
+            return None;
+        }
+
+        let long_len = usize::from(bytes[OFF_LFN_LEN]);
+        if long_len == 0 || long_len > LFN_BYTES {
+            return None;
+        }
+        let long_name = core::str::from_utf8(&bytes[OFF_LFN..OFF_LFN + long_len]).ok()?;
+        let mut name = String::<LFN_BYTES>::new();
+        name.push_str(long_name).ok()?;
+
+        let stage = Located {
+            alias: read_name(&bytes[OFF_STAGE..OFF_STAGE + 12])?,
+            chain: read_chain(bytes, OFF_STAGE_CLUSTER),
+        };
+        // The upload is the one file the record must be able to name: the
+        // whole sequence turns on recognising the installed book. `install`
+        // refuses an empty body, so nothing this build writes lands here —
+        // what does is a record laid out by some other build.
+        if stage.chain == 0 {
+            return None;
+        }
+        let rollback = read_name(&bytes[OFF_ROLLBACK..OFF_ROLLBACK + 12])?;
+        let old = if bytes[OFF_FLAGS] & FLAG_HAS_OLD != 0 {
+            let alias = read_name(&bytes[OFF_OLD..OFF_OLD + 12])?;
+            let chain = read_chain(bytes, OFF_OLD_CLUSTER);
+            // Same rule, same reason: an empty file cannot be told from any
+            // other, and both steps that act on the predecessor take a book
+            // off the shelf.
+            if alias.is_empty() || chain == 0 {
+                return None;
+            }
+            Some(Located { alias, chain })
+        } else {
+            None
+        };
+
+        if stage.alias.is_empty() || rollback.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            stage,
+            long_name: name,
+            old,
+            rollback,
+        })
+    }
+}
+
+fn write_name(out: &mut [u8], name: &str) {
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(out.len());
+    out[..len].copy_from_slice(&bytes[..len]);
+}
+
+fn read_chain(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+fn read_name(bytes: &[u8]) -> Option<ShortName> {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    let text = core::str::from_utf8(&bytes[..end]).ok()?;
+    let mut name = ShortName::new();
+    name.push_str(text).ok()?;
+    Some(name)
+}
+
+/// Where the file can be found right now — the whole of what recovery needs
+/// to observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Presence {
+    /// The predecessor is still under its own name in `/BOOKS`.
+    pub old: bool,
+    /// A copy is parked in `/XTEINK/ROLLBACK`.
+    pub rollback: bool,
+    /// The finished upload is still in `/XTEINK/UPLOAD`, on the chain the
+    /// record named — not merely under that name, which a stranger could hold.
+    pub stage: bool,
+    /// The long name in `/BOOKS` is held by a file on the upload's recorded
+    /// chain — the installed book. Holding the name is not enough on its own:
+    /// the entry can have been put there by something other than this
+    /// transaction, which is what [`Self::foreign`] is for.
+    pub dest: bool,
+    /// The long name is held by a file on none of this transaction's three
+    /// chains — not the upload, not the parked copy, not the predecessor. The
+    /// card is browsable from a computer, so a name can be taken while an
+    /// upload is in flight. All three are recorded by chain, so this stays
+    /// answerable for the whole transaction.
+    pub foreign: bool,
+}
+
+/// The single next action. Recovery applies one, re-observes, and asks again,
+/// so a step that fails is simply a step that gets retried on the next mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Give the predecessor a second name under `/XTEINK/ROLLBACK`.
+    RetireOldHolder,
+    /// The predecessor now has two names on one chain. Take away the one in
+    /// `/BOOKS` — unlink only, since the rollback copy is that same data.
+    UnlinkOldHolder,
+    /// Give the finished upload its real name in `/BOOKS`.
+    ///
+    /// A move, which takes the scratch name as it goes. That is load bearing:
+    /// while that name stands, the upload has not been installed, and recovery
+    /// reads it that way. A link would keep it and lose the distinction — see
+    /// the note on the module.
+    InstallStage,
+    /// The book has two names on one chain, because the move was cut between
+    /// its two writes. Take away the scratch one — unlink only, since the
+    /// shelf copy is that same data.
+    UnlinkStage,
+    /// The install is complete and the predecessor is obsolete. The only step
+    /// that frees clusters.
+    ///
+    /// Under the module's contract — this device the only writer — the shelf
+    /// entry here is this transaction's book, since nothing else could be on
+    /// the chain the record names.
+    ///
+    /// Outside it, this is the one step that can lose a book: if the scratch
+    /// chain was freed elsewhere and its number went to a book copied on under
+    /// the same name, the predecessor is freed here for a stranger. No
+    /// arrangement of FAT operations closes that — only identity the record
+    /// carries itself, such as a digest, which costs reading the candidate
+    /// book at every recovery.
+    ReclaimRollback,
+    /// The upload was lost before it was installed, but the predecessor is
+    /// safe in rollback. Put it back where it came from.
+    RestoreOldHolder,
+    /// The predecessor is back under its own name and the parked copy is the
+    /// same chain. Take the parked name away — unlink only.
+    UnlinkRollbackCopy,
+    /// Nothing left to do; clear the journal.
+    Done,
+}
+
+/// The next step towards the state `intent` describes, given what is on the
+/// card.
+///
+/// Total by construction: every combination of the observations has an
+/// answer, because a recovery that could encounter a state it has no rule for
+/// is a recovery that stalls on exactly the crash it exists to handle.
+pub fn plan(intent: &InstallIntent, at: Presence) -> Step {
+    match (at.stage, at.dest) {
+        // The upload has not been installed yet. Clear its destination's name
+        // first, which means getting the predecessor out of `/BOOKS`.
+        (true, false) => match (at.foreign, at.old, at.rollback) {
+            // Somebody else's file holds the name, so the install cannot
+            // happen until that is resolved. Nothing is parked, so nothing of
+            // ours is off the shelf: give up and let the sweep take the
+            // upload. Retrying would refuse every later upload for as long as
+            // that file stayed, and retiring the predecessor first would park
+            // it for nothing.
+            (true, _, false) => Step::Done,
+            // Once the predecessor is parked there is no such exit: it cannot
+            // go back under a name somebody else holds. The install is still
+            // owed, so keep asking — the card takes it the moment the
+            // collision clears, and until then the record keeps the sweep off
+            // the parked book.
+            (true, _, true) => Step::InstallStage,
+            (false, true, false) => Step::RetireOldHolder,
+            (false, true, true) => Step::UnlinkOldHolder,
+            (false, false, _) => Step::InstallStage,
+        },
+        // Mid-install: the move was cut between its two writes, so both names
+        // stand on the one chain.
+        (true, true) => Step::UnlinkStage,
+        // Installed. Anything parked is obsolete now, and obsolete rather
+        // than shared: the installed book came from the scratch file, not
+        // from the predecessor.
+        (false, true) => match (at.old, at.rollback) {
+            // Both stand on the predecessor's chain, so this unlinks rather
+            // than reclaims. Only reachable if something outside put a file
+            // at the destination alias — and assuming otherwise costs a freed
+            // chain that a live name still points at.
+            (true, true) => Step::UnlinkRollbackCopy,
+            (false, true) => Step::ReclaimRollback,
+            (_, false) => Step::Done,
+        },
+        // Neither the upload nor the installed book is there. Whatever
+        // happened, the predecessor is the only book left to protect.
+        (false, false) => match (at.old, at.rollback) {
+            // Mid-retirement, with the upload gone: unwind the half-done move
+            // instead of finishing a transaction that has nothing to install.
+            (true, true) => Step::UnlinkRollbackCopy,
+            // The predecessor is parked and its own name is free. Put it
+            // back; this is the only path that walks the sequence backwards.
+            (false, true) if intent.old.is_some() => Step::RestoreOldHolder,
+            // A parked copy with no predecessor recorded is not this
+            // transaction's to interpret, and unlinking it would discard the
+            // only name some other file has left.
+            (false, true) => Step::Done,
+            // The predecessor stands and nothing else happened, or there was
+            // never anything to install. Either way the shelf is consistent.
+            (_, false) => Step::Done,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Applying a plan to a card
+// ---------------------------------------------------------------------------
+
+use core::ops::ControlFlow;
+
+use crate::{open_or_make_dir, remove_file_reclaiming_clusters, RemoveStatus};
+use embedded_sdmmc::{Directory, Mode, TimeSource};
+use proto::cache::{CACHE_ROOT_DIR, CATALOG_FILE};
+
+/// Why a step could not be carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallError {
+    /// The card would not answer a question or would not accept a write.
+    /// Always retryable: the transaction stands and the next mount tries
+    /// again.
+    Card,
+    /// The step needed something the record does not describe — a
+    /// predecessor step on a record with no predecessor. Retrying cannot
+    /// help.
+    Malformed,
+    /// A transaction is already in flight. Until it is finished, its record
+    /// is the only thing that knows where the files it named have got to,
+    /// and a second transaction would both destroy that record and mutate
+    /// names the first one still owns.
+    Busy,
+    /// A file this transaction would name has no bytes, so no cluster, so the
+    /// record cannot tell it from any other empty file. Refused before
+    /// anything is written down, for the upload and the book it replaces
+    /// alike. No EPUB is zero bytes, and an empty one on the shelf can be
+    /// deleted and the upload retried.
+    Empty,
+}
+
+/// What a recovery pass did, for the caller that has to decide whether its
+/// cached view of the shelf is still good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallRecovery {
+    /// A step changed what is in `/BOOKS`, so any cached catalog is stale.
+    pub touched_shelf: bool,
+    /// No leftover scratch or rollback file is still there — whether one
+    /// would not delete, or there were more than a pass takes. Housekeeping
+    /// only: these files are invisible to the catalog and the reader, so a
+    /// false here is worth logging and nothing more. Deliberately not part of
+    /// `complete`, or one stale file could turn a committed upload into a
+    /// failed one and block a library scan.
+    pub swept: bool,
+    /// A record was in flight when this pass started — including one this
+    /// pass then finished, and one it could not read.
+    ///
+    /// A cached catalog cannot be trusted when this is true, and
+    /// `touched_shelf` is not enough to tell: an install whose shelf-changing
+    /// steps happened *before* the reset leaves this pass with only the
+    /// rollback copy to reclaim, which changes nothing in `/BOOKS` while the
+    /// shelf has already moved on from what the catalog describes.
+    pub had_intent: bool,
+    /// Every step the plan asked for was carried out and the journal is
+    /// clear. When false, the transaction stands and the next mount retries
+    /// it — nothing has been abandoned.
+    pub complete: bool,
+}
+
+type Dir<'a, D, T, const MD: usize, const MF: usize, const MV: usize> =
+    Directory<'a, D, T, MD, MF, MV>;
+
+/// The chain this name points at, or `Ok(None)` if the name is not here.
+/// `None` when the card would not say, which is never the same as "no".
+fn entry_cluster<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    directory: &Dir<'_, D, T, MD, MF, MV>,
+    name: &str,
+) -> Option<Option<embedded_sdmmc::ClusterId>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match directory.find_directory_entry(name) {
+        Ok(entry) => Some(Some(entry.cluster)),
+        Err(embedded_sdmmc::Error::NotFound) => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// Record an intent durably, before touching anything it describes.
+pub fn write_intent<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+    intent: &InstallIntent,
+) -> Result<(), InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // Truncating a record that still describes unfinished work would leave
+    // the files it named with nothing to explain them — a predecessor parked
+    // under a name no one is looking for.
+    match read_intent(root)? {
+        IntentState::Absent | IntentState::Truncated => {}
+        IntentState::Valid(_) | IntentState::Unrecognized => return Err(InstallError::Busy),
+    }
+    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+    let file = xteink
+        .open_file_in_dir(JOURNAL_FILE, Mode::ReadWriteCreateOrTruncate)
+        .map_err(|_| InstallError::Card)?;
+    let bytes = intent.encode();
+    let written = file.write(&bytes).is_ok();
+    let closed = file.close().is_ok();
+    if written && closed {
+        Ok(())
+    } else {
+        Err(InstallError::Card)
+    }
+}
+
+/// What the journal says, which is three answers rather than two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntentState {
+    /// No record. Nothing has happened that this transaction started.
+    Absent,
+    /// A record shorter than one. Written whole before the first mutation and
+    /// truncated only after the last, so a short one had either not started
+    /// or already finished: nothing to replay. Which of the two cannot be
+    /// told from here, and one of them moved the shelf, so a cached catalog
+    /// still cannot be trusted.
+    Truncated,
+    /// A record this pass can act on.
+    Valid(InstallIntent),
+    /// A whole record this build cannot read: unknown version, failed
+    /// checksum, nonsense fields.
+    ///
+    /// [`Self::Truncated`]'s argument does not hold here. It was written, so
+    /// its transaction started, and another build's version describes work in
+    /// a shape this one cannot see. Erasing it would destroy the only account
+    /// of where a book went, so it is kept and mutations are refused.
+    Unrecognized,
+}
+
+/// Read back the intent in flight.
+///
+/// [`InstallError::Card`] means the card would not say, which must not be
+/// read as "no transaction" — that would leave a half-done install unrepaired
+/// while the shelf is served.
+pub fn read_intent<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+) -> Result<IntentState, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(IntentState::Absent),
+        Err(_) => return Err(InstallError::Card),
+    };
+    let file = match xteink.open_file_in_dir(JOURNAL_FILE, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(IntentState::Absent),
+        Err(_) => return Err(InstallError::Card),
+    };
+    let mut bytes = [0u8; RECORD_BYTES];
+    let read = file.read(&mut bytes);
+    if file.close().is_err() {
+        return Err(InstallError::Card);
+    }
+    match read {
+        Ok(count) if count == RECORD_BYTES => match InstallIntent::decode(&bytes) {
+            Some(intent) => Ok(IntentState::Valid(intent)),
+            None => Ok(IntentState::Unrecognized),
+        },
+        // Clearing a journal truncates it before unlinking it, so a
+        // zero-length one is very likely a transaction that finished and was
+        // interrupted on its way out — with the shelf already changed.
+        // Calling that "no record" is how a stale catalog survives.
+        Ok(_) => Ok(IntentState::Truncated),
+        Err(_) => Err(InstallError::Card),
+    }
+}
+
+/// Reclaim the record. Public so a caller that has decided there is nothing
+/// to replay can stop it retiring the catalog on every mount afterwards.
+pub fn clear_intent<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+) -> Result<(), InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(()),
+        Err(_) => return Err(InstallError::Card),
+    };
+    match remove_file_reclaiming_clusters(&xteink, JOURNAL_FILE) {
+        RemoveStatus::Removed | RemoveStatus::Absent => Ok(()),
+        RemoveStatus::Failed => Err(InstallError::Card),
+    }
+}
+
+/// Where each of the four files stands right now.
+pub fn observe<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+    books: &Dir<'_, D, T, MD, MF, MV>,
+    intent: &InstallIntent,
+) -> Result<Presence, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+    let upload = open_or_make_dir(&xteink, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
+    let rollback = open_or_make_dir(&xteink, ROLLBACK_DIR).map_err(|()| InstallError::Card)?;
+
+    // The alias cannot tell these entries apart: retiring the predecessor
+    // frees its alias, and the driver hands the same one to the replacement.
+    // The chain can, being what a move never changes — the installed book
+    // carries the scratch file's, the predecessor the parked copy's.
+    let staged = entry_cluster(&upload, intent.stage.alias.as_str()).ok_or(InstallError::Card)?;
+    // By the name it was parked under: the move gave it a derived alias.
+    let parked = holder_of_long_name(&rollback, intent.rollback.as_str())
+        .ok_or(InstallError::Card)?
+        .map(|(_, cluster)| cluster);
+    let holder = holder_of_long_name(books, intent.long_name.as_str()).ok_or(InstallError::Card)?;
+
+    // The installed book is the one on the upload's chain, recorded before
+    // anything moved. Asking instead whether the scratch file is still there
+    // would make every holder look installed the moment it went, a
+    // stranger's included.
+    let dest = match &holder {
+        Some((_, cluster)) => cluster.value() == intent.stage.chain,
+        None => false,
+    };
+
+    // A shelf entry on the parked copy's chain *is* the predecessor, whatever
+    // it is called: a restore cut between its two writes puts the book back
+    // under a derived alias, and the recorded one is no help there.
+    let restored = match (&holder, parked) {
+        (Some((_, cluster)), Some(parked)) => *cluster == parked,
+        _ => false,
+    };
+
+    // Otherwise by its recorded alias, not the long name: a book stored
+    // before long names has none, which is why it needs replacing rather than
+    // colliding. The alias must still point at the recorded chain, because a
+    // freed alias goes to whatever is written next — and a file merely
+    // answering to that name is somebody else's, which both steps this
+    // authorises would take off the shelf.
+    let standing = match &intent.old {
+        Some(old) => entry_cluster(books, old.alias.as_str())
+            .ok_or(InstallError::Card)?
+            .is_some_and(|found| found.value() == old.chain),
+        None => false,
+    };
+    let old = restored || standing;
+
+    // A holder on none of this transaction's three chains is somebody else's
+    // file, and moving it aside is the one thing recovery may not do.
+    let recorded_old = intent.old.as_ref().map(|old| old.chain);
+    let foreign = match &holder {
+        Some((_, cluster)) => !dest && !restored && recorded_old != Some(cluster.value()),
+        None => false,
+    };
+
+    Ok(Presence {
+        old,
+        rollback: parked.is_some(),
+        // On the recorded chain, not merely under the recorded name: a
+        // stranger at the scratch name is not this upload.
+        stage: staged.is_some_and(|staged| staged.value() == intent.stage.chain),
+        dest,
+        foreign,
+    })
+}
+
+/// The alias the driver gave the parked copy, found by the name it was parked
+/// under.
+fn parked_alias<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    rollback: &Dir<'_, D, T, MD, MF, MV>,
+    intent: &InstallIntent,
+) -> Result<Option<(ShortName, embedded_sdmmc::ClusterId)>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    holder_of_long_name(rollback, intent.rollback.as_str()).ok_or(InstallError::Card)
+}
+
+/// Carry out one step. `Ok(true)` if `/BOOKS` changed.
+///
+/// Public because an install and a recovery are the same walk: the caller
+/// that just staged a file writes its intent and then drives the plan
+/// forward exactly as the next mount would.
+pub fn apply_step<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+    books: &Dir<'_, D, T, MD, MF, MV>,
+    intent: &InstallIntent,
+    step: Step,
+) -> Result<bool, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+    let upload = open_or_make_dir(&xteink, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
+    let rollback_dir = open_or_make_dir(&xteink, ROLLBACK_DIR).map_err(|()| InstallError::Card)?;
+
+    match step {
+        Step::RetireOldHolder => {
+            let old = intent.old.as_ref().ok_or(InstallError::Malformed)?;
+            // The parked copy's long name is its own short name: nothing
+            // reads it, and giving it the book's real name would put a second
+            // holder of that name in a directory that allows only one.
+            books
+                .move_file_in_dir_lfn(old.alias.as_str(), &rollback_dir, intent.rollback.as_str())
+                .map_err(|_| InstallError::Card)?;
+            // A move takes the shelf copy away as it makes the parked one, so
+            // the shelf did change.
+            Ok(true)
+        }
+        Step::UnlinkOldHolder => {
+            let old = intent.old.as_ref().ok_or(InstallError::Malformed)?;
+            books
+                .delete_entry_in_dir(old.alias.as_str())
+                .map_err(|_| InstallError::Card)?;
+            Ok(true)
+        }
+        Step::InstallStage => {
+            upload
+                .move_file_in_dir_lfn(
+                    intent.stage.alias.as_str(),
+                    books,
+                    intent.long_name.as_str(),
+                )
+                .map_err(|_| InstallError::Card)?;
+            Ok(true)
+        }
+        Step::UnlinkStage => {
+            upload
+                .delete_entry_in_dir(intent.stage.alias.as_str())
+                .map_err(|_| InstallError::Card)?;
+            Ok(false)
+        }
+        Step::ReclaimRollback => {
+            let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
+                return Ok(false);
+            };
+            match remove_file_reclaiming_clusters(&rollback_dir, alias.as_str()) {
+                RemoveStatus::Removed | RemoveStatus::Absent => Ok(false),
+                RemoveStatus::Failed => Err(InstallError::Card),
+            }
+        }
+        Step::RestoreOldHolder => {
+            // Restored under the book's long name rather than the alias it
+            // used to have: the alias was never the name, and the driver
+            // derives a fresh one anyway. But a record with no predecessor
+            // has nothing to put back.
+            if intent.old.is_none() {
+                return Err(InstallError::Malformed);
+            }
+            let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
+                return Ok(false);
+            };
+            rollback_dir
+                .move_file_in_dir_lfn(alias.as_str(), books, intent.long_name.as_str())
+                .map_err(|_| InstallError::Card)?;
+            Ok(true)
+        }
+        Step::UnlinkRollbackCopy => {
+            let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
+                return Ok(false);
+            };
+            rollback_dir
+                .delete_entry_in_dir(alias.as_str())
+                .map_err(|_| InstallError::Card)?;
+            Ok(false)
+        }
+        Step::Done => Ok(false),
+    }
+}
+
+/// Get rid of a leftover without ever freeing a chain the shelf may share.
+///
+/// A move that was cut leaves two names on one chain, so a leftover can be
+/// the very file a book on the shelf is reading from. Truncating it there
+/// frees the shelf copy's clusters, so a shared chain has only its name taken
+/// away. Every caller that removes a leftover goes through here: the sweep,
+/// and the upload that finds the scratch name already taken.
+fn discard_leftover<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    directory: &Dir<'_, D, T, MD, MF, MV>,
+    books: &Dir<'_, D, T, MD, MF, MV>,
+    name: &str,
+) -> Result<(), InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(cluster) = entry_cluster(directory, name).ok_or(InstallError::Card)? else {
+        return Ok(());
+    };
+    if shelf_holds_chain(books, cluster).ok_or(InstallError::Card)? {
+        directory
+            .delete_entry_in_dir(name)
+            .map_err(|_| InstallError::Card)?;
+    } else if remove_file_reclaiming_clusters(directory, name) == RemoveStatus::Failed {
+        return Err(InstallError::Card);
+    }
+    Ok(())
+}
+
+/// Whether any book on the shelf is reading from this chain.
+fn shelf_holds_chain<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    books: &Dir<'_, D, T, MD, MF, MV>,
+    cluster: embedded_sdmmc::ClusterId,
+) -> Option<bool>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut shared = false;
+    books
+        .iterate_dir(|entry| {
+            if entry.attributes.is_directory() || entry.attributes.is_volume() {
+                return ControlFlow::Continue(());
+            }
+            if entry.cluster == cluster {
+                shared = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })
+        .ok()?;
+    Some(shared)
+}
+
+/// Reclaim files left behind by transactions that are over.
+///
+/// Only called once the journal is clear, so nothing here is named by a
+/// record: an interrupted upload leaves its scratch file, and a transaction
+/// whose record was lost can leave a parked copy no later plan will mention.
+///
+/// Housekeeping, not recovery. These files are invisible to the catalog and
+/// the reader, so a failure is worth reporting but must not turn a finished
+/// install into a failed one. Bounded per pass: the rest wait for the next
+/// mount rather than delaying the shelf, and `false` says they are waiting.
+fn sweep_leftovers<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+    books: &Dir<'_, D, T, MD, MF, MV>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    const PER_PASS: usize = 8;
+    let Ok(xteink) = open_or_make_dir(root, CACHE_ROOT_DIR) else {
+        return false;
+    };
+    let mut swept = true;
+    for directory in [UPLOAD_DIR, ROLLBACK_DIR] {
+        let Ok(dir) = open_or_make_dir(&xteink, directory) else {
+            swept = false;
+            continue;
+        };
+        let mut stale: heapless::Vec<ShortName, PER_PASS> = heapless::Vec::new();
+        // A file this pass will not get to is still a file left behind, and
+        // the caller has no other way to hear about it.
+        let mut remaining = false;
+        let walked = dir.iterate_dir(|entry| {
+            if entry.attributes.is_directory() || entry.attributes.is_volume() {
+                return ControlFlow::Continue(());
+            }
+            let mut name = ShortName::new();
+            use core::fmt::Write as _;
+            if write!(name, "{}", entry.name).is_err() {
+                remaining = true;
+                return ControlFlow::Continue(());
+            }
+            if stale.push(name).is_err() {
+                remaining = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        if walked.is_err() {
+            swept = false;
+            continue;
+        }
+        // Every name is attempted: one file that will not delete should not
+        // strand the others until the next mount.
+        for name in &stale {
+            if discard_leftover(&dir, books, name.as_str()).is_err() {
+                remaining = true;
+            }
+        }
+        swept &= !remaining;
+    }
+    swept
+}
+
+/// Finish whatever install was in flight, then clear the journal.
+///
+/// Runs before the shelf is served. Each step is applied against a fresh
+/// observation, so a step that fails simply leaves the transaction standing
+/// for the next mount rather than advancing a phase that did not happen.
+///
+/// Retires the catalog snapshot first when there is a record to act on — see
+/// the note inside on why that is a precondition rather than the caller's
+/// housekeeping.
+pub fn recover_installs<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+    books: &Dir<'_, D, T, MD, MF, MV>,
+) -> InstallRecovery
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut touched_shelf = false;
+    let state = match read_intent(root) {
+        Ok(state) => state,
+        // A record that cannot be read might be describing a shelf that has
+        // already moved, so this is not the same as finding none.
+        Err(_) => {
+            return InstallRecovery {
+                touched_shelf,
+                swept: false,
+                had_intent: true,
+                complete: false,
+            }
+        }
+    };
+
+    // Both of the things this pass may do from here — move books between
+    // directories, and clear the record afterwards — end with a card on which
+    // nothing says a catalog snapshot describes the shelf as it used to be.
+    // The record is that evidence, and recovery's last act is to remove it. So
+    // the snapshot goes first, and one that will not go is a reason to leave
+    // the whole transaction for the next mount rather than to press on and
+    // delete the only thing that would have caught it.
+    if matches!(state, IntentState::Valid(_) | IntentState::Truncated)
+        && !crate::clear_cache_file(root, CATALOG_FILE)
+    {
+        return InstallRecovery {
+            touched_shelf,
+            swept: false,
+            had_intent: true,
+            complete: false,
+        };
+    }
+
+    let intent = match state {
+        IntentState::Valid(intent) => intent,
+        // Kept, deliberately. Sweeping now would clear scratch and rollback
+        // files this build cannot know are still spoken for.
+        IntentState::Unrecognized => {
+            return InstallRecovery {
+                touched_shelf,
+                swept: false,
+                had_intent: true,
+                complete: false,
+            }
+        }
+        // Nothing was in flight, so nothing here can move the shelf: the
+        // sweep only touches the scratch and rollback directories.
+        IntentState::Absent => {
+            return InstallRecovery {
+                touched_shelf,
+                swept: sweep_leftovers(root, books),
+                had_intent: false,
+                complete: true,
+            }
+        }
+        // Nothing to replay. Reclaim it so it stops retiring the catalog on
+        // every mount, but say it was there.
+        IntentState::Truncated => {
+            let cleared = clear_intent(root).is_ok();
+            return InstallRecovery {
+                touched_shelf,
+                swept: cleared && sweep_leftovers(root, books),
+                had_intent: true,
+                complete: cleared,
+            };
+        }
+    };
+
+    // One step per observation. The bound is the length of the longest path
+    // through `plan`, and exists so a card that keeps reporting a state the
+    // step did not change cannot spin here forever.
+    for _ in 0..8 {
+        let Ok(presence) = observe(root, books, &intent) else {
+            return InstallRecovery {
+                touched_shelf,
+                swept: false,
+                had_intent: true,
+                complete: false,
+            };
+        };
+        let step = plan(&intent, presence);
+        if step == Step::Done {
+            let cleared = clear_intent(root).is_ok();
+            // Sweeping only once the record is gone: while it stands it names
+            // files a reset here would have the next mount pick up again.
+            return InstallRecovery {
+                touched_shelf,
+                swept: cleared && sweep_leftovers(root, books),
+                had_intent: true,
+                complete: cleared,
+            };
+        }
+        match apply_step(root, books, &intent, step) {
+            Ok(changed) => touched_shelf |= changed,
+            // Retrying is not a different answer here, it is the same one on
+            // every mount for the life of the card — the record cannot
+            // describe the step the shelf is asking for, and no amount of
+            // waiting changes that. So let it go rather than refuse every
+            // upload and delete forever.
+            //
+            // Nothing is lost by sweeping afterwards. The only observation
+            // that plans a predecessor step against a record with no
+            // predecessor is a shelf entry sharing the parked copy's chain,
+            // and `discard_leftover` unlinks a name whose chain the shelf
+            // holds rather than freeing it.
+            Err(InstallError::Malformed) => {
+                let cleared = clear_intent(root).is_ok();
+                return InstallRecovery {
+                    touched_shelf,
+                    swept: cleared && sweep_leftovers(root, books),
+                    had_intent: true,
+                    complete: cleared,
+                };
+            }
+            Err(_) => {
+                return InstallRecovery {
+                    touched_shelf,
+                    swept: false,
+                    had_intent: true,
+                    complete: false,
+                }
+            }
+        }
+    }
+    InstallRecovery {
+        touched_shelf,
+        swept: false,
+        had_intent: true,
+        complete: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The caller's side: stage a file, then ask for it to be installed
+// ---------------------------------------------------------------------------
+
+use crate::same_long_name;
+use embedded_sdmmc::File;
+
+/// How many rollback names to try before giving up. Each is derived from the
+/// book, so a collision means a copy parked by a transaction whose record was
+/// lost; sixteen of those for one book is not a card this code can help with.
+const ROLLBACK_PROBE_LIMIT: u16 = 16;
+
+fn with_extension(alias: &str, extension: &str) -> ShortName {
+    let mut name = ShortName::new();
+    let _ = name.push_str(alias.split('.').next().unwrap_or(alias));
+    let _ = name.push_str(extension);
+    name
+}
+
+/// A book as the pre-long-name uploader stored it, so a re-upload replaces it
+/// instead of landing beside it.
+///
+/// Those books are an 8.3 alias with no long name, their real filename in a
+/// `.TXT` label beside a `.ID` identity. A new upload's long name therefore
+/// matches nothing on the shelf, and without this the user gets two copies.
+/// Identity rather than the label, because labels are truncated display
+/// strings that two books can share — which is why the sidecar exists.
+#[derive(Debug, Clone)]
+pub struct LegacyKey {
+    /// The alias the old uploader derived from this client filename.
+    pub alias: ShortName,
+    /// The identity hash it recorded alongside it.
+    pub identity: u64,
+}
+
+/// How many consecutive aliases the old uploader could have used for one
+/// book. It probed a fixed window from the derived name, so a book that
+/// collided with others sits somewhere inside it.
+const LEGACY_PROBE_WINDOW: u16 = 16;
+
+/// The pre-long-name book matching `key`, if one is still on the shelf.
+///
+/// `None` is a card that would not answer: proceeding would install a second
+/// copy of a book that is already there.
+fn legacy_holder<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+    books: &Dir<'_, D, T, MD, MF, MV>,
+    key: &LegacyKey,
+) -> Option<Option<Located>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let (prefix, base_tail) = split_legacy_alias(key.alias.as_str())?;
+    for probe in 0..LEGACY_PROBE_WINDOW {
+        let candidate = legacy_alias(&prefix, base_tail.wrapping_add(u32::from(probe)));
+        let Some(chain) = entry_cluster(books, candidate.as_str())? else {
+            continue;
+        };
+        match crate::read_upload_identity(root, candidate.as_str()) {
+            Ok(Some(identity)) if identity == key.identity => {
+                return Some(Some(Located {
+                    alias: candidate,
+                    chain: chain.value(),
+                }))
+            }
+            // A book with no identity, or a different one, is a different
+            // book that happens to sit in this window.
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(None)
+}
+
+/// `PPPPTTTT.EPU` split into its prefix and base-36 tail.
+fn split_legacy_alias(alias: &str) -> Option<(String<4>, u32)> {
+    let bytes = alias.as_bytes();
+    if bytes.len() != 12 || &bytes[8..12] != b".EPU" {
+        return None;
+    }
+    if !bytes[..8]
+        .iter()
+        .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut prefix = String::<4>::new();
+    prefix.push_str(&alias[..4]).ok()?;
+    let mut tail = 0u32;
+    for &byte in &bytes[4..8] {
+        tail = tail * 36
+            + match byte {
+                b'0'..=b'9' => u32::from(byte - b'0'),
+                _ => u32::from(byte - b'A' + 10),
+            };
+    }
+    Some((prefix, tail))
+}
+
+fn legacy_alias(prefix: &str, tail: u32) -> ShortName {
+    let mut name = ShortName::new();
+    let _ = name.push_str(prefix);
+    for digit in proto::upload::base36_tail(tail) {
+        let _ = name.push(digit as char);
+    }
+    let _ = name.push_str(".EPU");
+    name
+}
+
+/// A book being streamed into scratch space, under a name nothing reads.
+///
+/// Nothing in `/BOOKS` is touched until [`StagedUpload::install`], so an
+/// upload that is interrupted — by a lost connection, a full card, a reset —
+/// leaves a scratch file and no trace in the library.
+pub struct StagedUpload<'a, D, T, const MD: usize, const MF: usize, const MV: usize>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    file: File<'a, D, T, MD, MF, MV>,
+    stage: ShortName,
+    long_name: String<64>,
+    legacy: Option<LegacyKey>,
+}
+
+impl<'a, D, T, const MD: usize, const MF: usize, const MV: usize> StagedUpload<'a, D, T, MD, MF, MV>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    /// Open scratch space for a book that will be installed as `long_name`.
+    ///
+    /// `legacy` describes the same book as the old uploader would have stored
+    /// it, so a re-upload of a book that predates long names replaces it
+    /// rather than landing beside it. `None` skips that lookup.
+    pub fn begin(
+        root: &Directory<'a, D, T, MD, MF, MV>,
+        books: &Directory<'_, D, T, MD, MF, MV>,
+        long_name: &str,
+        legacy: Option<LegacyKey>,
+    ) -> Result<Self, InstallError> {
+        let mut name = String::<64>::new();
+        name.push_str(long_name)
+            .map_err(|_| InstallError::Malformed)?;
+
+        // A record in flight owns the scratch directory, the alias it is
+        // installing to, and the predecessor it parked. Staging alongside it
+        // would take names it is still counting on, and installing would
+        // destroy the only description of where its files went.
+        match read_intent(root)? {
+            IntentState::Absent | IntentState::Truncated => {}
+            IntentState::Valid(_) | IntentState::Unrecognized => return Err(InstallError::Busy),
+        }
+
+        let alias = proto::upload::upload_short_alias(long_name, 0);
+        let stage = with_extension(alias.as_str(), ".TMP");
+
+        let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+        let upload = open_or_make_dir(&xteink, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
+        // A leftover from an abandoned upload is cleared rather than appended
+        // to. Not always by reclaiming it: an install cut half way through
+        // leaves the scratch file and the book it published sharing one
+        // chain, and if the record was lost too this is the next thing to
+        // touch that name.
+        discard_leftover(&upload, books, stage.as_str())?;
+        let file = upload
+            .open_file_in_dir(stage.as_str(), Mode::ReadWriteCreate)
+            .map_err(|_| InstallError::Card)?;
+        Ok(Self {
+            file,
+            stage,
+            long_name: name,
+            legacy,
+        })
+    }
+
+    pub fn write(&self, bytes: &[u8]) -> Result<(), InstallError> {
+        self.file.write(bytes).map_err(|_| InstallError::Card)
+    }
+
+    /// Give up, leaving the library exactly as it was.
+    pub fn abandon(self, root: &Directory<'_, D, T, MD, MF, MV>) {
+        let _ = self.file.close();
+        if let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) {
+            if let Ok(upload) = xteink.open_dir(UPLOAD_DIR) {
+                let _ = remove_file_reclaiming_clusters(&upload, self.stage.as_str());
+            }
+        }
+    }
+
+    /// Publish the staged file to `/BOOKS` under its long name, replacing any
+    /// book already holding that name.
+    ///
+    /// `Ok(Some(alias))` is the 8.3 name the book now answers to. `Ok(None)`
+    /// is a transaction that finished and installed nothing — a rollback, or
+    /// a name that turned out to belong to somebody else. `Err` says why it
+    /// could not be finished here, which does not always mean it will not
+    /// happen: once the intent is durable, an install interrupted from this
+    /// point is finished by the next mount.
+    pub fn install(
+        self,
+        root: &Directory<'_, D, T, MD, MF, MV>,
+        books: &Directory<'_, D, T, MD, MF, MV>,
+    ) -> Result<Option<ShortName>, InstallError> {
+        let Self {
+            file,
+            stage,
+            long_name,
+            legacy,
+        } = self;
+        // Until the close succeeds the file is not durable, and installing a
+        // book the card has not finished writing is the one thing staging
+        // exists to prevent.
+        if file.close().is_err() {
+            discard_scratch(root, stage.as_str());
+            return Err(InstallError::Card);
+        }
+
+        // Read after the close, never before: a file's entry is only brought
+        // up to date when it is flushed, so an open file's chain is whatever
+        // it was before the body was written.
+        let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+        let upload = open_or_make_dir(&xteink, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
+        let staged = entry_cluster(&upload, stage.as_str())
+            .ok_or(InstallError::Card)?
+            .ok_or(InstallError::Card)?;
+        // A body with no clusters is a body the record cannot name. Recording
+        // it anyway would make every other empty file on the shelf answer to
+        // the same identity — including the one being replaced, which recovery
+        // would then read as this upload already installed.
+        if staged.value() == 0 {
+            drop(upload);
+            drop(xteink);
+            discard_scratch(root, stage.as_str());
+            return Err(InstallError::Empty);
+        }
+        let staged = staged.value();
+        // Dropped before the rest: every lookup below opens its own handles,
+        // and the directory table is small enough that holding these would
+        // starve them.
+        drop(upload);
+        drop(xteink);
+
+        // The chain is recorded alongside each alias: it is what still
+        // identifies these files after their names have been rewritten, freed
+        // and handed to something else.
+        let holder = holder_of_long_name(books, long_name.as_str()).ok_or(InstallError::Card)?;
+        let old = match holder.map(|(alias, chain)| Located {
+            alias,
+            chain: chain.value(),
+        }) {
+            Some(holder) => Some(holder),
+            // Nothing on the shelf carries this long name, which for a book
+            // stored before long names existed is exactly what it would look
+            // like whether or not it is there.
+            None => match &legacy {
+                Some(key) => legacy_holder(root, books, key).ok_or(InstallError::Card)?,
+                None => None,
+            },
+        };
+        // Same rule for the book being replaced: a transaction that cannot
+        // name the file it is about to move off the shelf must not start. An
+        // empty EPUB can be deleted and the upload retried, which is a plainer
+        // answer than acting on a file the record cannot recognise again.
+        if old.as_ref().is_some_and(|old| old.chain == 0) {
+            discard_scratch(root, stage.as_str());
+            return Err(InstallError::Empty);
+        }
+        // Probed rather than derived from the book alone. A copy parked by a
+        // transaction whose record was lost still sits under that derived
+        // name, and linking onto a name that is taken fails every time it is
+        // tried -- which would wedge this book's uploads permanently.
+        let rollback = free_rollback_name(root, stage.as_str()).ok_or(InstallError::Card)?;
+        let intent = InstallIntent {
+            rollback,
+            stage: Located {
+                alias: stage,
+                chain: staged,
+            },
+            long_name,
+            old,
+        };
+        write_intent(root, &intent)?;
+
+        if !recover_installs(root, books).complete {
+            return Err(InstallError::Card);
+        }
+        // The plan is the authority on whether the book landed, not the step
+        // count: a transaction that ended in a rollback completed cleanly and
+        // still installed nothing.
+        if !observe(root, books, &intent)?.dest {
+            return Ok(None);
+        }
+        // The retired book's label and identity now describe a name that is
+        // gone. Best-effort: a sidecar left behind is only read for a book
+        // that still exists.
+        if legacy.is_some() {
+            if let Some(retired) = &intent.old {
+                crate::delete_upload_sidecars(root, retired.alias.as_str());
+            }
+        }
+        // The alias the driver derived, for the caller's log. It is an
+        // artefact of the format, not the book's name.
+        Ok(holder_of_long_name(books, intent.long_name.as_str())
+            .flatten()
+            .map(|(alias, _)| alias))
+    }
+}
+
+/// Reclaim a scratch file for a transaction that will not be started.
+///
+/// Best-effort: nothing under `/XTEINK/UPLOAD` is visible to the catalog or
+/// the reader, and the sweep comes back for whatever is left.
+fn discard_scratch<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+    stage: &str,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) {
+        if let Ok(upload) = xteink.open_dir(UPLOAD_DIR) {
+            let _ = remove_file_reclaiming_clusters(&upload, stage);
+        }
+    }
+}
+
+/// A name in the rollback directory that no file holds.
+fn free_rollback_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Dir<'_, D, T, MD, MF, MV>,
+    stage: &str,
+) -> Option<ShortName>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).ok()?;
+    let rollback = open_or_make_dir(&xteink, ROLLBACK_DIR).ok()?;
+    let stem = stage.split('.').next().unwrap_or(stage);
+    for probe in 0..ROLLBACK_PROBE_LIMIT {
+        let mut candidate = ShortName::new();
+        if probe == 0 {
+            candidate.push_str(stem).ok()?;
+        } else {
+            // Trade a character of the stem for the probe digit rather than
+            // overflow the 8.3 stem.
+            let keep = stem.len().min(7);
+            candidate.push_str(&stem[..keep]).ok()?;
+            candidate
+                .push(char::from_digit(u32::from(probe) % 36, 36)?.to_ascii_uppercase())
+                .ok()?;
+        }
+        candidate.push_str(".OLD").ok()?;
+        if holder_of_long_name(&rollback, candidate.as_str())?.is_none() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The book currently holding `long_name`, if one does.
+///
+/// `Some(None)` is a name nobody holds; `None` is a shelf that would not say,
+/// which must stop the install — proceeding would put a second holder of the
+/// name on the card.
+fn holder_of_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    books: &Directory<'_, D, T, MD, MF, MV>,
+    long_name: &str,
+) -> Option<Option<(ShortName, embedded_sdmmc::ClusterId)>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut storage = [0u8; crate::LFN_SCAN_BYTES];
+    let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
+    let mut holder: Option<(ShortName, embedded_sdmmc::ClusterId)> = None;
+    let walked = books.iterate_dir_lfn(&mut lfn, |entry, found| {
+        if entry.attributes.is_directory() || entry.attributes.is_volume() {
+            return ControlFlow::Continue(());
+        }
+        if !found.is_some_and(|name| same_long_name(name, long_name)) {
+            return ControlFlow::Continue(());
+        }
+        let mut name = ShortName::new();
+        use core::fmt::Write as _;
+        // A name that would not fit is not this entry's alias, and the holder
+        // is handed to steps that delete and move things.
+        if write!(name, "{}", entry.name).is_err() {
+            return ControlFlow::Continue(());
+        }
+        holder = Some((name, entry.cluster));
+        // A directory holds at most one entry under a long name, so there is
+        // nothing further to find.
+        ControlFlow::Break(())
+    });
+    walked.ok()?;
+    Some(holder)
+}

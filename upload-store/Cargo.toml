@@ -7,8 +7,9 @@ edition = "2021"
 workspace = true
 
 [dependencies]
-# Same pin as fw's; see fw/Cargo.toml for why this exact rev.
-embedded-sdmmc = { git = "https://github.com/rust-embedded-community/embedded-sdmmc-rs.git", rev = "d26892f7405469eba95741763ab39bda2239d5ec", default-features = false }
+# The rev, and why it is that rev, live in the root manifest's
+# [workspace.dependencies].
+embedded-sdmmc = { workspace = true }
 heapless = "0.9.0"
 proto = { path = "../proto" }
 

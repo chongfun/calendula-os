@@ -181,15 +181,34 @@ bytes, and `POST /delete?name=` removes a book (card-root entries carry
 task — still the single SD owner — through `fw::upload`'s two-buffer
 ping-pong: 4 KB chunks carry loaned buffers one way and the buffers come
 back on a return channel once written. The display task holds one
-interruptible SD session for the upload phase and writes
-`/BOOKS/<8.3>.EPU` (the catalog scan accepts `.epu` alongside `.epub`),
-recording the browser's original filename in a `/XTEINK/LABELS/<stem>.TXT`
-sidecar so the shelf and Library can label the book with it. Power/idle
-sleep and the done press abort an active writer through the upload-store
-transaction (the staged file's FAT chain is reclaimed, replaced originals
-untouched), close the SD session, and only then sleep or reset; the done
-press waits for the stop acknowledgement so the reset never races an open
-FAT writer. The boot rescan then surfaces the new books.
+interruptible SD session for the upload phase.
+
+Bytes stream into `/XTEINK/UPLOAD` under an opaque name with no long name,
+so nothing enters the library namespace until the file is complete and an
+interrupted upload leaves only a scratch file. Installing it is a
+same-volume move: directory entries are rewritten and the cluster chain is
+left alone, so the book arrives in `/BOOKS` under its real filename as a
+VFAT long name (FAT also requires an 8.3 alias, which the driver derives;
+the catalog scan accepts `.epu` alongside `.epub` and opens books by that
+alias). The card is therefore organizable on a computer. Whatever held the
+name is parked in `/XTEINK/ROLLBACK` until the install completes, and
+reclaimed only then.
+
+One `/XTEINK/INSTALL.JNL` record describes the whole transaction. It is
+written before anything is touched and cleared when everything is done,
+never updated in between. Recovery replays it before the library is scanned
+or a cached catalog is trusted, and while an unresolved record stands it
+owns the names it describes: further uploads *and* deletes are refused
+until it clears. Books uploaded before long-name support are recognized by
+their `/XTEINK/LABELS/<stem>.ID` identity sidecar and migrated by the same
+transaction rather than duplicated; those sidecars are still read for such
+books, but no longer written.
+
+Power/idle sleep and the done press abandon an active writer (the scratch
+file's FAT chain is reclaimed, the shelf untouched), close the SD session,
+and only then sleep or reset; the done press waits for the stop
+acknowledgement so the reset never races an open FAT writer. The boot
+rescan then surfaces the new books.
 
 Station credentials come from `/XTEINK/WIFI.BIN` (written by the
 onboarding portal below), falling back to compile-time `option_env!`
@@ -614,8 +633,11 @@ has no EPUBs.
 /XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
 /XTEINK/CATALOG.BIN
+/XTEINK/INSTALL.JNL
 /XTEINK/LABELS/<stem>.TXT
 /XTEINK/PROBE.TXT
+/XTEINK/ROLLBACK/<txn>
+/XTEINK/UPLOAD/<txn>
 /XTEINK/STATEA.BIN
 /XTEINK/STATEB.BIN
 ```

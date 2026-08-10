@@ -10,7 +10,7 @@ use embassy_futures::select::{select, Either};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
-use embedded_sdmmc::sdcard::CardType;
+use embedded_sdmmc::embedded_sdmmc_types::sdcard::CardType;
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
 use embedded_sdmmc::{Directory, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use esp_hal::gpio::Output;
@@ -321,7 +321,7 @@ fn remembered_card_type() -> Option<CardType> {
     match WARM_CARD_CODE.load(Ordering::Relaxed) {
         1 => Some(CardType::SD1),
         2 => Some(CardType::SD2),
-        3 => Some(CardType::SDHC),
+        3 => Some(CardType::SdhcSdxc),
         _ => None,
     }
 }
@@ -330,7 +330,7 @@ fn remember_card_type(card_type: CardType) {
     let code = match card_type {
         CardType::SD1 => 1,
         CardType::SD2 => 2,
-        CardType::SDHC => 3,
+        CardType::SdhcSdxc => 3,
     };
     WARM_CARD_CODE.store(code, Ordering::Relaxed);
 }
@@ -526,11 +526,21 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
         return;
     };
     let root = Directory::new(raw_root, &volume_mgr);
-    // New books invalidate the catalog snapshot: the next boot's cache
-    // load misses and runs a full scan, which is how uploads surface.
-    if let Ok(xteink) = root.open_dir("XTEINK") {
-        let _ = upload_store::remove_file_reclaiming_clusters(&xteink, "CATALOG.BIN");
+    // New books invalidate the catalog snapshot: the next boot's cache load
+    // misses and runs a full scan, which is how uploads surface.
+    //
+    // Proving it gone is a precondition for changing anything, not a
+    // courtesy. A clean install clears its journal and a delete never writes
+    // one, so afterwards nothing on the card would say the snapshot is stale:
+    // it would simply be believed, listing a deleted book or missing a new
+    // one.
+    let catalog_cleared = upload_store::clear_cache_file(&root, proto::cache::CATALOG_FILE);
+    if catalog_cleared {
         esp_println::println!("upload: catalog snapshot invalidated");
+    } else {
+        esp_println::println!(
+            "upload: catalog snapshot could not be invalidated; refusing changes"
+        );
     }
     // The books handle lives inside this block so every FAT handle is dead
     // by scope before the close-and-acknowledge tail below: UPLOAD_STOPPED
@@ -547,7 +557,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
             },
         };
         match books {
-            Ok(books) => serve_uploads(&root, &books).await,
+            Ok(books) => serve_uploads(&root, &books, catalog_cleared).await,
             Err(_) => {
                 esp_println::println!("upload: BOOKS setup failed");
                 refuse_uploads_until_exit().await
@@ -571,11 +581,26 @@ async fn serve_uploads<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    catalog_cleared: bool,
 ) -> UploadSessionExit
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // Finish anything an earlier session left in flight before touching the
+    // shelf. A record still on the card owns the names it describes and is
+    // the only thing that knows where its files went, so this session must
+    // not write over them or over it.
+    //
+    // Recovery changes the shelf like anything else, so it waits on the same
+    // proof: it ends by clearing the record, and the record is the only thing
+    // that would tell the next mount a surviving snapshot is stale.
+    if !catalog_cleared {
+        esp_println::println!("upload: no install is replayed while the old snapshot stands");
+    } else if !upload_store::install::recover_installs(root, books).complete {
+        esp_println::println!("upload: an install is unfinished; refusing changes until it clears");
+    }
+
     loop {
         let begin = match select(
             UPLOAD_BEGINS.receive(),
@@ -592,7 +617,19 @@ where
             // the upload phase describe views this session never shows.
             Either::Second(Either::Second(DisplayCommand::Render(_))) => continue,
         };
-        let ok = if begin.delete {
+        // Asked once per command rather than once per session, because an
+        // install that fails part way through leaves a record behind and
+        // everything after it is in the same position as a session that
+        // started with one.
+        // Nothing may change while a snapshot of the old shelf might survive.
+        let settled = catalog_cleared && installs_settled(root, books);
+        let ok = if !settled {
+            // Writes and deletes alike: a delete could remove the very book
+            // an unfinished install parked, or the one it is about to
+            // install over.
+            esp_println::println!("upload: refused, an install is still in flight");
+            false
+        } else if begin.delete {
             let removed = if begin.in_books {
                 upload_store::remove_file_reclaiming_clusters(books, begin.name.as_str())
                     == upload_store::RemoveStatus::Removed
@@ -612,12 +649,54 @@ where
         };
         esp_println::println!(
             "upload: '{}' {} ok={}",
-            begin.name,
+            if begin.delete {
+                begin.name.as_str()
+            } else {
+                begin.long_name.as_str()
+            },
             if begin.delete { "delete" } else { "write" },
             ok
         );
         UPLOAD_RESULTS.send(ok).await;
     }
+}
+
+/// Whether the journal leaves the shelf free to change, replaying it once
+/// more if it does not.
+///
+/// A pass that could not finish may only have been the card refusing a read,
+/// and a session that gave up at its first command would then refuse every
+/// command after it. Cheap when there is nothing in flight: one read of the
+/// journal, and no recovery pass at all.
+fn installs_settled<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if journal_is_clear(root) {
+        return true;
+    }
+    upload_store::install::recover_installs(root, books);
+    journal_is_clear(root)
+}
+
+/// A journal with nothing left to replay. A card that will not answer is not
+/// one of those.
+fn journal_is_clear<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    matches!(
+        upload_store::install::read_intent(root),
+        Ok(upload_store::install::IntentState::Absent
+            | upload_store::install::IntentState::Truncated)
+    )
 }
 
 /// Restore the display's SPI clock, clear the session-active flag, and hand
@@ -691,39 +770,37 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    // The probe/sidecar/replace state machine lives in upload-store (where
-    // the host fault-injection tests exercise it); this shell owns only the
-    // chunk streaming between begin and commit/abort.
-    let begun = upload_store::PendingUpload::begin(
+    // The book streams into scratch space outside /BOOKS, so nothing here
+    // can leave a partial file on the shelf. Choosing the alias, retiring
+    // whatever held the name, and surviving a reset mid-swap all belong to
+    // the installer in upload-store, where the host tests exercise them.
+    let staged = match upload_store::install::StagedUpload::begin(
         root,
         books,
-        &begin.name,
-        begin.identity_hash,
-        begin.label.as_str(),
-    );
-    let Ok(pending) = begun else {
-        return match drain_until_end().await {
-            Ok(()) => UploadWrite::Finished(None),
-            Err(exit) => UploadWrite::Interrupted(exit),
-        };
+        begin.long_name.as_str(),
+        begin.legacy.clone(),
+    ) {
+        Ok(staged) => staged,
+        Err(error) => {
+            // Busy is the ordinary one: an earlier install is still owed
+            // work, and until it clears nothing else may touch the shelf.
+            esp_println::println!("upload: cannot stage '{}': {:?}", begin.long_name, error);
+            return match drain_until_end().await {
+                Ok(()) => UploadWrite::Finished(None),
+                Err(exit) => UploadWrite::Interrupted(exit),
+            };
+        }
     };
-    let malformed = pending.skipped_malformed_sidecars();
-    if malformed > 0 {
-        esp_println::println!(
-            "upload: {} malformed identity sidecar(s) treated as absent",
-            malformed
-        );
-    }
     let mut failed = false;
     let mut aborted = false;
     loop {
         let chunk = match next_upload_chunk().await {
             Ok(chunk) => chunk,
             Err(exit) => {
-                // The transaction's abort path closes the staged file and
-                // reclaims its cluster chain; the original book (if this
-                // was a replace) is untouched by design.
-                pending.abort(root, books);
+                // Nothing has been published, so abandoning is just
+                // reclaiming the scratch file. Whatever holds this name on
+                // the shelf never knew about this upload.
+                staged.abandon(root);
                 return UploadWrite::Interrupted(exit);
             }
         };
@@ -736,7 +813,7 @@ where
                 // 2026-07-11: it cost ~1 s per 3.2 MB upload and bought
                 // nothing — TCP rides out the stall via buffering. Don't
                 // reintroduce pacing without a timed upload A/B.
-                if pending
+                if staged
                     .write(&buffer[..chunk.len.min(buffer.len())])
                     .is_err()
                 {
@@ -752,12 +829,22 @@ where
         }
     }
     if failed || aborted {
-        pending.abort(root, books);
+        staged.abandon(root);
         return UploadWrite::Finished(None);
     }
-    // commit closes the file and retires the replaced copies only if the
-    // close succeeded; a failed close discards the target and returns None.
-    UploadWrite::Finished(pending.commit(root, books))
+    // install closes the file first: a book the card has not finished
+    // writing is never published. From the moment the intent is durable the
+    // swap completes here or at the next mount, never half way.
+    match staged.install(root, books) {
+        Ok(alias) => UploadWrite::Finished(alias),
+        Err(error) => {
+            // Worth naming: from the outside every one of these is the same
+            // silent `ok=false`, and they call for different things — Card is
+            // the card, Busy is a record this session must wait out.
+            esp_println::println!("upload: '{}' not installed: {:?}", begin.long_name, error);
+            UploadWrite::Finished(None)
+        }
+    }
 }
 
 /// Consumes one file's worth of chunks without a file to write into.
