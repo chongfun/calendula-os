@@ -91,6 +91,25 @@ fn mint_portal_psk(rng: Rng) -> app_core::PortalPsk {
     app_core::PortalPsk::new(bytes).expect("minted PSK must be valid")
 }
 
+/// Mints this serving session's upload token from the hardware RNG, the
+/// same way and from the same alphabet as the portal PSK: unambiguous
+/// glyphs, because a phone that cannot scan the QR reads it off the screen.
+fn mint_upload_token(rng: Rng) -> app_core::UploadToken {
+    let mut bytes = [0u8; app_core::UploadToken::LEN];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        for byte in rng.random().to_le_bytes() {
+            let draw = (byte & 0x3F) as usize;
+            if draw < PSK_ALPHABET.len() && filled < bytes.len() {
+                bytes[filled] = PSK_ALPHABET[draw];
+                filled += 1;
+            }
+        }
+    }
+    // Every byte was drawn from PSK_ALPHABET, so validation cannot fail.
+    app_core::UploadToken::new(bytes).expect("minted token must be valid")
+}
+
 /// Compile-time station credentials for the dev phase:
 /// `XTEINK_WIFI_SSID=... XTEINK_WIFI_PASS=... cargo build ...`
 pub fn credentials() -> Option<(&'static str, &'static str)> {
@@ -217,6 +236,10 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
     // First Start already consumed; later Starts are Confirm retries
     // from the error screen. A successful join falls through to the
     // book server, which runs until the session's reset.
+    // Minted per session and never persisted: it exists only for as long as
+    // this server runs, and the reset at session end retires it.
+    let upload_token = mint_upload_token(rng);
+
     let ip = loop {
         match session
             .attempt(creds.ssid(), creds.password(), &mut hint, stored_hint)
@@ -234,10 +257,18 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
 
     let stack = session.stack;
     esp_println::println!("upload: serving at {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-    send_event(SyncEvent::Serving(ip));
+    send_event(SyncEvent::Serving(ip, upload_token));
     select(
         exit_after_uploads(),
-        upload_server(stack, tcp_rx, tcp_tx, http_a, http_b, catalog_len),
+        upload_server(
+            stack,
+            tcp_rx,
+            tcp_tx,
+            http_a,
+            http_b,
+            catalog_len,
+            upload_token,
+        ),
     )
     .await;
     unreachable!()
@@ -298,12 +329,18 @@ const UPLOAD_PAGE: &str = concat!(
     r##"queue=document.getElementById('queue'),"##,
     r##"drop=document.getElementById('drop'),"##,
     r##"input=document.getElementById('files');"##,
+    // The session token is the first path segment of whatever URL the
+    // client used to reach this page, so every request can be rebuilt from
+    // it. Deriving it here rather than templating it into the HTML keeps
+    // this page a build-time constant, and keeps the token out of the
+    // document source for anything that later saves or shares it.
+    r##"const T=location.pathname.replace(/\/+$/,'');"##,
     r##"function row(label){const li=document.createElement('li');"##,
     r##"const span=document.createElement('span');span.textContent=label;"##,
     r##"li.appendChild(span);return li}"##,
     r##"async function load(){let text=null;"##,
     r##"for(let i=0;i<10&&text===null;i++){try{"##,
-    r##"const r=await fetch('/list');if(r.ok)text=await r.text();}"##,
+    r##"const r=await fetch(T+'/list');if(r.ok)text=await r.text();}"##,
     r##"catch(e){}if(text===null)await new Promise(d=>setTimeout(d,800))}"##,
     r##"if(text===null){shelf.textContent='';"##,
     r##"shelf.appendChild(row('— the card did not answer —'));return}"##,
@@ -315,7 +352,7 @@ const UPLOAD_PAGE: &str = concat!(
     r##"const a=document.createElement('a');a.className='del';"##,
     r##"a.textContent='remove';a.onclick=async()=>{"##,
     r##"if(!confirm('Remove '+(label||open)+' from the card?'))return;"##,
-    r##"const r=await fetch('/delete?name='+encodeURIComponent(open)+"##,
+    r##"const r=await fetch(T+'/delete?name='+encodeURIComponent(open)+"##,
     r##"(flag==='R'?'&root=1':''),"##,
     r##"{method:'POST'});if(r.ok)li.remove()};li.appendChild(a);"##,
     r##"shelf.appendChild(li)}}"##,
@@ -323,7 +360,7 @@ const UPLOAD_PAGE: &str = concat!(
     r##"const li=row(f.name);const bar=document.createElement('progress');"##,
     r##"bar.max=1;bar.value=0;li.appendChild(bar);queue.appendChild(li);"##,
     r##"const xhr=new XMLHttpRequest();"##,
-    r##"xhr.open('POST','/upload?name='+encodeURIComponent(f.name));"##,
+    r##"xhr.open('POST',T+'/upload?name='+encodeURIComponent(f.name));"##,
     r##"xhr.upload.onprogress=e=>{if(e.lengthComputable)bar.value=e.loaded/e.total};"##,
     r##"xhr.onloadend=()=>{bar.remove();"##,
     r##"li.appendChild(document.createTextNode(xhr.status===200?' ✓':' — failed'));"##,
@@ -347,6 +384,7 @@ async fn upload_server(
     request_buf: &'static mut [u8],
     catalog: &'static mut [u8],
     catalog_len: usize,
+    token: app_core::UploadToken,
 ) -> ! {
     // Staging ping-pong buffers live in the loaned heap.
     let mut pool: heapless::Vec<&'static mut [u8], 2> = heapless::Vec::new();
@@ -412,6 +450,26 @@ async fn upload_server(
         // Reborrow the pieces by index so the buffer stays usable for the
         // body bytes that arrived with the headers.
         let path_at = method_len + 1;
+        // Every endpoint sits behind this session's token, carried as the
+        // first path segment: `/<token>`, `/<token>/list`,
+        // `/<token>/upload?name=...`. Without it any device on the LAN could
+        // add and delete books. Stripping it here means the dispatch below
+        // sees exactly the paths it always did, including the query offsets
+        // the delete and upload handlers index into.
+        let stripped = request_buf
+            .get(path_at..path_at + path_len)
+            .and_then(|path| token.strip_path_prefix(path))
+            .map(|prefix| (path_at + prefix, path_len - prefix));
+        let Some((path_at, path_len)) = stripped else {
+            // Deliberately the same answer a nonexistent path gets, and
+            // before any upload machinery is touched: a wrong token must
+            // not start a storage session or tell the caller it was close.
+            let _ = write_http_response(&mut socket, "404 Not Found", "not found").await;
+            socket.close();
+            let _ = with_timeout(Duration::from_secs(2), socket.flush()).await;
+            continue;
+        };
+
         let is_upload_post = request_buf
             .get(..method_len)
             .map(|m| m == b"POST")

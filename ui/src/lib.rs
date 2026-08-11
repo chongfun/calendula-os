@@ -52,7 +52,7 @@ pub enum UiSyncStatus {
     /// rather than raw bytes so its redacted `Debug` keeps the live
     /// password out of any formatted UI state.
     PortalUp(PortalPsk),
-    Serving([u8; 4]),
+    Serving([u8; 4], app_core::UploadToken),
     CredentialsSaved,
     Error(&'static str),
 }

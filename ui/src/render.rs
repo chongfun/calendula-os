@@ -739,7 +739,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         UiSyncStatus::NotConfigured => dash_key(fb, layout, 1, "set up", true),
         UiSyncStatus::ForgetPending => dash_key(fb, layout, 1, "forget", true),
         UiSyncStatus::Error(_) => dash_key(fb, layout, 1, "again", true),
-        UiSyncStatus::CredentialsSaved | UiSyncStatus::Serving(_) => {
+        UiSyncStatus::CredentialsSaved | UiSyncStatus::Serving(..) => {
             dash_key(fb, layout, 1, "done", true)
         }
         _ => dash_unused(fb, layout, 1),
@@ -814,7 +814,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             let mut temp = [0u8; join_qr::BUFFER_LEN];
             let mut out = [0u8; join_qr::BUFFER_LEN];
             // 140 + 33 modules * 5 px + the 20 px quiet zone ends at
-            // y 325; the first caption baseline at 352 keeps its
+            // y 325; the first caption baseline at 356 keeps its
             // ascenders out of the cleared band.
             if let Some(qr) = join_qr::encode(psk_text, &mut temp, &mut out) {
                 draw_qr(fb, &qr, layout.heading_cx, 140, 5);
@@ -826,10 +826,10 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             push_str(&mut buf, &mut cursor, "\u{201d}");
             draw_text_centered(
                 fb,
-                literata_small(FontStyle::Regular),
+                literata(FontStyle::Regular),
                 text_in(&buf, cursor),
                 layout.heading_cx,
-                352,
+                356,
             );
             let mut buf = [0u8; 32];
             let mut cursor = 0;
@@ -837,26 +837,59 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             push_str(&mut buf, &mut cursor, psk_text);
             draw_text_centered(
                 fb,
-                literata_small(FontStyle::Regular),
+                literata(FontStyle::Regular),
                 text_in(&buf, cursor),
                 layout.heading_cx,
-                384,
+                392,
             );
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "then enter your wi-fi in the page that opens \u{00b7} http://192.168.4.1",
                 layout.heading_cx,
-                416,
+                424,
             );
         }
-        UiSyncStatus::Serving(ip) => {
-            let mut buf = [0u8; 56];
+        UiSyncStatus::Serving(ip, token) => {
+            // The address carries the session's upload token, which is what
+            // keeps the rest of the LAN out of /upload and /delete. The QR
+            // is how a phone gets it without anyone reading six characters
+            // off a screen; the printed line under it is the fallback, and
+            // is why the token alphabet excludes look-alike glyphs.
+            let mut address = [0u8; 22];
+            let mut address_len = 0;
+            push_ipv4(&mut address, &mut address_len, ip);
+            let address = text_in(&address, address_len);
+
+            let mut temp = [0u8; join_qr::BUFFER_LEN];
+            let mut out = [0u8; join_qr::BUFFER_LEN];
+            // Same geometry as the portal QR above: 33 modules at 5 px from
+            // y 140 plus the quiet zone ends clear of the caption baseline.
+            if let Some(qr) =
+                join_qr::encode_upload_url(address, token.as_str(), &mut temp, &mut out)
+            {
+                draw_qr(fb, &qr, layout.heading_cx, 140, 5);
+            }
+            let mut buf = [0u8; 64];
             let mut cursor = 0;
-            push_str(&mut buf, &mut cursor, "visit ");
-            push_ipv4(&mut buf, &mut cursor, ip);
-            push_str(&mut buf, &mut cursor, " to add and remove books");
-            centered_note(fb, layout, text_in(&buf, cursor));
+            push_str(&mut buf, &mut cursor, "http://");
+            push_str(&mut buf, &mut cursor, address);
+            push_str(&mut buf, &mut cursor, "/");
+            push_str(&mut buf, &mut cursor, token.as_str());
+            draw_text_centered(
+                fb,
+                literata(FontStyle::Regular),
+                text_in(&buf, cursor),
+                layout.heading_cx,
+                356,
+            );
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Italic),
+                "scan or type this to add and remove books",
+                layout.heading_cx,
+                392,
+            );
         }
         UiSyncStatus::CredentialsSaved => {
             centered_note(fb, layout, "wi-fi saved");

@@ -1167,6 +1167,84 @@ impl core::fmt::Debug for PortalPsk {
     }
 }
 
+/// Gate on `/upload`, `/delete` and `/list` for one serving session.
+///
+/// Those endpoints were reachable by anything on the LAN: any device on the
+/// same network could add or delete books while a session was up. The fix
+/// has to be something the *user* knows and a stray LAN client does not, so
+/// the token is minted per session, shown on the device screen, and carried
+/// as the first path segment of every request. Embedding it in the page
+/// served at `/` instead would hand it to exactly the clients it excludes.
+///
+/// Six characters of [`PSK_ALPHABET`] is ~34 bits. Short enough to type off
+/// the screen when a phone cannot scan the QR, and the session is short and
+/// LAN-scoped — an attacker gets no offline guessing, only online attempts
+/// against an ESP32 that answers one connection at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct UploadToken {
+    bytes: [u8; UploadToken::LEN],
+}
+
+impl core::fmt::Debug for UploadToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UploadToken")
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl UploadToken {
+    pub const LEN: usize = 6;
+
+    /// Fixed value for the emulators, so golden frames render
+    /// deterministically. Never minted on a device.
+    pub const EMULATOR_DEMO: Self = Self { bytes: *b"k7mfqx" };
+
+    /// `None` unless every byte is from [`PSK_ALPHABET`], which is what
+    /// keeps a token safe to splice into a URL and a QR payload unescaped.
+    pub fn new(bytes: [u8; Self::LEN]) -> Option<Self> {
+        if bytes.iter().all(|byte| PSK_ALPHABET.contains(byte)) {
+            Some(Self { bytes })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Every byte came from PSK_ALPHABET, which is ASCII.
+        core::str::from_utf8(&self.bytes).unwrap_or("")
+    }
+
+    /// Strip the leading `/<token>` segment from a request path, returning
+    /// how many bytes it occupied so the caller can re-slice past it.
+    ///
+    /// `None` is every request the session must refuse. This is the gate
+    /// itself, so it lives here rather than in the server loop: it is
+    /// parsing, it decides who may write to the card, and `fw` has no host
+    /// tests to hold it.
+    pub fn strip_path_prefix(&self, path: &[u8]) -> Option<usize> {
+        let segment = path.strip_prefix(b"/")?;
+        let end = segment
+            .iter()
+            .position(|byte| *byte == b'/' || *byte == b'?')
+            .unwrap_or(segment.len());
+        self.matches(&segment[..end]).then_some(1 + end)
+    }
+
+    /// Whether `candidate` is this token, compared over the whole length
+    /// so a wrong guess cannot be narrowed by how long the answer took.
+    pub fn matches(&self, candidate: &[u8]) -> bool {
+        if candidate.len() != Self::LEN {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (a, b) in self.bytes.iter().zip(candidate) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+}
+
 /// Alphabet for the per-session portal PSK: ASCII alphanumerics minus
 /// the hand-typing-ambiguous 0/O/1/I/l/i/o (phones that cannot scan
 /// type it from the screen) and nothing the `WIFI:` QR payload needs
@@ -1726,7 +1804,7 @@ pub enum SyncStatus {
     PortalUp(PortalPsk),
     /// Connected and the book server answers at this address until the
     /// session ends.
-    Serving([u8; 4]),
+    Serving([u8; 4], UploadToken),
     /// The portal captured and stored credentials; a fresh session will
     /// use them after the reset.
     CredentialsSaved,
@@ -1757,7 +1835,7 @@ pub enum SyncEvent {
     Connected([u8; 4]),
     /// The onboarding hotspot is up, secured with this session's PSK.
     PortalUp(PortalPsk),
-    Serving([u8; 4]),
+    Serving([u8; 4], UploadToken),
     CredentialsSaved(WifiSsid),
     Failed(SyncError),
 }
@@ -2190,7 +2268,7 @@ impl ReaderState {
                     next.wifi_ssid_len = 0;
                     next.sync_status = SyncStatus::NotConfigured;
                 }
-                SyncStatus::CredentialsSaved | SyncStatus::Serving(_) => {
+                SyncStatus::CredentialsSaved | SyncStatus::Serving(..) => {
                     next.view = AppView::Home;
                     next.selection = 0;
                     next.sync_status = next.wireless_entry_status();
@@ -2488,7 +2566,7 @@ impl ReaderState {
             SyncEvent::Connecting => SyncStatus::Connecting,
             SyncEvent::Connected(ip) => SyncStatus::Connected(ip),
             SyncEvent::PortalUp(psk) => SyncStatus::PortalUp(psk),
-            SyncEvent::Serving(ip) => SyncStatus::Serving(ip),
+            SyncEvent::Serving(ip, token) => SyncStatus::Serving(ip, token),
             SyncEvent::CredentialsSaved(ssid) => {
                 self.wifi_ssid = ssid.bytes;
                 self.wifi_ssid_len = ssid.len;
@@ -2850,6 +2928,104 @@ fn next_font_family(family: FontFamily, custom_available: bool) -> FontFamily {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_upload_token_only_accepts_its_own_exact_value() {
+        let token = UploadToken::EMULATOR_DEMO;
+        assert!(token.matches(token.as_str().as_bytes()));
+        assert_eq!(token.as_str().len(), UploadToken::LEN);
+
+        // The gate strips one path segment and hands it here, so these are
+        // the shapes a wrong or truncated URL actually produces.
+        assert!(!token.matches(b""));
+        assert!(!token.matches(b"k7mfq"));
+        assert!(!token.matches(b"k7mfqxx"));
+        assert!(!token.matches(b"K7MFQX"));
+        assert!(!token.matches(b"upload"));
+    }
+
+    #[test]
+    fn the_gate_admits_exactly_the_urls_the_screen_shows() {
+        let token = UploadToken::EMULATOR_DEMO;
+        let prefix = 1 + UploadToken::LEN;
+
+        // The address rendered on the serving screen, and the three requests
+        // the page derives from it. These are the whole authorized surface.
+        assert_eq!(token.strip_path_prefix(b"/k7mfqx"), Some(prefix));
+        assert_eq!(token.strip_path_prefix(b"/k7mfqx/list"), Some(prefix));
+        assert_eq!(
+            token.strip_path_prefix(b"/k7mfqx/upload?name=book.epub"),
+            Some(prefix)
+        );
+        assert_eq!(
+            token.strip_path_prefix(b"/k7mfqx/delete?name=BOOK.EPB&root=1"),
+            Some(prefix)
+        );
+        // Stripping must leave the path the dispatch already understood,
+        // query string and all — that is what keeps the offsets the delete
+        // and upload handlers index into valid.
+        let path = b"/k7mfqx/upload?name=book.epub";
+        assert_eq!(&path[prefix..], b"/upload?name=book.epub");
+
+        // Everything a LAN client would reach for unaided.
+        for refused in [
+            &b"/"[..],
+            b"/list",
+            b"/upload?name=book.epub",
+            b"/delete?name=BOOK.EPB",
+            b"/favicon.ico",
+            b"",
+            // Right length, wrong value; and the token as a *later* segment,
+            // which a prefix check that scanned instead of anchoring would
+            // wrongly admit.
+            b"/k7mfqy/upload",
+            b"/upload/k7mfqx",
+            b"/K7MFQX/list",
+            // Truncated and overlong first segments.
+            b"/k7mfq/list",
+            b"/k7mfqxx/list",
+        ] {
+            assert_eq!(
+                token.strip_path_prefix(refused),
+                None,
+                "{:?} must be refused",
+                core::str::from_utf8(refused)
+            );
+        }
+    }
+
+    #[test]
+    fn an_upload_token_refuses_bytes_a_url_would_need_escaped() {
+        // The token is spliced into a URL and a QR payload unescaped, so
+        // the alphabet is the guarantee that it needs no escaping.
+        assert!(UploadToken::new(*b"k7mfqx").is_some());
+        for bad in [*b"k7mf/x", *b"k7mf?x", *b"k7mf x", *b"k7mf;x", *b"k7mfq0"] {
+            assert!(
+                UploadToken::new(bad).is_none(),
+                "{:?} must not mint",
+                core::str::from_utf8(&bad)
+            );
+        }
+        // Every alphabet byte must be mintable, or the draw silently loses
+        // part of its range.
+        for byte in PSK_ALPHABET {
+            assert!(UploadToken::new([*byte; UploadToken::LEN]).is_some());
+        }
+    }
+
+    #[test]
+    fn serving_carries_the_token_the_screen_has_to_show() {
+        let state = with_saved_network(ReaderState::boot())
+            .apply_sync_event(SyncEvent::Connected([192, 168, 0, 233]))
+            .apply_sync_event(SyncEvent::Serving(
+                [192, 168, 0, 233],
+                UploadToken::EMULATOR_DEMO,
+            ));
+        assert_eq!(
+            state.sync_status,
+            SyncStatus::Serving([192, 168, 0, 233], UploadToken::EMULATOR_DEMO)
+        );
+    }
     use super::*;
 
     const CTX: ReducerContext = ReducerContext::new(1, 3);
@@ -3592,8 +3768,14 @@ mod tests {
         let state = with_saved_network(ReaderState::boot());
         let state = press(press(state, Button::Previous), Button::Confirm)
             .apply_sync_event(SyncEvent::Connected([192, 168, 0, 233]))
-            .apply_sync_event(SyncEvent::Serving([192, 168, 0, 233]));
-        assert_eq!(state.sync_status, SyncStatus::Serving([192, 168, 0, 233]));
+            .apply_sync_event(SyncEvent::Serving(
+                [192, 168, 0, 233],
+                UploadToken::EMULATOR_DEMO,
+            ));
+        assert_eq!(
+            state.sync_status,
+            SyncStatus::Serving([192, 168, 0, 233], UploadToken::EMULATOR_DEMO)
+        );
         // The screen labels Confirm "done" while serving, so it must exit
         // exactly like Back does (the wifi task defers the reset past any
         // in-flight transfer either way).
@@ -4658,7 +4840,10 @@ mod tests {
         assert_eq!(held.sync_status, SyncStatus::Connecting);
         let state = state.apply_sync_event(SyncEvent::Connected([192, 168, 1, 23]));
         assert_eq!(state.sync_status, SyncStatus::Connected([192, 168, 1, 23]));
-        let state = state.apply_sync_event(SyncEvent::Serving([192, 168, 1, 23]));
+        let state = state.apply_sync_event(SyncEvent::Serving(
+            [192, 168, 1, 23],
+            UploadToken::EMULATOR_DEMO,
+        ));
 
         // The done press returns Home with the entry status restored.
         let state = press(state, Button::Confirm);

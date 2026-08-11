@@ -191,7 +191,10 @@ impl WebEmulator {
                 self.ops
                     .push((now + 1600.0, Op::Sync(SyncEvent::Connected([192, 168, 1, 27]))));
                 self.ops
-                    .push((now + 2600.0, Op::Sync(SyncEvent::Serving([192, 168, 1, 27]))));
+                    .push((now + 2600.0, Op::Sync(SyncEvent::Serving(
+                        [192, 168, 1, 27],
+                        app_core::UploadToken::EMULATOR_DEMO,
+                    ))));
             } else {
                 // No saved network: the onboarding hotspot comes up (with
                 // the fixed demo PSK in place of the per-session one the

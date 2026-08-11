@@ -44,9 +44,34 @@ pub fn encode<'a>(
     temp: &mut [u8; BUFFER_LEN],
     out: &'a mut [u8; BUFFER_LEN],
 ) -> Option<QrCode<'a>> {
+    encode_parts(&["WIFI:T:WPA;S:", PORTAL_SSID, ";P:", psk, ";;"], temp, out)
+}
+
+/// Encodes the serving session's browser address —
+/// `http://<ip>/<token>` — the same way. The address is what carries the
+/// upload token, so the QR is how a phone gets it without anyone typing
+/// it; the printed line under it is the fallback.
+///
+/// At most 15 bytes of dotted quad plus a 6-byte token and 8 of
+/// scaffolding is 29 bytes, comfortably inside version 3's 42 at EC M —
+/// so this never approaches [`MAX_VERSION`].
+pub fn encode_upload_url<'a>(
+    ip: &str,
+    token: &str,
+    temp: &mut [u8; BUFFER_LEN],
+    out: &'a mut [u8; BUFFER_LEN],
+) -> Option<QrCode<'a>> {
+    encode_parts(&["http://", ip, "/", token], temp, out)
+}
+
+fn encode_parts<'a>(
+    parts: &[&str],
+    temp: &mut [u8; BUFFER_LEN],
+    out: &'a mut [u8; BUFFER_LEN],
+) -> Option<QrCode<'a>> {
     let mut payload = [0u8; 64];
     let mut len = 0;
-    for part in ["WIFI:T:WPA;S:", PORTAL_SSID, ";P:", psk, ";;"] {
+    for part in parts {
         let bytes = part.as_bytes();
         if len + bytes.len() > payload.len() {
             return None;
