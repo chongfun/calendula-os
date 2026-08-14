@@ -1,6 +1,27 @@
 # UC8179 display driver for X4 (newer production panels)
 
-Status: ready-for-human
+Status: needs-hardware
+
+**Restatused 2026-08-13, and the reason is worth more than the label.** This
+read `ready-for-human`, the same status as the UC8279 X3 PRD, and the two are
+not the same kind of thing. That PRD's hardware caveat is a *schedule* risk — a
+UC8279d X3 unit can arrive on this bench, so "blocks shipping, not development"
+is a gate that will one day close. **This one can never close.** The owner has
+no X4 and no path to one, so identical wording implied the difference was
+timing when it is a difference in kind.
+
+Two honest deliverables, and this PRD should pick one rather than leave it
+implicit:
+
+1. **Reframe it** to what is achievable here — a compile-clean, host-tested
+   port whose acceptance is "matches the freeink reference and passes host
+   tests", with device validation handed to someone with X4 hardware (upstream
+   has benched UC8179 units).
+2. **Park it.** It costs nothing today: `fw/src/display_flush/mod.rs` already
+   routes a confirmed UC8179 to the SSD1677 backend — unchanged behaviour, not
+   a dark panel. This is the asymmetry with the X3 case, where an undetected
+   UC8279d on the UC8253 backend risks a dark panel on units that actually
+   ship. **No user harm accrues while this sits.**
 
 ## Problem
 
@@ -39,7 +60,7 @@ Transform constants: `MIRROR_X=true`, `MIRROR_Y=true`, `REVERSE_BITS=true`.
 
 ### Dependencies
 
-- Depends on: `panel-controller-detection` (dispatch layer must exist to route to this backend)
+- Depends on: the runtime controller probe, shipped as #76 (`display/src/epd/probe.rs`, `hal-ext/src/epd_probe.rs`, dispatch in `fw/src/display_flush/mod.rs`). The dispatch layer exists and routes a confirmed sibling to the default backend until one of these drivers lands; `active_backend()` is where the second arm goes.
 - **Carries the deep-sleep RST hold with it, and this is the controller the drain was reported on.** Upstream's field report is a UC8179 pack dead in ~36 h: the active-low RESET pin floats high-Z in deep sleep, drifts, and restarts the controller's explicitly BTST-programmed DC-DC booster, which then drains through "off". The SSD1677 tolerates the same floating pin — no external booster, and its deep sleep actively discharges — which is why this has never bitten our X4 units and why PR #70 closing unmerged carried no consequence. Shipping this driver changes that: it must land with a RST hold. Note that #70's `rst.set_high()` is not the mechanism, since a C3 pad goes high-Z in deep sleep whatever its output level; upstream `0425477` arms a pad hold before sleep and releases it in bus init before the wake reset pulse, and both halves are required — an un-released hold makes the reset pulse bounce off the latch.
 
 ### Notes
@@ -72,8 +93,9 @@ field report names, so the dependency belongs on this PRD even though PR #70 was
 closed unmerged for the SSD1677 units we actually ship.
 
 **2026-08-07** — The dispatch dependency is satisfied:
-`panel-controller-detection` is implemented on
-`feature/runtime-display-controller-detection` (58f5fa0). `fw::display_flush`
+The controller probe merged as #76 (`27ea614`); its PRD has been deleted now
+that the code and `docs/ARCHITECTURE.md:383-446` carry the reasoning, and is
+recoverable at `733d27c` if needed. `fw::display_flush`
 routes the four panel operations through a `DetectedController` read from the
 boot probe, and the arm this backend plugs into is marked in the source. Until
 it lands, a confirmed UC8179 runs the SSD1677 backend — unchanged behaviour,
@@ -89,3 +111,54 @@ detected, that asymmetry is the first thing to revisit. And `VER` byte 2
 `/XTEINK/PROBE.TXT`: it is what separates a UC8179 (`0x01`) from a UC8279 in
 X4 clothing (`0x02`/`0x68`/`0x69`), which is the discriminator this PRD will
 need if X4 units turn out to carry either.
+
+**2026-08-13 upstream sweep — four corrections. The first two mean the current
+spec would build the wrong thing.**
+
+1. **The BUSY model in Problem is now wrong.** freeink `c60987a` replaced
+   `BusyPolarity::X3TwoPhase` with a new `UcIdleHigh` for both UC8179 and
+   UC8279 X4: delay one RTOS tick, then poll until BUSY_N is HIGH — **no LOW
+   edge observed, and deliberately no millisecond timeout**, because *"issuing
+   the next command while BUSY_N is still LOW can make the UC controller
+   discard plane or LUT writes."* `waitRefreshComplete()` now routes
+   `UcIdleHigh` back through `waitBusy()` rather than the ISR/semaphore path,
+   *"so a missed assertion edge can never make the caller write RAM while the
+   waveform is still busy."* This PRD still specifies the edge-qualified
+   two-phase wait upstream just removed — which can miss the edge on a fast
+   operation and return immediately.
+2. **A missing init register.** `41f2a7f` appends PWS (0xE3) = 0x22 after GATE
+   — "VCOM 2 lines, source 2 × 660 ns", from GxEPD2, for dithered-bitmap
+   stability. Upstream keeps it configurable (0 = skip) because the X4 Pro uses
+   different glass and a 600-gate scan, so port it as a zeroable constant
+   rather than a blind copy.
+3. **The RST hold refinement, which bites harder here** because this PRD makes
+   the hold a ship blocker. Per freeink `61f0b2b`: the hold *level* is
+   board-conditional (X4 lands on HIGH **because** its panel rail is never
+   gated, not by default), and "releases it in bus init … and both halves are
+   required" is now **three** sites — the third being controller detection,
+   which runs before bus init. On our tree that is `fw/src/main.rs:488`
+   borrowing GPIO5 ahead of `Output::new` at `:498`.
+4. **This PRD ports one of two drivers the probe can now select.** `41f2a7f`
+   plus `625a496` — the latter sitting in the *previous* sweep window and
+   missed on 2026-08-06 — mean upstream ships a distinct `Uc8279X4Driver`, and
+   `BoardConfig.h` enables both `FREEINK_DRIVER_UC8179` and
+   `FREEINK_DRIVER_UC8279_X4` for X4 **and** X4 Pro, so it is not X4-Pro-only.
+   Upstream's own reference doc says to keep three drivers apart. This PRD
+   still frames it as "if X4 units turn out to carry either" — upstream has
+   settled that they do, and a UC8279-in-X4-clothing unit would fall through to
+   SSD1677 under this scope as written.
+
+**Do not "correct" the PSR values from upstream's commit message.** `c60987a`'s
+message claims *"UC8179 now uses PSR 0x3B and software byte/bit reversal
+instead of SHL."* The diff does not do that: `uc8179DefaultConfig()` still
+ships `psr0 = 0x3F` (0x3B + SHL), mirror-X is still the hardware SHL bit, and
+only comments were reworded. This PRD's pinned transforms and PSR values are
+**current and correct** — verified against the shipped code, not the message.
+Same failure mode as the stale-header warning above, and it earns the same
+explicit treatment.
+
+*Adjacent, out of scope but worth not losing:* `c60987a` also changed the
+**SSD1677** — a 10 ms wait after SWRESET, and a documented FAST/`0xFC`
+`turnOff=true` shutdown (`0x3C=0x80`, `0x22=0x03`, `0x20`, 200 ms) with async
+updates deferring it until refresh completion. That is the backend our X4
+builds ship *today*.
