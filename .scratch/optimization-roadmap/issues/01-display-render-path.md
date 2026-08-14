@@ -84,6 +84,30 @@ has changed. *(The nibble→frames mapping is inferred; no UC8253 datasheet is
 in the repo. It does not need to be right for the experiment to be worth
 running.)*
 
+**Independent confirmation and one warning, from the 2026-08-13 upstream sweep
+(freeink `cd2bcc5`).** Upstream's UC8253 X3 driver reaches CDI through
+`loadBankCdi(bus, 0x29, 0x07, bank)` — the same two bytes this item names, from
+a separate lineage, which is as close to corroboration as these constants get
+without a datasheet. Their header documents the high byte as mode selection:
+CDI `0x29` differential, `0xA9` absolute. That matches our reading, so the
+value under suspicion really is the interval field and not something else
+wearing its bits.
+
+**The warning is worth more than the confirmation.** The same commit fixes a
+CDI bug on their UC8279 driver of exactly the shape A12 might invent: the
+driver had been sending a *first-vs-later* CDI split (`0xD7` then `0x97`), and
+byte-level RE of the stock firmware showed stock sends **one constant value on
+every refresh**, with `0xD7` belonging to a separate settle pass their driver
+does not run. The invented split caused border ghosting on later pages. So: if
+the experiment below leads to varying CDI *per refresh* rather than changing
+one constant, that is the failure mode to expect, and border ghosting on the
+second and later pages is its signature — not something a single-page capture
+would show.
+
+Their method is also the cheapest way to settle what stock actually sends, and
+we have not tried it: read the constants out of the factory firmware image
+rather than inferring them from behaviour.
+
 - Impact if the interval accounts for even 6 of the ~10.6 frames:
   **~77–100 ms off every refresh in every mode**, page turns included —
   **18–24% of the whole 424 ms turn**, an order of magnitude more than

@@ -106,7 +106,7 @@ is the opposite of what was expected when this started.
 | 1 | **A13 — FastClean's 200 ms trailing settle** | A | Measured: `flush_ms` 686 against `busy_ms` 455, and the 204 ms tail is a `DelayMs(200)` whose only job is to precede the *next* RAM write — which already happens after `Settled`. Pure reordering. **−200 ms (−29%) on every view change, every wake, every menu step.** | S |
 | 2 | **A12 — the 136 ms that is not waveform drive** | A | `busy_ms = 136.0 + 12.79 × frames` fits three modes to under 1 ms. 136 ms is **36% of every Fast BUSY** and is controller interval, not drive. Prime suspect is a CDI nibble never varied since the reference driver. **One byte, one capture; potentially ~77–100 ms off every refresh = 18–24% of a page turn.** Test before building. | S to test |
 | 3 | **A14 — frame-identity guard at the flush seam** | A | **G2 shipped as #56**, so the double repaint is gone. A14 remains worth landing: `fb == prev_fb` catches an identical frame from *any* cause — the 62-refresh end-of-book case, the loading plate's duplicate flush, six no-op input sites — and being below the reducer it cannot strand the reader the way an event-layer suppression can. Measure the hit rate first (`identical=<bool>` on `bench: render`); under ~2% outside the known cases, drop it. | S–M |
-| 4 | **C2** — measure sleep current with the fuel gauge, then hold GPIOs if it indicts them | C | **Unblocked 2026-07-30: the first-line experiment needs no meter and no disassembly.** The X3's BQ27220 sits on the battery and keeps integrating while the SoC is in deep sleep, so a charge-register read, a 24–72 h sleep, and a second read give average standby draw. Over 48 h, 15 µA is 0.72 mAh against 300 µA's 14.4 mAh — decisive even at 1 mAh resolution, and a null result *is* the answer. Cost is one register and one `println!`. The series meter drops to a follow-up for if it comes back high. **The "which GPIOs" half now has two named suspects from the 2026-08-06 upstream sweep, so a high reading has somewhere to go: (a) the X3 SD rail on GPIO13 — we drive that pin nowhere and so never cut the card for sleep, and freeink confirmed the pin by factory-firmware RE (`x3-sd-rail-sleep-power`); and (b) the panel RST line floating in deep sleep, closed unmerged as PR #70, which upstream reports as ~36 h-to-dead on a UC8179 while calling the SSD1677 tolerant. Neither is confirmed on our hardware and the gauge cannot separate them, but the card can be removed outright for a control run, making (a) the cheaper one to isolate.** | S |
+| 4 | **C2** — measure sleep current with the fuel gauge, then hold GPIOs if it indicts them | C | **Unblocked 2026-07-30: the first-line experiment needs no meter and no disassembly.** The X3's BQ27220 sits on the battery and keeps integrating while the SoC is in deep sleep, so a charge-register read, a 24–72 h sleep, and a second read give average standby draw. Over 48 h, 15 µA is 0.72 mAh against 300 µA's 14.4 mAh — decisive even at 1 mAh resolution, and a null result *is* the answer. Cost is one register and one `println!`. The series meter drops to a follow-up for if it comes back high. **The "which GPIOs" half now has two named suspects from the 2026-08-06 upstream sweep, so a high reading has somewhere to go: (a) the X3 SD rail on GPIO13 — we drive that pin nowhere and so never cut the card for sleep, and freeink confirmed the pin by factory-firmware RE (`x3-sd-rail-sleep-power`); and (b) the panel RST line floating in deep sleep, closed unmerged as PR #70, which upstream reports as ~36 h-to-dead on a UC8179 while calling the SSD1677 tolerant. Neither is confirmed on our hardware and the gauge cannot separate them, but the card can be removed outright for a control run, making (a) the cheaper one to isolate.** **Sharpened 2026-08-13: upstream measured 12.8 µA deep sleep on X3 hardware, so the board is known to reach ~13 µA and any high reading here is our pin configuration. And crosspoint `9b1fb712` now guards GPIO13 to C3 boards only — X4 uses that pin for `power.latch0`, so a fix must be board-gated.** | S |
 
 ### Tier 2 — gated on a Tier 0 measurement
 
@@ -150,6 +150,7 @@ or `sd_session.rs` needs that migration, not a rebase.** Verified by
 | 11 | **F10/F11 — close two CI holes** | F | `tools/web-emulator` is built by **no PR gate** (a broken wasm merges green); the bench harness's own 25 tests run nowhere. Both cost ~0 CI wall clock. | S |
 | 12 | **D5** — portal → station handoff | D | ~40–60 s and 3 steps off first-time onboarding. | M |
 | 13 | **E7** — `sort_unstable_by_key` in the wifi scan | E | One stable sort of 20 elements costs a 4,128 B frame and 3.8 KB of flash; stability is irrelevant there. Cheapest item in the roadmap. | S |
+| 13a | **C11 — scale the CPU clock down when nothing needs 160 MHz** | C | **New 2026-08-13 from crosspoint `70faa29d`.** We set 160 MHz once at `fw/src/main.rs:365` and never vary it. Upstream measured a 3 s post-turn 160 MHz tail at 21.2 mA on an X3. Unlike C10 this touches no timer domain and is not blocked. Impact deliberately unestimated — but note our BUSY wait already sits in WFI on a GPIO edge rather than spinning, so the lever is clock-tree only and **upstream's 3.2× is not this item's number**. **Run it on C2's gauge rig, not separately** — same instrument, same untethered requirement. | S–M |
 | 14 | **F5 re-scoped** | F | Merriweather is **42.9% of the wasm** and is not the default face: −41% on *every* first visit, not just a board switch. The old deferral reasoning was wrong. | L |
 
 ### Unresolved — measure before ranking
@@ -248,6 +249,12 @@ they describe a device plugged into a laptop, which is not the shipped one.
 **Never measured:** deep-sleep current or any other power figure at any
 operating point (C2); the upload throughput ceiling's cause; boot- and
 wake-to-first-paint, though the data is already in every capture on disk.
+**Still true of *this* firmware after the 2026-08-13 sweep** — but upstream now
+has X3 figures from a PPK2 at the battery terminals (deep sleep **12.8 µA**,
+static-page idle **9.68 mA** before their light-sleep work, **2.78 mA** after;
+crosspoint `70faa29d`). Different firmware and a different GPIO configuration,
+so these are reference points, not our numbers. Their value is that they bound
+what the hardware can do, which is what C2 has been unable to say. See C10.
 **Permanently unavailable: the owner has no X4.** Every "verify on both
 boards" step is X4 compile/clippy/goldens only; on-device X4 validation
 happens if a contributor with hardware appears. C2's wake-reliability step
@@ -408,6 +415,37 @@ One issue file each, owning a distinct set of files.
 
 Each of these was tried, measured, and rejected. The reason is the part that
 matters — without it the idea comes back.
+
+**Assessed and declined from the 2026-08-13 upstream sweep** (crosspoint
+`255bab31..`, freeink `8b8337b..`). Recorded because each one *looks* like a
+port until you check one fact:
+
+- **freeink `fdf246d`, `__builtin_popcount` → inlined SWAR.** Xtensa-specific:
+  the builtin lowers to a windowed `callx8` into ROM's `__popcountsi2`. **We
+  target `riscv32imc`** (`rust-toolchain.toml`), a different backend entirely,
+  and the driver they fixed is not one we run. Do not port on the strength of
+  the headline. *(The transferable half is the shape of the bug — tens of
+  thousands of calls per page turn existing only to feed a serial-log
+  statistic. That is C7's argument, restated by someone else's profiler.)*
+- **crosspoint `6af9a049`, cache cumulative spine sizes in RAM.** Their progress
+  bar computes percent-of-book from cumulative spine *byte* sizes, so every
+  render paid two seeks and a heap-allocating read. **We do not compute progress
+  that way** — the reducer carries a page count from the paginated cache and
+  the reading view renders from RAM. There is no per-render SD read here to
+  remove.
+- **freeink `b17beee`, "one forced full sync after begin(), not two".** Their
+  `begin()` set a `_initialFullSyncsRemaining = 2` countdown, so a splash screen
+  consumed the first forced clean and the first real screen still paid the
+  second (press-to-home 7634 → 4569 ms on X3). **We have no countdown**:
+  `fw/src/tasks/display.rs:426` is the sole panel-init site, gated on
+  `!screen_on() && last_request().is_none()`, and the mode comes from the
+  refresh planner. Worth knowing the failure mode exists; there is nothing to
+  fix. *(C8 remains the sleep-side version of this question and is unaffected.)*
+- **The Paper Mono / Murphy M4 / X4 Pro wave in freeink** (`3c20447`, `f9aa77e`,
+  `d123567`, `41f2a7f`, and the grayscale run `72529a0`/`f50b1ab`/`477ac31`).
+  Other hardware, and grayscale was assessed and rejected on 2026-07-25 for
+  reasons that have not changed. `41f2a7f` is UC8279-for-X4-Pro and does not
+  advance the open UC8279 **X3** port; keep watching that PRD, not this commit.
 
 - **A10 as specified (pre-computed line-wrap caching).** There is no wrapping
   in the render path to cache. The EPUB sink wraps at cache-build time,

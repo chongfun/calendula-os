@@ -88,6 +88,21 @@ untouched. Then **measure**, which is the part that has never been done.
   `docs/ARCHITECTURE.md`). The difference between ~15 µA and several hundred
   is months versus a week or two of shelf life. It may already be fine —
   nothing proves it either way, and that is the point.
+- **Upstream now has a reference figure: 12.8 µA deep sleep, measured on an X3
+  with a PPK2 at the battery terminals** (crosspoint `70faa29d`, 2026-08-12).
+  This does **not** measure our firmware — different GPIO configuration is
+  exactly the variable C2 exists to test — but it changes what a reading means.
+  The hardware demonstrably reaches ~13 µA, so a high reading on our side is
+  our pin configuration and not the board, and the "it may already be fine"
+  branch now has a specific number to be fine *against*. It also confirms the
+  10–15 µA claim was the right order of magnitude, which the roadmap could not
+  say before.
+- **The GPIO13 suspect is now confirmed board-conditional upstream.**
+  crosspoint `9b1fb712` ("Guard GPIO13 power control for Xteink C3 boards
+  only") restricts the GPIO13 SD-rail control to C3 boards, because X4 uses the
+  same pin for `power.latch0`. Anything we write here must be board-gated the
+  same way — driving GPIO13 unconditionally would toggle a power latch on the
+  board we cannot test on.
 - Risk: wake reliability. Pin maps differ between boards (GPIO0 is the ADC
   divider on X4 and I2C SCL to the BQ27220 on X3). The terminal-path pin
   handling changed in #27: the wake button now arrives through a cooperative
@@ -216,9 +231,51 @@ panel is a bring-up failure mode and X4 cannot be regression-tested.)*
 
 ### C10 (L, blocked upstream): light sleep between page turns — costed honestly, not yet buildable
 
-`enter_light_sleep_timer` has zero call sites and the "do not re-propose"
-entry below tells the next reader to wire it up or delete it. Here is the
-costing, so nobody spends a week discovering the blocker:
+**Upstream measured this on an X3, 2026-08-12 (crosspoint `70faa29d`, "light-sleep
+idle + refresh downclock — ~3.2x active reading time"). It answers C10's gating
+question and does not lift C10's blocker — those are two different things, and
+the entry below is edited on that basis rather than rewritten.**
+
+Their method is one this roadmap has wanted for four rounds: a Nordic PPK2 at
+the battery terminals, slim build, USB cable removed, 3.8 V. Their numbers, on
+their firmware:
+
+| Metric | Before | After |
+|---|---|---|
+| Idle on a static page | 9.68 mA | **2.78 mA** |
+| Session average @ 30 s/page | ~11.6 mA | **~3.6 mA** |
+| Post-turn 160 MHz tail | 21.2 mA × 3 s | eliminated |
+| Deep sleep | 12.8 µA | unchanged |
+
+**What that settles.** C10 says below that C2's awake-idle reading decides it:
+≥15 mA means the SoC dominates and this is worth an L, ≤8 mA means the board
+rails dominate and C10 should be closed. Upstream took the same board family
+from 9.68 to 2.78 mA, so **~6.9 mA of a 9.68 mA idle was SoC and clock, not
+rails** — the SoC dominates, decisively, and the "close it" branch is dead.
+Note also that our 15 mA estimate for 160 MHz WFI is datasheet-typical and
+upstream's whole-board idle came in *below* it; treat the arithmetic below as
+an upper bound.
+
+**What it does not settle, and must not be read as settling.** This is a
+different firmware on a different runtime — an Arduino/ESP-IDF main loop
+calling `esp_light_sleep_start()` directly. **Our TIMG0 blocker is untouched by
+it**: they have no embassy time driver to desynchronize. The implementation
+does not port. Their "before" also already had #852's flat 3 s full-speed
+window, so their delta is not measured against a design like ours.
+
+**Three things worth taking regardless of C10's fate:**
+
+1. **Their guard list is design input we would otherwise buy with a bug.** Never
+   light-sleep while a render lock is held, while Wi-Fi is up, or while USB is
+   connected — light sleep kills the CDC link.
+2. **That last guard collides with Tier 0d.** If light sleep is disabled
+   whenever USB is attached, then a tethered capture cannot see this item at
+   all — not "measures it slightly wrong", *cannot see it*. Any C10 verification
+   plan has to be untethered from the start, which means the gauge method, not
+   the serial log.
+3. **The post-turn full-speed tail is a separate, unblocked item.** See C11.
+
+Here is the costing, so nobody spends a week discovering the blocker:
 
 **The optimistic arithmetic** (datasheet-typical, SoC only): idle at 160 MHz
 in WFI ≈15 mA; C3 light sleep ≈130 µA; at a 15 ms cadence with ~1.2 ms
@@ -252,6 +309,45 @@ The only periodic waker with a static page on screen is that tick; the gauge is
 30 s and every other task is parked on a channel or an infinite `pending()`.
 The seam for any deeper tier is `esp_rtos::start_with_idle_hook`, which nothing
 references today.)*
+
+### C11 (S–M, unblocked): scale the CPU clock down when nothing needs 160 MHz
+
+**New 2026-08-13, from crosspoint `70faa29d`.** We set the CPU clock once —
+`esp_hal::Config::default().with_cpu_clock(CpuClock::_160MHz)` at
+`fw/src/main.rs:365` — and never vary it again. Upstream's measurement puts a
+number on what that costs: eliminating a 3 s post-turn tail at 160 MHz was
+worth 21.2 mA × 3 s per page turn on its own, separately from their light-sleep
+work.
+
+**This is not C10 and is not blocked by C10's blocker.** Changing the CPU
+frequency does not stop TIMG0, does not desynchronize embassy's clock, and does
+not consume the `Rtc` handle. It is orthogonal to the light-sleep tier and can
+land without it.
+
+**Be honest about the two places it applies, because they are not equal:**
+
+- **During a refresh's BUSY wait (379 ms of every 405 ms flush).** Upstream's
+  version of this recovers a genuine spin — their `pollBusy()` polls the pin in
+  a loop. **Ours does not spin**: `hal-ext/src/spi_dma.rs:99-134` awaits
+  `busy.wait_for_low()` / `wait_for_high()` on a GPIO edge, so the CPU is
+  already in WFI for the whole wait. The lever here is therefore only the
+  difference between WFI at 160 MHz and WFI at 10 MHz — the clock tree and PLL,
+  not the core. Real, but a fraction of what upstream measured, and **anyone
+  quoting their 3.2× for this item is quoting the wrong number.**
+- **During idle with a static page on screen**, where the same clock tree is up
+  for a reader doing nothing at 30 s/page. This is the larger share and it does
+  not need light sleep to collect.
+
+- Impact: unknown until measured, and deliberately not estimated here — the
+  point of the item is that it is cheap to try. Bracket it with the gauge
+  method (C2), not with a tethered capture.
+- Risk: the SPI bus clock divider and any timing derived from the CPU clock
+  must be re-derived or re-asserted across a frequency change; a downclock
+  taken while a DMA transfer is in flight is the obvious way to corrupt a
+  flush. Raise the clock on the same lock that guards a render, as upstream
+  does, rather than sprinkling calls.
+- Verify: gauge-integrated idle window at each clock, plus the existing
+  `bench: refresh` timings to prove no refresh got slower.
 
 ### C6 (M; blocked on the X3 display path being hardware-verified): power off the UC8253 charge pump on static pages
 
