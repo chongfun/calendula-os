@@ -1,51 +1,66 @@
 # User-Managed Library — PRD
 
-Status: **Draft for review.** Requirements below marked *(stated)* come from
-the product owner; those marked *(inferred)* are the author's reading and
-need confirmation. Facts marked *(verified)* were read from the pinned
-dependency or measured on hardware and are cited.
+Status: **Draft for review.** Requirements marked *(stated)* come from the
+product owner; *(inferred)* are the author's reading and need confirmation;
+*(decided)* were settled in review on 2026-08-13 and the alternative is
+recorded so it is not silently relitigated. Facts marked *(verified)* were
+read from the pinned dependency or measured on hardware, and are cited.
+
+This document **absorbs the `cache3-architecture` draft** (commit `49b2c0a`),
+which is superseded.
 
 Scope is deliberately independent of the on-device image-rendering PRD.
-Nothing here depends on render bundles, and nothing here blocks them; the
-two meet only at the point where a book has an identity.
-
-This document **absorbs the `cache3-architecture` draft** (commit
-`49b2c0a`), which is superseded. The two cannot be delivered separately:
-they share one identity contract, they rewrite the same on-disk layout,
-and the headline acceptance criterion — move a book from a computer and
-keep your place — cannot be demonstrated by either alone. Splitting them
-would also mean writing the reading-position format twice and breaking
-card compatibility twice.
+Nothing here depends on render bundles, and nothing here blocks them; the two
+meet only at the point where a book has an identity.
 
 ---
 
+## 0. What changed on 2026-08-13, and why this was rewritten
+
+**PR #75 shipped the naming half of this PRD**, and it did not ship the design
+sketched here. Reading the previous draft against the tree now would mislead on
+three counts, so the affected sections are rewritten rather than annotated:
+
+- **Long-name creation, deletion, and a same-volume move all exist**, in our
+  own fork. The previous §4 was written against a pin that no longer describes
+  this repository. See §4.
+- **The staging design here was tried and abandoned.** The old §6.2 argued that
+  because no rename existed, staging had to mean "create under the final name
+  and hide it behind a marker." A rename exists now, and the marker protocol
+  was retired for documented reasons across four review rounds. See §6.1.
+- **The previous draft's own Q4 — "land the long-name port first as its own
+  slice?" — was answered by events.** That slice is #75. What remains is
+  folders, identity, and derived state.
+
+One thing #75 also made visible, which no version of this document has
+addressed: **the shipped installer's safety promise is explicitly "this device
+is the only writer."** A user-managed library is, definitionally, a card edited
+elsewhere. §5.3 and §6.2 now carry a policy for that rather than leaving it
+implicit.
+
 ## 1. Problem
 
-The device can read a library the user organizes, but it cannot *write*
-into one. Books uploaded over the wireless hotspot land in a single
-directory under machine-generated 8.3 names — `8620JLY1.EPU` — because the
-SD driver can only create short filenames. The device shows a real title
-(read from the EPUB), so the defect is invisible on the device and total on
-a computer: a card of uploaded books cannot be organized by hand, because
-the files cannot be identified by name.
+The device can read a library the user organizes, and since #75 it writes real
+filenames into it. What it still cannot do is let the user decide **where** a
+book goes, or keep anything it derived from a book when the user moves that
+book on a computer.
 
-Reading long filenames already works, so the gap is narrow and specific.
+Three defects share one root — derived state keyed to where a book *is* rather
+than what it *is*:
 
-Two further defects share the same root — derived state keyed to where a
-book *is* rather than what it *is* — and are in scope because fixing them
-separately would mean writing the same formats twice:
-
-- Reorganizing the card from a computer discards a book's cache and its
-  reading position, because both are keyed by a hash of its path.
+- Every uploaded book lands in one directory. The user picks the name now, not
+  the place.
+- Reorganizing the card from a computer discards a book's cache and its reading
+  position, because both are keyed by a hash of its path.
 - Changing type settings moves the reader's place, because the position is
   stored as a page index and a settings change reflows the text. It also
-  rebuilds pagination for a configuration the reader may switch straight
-  back to.
+  rebuilds pagination for a configuration the reader may switch straight back
+  to.
 
 ## 2. Goals
 
 1. A book uploaded over the hotspot lands in **a folder the user picks at
-   upload time**, under **its real filename**. *(stated)*
+   upload time**. *(stated)* — the filename half of this shipped in #75.
 2. The SD card remains organizable from a computer: real directories, real
    filenames, freely rearranged. *(stated)*
 3. Sideloaded books continue to work exactly as they do now, including the
@@ -53,324 +68,462 @@ separately would mean writing the same formats twice:
 4. The library scales to 1000+ books without holding the library in RAM.
    *(stated)*
 5. Reorganizing the card from a computer does not destroy derived state —
-   reading positions, caches, and (later) render bundles survive a file
-   being moved or renamed. *(stated)*
-6. Changing type settings preserves the reader's place in the book, and
-   does not discard work that does not depend on those settings. *(stated)*
+   reading positions, caches, and (later) render bundles survive a file being
+   moved or renamed. *(stated)*
+6. Changing type settings preserves the reader's place in the book, and does
+   not discard work that does not depend on those settings. *(stated)*
 
 ## 3. Non-goals
 
 - Image rendering, render bundles, and the device decoder. Separate PRD.
-- The managed-slot workspace redesign (`source-store` index/streaming). It
-  is affected by §6.3 but sequenced separately.
+- The managed-slot workspace redesign (`source-store` index/streaming).
+  Affected by §6.4, sequenced separately.
 - Tags or saved searches. Folders first; tags may layer on later.
 - Any migration of existing cards. Starting fresh is acceptable. *(stated)*
+- Supporting a card edited by another writer *concurrently with* a device
+  transaction. §5.3 makes this detectable and survivable, not supported.
 
 ## 4. Verified constraints
 
-These are properties of the `embedded-sdmmc` revision *this repository
-currently pins* (`d26892f`) unless noted — see §4.7, which supersedes
-several of them.
+Properties of the revision this repository pins **today**: our fork
+`chongfun/embedded-sdmmc-rs`, branch `calendula/long-names-and-error-fidelity`,
+pinned in `[workspace.dependencies]`. Rev omitted here on purpose — it moves,
+and the manifest is the authority.
 
-On the pin comment: it warns that newer upstream SD rewrites "fail cold
-card init on the X4." That observation is **inherited from upstream**
-(`Jon-Vii/xteink-x4-os`, whose device the X4 is) and was never reproduced
-here; this project develops on the X3 and has no X4 hardware. Treat it as
-upstream's finding on upstream's board, not as a local measurement.
+The old pin comment warning that newer upstream SD rewrites "fail cold card
+init on the X4" is **retired**. It was upstream's observation on upstream's
+board, never reproduced here, and the fork is now on the v0.10 base and boots
+on the X3.
 
-1. **Long filenames can be read, not written.** *(verified)*
-   `Directory::iterate_dir_lfn` walks the long-name chain, but
-   `open_file_in_dir` and `make_dir_in_dir` are bounded by
-   `ToShortFileName`. A file the device creates has an 8.3 entry and no
-   long name at all — on the device *or* on a computer.
-2. **Every long-named file also has a unique 8.3 alias**, and the read path
-   ties the chain to it by checksum (`csum` plus sequence tracking in the
-   directory state machine). *(verified)* Generating that alias is
-   therefore part of any write support, and it must be unique within the
-   directory.
-3. **There is no rename or move API.** *(verified)* No `rename`/`move_file`
-   exists anywhere in the driver.
-4. **Delete removes only the short entry.** *(verified)*
-   `delete_entry_in_block` writes `0xE5` over the matched 8.3 entry and
-   nothing else, so deleting a long-named file orphans its chain entries.
-   Because reads are checksum-guarded, an orphan is *clutter, not
-   corruption* — it cannot be misattributed to another file — but it
-   consumes directory entries and `chkdsk` will flag it.
+1. **Long filenames can be read *and written*.** *(verified)* The fork adds
+   long-name creation, and #75 ships books to the shelf under real names.
+2. **Every long-named file also has a unique 8.3 alias**, tied to the chain by
+   checksum. *(verified)* **The driver derives the alias itself** and refuses a
+   long name already present in the destination, so nothing above the driver
+   chooses or records an alias. A freed alias is reused by whatever is created
+   next, which is why an alias cannot be an identity.
+3. **A same-volume move exists.** *(verified)* `move_file_in_dir_lfn` renames by
+   rewriting directory entries and leaving the cluster chain alone. It is the
+   primitive #75's installer is built on.
+4. **Delete removes the whole long-name chain.** *(verified)*
+   `mark_directory_slots_deleted` marks the short entry first as the commit
+   point, then the LFN slots. **This supersedes the previous draft's
+   orphan-entry constraint**, which described the old upstream pin. The
+   `chkdsk`-clean acceptance criterion is met by the current pin rather than
+   being work.
 5. **Directory lookup is a linear scan.** *(verified)* Both
-   `find_directory_entry` and the delete path walk directory blocks, so
-   cost grows with entries per directory. Folders are a performance
-   property, not only an organizational one.
-7. **Long-name creation already exists upstream, and we have not synced
-   it.** *(verified)* Upstream commit `7f9856d`, "Write wireless uploads as
-   EPUB long names", replaces the dependency with a fork
-   (`Jon-Vii/embedded-sdmmc-rs`, rev `329b3a5`) described as "based exactly
-   on the proven #210 revision, adding allocation-free VFAT long-name
-   creation/deletion" — the same revision we pin, so it avoids the rewrites
-   the pin comment warns about. It adds `create_file_in_dir_lfn`, a
-   deterministic probeable short-alias generator
-   (`proto::upload::upload_short_alias`), a long-name sanitizer
-   (`wireless_epub_filename`), and LFN-aware deletion, which is constraint
-   4's defect. It does **not** add rename. Our `fw` has diverged 87 commits
-   since, so this is a port rather than a cherry-pick — but the driver fork
-   is reusable as-is.
-6. **Upload throughput is ~88 KB/s end to end** (2.5 MB committed in
-   28.4 s, X3, 2026-08-06), with the network itself near 160 KB/s. *(verified)*
-   Nothing has yet established what caps it; see §8.
+   `find_directory_entry` and the delete path walk directory blocks, so cost
+   grows with entries per directory. Folders are a performance property, not
+   only an organizational one.
+6. **The first cluster is the only on-card identifier a move preserves.**
+   *(verified)* #75's install journal names a book's predecessor by
+   `ClusterId`, precisely because a move rewrites the long name and a retired
+   alias is re-derived for whatever replaces it. This is a *transaction-scoped*
+   identity, not a library one — a cluster number is reused after free. §6.3
+   explains why this PRD needs a second, content-derived identity rather than
+   reusing it.
+7. **Uploads are ~88 KB/s end to end** (2.5 MB in 28.4 s, X3, 2026-08-06),
+   with the network near 160 KB/s. *(verified)* Cause unestablished. Note this
+   predates #75, which changed the write path; see §9.
+8. **The installer does not support concurrent outside writers.** *(verified,
+   from `upload-store/src/install.rs`)* Its stated promise is power-loss safety
+   "while this device is the only thing writing to the card." FAT counts no
+   references, so a chain freed by another writer is indistinguishable from one
+   still held. Where it can, the installer refuses rather than destroys.
 
 ## 5. Requirements
 
 ### 5.1 Naming and placement
 
-- R1. The upload request carries a **destination folder** and a **filename**.
-- R2. The device creates the file with that filename, preserving case and
-  characters that FAT long names permit; it rejects a request whose name
-  cannot be represented, rather than silently substituting one.
-- R3. The device generates a unique 8.3 alias for each created file. The
-  alias is an implementation detail and never shown to the user.
-- R4. The device creates the destination folder if absent, subject to the
-  same naming rules.
-- R5. Deleting a device-created or user-created file removes its long-name
-  chain along with its short entry.
+- R1. The upload request carries a **destination folder**. *(the filename half
+  shipped in #75)*
+- R2. The device creates the file with the requested filename, preserving case
+  and permitted characters, and rejects a name it cannot represent rather than
+  substituting one. *(shipped, #75)*
+- R3. The 8.3 alias is the driver's to choose and is never shown to the user.
+  *(shipped, #75 — restated because it constrains §6.3)*
+- R4. The device creates the destination folder if absent, subject to the same
+  naming rules.
+- R5. Deleting a long-named book removes its whole chain. *(satisfied by the
+  pin, §4.4)*
 
 ### 5.2 Identity and reorganization
 
-- R6. A book's identity is its **content** — exact length plus complete
-  SHA-256 — not its path. *(stated)*
-- R7. A book's path is a **locator**: a hint for finding bytes, repairable
-  when the user moves or renames the file, and carrying no authority.
+- R6. A book's identity is derived from its **content**, not its path: exact
+  length plus a hash over sampled regions. *(decided — §6.3 gives the
+  construction and the rejected alternative)*
+- R7. A book's path is a **locator**: a hint for finding bytes, repairable when
+  the user moves or renames the file, and carrying no authority.
 - R8. Moving or renaming a book from a computer preserves its identity, and
   therefore everything bound to that identity.
-- R9. Two files with the same name in different folders are different
-  books. Two copies of identical bytes are **one** logical book with more
-  than one locator. This is not an independent choice: it follows from R6,
-  since identical bytes cannot produce different identities without
-  reintroducing the path dependence R6 removes. The simplifying
-  consequence is that a record holds one locator at a time and may be
-  re-pointed at any copy whose content matches. *(resolved)*
+- R9. **Each locator is its own book.** Two files with identical bytes in two
+  folders are two books with two reading positions. Identity exists to *repair
+  a move*, not to merge copies. *(decided; supersedes the previous draft's
+  "one logical book, many locators")*
 
-### 5.3 Staging and crash safety
+  The rejected reading followed from "identity is content" and is coherent, but
+  its user-visible consequence is that two people reading the same EPUB from
+  separate folders share one place in it, and that deleting one copy re-points
+  the record at the other. Repair is the behaviour goal 5 actually asks for;
+  merging is a different feature nobody requested.
 
-- R10. A partially uploaded file is never presented as a book.
-- R11. Interruption at any point leaves the card in one of exactly two
-  states: no book, or a complete and readable book. Nothing in between is
-  visible to the reader.
-- R12. Cleanup of interrupted uploads is restartable and requires no
-  in-memory state carried across a reboot.
+- R10. A move is recognized as: a record's locator no longer resolves, **and**
+  exactly one unclaimed file with matching identity exists. If the old locator
+  still resolves, or more than one candidate matches, the device changes
+  nothing — that is a copy, not a move. *(inferred from R9; the conservative
+  direction, since doing nothing costs a rebuild and guessing costs the
+  reader's place)*
+
+### 5.3 Staging, crash safety, and outside writers
+
+- R11. A partially uploaded file is never presented as a book. *(shipped, #75)*
+- R12. Interruption at any point leaves the card in one of exactly two states:
+  no book, or a complete and readable book. *(shipped, #75)*
+- R13. Cleanup is restartable and carries no in-memory state across a reboot.
+  *(shipped, #75 — the card's state is the progress record)*
+- R14. **Recovery runs before the library is scanned or a cached catalog is
+  trusted.** *(shipped, #75)*
+- R15. **When recovery cannot resolve what it finds, the device surfaces it
+  rather than guessing.** *(decided)* A card edited underneath an open
+  transaction can present a combination the plan does not map — a predecessor
+  deleted from a computer mid-install, a destination name now held by a foreign
+  file. The device must leave the card alone in that case and say so. A visible
+  odd state is recoverable by the user; a silent wrong guess costs a book.
 
 ### 5.4 Library
 
-- R13. The library browses **physical folders**, one directory at a time,
-  so resident memory is bounded by folder size and not by library size.
-- R14. Books display their real title where known, falling back to the
-  filename — the current catalog's cached-title behavior is preserved
-  rather than regressing to filenames.
-- R15. Uploaded and sideloaded books appear together, indistinguishable to
-  the reader except where integrity state differs.
+- R16. The library browses **physical folders**, one directory at a time, so
+  resident memory is bounded by folder size and not by library size.
+- R17. Books display their real title where known, falling back to the
+  filename — the current cached-title behavior is preserved rather than
+  regressing to filenames.
+- R18. Uploaded and sideloaded books appear together, indistinguishable to the
+  reader except where integrity state differs.
 
 ### 5.5 Derived state: cache and reading position
 
 Absorbed from the `CACHE3 + POS3` draft, with identity corrected per R6.
 
-- R16. Cache and position records are addressed by **content identity**,
-  not by a path-derived hash. The current `source_hash` is
-  `FNV(display_path, byte_size)`; keying the new layout on it would make
-  moving a book on a computer orphan its cache and lose its position,
-  which R8 forbids.
-- R17. Cached work that does not depend on type settings — the parsed
-  spine, TOC, cover, container index — is not discarded when type settings
-  change.
-- R18. Reading position is stored as a **content anchor** that is
-  independent of layout — `(spine index, content-block ordinal)`, a
-  position in the `CONT.BIN` stream — and the page number is derived from
-  it for the current settings. Storing a page index means a settings
-  change silently moves the reader, which is a defect present today.
-  Paragraph granularity is sufficient *(stated)*; the format should leave
-  room for an optional intra-paragraph offset without a version bump.
-- R19. Position survives cache clearing, cache eviction, and any number of
-  layout changes. Losing cached pages is an inconvenience; losing the
-  reader's place is not.
-- R20. Two type-setting configurations coexist on card, so alternating
-  between them does not rebuild pagination each time.
-- R21. A cache generation is valid only once fully written. Interruption
-  leaves it ignorable and reclaimable, never partially loadable.
-- R22. Cache directories carry a book's full identity in their path, so
+- R19. Cache and position records are addressed by **content identity**, not by
+  a path-derived hash. The current key is `source_hash: u32` =
+  `FNV(display_path, byte_size)` (`proto/src/cache.rs`), which makes moving a
+  book orphan its cache and lose its position — what R8 forbids.
+- R20. Cached work that does not depend on type settings — the parsed spine,
+  TOC, cover, container index — is not discarded when type settings change.
+- R21. Reading position is stored as a **content anchor** independent of
+  layout: `(spine index, content-block ordinal)`, a position in the `CONT.BIN`
+  stream, with the page number derived for the current settings. Paragraph
+  granularity is sufficient *(stated)*; the format should leave room for an
+  optional intra-paragraph offset without a version bump.
+- R22. Position survives cache clearing, eviction, and any number of layout
+  changes. Losing cached pages is an inconvenience; losing the reader's place
+  is not.
+- R23. Two type-setting configurations coexist on card, so alternating between
+  them does not rebuild pagination each time.
+- R24. A cache generation is valid only once fully written. Interruption leaves
+  it ignorable and reclaimable, never partially loadable.
+- R25. Cache directories carry enough of a book's identity in their path that
   distinct books cannot collide on a truncated key.
-- R23. Superseded cache layouts are removed on a best-effort background
-  sweep. No in-place migration is attempted; rebuilding is cheap and
-  correct, migrating is neither.
+- R26. Superseded cache layouts are removed on a best-effort background sweep.
+  No in-place migration; rebuilding is cheap and correct, migrating is neither.
 
-## 6. Design sketch
+## 6. Design
 
-### 6.1 Long-filename write support
+### 6.1 What #75 already provides, and what this PRD must not undo
 
-**Port upstream's implementation rather than writing one** (§4.7). It
-already covers R2, R3, and R5 — creation, deterministic alias generation
-with a uniqueness probe, and LFN-aware deletion — and is built on the same
-driver revision we pin, so it does not walk into the cold-init question.
+The installer in `upload-store/src/install.rs` is the foundation for everything
+in slice 1. Its shape:
 
-Remaining work is the port itself: our `fw` has moved 87 commits since,
-and the upload path in particular was rewritten. Verify on the X3, which
-is the only hardware this project has.
+```text
+/XTEINK/UPLOAD/<txn>   scratch, opaque, no long name — nothing scans it
+/BOOKS/<old>  --move--> /XTEINK/ROLLBACK/<txn>   predecessor parked
+/XTEINK/UPLOAD/<txn> --move--> /BOOKS/, under the long name
+/XTEINK/ROLLBACK/<txn> --delete, reclaiming its clusters
+```
 
-Not provided upstream, and therefore still open: **rename**. §6.2 avoids
-needing it.
+One `INSTALL.JNL` record describes the whole intent. It is written before
+anything is touched, cleared when everything is done, never updated in between,
+and while it stands it owns the names it describes — further uploads and
+deletes are refused until it clears. Progress is not recorded because the four
+places a file can be at rest determine the next action uniquely.
 
-Residual risk is much lower than writing this from scratch, but not zero —
-it still writes directory-entry structures, and a bug corrupts directories
-rather than only our files. The fork carries upstream's own testing; the
-acceptance criterion about leaving no orphan entries (§7) is what proves
-it here.
+**Two properties of it are load-bearing for this PRD and must survive:**
 
-### 6.2 Upload staging
+- *Only one step frees clusters, and never while two names share a chain.* A
+  move puts two names on one chain briefly; cleanup there must unlink, never
+  reclaim.
+- *The predecessor is identified by cluster chain, not by name*, because
+  retiring it frees its alias and the driver re-derives the same alias for its
+  replacement.
 
-No rename exists (§4.3, §4.7), so staging cannot mean "write under a
-temporary name and rename on commit." It does not need to: the durable
-**staging marker** already carries exactly this meaning — a committed
-marker with no matching committed metadata keeps its candidate hidden —
-and that machinery is already implemented and power-cut validated.
+**The retired approach, recorded so it does not return.** The previous draft
+staged by creating the file under its final long name and hiding it behind a
+durable `.PND`/`.CLN` marker. That protocol was abandoned after four review
+rounds each found another place where state spread across multiple directory
+entries could not distinguish "absent" from "unknown", "old generation" from
+"new", or "committed" from "partially cleaned up". It was compensating for a
+missing move primitive. The move now exists.
 
-1. Create the destination folder if needed.
-2. Publish the staging marker naming the intended path.
-3. Create the file **under its final long name** and stream, verifying
-   declared length and SHA-256 as bytes arrive.
-4. Reread the persisted file and confirm identity independently.
-5. Publish the metadata record; the marker's candidate becomes the book.
+### 6.2 Slice 1 — destination folders on the shipped installer
 
-The library scan must consult the marker so a candidate is hidden while it
-is staging — the one new coupling this introduces. Crash windows: before
-step 5 the marker explains the file, which stays hidden and is reclaimable
-by cleanup; after step 5 the book is live. A user who pulls the card
-mid-upload sees a truncated `.epub` on their computer, which is what an
-interrupted copy looks like anywhere.
+The installer already moves a finished file to a chosen name in a chosen
+directory. Slice 1 generalizes *which* directory, and the work is mostly about
+what the journal owns.
 
-### 6.3 Records
+- The destination becomes a path rather than today's `in_books` boolean
+  (`fw/src/upload.rs`, `book_build.rs`). Book location is currently a two-value
+  choice — `/BOOKS` or the card root — and folders make it a path.
+- **The journal's name-ownership widens to path-ownership.** Today a standing
+  record owns the names it describes; with folders it owns
+  `(directory, long name)` pairs, and the refusal that protects them has to key
+  on both. A record naming `/SciFi/Dune.epub` must not block an upload to
+  `/Fantasy/Dune.epub`.
+- Folder creation (R4) happens before the journal record is written, because a
+  failed `mkdir` after the record stands is an unresolvable state — it makes
+  the record describe a destination that cannot exist.
+- `/XTEINK/UPLOAD` and `/XTEINK/ROLLBACK` stay where they are. Staging is not
+  per-folder; the move is same-volume, so the scratch directory's location is
+  irrelevant to cost.
 
-Source metadata keeps its durable A/B commit protocol unchanged. What
-changes is how a record points at its book: the fixed 12-byte 8.3
-`unmanaged_name` becomes a path locator, and lookups key on content
-identity (R6). The existing bare-filename field cannot express folders and
-would treat `/SciFi/BOOK1.EPU` and `/Fantasy/BOOK1.EPU` as one book.
+**Catalog: keep one file in slice 1.** #75 clears a single `CATALOG.BIN` and
+**refuses the whole session if it cannot prove it gone** — the snapshot must
+not survive a change it does not describe. Per-directory catalogs turn one
+proof into N, and an N-way partial failure has no equally clean answer. So
+slice 1 keeps a single catalog whose records carry full paths, and
+per-directory catalogs move to slice 2, where the identity rework forces a
+format change anyway. **This sequences the on-disk break into one event rather
+than two.** *(inferred; the alternative is per-directory catalogs in slice 1
+and a definition of what a partial invalidation means)*
 
-This is where the milestone touches the image-rendering PRD's M0S work, and
-the touch is narrow: the record protocol, idempotency, receipts, container
-gate, and validation rules are unaffected.
+### 6.3 Content fingerprint
 
-### 6.4 What a settings change actually rebuilds
+**Identity is `(exact_length, SHA-256 over sampled regions)`.** *(decided)*
+
+```text
+identity = ( length,
+             SHA256( head  ‖ tail  ‖ interior[0..N] ) )
+
+head      first 64 KiB
+tail      last  64 KiB
+interior  N fixed-size blocks at offsets that are a pure
+          function of `length` alone
+```
+
+Offsets must depend on nothing but the length, so the same bytes always produce
+the same identity on any device and after any move. Files below
+head+tail+interior are hashed whole, which makes the small-file case exact
+rather than special.
+
+**Why sampling rather than the whole file.** The full-SHA-256 reading of
+"identity is content" is the honest one, and it was rejected on cost, not
+principle. Recognizing a moved book means hashing it; hashing is software
+(`sha2`, as used for OTA images — no hardware SHA is wired up); and the work
+scales with **total bytes on the card**, so a rescan after the user reorganizes
+a full card reads and hashes the whole card. Sampling makes the same rescan
+scale with book *count*: ~256 KiB per book instead of an entire book.
+
+**Why it is safe enough for EPUBs, stated honestly.** Two books would have to
+share an exact length *and* every sampled region. An EPUB is a zip: its central
+directory sits at the tail and its first local header at the head, so two
+different books colliding is a constructed case rather than an accidental one.
+Two *builds* of the same book — recompressed, re-ordered — differ in length or
+in the central directory almost always.
+
+**The blast radius, which is the part that makes this acceptable.** A collision
+binds one book to another's cache and reading position. That is a wrong place
+in a book and a stale pagination, repaired by clearing the cache. It is not
+corruption, it cannot cross into file contents, and it cannot lose a file. The
+same collision under a scheme that *merged* books (rejected R9) would have been
+worse; under R9 as decided, each locator keeps its own record and a collision
+misroutes one binding.
+
+**Not reusable for this: the first cluster** (§4.6). It is the right identity
+inside a transaction and the wrong one across time, because FAT reuses a freed
+cluster number for whatever is written next. A record keyed on it would
+silently re-point at an unrelated file after a delete.
+
+### 6.4 Records
+
+Source metadata keeps its durable A/B commit protocol unchanged. What changes
+is how a record points at its book: the fixed 12-byte 8.3 `unmanaged_name`
+becomes a path locator, and lookups key on content identity (R6). The existing
+bare-filename field cannot express folders and would treat `/SciFi/BOOK1.EPU`
+and `/Fantasy/BOOK1.EPU` as one book.
+
+This is where the milestone touches the image-rendering PRD's M0S work, and the
+touch is narrow: the record protocol, idempotency, receipts, container gate, and
+validation rules are unaffected.
+
+### 6.5 What a settings change actually rebuilds
 
 `CONT.BIN` already captures the parsed content stream — the `push_block`
 sequence of `(spine_index, text, role, style, align, paragraph_end)`, all
-content-derived — and a type-settings change replays it rather than
-re-reading the zip, inflating, and parsing XML. So the expensive half of
-R17 holds today, and `CACHE3`'s placement of `CONT.BIN` under `COMMON/` is
-correct. What a settings change legitimately rebuilds is line breaking and
-page assembly, which is what a settings change *is*.
+content-derived — and a type-settings change replays it rather than re-reading
+the zip, inflating, and parsing XML. So the expensive half of R20 holds today,
+and `CACHE3`'s placement of `CONT.BIN` under `COMMON/` is correct. What a
+settings change legitimately rebuilds is line breaking and page assembly, which
+is what a settings change *is*.
 
 This is also why the anchor cannot be a block index. `BlockRecord` carries
-`line_count` and is produced by replaying the content stream through the
-layout engine, so it is layout-derived and no more stable than a page
-number. The stable unit is the position in the `CONT.BIN` stream itself.
+`line_count` and is produced by replaying the content stream through the layout
+engine, so it is layout-derived and no more stable than a page number. The
+stable unit is the position in the `CONT.BIN` stream itself.
 
-The anchor costs nothing on the reading path: it is written at page turn
-as an ordinal the layout already holds, and resolved only during a layout
-pass that a settings change performs regardless.
+The anchor costs nothing on the reading path: it is written at page turn as an
+ordinal the layout already holds, and resolved only during a layout pass that a
+settings change performs regardless.
 
-### 6.5 Cache and position identity
+### 6.6 Cache and position identity
 
-`CACHE3`'s two-level `<hash-8>/<size-8>` directory split is kept — it also
-bounds directory size, which §4.5 makes a performance requirement and not
-only a tidiness one — but the components become content-derived: a prefix
-of the source SHA-256 plus the exact length, both already computed for R6.
-Directory names stay within 8.3, which the device must satisfy to create
-them.
+`CACHE3`'s two-level directory split is kept — it bounds directory size, which
+§4.5 makes a performance requirement and not only a tidiness one — but the
+components become content-derived: a prefix of the fingerprint plus the exact
+length, both already computed for R6. Directory names stay within 8.3, which
+the device must satisfy to create them.
 
-Reading position becomes `(spine index, block index, offset within block)`
-or the narrowest anchor the layout engine can resolve back to a page. The
-open path resolves the anchor against the current layout; the page number
-stops being stored at all. This is the change that fixes the settings
-bug, and `POS3`'s separation from the cache is what keeps it durable
-across eviction.
+Note this changes `source_hash`/`source_size` in `BookV2Header` and
+`SectionV2Header`, so it is a cache format break and a version bump. Per R26
+there is no migration: the sweep removes the old layout and the next open
+rebuilds.
 
-### 6.6 Derived-state layout
+Reading position becomes the R21 anchor. The open path resolves it against the
+current layout; the page number stops being stored at all. `POS3`'s separation
+from the cache is what keeps position durable across eviction.
 
-From the absorbed draft, with `<identity>` now content-derived (R16)
-rather than `FNV(display_path, size)`:
+### 6.7 Derived-state layout
+
+`<identity>` is content-derived (R6). Shown alongside the directories #75 owns,
+because they share the namespace:
 
 ```text
 /XTEINK/
+  UPLOAD/            #75: upload scratch, opaque names
+  ROLLBACK/          #75: parked predecessors
+  INSTALL.JNL        #75: standing transaction intent
+  CATALOG.BIN        one catalog in slice 1; per-folder in slice 2
   CACHE3/<identity>/
-    COMMON/            layout-independent: TOC.BIN, COVER.BIN, CONT.BIN
-    SLOT0/ SLOT1/      one per type-setting configuration (R20)
-      BOOK.BIN         written last; the slot's commit record (R21)
+    COMMON/          layout-independent: TOC.BIN, COVER.BIN, CONT.BIN
+    SLOT0/ SLOT1/    one per type-setting configuration (R23)
+      BOOK.BIN       written last; the slot's commit record (R24)
       SECTIONS/S<nnn>.BIN
     RECENTA.BIN RECENTB.BIN   advisory recency for eviction
   POS3/<identity>/
-    POSA.BIN POSB.BIN  reading position, isolated from cache (R19)
+    POSA.BIN POSB.BIN          reading position, isolated from cache (R22)
 ```
 
-Publication empties the victim slot, writes sections, then writes
-`BOOK.BIN` last, so an interrupted publication leaves a slot that fails
-validation and is reclaimed rather than half-loaded. Recency is advisory:
-losing it costs a wrong eviction choice, never correctness.
+Publication empties the victim slot, writes sections, then writes `BOOK.BIN`
+last, so an interrupted publication leaves a slot that fails validation and is
+reclaimed rather than half-loaded. Recency is advisory: losing it costs a wrong
+eviction choice, never correctness.
 
-`<identity>` is split across two directory levels so no single directory
-accumulates an entry per book — the same reason §4.5 makes folders a
-performance property. The components come from the content identity R6
-already computes.
+### 6.8 Library scan
 
-### 6.7 Library scan
+Per-directory catalogs rather than one flat file, so entering a folder reads
+only that folder's records and cached titles (R16, R17). **Slice 2**, per
+§6.2's sequencing argument.
 
-Per-directory catalogs rather than one flat file, so entering a folder
-reads only that folder's records and cached titles (R13, R14).
+Identity repair (R10) runs as part of the scan: a record whose locator does not
+resolve is a candidate for re-pointing, resolved against unclaimed files with
+matching identity. This is the one place the fingerprint cost lands on a path
+the user waits for, which is why §9 gates it.
 
-## 7. Acceptance
+## 7. Slices
 
-- A book uploaded to a chosen folder appears on a computer under its real
-  name, in that folder.
-- Moving that file to another folder on a computer, then remounting,
-  leaves the book readable with its position intact.
+Two, sequenced, each independently shippable. *(decided)*
+
+**Slice 1 — placement.** R1, R4, R16, R17, R18, plus the journal path-ownership
+and folder-creation ordering of §6.2. Builds directly on #75. Delivers the
+stated goal that is currently half-met: the user picks the folder, and the card
+browses the way it is organized. No identity work, no cache format change, one
+catalog.
+
+**Slice 2 — identity and derived state.** R6–R10, R19–R26. Changes the cache
+key, the position format, and the catalog layout in one on-disk break.
+
+Splitting here works because slice 1 changes no derived-state format and slice
+2 changes them all at once. The previous draft argued identity and cache could
+not be split from naming; that was true when naming was in scope, and naming
+shipped.
+
+## 8. Acceptance
+
+**Slice 1**
+
+- A book uploaded to a chosen folder appears on a computer under its real name,
+  in that folder.
+- A book uploaded to `/SciFi/Dune.epub` is not blocked by a standing record for
+  `/Fantasy/Dune.epub`, and is blocked by one for its own path.
+- Creating the destination folder fails cleanly *before* any journal record
+  exists; no failure leaves a record naming an absent directory.
+- A 1000-book library browses with resident memory bounded by folder size.
+- Deleting a long-named book leaves no orphan directory entries (`fsck`/
+  `chkdsk` clean). Expected to pass on the current pin (§4.4) — this is a
+  regression guard, not new work.
+
+**Slice 2**
+
+- Moving a book to another folder on a computer, then remounting, leaves it
+  readable with its position intact.
 - Renaming it on a computer does the same.
-- Deleting a long-named book from the device leaves no orphan directory
-  entries (`fsck`/`chkdsk` clean).
-- Power loss at every step of §6.2 yields either no book or a complete
-  readable book, verified by the abrupt-reset campaign harness
-  (`tools/powercut_campaign.py`) extended to this path.
-- Changing type settings on an open book leaves the reader on the same
-  text, not the same page number, and does not rebuild the parsed spine,
-  TOC, or cover.
+- Moving *and* renaming in one action does the same. (This is the case the
+  rejected locator-only scheme fails, so it is the criterion that proves the
+  fingerprint earns its cost.)
+- Copying a book to a second folder produces **two** books with independent
+  positions, and re-pointing does not occur while both files exist (R9, R10).
+- Changing type settings on an open book leaves the reader on the same text,
+  not the same page number, and does not rebuild the parsed spine, TOC, or
+  cover.
 - Alternating between two type-setting configurations does not rebuild
   pagination on each switch.
 - A cache publication interrupted at any point leaves no slot that loads
   partially; the next open reclaims it.
-- A 1000-book library browses with resident memory bounded by folder size.
+
+**Both**
+
+- Power loss at every step yields either no book or a complete readable book.
+  **The harness this needs does not exist**: the previous draft cited
+  `tools/powercut_campaign.py`, which is referenced nowhere else in the repo
+  and has never existed. Either build it or name the real procedure — #75 was
+  validated by a hand-run reset campaign, and that is worth automating once
+  rather than repeating.
+- A card edited underneath an open transaction leaves the device saying so,
+  not guessing (R15). Test by deleting the predecessor from a computer with a
+  record standing.
 - No watchdog or responsiveness limit is violated; no request blocks on a
   whole-library operation.
 
-## 8. Measurement gates
+## 9. Measurement gates
 
-- **Upload throughput.** Currently ~88 KB/s end to end (§4.6), which sets
-  how long filling a library takes. Cause unknown; measure before
-  optimizing, and before assuming uploading is a viable way to move a large
-  library onto a card.
-- **Alias generation cost** in a large directory, if `~N` probing is chosen
-  over hashing.
-- **Per-directory catalog read cost** at the folder sizes a 1000-book
-  library actually produces.
+- **Fingerprint cost, per book and per rescan.** *(gates slice 2)* Measure
+  SHA-256 throughput on the X3 and the wall time to fingerprint one book, then
+  a 1000-book card. The sampled construction was chosen to make this bounded by
+  book count; that has to be confirmed, not assumed. If it lands somewhere that
+  cannot run on the scan path, the fallback is a background pass with the
+  library usable from locators meanwhile — decide that *after* the number
+  exists. **Check first whether the C3's hardware SHA is reachable through
+  `esp-hal`**; nothing in the tree uses it today and it would change the answer.
+- **Upload throughput.** §4.7's ~88 KB/s predates #75 and its write path.
+  Re-take before quoting; the roadmap's WS-D owns the ceiling investigation.
+- **Per-directory catalog read cost** at the folder sizes a 1000-book library
+  actually produces. *(gates slice 2's catalog split)*
+- **Directory-scan cost at depth**, since §4.5 makes lookup linear in entries
+  and folders are the mitigation.
 
-## 9. Open questions
+## 10. Open questions
 
-1. What happens to a book whose file the user deletes from a computer — is
-   the record reclaimed automatically, or does the book show as unavailable
-   until the user acts?
-2. Does the browser pick from existing folders only, or may it create new
-   ones at upload time?
-3. Should sideloaded books receive records at all in this milestone, or
-   only when a later milestone needs to persist something derived from them?
-4. Sequencing: the upstream long-name port (§6.1) is self-contained and
-   delivers a visible improvement on its own — uploads stop being cryptic —
-   without any of the identity or cache work. Land it first as its own
-   slice?
-5. *(answered)* Eight upstream commits are unsynced as of 2026-08-07. Two
-   bear on this PRD: `7f9856d` (long names, §4.7) and `9b0123d` "Preserve
-   UTF-8 in catalog labels". The rest are OTA partition layout and SD
-   firmware-picker work. Worth a deliberate sync pass before implementing,
-   since `7f9856d` was found only by tracing a stale comment.
+1. What happens to a book whose file the user deletes from a computer — is the
+   record reclaimed automatically, or does the book show as unavailable until
+   the user acts? Interacts with R10: a deleted book and a moved book look
+   identical until a matching candidate is found.
+2. Does the browser pick from existing folders only, or may it create new ones
+   at upload time? R4 assumes creation is allowed; if not, slice 1 loses the
+   folder-creation ordering constraint in §6.2.
+3. Should sideloaded books receive records in slice 1, or only when slice 2
+   needs to persist something derived from them?
+4. How is R15's "surface it" presented? A library-level notice, a per-book
+   state, or a boot-time screen. The requirement is that it is not silent; the
+   form is open.
+5. *(answered 2026-08-13)* The long-name port landed as #75. The eight-commit
+   upstream backlog from 2026-08-07 is resolved for this PRD's purposes;
+   `9b0123d` "Preserve UTF-8 in catalog labels" should be checked against the
+   catalog work in slice 1.
