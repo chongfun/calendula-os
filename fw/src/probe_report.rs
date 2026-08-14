@@ -25,7 +25,7 @@ const REPORT_FILE: &str = "PROBE.TXT";
 /// to spare. Overflow truncates rather than failing (see `render`).
 const REPORT_BYTES: usize = 640;
 
-/// Write `XTEINK/PROBE.TXT` from this boot's probe.
+/// Write `READER/PROBE.TXT` from this boot's probe.
 ///
 /// Best effort: the report is diagnostics, so a card that is absent, full, or
 /// read-only costs a log line and nothing else.

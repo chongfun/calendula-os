@@ -259,16 +259,20 @@ fn body_named(books: &Dir<'_>, long_name: &str) -> Vec<u8> {
 /// Lay down the starting state: a finished upload waiting in the scratch
 /// directory, and optionally the book it replaces already on the shelf.
 fn prepare(root: &Dir<'_>, books: &Dir<'_>, intent: &mut InstallIntent) {
-    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
-        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
-        root.open_dir("XTEINK").expect("open XTEINK")
-    });
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .unwrap_or_else(|_| {
+            root.make_dir_in_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("make cache root");
+            root.open_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("open cache root")
+        });
     for name in [UPLOAD_DIR, ROLLBACK_DIR] {
-        if xteink.open_dir(name).is_err() {
-            xteink.make_dir_in_dir(name).expect("make subdir");
+        if cache_root.open_dir(name).is_err() {
+            cache_root.make_dir_in_dir(name).expect("make subdir");
         }
     }
-    let upload = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let upload = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
 
     let staged = upload
         .open_file_in_dir(intent.stage.alias.as_str(), Mode::ReadWriteCreate)
@@ -405,8 +409,10 @@ fn a_retired_predecessor_is_parked_whole() {
 
     install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
 
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
     // Opened by the name it was parked under: the alias is the driver's.
     let parked = rollback
         .open_long_name_file_in_dir(intent.rollback.as_str(), Mode::ReadOnly)
@@ -573,8 +579,10 @@ fn a_lost_stage_does_not_make_a_stranger_look_like_the_installed_book() {
     prepare(&root, &books, &mut intent);
     install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
 
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let upload_dir = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
     upload_dir
         .delete_entry_in_dir(intent.stage.alias.as_str())
         .expect("lose the upload");
@@ -591,7 +599,7 @@ fn a_lost_stage_does_not_make_a_stranger_look_like_the_installed_book() {
         "the predecessor cannot go back under a name somebody else holds"
     );
     assert_eq!(body_named(&books, BOOK_NAME), b"not either of ours");
-    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
     let parked = rollback
         .open_long_name_file_in_dir(intent.rollback.as_str(), Mode::ReadOnly)
         .expect("the predecessor must still be parked, not reclaimed");
@@ -719,8 +727,10 @@ fn an_install_whose_name_was_taken_holds_on_to_the_parked_predecessor() {
         b"not either of ours",
         "the file holding the name must be left alone"
     );
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
     let parked = rollback
         .open_long_name_file_in_dir(intent.rollback.as_str(), Mode::ReadOnly)
         .expect("the predecessor must still be parked, not swept");
@@ -751,8 +761,10 @@ fn a_step_the_record_cannot_describe_settles_instead_of_wedging() {
 
     // One chain under two names, one of them parked under this record's
     // rollback name and one holding the book's long name on the shelf.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
     let stray = rollback
         .create_file_in_dir_lfn(intent.rollback.as_str())
         .expect("a parked copy this record never made");
@@ -812,8 +824,10 @@ fn a_torn_journal_changes_nothing() {
     prepare(&root, &books, &mut intent);
 
     // Corrupt the record in place.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let file = xteink
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let file = cache_root
         .open_file_in_dir(install::JOURNAL_FILE, Mode::ReadWriteTruncate)
         .expect("open journal");
     file.write(&[0x5A; 40]).expect("scribble");
@@ -861,8 +875,10 @@ fn a_predecessor_restored_after_a_lost_upload_is_still_whole() {
     install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
 
     // The scratch file goes missing before it was ever installed.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let upload = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let upload = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
     upload
         .delete_entry_in_dir(intent.stage.alias.as_str())
         .expect("lose the upload");
@@ -891,8 +907,10 @@ use upload_store::install::StagedUpload;
 
 /// Whatever is sitting in the scratch directory.
 fn scratch_files(root: &Dir<'_>) -> Vec<std::string::String> {
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let upload_dir = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
     let mut left = Vec::new();
     upload_dir
         .iterate_dir(|entry| {
@@ -1055,8 +1073,10 @@ fn books_that_share_an_alias_both_survive() {
 // ---------------------------------------------------------------------------
 
 fn journal_bytes(root: &Dir<'_>) -> Vec<u8> {
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let file = xteink
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let file = cache_root
         .open_file_in_dir(install::JOURNAL_FILE, Mode::ReadOnly)
         .expect("journal present");
     let mut out = vec![0u8; file.length() as usize];
@@ -1271,14 +1291,18 @@ fn a_legacy_book_with_another_identity_is_left_alone() {
 }
 
 fn write_legacy_sidecars(root: &Dir<'_>, alias: &str, identity: u64, label: &str) {
-    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
-        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
-        root.open_dir("XTEINK").expect("open XTEINK")
-    });
-    if xteink.open_dir("LABELS").is_err() {
-        xteink.make_dir_in_dir("LABELS").expect("make LABELS");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .unwrap_or_else(|_| {
+            root.make_dir_in_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("make cache root");
+            root.open_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("open cache root")
+        });
+    if cache_root.open_dir("LABELS").is_err() {
+        cache_root.make_dir_in_dir("LABELS").expect("make LABELS");
     }
-    let labels = xteink.open_dir("LABELS").expect("labels");
+    let labels = cache_root.open_dir("LABELS").expect("labels");
     let stem = alias.split('.').next().expect("stem");
 
     let mut id_name = std::string::String::from(stem);
@@ -1309,14 +1333,18 @@ fn a_leftover_that_will_not_delete_does_not_fail_the_install() {
 
     // A stray scratch file from some earlier upload, held open so the sweep
     // cannot reclaim it.
-    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
-        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
-        root.open_dir("XTEINK").expect("open XTEINK")
-    });
-    if xteink.open_dir(UPLOAD_DIR).is_err() {
-        xteink.make_dir_in_dir(UPLOAD_DIR).expect("make UPLOAD");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .unwrap_or_else(|_| {
+            root.make_dir_in_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("make cache root");
+            root.open_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("open cache root")
+        });
+    if cache_root.open_dir(UPLOAD_DIR).is_err() {
+        cache_root.make_dir_in_dir(UPLOAD_DIR).expect("make UPLOAD");
     }
-    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let upload_dir = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
     let stray = upload_dir
         .open_file_in_dir("STRAY001.TMP", Mode::ReadWriteCreate)
         .expect("stray");
@@ -1355,10 +1383,13 @@ fn a_sweep_that_runs_out_of_quota_says_leftovers_remain() {
     // More than one pass takes. If the quota is ever raised past this, the
     // first assertion below is what says so.
     const LEFTOVERS: usize = 9;
-    root.make_dir_in_dir("XTEINK").expect("make XTEINK");
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    xteink.make_dir_in_dir(UPLOAD_DIR).expect("make UPLOAD");
-    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    root.make_dir_in_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("make cache root");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    cache_root.make_dir_in_dir(UPLOAD_DIR).expect("make UPLOAD");
+    let upload_dir = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
     for index in 0..LEFTOVERS {
         let mut name = std::string::String::from("LEFT000");
         name.push(char::from_digit(index as u32, 10).expect("digit"));
@@ -1440,8 +1471,10 @@ fn a_restore_cut_half_way_through_is_finished_not_repeated() {
     install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
 
     // The upload is lost, so the transaction has to walk backwards.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let upload_dir = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
     upload_dir
         .delete_entry_in_dir(intent.stage.alias.as_str())
         .expect("lose the upload");
@@ -1484,16 +1517,20 @@ fn a_restore_cut_half_way_through_is_finished_not_repeated() {
 
 /// Just the scratch file, for fixtures that build their own intent.
 fn prepare_scratch(root: &Dir<'_>, intent: &mut InstallIntent) {
-    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
-        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
-        root.open_dir("XTEINK").expect("open XTEINK")
-    });
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .unwrap_or_else(|_| {
+            root.make_dir_in_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("make cache root");
+            root.open_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("open cache root")
+        });
     for name in [UPLOAD_DIR, ROLLBACK_DIR] {
-        if xteink.open_dir(name).is_err() {
-            xteink.make_dir_in_dir(name).expect("make subdir");
+        if cache_root.open_dir(name).is_err() {
+            cache_root.make_dir_in_dir(name).expect("make subdir");
         }
     }
-    let upload = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let upload = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
     let staged = upload
         .open_file_in_dir(intent.stage.alias.as_str(), Mode::ReadWriteCreate)
         .expect("scratch file");
@@ -1520,8 +1557,10 @@ fn a_journal_cut_while_being_cleared_still_retires_the_catalog() {
 
     // Reproduce the first half of clearing: the record is truncated, its
     // directory entry is not yet gone.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    xteink
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    cache_root
         .open_file_in_dir(install::JOURNAL_FILE, Mode::ReadWriteCreate)
         .expect("recreate journal")
         .close()
@@ -1564,8 +1603,10 @@ fn the_sweep_never_frees_a_chain_the_shelf_is_reading() {
     disk.undo_unlinks(&before);
 
     // And the record goes missing, so nothing above the sweep will tidy it.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    xteink
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    cache_root
         .delete_entry_in_dir(install::JOURNAL_FILE)
         .expect("lose the record");
 
@@ -1578,7 +1619,7 @@ fn the_sweep_never_frees_a_chain_the_shelf_is_reading() {
     );
 
     // The parked name is gone either way; only the chain was spared.
-    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
     let mut parked = Vec::new();
     rollback
         .iterate_dir(|entry| {
@@ -1624,8 +1665,10 @@ fn the_sweep_never_frees_a_chain_a_just_installed_book_is_reading() {
     );
 
     // And the record goes missing, so only the sweep is left.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    xteink
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    cache_root
         .delete_entry_in_dir(install::JOURNAL_FILE)
         .expect("lose the record");
 
@@ -1716,8 +1759,10 @@ fn a_record_from_another_build_is_kept_and_blocks_the_card() {
     upload(&root, &books, BOOK_NAME, &old_body()).expect("a book to protect");
 
     // A full-size record with a version this build does not know.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let file = xteink
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let file = cache_root
         .open_file_in_dir(install::JOURNAL_FILE, Mode::ReadWriteCreate)
         .expect("journal");
     // Built by the encoder, so the header is whatever this build writes, and
@@ -1791,8 +1836,10 @@ fn staging_over_a_leftover_never_frees_a_chain_the_shelf_is_reading() {
     disk.undo_unlinks(&before);
 
     // The record is gone, and the sweep never got to this file.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    xteink
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    cache_root
         .delete_entry_in_dir(install::JOURNAL_FILE)
         .expect("lose the record");
     assert!(
@@ -1832,8 +1879,10 @@ fn recovery_leaves_the_shelf_alone_while_a_snapshot_it_cannot_clear_stands() {
 
     // A snapshot of the shelf as it stands, held open so it cannot be removed
     // — the transient failure a wireless session hits on the way in.
-    let xteink = root.open_dir("XTEINK").expect("xteink");
-    let snapshot = xteink
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let snapshot = cache_root
         .open_file_in_dir(proto::cache::CATALOG_FILE, Mode::ReadWriteCreate)
         .expect("snapshot");
     snapshot
@@ -1867,7 +1916,7 @@ fn recovery_leaves_the_shelf_alone_while_a_snapshot_it_cannot_clear_stands() {
     assert_eq!(body_named(&books, BOOK_NAME), new_body());
     assert!(
         matches!(
-            xteink.find_directory_entry(proto::cache::CATALOG_FILE),
+            cache_root.find_directory_entry(proto::cache::CATALOG_FILE),
             Err(embedded_sdmmc::Error::NotFound)
         ),
         "the snapshot went before the shelf moved, not after"
@@ -1890,10 +1939,14 @@ fn a_snapshot_that_will_not_go_is_not_reported_gone() {
         "a card with no cache root has no snapshot to invalidate"
     );
 
-    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
-        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
-        root.open_dir("XTEINK").expect("open XTEINK")
-    });
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .unwrap_or_else(|_| {
+            root.make_dir_in_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("make cache root");
+            root.open_dir(proto::cache::CACHE_ROOT_DIR)
+                .expect("open cache root")
+        });
 
     // Present but not there: still nothing to invalidate.
     assert!(upload_store::clear_cache_file(
@@ -1902,7 +1955,7 @@ fn a_snapshot_that_will_not_go_is_not_reported_gone() {
     ));
 
     // A snapshot that cannot be removed must not read as removed.
-    let snapshot = xteink
+    let snapshot = cache_root
         .open_file_in_dir(proto::cache::CATALOG_FILE, Mode::ReadWriteCreate)
         .expect("snapshot");
     snapshot
@@ -1921,9 +1974,38 @@ fn a_snapshot_that_will_not_go_is_not_reported_gone() {
     ));
     assert!(
         matches!(
-            xteink.find_directory_entry(proto::cache::CATALOG_FILE),
+            cache_root.find_directory_entry(proto::cache::CATALOG_FILE),
             Err(embedded_sdmmc::Error::NotFound)
         ),
         "and it really is gone"
+    );
+}
+
+/// The sidecar readers had no direct test at all, which is how a change to the
+/// cache root could have moved them silently.
+#[test]
+fn labels_under_the_current_cache_root_are_read() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let alias = proto::upload::sanitized_name(b"Middlemarch.epub");
+    let existing = books
+        .open_file_in_dir(alias.as_str(), Mode::ReadWriteCreate)
+        .expect("a book from before long names");
+    existing.write(&old_body()).expect("write");
+    existing.close().expect("close");
+    let identity = proto::upload::hash_identity(b"Middlemarch.epub");
+    write_legacy_sidecars(&root, alias.as_str(), identity, "Middlemarch");
+
+    let mut label = String::<64>::new();
+    assert!(
+        upload_store::read_upload_label(&root, alias.as_str(), &mut label),
+        "a label under {} must be found",
+        proto::cache::CACHE_ROOT_DIR
+    );
+    assert_eq!(label.as_str(), "Middlemarch");
+    assert_eq!(
+        upload_store::read_upload_identity(&root, alias.as_str()),
+        Ok(Some(identity))
     );
 }

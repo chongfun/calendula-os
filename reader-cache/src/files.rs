@@ -199,8 +199,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
-    let cache = open_or_make_dir(&xteink, CACHE_V2_DIR)?;
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    let cache = open_or_make_dir(&cache_root, CACHE_V2_DIR)?;
     let book = open_or_make_dir(&cache, key)?;
     let _ = open_or_make_dir(&book, CACHE_SECTIONS_DIR)?;
     Ok(())
@@ -257,8 +257,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
-    let cache = open_or_make_dir(&xteink, CACHE_V2_DIR)?;
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    let cache = open_or_make_dir(&cache_root, CACHE_V2_DIR)?;
     let book = open_or_make_dir(&cache, key)?;
     write_two_generation(
         &book,
@@ -282,8 +282,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
     let book = cache.open_dir(key).ok()?;
     let mut bytes = [0u8; POSITION_BYTES];
     if read_two_generation(
@@ -316,9 +316,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR)?;
     write_two_generation(
-        &xteink,
+        &cache_root,
         STATE_GENERATIONS,
         STATE_DURABLE_MAGIC,
         &record.encode(),
@@ -330,7 +330,7 @@ const STATE_GENERATIONS: [&str; 2] = ["STATEA.BIN", "STATEB.BIN"];
 const STATE_DURABLE_MAGIC: [u8; 4] = *b"MGST";
 
 /// Read the newest valid STATEA/STATEB generation, falling back to the
-/// legacy `/XTEINK/STATE.BIN`. Returns None when every copy is absent,
+/// legacy `/READER/STATE.BIN`. Returns None when every copy is absent,
 /// short, or fails its checksum.
 pub fn read_state_file<
     D,
@@ -345,12 +345,17 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
     let mut bytes = [0u8; proto::nvm::AppStateRecord::ENCODED_LEN];
-    if read_two_generation(&xteink, STATE_GENERATIONS, STATE_DURABLE_MAGIC, &mut bytes) {
+    if read_two_generation(
+        &cache_root,
+        STATE_GENERATIONS,
+        STATE_DURABLE_MAGIC,
+        &mut bytes,
+    ) {
         return proto::nvm::AppStateRecord::decode(&bytes);
     }
-    let file = xteink
+    let file = cache_root
         .open_file_in_dir(CACHE_STATE_FILE, Mode::ReadOnly)
         .ok()?;
     // One read suffices for a 32-byte record; shorter V1/V2 files decode
@@ -372,8 +377,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let fonts = xteink.open_dir(FONT_PACK_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let fonts = cache_root.open_dir(FONT_PACK_DIR).ok()?;
     let file = fonts
         .open_file_in_dir(FONT_PACK_FILE, Mode::ReadOnly)
         .ok()?;
@@ -436,9 +441,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR)?;
     write_two_generation(
-        &xteink,
+        &cache_root,
         WIFI_GENERATIONS,
         WIFI_DURABLE_MAGIC,
         &record.encode(),
@@ -460,7 +465,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) else {
+    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
         return true;
     };
     let mut ok = true;
@@ -475,7 +480,7 @@ where
         WIFI_HINT_GENERATIONS[0],
         WIFI_HINT_GENERATIONS[1],
     ] {
-        ok &= upload_store::remove_file_reclaiming_clusters(&xteink, name)
+        ok &= upload_store::remove_file_reclaiming_clusters(&cache_root, name)
             != upload_store::RemoveStatus::Failed;
     }
     ok
@@ -501,9 +506,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR)?;
     write_two_generation(
-        &xteink,
+        &cache_root,
         WIFI_HINT_GENERATIONS,
         WIFI_HINT_DURABLE_MAGIC,
         &record.encode(),
@@ -525,10 +530,10 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
     let mut bytes = [0u8; proto::nvm::WifiApHintRecord::ENCODED_LEN];
     read_two_generation(
-        &xteink,
+        &cache_root,
         WIFI_HINT_GENERATIONS,
         WIFI_HINT_DURABLE_MAGIC,
         &mut bytes,
@@ -552,12 +557,19 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
     let mut bytes = [0u8; proto::nvm::WifiCredentialsRecord::ENCODED_LEN];
-    if read_two_generation(&xteink, WIFI_GENERATIONS, WIFI_DURABLE_MAGIC, &mut bytes) {
+    if read_two_generation(
+        &cache_root,
+        WIFI_GENERATIONS,
+        WIFI_DURABLE_MAGIC,
+        &mut bytes,
+    ) {
         return proto::nvm::WifiCredentialsRecord::decode(&bytes);
     }
-    let file = xteink.open_file_in_dir(WIFI_FILE, Mode::ReadOnly).ok()?;
+    let file = cache_root
+        .open_file_in_dir(WIFI_FILE, Mode::ReadOnly)
+        .ok()?;
     let len = file.read(&mut bytes).ok()?;
     proto::nvm::WifiCredentialsRecord::decode(&bytes[..len])
 }
@@ -927,8 +939,8 @@ where
             }
         };
     }
-    let xteink = open!(root.open_dir(CACHE_ROOT_DIR));
-    let cache = open!(xteink.open_dir(CACHE_V2_DIR));
+    let cache_root = open!(root.open_dir(CACHE_ROOT_DIR));
+    let cache = open!(cache_root.open_dir(CACHE_V2_DIR));
     let book_dir = open!(cache.open_dir(key));
     let file = open!(book_dir.open_file_in_dir(CACHE_BOOK_FILE, Mode::ReadOnly));
     let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
@@ -974,7 +986,7 @@ const SHORT_NAME_BYTES: usize = 12;
 /// interrupted delete leaves a cache that reads as absent and gets rebuilt,
 /// rather than a header advertising sections that are no longer there.
 ///
-/// The global reading position in XTEINK/STATE.BIN is never touched.
+/// The global reading position in READER/STATE.BIN is never touched.
 pub fn empty_cache_dir<
     D,
     T,
@@ -991,12 +1003,12 @@ where
 {
     // A directory that isn't there holds no cache; anything else going wrong
     // on the way in means we cannot say the cache is gone.
-    let xteink = match root.open_dir(CACHE_ROOT_DIR) {
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
         Ok(dir) => dir,
         Err(embedded_sdmmc::Error::NotFound) => return true,
         Err(_) => return false,
     };
-    let cache = match xteink.open_dir(CACHE_V2_DIR) {
+    let cache = match cache_root.open_dir(CACHE_V2_DIR) {
         Ok(dir) => dir,
         Err(embedded_sdmmc::Error::NotFound) => return true,
         Err(_) => return false,
@@ -1705,7 +1717,7 @@ where
     }
 }
 
-/// Open the book's cache directory (`XTEINK/CACHE2/<key>`) with one handle
+/// Open the book's cache directory (`READER/CACHE2/<key>`) with one handle
 /// walked via `change_dir` — the single owner of that path walk. Opening a
 /// directory another walk also passes through is fine: this embedded-sdmmc
 /// rev allows duplicate directory opens (directories hold no cached
@@ -2106,8 +2118,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
     let book_dir = cache.open_dir(key).ok()?;
     let sections = book_dir.open_dir(CACHE_SECTIONS_DIR).ok()?;
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
@@ -2133,8 +2145,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
     let book_dir = cache.open_dir(key).ok()?;
     let file = book_dir.open_file_in_dir(CACHE_BOOK_FILE, mode).ok()?;
     Some(f(&file))
@@ -2157,8 +2169,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
     let book_dir = cache.open_dir(key).ok()?;
     let file = book_dir.open_file_in_dir(CACHE_TOC_FILE, mode).ok()?;
     Some(f(&file))
@@ -2387,8 +2399,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
     let book_dir = cache.open_dir(key).ok()?;
     let file = book_dir.open_file_in_dir(CACHE_COVER_FILE, mode).ok()?;
     Some(f(&file))

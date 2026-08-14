@@ -183,7 +183,7 @@ pub trait AppStateStore {
     fn store_app_state(&mut self, record: AppStateRecord) -> Result<(), Self::Error>;
 }
 
-/// Station credentials at `/XTEINK/WIFI.BIN`, written by the onboarding
+/// Station credentials at `/READER/WIFI.BIN`, written by the onboarding
 /// portal and read back ahead of every sync session. Same envelope as
 /// `AppStateRecord`: magic, version, payload, checksum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

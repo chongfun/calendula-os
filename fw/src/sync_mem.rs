@@ -49,7 +49,7 @@ pub struct SyncLoan {
     pub tcp_tx: &'static mut [u8],
     pub http_a: &'static mut [u8],
     pub http_b: &'static mut [u8],
-    /// Credentials from /XTEINK/WIFI.BIN; `None` sends the wifi task into
+    /// Credentials from /READER/WIFI.BIN; `None` sends the wifi task into
     /// the onboarding portal unless the build carries compile-time ones.
     pub wifi: Option<app_core::WifiCredentials>,
     /// Which AP to try first, already proven to belong to `wifi`'s network.

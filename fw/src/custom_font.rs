@@ -57,10 +57,10 @@ where
     T: TimeSource,
 {
     fn with_reader(&self, read: &mut dyn FnMut(&mut dyn PackReader)) -> bool {
-        let Ok(xteink) = self.root.open_dir(proto::cache::CACHE_ROOT_DIR) else {
+        let Ok(cache_root) = self.root.open_dir(proto::cache::CACHE_ROOT_DIR) else {
             return false;
         };
-        let Ok(fonts) = xteink.open_dir(FONT_PACK_DIR) else {
+        let Ok(fonts) = cache_root.open_dir(FONT_PACK_DIR) else {
             return false;
         };
         let Ok(file) = fonts.open_file_in_dir(FONT_PACK_FILE, Mode::ReadOnly) else {
@@ -160,10 +160,10 @@ where
     if !source.custom_font_available() {
         return false;
     }
-    let Some(xteink) = root.open_dir(proto::cache::CACHE_ROOT_DIR).ok() else {
+    let Some(cache_root) = root.open_dir(proto::cache::CACHE_ROOT_DIR).ok() else {
         return false;
     };
-    let Some(fonts) = xteink.open_dir(FONT_PACK_DIR).ok() else {
+    let Some(fonts) = cache_root.open_dir(FONT_PACK_DIR).ok() else {
         return false;
     };
     let Some(file) = fonts.open_file_in_dir(FONT_PACK_FILE, Mode::ReadOnly).ok() else {

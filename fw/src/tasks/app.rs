@@ -21,7 +21,7 @@ pub async fn run() {
     let ctx = reducer_context();
     let mut state = ReaderState::boot();
     // Compile-time dev credentials name the network immediately; the
-    // display task's boot probe of /XTEINK/WIFI.BIN arrives later and
+    // display task's boot probe of /READER/WIFI.BIN arrives later and
     // overrides, matching the wifi task's stored-beats-built-in order.
     if let Some((ssid, _)) = crate::tasks::wifi::credentials() {
         if let Some(ssid) = app_core::WifiSsid::new(ssid) {

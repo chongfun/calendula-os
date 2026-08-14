@@ -116,12 +116,12 @@ Current code status:
   cover data, advertised page counts, and source identity. The current in-flash
   demo book remains a fallback source while SD EPUB loading is hardened.
 - The selected-book preview path has been replaced by `build_or_load_book_cache`.
-  First open writes `/XTEINK/CACHE/E<hash>/BOOK.BIN`, builds the requested
-  section into `/XTEINK/CACHE/E<hash>/SECTIONS/SNNN.BIN`, and renders from those
+  First open writes `/READER/CACHE2/E<hash>/BOOK.BIN`, builds the requested
+  section into `/READER/CACHE2/E<hash>/SECTIONS/SNNN.BIN`, and renders from those
   flat records. Near-end NEXT requests a larger cached page target before
   rendering, so partial section caches can extend on demand.
 - Home can now draw a selected-book cover bitmap from
-  `/XTEINK/CACHE/E<hash>/COVER.BIN`. The firmware format is a fixed 202x303,
+  `/READER/CACHE2/E<hash>/COVER.BIN`. The firmware format is a fixed 202x303,
   1-bit, row-packed DOD bitmap; if it is absent or invalid, the Dock Clean
   fallback artwork is used. Host preview tooling can generate this cache file
   from an EPUB cover image.
@@ -133,8 +133,11 @@ Current code status:
   and UTF-8 text bytes. Line/word cache records remain defined in `proto::cache`
   for the next rendering refinement; the current firmware renderer still draws
   styled block text with Literata.
-- `/XTEINK/STATE.BIN` writes the encoded `AppStateRecord` for SD reading
-  progress. Version 2 stores the volatile book id plus stable SD source identity
+- The encoded `AppStateRecord` for SD reading progress is written to
+  `/READER/STATEA.BIN` and `/READER/STATEB.BIN` alternately, so a write torn
+  by a power cut leaves the previous generation readable; a legacy
+  `/READER/STATE.BIN` is still read when neither generation is valid.
+  Version 2 stores the volatile book id plus stable SD source identity
   derived from path and file size; boot/Home restore scans the card, maps the
   record back to the matching EPUB, and keeps v1 decode fallback for older state
   files.
@@ -158,7 +161,7 @@ Current code status:
   serialized EPD and SD transactions, while SD sessions, SD discovery, cache
   file I/O, EPUB cache construction, reader layout, view drawing, and EPD
   flushing now live in deeper `fw` modules.
-- Files is instant and catalog-backed. `/XTEINK/CATALOG.BIN` stores a flat fixed
+- Files is instant and catalog-backed. `/READER/CATALOG.BIN` stores a flat fixed
   record list of discovered EPUBs. Firmware may show “Library unavailable” while
   no catalog snapshot exists; it shows “No books available” only after a
   completed scan proves there are no EPUBs.
@@ -236,7 +239,7 @@ Current code status:
   WIFI.BIN and no compile-time credentials, Confirm on the Sync screen
   raises an open XTEINK-X4 hotspot at 192.168.4.1 with hand-rolled captive
   DHCP/DNS (proto::captive, host-tested) and a credential form; submitted
-  credentials persist through StoreWifiCredentials into /XTEINK/WIFI.BIN
+  credentials persist through StoreWifiCredentials into /READER/WIFI.BIN
   and the next session joins as a station. Join QR baked by
   tools/generate_qr.py. Stack region after the portal: ~38.9 KB.
 - Browser EPUB upload validated end to end on hardware June 11 2026: a

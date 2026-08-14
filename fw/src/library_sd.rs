@@ -10,8 +10,10 @@ use reader_cache::store::{
 };
 
 /// Every file this firmware owns on the card lives here, catalog and
-/// diagnostics alike (see `crate::probe_report`).
-pub(crate) const CATALOG_ROOT_DIR: &str = "XTEINK";
+/// diagnostics alike (see `crate::probe_report`). One definition, shared with
+/// the upload journal and the reader cache: two spellings of this directory
+/// is two halves of the firmware disagreeing about where the card is.
+pub(crate) use proto::cache::CACHE_ROOT_DIR as CATALOG_ROOT_DIR;
 use proto::cache::CATALOG_FILE;
 use proto::catalog::{
     catalog_file_len, catalog_identity_staged, catalog_record_identity, decode_catalog_record,
@@ -30,7 +32,7 @@ use proto::catalog::{
 /// read as a card that simply had no catalog yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatalogFault {
-    /// Nothing to load: no `XTEINK` directory, or no `CATALOG.BIN` in it.
+    /// Nothing to load: no cache-root directory, or no `CATALOG.BIN` in it.
     /// This is the normal state of a card whose catalog has not been built,
     /// and what makes the caller queue a scan.
     Missing,
@@ -274,8 +276,10 @@ where
         )
     {
         esp_println::println!(
-            "sd: XTEINK/INSTALL.JNL is from a build this one cannot read; \
-             uploads and deletes are refused until it is resolved"
+            "sd: {}/{} is from a build this one cannot read; \
+             uploads and deletes are refused until it is resolved",
+            CATALOG_ROOT_DIR,
+            upload_store::install::JOURNAL_FILE
         );
     }
     if !outcome.complete {
@@ -458,8 +462,8 @@ where
     if batch_capacity == 0 {
         return Err(());
     }
-    let xteink = open_or_make_dir(root, CATALOG_ROOT_DIR)?;
-    let file = xteink
+    let cache_root = open_or_make_dir(root, CATALOG_ROOT_DIR)?;
+    let file = cache_root
         .open_file_in_dir(CATALOG_FILE, Mode::ReadWriteCreateOrTruncate)
         .map_err(|_| ())?;
 
@@ -579,8 +583,8 @@ where
 {
     // `NotFound` is a card with no catalog yet; anything else from the same
     // call is the card refusing, and the two must not report alike.
-    let xteink = root.open_dir(CATALOG_ROOT_DIR).map_err(open_fault)?;
-    let file = xteink
+    let cache_root = root.open_dir(CATALOG_ROOT_DIR).map_err(open_fault)?;
+    let file = cache_root
         .open_file_in_dir(CATALOG_FILE, Mode::ReadOnly)
         .map_err(open_fault)?;
     let mut header = [0u8; CATALOG_HEADER_BYTES];
@@ -902,10 +906,10 @@ where
     if title.is_empty() {
         return false;
     }
-    let Ok(xteink) = root.open_dir(CATALOG_ROOT_DIR) else {
+    let Ok(cache_root) = root.open_dir(CATALOG_ROOT_DIR) else {
         return false;
     };
-    let Ok(file) = xteink.open_file_in_dir(CATALOG_FILE, Mode::ReadWriteAppend) else {
+    let Ok(file) = cache_root.open_file_in_dir(CATALOG_FILE, Mode::ReadWriteAppend) else {
         return false;
     };
     if file.seek_from_start(0).is_err() {
@@ -1012,8 +1016,8 @@ fn sweep_orphan_caches<
     // Collect cache-dir names up front: embedded-sdmmc forbids opening files
     // while a directory iteration holds the lock.
     let mut keys: heapless::Vec<String<8>, SWEEP_MAX_PER_PASS> = heapless::Vec::new();
-    if let Ok(xteink) = root.open_dir(proto::cache::CACHE_ROOT_DIR) {
-        if let Ok(cache) = xteink.open_dir(proto::cache::CACHE_V2_DIR) {
+    if let Ok(cache_root) = root.open_dir(proto::cache::CACHE_ROOT_DIR) {
+        if let Ok(cache) = cache_root.open_dir(proto::cache::CACHE_V2_DIR) {
             let _ = cache.iterate_dir(|entry| {
                 if !entry.attributes.is_directory() {
                     return ControlFlow::Continue(());

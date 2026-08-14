@@ -1,6 +1,6 @@
 //! Installing a finished file under its real name, crash-safely.
 //!
-//! Uploads stream into a scratch file under `/XTEINK/UPLOAD`, opaque and with
+//! Uploads stream into a scratch file under `/READER/UPLOAD`, opaque and with
 //! no long name, so an interrupted one leaves a stray file and nothing a
 //! catalog scan will trip over.
 //!
@@ -10,9 +10,9 @@
 //! record:
 //!
 //! ```text
-//! /BOOKS/<old>          --move-->  /XTEINK/ROLLBACK/<txn>
-//! /XTEINK/UPLOAD/<txn>  --move-->  /BOOKS/, under the long name
-//! /XTEINK/ROLLBACK/<txn> --delete, reclaiming its clusters
+//! /BOOKS/<old>          --move-->  /READER/ROLLBACK/<txn>
+//! /READER/UPLOAD/<txn>  --move-->  /BOOKS/, under the long name
+//! /READER/ROLLBACK/<txn> --delete, reclaiming its clusters
 //! ```
 //!
 //! Each move rewrites directory entries and leaves the cluster chain alone,
@@ -143,7 +143,7 @@ pub struct Located {
 /// What an install is trying to achieve, in full, before it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallIntent {
-    /// The finished file under `/XTEINK/UPLOAD`. Its chain is what identifies
+    /// The finished file under `/READER/UPLOAD`. Its chain is what identifies
     /// the book once installed — the scratch name is gone by then.
     pub stage: Located,
     /// The long name the book is installed under. A directory holds at most one
@@ -288,9 +288,9 @@ fn read_name(bytes: &[u8]) -> Option<ShortName> {
 pub struct Presence {
     /// The predecessor is still under its own name in `/BOOKS`.
     pub old: bool,
-    /// A copy is parked in `/XTEINK/ROLLBACK`.
+    /// A copy is parked in `/READER/ROLLBACK`.
     pub rollback: bool,
-    /// The finished upload is still in `/XTEINK/UPLOAD`, on the chain the
+    /// The finished upload is still in `/READER/UPLOAD`, on the chain the
     /// record named — not merely under that name, which a stranger could hold.
     pub stage: bool,
     /// The long name in `/BOOKS` is held by a file on the upload's recorded
@@ -310,7 +310,7 @@ pub struct Presence {
 /// so a step that fails is simply a step that gets retried on the next mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// Give the predecessor a second name under `/XTEINK/ROLLBACK`.
+    /// Give the predecessor a second name under `/READER/ROLLBACK`.
     RetireOldHolder,
     /// The predecessor now has two names on one chain. Take away the one in
     /// `/BOOKS` — unlink only, since the rollback copy is that same data.
@@ -511,8 +511,8 @@ where
         IntentState::Absent | IntentState::Truncated => {}
         IntentState::Valid(_) | IntentState::Unrecognized => return Err(InstallError::Busy),
     }
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
-    let file = xteink
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+    let file = cache_root
         .open_file_in_dir(JOURNAL_FILE, Mode::ReadWriteCreateOrTruncate)
         .map_err(|_| InstallError::Card)?;
     let bytes = intent.encode();
@@ -560,12 +560,12 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = match root.open_dir(CACHE_ROOT_DIR) {
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
         Ok(dir) => dir,
         Err(embedded_sdmmc::Error::NotFound) => return Ok(IntentState::Absent),
         Err(_) => return Err(InstallError::Card),
     };
-    let file = match xteink.open_file_in_dir(JOURNAL_FILE, Mode::ReadOnly) {
+    let file = match cache_root.open_file_in_dir(JOURNAL_FILE, Mode::ReadOnly) {
         Ok(file) => file,
         Err(embedded_sdmmc::Error::NotFound) => return Ok(IntentState::Absent),
         Err(_) => return Err(InstallError::Card),
@@ -598,12 +598,12 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = match root.open_dir(CACHE_ROOT_DIR) {
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
         Ok(dir) => dir,
         Err(embedded_sdmmc::Error::NotFound) => return Ok(()),
         Err(_) => return Err(InstallError::Card),
     };
-    match remove_file_reclaiming_clusters(&xteink, JOURNAL_FILE) {
+    match remove_file_reclaiming_clusters(&cache_root, JOURNAL_FILE) {
         RemoveStatus::Removed | RemoveStatus::Absent => Ok(()),
         RemoveStatus::Failed => Err(InstallError::Card),
     }
@@ -619,9 +619,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
-    let upload = open_or_make_dir(&xteink, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
-    let rollback = open_or_make_dir(&xteink, ROLLBACK_DIR).map_err(|()| InstallError::Card)?;
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+    let upload = open_or_make_dir(&cache_root, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
+    let rollback = open_or_make_dir(&cache_root, ROLLBACK_DIR).map_err(|()| InstallError::Card)?;
 
     // The alias cannot tell these entries apart: retiring the predecessor
     // frees its alias, and the driver hands the same one to the replacement.
@@ -712,9 +712,10 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
-    let upload = open_or_make_dir(&xteink, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
-    let rollback_dir = open_or_make_dir(&xteink, ROLLBACK_DIR).map_err(|()| InstallError::Card)?;
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+    let upload = open_or_make_dir(&cache_root, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
+    let rollback_dir =
+        open_or_make_dir(&cache_root, ROLLBACK_DIR).map_err(|()| InstallError::Card)?;
 
     match step {
         Step::RetireOldHolder => {
@@ -863,12 +864,12 @@ where
     T: TimeSource,
 {
     const PER_PASS: usize = 8;
-    let Ok(xteink) = open_or_make_dir(root, CACHE_ROOT_DIR) else {
+    let Ok(cache_root) = open_or_make_dir(root, CACHE_ROOT_DIR) else {
         return false;
     };
     let mut swept = true;
     for directory in [UPLOAD_DIR, ROLLBACK_DIR] {
-        let Ok(dir) = open_or_make_dir(&xteink, directory) else {
+        let Ok(dir) = open_or_make_dir(&cache_root, directory) else {
             swept = false;
             continue;
         };
@@ -1215,8 +1216,8 @@ where
         let alias = proto::upload::upload_short_alias(long_name, 0);
         let stage = with_extension(alias.as_str(), ".TMP");
 
-        let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
-        let upload = open_or_make_dir(&xteink, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
+        let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+        let upload = open_or_make_dir(&cache_root, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
         // A leftover from an abandoned upload is cleared rather than appended
         // to. Not always by reclaiming it: an install cut half way through
         // leaves the scratch file and the book it published sharing one
@@ -1241,8 +1242,8 @@ where
     /// Give up, leaving the library exactly as it was.
     pub fn abandon(self, root: &Directory<'_, D, T, MD, MF, MV>) {
         let _ = self.file.close();
-        if let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) {
-            if let Ok(upload) = xteink.open_dir(UPLOAD_DIR) {
+        if let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) {
+            if let Ok(upload) = cache_root.open_dir(UPLOAD_DIR) {
                 let _ = remove_file_reclaiming_clusters(&upload, self.stage.as_str());
             }
         }
@@ -1279,8 +1280,8 @@ where
         // Read after the close, never before: a file's entry is only brought
         // up to date when it is flushed, so an open file's chain is whatever
         // it was before the body was written.
-        let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
-        let upload = open_or_make_dir(&xteink, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
+        let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
+        let upload = open_or_make_dir(&cache_root, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
         let staged = entry_cluster(&upload, stage.as_str())
             .ok_or(InstallError::Card)?
             .ok_or(InstallError::Card)?;
@@ -1290,7 +1291,7 @@ where
         // would then read as this upload already installed.
         if staged.value() == 0 {
             drop(upload);
-            drop(xteink);
+            drop(cache_root);
             discard_scratch(root, stage.as_str());
             return Err(InstallError::Empty);
         }
@@ -1299,7 +1300,7 @@ where
         // and the directory table is small enough that holding these would
         // starve them.
         drop(upload);
-        drop(xteink);
+        drop(cache_root);
 
         // The chain is recorded alongside each alias: it is what still
         // identifies these files after their names have been rewritten, freed
@@ -1369,7 +1370,7 @@ where
 
 /// Reclaim a scratch file for a transaction that will not be started.
 ///
-/// Best-effort: nothing under `/XTEINK/UPLOAD` is visible to the catalog or
+/// Best-effort: nothing under `/READER/UPLOAD` is visible to the catalog or
 /// the reader, and the sweep comes back for whatever is left.
 fn discard_scratch<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Dir<'_, D, T, MD, MF, MV>,
@@ -1378,8 +1379,8 @@ fn discard_scratch<D, T, const MD: usize, const MF: usize, const MV: usize>(
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) {
-        if let Ok(upload) = xteink.open_dir(UPLOAD_DIR) {
+    if let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) {
+        if let Ok(upload) = cache_root.open_dir(UPLOAD_DIR) {
             let _ = remove_file_reclaiming_clusters(&upload, stage);
         }
     }
@@ -1394,8 +1395,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR).ok()?;
-    let rollback = open_or_make_dir(&xteink, ROLLBACK_DIR).ok()?;
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).ok()?;
+    let rollback = open_or_make_dir(&cache_root, ROLLBACK_DIR).ok()?;
     let stem = stage.split('.').next().unwrap_or(stage);
     for probe in 0..ROLLBACK_PROBE_LIMIT {
         let mut candidate = ShortName::new();

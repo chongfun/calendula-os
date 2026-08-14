@@ -27,7 +27,7 @@ flowchart TD
     ui["ui<br/>bounded layout/render helpers"]
 
     epd["EPD panel (X4: SSD1677/UC8179, X3: UC8253/UC8279d)<br/>framebuffer / previous-frame RAM"]
-    sd["microSD FAT<br/>/BOOKS + card root EPUBs<br/>/XTEINK cache + catalog + state"]
+    sd["microSD FAT<br/>/BOOKS + card root EPUBs<br/>/READER cache + catalog + state"]
     sleep["ESP32-C3 deep sleep"]
 
     emulator["tools/emulator<br/>host reducer + panel protocol model<br/>scenario/golden-frame runner"]
@@ -183,7 +183,7 @@ ping-pong: 4 KB chunks carry loaned buffers one way and the buffers come
 back on a return channel once written. The display task holds one
 interruptible SD session for the upload phase.
 
-Bytes stream into `/XTEINK/UPLOAD` under an opaque name with no long name,
+Bytes stream into `/READER/UPLOAD` under an opaque name with no long name,
 so nothing enters the library namespace until the file is complete and an
 interrupted upload leaves only a scratch file. Installing it is a
 same-volume move: directory entries are rewritten and the cluster chain is
@@ -191,18 +191,27 @@ left alone, so the book arrives in `/BOOKS` under its real filename as a
 VFAT long name (FAT also requires an 8.3 alias, which the driver derives;
 the catalog scan accepts `.epu` alongside `.epub` and opens books by that
 alias). The card is therefore organizable on a computer. Whatever held the
-name is parked in `/XTEINK/ROLLBACK` until the install completes, and
+name is parked in `/READER/ROLLBACK` until the install completes, and
 reclaimed only then.
 
-One `/XTEINK/INSTALL.JNL` record describes the whole transaction. It is
+One `/READER/INSTALL.JNL` record describes the whole transaction. It is
 written before anything is touched and cleared when everything is done,
 never updated in between. Recovery replays it before the library is scanned
 or a cached catalog is trusted, and while an unresolved record stands it
 owns the names it describes: further uploads *and* deletes are refused
 until it clears. Books uploaded before long-name support are recognized by
-their `/XTEINK/LABELS/<stem>.ID` identity sidecar and migrated by the same
+their `/READER/LABELS/<stem>.ID` identity sidecar and migrated by the same
 transaction rather than duplicated; those sidecars are still read for such
 books, but no longer written.
+
+The cache root is `/READER`, named for the reader rather than for a board,
+since the same firmware runs on more than one vendor's hardware. It was
+`/XTEINK` until then, and nothing in the firmware knows that: renaming the
+directory from a computer carries the catalog, the caches, the reading
+position, the Wi-Fi credentials, the fonts and any unresolved install
+journal across together, so the layout has one name and one set of rules
+rather than a compatibility path kept alive for cards that have already
+moved.
 
 Power/idle sleep and the done press abandon an active writer (the scratch
 file's FAT chain is reclaimed, the shelf untouched), close the SD session,
@@ -210,7 +219,7 @@ and only then sleep or reset; the done press waits for the stop
 acknowledgement so the reset never races an open FAT writer. The boot
 rescan then surfaces the new books.
 
-Station credentials come from `/XTEINK/WIFI.BIN` (written by the
+Station credentials come from `/READER/WIFI.BIN` (written by the
 onboarding portal below), falling back to compile-time `option_env!`
 values (`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`) for dev builds.
 At boot the display task reads WIFI.BIN once and reports the saved
@@ -442,7 +451,7 @@ verdict; re-running the probe takes a power cycle, and `main` logs which path
 it took.
 
 The verdict, the raw VER/FLG bytes and the MTP header are written to
-`/XTEINK/PROBE.TXT` on every boot, so a locked unit with no serial console is
+`/READER/PROBE.TXT` on every boot, so a locked unit with no serial console is
 still diagnosable.
 
 The full refresh (the only mode that reliably clears unknown pixels) and normal
@@ -601,7 +610,7 @@ reparse.
 
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
 file names in the firmware path. The library list is a windowed catalog
-snapshot at `/XTEINK/CATALOG.BIN` (v6: `X4CT` magic, u16 book count, 156-byte
+snapshot at `/READER/CATALOG.BIN` (v6: `X4CT` magic, u16 book count, 156-byte
 records). Firmware streams it `LIBRARY_WINDOW` (16) entries at a time instead
 of holding the whole list in RAM, so library size is bounded by the card, and
 only window crossings re-read it. The currently open book sits in a separate
@@ -626,20 +635,20 @@ cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
 
 ```text
-/XTEINK/CACHE2/E<hash>/BOOK.BIN
-/XTEINK/CACHE2/E<hash>/TOC.BIN
-/XTEINK/CACHE2/E<hash>/COVER.BIN
-/XTEINK/CACHE2/E<hash>/CONT.BIN
-/XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
-/XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
-/XTEINK/CATALOG.BIN
-/XTEINK/INSTALL.JNL
-/XTEINK/LABELS/<stem>.TXT
-/XTEINK/PROBE.TXT
-/XTEINK/ROLLBACK/<txn>
-/XTEINK/UPLOAD/<txn>
-/XTEINK/STATEA.BIN
-/XTEINK/STATEB.BIN
+/READER/CACHE2/E<hash>/BOOK.BIN
+/READER/CACHE2/E<hash>/TOC.BIN
+/READER/CACHE2/E<hash>/COVER.BIN
+/READER/CACHE2/E<hash>/CONT.BIN
+/READER/CACHE2/E<hash>/SECTIONS/S000.BIN
+/READER/CACHE2/E<hash>/SECTIONS/S001.BIN
+/READER/CATALOG.BIN
+/READER/INSTALL.JNL
+/READER/LABELS/<stem>.TXT
+/READER/PROBE.TXT
+/READER/ROLLBACK/<txn>
+/READER/UPLOAD/<txn>
+/READER/STATEA.BIN
+/READER/STATEB.BIN
 ```
 
 `BOOK.BIN` holds a `BookV2Header`, one `BookV2SectionRecord` per section (spine,
@@ -903,7 +912,7 @@ size.
 Persistent app state is represented by `hal_ext::nvm::AppStateRecord`, a compact
 versioned/checksummed record for book id, chapter, rendered screen, shell
 orientation, reading orientation, refresh policy, source hash, and source file
-size. The firmware stores it in alternating `/XTEINK/STATEA.BIN`/`STATEB.BIN`
+size. The firmware stores it in alternating `/READER/STATEA.BIN`/`STATEB.BIN`
 generations for SD reading progress (per-book positions use `POSA.BIN`/
 `POSB.BIN` beside the book's cache, and Wi-Fi credentials `WIFIA.BIN`/
 `WIFIB.BIN`, all framed by `proto::durable`);
