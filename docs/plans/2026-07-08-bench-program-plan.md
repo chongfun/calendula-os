@@ -184,7 +184,13 @@ Pass criteria:
 - wake performs exactly one deferred boot/restored render;
 - no visible artifact notes are recorded for the run.
 
-This directly continues `.scratch/sleep-screen-artifacts`.
+This suite replaced an inherited upstream investigation into intermittent
+sleep-screen artifacts (`.scratch/sleep-screen-artifacts`, deleted 2026-08-13,
+recoverable at `23a85b8`). That issue arrived from the X4 project and was never
+reproduced here: most of its diagnostic markers are emitted only by the
+SSD1677 backend, which an X3 build does not compile, and the maintainer — who
+has only an X3 — never observed the symptom. What survives it is this suite,
+which mechanizes its manual repro protocol.
 
 ### `thermal-run`
 
