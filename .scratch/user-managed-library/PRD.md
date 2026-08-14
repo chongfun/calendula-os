@@ -6,8 +6,11 @@ product owner; *(inferred)* are the author's reading and need confirmation;
 recorded so it is not silently relitigated. Facts marked *(verified)* were
 read from the pinned dependency or measured on hardware, and are cited.
 
-This document **absorbs the `cache3-architecture` draft** (commit `49b2c0a`),
-which is superseded.
+This document **absorbs the `cache3-architecture` draft**, which is superseded
+and has been deleted. It is recoverable at `833221b` — `git show
+833221b:.scratch/cache3-architecture/PRD.md`. *(The draft previously cited
+`49b2c0a` for the same content; that SHA is a pre-rebase copy, unreachable from
+any branch and eventually collectable. Cite the reachable one.)*
 
 Scope is deliberately independent of the on-device image-rendering PRD.
 Nothing here depends on render bundles, and nothing here blocks them; the two
