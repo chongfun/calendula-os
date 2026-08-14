@@ -421,12 +421,16 @@ matters — without it the idea comes back.
 port until you check one fact:
 
 - **freeink `fdf246d`, `__builtin_popcount` → inlined SWAR.** Xtensa-specific:
-  the builtin lowers to a windowed `callx8` into ROM's `__popcountsi2`. **We
-  target `riscv32imc`** (`rust-toolchain.toml`), a different backend entirely,
-  and the driver they fixed is not one we run. Do not port on the strength of
-  the headline. *(The transferable half is the shape of the bug — tens of
-  thousands of calls per page turn existing only to feed a serial-log
-  statistic. That is C7's argument, restated by someone else's profiler.)*
+  the builtin lowers to a windowed `callx8` into ROM's `__popcountsi2`. Today's
+  firmware targets `riscv32imc` (`rust-toolchain.toml`) and has no `count_ones`
+  on any path, so there is nothing to fix **now**. **Do not read this as
+  "Xtensa findings are irrelevant" — that stops being true the moment `fw-s3`
+  exists.** The Sticky is an ESP32-S3, which is Xtensa, and the Sticky PRD
+  already requires Xtensa binary-analysis tooling; this is a concrete first job
+  for it. Re-read this entry, not just its verdict, when `fw-s3` lands.
+  *(The architecture-neutral half is the shape of the bug — tens of thousands
+  of calls per page turn existing only to feed a serial-log statistic. That is
+  C7's argument, restated by someone else's profiler.)*
 - **crosspoint `6af9a049`, cache cumulative spine sizes in RAM.** Their progress
   bar computes percent-of-book from cumulative spine *byte* sizes, so every
   render paid two seeks and a heap-allocating read. **We do not compute progress
@@ -441,11 +445,20 @@ port until you check one fact:
   `!screen_on() && last_request().is_none()`, and the mode comes from the
   refresh planner. Worth knowing the failure mode exists; there is nothing to
   fix. *(C8 remains the sleep-side version of this question and is unaffected.)*
-- **The Paper Mono / Murphy M4 / X4 Pro wave in freeink** (`3c20447`, `f9aa77e`,
-  `d123567`, `41f2a7f`, and the grayscale run `72529a0`/`f50b1ab`/`477ac31`).
-  Other hardware, and grayscale was assessed and rejected on 2026-07-25 for
-  reasons that have not changed. `41f2a7f` is UC8279-for-X4-Pro and does not
-  advance the open UC8279 **X3** port; keep watching that PRD, not this commit.
+- **The grayscale run in freeink** (`72529a0`, `f50b1ab`, `477ac31`, `a7bb60b`).
+  Assessed and rejected on 2026-07-25 for reasons that have not changed: no
+  2-bpp consumer, the RAM budget, and the UC8279 cannot use our LUTs. `41f2a7f`
+  is UC8279-for-**X4 Pro** and does not advance the open UC8279 **X3** port —
+  watch that PRD, not this commit.
+- **Not declined, re-scoped: the Paper Mono / Murphy / X4 Pro wave is ESP32-S3
+  bring-up** (`3c20447`, `f9aa77e`, `d123567`, `ba4f1d6`, `f9c60ae`, `24fbab7`).
+  `platformio.sample.ini` puts X4 Pro, Paper Mono, Murphy and PaperS3 all on
+  `board_build.mcu = esp32s3`; only the Xteink X3/X4 line is C3. **That is the
+  Sticky's silicon**, so this wave is reference material for
+  `reterminal-sticky-support`, not "other hardware". It is out of scope *for
+  this roadmap* because the roadmap owns the shipping C3 firmware — which is a
+  different statement from irrelevant, and the distinction is the whole reason
+  this bullet exists. Findings routed to that PRD rather than recorded here.
 
 - **A10 as specified (pre-computed line-wrap caching).** There is no wrapping
   in the render path to cache. The EPUB sink wraps at cache-build time,

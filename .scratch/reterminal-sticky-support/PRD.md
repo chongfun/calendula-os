@@ -271,6 +271,25 @@ Rail pads follow the early-boot hold reconciliation contract in the power-latch 
 
 Rails that should remain off during early boot may remain held off until their peripheral is intentionally initialized; configure the enable pin to its required ON state before releasing that pad's hold.
 
+### Upstream reference: this is solved on the same silicon
+
+Everything above was derived from the S3 documentation. **freeink-sdk implements it on ESP32-S3 and names the Sticky by hardware characteristic**, so the requirements below are no longer only inferred. Provenance: `libs/hardware/PowerManager/src/PowerManager.cpp` (`holdRailOff`, `powerDownRailsForSleep`, `deepSleep`), `libs/hardware/BoardConfig/include/BoardConfig.h` (`releaseSdRail`), `libs/hardware/XteinkDetect/src/XteinkDetect.cpp`, `libs/display/FreeInkDisplay/src/bus/EpdBus.cpp`, commit `61f0b2b`, swept 2026-08-13.
+
+It is C++/ESP-IDF and we are Rust/`esp-hal`, so **the API does not port and the sequencing does**. Three rules there that this PRD did not state:
+
+**1. The panel RESET pin is a held pad, and its sleep level depends on whether the panel rail is gated.**
+
+Upstream derives it as `resetSleepLevel = display.powerEnable >= 0 ? LOW : HIGH` and explains both directions:
+
+- **Gated rail — this is Sticky.** Driving an unpowered panel's RESET input HIGH back-powers the controller through its RESET protection diode, "turning sleep into a milliamp-level drain". Hold RESET **LOW** alongside a switched-off rail.
+- **Rail stays powered** (their X4 Pro). Hold RESET **HIGH** so the controller cannot drift out of deep sleep and restart its analog booster.
+
+Sticky is the gated case. A generic "hold RESET at its idle level" would pick the wrong one and the symptom is standby drain, not a functional failure — it would pass every wake test and fail the battery.
+
+**2. Rail-enable polarity is per-rail, and "off" is the inactive level, not LOW.** Upstream carries an active-high/active-low flag per rail because at least one of their boards powers its card *while held LOW*. Sticky's EPD/SD/touch enables must each be confirmed against the schematic, and the sleep write must be the inactive level for that pad rather than a blanket zero. Section "Switched peripheral rails" already says to confirm the inactive level from the schematic; this is why it matters at sleep entry and not only at init.
+
+**3. Release-before-write is required at every consumer, not only at boot reconciliation.** Upstream calls `gpio_hold_dis` immediately before configuring a pad in *six* places, and the comment is the same each time: a retained hold makes the subsequent write a silent no-op. Their `holdRailOff` even releases before re-holding, because a hold left from a previous cycle would defeat the write it is about to make. Our global early-boot reconciliation covers the common path; it does not cover a consumer that touches a held pad before reconciliation has run, which is the subject of the next two sections.
+
 ## Display
 
 Sticky uses an 800×480 SSD1677.
@@ -282,6 +301,20 @@ Do not add a second Sticky-specific driver.
 Add a small panel configuration seam for values that genuinely differ, including the Sticky's refresh/update and border-waveform behavior.
 
 Existing X4 behavior must remain unchanged.
+
+### Whatever issues the first RESET pulse must release the RESET hold itself
+
+The sleep path holds RESET at a board-safe level (LOW on Sticky — see "Upstream reference"), and **a per-pin hold survives the wake reset**. Any code that pulses RESET before global hold reconciliation has run must therefore call the release itself, or every write bounces off the retained latch and the pulse never reaches the panel.
+
+Upstream states this as a hard ordering constraint because their controller detection runs before display bus init, and a probe whose reset pulse silently did nothing **selects the wrong driver** rather than failing — the worst available outcome, since it produces a plausible-looking wrong answer.
+
+For `fw-s3` this applies to whichever of these touches RESET first on a given boot, and the answer must be established rather than assumed:
+
+- runtime panel controller detection, if the Sticky path runs the probe at all;
+- the SSD1677 driver's own init;
+- any early diagnostic or bring-up path added during Milestone 1.
+
+Requirement: release the RESET pad's hold immediately before configuring it, at each such site, rather than relying on reconciliation having already run. This is the same discipline as the SD rail rescue above and fails the same silent way.
 
 ### Validation
 
@@ -306,6 +339,20 @@ Verify no persistent fast-refresh border artifact.
 Sticky MicroSD shares SPI with the EPD using separate chip selects.
 
 Reuse shared-bus/session logic where possible.
+
+### The SD rail must be powered before the first display transaction
+
+**A shared bus plus a switched SD rail plus pad hold combine into a failure that looks like a dead panel.** Upstream hit it and rescues the rail explicitly (`BoardConfig::releaseSdRail`): a previous firmware's sleep path latches the SD rail off with a pad hold, the hold survives reset *and reflashing*, and on a board where SD shares the display's SPI bus **an unpowered card clamps SCLK/MOSI so the panel never hears a command**.
+
+Sticky has all three preconditions. The consequences are worth stating plainly because they shape debugging:
+
+- The symptom is a display that never initializes, on a build whose display code is correct.
+- It survives a reflash, so "flash a known-good image" does not clear it and will actively mislead.
+- It is reachable on a **first** boot of `fw-s3` on a unit that previously ran any firmware using pad hold — including an earlier `fw-s3`.
+
+Requirement: before the first display transaction, release any inherited hold on the SD rail-enable pad, drive it to its **ON** level, and deselect the card's chip select. Do this whether or not storage is otherwise needed on that boot path, and do it even when the boot does not intend to mount the card.
+
+Validate it directly rather than by inference: enter deep sleep with the SD rail held off, then cold-boot and confirm the display initializes. A test that only ever boots from a fully-powered state cannot see this.
 
 `fw-s3` owns:
 
@@ -645,6 +692,8 @@ No full app integration requirement.
 - display full/fast modes work and are timed
 - SD works
 - hundreds of SD/display alternations pass
+- **the display initializes on a cold boot entered from a state where the SD rail was left held off** — the shared-bus clamp described under Storage. Reaching this state deliberately is part of the test, not a hazard to avoid
+- **every site that pulses RESET releases the RESET hold first**, verified by inspection of each such site rather than by the display happening to work on a boot that had no inherited hold
 - battery readings are plausible
 - physical controls work
 - shared-driver changes do not regress C3
@@ -679,6 +728,8 @@ Add:
 - no latch glitch/power-off occurs
 - 50 battery-only sleep/wake cycles pass
 - EPD, SD, and touch rails are verified off during genuine deep sleep, measured at the rail or enable pad rather than inferred from pre-sleep writes
+- **the panel RESET pad is verified LOW during deep sleep**, not merely held — Sticky's gated EPD rail makes a held-HIGH RESET a back-power path through the controller's protection diode, and the cost is standby current rather than a failed wake
+- **standby current is measured**, because every failure mode in the two items above is invisible to a functional sleep/wake test and shows up only as drain. A cycle count that passes 50/50 is not evidence the hold levels are right
 
 Full navigation is not required because Back still requires touch.
 
