@@ -1147,6 +1147,79 @@ impl WifiSsid {
     }
 }
 
+/// The onboarding hotspot's SSID, built from this device's MAC address.
+///
+/// Per device rather than per board. Two readers running this firmware raise
+/// two hotspots, and a name that only said which model it was would leave a
+/// pair of the same model indistinguishable in a Wi-Fi list — where some
+/// clients collapse identical SSIDs into one row and give no way to pick. The
+/// screen names the network the join QR points at, so whatever is on screen
+/// has to match exactly one entry in the list.
+///
+/// Stored as the three MAC bytes it varies by, not as the finished string: this
+/// rides `SyncEvent::PortalUp` into a `RenderRequest` that sits four deep in a
+/// channel, and ten of the sixteen characters are a prefix that never
+/// changes. [`Self::write_into`] spells it out into a caller's buffer, which
+/// costs a stack frame rather than `.bss`.
+///
+/// It travels from the firmware because that is the only layer that can read a
+/// MAC. Nothing here is keyed on the board, so a new one inherits it with
+/// nothing to remember.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PortalSsid {
+    tail: [u8; 3],
+}
+
+impl PortalSsid {
+    /// `CALENDULA-` plus six hex digits.
+    pub const LEN: usize = 16;
+    const PREFIX: &'static [u8] = b"CALENDULA-";
+
+    /// Fixed value for the emulators' synthetic portal flow, so golden frames
+    /// render deterministically. Never used on hardware, where the tail comes
+    /// from the MAC.
+    pub const EMULATOR_DEMO: Self = Self {
+        tail: [0xDE, 0x11, 0x0A],
+    };
+
+    /// The name for a device whose MAC ends in these three bytes.
+    ///
+    /// Three because that is the widest device-specific part a MAC is sure to
+    /// carry: no IEEE allocation block holds more than 2^24 addresses, so
+    /// within any one block the low three bytes are distinct. Two readers
+    /// whose MACs come from the same block cannot share a name.
+    ///
+    /// Between blocks they can, and one vendor may hold several — so "same
+    /// silicon" does not settle it either. There is no single likelihood to
+    /// quote for that: a 24-bit allocation prefix leaves all three bytes
+    /// varying, a 36-bit one leaves twelve bits, so how much of the tail is
+    /// really free depends on how the blocks were handed out. This is a
+    /// discriminator, not an identifier.
+    ///
+    /// Mixing the whole 48-bit address down to three bytes would buy a
+    /// uniform chance instead of that ragged one, at the cost of a suffix
+    /// nobody can read off a MAC — which is worth more when two devices are
+    /// on the bench than the difference between unlikely and unlikelier.
+    pub const fn from_mac_tail(tail: [u8; 3]) -> Self {
+        Self { tail }
+    }
+
+    /// Spell the name into `buf` and borrow it back.
+    pub fn write_into<'a>(&self, buf: &'a mut [u8; Self::LEN]) -> &'a str {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        buf[..Self::PREFIX.len()].copy_from_slice(Self::PREFIX);
+        let at = Self::PREFIX.len();
+        buf[at] = HEX[usize::from(self.tail[0] >> 4)];
+        buf[at + 1] = HEX[usize::from(self.tail[0] & 0x0F)];
+        buf[at + 2] = HEX[usize::from(self.tail[1] >> 4)];
+        buf[at + 3] = HEX[usize::from(self.tail[1] & 0x0F)];
+        buf[at + 4] = HEX[usize::from(self.tail[2] >> 4)];
+        buf[at + 5] = HEX[usize::from(self.tail[2] & 0x0F)];
+        // Prefix and hex digits alike are ASCII by construction.
+        core::str::from_utf8(buf).unwrap_or("")
+    }
+}
+
 /// The onboarding hotspot's WPA2 PSK, minted fresh from the hardware RNG
 /// each time the portal starts. It rides `SyncEvent::PortalUp` into
 /// `SyncStatus` so the Wireless screen can render the join QR and the
@@ -1723,7 +1796,7 @@ pub enum SyncStatus {
     Connected([u8; 4]),
     /// The onboarding hotspot is up; the screen renders the join QR and
     /// manual-join password from this session's PSK.
-    PortalUp(PortalPsk),
+    PortalUp(PortalPsk, PortalSsid),
     /// Connected and the book server answers at this address until the
     /// session ends.
     Serving([u8; 4]),
@@ -1756,7 +1829,7 @@ pub enum SyncEvent {
     Connecting,
     Connected([u8; 4]),
     /// The onboarding hotspot is up, secured with this session's PSK.
-    PortalUp(PortalPsk),
+    PortalUp(PortalPsk, PortalSsid),
     Serving([u8; 4]),
     CredentialsSaved(WifiSsid),
     Failed(SyncError),
@@ -2487,7 +2560,7 @@ impl ReaderState {
             }
             SyncEvent::Connecting => SyncStatus::Connecting,
             SyncEvent::Connected(ip) => SyncStatus::Connected(ip),
-            SyncEvent::PortalUp(psk) => SyncStatus::PortalUp(psk),
+            SyncEvent::PortalUp(psk, ssid) => SyncStatus::PortalUp(psk, ssid),
             SyncEvent::Serving(ip) => SyncStatus::Serving(ip),
             SyncEvent::CredentialsSaved(ssid) => {
                 self.wifi_ssid = ssid.bytes;
@@ -3526,7 +3599,14 @@ mod tests {
         // 16 bytes and the planner's stored request four. Recorded because
         // `.bss` trades one-for-one against the main stack region on this
         // target, so a struct in a channel is never free.
-        assert_eq!(core::mem::size_of::<RenderRequest>(), 112);
+        //
+        // 112 -> 120 when the portal SSID joined the PSK in
+        // `SyncStatus::PortalUp`: three bytes of payload landing either side
+        // of an alignment boundary, so the channel pays 32 and the planner 8.
+        // Storing the three MAC bytes rather than the sixteen-character name
+        // is what keeps it to that -- the finished string would have cost 16
+        // and 64 (see `PortalSsid`).
+        assert_eq!(core::mem::size_of::<RenderRequest>(), 120);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
             "the departing state has outgrown the credentials variant",
@@ -3566,16 +3646,19 @@ mod tests {
         assert_eq!(state.sync_status, SyncStatus::NotConfigured);
         let state = press(state, Button::Confirm);
         assert_eq!(state.sync_status, SyncStatus::Starting);
-        let state = state.apply_sync_event(SyncEvent::PortalUp(PortalPsk::EMULATOR_DEMO));
+        let state = state.apply_sync_event(SyncEvent::PortalUp(
+            PortalPsk::EMULATOR_DEMO,
+            PortalSsid::EMULATOR_DEMO,
+        ));
         assert_eq!(
             state.sync_status,
-            SyncStatus::PortalUp(PortalPsk::EMULATOR_DEMO)
+            SyncStatus::PortalUp(PortalPsk::EMULATOR_DEMO, PortalSsid::EMULATOR_DEMO)
         );
         // Confirm is inert while the portal serves.
         let state = press(state, Button::Confirm);
         assert_eq!(
             state.sync_status,
-            SyncStatus::PortalUp(PortalPsk::EMULATOR_DEMO)
+            SyncStatus::PortalUp(PortalPsk::EMULATOR_DEMO, PortalSsid::EMULATOR_DEMO)
         );
         let state = state.apply_sync_event(SyncEvent::CredentialsSaved(
             WifiSsid::new("latent.space").unwrap(),

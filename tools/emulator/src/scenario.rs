@@ -276,7 +276,10 @@ fn parse_sync_event(kind: &str, step: &Step) -> Result<SyncEvent, String> {
         // The fixed demo PSK stands in for the per-session one the
         // firmware mints, so the join QR renders deterministically for
         // the goldens.
-        "PortalUp" | "portal-up" => Ok(SyncEvent::PortalUp(app_core::PortalPsk::EMULATOR_DEMO)),
+        "PortalUp" | "portal-up" => Ok(SyncEvent::PortalUp(
+            app_core::PortalPsk::EMULATOR_DEMO,
+            app_core::PortalSsid::EMULATOR_DEMO,
+        )),
         "Serving" | "serving" => Ok(SyncEvent::Serving(step.ip.unwrap_or([192, 168, 0, 233]))),
         "NetworkSaved" | "network-saved" => Ok(SyncEvent::NetworkSaved(
             app_core::WifiSsid::new(step.ssid.as_deref().unwrap_or("HOME-WIFI"))
@@ -311,7 +314,7 @@ fn sync_status_name(status: SyncStatus) -> &'static str {
         SyncStatus::Starting => "starting",
         SyncStatus::Connecting => "connecting",
         SyncStatus::Connected(_) => "connected",
-        SyncStatus::PortalUp(_) => "portal-up",
+        SyncStatus::PortalUp(..) => "portal-up",
         SyncStatus::Serving(_) => "serving",
         SyncStatus::CredentialsSaved => "credentials-saved",
         SyncStatus::Error(_) => "error",

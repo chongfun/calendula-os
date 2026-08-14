@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub use app_core::LibraryMenu;
-use app_core::PortalPsk;
+use app_core::{PortalPsk, PortalSsid};
 
 pub mod app_render;
 pub mod custom_font;
@@ -51,7 +51,7 @@ pub enum UiSyncStatus {
     /// for the join QR and manual-join text. Carried as [`PortalPsk`]
     /// rather than raw bytes so its redacted `Debug` keeps the live
     /// password out of any formatted UI state.
-    PortalUp(PortalPsk),
+    PortalUp(PortalPsk, PortalSsid),
     Serving([u8; 4]),
     CredentialsSaved,
     Error(&'static str),
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn portal_psk_stays_redacted_in_ui_debug_output() {
         let psk = PortalPsk::EMULATOR_DEMO;
-        let status = UiSyncStatus::PortalUp(psk);
+        let status = UiSyncStatus::PortalUp(psk, PortalSsid::EMULATOR_DEMO);
         let shell = UiShell {
             view: UiView::Wireless,
             orientation: UiOrientation::PortraitButtonsRight,

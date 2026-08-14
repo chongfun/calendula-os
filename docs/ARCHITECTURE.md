@@ -221,7 +221,7 @@ rescan then surfaces the new books.
 
 Station credentials come from `/READER/WIFI.BIN` (written by the
 onboarding portal below), falling back to compile-time `option_env!`
-values (`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`) for dev builds.
+values (`CALENDULA_WIFI_SSID`/`CALENDULA_WIFI_PASS`) for dev builds.
 At boot the display task reads WIFI.BIN once and reports the saved
 network's name as `SyncEvent::NetworkSaved`, so the Wireless screen can
 show which network is saved and offer connect/forget honestly instead of
@@ -233,7 +233,10 @@ recovery path for a wrong password or a changed router that used to
 require editing the card on a computer.
 
 With no credentials anywhere, starting a session raises the onboarding portal
-instead: a WPA2 hotspot (`XTEINK-X4` or `XTEINK-X3`, named for the board)
+instead: a WPA2 hotspot (`CALENDULA-XXXXXX`, the last six hex digits of this
+device's MAC, so the name on screen picks out one entry in a Wi-Fi list. Two
+devices whose addresses come from one IEEE allocation block cannot share it;
+between blocks it discriminates rather than guarantees)
 at 192.168.4.1 with a captive DHCP
 server, a DNS catch-all (every name resolves to the portal, which makes
 phones raise their sign-in sheet unprompted), and a credential form on

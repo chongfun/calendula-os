@@ -803,7 +803,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             push_ipv4(&mut buf, &mut cursor, ip);
             centered_note(fb, layout, text_in(&buf, cursor));
         }
-        UiSyncStatus::PortalUp(psk) => {
+        UiSyncStatus::PortalUp(psk, ssid) => {
             // The QR joins the WPA2 hotspot, whose PSK this session
             // minted; the captive DNS then raises the phone's sign-in
             // sheet with the credential form. The QR is encoded here at
@@ -816,13 +816,15 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             // 140 + 33 modules * 5 px + the 20 px quiet zone ends at
             // y 325; the first caption baseline at 352 keeps its
             // ascenders out of the cleared band.
-            if let Some(qr) = join_qr::encode(psk_text, &mut temp, &mut out) {
+            let mut ssid_buf = [0u8; app_core::PortalSsid::LEN];
+            let ssid_text = ssid.write_into(&mut ssid_buf);
+            if let Some(qr) = join_qr::encode(ssid_text, psk_text, &mut temp, &mut out) {
                 draw_qr(fb, &qr, layout.heading_cx, 140, 5);
             }
             let mut buf = [0u8; 48];
             let mut cursor = 0;
             push_str(&mut buf, &mut cursor, "scan to join \u{201c}");
-            push_str(&mut buf, &mut cursor, join_qr::PORTAL_SSID);
+            push_str(&mut buf, &mut cursor, ssid_text);
             push_str(&mut buf, &mut cursor, "\u{201d}");
             draw_text_centered(
                 fb,

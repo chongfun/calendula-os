@@ -199,7 +199,10 @@ impl WebEmulator {
                 // a few seconds later.
                 self.ops.push((
                     now + 900.0,
-                    Op::Sync(SyncEvent::PortalUp(app_core::PortalPsk::EMULATOR_DEMO)),
+                    Op::Sync(SyncEvent::PortalUp(
+                        app_core::PortalPsk::EMULATOR_DEMO,
+                        app_core::PortalSsid::EMULATOR_DEMO,
+                    )),
                 ));
                 self.ops.push((
                     now + 7000.0,
