@@ -162,3 +162,27 @@ explicit treatment.
 `turnOff=true` shutdown (`0x3C=0x80`, `0x22=0x03`, `0x20`, 200 ms) with async
 updates deferring it until refresh completion. That is the backend our X4
 builds ship *today*.
+
+**Rescued from an abandoned PRD, because the last copy was about to be garbage
+collected.** An `ssd1677-production-fixes` PRD was written on 2026-08-05 and
+dropped once it turned out to be X4-only — SSD1677 is `cfg`'d out of X3 builds,
+so none of it was reachable on the only hardware this project has. That was the
+right call, and it is not being reopened here. But the document survived solely
+in a dangling commit (`bc96b25`) on no branch, and one of its findings is still
+live in shipped X4 builds:
+
+- **We apply the fast-DU `0x1C` shortcut unconditionally**
+  (`display/src/epd/ssd1677.rs:143`, the `RefreshMode::Fast` arm). Upstream made
+  it **opt-in after ghosting and blotching reports**. Note the neighbouring
+  `FastClean` arm carries a "deliberately" comment explaining its bit choice and
+  the `Fast` arm carries none, so the unconditional `0x1C` currently reads as
+  considered when it is inherited.
+- Its other fix — the booster soft-start 5th byte `0x80` — **already landed**
+  as #69 and is at `display/src/epd/ssd1677.rs:61`. Nothing to do.
+
+The implementation is not lost: `origin/feature/fast-du-setting` (tip
+`7463c78`) makes the shortcut a setting, and `origin/fix-rst-pin-hold`
+(`d34a733`) carries the RST work. Both are live refs. It is only the *reasoning*
+that was dangling, which is why it is written here rather than left as a branch
+nobody would think to read. Anyone picking up X4 display work should start from
+those two branches rather than from scratch.
