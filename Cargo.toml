@@ -15,6 +15,60 @@ resolver = "2"
 # table implicitly. The tools/ crates are separate workspaces and stay outside
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
+[workspace.dependencies]
+# Our fork: chongfun/embedded-sdmmc-rs, branch
+# calendula/long-names-and-error-fidelity.
+# Upstream v0.10, plus Jon-Vii's create_file_in_dir_lfn so wireless uploads land
+# under a real filename instead of an 8.3 alias, plus five changes of ours.
+#
+# Two are the same bug in different clothes: a FAT read that failed was
+# reported as a file that is absent, and elsewhere as a disk that is full.
+# Upload recovery reads both of those as evidence about what an interrupted
+# run managed to do, so a transient read error made it undo completed work.
+#
+# The third is move_file_in_dir_lfn: a same-volume move that renames a file by
+# rewriting directory entries, so installing a staged upload costs two
+# directory writes rather than a copy of the whole book. It owns both writes,
+# so the window where one chain has two names is reachable only by a power cut
+# inside the call; recovering from it means unlinking the name you do not
+# want, never truncating it. See tests/fat_chain_errors.rs and
+# tests/move_file.rs there.
+#
+# This revision also moves two decisions into the driver that used to be ours.
+# It derives the 8.3 alias itself, since only the directory can know which are
+# free, and it refuses a long name already present in the destination. So
+# nothing here chooses or records an alias any more: a book is identified on
+# the shelf by its long name, and by the cluster chain a move preserves.
+#
+# v0.10 renames delete_file_in_dir to delete_entry_in_dir, moves CardType into
+# embedded-sdmmc-types, and has the iterate_dir callbacks return ControlFlow,
+# which several scans here now use to stop early.
+#
+# The fourth is ClusterId::value, which reads out the number the driver kept
+# to itself. The install journal has to name the book it is replacing across a
+# power cut, and neither name will do it: a move rewrites the long name, and a
+# freed 8.3 alias goes to whatever is created next. The first cluster is what a
+# move never changes.
+#
+# The fifth is link_file_in_dir_lfn, the first half of a move on its own.
+# Nothing here uses it, and the reason is worth recording: publishing by link
+# would keep the scratch name past the install, and that name going away is how
+# recovery tells an install that has happened from one that has not. Buying a
+# second proof at the cost of that one turns an ordinary outside edit -- a book
+# deleted from /BOOKS -- into a lost predecessor. See the note on
+# upload-store's install module.
+#
+# Regression coverage for all five of our changes lives in the fork, not here:
+# tests/fat_chain_errors.rs for the error-propagation fixes, tests/move_file.rs
+# for the move, the link, and the recorded cluster. A bump that loses them
+# would still compile against this workspace, so re-run the fork's suite when
+# moving the rev. There is no upstream issue or PR to track: the fork we branched from
+# is unmaintained, so this rev is where these fixes live.
+# Pinned in one place: three manifests drifting apart is how a rev bump
+# turns into a partial upgrade, with two crates compiled against
+# different definitions of the same types.
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "7308883cfe87490e0533d56566162b815c12be76", default-features = false }
+
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an
 # inner `unsafe {}` so each operation's obligations stay visible.

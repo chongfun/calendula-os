@@ -22,8 +22,9 @@ display = { path = "../display" }
 proto = { path = "../proto" }
 ui = { path = "../ui" }
 heapless = "0.9.0"
-# Same pin as fw's and upload-store's; see fw/Cargo.toml for why this exact rev.
-embedded-sdmmc = { git = "https://github.com/rust-embedded-community/embedded-sdmmc-rs.git", rev = "d26892f7405469eba95741763ab39bda2239d5ec", default-features = false }
+# The rev, and why it is that rev, live in the root manifest's
+# [workspace.dependencies].
+embedded-sdmmc = { workspace = true }
 upload-store = { path = "../upload-store" }
 esp-println = { version = "0.17.0", features = ["esp32c3"], optional = true }
 

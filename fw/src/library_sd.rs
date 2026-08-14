@@ -1,5 +1,6 @@
 use crate::display_flush::Epd;
 use crate::sd_session;
+use core::ops::ControlFlow;
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, LfnBuffer, Mode, TimeSource};
 use esp_hal::gpio::Output;
@@ -11,7 +12,7 @@ use reader_cache::store::{
 /// Every file this firmware owns on the card lives here, catalog and
 /// diagnostics alike (see `crate::probe_report`).
 pub(crate) const CATALOG_ROOT_DIR: &str = "XTEINK";
-const CATALOG_FILE: &str = "CATALOG.BIN";
+use proto::cache::CATALOG_FILE;
 use proto::catalog::{
     catalog_file_len, catalog_identity_staged, catalog_record_identity, decode_catalog_record,
     encode_catalog_header, encode_catalog_placeholder_header, encode_catalog_record,
@@ -46,10 +47,14 @@ enum CatalogFault {
     Invalid,
     /// The card refused an open, a seek, or a read.
     Device,
+    /// Not a fault at all: recovery removed an interrupted upload, so any
+    /// catalog written before it may name a file that is now gone. The
+    /// rescan that follows is the repair, not a symptom.
+    Reclaimed,
 }
 
 /// A failed open is only a missing catalog when the card said so.
-fn open_fault<E: core::fmt::Debug>(error: embedded_sdmmc::Error<E>) -> CatalogFault {
+fn open_fault<E: core::error::Error>(error: embedded_sdmmc::Error<E>) -> CatalogFault {
     match error {
         embedded_sdmmc::Error::NotFound => CatalogFault::Missing,
         _ => CatalogFault::Device,
@@ -64,6 +69,7 @@ impl CatalogFault {
             Self::Stale => "stale",
             Self::Invalid => "invalid",
             Self::Device => "error",
+            Self::Reclaimed => "reclaimed",
         }
     }
 }
@@ -77,14 +83,35 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
     let status = sd_session::with_root(epd, sd_cs, |root| {
         esp_println::println!("sd: card init begin");
         esp_println::println!("sd: open root");
-        library.clear_catalog();
         library.status = LibraryScanStatus::Scanning;
-        // The 16 KB section text arena doubles as the scan's staging and
-        // identity scratch: a scan runs from the storage dispatcher (boot or
-        // an explicit refresh), never while a page render is reading the
-        // arena, and the section window is invalidated below so a stale page
-        // can't be served from clobbered text afterwards.
-        let scanned = write_catalog_streaming(root, library.arena_as_scratch());
+        let reconciled = reconcile_interrupted_uploads(root);
+        // The scanner knows nothing of installs in flight, so a shelf with
+        // one pending may list whichever copy the interrupted swap left —
+        // possibly the book about to be replaced. That is still a real book,
+        // and listing it beats handing a cold-booted reader an empty library,
+        // which a record this build cannot read would do for good. So the
+        // catalog is published either way and `scan_ok` below carries the
+        // unreconciled state; the next mount finds the record still standing
+        // and rebuilds rather than trusting the snapshot.
+        //
+        // The resident catalog is cleared only once a scan is actually going
+        // to run. Clearing first would make the fallback below meaningless —
+        // it keeps the in-memory catalog when a scan fails, and an emptied
+        // one is never non-empty — so a card that would not answer would take
+        // the reader's whole shelf rather than postponing the rebuild.
+        let scanned = if reconciled.shelf_readable {
+            // The 16 KB section text arena doubles as the scan's staging and
+            // identity scratch: a scan runs from the storage dispatcher
+            // (boot or an explicit refresh), never while a page render is
+            // reading the arena, and the section window is invalidated below
+            // so a stale page can't be served from clobbered text
+            // afterwards.
+            library.clear_catalog();
+            write_catalog_streaming(root, library.arena_as_scratch())
+        } else {
+            esp_println::println!("sd: shelf unreadable; keeping the catalog for the next mount");
+            Err(())
+        };
         let status = match scanned {
             Ok(0) => LibraryScanStatus::Empty,
             Ok(count) => {
@@ -101,8 +128,13 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
                 } else {
                     // Drop the cached data of books no longer on the card:
                     // this is the one moment the full book set is known and
-                    // the catalog is proven fresh.
-                    sweep_orphan_caches(root, library.arena_as_scratch());
+                    // the catalog is proven fresh. Not while an install is
+                    // pending: a parked predecessor is off the shelf but its
+                    // cache is still wanted, and a rollback would bring the
+                    // book back bare.
+                    if reconciled.outcome.complete {
+                        sweep_orphan_caches(root, library.arena_as_scratch());
+                    }
                     LibraryScanStatus::Ready
                 }
             }
@@ -113,18 +145,23 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         // renders from it.
         library.clear_lines();
         library.set_text_holds_toc(false);
-        status
+        (status, reconciled.outcome.complete)
     })
     .unwrap_or_else(|err| {
         esp_println::println!("sd: session failed: {:?}", err);
-        LibraryScanStatus::Error
+        (LibraryScanStatus::Error, false)
     });
+    let (status, reconciled) = status;
     // The scan's own verdict, taken before the fallback below can replace it.
     // That fallback keeps the UI on an older in-memory catalog when a scan
     // fails with books already listed — right for the reader, wrong for
     // telemetry, since `library.status` then reads `Ready` for a scan that
     // did not happen. `Empty` is a scan that succeeded and found nothing.
-    let scan_ok = status != LibraryScanStatus::Error;
+    //
+    // A catalog published over an unreconciled shelf reads the same way, and
+    // for the same reason: the reader gets a shelf, but it describes a book
+    // set an install in flight may still move.
+    let scan_ok = status != LibraryScanStatus::Error && reconciled;
     library.status = if status == LibraryScanStatus::Error && !library.catalog_is_empty() {
         LibraryScanStatus::Ready
     } else {
@@ -139,6 +176,121 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         start.elapsed().as_millis(),
         Instant::now().as_millis(),
     );
+}
+
+/// What one reconciliation pass found.
+struct Reconciled {
+    outcome: upload_store::install::InstallRecovery,
+    /// `/BOOKS` opened, or is genuinely not there. False is a card that would
+    /// not answer, where a scan would fail too — and clearing the resident
+    /// catalog to run one would cost the reader their shelf for nothing.
+    shelf_readable: bool,
+}
+
+/// Finish any install an earlier session left in flight.
+///
+/// This must run on *every* boot path that goes on to serve the shelf, not
+/// only the scan: a session invalidates `CATALOG.BIN` at entry, so a crash
+/// normally forces a rescan, but that deletion is best-effort and recovery
+/// must not depend on another module's side effect having succeeded.
+fn reconcile_interrupted_uploads<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Reconciled
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // The same distinction `walk_epubs` draws: a genuinely absent /BOOKS
+    // holds nothing to finish, while one that will not open has not answered.
+    // Only the first is a clean shelf.
+    let books = match root.open_dir("BOOKS") {
+        Ok(books) => books,
+        // No shelf means no install can be finished here, but a record may
+        // still be describing one -- and a record that stands must keep a
+        // cached catalog from being trusted and keep a fresh one from being
+        // published, whether or not there is a /BOOKS to look at.
+        Err(embedded_sdmmc::Error::NotFound) => {
+            use upload_store::install::IntentState;
+            let (had_intent, complete) = match upload_store::install::read_intent(root) {
+                Ok(IntentState::Absent) => (false, true),
+                // Nothing to replay, but something was there — and whatever
+                // it was may have moved the shelf before it went. Reclaim it
+                // here too, or it would retire the catalog on every mount
+                // for as long as the shelf stays missing.
+                Ok(IntentState::Truncated) => {
+                    (true, upload_store::install::clear_intent(root).is_ok())
+                }
+                Ok(IntentState::Valid(_)) | Ok(IntentState::Unrecognized) => (true, false),
+                Err(_) => (true, false),
+            };
+            return Reconciled {
+                outcome: upload_store::install::InstallRecovery {
+                    touched_shelf: false,
+                    swept: false,
+                    had_intent,
+                    complete,
+                },
+                // Nothing to reconcile against, but a scan still has the card
+                // root to walk.
+                shelf_readable: true,
+            };
+        }
+        Err(_) => {
+            esp_println::println!("sd: shelf unreadable; recovery cannot report it clean");
+            // Not knowing whether an install is in flight is not the same as
+            // knowing there is none, and a cached catalog must not be
+            // trusted on the strength of a shelf that would not open.
+            return Reconciled {
+                outcome: upload_store::install::InstallRecovery {
+                    touched_shelf: false,
+                    swept: false,
+                    had_intent: true,
+                    complete: false,
+                },
+                shelf_readable: false,
+            };
+        }
+    };
+    let outcome = upload_store::install::recover_installs(root, &books);
+    if outcome.touched_shelf {
+        esp_println::println!("sd: finished an interrupted install");
+    }
+    if !outcome.swept {
+        // Invisible to the reader either way; the next mount tries again.
+        esp_println::println!("sd: could not clear every leftover upload file");
+    }
+    // Only worth reopening the journal when recovery did not settle: a record
+    // this build cannot read is one of the reasons it would not.
+    if !outcome.complete
+        && matches!(
+            upload_store::install::read_intent(root),
+            Ok(upload_store::install::IntentState::Unrecognized)
+        )
+    {
+        esp_println::println!(
+            "sd: XTEINK/INSTALL.JNL is from a build this one cannot read; \
+             uploads and deletes are refused until it is resolved"
+        );
+    }
+    if !outcome.complete {
+        // Deliberately not fatal. An unfinished install leaves the shelf
+        // holding one complete book either way — the old one or the new one
+        // — and the next mount picks the transaction up again. Refusing to
+        // serve the library over a transient card error would cost the
+        // reader their whole shelf to fix something that is not visible to
+        // them.
+        esp_println::println!("sd: an install is still in flight; retrying next mount");
+    }
+    Reconciled {
+        outcome,
+        shelf_readable: true,
+    }
 }
 
 #[inline(never)]
@@ -158,7 +310,42 @@ pub(crate) fn load_catalog_cache(
     // with no snapshot prints one right before the scan that builds it.
     // `.is_ok()` here reported every outcome — refused read, bad seek, torn
     // file — as that same benign miss.
-    let outcome = sd_session::with_root(epd, sd_cs, |root| read_catalog_window(root, library, 0));
+    let outcome = sd_session::with_root(epd, sd_cs, |root| {
+        // Before the shelf is served from a cached catalog: a cache hit
+        // skips the scan entirely, so this is the only place an interrupted
+        // upload gets reconciled on an ordinary boot.
+        //
+        // Only on a hit, though. A miss is answered by a scan, which
+        // reconciles before it publishes anything, so recovering here too
+        // would read the install journal twice on every cold boot — and a
+        // cold boot is the normal state after an upload session, which
+        // invalidates the snapshot on the way in. Nothing is served
+        // unreconciled either way: a miss leaves the catalog cleared until
+        // that scan.
+        //
+        // A catalog written *before* this recovery may name a book the swap
+        // has since moved to a different alias, so a record in flight retires
+        // the catalog just read rather than trusting it; the rescan that
+        // follows rebuilds it against the shelf as it now stands.
+        let loaded = read_catalog_window(root, library, 0);
+        if loaded.is_ok() {
+            let recovery = reconcile_interrupted_uploads(root).outcome;
+            // Not just what this pass changed. An install whose shelf-changing
+            // steps happened before the reset leaves this pass with only a
+            // rollback copy to reclaim -- nothing in /BOOKS changes now, but
+            // /BOOKS already stopped matching the catalog when the book was
+            // installed under its new alias. The record's existence is the
+            // evidence; what this pass had left to do is not.
+            if recovery.touched_shelf || recovery.had_intent {
+                // The window this catalog describes was read into the library
+                // a moment ago. Drop it rather than leave a stale shelf
+                // resident for anything that reads before the rescan.
+                library.clear_catalog();
+                return Err(CatalogFault::Reclaimed);
+            }
+        }
+        loaded
+    });
     let result = match outcome {
         Ok(Ok(())) => "hit",
         Ok(Err(fault)) => fault.bench_result(),
@@ -829,15 +1016,23 @@ fn sweep_orphan_caches<
         if let Ok(cache) = xteink.open_dir(proto::cache::CACHE_V2_DIR) {
             let _ = cache.iterate_dir(|entry| {
                 if !entry.attributes.is_directory() {
-                    return;
+                    return ControlFlow::Continue(());
                 }
                 let mut name = String::<8>::new();
-                let _ = write!(name, "{}", entry.name);
-                if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
-                    return;
+                // A name that does not fit would be truncated into a
+                // *different* key, and everything downstream -- the header
+                // read, the reclaim -- would act on whatever that names.
+                if write!(name, "{}", entry.name).is_err() {
+                    return ControlFlow::Continue(());
                 }
-                // Past capacity silently drops; the leftover keys sweep next scan.
-                let _ = keys.push(name);
+                if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
+                    return ControlFlow::Continue(());
+                }
+                // A full batch is this pass's quota; the rest sweep next scan.
+                if keys.push(name).is_err() {
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
             });
         }
     }
@@ -1038,17 +1233,22 @@ where
     let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
     dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
-            return;
+            return ControlFlow::Continue(());
         }
 
-        // The 8.3 name stays the open handle whichever name is catalogued.
+        // The 8.3 name stays the open handle whichever name is catalogued, so
+        // a prefix of one is worse than no entry: it names a different file,
+        // or none.
         let mut open_name = String::<16>::new();
         use core::fmt::Write;
-        let _ = write!(open_name, "{}", entry.name);
+        if write!(open_name, "{}", entry.name).is_err() {
+            return ControlFlow::Continue(());
+        }
         let Some(name) = proto::storage::catalog_scan_name(long_name, &open_name) else {
-            return;
+            return ControlFlow::Continue(());
         };
         visit_prefixed(prefix, name, &open_name, in_books_dir, entry.size, visit);
+        ControlFlow::Continue(())
     })
     .map_err(|_| ())
 }

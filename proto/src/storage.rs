@@ -72,8 +72,9 @@ pub trait ProgressStorage {
 }
 
 pub fn is_epub_path(path: &str) -> bool {
-    // Uploads are written with 8.3 names, where the extension truncates
-    // to ".epu"; accept both spellings everywhere EPUBs are discovered.
+    // Uploads now create VFAT long names ending in ".epub", but releases
+    // before that wrote only 8.3 ".epu" names, and sideloaded books use
+    // either; accept both spellings everywhere EPUBs are discovered.
     if path.len() >= 4 {
         let tail = &path.as_bytes()[path.len() - 4..];
         if tail[0] == b'.'
@@ -149,8 +150,9 @@ pub fn catalog_scan_name<'a>(long_name: Option<&'a str>, short_name: &'a str) ->
         // comparison not to depend on that being true.
         Some("") => return None,
         Some(name) => name,
-        // No long name at all, which is an ordinary 8.3-only entry: uploads
-        // write those, and the short name is the whole name. A short name
+        // No long name at all, which is an ordinary 8.3-only entry: books
+        // uploaded before long-name support, and anything copied on as 8.3
+        // from a computer. The short name is the whole name. A short name
         // cannot begin with a dot, so the hidden-entry test below never fires
         // on this branch -- it is applied uniformly rather than skipped,
         // because a rule that runs on one branch and not the other is the
@@ -181,8 +183,58 @@ pub fn catalog_display_path<const N: usize>(prefix: &str, name: &str, out: &mut 
     };
     let stem = &name[..name.len() - suffix.len()];
     let stem_capacity = N.saturating_sub(out.len() + suffix.len());
-    push_utf8_prefix(stem, out.len() + stem_capacity, out);
+
+    // A trimmed path must still name exactly one book. This string is not
+    // only shown: `source_hash` and `cache_key_for` both hash it, so two
+    // files whose names agree up to the trim and whose sizes match would
+    // otherwise share a catalog identity *and* a cache. Uploads make that
+    // reachable — they permit a 59-byte stem while `/books/` leaves 52 — so
+    // a trim spends its last few bytes on a discriminator over the whole
+    // name instead of more of a prefix the two already share.
+    if out.len() + stem.len() + suffix.len() > N {
+        let tag = discriminator(name);
+        let kept = stem_capacity.saturating_sub(tag.len());
+        push_utf8_prefix(stem, out.len() + kept, out);
+        let _ = out.push_str(&tag);
+    } else {
+        push_utf8_prefix(stem, out.len() + stem_capacity, out);
+    }
     let _ = out.push_str(suffix);
+}
+
+/// A short, filename-legal tag distinguishing names that share a trimmed
+/// prefix: base-36 over an FNV-1a of the whole name.
+///
+/// Seven digits, because 36^7 exceeds `u32::MAX` and so carries the hash
+/// whole. That is what keeps trimming from weakening identity: this string
+/// feeds `source_hash` and `cache_key_for`, so a trimmed path must not
+/// collide more readily than those 32-bit hashes do by themselves. Five
+/// digits folded the hash into 36^5 and made trims collide roughly seventy
+/// times sooner than the identity they feed — a real pair being
+/// `A*46 + "000000007328"` and `A*46 + "000000085285"`, distinct names with
+/// one display path.
+///
+/// Exactness is not on offer at this layer while identity is a 32-bit FNV;
+/// content-addressed identity is the fix, and it belongs to the
+/// user-managed-library milestone rather than here.
+fn discriminator(name: &str) -> String<8> {
+    const BASE36: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut hash = 0x811c_9dc5u32;
+    for byte in name.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let mut out = String::new();
+    let _ = out.push('~');
+    let mut digits = [0u8; 7];
+    for slot in digits.iter_mut().rev() {
+        *slot = BASE36[(hash % 36) as usize];
+        hash /= 36;
+    }
+    for digit in digits {
+        let _ = out.push(digit as char);
+    }
+    out
 }
 
 fn push_utf8_prefix<const N: usize>(text: &str, end: usize, out: &mut String<N>) {
@@ -196,6 +248,81 @@ fn push_utf8_prefix<const N: usize>(text: &str, end: usize, out: &mut String<N>)
 
 #[cfg(test)]
 mod tests {
+
+    /// Two names that shared a display path under a five-digit tag. The tag
+    /// feeds `source_hash` and `cache_key_for`, so an identical path here
+    /// means one catalog identity and one cache for two books.
+    #[test]
+    fn trimmed_paths_survive_a_tag_that_would_have_folded() {
+        let stem = "A".repeat(46);
+        let mut first = String::<64>::new();
+        let mut second = String::<64>::new();
+        catalog_display_path(
+            "/books/",
+            &std::format!("{stem}000000007328.epub"),
+            &mut first,
+        );
+        catalog_display_path(
+            "/books/",
+            &std::format!("{stem}000000085285.epub"),
+            &mut second,
+        );
+        assert_ne!(
+            first, second,
+            "distinct names must not share a display path"
+        );
+        assert!(first.len() <= 64 && second.len() <= 64);
+        assert!(first.ends_with(".epub") && second.ends_with(".epub"));
+    }
+
+    /// Uploads permit a 59-byte stem while `/books/` leaves 52, so two legal
+    /// uploads can agree through the trim. The trimmed path is hashed for
+    /// both catalog identity and cache key, so letting them collide would
+    /// hand two books one cache.
+    #[test]
+    fn trimmed_paths_stay_distinct_for_distinct_names() {
+        let shared = "A".repeat(52);
+        let mut first = String::<64>::new();
+        let mut second = String::<64>::new();
+        catalog_display_path("/books/", &std::format!("{shared}1234567.epub"), &mut first);
+        catalog_display_path(
+            "/books/",
+            &std::format!("{shared}7654321.epub"),
+            &mut second,
+        );
+        assert_ne!(
+            first, second,
+            "names differing only past the trim must not share an identity"
+        );
+        assert!(first.len() <= 64 && second.len() <= 64);
+        assert!(first.ends_with(".epub") && second.ends_with(".epub"));
+
+        // A name that fits is untouched, so existing caches keep their keys.
+        let mut short = String::<64>::new();
+        catalog_display_path("/books/", "Novel.epub", &mut short);
+        assert_eq!(short.as_str(), "/books/Novel.epub");
+    }
+
+    /// Long upload names made this path load-bearing: display names are now
+    /// routinely multi-byte and long enough to trim, and a trim that lands
+    /// mid-character would put invalid UTF-8 in every catalog record.
+    #[test]
+    fn display_paths_trim_on_character_boundaries() {
+        let mut path = String::<64>::new();
+        let mut name = String::<128>::new();
+        for _ in 0..30 {
+            let _ = name.push('\u{1f600}');
+        }
+        let _ = name.push_str(".epub");
+        catalog_display_path("/books/", name.as_str(), &mut path);
+        assert!(path.len() <= 64);
+        assert!(core::str::from_utf8(path.as_bytes()).is_ok());
+
+        let mut path = String::<64>::new();
+        catalog_display_path("/books/", "M\u{e4}rchen.epub", &mut path);
+        assert_eq!(path.as_str(), "/books/M\u{e4}rchen.epub");
+    }
+
     extern crate std;
 
     use super::*;

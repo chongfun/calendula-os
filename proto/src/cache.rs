@@ -33,6 +33,10 @@ pub const CACHE_VERSION: u16 = 1;
 pub const CACHE_V2_VERSION: u16 = 26;
 const CACHE_V2_COMPAT_VERSION: u16 = 26;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
+/// The catalog snapshot, under the cache root. Named here because both the
+/// scan that writes it and the upload session that must prove it gone need
+/// to mean the same file.
+pub const CATALOG_FILE: &str = "CATALOG.BIN";
 pub const CACHE_DIR: &str = "CACHE";
 pub const CACHE_V2_DIR: &str = "CACHE2";
 pub const CACHE_SECTIONS_DIR: &str = "SECTIONS";
@@ -1829,6 +1833,7 @@ mod tests {
     #[test]
     fn artifact_names_and_cache_key_are_stable() {
         assert_eq!(CACHE_ROOT_DIR, "XTEINK");
+        assert_eq!(CATALOG_FILE, "CATALOG.BIN");
         assert_eq!(CACHE_DIR, "CACHE");
         assert_eq!(CACHE_V2_DIR, "CACHE2");
         assert_eq!(CACHE_SECTIONS_DIR, "SECTIONS");

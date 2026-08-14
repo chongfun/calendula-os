@@ -7,6 +7,7 @@
 //! compiles for the riscv32 firmware target and is excluded from the CI
 //! test job.
 
+use core::fmt::Write;
 use heapless::String;
 
 /// 8.3 names cap at twelve characters.
@@ -260,9 +261,295 @@ pub fn parse_identity_read<E>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// VFAT long names
+// ---------------------------------------------------------------------------
+//
+// Ported from upstream `7f9856d` ("Write wireless uploads as EPUB long
+// names"), alongside the driver fork that can create them. These supersede
+// `sanitized_name` for the wireless path: the long name is what the user
+// sees on a computer, and the 8.3 alias below exists only because FAT
+// requires every long-named file to have one.
+
+/// Longest long-name we build. Bounded rather than heap-allocated, like
+/// everything else on this path.
+pub const UPLOAD_FILENAME_BYTES: usize = 64;
+pub type UploadFilename = String<UPLOAD_FILENAME_BYTES>;
+pub type UploadShortName = String<12>;
+
+const EPUB_SUFFIX: &str = ".epub";
+const MAX_DECODED_BASENAME_BYTES: usize = 256;
+const FNV_OFFSET: u32 = 0x811C_9DC5;
+const FNV_PRIME: u32 = 0x0100_0193;
+
+/// Turn an **already percent-decoded** browser filename into a portable
+/// VFAT long name.
+///
+/// Path components and the supplied extension are discarded, FAT-invalid
+/// characters are replaced, and the result always ends in lowercase `.epub`.
+///
+/// Decoding is deliberately not done here. [`raw_query_name`] decodes the
+/// query value in place, and this project's upload path calls it first, so
+/// decoding again would consume a second round of escapes: a file genuinely
+/// named `Novel%2FPart.epub` arrives as `Novel%252FPart.epub`, decodes once
+/// to its real name, and a second pass would read that `%2F` as a path
+/// separator and truncate the name to `Part.epub`. One decoding boundary,
+/// and it is the caller's.
+pub fn wireless_epub_filename(client_name: &[u8]) -> UploadFilename {
+    let mut basename = [0u8; MAX_DECODED_BASENAME_BYTES];
+    let mut basename_len = 0;
+    for &byte in client_name {
+        if byte == b'/' || byte == b'\\' {
+            basename_len = 0;
+        } else if basename_len < basename.len() {
+            basename[basename_len] = byte;
+            basename_len += 1;
+        }
+    }
+
+    let decoded = match core::str::from_utf8(&basename[..basename_len]) {
+        Ok(text) => text,
+        Err(error) => core::str::from_utf8(&basename[..error.valid_up_to()]).unwrap_or(""),
+    };
+    let decoded = decoded.trim_matches(|ch| ch == ' ' || ch == '.');
+    let stem = decoded
+        .rfind('.')
+        .map(|extension_at| &decoded[..extension_at])
+        .unwrap_or(decoded)
+        .trim_matches(|ch| ch == ' ' || ch == '.');
+
+    let mut out = UploadFilename::new();
+    for ch in stem.chars() {
+        let ch = if ch.is_control()
+            || matches!(ch, '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|')
+        {
+            '_'
+        } else {
+            ch
+        };
+        if out.len() + ch.len_utf8() + EPUB_SUFFIX.len() > out.capacity() {
+            break;
+        }
+        let _ = out.push(ch);
+    }
+    while out.ends_with([' ', '.']) {
+        out.pop();
+    }
+    if out.is_empty() {
+        let _ = out.push_str("Book");
+    }
+    // Windows reserves these device names even with an extension, so a card
+    // holding `NUL.epub` cannot be manipulated normally there — and this
+    // helper promises a *portable* name. FAT itself permits them, and the
+    // driver's validator checks only characters and length, so the guard
+    // belongs here.
+    //
+    // The reservation attaches to the part before the *first* dot, so
+    // `NUL.txt` is reserved too and the guard has to look there rather than
+    // at the whole stem. The suffix that follows is kept: `NUL.txt` becomes
+    // `NUL_.txt`, not `NUL.txt_`.
+    let head_len = out.as_str().split('.').next().map_or(0, str::len);
+    if is_reserved_dos_name(&out[..head_len]) {
+        let mut guarded = UploadFilename::new();
+        let _ = guarded.push_str(&out[..head_len]);
+        let _ = guarded.push('_');
+        for ch in out[head_len..].chars() {
+            if guarded.len() + ch.len_utf8() + EPUB_SUFFIX.len() > guarded.capacity() {
+                break;
+            }
+            let _ = guarded.push(ch);
+        }
+        out = guarded;
+    }
+    let _ = out.push_str(EPUB_SUFFIX);
+    out
+}
+
+/// Whether a name component is a reserved DOS device name,
+/// case-insensitively. Compares by `char` rather than by byte because the
+/// port numbers may be superscripts, which are multi-byte.
+fn is_reserved_dos_name(component: &str) -> bool {
+    const BARE: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    const NUMBERED: [&str; 2] = ["COM", "LPT"];
+
+    if BARE.iter().any(|name| component.eq_ignore_ascii_case(name)) {
+        return true;
+    }
+    let mut chars = component.chars();
+    let (Some(a), Some(b), Some(c), Some(port)) =
+        (chars.next(), chars.next(), chars.next(), chars.next())
+    else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    // Windows recognizes the superscript forms of 1-3 here as well as the
+    // ASCII digits, so `COM\u{b9}` names the same device as `COM1`.
+    if !matches!(port, '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}') {
+        return false;
+    }
+    NUMBERED.iter().any(|name| {
+        let mut want = name.chars();
+        [a, b, c].iter().all(|ch| {
+            want.next()
+                .is_some_and(|expected| ch.eq_ignore_ascii_case(&expected))
+        })
+    })
+}
+
+/// Build a deterministic, legal 8.3 alias for a long upload filename.
+///
+/// FAT gives every long-named file a short alias, so one has to exist; it is
+/// never shown to the user. `probe` is incremented only when the alias is
+/// already occupied by another directory entry. The `.EPU` extension keeps
+/// the file openable by the ordinary catalog scan if its long-name records
+/// are ever damaged.
+pub fn upload_short_alias(long_name: &str, probe: u16) -> UploadShortName {
+    let mut hash = FNV_OFFSET;
+    for byte in long_name
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(probe.to_le_bytes())
+    {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    let mut out = UploadShortName::new();
+    write!(out, "{hash:08X}.EPU").expect("8.3 alias always fits");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_device_names_are_guarded_before_any_suffix() {
+        // The reservation attaches to the component before the first dot, so
+        // an inner suffix must be kept rather than swallowed.
+        assert_eq!(wireless_epub_filename(b"NUL.txt.epub"), "NUL_.txt.epub");
+        assert_eq!(
+            wireless_epub_filename("LPT\u{b3}.foo.epub".as_bytes()),
+            "LPT\u{b3}_.foo.epub"
+        );
+        // Superscript port numbers name the same devices on Windows.
+        assert_eq!(
+            wireless_epub_filename("COM\u{b9}.epub".as_bytes()),
+            "COM\u{b9}_.epub"
+        );
+    }
+
+    #[test]
+    fn reserved_dos_names_are_made_portable() {
+        // Reserved even with an extension on Windows.
+        assert_eq!(wireless_epub_filename(b"NUL.epub"), "NUL_.epub");
+        assert_eq!(wireless_epub_filename(b"con.epub"), "con_.epub");
+        assert_eq!(wireless_epub_filename(b"COM1.epub"), "COM1_.epub");
+        assert_eq!(wireless_epub_filename(b"lpt9.epub"), "lpt9_.epub");
+        // Not reserved: bare COM/LPT, a zero suffix, and ordinary names that
+        // merely start the same way.
+        assert_eq!(wireless_epub_filename(b"COM.epub"), "COM.epub");
+        assert_eq!(wireless_epub_filename(b"COM0.epub"), "COM0.epub");
+        assert_eq!(wireless_epub_filename(b"CON1.epub"), "CON1.epub");
+        assert_eq!(wireless_epub_filename(b"Contact.epub"), "Contact.epub");
+    }
+
+    /// Upstream `9b0123d` ("Preserve UTF-8 in catalog labels") fixed a
+    /// byte-wise stem prettifier that could split a multi-byte character.
+    /// This tree derives labels through a char-wise implementation already;
+    /// the test is ported so the property is pinned here rather than only
+    /// upstream, and so a future rewrite cannot quietly reintroduce it.
+    #[test]
+    fn catalog_labels_preserve_utf8() {
+        let mut label = String::<64>::new();
+        derive_catalog_label(
+            "/books/marigold_wireless_Caf\u{e9}_Test.epub",
+            "X.EPU",
+            &mut label,
+        );
+        assert_eq!(label, "Marigold Wireless Caf\u{e9} Test");
+
+        label.clear();
+        derive_catalog_label("/books/M\u{e4}rchen \u{1f600}.epub", "X.EPU", &mut label);
+        assert_eq!(label, "M\u{e4}rchen \u{1f600}");
+
+        // A stem long enough to hit the 64-byte cap mid-character must stop
+        // on a boundary, not split one.
+        label.clear();
+        let mut long_path = String::<256>::new();
+        let _ = long_path.push_str("/books/");
+        for _ in 0..40 {
+            let _ = long_path.push('\u{1f600}');
+        }
+        let _ = long_path.push_str(".epub");
+        derive_catalog_label(long_path.as_str(), "X.EPU", &mut label);
+        assert!(core::str::from_utf8(label.as_bytes()).is_ok());
+    }
+
+    /// The filename must be percent-decoded exactly once. `raw_query_name`
+    /// decodes in place, so a helper that decodes again turns a literal `%`
+    /// in a filename into a second round of escapes — and `%252F` into a
+    /// path separator that silently truncates the name.
+    #[test]
+    fn upload_filename_decodes_exactly_once() {
+        // `Novel%2FPart.epub` is the real filename; the browser escapes its
+        // percent sign, so the query carries `Novel%252FPart.epub`.
+        let mut path = *b"/upload?name=Novel%252FPart.epub";
+        let decoded = raw_query_name(&mut path).expect("query name");
+        assert_eq!(decoded, b"Novel%2FPart.epub");
+        assert_eq!(
+            wireless_epub_filename(decoded),
+            "Novel%2FPart.epub",
+            "a literal percent escape must not be decoded a second time"
+        );
+    }
+
+    #[test]
+    fn keeps_a_readable_epub_long_name() {
+        assert_eq!(
+            wireless_epub_filename(b"The Left Hand of Darkness.epub"),
+            "The Left Hand of Darkness.epub"
+        );
+        assert_eq!(
+            wireless_epub_filename("M\u{e4}rchen \u{1f600}.EPUB".as_bytes()),
+            "M\u{e4}rchen \u{1f600}.epub"
+        );
+    }
+
+    #[test]
+    fn removes_paths_and_sanitizes_fat_characters() {
+        assert_eq!(
+            wireless_epub_filename(b"../unsafe:book?.epub"),
+            "unsafe_book_.epub"
+        );
+        assert_eq!(
+            wireless_epub_filename(br"C:\fakepath\Novel.zip"),
+            "Novel.epub"
+        );
+        assert_eq!(wireless_epub_filename(b"..."), "Book.epub");
+    }
+
+    #[test]
+    fn truncates_on_a_utf8_boundary_and_keeps_the_suffix() {
+        let name = wireless_epub_filename(
+            "\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}.epub".as_bytes(),
+        );
+        assert!(name.len() <= UPLOAD_FILENAME_BYTES);
+        assert!(name.ends_with(EPUB_SUFFIX));
+        assert!(core::str::from_utf8(name.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn aliases_are_legal_deterministic_and_probeable() {
+        let first = upload_short_alias("A Book.epub", 0);
+        assert_eq!(first, upload_short_alias("A Book.epub", 0));
+        assert_ne!(first, upload_short_alias("A Book.epub", 1));
+        assert_eq!(first.len(), 12);
+        assert!(first.ends_with(".EPU"));
+        assert!(first[..8].bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn test_sanitized_name() {

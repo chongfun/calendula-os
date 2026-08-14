@@ -54,6 +54,14 @@ const IDENTITY: (u32, u32) = (0xABCD_1234, 4096);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DiskError;
 
+impl core::fmt::Display for DiskError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "injected disk error")
+    }
+}
+
+impl std::error::Error for DiskError {}
+
 /// Arms exactly-once faults: `fail_write_in = Some(n)` fails the (n+1)th
 /// subsequent write, then disarms. Exactly-once is the point — the cleanup
 /// paths under test issue their *own* I/O after the fault, and a sticky fault

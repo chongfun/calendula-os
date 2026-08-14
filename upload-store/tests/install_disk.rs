@@ -1,0 +1,1929 @@
+//! The install sequence against a real FAT filesystem.
+//!
+//! The planner is tested on its own in `install_plan.rs`; what is checked
+//! here is that each step does to the card what the planner believes it
+//! does, and that stopping anywhere in the sequence — as a power cut would —
+//! still leaves exactly one complete book on the shelf under the right name.
+
+use core::ops::ControlFlow;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use embedded_sdmmc::{
+    Block, BlockCount, BlockDevice, BlockIdx, Directory, LfnBuffer, Mode, TimeSource, Timestamp,
+    VolumeIdx, VolumeManager,
+};
+use heapless::String;
+use upload_store::install::{
+    self, recover_installs, InstallIntent, Located, Step, ROLLBACK_DIR, UPLOAD_DIR,
+};
+
+const BLOCK_BYTES: usize = 512;
+const DISK_BLOCKS: u32 = 32 * 1024;
+const PART_START_BLOCK: u32 = 64;
+
+struct RamDisk {
+    data: RefCell<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct DiskError;
+
+impl core::fmt::Display for DiskError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "injected disk error")
+    }
+}
+
+impl std::error::Error for DiskError {}
+
+/// Shared so a test can look at the image after handing the card to a volume
+/// manager, and put back what a half-finished move took away.
+#[derive(Clone)]
+struct SharedDisk(Rc<RamDisk>);
+
+impl SharedDisk {
+    fn image(&self) -> Vec<u8> {
+        self.0.data.borrow().clone()
+    }
+
+    /// Put back the directory entries a move marked deleted, leaving the
+    /// state a power cut between its two writes would: the destination
+    /// written, the source not yet taken away, one chain under both names.
+    ///
+    /// Only entries whose sole difference is the deletion mark are restored,
+    /// so this undoes an unlink and nothing else.
+    fn undo_unlinks(&self, before: &[u8]) {
+        let mut data = self.0.data.borrow_mut();
+        let mut restored = 0;
+        for at in (0..data.len().min(before.len())).step_by(32) {
+            let live_before = before[at] != 0xE5 && before[at] != 0x00;
+            if data[at] == 0xE5 && live_before && data[at + 1..at + 32] == before[at + 1..at + 32] {
+                data[at] = before[at];
+                restored += 1;
+            }
+        }
+        assert!(
+            restored > 0,
+            "no unlink to undo; the fixture proves nothing"
+        );
+    }
+}
+
+impl BlockDevice for SharedDisk {
+    type Error = DiskError;
+
+    fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), DiskError> {
+        self.0.read(blocks, start)
+    }
+
+    fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
+        self.0.write(blocks, start)
+    }
+
+    fn num_blocks(&self) -> Result<BlockCount, DiskError> {
+        self.0.num_blocks()
+    }
+}
+
+impl BlockDevice for RamDisk {
+    type Error = DiskError;
+
+    fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), DiskError> {
+        let data = self.data.borrow();
+        for (i, block) in blocks.iter_mut().enumerate() {
+            let at = (start.0 as usize + i) * BLOCK_BYTES;
+            block.copy_from_slice(&data[at..at + BLOCK_BYTES]);
+        }
+        Ok(())
+    }
+
+    fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
+        let mut data = self.data.borrow_mut();
+        for (i, block) in blocks.iter().enumerate() {
+            let at = (start.0 as usize + i) * BLOCK_BYTES;
+            data[at..at + BLOCK_BYTES].copy_from_slice(&block[..]);
+        }
+        Ok(())
+    }
+
+    fn num_blocks(&self) -> Result<BlockCount, DiskError> {
+        Ok(BlockCount(DISK_BLOCKS))
+    }
+}
+
+struct StaticTime;
+
+impl TimeSource for StaticTime {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+            year_since_1970: 56,
+            zero_indexed_month: 4,
+            zero_indexed_day: 19,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+
+type Mgr = VolumeManager<SharedDisk, StaticTime, 8, 8, 1>;
+type Dir<'a> = Directory<'a, SharedDisk, StaticTime, 8, 8, 1>;
+
+fn format_disk() -> Vec<u8> {
+    let mut disk = vec![0u8; DISK_BLOCKS as usize * BLOCK_BYTES];
+    let part_blocks = DISK_BLOCKS - PART_START_BLOCK;
+    let mut partition = vec![0u8; part_blocks as usize * BLOCK_BYTES];
+    fatfs::format_volume(
+        std::io::Cursor::new(partition.as_mut_slice()),
+        fatfs::FormatVolumeOptions::new().fat_type(fatfs::FatType::Fat16),
+    )
+    .expect("format");
+    disk[PART_START_BLOCK as usize * BLOCK_BYTES..].copy_from_slice(&partition);
+    let entry = 446;
+    disk[entry + 4] = 0x06;
+    disk[entry + 8..entry + 12].copy_from_slice(&PART_START_BLOCK.to_le_bytes());
+    disk[entry + 12..entry + 16].copy_from_slice(&part_blocks.to_le_bytes());
+    disk[510] = 0x55;
+    disk[511] = 0xAA;
+    disk
+}
+
+fn new_card() -> SharedDisk {
+    SharedDisk(Rc::new(RamDisk {
+        data: RefCell::new(format_disk()),
+    }))
+}
+
+fn open_mgr(disk: SharedDisk) -> Mgr {
+    VolumeManager::new_with_limits(disk, StaticTime, 5000)
+}
+
+fn open_dirs(mgr: &Mgr) -> (Dir<'_>, Dir<'_>) {
+    let volume = mgr.open_volume(VolumeIdx(0)).expect("volume");
+    let raw_volume = volume.to_raw_volume();
+    let raw_root = mgr.open_root_dir(raw_volume).expect("root");
+    let root = Directory::new(raw_root, mgr);
+    if root.open_dir("BOOKS").is_err() {
+        root.make_dir_in_dir("BOOKS").expect("make BOOKS");
+    }
+    let raw_root = mgr.open_root_dir(raw_volume).expect("reopen root");
+    let raw_books = mgr.open_dir(raw_root, "BOOKS").expect("open BOOKS");
+    mgr.close_dir(raw_root).expect("close spare root");
+    (root, Directory::new(raw_books, mgr))
+}
+
+fn short(text: &str) -> String<12> {
+    let mut name = String::new();
+    name.push_str(text).expect("fits");
+    name
+}
+
+fn long(text: &str) -> String<64> {
+    let mut name = String::new();
+    name.push_str(text).expect("fits");
+    name
+}
+
+const BOOK_NAME: &str = "Middlemarch.epub";
+
+/// Big enough to span several clusters. A single-cluster book hides the
+/// mistake this suite exists to catch: freeing its chain still leaves the
+/// first cluster readable, so a reclaim where an unlink was needed looks
+/// harmless until the day the book is longer than one cluster.
+const BODY_BYTES: usize = 40 * 1024;
+
+fn old_body() -> Vec<u8> {
+    (0..BODY_BYTES).map(|i| (i % 251) as u8).collect()
+}
+
+fn new_body() -> Vec<u8> {
+    (0..BODY_BYTES + 512).map(|i| (i % 241) as u8).collect()
+}
+
+fn intent(replacing: bool) -> InstallIntent {
+    InstallIntent {
+        // Chains are filled in by `prepare` once the files exist: they belong
+        // to the card, so a fixture cannot name them in advance.
+        stage: Located {
+            alias: short("TXN00001.TMP"),
+            chain: 0,
+        },
+        long_name: long(BOOK_NAME),
+        old: replacing.then(|| Located {
+            alias: short(""),
+            chain: 0,
+        }),
+        rollback: short("TXN00001.OLD"),
+    }
+}
+
+/// The 8.3 alias and chain of the entry holding `long_name` — what a record
+/// names its predecessor by.
+fn holder_of(books: &Dir<'_>, long_name: &str) -> Option<Located> {
+    let mut storage = [0u8; 256];
+    let mut lfn = LfnBuffer::new(&mut storage);
+    let mut found = None;
+    books
+        .iterate_dir_lfn(&mut lfn, |entry, name| {
+            if name == Some(long_name) {
+                found = Some(Located {
+                    alias: short(&entry.name.to_string()),
+                    chain: entry.cluster.value(),
+                });
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })
+        .expect("iterate");
+    found
+}
+
+/// The 8.3 alias the driver gave the entry holding `long_name`.
+fn alias_of(books: &Dir<'_>, long_name: &str) -> Option<String<12>> {
+    holder_of(books, long_name).map(|held| held.alias)
+}
+
+/// The book on the shelf under `long_name`.
+///
+/// Resolved to the alias first and opened by that, which is how the reader
+/// opens a book: the catalog stores the 8.3 name, and nothing outside these
+/// tests opens by long name. It also avoids `open_long_name_file_in_dir`,
+/// which the driver can fail to resolve for an entry its own iterator lists —
+/// see the note in `a_stranger_on_the_recycled_cluster_does_not_get_the_predecessor_freed`.
+fn body_named(books: &Dir<'_>, long_name: &str) -> Vec<u8> {
+    let alias = alias_of(books, long_name).expect("a book under that long name");
+    body(books, alias.as_str())
+}
+
+/// Lay down the starting state: a finished upload waiting in the scratch
+/// directory, and optionally the book it replaces already on the shelf.
+fn prepare(root: &Dir<'_>, books: &Dir<'_>, intent: &mut InstallIntent) {
+    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
+        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
+        root.open_dir("XTEINK").expect("open XTEINK")
+    });
+    for name in [UPLOAD_DIR, ROLLBACK_DIR] {
+        if xteink.open_dir(name).is_err() {
+            xteink.make_dir_in_dir(name).expect("make subdir");
+        }
+    }
+    let upload = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+
+    let staged = upload
+        .open_file_in_dir(intent.stage.alias.as_str(), Mode::ReadWriteCreate)
+        .expect("create scratch file");
+    staged.write(&new_body()).expect("stream");
+    staged.close().expect("close");
+    // After the close: an open file's entry still describes what it was.
+    intent.stage.chain = upload
+        .find_directory_entry(intent.stage.alias.as_str())
+        .expect("the scratch file")
+        .cluster
+        .value();
+
+    if intent.old.is_some() {
+        let existing = books
+            .create_file_in_dir_lfn(BOOK_NAME)
+            .expect("existing book");
+        existing.write(&old_body()).expect("write");
+        existing.close().expect("close");
+        intent.old = Some(holder_of(books, BOOK_NAME).expect("predecessor alias and chain"));
+    }
+
+    install::write_intent(root, intent).expect("journal the intent");
+}
+
+fn body(books: &Dir<'_>, name: &str) -> Vec<u8> {
+    let file = books
+        .open_file_in_dir(name, Mode::ReadOnly)
+        .expect("open book");
+    let mut out = vec![0u8; file.length() as usize];
+    file.read(&mut out).expect("read");
+    out
+}
+
+/// Every long name in `/BOOKS`, so a duplicate cannot hide behind an alias.
+fn shelf_long_names(books: &Dir<'_>) -> Vec<std::string::String> {
+    let mut storage = [0u8; 256];
+    let mut lfn = LfnBuffer::new(&mut storage);
+    let mut names = Vec::new();
+    books
+        .iterate_dir_lfn(&mut lfn, |entry, long| {
+            if entry.attributes.is_directory() || entry.attributes.is_volume() {
+                return ControlFlow::Continue(());
+            }
+            names.push(match long {
+                Some(text) if !text.is_empty() => text.to_string(),
+                _ => entry.name.to_string(),
+            });
+            ControlFlow::Continue(())
+        })
+        .expect("iterate");
+    names
+}
+
+/// Walk the install one step at a time, stopping after `stop_after` of them,
+/// then hand what is left to recovery. Whatever the cut point, the shelf must
+/// end up holding exactly one `Middlemarch.epub`, and it must be complete.
+fn install_interrupted_after(steps_taken: usize, replacing: bool) {
+    let disk = new_card();
+    let mut intent = intent(replacing);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+
+    let mut applied = 0;
+    while applied < steps_taken {
+        let presence = install::observe(&root, &books, &intent).expect("observe");
+        let step = install::plan(&intent, presence);
+        if step == Step::Done {
+            break;
+        }
+        install::apply_step(&root, &books, &intent, step).expect("step");
+        applied += 1;
+    }
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        outcome.complete,
+        "recovery after {steps_taken} step(s) did not finish"
+    );
+
+    let names = shelf_long_names(&books);
+    let holders = names.iter().filter(|n| n.as_str() == BOOK_NAME).count();
+    assert_eq!(
+        holders, 1,
+        "after stopping at step {steps_taken}, the shelf held {holders} copies of {BOOK_NAME} ({names:?})"
+    );
+
+    // The surviving copy must be the complete new edition. Recovery drives
+    // every cut point forward to the installed book; the case that ends in a
+    // restored predecessor is a lost upload, tested separately.
+    let installed = body_named(&books, BOOK_NAME);
+    assert_eq!(
+        installed,
+        new_body(),
+        "the surviving book was truncated or is the wrong edition"
+    );
+
+    // And nothing is left behind to confuse the next mount.
+    assert!(
+        install::read_intent(&root).expect("read journal") == install::IntentState::Absent,
+        "the journal must be clear once recovery completes"
+    );
+}
+
+#[test]
+fn a_first_install_survives_a_cut_at_every_step() {
+    for stop_after in 0..=4 {
+        install_interrupted_after(stop_after, false);
+    }
+}
+
+#[test]
+fn a_replacement_survives_a_cut_at_every_step() {
+    for stop_after in 0..=6 {
+        install_interrupted_after(stop_after, true);
+    }
+}
+
+/// Retiring the predecessor must park it whole. The move is the driver's now
+/// — it writes the new name and takes the old one away, unlinking the new one
+/// again if it cannot — so what is checked here is that the book arrives in
+/// rollback intact and that recovery carries on from there. The window where
+/// one chain briefly has two names is only reachable through a power cut
+/// inside that call, and the rule for it (unlink, never reclaim) is pinned by
+/// the planner tests.
+#[test]
+fn a_retired_predecessor_is_parked_whole() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    // Opened by the name it was parked under: the alias is the driver's.
+    let parked = rollback
+        .open_long_name_file_in_dir(intent.rollback.as_str(), Mode::ReadOnly)
+        .expect("parked copy");
+    assert_eq!(
+        parked.length() as usize,
+        BODY_BYTES,
+        "the parked copy must describe the same data, not an empty file"
+    );
+    parked.close().expect("close");
+    assert!(
+        alias_of(&books, BOOK_NAME).is_none(),
+        "the shelf gave the name up when the predecessor was parked"
+    );
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete);
+    assert!(outcome.touched_shelf, "the shelf did change");
+    assert_eq!(body_named(&books, BOOK_NAME), new_body());
+}
+
+/// An upload with no bytes has no cluster, and a record naming it would name
+/// every other empty file on the card equally well — starting with the book it
+/// is replacing, which recovery would then read as this upload already
+/// installed and unlink the scratch file over. Refused before anything is
+/// written down.
+#[test]
+fn an_upload_with_no_bytes_is_refused_before_a_record_exists() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    // The dangerous shape: an empty upload over an empty book of the same
+    // name, where neither has a chain to tell them apart.
+    let empty = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("an empty book");
+    empty.close().expect("close");
+
+    for name in [BOOK_NAME, "Nothing At All.epub"] {
+        let staged = StagedUpload::begin(&root, &books, name, None).expect("stage");
+        assert!(
+            matches!(
+                staged.install(&root, &books),
+                Err(install::InstallError::Empty)
+            ),
+            "an upload of {name} with no body must be refused, not journalled"
+        );
+        assert_eq!(
+            install::read_intent(&root).expect("journal"),
+            install::IntentState::Absent,
+            "a record here would refuse every later upload"
+        );
+        assert!(
+            scratch_files(&root).is_empty(),
+            "and the scratch file goes with it"
+        );
+    }
+
+    assert_eq!(
+        shelf_long_names(&books),
+        vec![BOOK_NAME.to_string()],
+        "the shelf is exactly as it was: one empty book, nothing added"
+    );
+    assert_eq!(body_named(&books, BOOK_NAME).len(), 0);
+
+    // The card is not wedged by the refusal.
+    upload(&root, &books, "Something Real.epub", &new_body()).expect("a real upload still works");
+    assert_eq!(shelf_long_names(&books).len(), 2);
+}
+
+/// A card managed from a computer can hold a zero-byte EPUB. Replacing one is
+/// refused rather than guessed at: it starts at cluster 0, which every other
+/// empty file also starts at, so a record naming it could not recognise it
+/// again — and both steps that act on the predecessor take a book off the
+/// shelf. Deleting it and retrying is the remedy, and one the device can do.
+#[test]
+fn a_replacement_for_an_empty_book_is_refused_rather_than_guessed() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let empty = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("an empty book");
+    empty.close().expect("close");
+    let alias = holder_of(&books, BOOK_NAME).expect("on the shelf");
+    assert_eq!(alias.chain, 0, "the fixture has to actually be empty");
+
+    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    staged.write(&new_body()).expect("stream");
+    assert!(
+        matches!(
+            staged.install(&root, &books),
+            Err(install::InstallError::Empty)
+        ),
+        "a predecessor with no chain must not be journalled"
+    );
+    assert_eq!(
+        install::read_intent(&root).expect("journal"),
+        install::IntentState::Absent,
+        "and no record is left to refuse later uploads"
+    );
+    assert!(scratch_files(&root).is_empty());
+    assert_eq!(body_named(&books, BOOK_NAME).len(), 0, "shelf untouched");
+
+    // The remedy, which the device can carry out itself: delete the empty
+    // book, then upload.
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&books, alias.alias.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    upload(&root, &books, BOOK_NAME, &new_body()).expect("now it lands");
+    assert_eq!(body_named(&books, BOOK_NAME), new_body());
+    assert_eq!(shelf_long_names(&books), vec![BOOK_NAME.to_string()]);
+}
+
+/// The move taking the scratch name away is load bearing. While that name
+/// stands the upload has not been installed; once it is gone it has. So a
+/// person deleting the newly installed book from a computer — ordinary, and
+/// the reason this branch gives books real filenames — reads as a lost
+/// install, and their old book goes back.
+///
+/// Publishing by *link* would keep the name and lose that signal: the same
+/// deletion would read as "not installed yet", the dangling entry would be
+/// linked in again, and the predecessor freed as obsolete. Both copies gone,
+/// from one ordinary act.
+#[test]
+fn a_book_deleted_from_a_computer_mid_transaction_gets_the_old_one_back() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+    install::apply_step(&root, &books, &intent, Step::InstallStage).expect("install");
+
+    // The card comes out and somebody deletes the book they can see, the
+    // ordinary way, which frees its chain.
+    let alias = alias_of(&books, BOOK_NAME).expect("the installed book");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&books, alias.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete, "a lost install is a settled transaction");
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        old_body(),
+        "the book the user had is the book the user gets back"
+    );
+    assert_eq!(shelf_long_names(&books), vec![BOOK_NAME.to_string()]);
+    assert!(scratch_files(&root).is_empty());
+}
+
+/// The same shape with the chain left allocated: the scratch entry is merely
+/// unlinked, so the stranger lands somewhere else and is foreign rather than
+/// unprovable. Either way the parked predecessor survives.
+#[test]
+fn a_lost_stage_does_not_make_a_stranger_look_like_the_installed_book() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    upload_dir
+        .delete_entry_in_dir(intent.stage.alias.as_str())
+        .expect("lose the upload");
+
+    let intruder = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("somebody else's book");
+    intruder.write(b"not either of ours").expect("write");
+    intruder.close().expect("close");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        !outcome.complete,
+        "the predecessor cannot go back under a name somebody else holds"
+    );
+    assert_eq!(body_named(&books, BOOK_NAME), b"not either of ours");
+    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let parked = rollback
+        .open_long_name_file_in_dir(intent.rollback.as_str(), Mode::ReadOnly)
+        .expect("the predecessor must still be parked, not reclaimed");
+    assert_eq!(parked.length() as usize, BODY_BYTES);
+    parked.close().expect("close");
+}
+
+/// The alias can be gone before recovery ever runs a step: the card comes out,
+/// the book being replaced is deleted from a computer, and a different one
+/// lands on the alias it gave up. Only the recorded chain can tell — the record
+/// names the predecessor by both, and here the name still resolves while the
+/// chain does not.
+#[test]
+fn a_book_that_took_the_alias_before_the_retire_is_not_retired_in_its_place() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+    let alias = intent.old.clone().expect("a predecessor").alias;
+
+    // The predecessor goes, and somebody else's book takes the name it left.
+    // Nothing of this transaction's has run yet.
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&books, alias.as_str()),
+        upload_store::RemoveStatus::Removed,
+        "the predecessor has to really be gone for the alias to be free"
+    );
+    let squatter = books
+        .open_file_in_dir(alias.as_str(), Mode::ReadWriteCreate)
+        .expect("a different book at the same alias");
+    squatter.write(b"a different book entirely").expect("write");
+    squatter.close().expect("close");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete);
+    assert_eq!(
+        body(&books, alias.as_str()),
+        b"a different book entirely",
+        "the book answering to the recorded alias was retired as though it were the predecessor"
+    );
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        new_body(),
+        "and the upload lands, since nothing holds its long name now"
+    );
+    assert!(scratch_files(&root).is_empty(), "with nothing left over");
+}
+
+/// Retiring the predecessor frees its alias, and the driver hands a free alias
+/// to the next file that needs one. So the recorded alias stops meaning "the
+/// predecessor" the moment the retire completes, and recovery must not treat
+/// whatever answers to it as a book of this transaction's to unlink.
+#[test]
+fn a_book_that_took_the_freed_alias_is_not_mistaken_for_the_predecessor() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+
+    // Park the predecessor, which gives its alias back to the directory.
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+    let freed = intent.old.clone().expect("a predecessor").alias;
+    assert!(
+        !shelf_long_names(&books).iter().any(|n| n == BOOK_NAME),
+        "the retire has to have completed, or the alias was never freed"
+    );
+
+    // Somebody else's book lands on it. Created under the bare alias so the
+    // collision is certain rather than a guess about what the driver derives.
+    let squatter = books
+        .open_file_in_dir(freed.as_str(), Mode::ReadWriteCreate)
+        .expect("a different book at the freed alias");
+    squatter.write(b"a different book entirely").expect("write");
+    squatter.close().expect("close");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete, "the install still has somewhere to go");
+    assert_eq!(
+        body(&books, freed.as_str()),
+        b"a different book entirely",
+        "the file at the freed alias was unlinked as though it were the predecessor"
+    );
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        new_body(),
+        "and the upload still installed under its own name"
+    );
+}
+
+/// The other half of the foreign-holder rule. With the predecessor parked, an
+/// install whose name has been taken has no exit: the upload cannot be
+/// installed, and the predecessor cannot go back under a name somebody else
+/// holds. Recovery has to keep saying so, because the record is the only thing
+/// keeping the sweep off the parked book.
+#[test]
+fn an_install_whose_name_was_taken_holds_on_to_the_parked_predecessor() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+
+    // The name the upload was going to take is taken by somebody else.
+    let intruder = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("somebody else's book");
+    intruder.write(b"not either of ours").expect("write");
+    intruder.close().expect("close");
+
+    for pass in 0..2 {
+        let outcome = recover_installs(&root, &books);
+        assert!(
+            !outcome.complete,
+            "pass {pass}: there is no way to finish, and saying otherwise clears the record"
+        );
+        assert!(outcome.had_intent);
+    }
+
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        b"not either of ours",
+        "the file holding the name must be left alone"
+    );
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let parked = rollback
+        .open_long_name_file_in_dir(intent.rollback.as_str(), Mode::ReadOnly)
+        .expect("the predecessor must still be parked, not swept");
+    assert_eq!(
+        parked.length() as usize,
+        BODY_BYTES,
+        "and parked whole, so resolving the collision can still put it back"
+    );
+    parked.close().expect("close");
+}
+
+/// [`InstallError::Malformed`] says retrying cannot help, so recovery must not
+/// keep asking: the same error on every mount, waited out, refuses every
+/// upload and delete for the life of the card.
+///
+/// Reaching it takes a card nothing here builds. A record with no predecessor
+/// still plans a predecessor step if `observe` reports one, and only a shelf
+/// entry sharing the parked copy's chain can — so the fixture links one, which
+/// is the shape a half-finished retire leaves.
+#[test]
+fn a_step_the_record_cannot_describe_settles_instead_of_wedging() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    // A first upload: nothing to replace, so the record names no predecessor.
+    let mut intent = intent(false);
+    prepare(&root, &books, &mut intent);
+
+    // One chain under two names, one of them parked under this record's
+    // rollback name and one holding the book's long name on the shelf.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let stray = rollback
+        .create_file_in_dir_lfn(intent.rollback.as_str())
+        .expect("a parked copy this record never made");
+    stray.write(&old_body()).expect("write");
+    stray.close().expect("close");
+    let parked_alias = alias_of(&rollback, intent.rollback.as_str()).expect("parked alias");
+    rollback
+        .link_file_in_dir_lfn(parked_alias.as_str(), &books, BOOK_NAME)
+        .expect("give that chain a name on the shelf too");
+
+    // Which is enough for the planner to ask for a step the record cannot do.
+    let presence = install::observe(&root, &books, &intent).expect("observe");
+    assert!(
+        presence.old,
+        "the fixture has to look like a standing old book"
+    );
+    assert!(matches!(
+        install::apply_step(&root, &books, &intent, install::plan(&intent, presence)),
+        Err(install::InstallError::Malformed)
+    ));
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        outcome.complete,
+        "an error that cannot resolve must not be retried forever"
+    );
+    assert!(outcome.had_intent, "and the catalog cannot be trusted");
+    assert_eq!(
+        install::read_intent(&root).expect("journal"),
+        install::IntentState::Absent,
+        "the record is let go, or the card refuses uploads for good"
+    );
+
+    // The book on the shelf keeps its data: the parked name shared its chain,
+    // so the sweep unlinks that name rather than freeing anything.
+    assert_eq!(body_named(&books, BOOK_NAME), old_body());
+
+    // And the card takes work again.
+    upload(&root, &books, "Something Else.epub", &new_body()).expect("a later upload");
+}
+
+/// A record *shorter* than one is never replayed. A record is written whole
+/// before the first mutation and truncated only after the last, so a short one
+/// belongs to a transaction that either had not started or had already
+/// finished. Recovery must move nothing. What it cannot do is call the card
+/// untouched: one of those two possibilities changed the shelf.
+///
+/// A whole record this build cannot read is the opposite case — it was
+/// written, so its transaction had started — and is kept rather than
+/// reclaimed. That is `a_record_from_another_build_is_kept_and_blocks_the_card`.
+#[test]
+fn a_torn_journal_changes_nothing() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+
+    // Corrupt the record in place.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let file = xteink
+        .open_file_in_dir(install::JOURNAL_FILE, Mode::ReadWriteTruncate)
+        .expect("open journal");
+    file.write(&[0x5A; 40]).expect("scribble");
+    file.close().expect("close");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        outcome.complete,
+        "there is nothing to replay, so recovery is settled"
+    );
+    assert!(
+        outcome.had_intent,
+        "a record was there, and it may have been the one a finished install \
+         was interrupted while clearing"
+    );
+    assert!(
+        !outcome.touched_shelf,
+        "nothing may be moved on the strength of a record that cannot be read"
+    );
+    assert_eq!(
+        install::read_intent(&root).expect("journal"),
+        install::IntentState::Absent,
+        "and it is reclaimed, or it would retire the catalog on every mount"
+    );
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        old_body(),
+        "no install may have happened"
+    );
+}
+
+/// Losing the upload after the predecessor has been unlinked is the state
+/// that makes the unlink-versus-reclaim rule bite. The predecessor's only
+/// remaining name is the parked one, so if unlinking had freed the chain the
+/// restored book would read back as rubble.
+#[test]
+fn a_predecessor_restored_after_a_lost_upload_is_still_whole() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+
+    // Retiring is one move: the predecessor is parked and off the shelf.
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+
+    // The scratch file goes missing before it was ever installed.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let upload = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    upload
+        .delete_entry_in_dir(intent.stage.alias.as_str())
+        .expect("lose the upload");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete, "recovery must resolve a lost upload");
+
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        old_body(),
+        "the book that was already on the shelf must come back intact"
+    );
+    let names = shelf_long_names(&books);
+    assert_eq!(
+        names.iter().filter(|n| n.as_str() == BOOK_NAME).count(),
+        1,
+        "exactly one copy, under its own name ({names:?})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The caller's path: stage, then install
+// ---------------------------------------------------------------------------
+
+use upload_store::install::StagedUpload;
+
+/// Whatever is sitting in the scratch directory.
+fn scratch_files(root: &Dir<'_>) -> Vec<std::string::String> {
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let mut left = Vec::new();
+    upload_dir
+        .iterate_dir(|entry| {
+            let name = entry.name.to_string();
+            if !entry.attributes.is_directory() && name != "." && name != ".." {
+                left.push(name);
+            }
+            ControlFlow::Continue(())
+        })
+        .expect("iterate");
+    left
+}
+
+fn upload(root: &Dir<'_>, books: &Dir<'_>, name: &str, body: &[u8]) -> Option<String<12>> {
+    let staged = StagedUpload::begin(root, books, name, None).expect("stage");
+    staged.write(body).expect("stream");
+    staged.install(root, books).expect("install")
+}
+
+#[test]
+fn an_upload_lands_under_its_long_name() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let alias = upload(&root, &books, BOOK_NAME, &new_body()).expect("install");
+
+    assert_eq!(body(&books, alias.as_str()), new_body());
+    assert_eq!(
+        shelf_long_names(&books),
+        vec![BOOK_NAME.to_string()],
+        "the shelf shows the book under the name the user gave it"
+    );
+    assert!(
+        install::read_intent(&root).expect("journal") == install::IntentState::Absent,
+        "a finished install leaves no journal"
+    );
+}
+
+#[test]
+fn uploading_the_same_name_again_replaces_the_book() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    upload(&root, &books, BOOK_NAME, &old_body()).expect("first");
+    let alias = upload(&root, &books, BOOK_NAME, &new_body()).expect("second");
+
+    assert_eq!(
+        body(&books, alias.as_str()),
+        new_body(),
+        "the second upload is what the shelf serves"
+    );
+    assert_eq!(
+        shelf_long_names(&books)
+            .iter()
+            .filter(|n| n.as_str() == BOOK_NAME)
+            .count(),
+        1,
+        "a folder must not end up with two files of one name"
+    );
+}
+
+/// Case is not a new book. FAT compares long names case-insensitively, and a
+/// computer would refuse the second file, so the upload has to replace rather
+/// than add.
+#[test]
+fn a_case_variant_replaces_rather_than_duplicates() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    upload(&root, &books, "Middlemarch.epub", &old_body()).expect("first");
+    let alias = upload(&root, &books, "MIDDLEMARCH.EPUB", &new_body()).expect("second");
+
+    let names = shelf_long_names(&books);
+    assert_eq!(names.len(), 1, "one book, not two ({names:?})");
+    assert_eq!(
+        body(&books, alias.as_str()),
+        new_body(),
+        "the case variant must replace the book, not be discarded by it"
+    );
+}
+
+#[test]
+fn an_abandoned_upload_leaves_the_shelf_exactly_as_it_was() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let alias = upload(&root, &books, BOOK_NAME, &old_body()).expect("first");
+
+    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    staged.write(b"half a book").expect("stream");
+    staged.abandon(&root);
+
+    assert_eq!(
+        body(&books, alias.as_str()),
+        old_body(),
+        "the book already on the shelf is untouched"
+    );
+    assert_eq!(shelf_long_names(&books), vec![BOOK_NAME.to_string()]);
+
+    // And the scratch space is clear, so the next upload starts empty.
+    assert!(
+        scratch_files(&root).is_empty(),
+        "scratch left behind: {:?}",
+        scratch_files(&root)
+    );
+}
+
+/// A book that never finished streaming is never published, so a mount that
+/// happens before the install has nothing to clean out of the library.
+#[test]
+fn an_upload_interrupted_mid_stream_never_reaches_the_shelf() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    staged.write(b"the first few chapters").expect("stream");
+    drop(staged);
+    assert!(
+        !scratch_files(&root).is_empty(),
+        "the half-written file should still be in scratch before recovery"
+    );
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete);
+    assert!(!outcome.touched_shelf);
+    assert!(
+        shelf_long_names(&books).is_empty(),
+        "an upload that was never installed must leave the shelf empty"
+    );
+    // A book nobody uploads again would otherwise keep its scratch forever.
+    assert!(
+        scratch_files(&root).is_empty(),
+        "recovery must reclaim scratch no transaction is using: {:?}",
+        scratch_files(&root)
+    );
+}
+
+/// Two books whose names collide on the 8.3 alias are still two books.
+#[test]
+fn books_that_share_an_alias_both_survive() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let first = upload(&root, &books, "A Very Long Title Indeed.epub", &old_body()).expect("first");
+    let second = upload(
+        &root,
+        &books,
+        "A Very Long Title Indeed II.epub",
+        &new_body(),
+    )
+    .expect("second");
+
+    assert_ne!(first, second, "each book needs its own alias");
+    assert_eq!(body(&books, first.as_str()), old_body());
+    assert_eq!(body(&books, second.as_str()), new_body());
+    assert_eq!(shelf_long_names(&books).len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// One journal, one owner
+// ---------------------------------------------------------------------------
+
+fn journal_bytes(root: &Dir<'_>) -> Vec<u8> {
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let file = xteink
+        .open_file_in_dir(install::JOURNAL_FILE, Mode::ReadOnly)
+        .expect("journal present");
+    let mut out = vec![0u8; file.length() as usize];
+    file.read(&mut out).expect("read journal");
+    out
+}
+
+/// A record in flight owns the names it describes. A second transaction
+/// starting alongside it would take the scratch and alias names it is
+/// counting on, and writing a second record would destroy the only
+/// description of where the first one's files went — leaving a predecessor
+/// parked in rollback under a name nothing is looking for.
+#[test]
+fn a_second_upload_cannot_displace_an_unfinished_one() {
+    // Stop transaction A at each point where its record is still owed work.
+    for stop_after in 1..=3 {
+        let disk = new_card();
+        let mut intent_a = intent(true);
+        let mgr = open_mgr(disk);
+        let (root, books) = open_dirs(&mgr);
+        prepare(&root, &books, &mut intent_a);
+
+        for _ in 0..stop_after {
+            let presence = install::observe(&root, &books, &intent_a).expect("observe");
+            let step = install::plan(&intent_a, presence);
+            if step == Step::Done {
+                break;
+            }
+            install::apply_step(&root, &books, &intent_a, step).expect("step");
+        }
+        let before = journal_bytes(&root);
+
+        // B tries to start while A's record still stands.
+        let refused = StagedUpload::begin(&root, &books, "Another Book.epub", None);
+        assert!(
+            matches!(refused, Err(install::InstallError::Busy)),
+            "a second upload must be refused while a record is in flight (stopped after {stop_after})"
+        );
+
+        // And writing B's record directly must not overwrite A's.
+        let intent_b = InstallIntent {
+            stage: Located {
+                alias: short("TXN00002.TMP"),
+                chain: 77,
+            },
+            long_name: long("Another Book.epub"),
+            old: None,
+            rollback: short("TXN00002.OLD"),
+        };
+        assert!(
+            matches!(
+                install::write_intent(&root, &intent_b),
+                Err(install::InstallError::Busy)
+            ),
+            "a record may not be replaced while it is owed work"
+        );
+        assert_eq!(
+            journal_bytes(&root),
+            before,
+            "A's record must survive byte for byte (stopped after {stop_after})"
+        );
+
+        // A still finishes, which is the point of protecting its record.
+        let outcome = recover_installs(&root, &books);
+        assert!(outcome.complete, "A must still be finishable");
+        assert_eq!(body_named(&books, BOOK_NAME), new_body());
+    }
+}
+
+/// Once a record is cleared the card is free again.
+#[test]
+fn a_finished_transaction_releases_the_card() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    upload(&root, &books, BOOK_NAME, &old_body()).expect("first");
+    upload(&root, &books, "Another Book.epub", &new_body()).expect("second");
+
+    assert_eq!(shelf_long_names(&books).len(), 2);
+}
+
+/// The shelf can stop matching the catalog *before* a reset, leaving recovery
+/// with nothing to change in `/BOOKS` and a cached catalog that describes an
+/// alias no longer on the card. The record's existence is what says the
+/// catalog is stale — not what this pass had left to do.
+#[test]
+fn a_record_left_by_an_installed_book_still_invalidates_the_catalog() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+
+    // Walk right up to the last step: the book is installed under its new
+    // alias, the predecessor is gone from /BOOKS, and only the rollback copy
+    // is left to reclaim.
+    for step in [Step::RetireOldHolder, Step::InstallStage] {
+        install::apply_step(&root, &books, &intent, step).expect("step");
+    }
+    let presence = install::observe(&root, &books, &intent).expect("observe");
+    assert_eq!(
+        install::plan(&intent, presence),
+        Step::ReclaimRollback,
+        "only the rollback copy should be left"
+    );
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete);
+    assert!(
+        !outcome.touched_shelf,
+        "this pass really does leave /BOOKS alone -- which is the trap"
+    );
+    assert!(
+        outcome.had_intent,
+        "a catalog read before this recovery cannot be trusted: /BOOKS moved \
+         from the old alias to the new one before the reset"
+    );
+}
+
+/// A book uploaded before long names existed is an 8.3 alias with a `.TXT`
+/// label and a `.ID` identity sidecar, and no long name at all. Re-uploading
+/// it must replace it: matching on the long name alone finds nothing, and the
+/// user ends up with the same book twice.
+#[test]
+fn re_uploading_a_book_from_before_long_names_replaces_it() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    // Lay down the old shape by hand: alias, label, identity, no LFN.
+    let client_name = b"Middlemarch.epub";
+    let legacy_alias = proto::upload::sanitized_name(client_name);
+    let identity = proto::upload::hash_identity(client_name);
+    let legacy = books
+        .open_file_in_dir(legacy_alias.as_str(), Mode::ReadWriteCreate)
+        .expect("legacy book");
+    legacy.write(&old_body()).expect("write");
+    legacy.close().expect("close");
+    write_legacy_sidecars(&root, legacy_alias.as_str(), identity, BOOK_NAME);
+
+    let key = upload_store::install::LegacyKey {
+        alias: short(legacy_alias.as_str()),
+        identity,
+    };
+    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, Some(key)).expect("stage");
+    staged.write(&new_body()).expect("stream");
+    let alias = staged
+        .install(&root, &books)
+        .expect("install")
+        .expect("the book landed");
+
+    assert_ne!(
+        alias.as_str(),
+        legacy_alias.as_str(),
+        "the new copy gets its own alias"
+    );
+    assert_eq!(body(&books, alias.as_str()), new_body());
+    assert_eq!(
+        shelf_long_names(&books),
+        vec![BOOK_NAME.to_string()],
+        "one book on the shelf, under its long name"
+    );
+    assert!(
+        books.find_directory_entry(legacy_alias.as_str()).is_err(),
+        "the book it replaced must be gone, not left beside it"
+    );
+    assert_eq!(
+        upload_store::read_upload_identity(&root, legacy_alias.as_str()),
+        Ok(None),
+        "the retired book's identity sidecar describes nothing now"
+    );
+}
+
+/// A different book that happens to sit in the same probe window is not the
+/// book being replaced — which is what the identity sidecar is for, since two
+/// books can share a truncated label.
+#[test]
+fn a_legacy_book_with_another_identity_is_left_alone() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let client_name = b"Middlemarch.epub";
+    let legacy_alias = proto::upload::sanitized_name(client_name);
+    let stranger = books
+        .open_file_in_dir(legacy_alias.as_str(), Mode::ReadWriteCreate)
+        .expect("stranger");
+    stranger.write(&old_body()).expect("write");
+    stranger.close().expect("close");
+    write_legacy_sidecars(
+        &root,
+        legacy_alias.as_str(),
+        proto::upload::hash_identity(b"A Different Book.epub"),
+        "A Different Book.epub",
+    );
+
+    let key = upload_store::install::LegacyKey {
+        alias: short(legacy_alias.as_str()),
+        identity: proto::upload::hash_identity(client_name),
+    };
+    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, Some(key)).expect("stage");
+    staged.write(&new_body()).expect("stream");
+    let alias = staged
+        .install(&root, &books)
+        .expect("install")
+        .expect("the book landed");
+
+    assert_eq!(body(&books, alias.as_str()), new_body());
+    assert_eq!(
+        body(&books, legacy_alias.as_str()),
+        old_body(),
+        "someone else's book must survive an upload that is not theirs"
+    );
+}
+
+fn write_legacy_sidecars(root: &Dir<'_>, alias: &str, identity: u64, label: &str) {
+    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
+        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
+        root.open_dir("XTEINK").expect("open XTEINK")
+    });
+    if xteink.open_dir("LABELS").is_err() {
+        xteink.make_dir_in_dir("LABELS").expect("make LABELS");
+    }
+    let labels = xteink.open_dir("LABELS").expect("labels");
+    let stem = alias.split('.').next().expect("stem");
+
+    let mut id_name = std::string::String::from(stem);
+    id_name.push_str(".ID");
+    let file = labels
+        .open_file_in_dir(id_name.as_str(), Mode::ReadWriteCreate)
+        .expect("identity sidecar");
+    file.write(&identity.to_le_bytes()).expect("write identity");
+    file.close().expect("close");
+
+    let mut txt_name = std::string::String::from(stem);
+    txt_name.push_str(".TXT");
+    let file = labels
+        .open_file_in_dir(txt_name.as_str(), Mode::ReadWriteCreate)
+        .expect("label sidecar");
+    file.write(label.as_bytes()).expect("write label");
+    file.close().expect("close");
+}
+
+/// Clearing leftovers is housekeeping, not part of the transaction. Those
+/// files sit outside `/BOOKS` and no catalog or reader can see them, so a
+/// failure to delete one must not turn a committed upload into a failed one
+/// — nor, through `complete`, stop the library being scanned.
+#[test]
+fn a_leftover_that_will_not_delete_does_not_fail_the_install() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    // A stray scratch file from some earlier upload, held open so the sweep
+    // cannot reclaim it.
+    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
+        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
+        root.open_dir("XTEINK").expect("open XTEINK")
+    });
+    if xteink.open_dir(UPLOAD_DIR).is_err() {
+        xteink.make_dir_in_dir(UPLOAD_DIR).expect("make UPLOAD");
+    }
+    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let stray = upload_dir
+        .open_file_in_dir("STRAY001.TMP", Mode::ReadWriteCreate)
+        .expect("stray");
+    stray.write(b"orphaned").expect("write");
+
+    let alias = upload(&root, &books, BOOK_NAME, &new_body())
+        .expect("a book must still install with a leftover in the way");
+    assert_eq!(body(&books, alias.as_str()), new_body());
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        outcome.complete,
+        "no journal is outstanding, so the transaction state is settled"
+    );
+    assert!(
+        !outcome.swept,
+        "the stray really is undeletable here, or this proves nothing"
+    );
+
+    // Once it is closed, the next pass tidies it away.
+    stray.close().expect("close");
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete && outcome.swept);
+    assert!(scratch_files(&root).is_empty());
+}
+
+/// The sweep takes a bounded number of files per pass, and `swept` is the only
+/// signal that any are left. Stopping at the quota has to read the same as
+/// failing to delete one, or the "could not clear every leftover" line goes
+/// quiet on the card with the most to clear.
+#[test]
+fn a_sweep_that_runs_out_of_quota_says_leftovers_remain() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    // More than one pass takes. If the quota is ever raised past this, the
+    // first assertion below is what says so.
+    const LEFTOVERS: usize = 9;
+    root.make_dir_in_dir("XTEINK").expect("make XTEINK");
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    xteink.make_dir_in_dir(UPLOAD_DIR).expect("make UPLOAD");
+    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    for index in 0..LEFTOVERS {
+        let mut name = std::string::String::from("LEFT000");
+        name.push(char::from_digit(index as u32, 10).expect("digit"));
+        name.push_str(".TMP");
+        let stray = upload_dir
+            .open_file_in_dir(name.as_str(), Mode::ReadWriteCreate)
+            .expect("stray");
+        stray.write(b"an upload nobody finished").expect("write");
+        stray.close().expect("close");
+    }
+
+    let first = recover_installs(&root, &books);
+    assert!(
+        first.complete,
+        "leftovers are housekeeping; they cannot fail the transaction"
+    );
+    assert!(
+        !first.swept,
+        "the pass stopped at its quota with files still there, and said it was done"
+    );
+    let left = scratch_files(&root).len();
+    assert!(
+        left > 0 && left < LEFTOVERS,
+        "the pass should have taken some but not all, and left {left}"
+    );
+
+    // The rest go on the next mount, and only then is the sweep finished.
+    let second = recover_installs(&root, &books);
+    assert!(
+        second.swept,
+        "nothing is left, so nothing is left to report"
+    );
+    assert!(scratch_files(&root).is_empty());
+}
+
+/// A restore cut between its two writes leaves the predecessor back on the
+/// shelf while the parked copy still stands — one chain under both names.
+/// Recovery has to see that shelf entry *as* the predecessor, and the alias
+/// cannot tell it: the driver derived a fresh one for the long name, and a
+/// book stored before long names had one of the old uploader's, which nothing
+/// hands back. Reading it as "no predecessor" sends recovery round to restore
+/// again, which fails on a long name already taken, forever.
+#[test]
+fn a_restore_cut_half_way_through_is_finished_not_repeated() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+
+    // A book from before long names: 8.3 alias, sidecars, no LFN at all.
+    let client_name = b"Middlemarch.epub";
+    let legacy_alias = proto::upload::sanitized_name(client_name);
+    let identity = proto::upload::hash_identity(client_name);
+    let legacy = books
+        .open_file_in_dir(legacy_alias.as_str(), Mode::ReadWriteCreate)
+        .expect("legacy book");
+    legacy.write(&old_body()).expect("write");
+    legacy.close().expect("close");
+    write_legacy_sidecars(&root, legacy_alias.as_str(), identity, BOOK_NAME);
+
+    let mut intent = InstallIntent {
+        stage: Located {
+            alias: short("TXN00001.TMP"),
+            chain: 0,
+        },
+        long_name: long(BOOK_NAME),
+        old: Some(Located {
+            alias: short(legacy_alias.as_str()),
+            chain: books
+                .find_directory_entry(legacy_alias.as_str())
+                .expect("the legacy book")
+                .cluster
+                .value(),
+        }),
+        rollback: short("TXN00001.OLD"),
+    };
+    prepare_scratch(&root, &mut intent);
+    install::write_intent(&root, &intent).expect("journal");
+
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+
+    // The upload is lost, so the transaction has to walk backwards.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let upload_dir = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    upload_dir
+        .delete_entry_in_dir(intent.stage.alias.as_str())
+        .expect("lose the upload");
+
+    let presence = install::observe(&root, &books, &intent).expect("observe");
+    assert_eq!(install::plan(&intent, presence), Step::RestoreOldHolder);
+
+    // Cut power inside the restore: the shelf entry is written, the parked
+    // one is not yet taken away.
+    let before = disk.image();
+    install::apply_step(&root, &books, &intent, Step::RestoreOldHolder).expect("restore");
+    disk.undo_unlinks(&before);
+
+    let presence = install::observe(&root, &books, &intent).expect("observe");
+    assert!(
+        presence.old,
+        "the shelf entry carries the parked copy's chain, so it is the \
+         predecessor whatever it is called: {presence:?}"
+    );
+    assert!(presence.rollback && !presence.stage && !presence.dest);
+    assert_eq!(
+        install::plan(&intent, presence),
+        Step::UnlinkRollbackCopy,
+        "the parked name is the one to drop, and only the name"
+    );
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete, "recovery must finish, not go round again");
+    assert!(
+        install::read_intent(&root).expect("journal") == install::IntentState::Absent,
+        "the record must be cleared"
+    );
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        old_body(),
+        "the predecessor must be back, whole"
+    );
+    assert_eq!(shelf_long_names(&books).len(), 1, "exactly one book");
+}
+
+/// Just the scratch file, for fixtures that build their own intent.
+fn prepare_scratch(root: &Dir<'_>, intent: &mut InstallIntent) {
+    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
+        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
+        root.open_dir("XTEINK").expect("open XTEINK")
+    });
+    for name in [UPLOAD_DIR, ROLLBACK_DIR] {
+        if xteink.open_dir(name).is_err() {
+            xteink.make_dir_in_dir(name).expect("make subdir");
+        }
+    }
+    let upload = xteink.open_dir(UPLOAD_DIR).expect("upload dir");
+    let staged = upload
+        .open_file_in_dir(intent.stage.alias.as_str(), Mode::ReadWriteCreate)
+        .expect("scratch file");
+    staged.write(&new_body()).expect("stream");
+    staged.close().expect("close");
+    intent.stage.chain = upload
+        .find_directory_entry(intent.stage.alias.as_str())
+        .expect("the scratch file")
+        .cluster
+        .value();
+}
+
+/// Clearing the journal truncates it before unlinking it, so a cut in between
+/// leaves a zero-length record behind — after the shelf has already changed.
+/// Reading that as "no record" is how a catalog naming the old alias survives
+/// a replacement.
+#[test]
+fn a_journal_cut_while_being_cleared_still_retires_the_catalog() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    upload(&root, &books, BOOK_NAME, &old_body()).expect("first");
+    upload(&root, &books, BOOK_NAME, &new_body()).expect("replacement");
+
+    // Reproduce the first half of clearing: the record is truncated, its
+    // directory entry is not yet gone.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    xteink
+        .open_file_in_dir(install::JOURNAL_FILE, Mode::ReadWriteCreate)
+        .expect("recreate journal")
+        .close()
+        .expect("close");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        outcome.complete,
+        "an install that reached Done has nothing left to replay"
+    );
+    assert!(
+        outcome.had_intent,
+        "a record was on the card, and the shelf moved before it was cleared"
+    );
+    assert_eq!(
+        install::read_intent(&root).expect("journal"),
+        install::IntentState::Absent,
+        "the leftover record is reclaimed, not carried forever"
+    );
+    assert_eq!(body_named(&books, BOOK_NAME), new_body());
+}
+
+/// A parked copy can still share its chain with a book on the shelf — what a
+/// move cut half way through leaves. If its record was lost too, the sweep is
+/// what finds it, and reclaiming there would free the clusters the shelf copy
+/// reads from.
+#[test]
+fn the_sweep_never_frees_a_chain_the_shelf_is_reading() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+
+    // Park the predecessor, then undo the unlink half: the shelf entry and
+    // the parked copy now name one chain.
+    let before = disk.image();
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+    disk.undo_unlinks(&before);
+
+    // And the record goes missing, so nothing above the sweep will tidy it.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    xteink
+        .delete_entry_in_dir(install::JOURNAL_FILE)
+        .expect("lose the record");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete, "no record, nothing to replay");
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        old_body(),
+        "the book the shelf is holding must survive the sweep intact"
+    );
+
+    // The parked name is gone either way; only the chain was spared.
+    let rollback = xteink.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let mut parked = Vec::new();
+    rollback
+        .iterate_dir(|entry| {
+            let name = entry.name.to_string();
+            if !entry.attributes.is_directory() && name != "." && name != ".." {
+                parked.push(name);
+            }
+            ControlFlow::Continue(())
+        })
+        .expect("iterate");
+    assert!(
+        parked.is_empty(),
+        "the parked name was not cleared: {parked:?}"
+    );
+
+    // Once nothing on the shelf shares it, an ordinary leftover is reclaimed.
+    assert!(
+        outcome.swept,
+        "the sweep reported a failure it did not have"
+    );
+}
+
+/// The mirror of the rollback case: an install move cut half way leaves the
+/// scratch file and the shelf entry naming one chain. If the record is lost
+/// too, the sweep is what finds the scratch file — and reclaiming it would
+/// free the clusters the book on the shelf is reading from.
+#[test]
+fn the_sweep_never_frees_a_chain_a_just_installed_book_is_reading() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+
+    let mut intent = intent(false);
+    prepare(&root, &books, &mut intent);
+
+    // Publish the book, then undo the unlink half of the move.
+    let before = disk.image();
+    install::apply_step(&root, &books, &intent, Step::InstallStage).expect("install");
+    disk.undo_unlinks(&before);
+    assert!(
+        !scratch_files(&root).is_empty(),
+        "the scratch name must be back for this to test anything"
+    );
+
+    // And the record goes missing, so only the sweep is left.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    xteink
+        .delete_entry_in_dir(install::JOURNAL_FILE)
+        .expect("lose the record");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete, "no record, nothing to replay");
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        new_body(),
+        "the installed book must survive the sweep intact"
+    );
+    assert!(
+        scratch_files(&root).is_empty(),
+        "the scratch name is still cleared; only the chain is spared"
+    );
+}
+
+/// The card is browsable from a computer now, so the name an upload is about
+/// to take can be taken by somebody else while it is in flight. That file is
+/// not this transaction's to move aside, and the install can never happen —
+/// but refusing forever would leave the card taking no uploads and no deletes
+/// for as long as the file stayed there.
+#[test]
+fn an_upload_gives_up_when_something_else_took_its_name() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    // An upload finished and journalled, with no book to replace.
+    let mut intent = intent(false);
+    prepare(&root, &books, &mut intent);
+
+    // Then the name is taken, by a file on neither of this transaction's
+    // chains.
+    let intruder = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("somebody else's book");
+    intruder.write(&old_body()).expect("write");
+    intruder.close().expect("close");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete, "the card must settle, not refuse forever");
+    assert!(
+        outcome.had_intent,
+        "a record was in flight, so a cached catalog cannot be trusted"
+    );
+    assert!(
+        !outcome.touched_shelf,
+        "giving up must not have moved anything in /BOOKS"
+    );
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        old_body(),
+        "the file that holds the name must be left exactly as it was"
+    );
+    assert_eq!(
+        shelf_long_names(&books),
+        vec![BOOK_NAME.to_string()],
+        "and it must be the only thing on the shelf"
+    );
+    assert!(
+        scratch_files(&root).is_empty(),
+        "the abandoned upload is reclaimed by the sweep, not leaked"
+    );
+
+    // A second pass has nothing left to say, so the catalog it rebuilt stands.
+    let again = recover_installs(&root, &books);
+    assert!(again.complete);
+    assert!(
+        !again.had_intent,
+        "the record is gone, so this must stop retiring the catalog"
+    );
+
+    // And the card takes uploads again: this time the file holding the name is
+    // seen up front and replaced properly.
+    upload(&root, &books, BOOK_NAME, &new_body()).expect("upload again");
+    assert_eq!(shelf_long_names(&books), vec![BOOK_NAME.to_string()]);
+    assert_eq!(body_named(&books, BOOK_NAME), new_body());
+}
+
+/// A whole record this build cannot read is not a torn one. It was written
+/// before the transaction touched anything, so its transaction had started —
+/// and if it came from a build with a newer format, the work it describes is
+/// in a shape this one cannot see. Erasing it would destroy the only account
+/// of where a book went.
+#[test]
+fn a_record_from_another_build_is_kept_and_blocks_the_card() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    upload(&root, &books, BOOK_NAME, &old_body()).expect("a book to protect");
+
+    // A full-size record with a version this build does not know.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let file = xteink
+        .open_file_in_dir(install::JOURNAL_FILE, Mode::ReadWriteCreate)
+        .expect("journal");
+    // Built by the encoder, so the header is whatever this build writes, and
+    // then aged: only the version is changed. A magic spelled out here would
+    // stop matching if the header ever changed, and the record would be
+    // rejected for that instead -- still Unrecognized, so the test would keep
+    // passing while no longer reaching the version check at all.
+    let mut record = InstallIntent {
+        stage: Located {
+            alias: short("TXN00009.TMP"),
+            chain: 33,
+        },
+        long_name: long("From A Later Build.epub"),
+        old: None,
+        rollback: short("TXN00009.OLD"),
+    }
+    .encode();
+    let unknown_version = 0xFFFFu16;
+    record[4..6].copy_from_slice(&unknown_version.to_le_bytes());
+    file.write(&record).expect("write");
+    file.close().expect("close");
+
+    assert_eq!(
+        install::read_intent(&root).expect("journal"),
+        install::IntentState::Unrecognized
+    );
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        !outcome.complete,
+        "a record this build cannot read is not a settled card"
+    );
+    assert!(outcome.had_intent, "and the catalog cannot be trusted");
+    assert_eq!(
+        install::read_intent(&root).expect("journal"),
+        install::IntentState::Unrecognized,
+        "the record must be preserved, not reclaimed"
+    );
+
+    // Nothing may write while it stands.
+    assert!(matches!(
+        StagedUpload::begin(&root, &books, "Another Book.epub", None),
+        Err(install::InstallError::Busy)
+    ));
+    assert_eq!(body_named(&books, BOOK_NAME), old_body());
+}
+
+/// The sweep is best-effort by design, so it cannot be the only thing
+/// standing between a half-finished install and the next upload. If it could
+/// not clear the scratch name — a transient card error is enough — the next
+/// upload of a book deriving that same name finds it still there, and
+/// reclaiming it would free the clusters of the book already on the shelf.
+#[test]
+fn staging_over_a_leftover_never_frees_a_chain_the_shelf_is_reading() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+
+    // The scratch name has to be the one a later upload of this book will
+    // derive, or nothing would collide and this would prove nothing.
+    let derived = proto::upload::upload_short_alias(BOOK_NAME, 0);
+    let stem = derived.as_str().split('.').next().expect("stem");
+    let mut intent = intent(false);
+    intent.stage.alias = short(&format!("{stem}.TMP"));
+    prepare(&root, &books, &mut intent);
+
+    // An install cut between its two writes: the book is published and the
+    // scratch name still points at the same chain.
+    let before = disk.image();
+    install::apply_step(&root, &books, &intent, Step::InstallStage).expect("install");
+    disk.undo_unlinks(&before);
+
+    // The record is gone, and the sweep never got to this file.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    xteink
+        .delete_entry_in_dir(install::JOURNAL_FILE)
+        .expect("lose the record");
+    assert!(
+        !scratch_files(&root).is_empty(),
+        "the leftover must still be there for this to test anything"
+    );
+
+    // The next upload of the same book derives the same scratch name.
+    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        new_body(),
+        "the book on the shelf must survive having its scratch name reused"
+    );
+
+    // And the upload that follows still works, replacing it properly.
+    staged.write(&old_body()).expect("stream");
+    staged.install(&root, &books).expect("install");
+    assert_eq!(body_named(&books, BOOK_NAME), old_body());
+    assert_eq!(shelf_long_names(&books).len(), 1);
+}
+
+/// Recovery changes `/BOOKS` like anything else, and owes the same proof.
+///
+/// It ends by clearing the record, and that record is the only thing that
+/// would tell the next mount a surviving snapshot is stale. So replaying while
+/// a snapshot that would not delete was standing would move the books and then
+/// destroy the evidence: the mount after finds a snapshot of the old shelf, no
+/// record, and nothing to say they disagree.
+#[test]
+fn recovery_leaves_the_shelf_alone_while_a_snapshot_it_cannot_clear_stands() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+
+    // A snapshot of the shelf as it stands, held open so it cannot be removed
+    // — the transient failure a wireless session hits on the way in.
+    let xteink = root.open_dir("XTEINK").expect("xteink");
+    let snapshot = xteink
+        .open_file_in_dir(proto::cache::CATALOG_FILE, Mode::ReadWriteCreate)
+        .expect("snapshot");
+    snapshot
+        .write(b"a catalog of the shelf as it stands")
+        .expect("write");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        !outcome.complete,
+        "a snapshot that will not go leaves the whole transaction for the next mount"
+    );
+    assert!(outcome.had_intent, "and the catalog cannot be trusted");
+    assert!(!outcome.touched_shelf);
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        old_body(),
+        "the shelf must not have advanced past what the snapshot describes"
+    );
+    assert!(
+        matches!(
+            install::read_intent(&root),
+            Ok(install::IntentState::Valid(_))
+        ),
+        "and the record has to still be there to catch it next time"
+    );
+
+    // Once the snapshot can go, it goes first and the transaction finishes.
+    snapshot.close().expect("close");
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete);
+    assert_eq!(body_named(&books, BOOK_NAME), new_body());
+    assert!(
+        matches!(
+            xteink.find_directory_entry(proto::cache::CATALOG_FILE),
+            Err(embedded_sdmmc::Error::NotFound)
+        ),
+        "the snapshot went before the shelf moved, not after"
+    );
+}
+
+/// Invalidating the catalog snapshot is a precondition for changing `/BOOKS`,
+/// not a courtesy: a clean install clears its journal and a delete never
+/// writes one, so once the shelf has moved nothing on the card would tell the
+/// next mount that the snapshot is describing the old one. The caller may
+/// only proceed when the card says the snapshot is gone.
+#[test]
+fn a_snapshot_that_will_not_go_is_not_reported_gone() {
+    let mgr = open_mgr(new_card());
+    let (root, _books) = open_dirs(&mgr);
+
+    // No cache root at all: nothing can be holding a snapshot.
+    assert!(
+        upload_store::clear_cache_file(&root, proto::cache::CATALOG_FILE),
+        "a card with no cache root has no snapshot to invalidate"
+    );
+
+    let xteink = root.open_dir("XTEINK").unwrap_or_else(|_| {
+        root.make_dir_in_dir("XTEINK").expect("make XTEINK");
+        root.open_dir("XTEINK").expect("open XTEINK")
+    });
+
+    // Present but not there: still nothing to invalidate.
+    assert!(upload_store::clear_cache_file(
+        &root,
+        proto::cache::CATALOG_FILE
+    ));
+
+    // A snapshot that cannot be removed must not read as removed.
+    let snapshot = xteink
+        .open_file_in_dir(proto::cache::CATALOG_FILE, Mode::ReadWriteCreate)
+        .expect("snapshot");
+    snapshot
+        .write(b"a catalog of the old shelf")
+        .expect("write");
+    assert!(
+        !upload_store::clear_cache_file(&root, proto::cache::CATALOG_FILE),
+        "a snapshot still held open is still on the card"
+    );
+
+    // Once it can be removed, it is, and the card says so.
+    snapshot.close().expect("close");
+    assert!(upload_store::clear_cache_file(
+        &root,
+        proto::cache::CATALOG_FILE
+    ));
+    assert!(
+        matches!(
+            xteink.find_directory_entry(proto::cache::CATALOG_FILE),
+            Err(embedded_sdmmc::Error::NotFound)
+        ),
+        "and it really is gone"
+    );
+}

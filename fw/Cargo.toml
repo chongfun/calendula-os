@@ -52,12 +52,13 @@ esp-hal           = { version = "1.1.1", features = ["esp32c3", "unstable"] }
 esp-rtos          = { version = "0.3.0", features = ["esp32c3", "embassy", "esp-radio", "esp-alloc"] }
 embedded-hal-async = "1.0.0"
 embedded-hal       = "1.0.0"
-# Pinned to unreleased develop for empty-directory deletion (PR #210, merged
-# 2025-12-22, not in any crates.io release as of 0.9.0). Swap back to a plain
-# version once 0.10 ships. Pinned to the #210 merge itself, NOT develop HEAD:
-# the later SD driver rewrites (#222/#226/#248/#249) fail cold card init on
-# the X4 ("sd: session failed: CardInit", July 4 2026).
-embedded-sdmmc     = { git = "https://github.com/rust-embedded-community/embedded-sdmmc-rs.git", rev = "d26892f7405469eba95741763ab39bda2239d5ec", default-features = false }
+# Our fork, now on upstream v0.10 — which carries the later SD rewrites the
+# previous #210 pin was avoiding. Those were reported to fail cold card init
+# on the X4 ("sd: session failed: CardInit", July 4 2026), upstream's board;
+# this project has only X3 hardware, and the X3 has been verified against this
+# revision. See [workspace.dependencies] in the root manifest for the fork and
+# what it changes.
+embedded-sdmmc     = { workspace = true }
 nb                = "1.1.0"
 portable-atomic   = { version = "1.10.0", features = ["unsafe-assume-single-core"] }
 static_cell       = "2.1.0"
