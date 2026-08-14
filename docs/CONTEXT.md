@@ -16,7 +16,7 @@ Rendering and task coordination should prefer ReaderStore query methods such as 
 
 ### Reader cache files
 
-The firmware module that owns the FAT paths and binary records for `/XTEINK/CATALOG.BIN`, `/XTEINK/CACHE/E<hash>/BOOK.BIN`, section files, cover sidecars, and `/XTEINK/STATE.BIN`.
+The firmware module that owns the FAT paths and binary records for `/READER/CATALOG.BIN`, `/READER/CACHE2/E<hash>/BOOK.BIN`, section files, cover sidecars, and the reading position — written to `STATEA.BIN` and `STATEB.BIN` alternately, so a torn write leaves the other generation intact, with a legacy `/READER/STATE.BIN` still read when neither is valid.
 
 Use this term for cache file I/O. Keep EPUB parsing, XHTML decoding, and pagination language separate from cache file persistence.
 

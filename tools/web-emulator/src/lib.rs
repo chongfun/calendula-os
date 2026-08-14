@@ -85,7 +85,7 @@ impl WebEmulator {
             },
         );
         emu.restore_active_book(ReaderSource::sd(0).book_id(), 0, 0);
-        // The firmware's boot probe of /XTEINK/WIFI.BIN, pretended: a saved
+        // The firmware's boot probe of /READER/WIFI.BIN, pretended: a saved
         // network so the Wireless screen opens on the connect/forget offer.
         // Forgetting it exposes the portal flow, which "saves" it back.
         emu.state = emu

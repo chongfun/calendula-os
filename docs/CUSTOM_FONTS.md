@@ -39,10 +39,10 @@ installed, Settings stays unchanged.
 3. Copy the generated file to the SD card:
 
    ```text
-   /XTEINK/FONTS/CUSTOM.FNT
+   /READER/FONTS/CUSTOM.FNT
    ```
 
-   Create the `XTEINK/FONTS` directories if they do not exist.
+   Create the `READER/FONTS` directories if they do not exist.
 4. Eject the SD card, insert it into the reader, and reboot.
 5. Open Settings and choose the custom typeface by name.
 
@@ -52,7 +52,7 @@ breaks and page counts.
 
 ## Current limits
 
-- There is one custom slot: `/XTEINK/FONTS/CUSTOM.FNT`.
+- There is one custom slot: `/READER/FONTS/CUSTOM.FNT`.
 - Raw `.ttf` and `.otf` files on the SD card are ignored.
 - Missing styles fall back to the closest supplied face while building the pack.
 - Keep font licensing in mind. Only install fonts you have the right to use.

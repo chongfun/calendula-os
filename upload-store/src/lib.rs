@@ -9,7 +9,7 @@
 //! read side of the label sidecars.
 //!
 //! Those sidecars are history. Before uploads carried a VFAT long name, a book
-//! on the card was an 8.3 alias and its real name lived in `XTEINK/LABELS`.
+//! on the card was an 8.3 alias and its real name lived in `READER/LABELS`.
 //! Books written that way are still on people's cards, so the catalog scan
 //! still falls back to reading their labels, and deleting a book still clears
 //! them. Nothing writes new ones.
@@ -23,7 +23,7 @@ use embedded_sdmmc::{Directory, Mode, TimeSource};
 use heapless::String;
 use proto::cache::CACHE_ROOT_DIR;
 
-/// Subdir under XTEINK holding one `<8.3-stem>.TXT` per book uploaded before
+/// Subdir under the cache root holding one `<8.3-stem>.TXT` per book uploaded before
 /// uploads carried a long name of their own, each with that book's real
 /// filename. Read-only now: the catalog scan falls back to it for those older
 /// books, and deleting a book clears whatever it left.
@@ -90,10 +90,10 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) else {
+    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
         return false;
     };
-    let Ok(labels) = xteink.open_dir(LABELS_DIR) else {
+    let Ok(labels) = cache_root.open_dir(LABELS_DIR) else {
         return false;
     };
     let mut file_name = String::<12>::new();
@@ -220,10 +220,10 @@ pub fn delete_upload_sidecars<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) else {
+    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
         return;
     };
-    let Ok(labels) = xteink.open_dir(LABELS_DIR) else {
+    let Ok(labels) = cache_root.open_dir(LABELS_DIR) else {
         return;
     };
     let mut file_name = String::<12>::new();
@@ -255,12 +255,12 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let xteink = match root.open_dir(CACHE_ROOT_DIR) {
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
         Ok(dir) => dir,
         Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
         Err(_) => return Err(install::InstallError::Card),
     };
-    let labels = match xteink.open_dir(LABELS_DIR) {
+    let labels = match cache_root.open_dir(LABELS_DIR) {
         Ok(dir) => dir,
         Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
         Err(_) => return Err(install::InstallError::Card),

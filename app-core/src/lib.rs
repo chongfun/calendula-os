@@ -429,7 +429,7 @@ pub enum StorageCommand {
     /// until the session's software reset reboots the reader.
     LoanSyncMemory,
     /// Persist the credentials captured by the onboarding portal to
-    /// /XTEINK/WIFI.BIN. Allowed during a sync session: it is the portal
+    /// /READER/WIFI.BIN. Allowed during a sync session: it is the portal
     /// that sends it.
     StoreWifiCredentials(WifiCredentials),
     /// Record which AP a join actually landed on, keyed to the network it
@@ -439,7 +439,7 @@ pub enum StorageCommand {
         ssid: WifiSsid,
         hint: WifiApHint,
     },
-    /// Delete /XTEINK/WIFI.BIN. Sent when the user confirms "forget" on
+    /// Delete /READER/WIFI.BIN. Sent when the user confirms "forget" on
     /// the Wireless screen, which is only reachable before the radio
     /// starts, so it never runs during a sync session.
     ForgetWifiCredentials,
@@ -1064,7 +1064,7 @@ impl SyncSession {
 }
 
 /// Station credentials as a bounded Copy message: what the onboarding
-/// portal captures and what `/XTEINK/WIFI.BIN` stores.
+/// portal captures and what `/READER/WIFI.BIN` stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WifiCredentials {
     pub ssid: [u8; 32],
@@ -1746,7 +1746,7 @@ pub enum SyncError {
 
 /// wifi task -> app task progress reports for the Wireless screen. The
 /// display task also sends `NetworkSaved` once at boot, after reading
-/// /XTEINK/WIFI.BIN, so the screen can name the saved network before any
+/// /READER/WIFI.BIN, so the screen can name the saved network before any
 /// session starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncEvent {
@@ -2184,7 +2184,7 @@ impl ReaderState {
                     next.sync_status = SyncStatus::Starting;
                 }
                 // Confirm affirms the forget: the app shell deletes
-                // /XTEINK/WIFI.BIN on this transition.
+                // /READER/WIFI.BIN on this transition.
                 SyncStatus::ForgetPending => {
                     next.wifi_ssid = [0; 32];
                     next.wifi_ssid_len = 0;
