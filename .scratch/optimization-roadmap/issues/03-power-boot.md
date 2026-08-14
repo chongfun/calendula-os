@@ -90,13 +90,40 @@ untouched. Then **measure**, which is the part that has never been done.
   nothing proves it either way, and that is the point.
 - **Upstream now has a reference figure: 12.8 µA deep sleep, measured on an X3
   with a PPK2 at the battery terminals** (crosspoint `70faa29d`, 2026-08-12).
-  This does **not** measure our firmware — different GPIO configuration is
-  exactly the variable C2 exists to test — but it changes what a reading means.
-  The hardware demonstrably reaches ~13 µA, so a high reading on our side is
-  our pin configuration and not the board, and the "it may already be fine"
-  branch now has a specific number to be fine *against*. It also confirms the
-  10–15 µA claim was the right order of magnitude, which the roadmap could not
-  say before.
+  **Corrected 2026-08-13 — that number is a *post-fix* figure, not a baseline,
+  and the first version of this bullet got it wrong.** At the same commit,
+  `startDeepSleep` already drives GPIO13 low and `gpio_hold_en`s it before
+  sleeping (`lib/hal/HalPowerManager.cpp:89-90`, with the hold surviving via
+  `esp_sleep_config_gpio_isolate` + `gpio_deep_sleep_hold_en`). So 12.8 µA is
+  what an X3 draws **with the SD rail explicitly cut and latched** — which is
+  precisely the configuration we do not have. It bounds what the hardware can
+  reach; it says nothing about what it draws with GPIO13 left alone. That makes
+  the rail a **stronger** suspect than "a high reading is our pin
+  configuration" implied, not a co-equal one.
+- **GPIO13 is the C3's flash SPIWP pad**, not a floating or pulled-up line
+  (crosspoint's own comment, `HalPowerManager.cpp:17`: "unused in this board's
+  DIO flash mode, rewired to the battery-latch MOSFET gate"). That is a third
+  possibility this roadmap and the `x3-sd-rail-sleep-power` PRD both missed —
+  the card powers up without us touching the pin because it is muxed to the
+  flash controller at boot, not because something holds it high. Claiming it is
+  the same class of move as `fw/src/main.rs:469`, which already claims GPIO12
+  (SPIHD) as `sd_cs` on the same DIO-mode premise and works.
+- **A larger suspect, and the only part of C2 investigable with no hardware:
+  our deep sleep never runs esp-hal's digital-pad isolation pass at all.**
+  `isolate_digital_gpio()` returns immediately unless the deep-sleep pad hold
+  is enabled (`esp-hal-1.1.1/src/rtc_cntl/sleep/esp32c3.rs:147-158`), and
+  esp-hal only ever **reads** `dg_pad_autohold_en` — the bit is never written
+  anywhere in the crate, so the guard is always false for us. The loop being
+  skipped carries esp-hal's own comment: *"make pad work as gpio (otherwise,
+  deep_sleep bottom current will rise)"* (`:177`). crosspoint and freeink both
+  enable the hold through ESP-IDF, so their isolation runs and ours does not.
+  This affects **every unheld digital pad**, not just the SD rail, and it is a
+  concrete named difference between the 12.8 µA firmware and ours. Check it
+  before spending a 72-hour gauge run on the rail alone.
+  - Blocker to be honest about: esp-hal exposes no public API for this, so
+    enabling it means raw PAC writes against `hal-ext`'s
+    `#![forbid(unsafe_code)]` and `fw`'s `#![deny(unsafe_code)]`. That is a
+    design decision, not a patch.
 - **The GPIO13 suspect is now confirmed board-conditional upstream.**
   crosspoint `9b1fb712` ("Guard GPIO13 power control for Xteink C3 boards
   only") restricts the GPIO13 SD-rail control to C3 boards, because X4 uses the
@@ -346,6 +373,15 @@ land without it.
   taken while a DMA transfer is in flight is the obvious way to corrupt a
   flush. Raise the clock on the same lock that guards a render, as upstream
   does, rather than sprinkling calls.
+- **Risk specific to light sleep, if C11 ever grows into C10: the SD rail and
+  the flash-leakage workaround collide.** GPIO13 is the C3's flash SPIWP pad
+  (see C2), and ESP-IDF's `CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND` pulls the
+  DIO-unused SPIWP pad low on light-sleep entry — which on the X3 is the SD
+  power rail. crosspoint carries a bespoke `lightSleep()` for exactly this
+  reason. esp-hal has no equivalent workaround today, so nothing bites us yet;
+  the coupling is recorded because a future esp-hal that gains one would cut
+  the card mid-session, and the symptom would look like SD corruption rather
+  than a sleep bug.
 - Verify: gauge-integrated idle window at each clock, plus the existing
   `bench: refresh` timings to prove no refresh got slower.
 
