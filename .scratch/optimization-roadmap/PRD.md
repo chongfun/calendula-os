@@ -9,6 +9,17 @@ code-reviewed implementation of Tier 0. Started 2026-07-09 from six parallel
 code-survey agents, one per workstream, scoped to mostly-disjoint code regions
 so work can proceed in parallel.
 
+**Reconciled against `main` 2026-08-13, after #75 (long-name uploads,
+journalled install) landed and v0.6.0 shipped.** #75 is not a performance
+change, but it moved the `embedded-sdmmc` pin to our own fork and rebased it
+onto upstream v0.10, and that touches this roadmap in two places worth reading
+before picking anything up: **D6 lost its cost side** (it was rated for the
+expense of *creating* a fork we now maintain anyway, so it re-rates L → M), and
+**Tier 3's "none needs a rebase" is no longer true** — `opt/b7-per-config-section-caches`
+conflicts, and the fix is a driver API migration rather than a rebase. WS-D's
+upload baseline predates #75's write path and needs re-taking before it is
+quoted again.
+
 This document is kept to three things: **what is left**, **what has been
 done**, and **what not to do**. Round-by-round history has been dropped —
 it lives in the git log and the PR descriptions, which are the honest
@@ -36,6 +47,11 @@ item:
   order is unconstrained by conflicts. Rank on correctness and residual work,
   not on cost-to-build. Three are much closer to done than their old queue
   positions implied; two have defects that must be fixed first.
+  **Expired 2026-08-13.** Four of the six have since merged; of the two left,
+  `opt/b7-per-config-section-caches` now conflicts with `main` and needs the
+  v0.10 driver migration. The *ranking principle* stands — rank on correctness
+  and residual work — but "landing order is unconstrained by conflicts" no
+  longer describes the tree. See Tier 3.
 
 ### Tier 0 — measurement integrity (do first; hours, not days)
 
@@ -96,13 +112,20 @@ is the opposite of what was expected when this started.
 
 | # | Item | WS | Why it ranks here | Effort |
 |---|---|---|---|---|
-| 5 | **Upload instrumentation, then D6** | D | The D2 post-mortem has been misread: it tested write *stalls*, never write *bandwidth*. Arithmetic says **~72% of upload wall time is single-block SD writes** and the ceiling is 1.4× above observed. D6's own precondition was met in July and it stayed deferred. ~25 lines of instrumentation resolve it in one capture. | S–M then L |
+| 5 | **Upload instrumentation, then D6** | D | The D2 post-mortem has been misread: it tested write *stalls*, never write *bandwidth*. Arithmetic says **~72% of upload wall time is single-block SD writes** and the ceiling is 1.4× above observed. D6's own precondition was met in July and it stayed deferred. ~25 lines of instrumentation resolve it in one capture. **Re-rated 2026-08-13: #75 removed D6's cost side.** It was sized as "L, fork maintenance" and carried a do-not-fork escape hatch; we now own and maintain that fork, so the payoff is unchanged and the cost is sunk. Effort drops L → M. The instrumentation still goes first — the 72% is arithmetic, not a measurement — but its job is now sizing, not deciding whether to fork. Re-take the baseline before quoting it: #75 changed the upload write path. | S–M then M |
 | 6 | **Cache write alignment** | B | Nothing arranges block-aligned writes, so CONT.BIN pays **2 writes + 1 read per 512 B**. Modelled at ~1.75× write amplification, cross-checked against the 2026-07-09 537-block measurement. No format change, no version bump. | S–M |
 | 7 | **E5 + E6 — halve the peak stack chain** | E | `CssRules` ~6.9 KB and `parse_opf`'s duplicated manifest+spine 5,896 B, both on the peak reader chain (26,768 B of 42,136). Two mechanical changes take it to ~14.8 KB. | S–M, M |
 
 ### Tier 3 — in-flight branches, ranked by residual work
 
-All sit on current `main`; none needs a rebase.
+~~All sit on current `main`; none needs a rebase.~~ **False as of #75
+(2026-08-13).** The driver pin moved to our fork and rebased onto upstream
+v0.10, which is a breaking API change for anything touching SD:
+`delete_file_in_dir` → `delete_entry_in_dir`, `CardType` moved into
+`embedded-sdmmc-types` (`SDHC` → `SdhcSdxc`), and `iterate_dir` callbacks now
+return `ControlFlow`. **Any branch predating #75 that touches `reader-cache/`
+or `sd_session.rs` needs that migration, not a rebase.** Verified by
+`git merge-tree` against `origin/main`, not assumed.
 
 | Branch | State | Residual |
 |---|---|---|
@@ -111,11 +134,11 @@ All sit on current `main`; none needs a rebase.
 | ~~`opt/font-aa-low-threshold`~~ | **MERGED as #72**. | — |
 | ~~`opt/prune-orphan-sections`~~ | **MERGED as #59**. | — |
 | ~~`opt/a11-landscape-glyph-batching`~~ | **MERGED as #57**. | — |
-| `opt/upload-session-token` | **Ready.** Complete, gate anchored not scanned, goldens re-blessed and visually verified on both boards. | Device check |
+| `opt/upload-session-token` | **Ready**, and still merges clean against #75. But it adds 68 lines to `fw/src/tasks/wifi.rs`, which #75 also changed, and #75 introduced refusal paths the token gate predates — uploads and deletes are refused while an install journal stands. Confirm the gate covers those before the device check rather than after. | Re-verify, then device check |
 | ~~`opt/inflate-caller-owned-window`~~ | **MERGED as #63**. | — |
 | ~~`opt/d4-directed-wifi-join`~~ | **MERGED as #73**. | — |
 | ~~`opt/single-repaint-per-page-turn`~~ | **MERGED as #56**, reworked first. The audit found it suppressed the `Loaded` *event* rather than the render, freezing the app's page count during a background build and stranding the reader at the frontier — rule 4 through a door rule 4 does not name. #56 moved the decision into `app_core::loaded_repaints` and kept the event unconditional, and picked up an open-gate latch and a failed-refresh retry on the way. | — |
-| `opt/b7-per-config-section-caches` | **Three defects** (issue 02): `&str` byte-slicing that aborts on SD-derived filenames — reproduced end-to-end, reachable from the orphan sweep on every catalog write; a cross-config cache wipe at three sites, not the one admitted; `BookBuildResume` not keyed by layout config. Still the best-structured large change in the queue. | The three fixes, plus prune orphaned sections first |
+| `opt/b7-per-config-section-caches` | **Three defects** (issue 02): `&str` byte-slicing that aborts on SD-derived filenames — reproduced end-to-end, reachable from the orphan sweep on every catalog write; a cross-config cache wipe at three sites, not the one admitted; `BookBuildResume` not keyed by layout config. Still the best-structured large change in the queue. **Now also conflicts with `main` in `reader-cache/src/files.rs`** — #75 migrated that file to the v0.10 driver API. Defect 1 is unaffected and still real: the fork's `ShortFileName: Display` still emits `byte as char` (`filesystem/filename.rs:238`). | The three fixes, the v0.10 migration, plus prune orphaned sections first |
 
 ### Tier 4 — worthwhile, unblocked, smaller
 
@@ -178,6 +201,7 @@ only as the honest home for prestage overlap.
 | Drop MarigoldOS lineage | #78 | Firmware identity OTA rename |
 | Board identity guard | #77 | Refuse to boot on wrong board |
 | Panel controller detection | #76 | Probe panel controller before driving |
+| **Long-name uploads, journalled install** | #75 | Uploads stage outside `/BOOKS` and install as a same-volume move — two directory writes rather than a copy of the book's length. Not a performance item, but it moved the driver pin to our fork and rewrote the surface three WS-D items are written against. Released as v0.6.0 |
 
 B7 is committed but not merged; everything else above is on `main`.
 
@@ -301,7 +325,11 @@ One issue file each, owning a distinct set of files.
   planner seed in `app-core/src/lib.rs`, boot region of the display task.
 - **WS-D — Storage & Wi-Fi** (`issues/04-storage-wifi-throughput.md`).
   `fw/src/sd_session.rs`, `fw/src/tasks/wifi.rs`, `fw/src/upload.rs`,
-  `fw/src/sync_mem.rs`, pinned `embedded-sdmmc`.
+  `fw/src/sync_mem.rs`, `upload-store/`, `proto/src/upload.rs`, and the
+  `embedded-sdmmc` fork — which since #75 is **ours to change**, not a pin to
+  work around. Its rev and rationale live in `[workspace.dependencies]` in the
+  root `Cargo.toml`; its regression tests live in the fork, so re-run them
+  there when bumping.
 - **WS-E — Flash & RAM budget** (`issues/05-flash-ram-budget.md`).
   `.cargo/config.toml`, `display/src/font.rs` (struct only), generated font
   tables.

@@ -300,6 +300,17 @@ than per run. Measure before building either.
     replay into a full EPUB re-parse. The first open that finds an unkeyed
     `BOOK.BIN` deletes it and the unkeyed section files instead.
 
+  **Rebase note, 2026-08-13 — this branch no longer merges cleanly.** #75
+  moved the driver pin to our fork and rebased it onto upstream v0.10, and the
+  conflict is in `reader-cache/src/files.rs`. It is an API migration, not a
+  textual one: `delete_file_in_dir` → `delete_entry_in_dir`, `CardType` moved
+  into `embedded-sdmmc-types` (`SDHC` → `SdhcSdxc`), and `iterate_dir`
+  callbacks now return `ControlFlow` instead of `()`. The last one is not
+  mechanical — `main`'s version of this file now uses `ControlFlow::Break` to
+  stop scans early, and a migration that returns `Continue` everywhere will
+  compile while quietly reverting those. Do the migration against `main`'s
+  intent, not against the compiler's complaints.
+
   **Branch audit, 2026-07-30 — three defects to fix before it merges.** The
   branch is the best-structured large change in the queue (1,473 of 1,485
   added lines are in host-testable crates, 11 real tests on the FAT
@@ -318,6 +329,13 @@ than per run. Measure before building either.
      Fix is mechanical — compare over `name.as_bytes()`; nothing here needs
      `str` semantics. `main` has no equivalent exposure; this is new surface.
      The near-miss test table is all ASCII, which is what let it through.
+     **Still live after #75** — re-checked in the fork, where `ShortFileName:
+     Display` still writes `c as char`
+     (`embedded-sdmmc/src/filesystem/filename.rs:238`). Long-name support does
+     not help here: `DirEntry::name` is still a `ShortFileName`, so every scan
+     in `reader-cache` still sees the 8.3 alias. If anything the exposure is
+     now easier to hit, since aliases are derived by the driver from
+     user-supplied filenames rather than from a hash.
   2. **The cross-config cache wipe is at three sites, not the one admitted.**
      Besides `publish.rs`, `fw/src/book_build.rs` calls `empty_cache_dir` on
      the cold-build `IndexWriteFailed` arm (~`:1962`) and on the **replay**

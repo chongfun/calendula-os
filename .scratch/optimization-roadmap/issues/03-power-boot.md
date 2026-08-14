@@ -17,6 +17,15 @@ Baseline facts: deep sleep is terminal — a wake is a cold boot
 (`hal-ext/src/rtc.rs:22-27`); the radio is genuinely off until a session;
 160 MHz race-to-idle is an explicit decision (`fw/src/main.rs:156-159`).
 
+New on the boot path since #75 (2026-08-13): upload recovery replays any
+standing install journal **before** the library is scanned or a cached catalog
+is trusted. In the ordinary case that is one small read that finds nothing.
+The case to know about when boot-to-first-paint is finally measured is the one
+after an interrupted upload: recovery does real work and then retires the
+catalog snapshot (`catalog_load` result `reclaimed`), so that boot pays a full
+rescan. It is correct and it is rare, but it is a slow boot with no code change
+behind it — do not let one land in a baseline capture unnoticed.
+
 ## Open
 
 Order: C7 (affects every other measurement in the roadmap) → C2 (the gauge

@@ -121,6 +121,12 @@ and unreported.
   screen_on` while X3 emits `mode busy_ms busy_low elapsed_ms screen_on t_ms`.
   X4 refresh events carry no `t_ms`, so they sort to the end of the stream and
   X4/X3 refresh figures are not the same measurement.
+- New 2026-08-13: #75 added a sixth `catalog_load` result, **`reclaimed`** —
+  the snapshot was retired on purpose because upload recovery deleted a file it
+  might name. `bench.py` classifies it as non-fault, correctly. Worth knowing
+  when reading boot captures taken across an interrupted upload: the rescan
+  that follows is the repair, not a regression, and it will show up as a slow
+  boot that no code change caused.
 
 ### F10 (S): `tools/web-emulator` is built by no PR gate
 

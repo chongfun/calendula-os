@@ -1,18 +1,38 @@
 # WS-D: Storage & Wi-Fi throughput — SD bandwidth, upload speed, session setup, onboarding
 
-Status (2026-07-30): D1 and D3 are on `main`. **D2 was implemented, measured,
-and rejected** — read its entry under "Do not re-propose" before touching
-upload throughput. Open: D4, then the upload-ceiling investigation, then D5.
-D6 only if the counters still indict SD.
+Status (2026-08-13): D1, D3 and **D4 (#73)** are on `main`. **D2 was
+implemented, measured, and rejected** — read its entry under "Do not
+re-propose" before touching upload throughput. Open: the upload-ceiling
+investigation, then D6, then D5.
+
+**#75 landed under this workstream and changed its ground.** Uploads now stage
+in `/XTEINK/UPLOAD` and install by a same-volume move under one journal
+record; the probe window and the identity/label sidecar writes are gone; and
+the driver moved from a pinned upstream to **our fork**. Three consequences
+for what follows: the 19.3 s baseline was measured on the old write path and
+needs re-taking, the FAT-tax calibration below now has non-FAT contributors,
+and **D6 is no longer gated on a decision to fork.**
 
 Owns: `fw/src/sd_session.rs`, `fw/src/tasks/wifi.rs`, `fw/src/upload.rs`,
-`fw/src/sync_mem.rs`, the vendored/pinned `embedded-sdmmc`.
+`fw/src/sync_mem.rs`, `upload-store/`, `proto/src/upload.rs`, and the
+`embedded-sdmmc` fork (`chongfun/embedded-sdmmc-rs`, branch
+`calendula/long-names-and-error-fidelity`).
 Note: `sd_session.rs` changes speed up WS-B's reader path too. This
 workstream owns the file; WS-B must not modify it.
+Note: the fork is a real dependency of WS-B as well — its v0.10 API is what
+`reader-cache` compiles against. A rev bump is a cross-workstream event, and
+the fork's own suite is the only regression coverage for our five changes to
+it (a bump that loses them still compiles here).
 
 ## Open
 
-### D4 (M): directed station join — persist channel and BSSID
+### ~~D4 (M): directed station join — persist channel and BSSID~~ — MERGED as #73
+
+Kept below for the two review notes, which describe shipped behaviour: the
+stale-hint regression bound (one failed-session sequence can cost 45 s against
+main's 35 s before it self-heals) is a real property of what merged, not a
+pre-merge concern. If that ceiling is ever felt in practice, clearing the hint
+after a miss inside the retry loop is the fix.
 
 `Session::join` sets only SSID, password and auth, so every join does a full
 all-channel scan: **~21 s**. The pinned esp-radio `StationConfig` supports
@@ -64,6 +84,18 @@ UTF-8, but make it one expression.
 Upload throughput sits near **160 KB/s under every configuration tried**, and
 nobody knows why. Ruled out by measurement (2026-07-11/12): radio RX buffers,
 AMPDU-RX, SD write stalls, SPI chunking.
+
+**Re-take the baseline first (2026-08-13).** Every number below descends from
+one 2026-07-11 figure — 3.2 MB in 19.3 s — and #75 changed the path that
+produced it. The bulk write is still ~6,250 single-block writes and the
+arithmetic should survive, but it is now *unverified* arithmetic on top of a
+superseded measurement, and this workstream's whole history is of exactly that
+compounding. One `curl` re-establishes it. What changed: the body streams to
+`/XTEINK/UPLOAD` rather than straight to its final name; the probe window
+(a walk of hash-derived 8.3 slots) and two sidecar writes per upload are gone;
+a journal write, a catalog-snapshot clear and the install move are new. All of
+the new work is directory-scale against a book-length stream, so the
+*direction* is a small improvement — but measure it, do not assume it.
 
 **Correction, 2026-07-30 — D2's post-mortem has been misread for three
 rounds.** It says "neither radio RX nor SD write *stalls* is the limiter",
@@ -166,9 +198,14 @@ second D2.**
   sequential stream (and each one breaks the card's sequential-write streak).
   At 32 KB clusters that is +6% writes; at 8 KB clusters, common on smaller
   cards, **+25%**. Free to quantify: `wr_blocks` for a 3.2 MB upload should be
-  6,250 with no FAT overhead; the excess *is* the tax. Fixing it (preallocating
-  the chain, or deferring mirror writes to close) needs the D6 fork and touches
-  FAT consistency — high risk, measure before considering.
+  6,250 with no FAT overhead; the excess *is* the tax. **Recalibrate against
+  #75 before reading the excess as FAT:** the journal record, the
+  catalog-snapshot clear and the install's two directory writes are now in that
+  count and are not the tax. Subtract a measured empty-upload floor rather than
+  reasoning about it. Fixing the tax itself (preallocating the chain, or
+  deferring mirror writes to close) is now a change to our own fork rather than
+  a reason to create one, but it still touches FAT consistency — high risk,
+  measure before considering.
 - **`with_sd_bounce` memsets 512 bytes for every one-byte SPI transaction.**
   Every command byte, response poll and busy poll is a full
   `SdSpiDevice::transaction` that unconditionally fills the whole
@@ -224,7 +261,20 @@ reset at session end.
   sign-in-sheet path, itself flagged untested); emulator scenario and goldens;
   a reset still restores the reading position.
 
-### D6 (L, fork maintenance): multi-block CMD18/CMD25 in the pinned embedded-sdmmc
+### D6 (M): multi-block CMD18/CMD25 in our embedded-sdmmc fork
+
+**Re-rated L → M on 2026-08-13, and the reason is the whole point of this
+entry.** D6 was never expensive in code; it was expensive because it required
+*creating and carrying a fork of a pinned dependency*, and that cost was
+priced in twice — once in the effort rating, once in the do-not-fork escape
+hatch at the bottom. **#75 paid it for unrelated reasons.** The pin is now
+`chongfun/embedded-sdmmc-rs`, branch `calendula/long-names-and-error-fidelity`,
+carrying five changes of ours with their own test suite. The upstream it
+branched from is unmaintained (see the note in `[workspace.dependencies]`), so
+the maintenance cost is sunk whether or not D6 ever happens.
+
+What is left is the code: a batching change in a crate we already edit, in a
+file we have already touched, against a test suite we already run.
 
 **Evidence (2026-07-12, X3, 11.7 MB EPUB cold build):** `sd_stats` showed
 `write_calls == write_blocks` (1,944 each) and a per-block write cost of
@@ -244,11 +294,19 @@ bench counters answers immediately whether this is worth it" — they were equal
 1,944 each, on 2026-07-12. Combined with the upload arithmetic above (~72% of
 upload wall time in single-block writes, ceiling only 1.4× above observed),
 this is now the largest identified lever in the workstream rather than a
-tier-3 maybe. Confirmed by reading the pinned crate: `VolumeManager::write`
-loops per block calling `block_cache.write_back()`, always a 1-block device
-write; the CMD25 branch beside it already does `ACMD23` pre-erase and drops
-CMD24 + CMD13 per block, and is unreachable only because the caller never
-passes more than one block.
+tier-3 maybe.
+
+**Re-confirmed against the fork on 2026-08-13**, because the crate this was
+originally read in no longer exists in that shape — #75 rebased onto upstream
+v0.10, which split the types out into `embedded-sdmmc-types` and renamed
+several of the APIs this workstream cites. The finding survives the move
+intact: `VolumeManager::write` still loops per block calling
+`block_cache.write_back()` (`embedded-sdmmc/src/volume_mgr.rs:1530`), always a
+1-block device write; the CMD25 branch still sits beside it doing `ACMD23`
+pre-erase and dropping CMD24 + CMD13 per block
+(`embedded-sdmmc/src/sdcard/spi.rs:249-252`), still unreachable only because
+the caller never passes more than one block. `wr_calls == wr_blocks` therefore
+still holds by construction, not just by the July counters.
 
 If per-block cost falls to a typical 0.6–0.9 ms, a 3.2 MB upload goes 19.3 s →
 **~10–12 s** (network then binds) and the 4.34 s of cold-build write time →
@@ -256,14 +314,25 @@ If per-block cost falls to a typical 0.6–0.9 ms, a 3.2 MB upload goes 19.3 s �
 is not.* Note `upload-store` is `#![forbid(unsafe_code)]`, so reinterpreting a
 4 KB chunk as `[Block; 8]` has to happen on the fw side.
 
-**Still gate it on the instrumentation above** — if `sd_write_ms` comes in
-under ~35% of upload wall time, do not fork. Weigh 2–3 s per cold build against
-the cost of maintaining a fork of a pinned dependency. Note #18 moved the upload write
-path into the `upload-store` crate; reader-cache writes still go through fw's
-SD session.
+**Still gate it on the instrumentation above** — but the gate is now about
+*size*, not about whether to fork. If `sd_write_ms` comes in under ~35% of
+upload wall time, the upload half of the case collapses and what remains is
+2–3 s per cold build; that is a smaller prize but no longer has a fork's
+creation cost set against it. The old wording said "do not fork" and that
+sentence is retired: there is nothing left to decide.
 
-- Risk: fork maintenance, FAT correctness (byte-compare uploaded files),
-  CS/timeout behaviour on the shared bus.
+Note #18 moved the upload write path into the `upload-store` crate;
+reader-cache writes still go through fw's SD session. Both reach the same
+per-block `write_back`, so a batching change lifts the cold build and the
+upload together.
+
+- Risk: FAT correctness (byte-compare uploaded files), CS/timeout behaviour on
+  the shared bus. **Fork maintenance is no longer a risk of this item** — it is
+  a standing cost of the project. What *is* a risk specific to D6: the fork's
+  regression suite lives in the fork, so a batching change has to be tested
+  there, and #75's own move/rollback tests (`tests/move_file.rs`,
+  `tests/fat_chain_errors.rs`) must keep passing — the install path depends on
+  cluster-chain behaviour that a write-batching change sits directly beneath.
 
 ## Done
 
@@ -271,6 +340,11 @@ SD session.
   one transaction) and the data clock went 20 → 25 MHz. **Measured: cold build
   −5.4%, `write_ms` −9.5%, progress write −35%.** This is the honest number;
   the PRD originally projected ~2× SD bandwidth and that framing was wrong.
+- **D4** (#73) — directed station join. Section kept above under "Open" for
+  its two review notes, which describe shipped behaviour.
+- **Long-name uploads, journalled install** (#75) — not a WS-D performance
+  item, but it landed in this workstream's files and moved the driver to our
+  fork. Its effect on the items here is described at the top.
 - **D3** (#19) — the onboarding hotspot was open, so the home SSID and
   password crossed the air in plaintext. Shipped as a **per-session runtime
   PSK** with on-device QR encoding, not the build-time PSK originally
