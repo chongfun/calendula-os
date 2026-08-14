@@ -515,6 +515,8 @@ Where Embassy task entry points require concrete hardware types, use thin platfo
 
 Do not introduce dynamic dispatch or allocation solely to erase peripheral types.
 
+Rail control is listed above as platform-owned, and that ownership has a shape requirement attached: see "Held pads and shared consumers" under Power architecture. The generic transfer/session logic shared here is exactly the code that touches rail and RESET pads which may carry an inherited hold, so the pad handle it is given has to reconcile that rather than assume a writable pin. Ordering matters as much as the handle: on a board where SD and the panel share a bus, the card rail has to be powered before the first display transaction, so "storage is not needed on this boot path" is not a reason to skip it.
+
 ## Power architecture
 
 Keep the semantic sleep handshake common:
@@ -532,6 +534,28 @@ Actual wake source and sleep instruction remain platform-specific.
 C3 retains its existing mechanism.
 
 S3 implements its own.
+
+### Step 6 is a sequence, not a call
+
+"Platform enters terminal deep sleep" reads as one instruction and is not one on either platform. Between permission and sleep sits a pad-state sequence — drive each pad that must survive sleep to its intended level, hold it individually, then enable the global hold — and on wake the inverse has to be unwound before anything writes those pads.
+
+**This PRD does not implement that sequence.** It is Sticky's, and the S3 half is specified in `reterminal-sticky-support`. What this PRD owns is not foreclosing it, because the seams that decide whether it is expressible are designed in Milestones 2 and 3, well before any of it is built. Three requirements follow, and each one is a shape the abstraction must be able to express — not behavior to add now.
+
+**Pad hold is a capability, not an assumption.** The two platforms hold pads by different mechanisms with different coverage: the S3 needs its digital GPIO deep-sleep hold path, while a C3 pad goes high-Z in deep sleep regardless of the level last written, and only RTC-domain pads can retain one at all. So a shared requirement phrased as "hold the RESET pad" is satisfiable on one platform and *not expressible* on the other for a non-RTC pin. That is not hypothetical: it is why PR #70's `rst.set_high()` could not have worked. Per the principle above, the shared interface states the outcome — *this pad's level survives deep sleep* — and the platform reports whether it can deliver it for a given pad. A shared caller must be able to ask, and must have somewhere to go when the answer is no.
+
+**A rail is not a bool.** Rail-enable polarity is per-rail and per-board: "off" is the pad's *inactive* level, which is LOW for an active-high enable and HIGH for an active-low one. Upstream carries a polarity flag per rail for exactly this reason — one of their boards powers its card while the enable is held LOW. Any common rail model that stores on/off without polarity pushes the inversion out to every caller, and the failure mode is a rail left powered through sleep, which shows up as standby drain rather than a functional fault.
+
+**A pad's sleep level can depend on another pad's rail.** The panel RESET line is the case that proves the contract has to carry a level rather than a mechanism: its correct sleep state is LOW when the panel rail is gated off — driving an unpowered controller's RESET high back-powers it through the protection diode — and HIGH when the rail stays powered, so the controller cannot leave deep sleep and restart its booster. Both are "hold RESET"; they are opposite levels, decided by a *different* pad's configuration. An interface that lets a board say only which pads to hold cannot express this. One that takes a level per pad can.
+
+### Held pads and shared consumers
+
+A held pad ignores writes. Releasing the hold is not optional cleanup — it is a precondition for the next write doing anything at all, and the failure is silent: the write returns success and the pin does not move.
+
+This matters here rather than only in the board PRD because **the code that touches these pads first is shared code**. The panel controller probe pulses RESET. The SD session drives the card rail. The display bus configures RESET again on init. All three live in common paths that will run on a platform where those pads may carry an inherited hold — from the last sleep, from a watchdog reset, or from an entirely different firmware that ran before this one.
+
+Requirement on the seam: a platform pad handle exposed to shared code must make "write without releasing an inherited hold" either impossible or loud. A bare `set_high()` on a pad that may be held is the trap — it is the API shape that produced #70's misdiagnosis, and repeating it in `fw-common` would spread a single-platform mistake to every consumer. Prefer a handle whose write path reconciles the hold, over a documented convention that each caller must remember.
+
+The consequence of getting this wrong is worth stating because it does not look like a pad problem: a probe whose reset pulse silently did nothing does not fail, it **selects the wrong driver**, and a card rail left held off on a board that shares SPI between SD and the panel clamps the bus so the display never initializes at all.
 
 ## Wi-Fi architecture
 
@@ -735,6 +759,7 @@ Scope:
 - dependency checks enforce the architecture
 - X3/X4 remain unchanged
 - C3 flash/RAM/stack measurements are re-compared after the moves; a source-only relocation is not assumed free
+- **the pad-state contract is demonstrably expressible before anything depends on it.** Moving the C3 RTC/deep-sleep helpers into `fw-c3` is the moment the shared side of this gets its shape, so write the S3 case down against it on paper: a per-pad sleep *level*, a platform answer to "can this pad hold", and a pad handle whose write reconciles an inherited hold. The check is that a Sticky-shaped requirement — hold RESET LOW because its rail is gated, hold a rail enable at its inactive level, release before the probe pulses — can be stated in the seam as it stands. **Do not implement it here.** If it cannot be stated, fix the seam now rather than after `fw-s3` exists, which is the whole reason the check sits in this milestone.
 
 ### Milestone 4: S3 platform proof
 

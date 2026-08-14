@@ -16,8 +16,11 @@ Required prerequisites:
 - `fw-common` is MCU-neutral.
 - `hal-ext` is MCU-neutral.
 - S3 does not inherit C3 linker, allocator, radio-memory, sleep, OTA/MMU, or single-core policy.
+- the pad-state seam can express a per-pad sleep *level*, a per-pad "can this platform hold it" answer, and a pad handle that reconciles an inherited hold. See "Step 6 is a sequence, not a call" and "Held pads and shared consumers" in that PRD, whose Milestone 3 checks this on paper specifically so this PRD does not have to retrofit it.
 
 This PRD adds a **board/device implementation** to an already-existing S3 platform.
+
+The pad-hold requirements below are the S3 and Sticky-specific half of that contract. If the two ever disagree, the multi-platform PRD owns the shape of the interface and this one owns the levels, polarities, and pins.
 
 ## Goal
 
