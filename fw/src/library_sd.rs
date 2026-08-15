@@ -260,6 +260,8 @@ where
         }
     };
     let outcome = upload_store::install::recover_installs(root, &books);
+    #[cfg(feature = "powercut-selftest")]
+    crate::powercut::report_recovery(&outcome);
     if outcome.touched_shelf {
         esp_println::println!("sd: finished an interrupted install");
     }

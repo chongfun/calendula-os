@@ -597,8 +597,15 @@ where
     // that would tell the next mount a surviving snapshot is stale.
     if !catalog_cleared {
         esp_println::println!("upload: no install is replayed while the old snapshot stands");
-    } else if !upload_store::install::recover_installs(root, books).complete {
-        esp_println::println!("upload: an install is unfinished; refusing changes until it clears");
+    } else {
+        let outcome = upload_store::install::recover_installs(root, books);
+        #[cfg(feature = "powercut-selftest")]
+        crate::powercut::report_recovery(&outcome);
+        if !outcome.complete {
+            esp_println::println!(
+                "upload: an install is unfinished; refusing changes until it clears"
+            );
+        }
     }
 
     loop {
@@ -832,6 +839,11 @@ where
         staged.abandon(root);
         return UploadWrite::Finished(None);
     }
+    // Test-only: the one place a cut can be timed into the install rather
+    // than aimed at it from outside. Must be the last thing before the call
+    // — anything awaited after it spends the deadline it just armed.
+    #[cfg(feature = "powercut-selftest")]
+    crate::powercut::arm_for_install().await;
     // install closes the file first: a book the card has not finished
     // writing is never published. From the moment the intent is durable the
     // swap completes here or at the next mount, never half way.

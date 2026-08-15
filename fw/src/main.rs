@@ -138,6 +138,8 @@ mod display_flush;
 mod library_sd;
 mod mmu;
 mod ota_update;
+#[cfg(feature = "powercut-selftest")]
+pub mod powercut;
 mod probe_cache;
 mod probe_report;
 mod sd_session;
@@ -643,5 +645,7 @@ fn main() -> ! {
         spawner.spawn(tasks::app::run().unwrap());
         esp_println::println!("main: spawn wifi t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::wifi::run(spawner, peripherals.WIFI).unwrap());
+        #[cfg(feature = "powercut-selftest")]
+        spawner.spawn(powercut::autostart().unwrap());
     })
 }

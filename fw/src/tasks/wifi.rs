@@ -421,10 +421,11 @@ async fn upload_server(
         // Reborrow the pieces by index so the buffer stays usable for the
         // body bytes that arrived with the headers.
         let path_at = method_len + 1;
-        let is_upload_post = request_buf
+        let is_post = request_buf
             .get(..method_len)
             .map(|m| m == b"POST")
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let is_upload_post = is_post
             && request_buf
                 .get(path_at..path_at + path_len)
                 .map(|p| p.starts_with(b"/upload"))
@@ -432,13 +433,39 @@ async fn upload_server(
 
         let path = request_buf.get(path_at..path_at + path_len).unwrap_or(b"/");
         let is_list = path.starts_with(b"/list");
-        let is_delete = request_buf
-            .get(..method_len)
-            .map(|m| m == b"POST")
-            .unwrap_or(false)
-            && path.starts_with(b"/delete");
+        let is_delete = is_post && path.starts_with(b"/delete");
+        // Test-only: the abrupt-reset arm for the install durability
+        // campaign. Compiles to `false` (and the branch below to nothing)
+        // outside `powercut-selftest` builds.
+        let is_powercut = {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                is_post && path.starts_with(b"/test-powercut")
+            }
+            #[cfg(not(feature = "powercut-selftest"))]
+            {
+                false
+            }
+        };
 
-        if is_list {
+        if is_powercut {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                // `at_install_ms` defers the arm to the start of the next
+                // install, which is the only way to land a cut inside a
+                // window too narrow to aim at from the host.
+                if let Some(ms) = crate::powercut::parse_at_install_ms(path) {
+                    crate::powercut::CUT_AT_INSTALL_MS.store(ms, portable_atomic::Ordering::SeqCst);
+                    let _ = write_http_response(&mut socket, "200 OK", "armed at install").await;
+                } else if let Some(ms) = crate::powercut::parse_after_ms(path) {
+                    crate::powercut::POWERCUT_ARM.signal(ms);
+                    let _ = write_http_response(&mut socket, "200 OK", "armed").await;
+                } else {
+                    let _ =
+                        write_http_response(&mut socket, "400 Bad Request", "bad after_ms").await;
+                }
+            }
+        } else if is_list {
             let listing =
                 core::str::from_utf8(&catalog[..catalog_len.min(catalog.len())]).unwrap_or("");
             let _ = write_http_response(&mut socket, "200 OK", listing).await;

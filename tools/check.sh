@@ -75,6 +75,13 @@ case "$COMMAND" in
 
         echo "Running firmware clippy with serial-log disabled for X3..."
         tools/cargo.sh clippy -p fw --no-default-features --features device-x3 -- -D warnings
+
+        # The durability campaign's firmware. Never shipped, so nothing above
+        # compiles it -- and a bench operator finding it broken is finding it
+        # at the worst possible moment, with the device already open and the
+        # card already staged. X3 only: it is the board the campaign runs on.
+        echo "Running firmware clippy for the powercut campaign for X3..."
+        tools/cargo.sh clippy -p fw --features device-x3,powercut-selftest -- -D warnings
         ;;
     test-host)
         echo "Running host tests..."
@@ -142,6 +149,16 @@ case "$COMMAND" in
         echo "Running bench harness tests..."
         "$PYTHON" -m unittest discover -s tools/bench -p 'test_*.py'
         ;;
+    test-tools)
+        # Operator tooling whose *analysis* decides a pass or a fail, and so
+        # cannot be left to be exercised only on a bench. The powercut
+        # campaign's landing logic is the whole of what turns an installer
+        # durability defect into a reported failure; a bug there reports
+        # green on a broken card.
+        require_python
+        echo "Running device tool tests..."
+        "$PYTHON" -m unittest tools/powercut_campaign.py
+        ;;
     ruff)
         # Python lint and formatting, configured in ruff.toml at the repo
         # root. Refuses to run rather than skipping when ruff is missing, for
@@ -193,7 +210,7 @@ case "$COMMAND" in
         #
         # Only pre-push and `all` reach this. CI invokes the individual
         # targets on separate runners and never goes through here.
-        FAST_STAGES=(fmt ruff test-bench clippy-host test-host test-host-x3)
+        FAST_STAGES=(fmt ruff test-bench test-tools clippy-host test-host test-host-x3)
 
         # Job control, for cancellation. Two things follow from `set -m` that
         # this arm depends on. Without it, POSIX has the shell set SIGINT to
@@ -276,7 +293,7 @@ case "$COMMAND" in
         "$0" firmware
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|ruff|golden-frames|test-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|ruff|golden-frames|test-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
         echo "  'all' runs all required root/firmware verification."
         exit 1
         ;;
