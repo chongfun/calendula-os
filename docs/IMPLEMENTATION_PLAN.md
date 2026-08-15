@@ -213,9 +213,9 @@ Current code status:
   document ids -> SyncEvents back to the screen -> Exit resets the device.
   Scenario coverage in `fixtures/scenarios/sync-*.toml`; protocol host tests
   in `proto::kosync`.
-- Dev credentials are compile-time: build with `XTEINK_WIFI_SSID`,
-  `XTEINK_WIFI_PASS`, `XTEINK_KOSYNC_HOST` (host or host:port, plain HTTP),
-  `XTEINK_KOSYNC_USER`, `XTEINK_KOSYNC_PASS`.
+- Dev credentials are compile-time: build with `CALENDULA_WIFI_SSID`,
+  `CALENDULA_WIFI_PASS`, `CALENDULA_KOSYNC_HOST` (host or host:port, plain HTTP),
+  `CALENDULA_KOSYNC_USER`, `CALENDULA_KOSYNC_PASS`.
 - On-device validation (June 11 2026, esp-hal 0.23 stack): the full session
   ran on hardware — Confirm started it, the loan + book gather + radio init
   completed, the station joined and got 192.168.0.233 via DHCP (~21 s from
@@ -237,11 +237,14 @@ Current code status:
   serial: a station join sourced from WIFI.BIN rather than compile-time
   credentials, and the auto-raised sign-in sheet. Details: with no
   WIFI.BIN and no compile-time credentials, Confirm on the Sync screen
-  raises an open XTEINK-X4 hotspot at 192.168.4.1 with hand-rolled captive
+  raises a `CALENDULA-XXXXXX` hotspot at 192.168.4.1 with hand-rolled captive
   DHCP/DNS (proto::captive, host-tested) and a credential form; submitted
   credentials persist through StoreWifiCredentials into /READER/WIFI.BIN
-  and the next session joins as a station. Join QR baked by
-  tools/generate_qr.py. Stack region after the portal: ~38.9 KB.
+  and the next session joins as a station. The join QR is encoded at
+  render time by ui/src/join_qr.rs from the session PSK and this device's
+  PortalSsid, neither of which is a build-time constant;
+  tools/generate_qr.py bakes only the fixed portal-URL QR. Stack region
+  after the portal: ~38.9 KB.
 - Browser EPUB upload validated end to end on hardware June 11 2026: a
   2.4 MB EPUB traveled browser -> Wi-Fi -> loaned buffers -> /BOOKS and
   surfaced on the shelf after the rescan; the page lists the catalog with

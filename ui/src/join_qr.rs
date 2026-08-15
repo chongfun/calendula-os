@@ -11,42 +11,32 @@
 
 use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
 
-/// The onboarding hotspot's SSID: the `S:` field of the QR payload and
-/// the network the Wireless screen's caption names. The firmware's AP
-/// config must beacon exactly this. Board-named so an X3 doesn't
-/// advertise itself as an X4; both spellings are nine bytes, so the QR
-/// payload shape is identical.
-pub const PORTAL_SSID: &str = if display::DEVICE_IS_X3 {
-    "XTEINK-X3"
-} else {
-    "XTEINK-X4"
-};
-
-/// Highest QR version the scratch buffers accommodate. The payload has a
-/// fixed shape — 18 bytes of `WIFI:` scaffolding around the 9-byte SSID
-/// and 16-byte PSK, 43 bytes total — which byte mode fits in version 4
-/// at EC level M (62-byte capacity; version 3's 42 misses by one), a
-/// 33-module symbol. Version 5 leaves the encoder one version of slack
-/// without growing the buffers past 173 bytes each.
+/// Highest QR version the scratch buffers accommodate. The payload is 18
+/// bytes of `WIFI:` scaffolding around the SSID and the 16-byte PSK — 50
+/// bytes for a [`app_core::PortalSsid`] — which byte mode fits in version 4
+/// at EC level M (62-byte capacity), a 33-module symbol. Version 5 leaves
+/// the encoder one version of slack without growing the buffers past 173
+/// bytes each, and the 64-byte payload scratch below caps the SSID at 30.
 pub const MAX_VERSION: Version = Version::new(5);
 
 /// Required length of both scratch buffers handed to [`encode`].
 pub const BUFFER_LEN: usize = 173;
 
-/// Encodes `WIFI:T:WPA;S:{PORTAL_SSID};P:{psk};;` at EC level M with the
+/// Encodes `WIFI:T:WPA;S:{ssid};P:{psk};;` at EC level M with the
 /// smallest version that fits (version 4 for the 16-char PSK) and an
 /// automatically chosen mask. The PSK alphabet excludes every character
 /// the `WIFI:` payload would need escaped (`\ ; , : "`), so `psk` is
 /// spliced in verbatim. Returns `None` only when the payload cannot fit
 /// [`MAX_VERSION`]; a portal-shaped PSK never triggers that.
 pub fn encode<'a>(
+    ssid: &str,
     psk: &str,
     temp: &mut [u8; BUFFER_LEN],
     out: &'a mut [u8; BUFFER_LEN],
 ) -> Option<QrCode<'a>> {
     let mut payload = [0u8; 64];
     let mut len = 0;
-    for part in ["WIFI:T:WPA;S:", PORTAL_SSID, ";P:", psk, ";;"] {
+    for part in ["WIFI:T:WPA;S:", ssid, ";P:", psk, ";;"] {
         let bytes = part.as_bytes();
         if len + bytes.len() > payload.len() {
             return None;
@@ -76,11 +66,15 @@ mod tests {
 
     fn demo_qr(out: &mut [u8; BUFFER_LEN]) -> QrCode<'_> {
         let mut temp = [0u8; BUFFER_LEN];
-        encode(DEMO_PSK, &mut temp, out).expect("demo PSK must encode")
+        let mut ssid = [0u8; app_core::PortalSsid::LEN];
+        let ssid = app_core::PortalSsid::EMULATOR_DEMO.write_into(&mut ssid);
+        encode(ssid, DEMO_PSK, &mut temp, out).expect("demo payload must encode")
     }
 
+    /// The payload is 50 bytes for a [`app_core::PortalSsid`] name and a
+    /// 16-character PSK, which byte mode fits in version 4 at EC level M.
     #[test]
-    fn sixteen_char_psk_lands_in_version_4() {
+    fn the_portal_payload_lands_in_version_4() {
         let mut out = [0u8; BUFFER_LEN];
         let qr = demo_qr(&mut out);
         assert_eq!(qr.version().value(), 4);
@@ -109,6 +103,34 @@ mod tests {
         let long = "23456789ABCDEFGH23456789ABCDEFGH23456789ABCDEFGH";
         let mut temp = [0u8; BUFFER_LEN];
         let mut out = [0u8; BUFFER_LEN];
-        assert!(encode(long, &mut temp, &mut out).is_none());
+        let mut ssid = [0u8; app_core::PortalSsid::LEN];
+        let ssid = app_core::PortalSsid::EMULATOR_DEMO.write_into(&mut ssid);
+        assert!(encode(ssid, long, &mut temp, &mut out).is_none());
+    }
+
+    /// The name is per device, so the symbol has to change with it -- a QR
+    /// that encoded one device's network on another's screen would join the
+    /// wrong reader.
+    #[test]
+    fn a_different_device_encodes_a_different_symbol() {
+        let mut a_buf = [0u8; BUFFER_LEN];
+        let a = demo_qr(&mut a_buf);
+        let a_modules: Vec<bool> = (0..a.size())
+            .flat_map(|y| (0..a.size()).map(move |x| (x, y)))
+            .map(|(x, y)| a.get_module(x, y))
+            .collect();
+
+        let mut temp = [0u8; BUFFER_LEN];
+        let mut b_buf = [0u8; BUFFER_LEN];
+        let mut other = [0u8; app_core::PortalSsid::LEN];
+        let other = app_core::PortalSsid::from_mac_tail([0x2A, 0x2D, 0x6C]).write_into(&mut other);
+        let b = encode(other, DEMO_PSK, &mut temp, &mut b_buf).expect("encodes");
+
+        assert_eq!(a.size(), b.size(), "both still version 4");
+        let b_modules: Vec<bool> = (0..b.size())
+            .flat_map(|y| (0..b.size()).map(move |x| (x, y)))
+            .map(|(x, y)| b.get_module(x, y))
+            .collect();
+        assert_ne!(a_modules, b_modules, "the symbol must carry the name");
     }
 }

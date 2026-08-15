@@ -54,9 +54,18 @@ const DIRECTED_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// disconnect that retires a leftover association.
 const RADIO_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
-/// The hotspot beacons the SSID the join QR names; `ui::join_qr` is the
-/// single source, so the QR a phone scans cannot drift from the AP.
-const PORTAL_SSID: &str = ui::join_qr::PORTAL_SSID;
+/// This device's hotspot name, from the low three bytes of its MAC.
+///
+/// Read here rather than fixed at build time because two readers running this
+/// firmware raise two hotspots, and a name keyed on the board could not tell
+/// a pair of the same model apart. The screen names the network the join QR
+/// points at, so one string beacons, renders, and encodes -- the AP and the QR
+/// cannot drift.
+fn portal_ssid() -> app_core::PortalSsid {
+    let mac = esp_hal::efuse::base_mac_address();
+    let bytes = mac.as_bytes();
+    app_core::PortalSsid::from_mac_tail([bytes[3], bytes[4], bytes[5]])
+}
 const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
 
 /// Alphabet for the per-session portal PSK; lives in app-core next to
@@ -92,11 +101,11 @@ fn mint_portal_psk(rng: Rng) -> app_core::PortalPsk {
 }
 
 /// Compile-time station credentials for the dev phase:
-/// `XTEINK_WIFI_SSID=... XTEINK_WIFI_PASS=... cargo build ...`
+/// `CALENDULA_WIFI_SSID=... CALENDULA_WIFI_PASS=... cargo build ...`
 pub fn credentials() -> Option<(&'static str, &'static str)> {
     Some((
-        option_env!("XTEINK_WIFI_SSID")?,
-        option_env!("XTEINK_WIFI_PASS")?,
+        option_env!("CALENDULA_WIFI_SSID")?,
+        option_env!("CALENDULA_WIFI_PASS")?,
     ))
 }
 
@@ -742,10 +751,13 @@ async fn run_portal(
     // dropdown with the manual-entry option.
     let options_len = scan_network_options(controller, http_b).await;
     let psk = mint_portal_psk(Rng::new());
+    let ssid = portal_ssid();
+    let mut ssid_buf = [0u8; app_core::PortalSsid::LEN];
+    let ssid_text = ssid.write_into(&mut ssid_buf);
     let device = Interface::access_point();
     let config = WifiConfig::AccessPoint(
         AccessPointConfig::default()
-            .with_ssid(PORTAL_SSID)
+            .with_ssid(ssid_text)
             .with_auth_method(AuthenticationMethod::Wpa2Personal)
             .with_password(psk.as_str().into()),
     );
@@ -776,8 +788,8 @@ async fn run_portal(
 
     // The PSK itself stays off the serial log; the screen is its only
     // channel.
-    esp_println::println!("portal: up at 192.168.4.1 as {}", PORTAL_SSID);
-    SYNC_EVENTS.send(SyncEvent::PortalUp(psk)).await;
+    esp_println::println!("portal: up at 192.168.4.1 as {}", ssid_text);
+    SYNC_EVENTS.send(SyncEvent::PortalUp(psk, ssid)).await;
 
     // Three servers share the task; Exit interrupts them with the reset.
     select(
