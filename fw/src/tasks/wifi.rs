@@ -447,8 +447,76 @@ async fn upload_server(
                 false
             }
         };
+        // Test-only: read a book back off the card and report what is in it.
+        let is_digest = {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                path.starts_with(b"/test-digest")
+            }
+            #[cfg(not(feature = "powercut-selftest"))]
+            {
+                false
+            }
+        };
 
-        if is_powercut {
+        if is_digest {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
+                let in_books = path_bytes
+                    .as_ref()
+                    .map(|p| !proto::upload::has_query_param(p, b"root=1"))
+                    .unwrap_or(true);
+                let name = path_bytes
+                    .as_mut()
+                    .and_then(|p| proto::upload::raw_query_name(p))
+                    .and_then(|decoded| valid_short_name(decoded));
+                match name {
+                    Some(name) => {
+                        // Reading the card needs a session for the same
+                        // reason a delete does: the storage owner holds the
+                        // volume, and nothing else may open it.
+                        if !session_started {
+                            crate::upload::UPLOAD_SESSION_ACTIVE
+                                .store(true, portable_atomic::Ordering::SeqCst);
+                            STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
+                            session_started = true;
+                        }
+                        crate::powercut::DIGEST_REQUESTS
+                            .send(crate::powercut::DigestRequest { name, in_books })
+                            .await;
+                        let reply = match select(
+                            crate::powercut::DIGEST_RESULTS.receive(),
+                            UPLOAD_INTERRUPTS.wait(),
+                        )
+                        .await
+                        {
+                            Either::First(reply) => reply,
+                            Either::Second(()) => {
+                                reclaim_upload_pipeline(&mut pool);
+                                session_started = false;
+                                None
+                            }
+                        };
+                        let mut body = heapless::String::<64>::new();
+                        match reply {
+                            Some((length, hash)) => {
+                                use core::fmt::Write as _;
+                                let _ = write!(body, "len={} fnv={:016x}", length, hash);
+                            }
+                            None => {
+                                let _ = body.push_str("unreadable");
+                            }
+                        }
+                        let _ = write_http_response(&mut socket, "200 OK", body.as_str()).await;
+                    }
+                    None => {
+                        let _ =
+                            write_http_response(&mut socket, "400 Bad Request", "bad name").await;
+                    }
+                }
+            }
+        } else if is_powercut {
             #[cfg(feature = "powercut-selftest")]
             {
                 // `at_install_ms` defers the arm to the start of the next

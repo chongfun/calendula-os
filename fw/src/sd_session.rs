@@ -587,6 +587,44 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    /// What woke the session loop.
+    enum SessionInput {
+        Command(UploadBegin),
+        Stop,
+        Display(DisplayCommand),
+        #[cfg(feature = "powercut-selftest")]
+        Digest(crate::powercut::DigestRequest),
+    }
+
+    /// The session's wait. A `powercut-selftest` build listens for a
+    /// readback alongside the ordinary commands; a shipping build compiles
+    /// to exactly the two-way wait it always had.
+    async fn next_session_input() -> SessionInput {
+        let ordinary = async {
+            match select(
+                UPLOAD_BEGINS.receive(),
+                select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+            )
+            .await
+            {
+                Either::First(begin) => SessionInput::Command(begin),
+                Either::Second(Either::First(())) => SessionInput::Stop,
+                Either::Second(Either::Second(command)) => SessionInput::Display(command),
+            }
+        };
+        #[cfg(feature = "powercut-selftest")]
+        {
+            match select(ordinary, crate::powercut::DIGEST_REQUESTS.receive()).await {
+                Either::First(input) => input,
+                Either::Second(request) => SessionInput::Digest(request),
+            }
+        }
+        #[cfg(not(feature = "powercut-selftest"))]
+        {
+            ordinary.await
+        }
+    }
+
     // Finish anything an earlier session left in flight before touching the
     // shelf. A record still on the card owns the names it describes and is
     // the only thing that knows where its files went, so this session must
@@ -609,20 +647,31 @@ where
     }
 
     loop {
-        let begin = match select(
-            UPLOAD_BEGINS.receive(),
-            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
-        )
-        .await
-        {
-            Either::First(begin) => begin,
-            Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
-            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
+        let begin = match next_session_input().await {
+            // Test-only readback, served from here because this is where the
+            // card's owner already holds `root` and `books` open — a digest
+            // taken anywhere else would be a second task on the bus. It sits
+            // in the wait rather than being polled around it, so a request
+            // arriving at an idle session is answered instead of waiting for
+            // some other command to wake the loop.
+            #[cfg(feature = "powercut-selftest")]
+            SessionInput::Digest(request) => {
+                let reply = if request.in_books {
+                    digest_book(books, request.name.as_str())
+                } else {
+                    digest_book(root, request.name.as_str())
+                };
+                crate::powercut::DIGEST_RESULTS.send(reply).await;
+                continue;
+            }
+            SessionInput::Command(begin) => begin,
+            SessionInput::Stop => return UploadSessionExit::Wireless,
+            SessionInput::Display(DisplayCommand::Sleep { generation }) => {
                 return UploadSessionExit::Sleep { generation }
             }
             // The wireless screen is already painted; renders queued during
             // the upload phase describe views this session never shows.
-            Either::Second(Either::Second(DisplayCommand::Render(_))) => continue,
+            SessionInput::Display(DisplayCommand::Render(_)) => continue,
         };
         // Asked once per command rather than once per session, because an
         // install that fails part way through leaves a record behind and
@@ -666,6 +715,60 @@ where
         );
         UPLOAD_RESULTS.send(ok).await;
     }
+}
+
+/// Read a book back off the card and digest the bytes that are actually
+/// there (`powercut-selftest` only).
+///
+/// The durability campaign's oracle was the directory entry's recorded
+/// length, which is metadata: an entry of the right size whose chain is
+/// wrong, unreadable, or holding somebody else's clusters satisfies it. This
+/// is the independent evidence — the file is opened, streamed, and hashed,
+/// so what comes back describes the chain rather than the entry over it.
+///
+/// `None` means the book could not be opened or a read failed part way, both
+/// of which the campaign treats as a book that is not there in any useful
+/// sense.
+#[cfg(feature = "powercut-selftest")]
+fn digest_book<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> crate::powercut::DigestReply
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = dir
+        .open_file_in_dir(name, embedded_sdmmc::Mode::ReadOnly)
+        .ok()?;
+    let mut hash = crate::powercut::DIGEST_SEED;
+    let mut read_total = 0u32;
+    // One sector at a time, on the session's stack. The campaign is the only
+    // caller and it is waiting on the answer, so this is allowed to be slow;
+    // it is not allowed to be large.
+    let mut buffer = [0u8; 512];
+    while !file.is_eof() {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hash = crate::powercut::digest_chunk(hash, &buffer[..read]);
+        read_total += read as u32;
+    }
+    let length = file.length();
+    // A file whose chain runs short of what its entry advertises is exactly
+    // the corruption this exists to catch, so it is reported rather than
+    // quietly digested at the wrong length.
+    if read_total != length {
+        esp_println::println!(
+            "powercut: '{}' read {} of {} bytes",
+            name,
+            read_total,
+            length
+        );
+        return None;
+    }
+    Some((length, hash))
 }
 
 /// Whether the journal leaves the shelf free to change, replaying it once

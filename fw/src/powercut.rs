@@ -21,6 +21,7 @@
 //! without button presses and keeps the idle-sleep leash pushed out.
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use portable_atomic::{AtomicU32, Ordering};
@@ -91,6 +92,33 @@ pub async fn arm_for_install() {
     esp_println::println!("powercut: arming {} ms at install", ms);
     POWERCUT_ARM.signal(u64::from(ms));
     Timer::after(Duration::from_millis(ARM_SETTLE_MS)).await;
+}
+
+/// A request to read a book off the card and digest what is actually there.
+pub struct DigestRequest {
+    pub name: crate::upload::UploadName,
+    pub in_books: bool,
+}
+
+/// `(length, digest)` of the named book's bytes, or `None` if it could not
+/// be opened or read.
+pub type DigestReply = Option<(u32, u64)>;
+
+pub static DIGEST_REQUESTS: Channel<CriticalSectionRawMutex, DigestRequest, 1> = Channel::new();
+pub static DIGEST_RESULTS: Channel<CriticalSectionRawMutex, DigestReply, 1> = Channel::new();
+
+/// FNV-1a over the file's bytes. Not a cryptographic claim — the campaign
+/// compares against a body it generated itself, so this only has to catch
+/// bytes that differ, not bytes chosen to collide. Cheap enough that the SD
+/// read stays the cost.
+pub const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+pub fn digest_chunk(hash: u64, bytes: &[u8]) -> u64 {
+    let mut hash = hash;
+    for &byte in bytes {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    hash
 }
 
 /// Reports what mount-time recovery found, for the campaign to read.

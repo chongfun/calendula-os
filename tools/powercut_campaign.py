@@ -20,23 +20,34 @@ Three properties of the device shape the checks:
   change what `/list` returns until the device reboots. Every read here is
   therefore taken *after* a reboot, which each cycle performs anyway.
 - **An interrupted operation has exactly two legal outcomes**, and the shelf
-  must land on one of them *at the right length*: for an upload, the book is
-  wholly there or wholly absent; for a delete, gone or still present.
+  must land on one of them *holding the right bytes*: for an upload, the book
+  is wholly there or wholly absent; for a delete, gone or still present.
   Anything else — a stranger appearing, an untargeted book vanishing, a name
-  listed twice, a book of a length no landing allows — is the failure this
-  campaign exists to catch. A duplicated name is the specific signature of a
-  half-finished move, where two directory entries share one cluster chain;
-  a wrong length is a book published half-written.
+  listed twice, a book whose contents match neither landing — is the failure
+  this campaign exists to catch. A duplicated name is the specific signature
+  of a half-finished move, where two directory entries share one cluster
+  chain.
 - **A standing journal record refuses further uploads and deletes.** So the
   next cycle's operation being accepted at all is the proof that recovery
   cleared the record. Cleanup is checked for the same thing, because the
   last cycle has no next one.
 
+The oracle reads books back off the card (`/test-digest`, selftest only)
+rather than trusting the listing. The length `/list` reports is the FAT
+directory entry's, which is metadata written beside the data: an entry of
+the right size whose chain is short, unreadable, or pointing at somebody
+else's clusters passes a length check — and mangled entries and chains are
+precisely what an interrupted install would leave. The digest comes from
+opening the file and streaming it, so it describes the chain.
+
 Books already on the card are an untouched baseline, verified at every read
-to still be present and still the same length. What the campaign may delete
-comes from a host-side manifest of what it created (`--manifest`), never
-from a name: a reader's own book that happens to be called `PCUT...` is not
-this tool's to remove, and it refuses to start rather than guess.
+to still be present and unchanged. What the campaign may delete comes from a
+host-side manifest (`--manifest`), and a claim in it is an intent, not a
+licence: before treating a listed book as its own the campaign reads it back
+and checks the bytes are the bytes it wrote. A book whose contents do not
+match — a reader's own book that happens to be called `PCUT...`, or one that
+replaced a claim after a crashed run — stops the run rather than being
+deleted.
 
 A run whose cuts did not actually land inside operations, or never reached
 the journal's replay path, exits non-zero. Green has to mean the property
@@ -105,6 +116,24 @@ RESET_PATTERN = r"rst:.*(RTC|WDT)|powercut: auto-starting"
 # the powercut-selftest firmware. The capture group says whether finishing
 # the transaction required moving a file.
 RECOVERY_PATTERN = r"powercut: recovery replayed a record: moved=(\w+)"
+
+
+DIGEST_SEED = 0xCBF29CE484222325
+DIGEST_PRIME = 0x100000001B3
+DIGEST_MASK = (1 << 64) - 1
+
+
+def digest(body):
+    """FNV-1a over `body`, matching `fw::powercut::digest_chunk`.
+
+    Not a cryptographic claim: the campaign compares against a body it
+    generated itself, so this only has to catch bytes that differ, not bytes
+    chosen to collide.
+    """
+    hash_ = DIGEST_SEED
+    for byte in body:
+        hash_ = ((hash_ ^ byte) * DIGEST_PRIME) & DIGEST_MASK
+    return hash_
 
 
 def scan(lines, pattern):
@@ -286,39 +315,99 @@ class Manifest:
     user's library. Kept on the host and written through on every claim, so
     a run killed mid-cycle still leaves a truthful list behind.
 
-    Keyed on the label, which the campaign chooses before it uploads. The
-    8.3 `open_name` beside it is the driver's to derive and is not known
-    until the book has been listed — too late to record an intent that has
-    to survive a crash during the write it describes.
+    Two states per label, and the difference decides whether this tool may
+    delete a book:
+
+    - **pending** — recorded before the upload, so a crash mid-write leaves
+      the intent behind. It carries the identity of the bytes that were
+      about to be sent. A pending claim is *not* authority to delete: the
+      upload may never have landed, and by the time anyone looks the label
+      could belong to a book somebody else put there.
+    - **owned** — the identity was read back off the card and matched. Only
+      these are deleted.
+
+    So ownership is knowledge in the strict sense: the campaign deletes a
+    book only when it has read that book's bytes and they are the bytes it
+    wrote. A label whose contents do not match is somebody else's.
+
+    A claim holds every identity the label may legitimately have, which
+    during a write is two: an interrupted replace leaves either the body
+    that was there or the one being written, and both are the campaign's.
+    The pair collapses to the one observed as soon as a cycle reads the
+    result back.
     """
 
     def __init__(self, path):
         self.path = path
-        self.owned = set()
+        # label -> {(length, digest), ...} the campaign wrote or meant to.
+        self.claims = {}
+
+    @property
+    def owned(self):
+        return set(self.claims)
 
     def load(self):
+        """Read the manifest. One line per label:
+
+            LABEL<tab>LENGTH:DIGEST[<tab>LENGTH:DIGEST...]
+
+        A line that does not parse stops the run with the line in hand. This
+        file is meant to be inspected and sometimes edited — the error a
+        reader gets for a stray keystroke should say what is wrong with it.
+        """
+        self.claims = {}
         try:
             with open(self.path, encoding="utf-8") as f:
-                self.owned = {line.strip() for line in f if line.strip()}
+                for number, line in enumerate(f, start=1):
+                    if not line.strip():
+                        continue
+                    label, *fields = line.rstrip("\n").split("\t")
+                    identities = set()
+                    for field in fields:
+                        length, _, hash_ = field.partition(":")
+                        if not length.isdigit() or len(hash_) != 16:
+                            raise AssertionError(
+                                f"{self.path}:{number}: cannot read {field!r} as "
+                                f"LENGTH:DIGEST — each claim is a decimal length and a "
+                                f"16-digit hex digest, tab-separated from the label"
+                            )
+                        identities.add((int(length), int(hash_, 16)))
+                    if not identities:
+                        raise AssertionError(
+                            f"{self.path}:{number}: {label!r} claims nothing, so it could "
+                            f"never be verified. Delete the line."
+                        )
+                    self.claims[label] = identities
         except FileNotFoundError:
-            self.owned = set()
-        return self.owned
+            pass
+        return self.claims
 
-    def claim(self, label):
-        if label in self.owned:
+    def claim(self, label, identities):
+        """Record every identity `label` may legitimately hold.
+
+        A claim with no identities would be a label this tool owns and can
+        never recognise — unverifiable, and so undeletable. `release` is the
+        way to say there is nothing there.
+        """
+        wanted = {identity for identity in identities if identity is not None}
+        if not wanted:
+            raise AssertionError(f"a claim on {label} must name what it may contain")
+        if self.claims.get(label) == wanted:
             return
-        self.owned.add(label)
-        # Appended and flushed one name at a time: a manifest that lags the
-        # card is a manifest that orphans files.
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(label + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        self.claims[label] = wanted
+        self._write()
 
     def release(self, label):
-        self.owned.discard(label)
+        self.claims.pop(label, None)
+        self._write()
+
+    def _write(self):
+        # Rewritten and fsynced on every change: a manifest that lags the
+        # card either orphans files or claims books it does not own.
         with open(self.path, "w", encoding="utf-8") as f:
-            f.write("".join(f"{name}\n" for name in sorted(self.owned)))
+            for label, identities in sorted(self.claims.items()):
+                fields = "\t".join(f"{length}:{hash_:016x}" for length, hash_ in sorted(identities))
+                f.write(f"{label}\t{fields}\n")
             f.flush()
             os.fsync(f.fileno())
 
@@ -401,22 +490,23 @@ def aim_ms(body_bytes, bytes_per_sec, fraction, floor_ms, ceiling_ms):
     return int(max(floor_ms, min(ceiling_ms, expected_ms * fraction)))
 
 
-def landing_size(kind, landing, new_len, old_len):
-    """The size the target book must have under a given landing, or None if
-    it should be absent.
+def landing_identity(kind, landing, new_identity, old_identity):
+    """The `(length, digest)` the target book must have under a given
+    landing, or None if it should be absent.
 
-    This is what turns presence into proof. A committed upload must be
-    exactly as long as the body that was sent; a rolled-back one must be
-    absent, or — for a replace — exactly as long as the body it was going to
-    replace. Both bodies are built to differ in length, so the two landings
-    of a replace are distinguishable, which comparing names alone never made
-    them.
+    This is what turns presence into proof, and it has to be the bytes
+    rather than the length. The length in `/list` is the FAT directory
+    entry's, which is metadata written beside the data: an entry of the
+    right size whose chain is short, unreadable, or pointing at somebody
+    else's clusters satisfies a length check and is exactly the damage an
+    interrupted FAT manipulation would do. The digest comes from reading the
+    file back, so it describes the chain.
     """
     if kind == "delete":
-        return None if landing == "committed" else old_len
+        return None if landing == "committed" else old_identity
     if landing == "committed":
-        return new_len
-    return old_len if kind == "replace" else None
+        return new_identity
+    return old_identity if kind == "replace" else None
 
 
 def legal_landings(kind, target, mine, answered=None):
@@ -499,6 +589,31 @@ class Device:
         )
         if status != 200 or "armed" not in body:
             raise AssertionError(f"arm failed -> {status}: {body}")
+
+    def digest_book(self, open_name, in_books=True, timeout=180):
+        """`(length, digest)` of what is actually in the named book, or None.
+
+        The device opens the file, streams it, and hashes the bytes, so this
+        describes the cluster chain rather than the directory entry over it.
+        Slow by nature — a megabyte read on the session's stack — hence the
+        long default timeout.
+        """
+        path = f"/test-digest?name={urllib.parse.quote(open_name)}"
+        if not in_books:
+            path += "&root=1"
+
+        def once():
+            status, body = self._request("GET", path, timeout=timeout)
+            if status != 200:
+                raise AssertionError(f"digest {open_name} -> {status}: {body}")
+            if body.strip() == "unreadable":
+                return None
+            m = re.fullmatch(r"len=(\d+) fnv=([0-9a-f]{16})", body.strip())
+            if not m:
+                raise AssertionError(f"digest {open_name} -> unparsable {body!r}")
+            return int(m.group(1)), int(m.group(2), 16)
+
+        return self._retrying(once)
 
     def arm_at_install(self, ms):
         """Hand the timing to the device: it arms when the install starts."""
@@ -624,9 +739,9 @@ class Campaign:
 
         Two gates, and the second is what makes this an oracle rather than a
         head-count: the set of campaign books must match a legal landing, and
-        the target book's *length* must match what that landing implies. A
-        book published half-written carries the name the campaign expects and
-        would pass the first gate on its own.
+        the target book's *contents*, read back off the card, must match what
+        that landing implies. A book published half-written carries the name
+        the campaign expects and would pass the first gate on its own.
         """
         target = op["label"]
         campaign_labels = set(by_label) - set(self.baseline)
@@ -646,25 +761,43 @@ class Campaign:
             )
 
         landed = by_label.get(target)
-        got_size = landed.size if landed else None
-        by_size = [
+        got = self.device.digest_book(landed.open_name, landed.in_books) if landed else None
+        # A listed book the device cannot read back is a failure on its own,
+        # whatever the label sets say: the entry survived and the data behind
+        # it did not.
+        if landed and got is None:
+            self.fail(
+                cycle,
+                f"{target} is listed as {landed.size} bytes but could not be read back. "
+                f"The directory entry outlived the data it points at.",
+            )
+        if landed and got[0] != landed.size:
+            self.fail(
+                cycle,
+                f"{target} is listed as {landed.size} bytes but reads back as {got[0]}. "
+                f"The directory entry disagrees with its own cluster chain.",
+            )
+        by_content = [
             name
             for name in by_labels
-            if landing_size(op["kind"], name, op.get("new_len"), op.get("old_len")) == got_size
+            if landing_identity(op["kind"], name, op.get("new_identity"), op.get("old_identity"))
+            == got
         ]
-        if not by_size:
+        if not by_content:
             wanted = "; ".join(
-                f"{name} implies {landing_size(op['kind'], name, op.get('new_len'), op.get('old_len'))}"
+                f"{name} implies "
+                f"{landing_identity(op['kind'], name, op.get('new_identity'), op.get('old_identity'))}"
                 for name in by_labels
             )
             self.fail(
                 cycle,
-                f"{target} is {got_size} bytes, which no landing allows: {wanted}. "
-                f"A book of the wrong length is a book published half-written.",
+                f"{target} reads back as {got}, which no landing allows: {wanted}. "
+                f"A book whose bytes are neither what was there nor what was sent "
+                f"is a book published half-written.",
             )
 
         self.mine = {name: by_label[name] for name in campaign_labels}
-        return by_size[0]
+        return by_content[0]
 
     def reboot(self, why, arm_ms=200):
         """Cut the device deliberately, with nothing in flight, to get a
@@ -691,8 +824,8 @@ class Campaign:
         """
         body = make_epub(CALIBRATION_LABEL, 250_000)
         # Claimed before the write, not after: a run killed here must leave
-        # behind a manifest that already knows this book is the campaign's.
-        self.manifest.claim(CALIBRATION_LABEL)
+        # behind a manifest that already knows what this book would contain.
+        self.manifest.claim(CALIBRATION_LABEL, [(len(body), digest(body))])
         started = time.monotonic()
         status, text = self.device.upload(f"{CALIBRATION_LABEL}.epub", body)
         elapsed = time.monotonic() - started
@@ -719,23 +852,48 @@ class Campaign:
         # by deleting — so a reader whose own book happens to be called
         # "PCUT..." would lose it. The manifest is on the host and survives
         # a crashed run, which is the case the guess existed to cover.
-        owned = self.manifest.load()
-        for book in self.device.list_books():
-            if book.label in owned:
+        claims = self.manifest.load()
+        listed = self.device.list_books()
+
+        # A claim is an intent, not a licence. Before treating a listed book
+        # as the campaign's — which means deleting it — read it back and
+        # check it is the book the manifest describes. A run that died before
+        # its upload landed leaves a claim whose label may since have been
+        # taken by a book somebody else put on the card, and the whole point
+        # of this tool being safe beside a real library is that such a book
+        # is not touched.
+        unverified = []
+        for book in listed:
+            if book.label not in claims:
+                self.baseline[book.label] = book
+                continue
+            got = self.device.digest_book(book.open_name, book.in_books)
+            if got in claims[book.label]:
                 self.mine[book.label] = book
             else:
-                self.baseline[book.label] = book
+                unverified.append((book, claims[book.label], got))
         print(f"baseline: {len(self.baseline)} book(s) left alone")
 
-        # A book carrying this run's naming that the manifest does not claim
-        # is either a user's book or the residue of a run whose manifest was
-        # lost. Refuse rather than choose: deleting it could destroy data,
-        # and adopting it as baseline would wedge every create on that label.
+        # Two ways to end up here, and neither may be resolved by guessing:
+        # a book whose label this campaign claims but whose contents are not
+        # what it wrote, and a book named like the campaign that no claim
+        # covers at all.
         strangers = sorted(
             label
             for label in self.baseline
             if label.startswith(CAMPAIGN_PREFIX) or label == CALIBRATION_LABEL
         )
+        if unverified:
+            described = ", ".join(
+                f"{book.label} (claimed {claimed}, found {got})"
+                for book, claimed, got in unverified
+            )
+            raise AssertionError(
+                f"books this campaign's manifest claims whose contents are not what it "
+                f"wrote: {described}. They are not this tool's to delete. Move or rename "
+                f"them, or clear the manifest at {self.manifest.path} if you know they "
+                f"are disposable."
+            )
         if strangers and not self.args.adopt_unclaimed:
             raise AssertionError(
                 f"books named like this campaign's, which its manifest does not claim: "
@@ -746,8 +904,18 @@ class Campaign:
         if strangers:
             print(f"adopting {len(strangers)} unclaimed book(s) named like this campaign")
             for label in strangers:
-                self.mine[label] = self.baseline.pop(label)
-                self.manifest.claim(label)
+                book = self.baseline.pop(label)
+                self.mine[label] = book
+                got = self.device.digest_book(book.open_name, book.in_books)
+                if got is not None:
+                    self.manifest.claim(label, [got])
+
+        # Claims with nothing on the card behind them are spent intents from
+        # a run that died before its upload landed. Dropping them here keeps
+        # a stale label from ever meeting a future book that happens to
+        # share it.
+        for label in sorted(set(claims) - {book.label for book in listed}):
+            self.manifest.release(label)
 
         # Leftovers from a crashed run share this run's label scheme, and a
         # "create" of a label that already exists is a replace wearing a
@@ -845,6 +1013,14 @@ class Campaign:
             self.args.max_ms,
         )
 
+    def identity_of(self, label):
+        """What is actually in one of the campaign's books right now."""
+        book = self.mine[label]
+        got = self.device.digest_book(book.open_name, book.in_books)
+        if got is None:
+            raise AssertionError(f"{label} is listed but could not be read back: {book}")
+        return got
+
     def body_differing_from(self, label, old_len, tries=8):
         """An EPUB for `label` whose encoded length is not `old_len`.
 
@@ -870,15 +1046,14 @@ class Campaign:
 
     def delete_mine(self):
         """Delete every book this campaign made, with no cuts."""
+        # Deliberately does not release anything. A 200 says the device
+        # accepted the delete, not that the entry is gone; the caller proves
+        # that from a fresh listing and releases then. Releasing here would
+        # hide a delete that answered but did not take.
         for label, book in list(self.mine.items()):
             status, body = self.device.delete(book.open_name, book.in_books)
             if status != 200:
                 print(f"  warning: delete {label} -> {status} {body}")
-            else:
-                # Released only on a confirmed delete. A book still on the
-                # card that the manifest has forgotten is one this tool can
-                # never clean up and will refuse to run over.
-                self.manifest.release(label)
 
     def cleanup(self):
         """Return the card to its baseline, then reboot so the final listing
@@ -891,12 +1066,17 @@ class Campaign:
         """
         print(f"cleanup: deleting {len(self.mine)} campaign book(s)")
         mark = self.serial.mark()
+        # The set to prove gone is captured before anything is deleted, and
+        # nothing is released until after the reboot. Releasing on a 200
+        # would take each book out of the set the final check looks at, so a
+        # delete the device answered but did not perform would be invisible
+        # to the very check meant to catch it.
+        expected_gone = set(self.mine)
         self.delete_mine()
         self.reboot("cleanup")
         self.check_recovery_clean("cleanup", mark)
-        owned = self.manifest.load()
         listed = {book.label for book in self.device.list_books()}
-        remaining = sorted(owned & listed)
+        remaining = sorted(expected_gone & listed)
         if remaining:
             self.fail(
                 "cleanup",
@@ -904,12 +1084,12 @@ class Campaign:
                 f"A delete that will not take is what a standing journal record "
                 f"looks like from outside.",
             )
-        # Claims are made before each write, so a rolled-back cycle leaves one
-        # behind for a book that never landed. Dropping those keeps the set
-        # this tool would delete as small as what it actually owns — the
-        # listing is known complete here, since a truncated one is fatal.
-        for label in sorted(owned - listed):
+        # Proven absent, so the claims can go. Claims for books that never
+        # landed go too — the listing is known complete here, since a
+        # truncated one is fatal.
+        for label in sorted(set(self.manifest.load()) - listed):
             self.manifest.release(label)
+        self.mine = {}
         print("  card returned to its baseline")
 
     def cycle(self, cycle):
@@ -933,24 +1113,24 @@ class Campaign:
                 "kind": "delete",
                 "label": mine[0],
                 "book": victim,
-                "new_len": None,
-                "old_len": victim.size,
+                "new_identity": None,
+                "old_identity": self.identity_of(mine[0]),
             }
         elif mine and cycle % 3 == 0:
             label = mine[0]
-            old_len = self.mine[label].size
-            # The replacement must differ in length from what it replaces:
-            # length is the only thing that tells this operation's two
-            # landings apart, so a same-size body would make the cycle
-            # unfalsifiable.
-            body = self.body_differing_from(label, old_len)
+            old_identity = self.identity_of(label)
+            # The replacement must differ from what it replaces, or the
+            # operation's two landings would be indistinguishable and the
+            # cycle unfalsifiable. Distinct random contents make the digests
+            # differ; the length check below makes it plain to read.
+            body = self.body_differing_from(label, old_identity[0])
             op = {
                 "kind": "replace",
                 "label": label,
                 "filename": f"{label}.epub",
                 "body": body,
-                "new_len": len(body),
-                "old_len": old_len,
+                "new_identity": (len(body), digest(body)),
+                "old_identity": old_identity,
             }
         else:
             label = f"{CAMPAIGN_PREFIX}{cycle:03}"
@@ -966,14 +1146,17 @@ class Campaign:
                 "label": label,
                 "filename": f"{label}.epub",
                 "body": body,
-                "new_len": len(body),
-                "old_len": None,
+                "new_identity": (len(body), digest(body)),
+                "old_identity": None,
             }
 
         # Claimed before the write, so a run killed mid-upload leaves a
-        # manifest that already owns what it may have created.
+        # manifest describing what it may have created. A replace changes
+        # what the label will contain, so the claim moves with it — the old
+        # identity stops being this campaign's proof the moment the new
+        # bytes may have landed, and either body is legitimately ours.
         if op["kind"] != "delete":
-            self.manifest.claim(op["label"])
+            self.manifest.claim(op["label"], [op["new_identity"], op.get("old_identity")])
 
         # 3. Arm. Two placements, because the upload has two windows worth
         # cutting and they need different mechanisms.
@@ -1047,8 +1230,17 @@ class Campaign:
         self.reboot(f"cycle {cycle} verification")
         by_label = self.read_shelf(cycle)
         outcome = self.converge(cycle, op, by_label, answered)
-        if op["kind"] == "delete" and outcome == "committed":
+        # Collapse the claim onto what the card actually holds now, so the
+        # two-identity window a write opens closes as soon as it is resolved.
+        settled = landing_identity(
+            op["kind"], outcome, op.get("new_identity"), op.get("old_identity")
+        )
+        if settled is None:
+            # Nothing under this label any more — a committed delete, or a
+            # create that rolled back. There is no book to own.
             self.manifest.release(op["label"])
+        else:
+            self.manifest.claim(op["label"], [settled])
 
         result = {
             "cycle": cycle,
@@ -1145,29 +1337,34 @@ class TestPowercutCampaign(unittest.TestCase):
         self.assertEqual(legal["committed"], {"PCUT001"})
         self.assertEqual(legal["rolled_back"], {"PCUT001"})
 
-    def test_size_is_what_tells_a_replace_apart(self):
+    def test_contents_are_what_tell_a_replace_apart(self):
         """The label set cannot distinguish a replace's landings, so the
-        length does: committed is the new body, rolled back is the old one.
+        bytes do: committed is the new body, rolled back is the old one.
         Without this the cycle asserts only that a book with the right name
         exists, which a half-written one also satisfies."""
-        self.assertEqual(landing_size("replace", "committed", 500, 300), 500)
-        self.assertEqual(landing_size("replace", "rolled_back", 500, 300), 300)
+        new, old = (500, 0xAAAA), (300, 0xBBBB)
+        self.assertEqual(landing_identity("replace", "committed", new, old), new)
+        self.assertEqual(landing_identity("replace", "rolled_back", new, old), old)
 
-    def test_size_for_a_create_and_a_delete(self):
-        self.assertEqual(landing_size("create", "committed", 500, None), 500)
-        # A rolled-back create leaves nothing behind to measure.
-        self.assertIsNone(landing_size("create", "rolled_back", 500, None))
-        self.assertIsNone(landing_size("delete", "committed", None, 300))
-        self.assertEqual(landing_size("delete", "rolled_back", None, 300), 300)
+    def test_identity_for_a_create_and_a_delete(self):
+        new, old = (500, 0xAAAA), (300, 0xBBBB)
+        self.assertEqual(landing_identity("create", "committed", new, None), new)
+        # A rolled-back create leaves nothing behind to read.
+        self.assertIsNone(landing_identity("create", "rolled_back", new, None))
+        self.assertIsNone(landing_identity("delete", "committed", None, old))
+        self.assertEqual(landing_identity("delete", "rolled_back", None, old), old)
 
-    def test_a_truncated_publish_matches_no_landing(self):
-        """The false green this size check exists to prevent: a book
-        published with the right name but the wrong number of bytes."""
-        sizes = {
-            landing: landing_size("create", landing, 500, None)
+    def test_wrong_bytes_at_the_right_length_match_no_landing(self):
+        """The false green content checking exists to prevent, and the one a
+        length check cannot: an entry advertising the expected size whose
+        chain holds something else."""
+        new = (500, 0xAAAA)
+        landings = {
+            landing: landing_identity("create", landing, new, None)
             for landing in ("committed", "rolled_back")
         }
-        self.assertNotIn(499, sizes.values())
+        same_length_wrong_bytes = (500, 0x1234)
+        self.assertNotIn(same_length_wrong_bytes, landings.values())
 
     def test_finds_evidence_that_precedes_the_reset_marker(self):
         """Cost three hardware runs to see. Mount-time recovery prints
@@ -1191,23 +1388,87 @@ class TestPowercutCampaign(unittest.TestCase):
         lines = [(1.0, "a=1"), (2.0, "b"), (3.0, "a=2")]
         self.assertEqual([m.group(1) for m, _ in scan(lines, r"a=(\d)")], ["1", "2"])
 
-    def test_manifest_owns_only_what_it_claimed(self):
-        """Ownership decides what gets deleted, so it is recorded rather
-        than guessed from a name. A reader's own book called PCUT007 is not
-        this campaign's to remove."""
+    def test_manifest_round_trips_identities(self):
+        """The file is the record, not the in-memory set: a killed run
+        leaves only the file behind."""
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
             manifest = Manifest(os.path.join(tmp, "m.txt"))
-            self.assertEqual(manifest.load(), set())
-            manifest.claim("PCUT001")
-            manifest.claim("PCUT002")
-            # A fresh reader sees the same claims: the file is the record,
-            # not the in-memory set, because a killed run leaves only a file.
-            self.assertEqual(Manifest(manifest.path).load(), {"PCUT001", "PCUT002"})
-            self.assertNotIn("PCUT007", manifest.owned)
+            self.assertEqual(manifest.load(), {})
+            manifest.claim("PCUT001", [(500, 0xABCD)])
+            manifest.claim("PCUT002", [(600, 0x1234), (700, 0x5678)])
+            reloaded = Manifest(manifest.path).load()
+            self.assertEqual(reloaded["PCUT001"], {(500, 0xABCD)})
+            self.assertEqual(reloaded["PCUT002"], {(600, 0x1234), (700, 0x5678)})
             manifest.release("PCUT001")
-            self.assertEqual(Manifest(manifest.path).load(), {"PCUT002"})
+            self.assertEqual(set(Manifest(manifest.path).load()), {"PCUT002"})
+
+    def test_a_claim_is_not_authority_over_someone_elses_book(self):
+        """The blocker from review: a claim records what the campaign
+        *intended* to write. If the run died before that landed and a user
+        later put their own book under the same label, the contents will not
+        match — and mismatching contents must not be treated as owned,
+        because ownership is what authorises deletion."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Manifest(os.path.join(tmp, "m.txt"))
+            manifest.load()
+            manifest.claim("PCUT007", [(500, 0xABCD)])
+            claims = Manifest(manifest.path).load()
+            somebody_elses = (1234, 0x9999)
+            self.assertNotIn(somebody_elses, claims["PCUT007"])
+
+    def test_a_replace_in_flight_may_hold_either_body(self):
+        """An interrupted replace leaves the old body or the new one, and
+        both are the campaign's — so a claim spanning a write records both,
+        or the next run refuses to recognise its own book."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Manifest(os.path.join(tmp, "m.txt"))
+            manifest.load()
+            old, new = (300, 0x1111), (500, 0x2222)
+            manifest.claim("PCUT001", [new, old])
+            claims = Manifest(manifest.path).load()
+            self.assertIn(old, claims["PCUT001"])
+            self.assertIn(new, claims["PCUT001"])
+            # Once the cycle reads the result back, the pair collapses.
+            manifest.claim("PCUT001", [old])
+            self.assertEqual(Manifest(manifest.path).load()["PCUT001"], {old})
+
+    def test_a_claim_must_name_what_it_may_contain(self):
+        """An identity-less claim is a label owned but unrecognisable, so it
+        could never be verified and never cleaned up. It also used to be
+        written as a line the next load could not parse, which took out a
+        run at cleanup."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Manifest(os.path.join(tmp, "m.txt"))
+            manifest.load()
+            with self.assertRaises(AssertionError):
+                manifest.claim("PCUT001", [None])
+            with self.assertRaises(AssertionError):
+                manifest.claim("PCUT001", [])
+            # And the file is still readable, because nothing was written.
+            self.assertEqual(Manifest(manifest.path).load(), {})
+
+    def test_a_malformed_manifest_says_what_is_wrong(self):
+        """The file is documented as something to inspect and sometimes
+        edit, so a stray keystroke should not surface as an unpacking
+        error from inside a comprehension."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.txt")
+            for bad in ("PCUT001\t999\tdeadbeefdeadbeef\n", "PCUT001\tnonsense\n", "PCUT001\n"):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(bad)
+                with self.assertRaises(AssertionError) as caught:
+                    Manifest(path).load()
+                self.assertIn(path, str(caught.exception))
 
     def test_manifest_claim_is_idempotent(self):
         import tempfile
@@ -1215,9 +1476,17 @@ class TestPowercutCampaign(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = Manifest(os.path.join(tmp, "m.txt"))
             manifest.load()
-            manifest.claim("PCUT001")
-            manifest.claim("PCUT001")
-            self.assertEqual(Manifest(manifest.path).load(), {"PCUT001"})
+            manifest.claim("PCUT001", [(1, 2)])
+            manifest.claim("PCUT001", [(1, 2)])
+            self.assertEqual(Manifest(manifest.path).load(), {"PCUT001": {(1, 2)}})
+
+    def test_digest_matches_the_firmware_construction(self):
+        """FNV-1a 64, same seed and prime as fw::powercut::digest_chunk.
+        A drift here would make every readback disagree."""
+        self.assertEqual(digest(b""), DIGEST_SEED)
+        expected = ((DIGEST_SEED ^ 0x61) * DIGEST_PRIME) & DIGEST_MASK
+        self.assertEqual(digest(b"a"), expected)
+        self.assertNotEqual(digest(b"ab"), digest(b"ba"))
 
     def test_places_the_cut_against_the_operation(self):
         self.assertEqual(classify_cut(reset_at=5.0, op_start=10.0, op_end=12.0), "before")
