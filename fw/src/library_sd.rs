@@ -1113,9 +1113,34 @@ where
     (staged, truncated)
 }
 
+/// The listing's trailing `|byte_size`, which only a campaign build carries.
+/// Empty otherwise, so a shipping listing keeps its three fields.
+fn listing_size_field(record: &CatalogRecord) -> String<16> {
+    #[cfg(feature = "powercut-selftest")]
+    {
+        use core::fmt::Write as _;
+        let mut field = String::new();
+        let _ = write!(field, "|{}", record.byte_size);
+        field
+    }
+    #[cfg(not(feature = "powercut-selftest"))]
+    {
+        let _ = record;
+        String::new()
+    }
+}
+
 /// Stream the whole catalog into the browser shelf buffer as
 /// `flag|open_name|label` lines (B = /BOOKS, R = card root). Truncates to the
 /// buffer; returns the bytes written.
+///
+/// A `powercut-selftest` build appends `|byte_size` to each line and, if the
+/// buffer ran out, a final `!TRUNCATED|written|total` line. Neither is in a
+/// shipping build. The browser destructures only the first three fields, so
+/// the extra one is invisible to it; the durability campaign requires both,
+/// because a listing it cannot tell is complete is a baseline it cannot
+/// prove untouched, and a size is the difference between "a book with this
+/// name exists" and "the book that was written is the book that is there".
 #[inline(never)]
 pub(crate) fn write_catalog_listing(
     epd: &mut Epd,
@@ -1127,8 +1152,18 @@ pub(crate) fn write_catalog_listing(
             seek_to_record(file, 0)?;
             let mut record = [0u8; CATALOG_RECORD_BYTES];
             let mut at = 0usize;
+            // Room kept back for the truncation marker, which is only worth
+            // writing when there is space left to write it in.
+            #[cfg(feature = "powercut-selftest")]
+            const TRUNCATION_MARKER_BYTES: usize = 32;
+            #[cfg(not(feature = "powercut-selftest"))]
+            const TRUNCATION_MARKER_BYTES: usize = 0;
+            let budget = out.len().saturating_sub(TRUNCATION_MARKER_BYTES);
+            let mut written = 0u16;
+            let mut truncated = false;
             for _ in 0..count as usize {
                 if read_exact_file(file, &mut record).is_err() {
+                    truncated = true;
                     break;
                 }
                 let decoded = decode_catalog_record(&record);
@@ -1145,8 +1180,10 @@ pub(crate) fn write_catalog_listing(
                     let _ = label.push_str(decoded.title.as_str());
                 }
                 let open_name = decoded.open_name.as_bytes();
-                let line_len = 1 + 1 + open_name.len() + 1 + label.len() + 1;
-                if at + line_len > out.len() {
+                let size_field = listing_size_field(&decoded);
+                let line_len = 1 + 1 + open_name.len() + 1 + label.len() + size_field.len() + 1;
+                if at + line_len > budget {
+                    truncated = true;
                     break;
                 }
                 out[at] = if decoded.in_books_dir { b'B' } else { b'R' };
@@ -1159,9 +1196,24 @@ pub(crate) fn write_catalog_listing(
                 at += 1;
                 out[at..at + label.len()].copy_from_slice(label.as_bytes());
                 at += label.len();
+                out[at..at + size_field.len()].copy_from_slice(size_field.as_bytes());
+                at += size_field.len();
                 out[at] = b'\n';
                 at += 1;
+                written += 1;
             }
+            #[cfg(feature = "powercut-selftest")]
+            if truncated {
+                use core::fmt::Write as _;
+                let mut marker = String::<32>::new();
+                let _ = writeln!(marker, "!TRUNCATED|{}|{}", written, count);
+                if at + marker.len() <= out.len() {
+                    out[at..at + marker.len()].copy_from_slice(marker.as_bytes());
+                    at += marker.len();
+                }
+            }
+            #[cfg(not(feature = "powercut-selftest"))]
+            let _ = (written, truncated);
             Ok(at)
         })
     })
