@@ -73,6 +73,18 @@ pub fn parse_at_install_ms(path: &[u8]) -> Option<u32> {
         .then_some(ms)
 }
 
+/// A decimal `u32` query parameter, if present and parsable.
+pub fn parse_u32(path: &[u8], name: &[u8]) -> Option<u32> {
+    let value = proto::upload::query_param(path, name)?;
+    core::str::from_utf8(value).ok()?.parse::<u32>().ok()
+}
+
+/// The `seed` parameter: the running digest, as 16 hex digits.
+pub fn parse_seed(path: &[u8]) -> Option<u64> {
+    let value = proto::upload::query_param(path, b"seed")?;
+    u64::from_str_radix(core::str::from_utf8(value).ok()?, 16).ok()
+}
+
 /// How long to let the executor run before returning, so the power task can
 /// act on the signal. The install that follows is a blocking SD sequence
 /// embassy cannot preempt, so an arm that has not taken effect by then would
@@ -94,15 +106,25 @@ pub async fn arm_for_install() {
     Timer::after(Duration::from_millis(ARM_SETTLE_MS)).await;
 }
 
-/// A request to read a book off the card and digest what is actually there.
+/// A request to read part of a book off the card and digest what is there.
+///
+/// Ranged, because the answer travels back over a socket with a 30-second
+/// idle timeout and a whole book is minutes of blocking SD reads: a request
+/// that outlives the timeout is killed with its reply half-made. The host
+/// walks the file in bounded pieces, carrying the running hash, so no single
+/// request holds a connection open long. Measured on an X3 at ~800 kB/s, a
+/// 4 MB piece answers in about five seconds.
 pub struct DigestRequest {
     pub name: crate::upload::UploadName,
     pub in_books: bool,
+    pub from: u32,
+    pub len: u32,
+    pub seed: u64,
 }
 
-/// `(length, digest)` of the named book's bytes, or `None` if it could not
-/// be opened or read.
-pub type DigestReply = Option<(u32, u64)>;
+/// `(file length, bytes read, digest so far)`, or `None` if the book could
+/// not be opened or the read failed.
+pub type DigestReply = Option<(u32, u32, u64)>;
 
 pub static DIGEST_REQUESTS: Channel<CriticalSectionRawMutex, DigestRequest, 1> = Channel::new();
 pub static DIGEST_RESULTS: Channel<CriticalSectionRawMutex, DigestReply, 1> = Channel::new();

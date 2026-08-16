@@ -462,6 +462,17 @@ async fn upload_server(
         if is_digest {
             #[cfg(feature = "powercut-selftest")]
             {
+                // Read out of the immutable view first: extracting the name
+                // decodes in place and takes the buffer mutably, which ends
+                // this borrow.
+                //
+                // Ranged: `from`/`len` bound the read so no reply outlives
+                // the socket's 30 s idle timeout, and `seed` carries the
+                // running hash across the pieces.
+                let from = crate::powercut::parse_u32(path, b"from").unwrap_or(0);
+                let len = crate::powercut::parse_u32(path, b"len").unwrap_or(u32::MAX);
+                let seed =
+                    crate::powercut::parse_seed(path).unwrap_or(crate::powercut::DIGEST_SEED);
                 let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
                 let in_books = path_bytes
                     .as_ref()
@@ -483,7 +494,13 @@ async fn upload_server(
                             session_started = true;
                         }
                         crate::powercut::DIGEST_REQUESTS
-                            .send(crate::powercut::DigestRequest { name, in_books })
+                            .send(crate::powercut::DigestRequest {
+                                name,
+                                in_books,
+                                from,
+                                len,
+                                seed,
+                            })
                             .await;
                         let reply = match select(
                             crate::powercut::DIGEST_RESULTS.receive(),
@@ -500,9 +517,10 @@ async fn upload_server(
                         };
                         let mut body = heapless::String::<64>::new();
                         match reply {
-                            Some((length, hash)) => {
+                            Some((length, read, hash)) => {
                                 use core::fmt::Write as _;
-                                let _ = write!(body, "len={} fnv={:016x}", length, hash);
+                                let _ =
+                                    write!(body, "size={} read={} fnv={:016x}", length, read, hash);
                             }
                             None => {
                                 let _ = body.push_str("unreadable");

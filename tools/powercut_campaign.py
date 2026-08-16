@@ -40,14 +40,27 @@ else's clusters passes a length check — and mangled entries and chains are
 precisely what an interrupted install would leave. The digest comes from
 opening the file and streaming it, so it describes the chain.
 
-Books already on the card are an untouched baseline, verified at every read
-to still be present and unchanged. What the campaign may delete comes from a
-host-side manifest (`--manifest`), and a claim in it is an intent, not a
-licence: before treating a listed book as its own the campaign reads it back
-and checks the bytes are the bytes it wrote. A book whose contents do not
-match — a reader's own book that happens to be called `PCUT...`, or one that
-replaced a claim after a crashed run — stops the run rather than being
-deleted.
+Books already on the card are an untouched baseline. What that is checked
+against differs by cost, and the difference is worth knowing before reading
+a pass:
+
+- **Every cycle**, for every baseline book: still listed, still the same
+  directory-entry size. Free, since the listing is read anyway.
+- **Every cycle**, for every book the campaign owns: read back and compared
+  to the bytes it wrote. These are small and few, and they are the ones a
+  cut could plausibly damage without touching their names.
+- **At the start and end of a run** (`--verify-baseline`), for every
+  baseline book: read back byte for byte. This is a full read of the card —
+  ~4 minutes for a 184 MB shelf at the ~800 kB/s an X3 manages — so it is
+  not run per cycle unless asked. A corrupted baseline book is therefore
+  caught, but possibly some cycles after the cut that caused it.
+
+What the campaign may delete comes from a host-side manifest (`--manifest`),
+and a claim in it is an intent, not a licence: before treating a listed book
+as its own the campaign reads it back and checks the bytes are the bytes it
+wrote. A book whose contents do not match — a reader's own book that happens
+to be called `PCUT...`, or one that replaced a claim after a crashed run —
+stops the run rather than being deleted.
 
 A run whose cuts did not actually land inside operations, or never reached
 the journal's replay path, exits non-zero. Green has to mean the property
@@ -117,6 +130,13 @@ RESET_PATTERN = r"rst:.*(RTC|WDT)|powercut: auto-starting"
 # the transaction required moving a file.
 RECOVERY_PATTERN = r"powercut: recovery replayed a record: moved=(\w+)"
 
+
+# How much of a book to digest per request. The device answers over a socket
+# with a 30-second idle timeout and reads at ~800 kB/s, so a whole 29 MB book
+# in one request outlives the connection carrying its answer — measured, as
+# an empty reply for that book and for whatever was asked next. Four
+# megabytes is about five seconds.
+DIGEST_CHUNK_BYTES = 4 * 1024 * 1024
 
 DIGEST_SEED = 0xCBF29CE484222325
 DIGEST_PRIME = 0x100000001B3
@@ -365,7 +385,11 @@ class Manifest:
                     identities = set()
                     for field in fields:
                         length, _, hash_ = field.partition(":")
-                        if not length.isdigit() or len(hash_) != 16:
+                        if (
+                            not length.isdigit()
+                            or len(hash_) != 16
+                            or not all(c in "0123456789abcdef" for c in hash_)
+                        ):
                             raise AssertionError(
                                 f"{self.path}:{number}: cannot read {field!r} as "
                                 f"LENGTH:DIGEST — each claim is a decimal length and a "
@@ -598,22 +622,41 @@ class Device:
         Slow by nature — a megabyte read on the session's stack — hence the
         long default timeout.
         """
-        path = f"/test-digest?name={urllib.parse.quote(open_name)}"
+        base = f"/test-digest?name={urllib.parse.quote(open_name)}"
         if not in_books:
-            path += "&root=1"
+            base += "&root=1"
 
-        def once():
-            status, body = self._request("GET", path, timeout=timeout)
-            if status != 200:
-                raise AssertionError(f"digest {open_name} -> {status}: {body}")
-            if body.strip() == "unreadable":
+        def piece(offset, hash_):
+            def once():
+                path = f"{base}&from={offset}&len={DIGEST_CHUNK_BYTES}&seed={hash_:016x}"
+                status, body = self._request("GET", path, timeout=timeout)
+                if status != 200:
+                    raise AssertionError(f"digest {open_name} -> {status}: {body}")
+                if body.strip() == "unreadable":
+                    return None
+                m = re.fullmatch(r"size=(\d+) read=(\d+) fnv=([0-9a-f]{16})", body.strip())
+                if not m:
+                    raise AssertionError(f"digest {open_name} -> unparsable {body!r}")
+                return int(m.group(1)), int(m.group(2)), int(m.group(3), 16)
+
+            return self._retrying(once)
+
+        offset, hash_ = 0, DIGEST_SEED
+        size = None
+        while True:
+            got = piece(offset, hash_)
+            if got is None:
                 return None
-            m = re.fullmatch(r"len=(\d+) fnv=([0-9a-f]{16})", body.strip())
-            if not m:
-                raise AssertionError(f"digest {open_name} -> unparsable {body!r}")
-            return int(m.group(1)), int(m.group(2), 16)
-
-        return self._retrying(once)
+            size, read, hash_ = got
+            offset += read
+            if read == 0 or offset >= size:
+                break
+        # A chain that runs short of what the directory entry advertises is
+        # exactly the corruption this exists to catch, so it reads as a book
+        # that is not there rather than as a book of a different length.
+        if offset != size:
+            return None
+        return size, hash_
 
     def arm_at_install(self, ms):
         """Hand the timing to the device: it arms when the install starts."""
@@ -640,6 +683,7 @@ class Campaign:
         self.device = Device(args.ip)
         self.args = args
         self.baseline = {}  # label -> Book, present before the campaign
+        self.baseline_identity = {}  # label -> (length, digest), if verified
         self.mine = {}  # label -> Book, uploaded by this campaign
         self.results = []
         self.rng = random.Random()
@@ -722,9 +766,9 @@ class Campaign:
         for label, book in self.baseline.items():
             if label not in by_label:
                 self.fail(cycle, f"a book that predates the campaign vanished: {book}")
-            # Untouched means byte-for-byte the same length, not merely still
-            # listed: a stray write into somebody else's book is exactly the
-            # damage this promise is about.
+            # The cheap half of "untouched", run every cycle. The byte-level
+            # half is `verify_baseline`, which costs a full read of the
+            # library and so runs at the ends of a campaign by default.
             if by_label[label].size != book.size:
                 self.fail(
                     cycle,
@@ -732,6 +776,53 @@ class Campaign:
                     f"was {book.size}, now {by_label[label].size}",
                 )
         return by_label
+
+    def verify_identities(self, cycle, books, expected, what):
+        """Read each of `books` back and check it against `expected`.
+
+        `expected` maps label to the identity, or set of identities, the book
+        may legitimately have. This is the only check that sees a book's
+        contents; everything else in `read_shelf` is the directory entry,
+        which is metadata written beside the data and survives corruption of
+        it.
+        """
+        for label, book in sorted(books.items()):
+            want = expected.get(label)
+            if want is None:
+                continue
+            allowed = want if isinstance(want, set) else {want}
+            got = self.device.digest_book(book.open_name, book.in_books)
+            if got is None:
+                self.fail(
+                    cycle,
+                    f"{what} {label} is listed but could not be read back: {book}. "
+                    f"The directory entry outlived the data it points at.",
+                )
+            if got not in allowed:
+                self.fail(
+                    cycle,
+                    f"{what} {label} reads back as {got}, not {sorted(allowed)}. "
+                    f"Nothing this campaign did should have changed it.",
+                )
+
+    def verify_baseline(self, cycle):
+        """Byte-check every book that predates the campaign.
+
+        Expensive — a full read of the library, measured at ~800 kB/s on an
+        X3, so ~4 minutes for a 184 MB shelf — which is why it is not run
+        every cycle by default. What it protects is the campaign's loudest
+        claim: that a durability test run beside somebody's library leaves
+        that library alone.
+        """
+        if not self.baseline_identity:
+            return
+        print(f"  verifying {len(self.baseline_identity)} baseline book(s) byte for byte...")
+        self.verify_identities(
+            cycle,
+            {label: self.baseline[label] for label in self.baseline_identity},
+            self.baseline_identity,
+            "a book that predates the campaign,",
+        )
 
     def converge(self, cycle, op, by_label, answered):
         """Decide which legal landing the shelf reached, and refuse anything
@@ -917,6 +1008,25 @@ class Campaign:
         for label in sorted(set(claims) - {book.label for book in listed}):
             self.manifest.release(label)
 
+        # What the baseline actually contains, so the promise to leave it
+        # alone can be checked against bytes rather than against the
+        # directory entries written beside them.
+        if self.args.verify_baseline != "never":
+            total = sum(book.size for book in self.baseline.values())
+            print(
+                f"reading {len(self.baseline)} baseline book(s) "
+                f"({total / 1_048_576:.0f} MB) to record what untouched means..."
+            )
+            for label, book in sorted(self.baseline.items()):
+                got = self.device.digest_book(book.open_name, book.in_books)
+                if got is None:
+                    raise AssertionError(
+                        f"a book that predates the campaign cannot be read: {book}. "
+                        f"This card has a problem the campaign did not cause, and a "
+                        f"baseline that cannot be read cannot be proven untouched."
+                    )
+                self.baseline_identity[label] = got
+
         # Leftovers from a crashed run share this run's label scheme, and a
         # "create" of a label that already exists is a replace wearing a
         # create's name: both landings leave the same set, so the check
@@ -1090,6 +1200,12 @@ class Campaign:
         for label in sorted(set(self.manifest.load()) - listed):
             self.manifest.release(label)
         self.mine = {}
+        # "Returned to its baseline" is a claim about the user's library, and
+        # until here it rested on names and directory-entry sizes. Deleting
+        # is the campaign's most destructive act and cleanup does the most of
+        # it, so the library is read back before that sentence is printed.
+        self.read_shelf("cleanup")
+        self.verify_baseline("cleanup")
         print("  card returned to its baseline")
 
     def cycle(self, cycle):
@@ -1241,6 +1357,15 @@ class Campaign:
             self.manifest.release(op["label"])
         else:
             self.manifest.claim(op["label"], [settled])
+
+        # The target is proven by `converge`. Everything else the campaign
+        # owns is collateral: a cut that corrupted a book it was not aiming
+        # at, without disturbing that book's name or directory entry, is
+        # invisible to every check above. These are small and few, so they
+        # are read back every cycle.
+        self.verify_identities(cycle, self.mine, self.manifest.claims, "a campaign book,")
+        if self.args.verify_baseline == "always":
+            self.verify_baseline(cycle)
 
         result = {
             "cycle": cycle,
@@ -1463,7 +1588,14 @@ class TestPowercutCampaign(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "m.txt")
-            for bad in ("PCUT001\t999\tdeadbeefdeadbeef\n", "PCUT001\tnonsense\n", "PCUT001\n"):
+            for bad in (
+                "PCUT001\t999\tdeadbeefdeadbeef\n",
+                "PCUT001\tnonsense\n",
+                "PCUT001\n",
+                # Right length, not hexadecimal: used to reach int(x, 16)
+                # and surface as a raw ValueError.
+                "PCUT001\t123:zzzzzzzzzzzzzzzz\n",
+            ):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(bad)
                 with self.assertRaises(AssertionError) as caught:
@@ -1479,6 +1611,17 @@ class TestPowercutCampaign(unittest.TestCase):
             manifest.claim("PCUT001", [(1, 2)])
             manifest.claim("PCUT001", [(1, 2)])
             self.assertEqual(Manifest(manifest.path).load(), {"PCUT001": {(1, 2)}})
+
+    def test_identity_check_catches_same_length_corruption(self):
+        """The collateral case: a book that is not the operation's target,
+        still listed under its own name at its own size, whose bytes have
+        changed. Directory-entry checks cannot see it; a readback can."""
+        book = Book(True, "PCUT001.EPU", "PCUT001", 500)
+        expected = {"PCUT001": (500, 0xAAAA)}
+        corrupted = (500, 0xBBBB)
+        self.assertNotIn(corrupted, {expected[book.label]})
+        # And a set-valued expectation (a write in flight) still rejects it.
+        self.assertNotIn(corrupted, {(500, 0xAAAA), (300, 0xCCCC)})
 
     def test_digest_matches_the_firmware_construction(self):
         """FNV-1a 64, same seed and prime as fw::powercut::digest_chunk.
@@ -1566,6 +1709,17 @@ def main():
     # pass. Lower them for exploratory bench work, not for a gate.
     parser.add_argument("--min-cut-share", type=float, default=0.5)
     parser.add_argument("--min-replays", type=int, default=1)
+    # How often the pre-existing library is read back byte for byte. It is a
+    # full read of the card — ~4 minutes for a 184 MB shelf at the ~800 kB/s
+    # an X3 manages — so per-cycle is opt-in rather than default.
+    parser.add_argument(
+        "--verify-baseline",
+        choices=("ends", "always", "never"),
+        default="ends",
+        help="byte-check books that predate the campaign at the start and end of a "
+        "run (ends, default), before and after every cut (always), or not at all "
+        "(never, leaving only names and directory-entry sizes checked)",
+    )
     args = parser.parse_args()
     Campaign(args).run()
 

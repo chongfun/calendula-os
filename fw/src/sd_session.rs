@@ -657,9 +657,9 @@ where
             #[cfg(feature = "powercut-selftest")]
             SessionInput::Digest(request) => {
                 let reply = if request.in_books {
-                    digest_book(books, request.name.as_str())
+                    digest_book(books, &request).await
                 } else {
-                    digest_book(root, request.name.as_str())
+                    digest_book(root, &request).await
                 };
                 crate::powercut::DIGEST_RESULTS.send(reply).await;
                 continue;
@@ -730,45 +730,57 @@ where
 /// of which the campaign treats as a book that is not there in any useful
 /// sense.
 #[cfg(feature = "powercut-selftest")]
-fn digest_book<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+async fn digest_book<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
     dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    name: &str,
+    request: &crate::powercut::DigestRequest,
 ) -> crate::powercut::DigestReply
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let file = dir
-        .open_file_in_dir(name, embedded_sdmmc::Mode::ReadOnly)
+        .open_file_in_dir(request.name.as_str(), embedded_sdmmc::Mode::ReadOnly)
         .ok()?;
-    let mut hash = crate::powercut::DIGEST_SEED;
+    let length = file.length();
+    if request.from > 0 {
+        file.seek_from_start(request.from).ok()?;
+    }
+    let mut hash = request.seed;
     let mut read_total = 0u32;
     // One sector at a time, on the session's stack. The campaign is the only
     // caller and it is waiting on the answer, so this is allowed to be slow;
     // it is not allowed to be large.
     let mut buffer = [0u8; 512];
-    while !file.is_eof() {
-        let read = file.read(&mut buffer).ok()?;
+    // Even a bounded range is seconds of blocking SD work, and the reply
+    // travels over a socket this task's own executor has to service. Without
+    // a yield the network task never runs for the length of the read, and the
+    // connection carrying the answer starves -- measured on an X3 as empty
+    // replies for the larger books, and for whatever request followed them.
+    // Every 32 sectors is 16 KB between yields, which costs nothing
+    // measurable against the SD reads.
+    const SECTORS_PER_YIELD: u32 = 32;
+    let mut since_yield = 0u32;
+    while read_total < request.len && !file.is_eof() {
+        let want = (request.len - read_total).min(buffer.len() as u32) as usize;
+        let read = file.read(&mut buffer[..want]).ok()?;
         if read == 0 {
             break;
         }
         hash = crate::powercut::digest_chunk(hash, &buffer[..read]);
         read_total += read as u32;
+        since_yield += 1;
+        if since_yield >= SECTORS_PER_YIELD {
+            since_yield = 0;
+            embassy_futures::yield_now().await;
+        }
     }
-    let length = file.length();
-    // A file whose chain runs short of what its entry advertises is exactly
-    // the corruption this exists to catch, so it is reported rather than
-    // quietly digested at the wrong length.
-    if read_total != length {
-        esp_println::println!(
-            "powercut: '{}' read {} of {} bytes",
-            name,
-            read_total,
-            length
-        );
-        return None;
-    }
-    Some((length, hash))
+    Some((length, read_total, hash))
 }
 
 /// Whether the journal leaves the shelf free to change, replaying it once
