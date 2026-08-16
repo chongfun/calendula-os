@@ -79,6 +79,25 @@ pub fn parse_u32(path: &[u8], name: &[u8]) -> Option<u32> {
     core::str::from_utf8(value).ok()?.parse::<u32>().ok()
 }
 
+/// The largest span one digest request may read, matching the host's chunk
+/// size.
+///
+/// A request asking for more is refused rather than trimmed. The bound is
+/// the whole point of the ranged protocol: a read long enough to outlive the
+/// socket's idle timeout takes the connection carrying its answer with it,
+/// and the request that follows. Serving an unbounded read on request would
+/// put that failure back within reach of a typo.
+pub const MAX_DIGEST_SPAN_BYTES: u32 = 4 * 1024 * 1024;
+
+/// `len` from the query, if present and within the span a single request may
+/// read. Absent, unparsable, zero, or too large is an absence — the caller
+/// refuses the request. Defaulting to "the whole file" is the one answer
+/// this must not give.
+pub fn parse_digest_len(path: &[u8]) -> Option<u32> {
+    let len = parse_u32(path, b"len")?;
+    (1..=MAX_DIGEST_SPAN_BYTES).contains(&len).then_some(len)
+}
+
 /// The `seed` parameter: the running digest, as 16 hex digits.
 pub fn parse_seed(path: &[u8]) -> Option<u64> {
     let value = proto::upload::query_param(path, b"seed")?;

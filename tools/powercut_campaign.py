@@ -451,6 +451,17 @@ class Manifest:
             with contextlib.suppress(OSError):
                 os.unlink(temporary)
             raise
+        # The rename itself is not durable until the directory holding it is
+        # flushed: fsyncing the file and not the entry that names it leaves
+        # the same crash window one step further along. Best effort, because
+        # opening a directory is a Unix affordance — elsewhere the atomic
+        # replace stands on its own.
+        with contextlib.suppress(OSError, AttributeError):
+            directory = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
 
 
 class ListingTruncated(Exception):
@@ -1647,6 +1658,37 @@ class TestPowercutCampaign(unittest.TestCase):
             with self.assertRaises(OSError):
                 broken._write()
             self.assertEqual(set(Manifest(path).load()), {"PCUT001", "PCUT002"})
+
+    def test_manifest_flushes_the_directory_after_replacing(self):
+        """The rename is what makes the new manifest the real one, and it is
+        not durable until the directory naming it is flushed. Checked by
+        observation rather than by trusting the call order to stay put."""
+        import tempfile
+        import unittest.mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Manifest(os.path.join(tmp, "m.txt"))
+            manifest.load()
+            events = []
+            real_replace, real_fsync = os.replace, os.fsync
+
+            def replace(src, dst):
+                events.append("replace")
+                return real_replace(src, dst)
+
+            def fsync(fd):
+                # Directories are the only fd opened O_RDONLY here; the
+                # manifest itself is written through a file object.
+                events.append("fsync-dir" if os.fstat(fd).st_mode & 0o040000 else "fsync-file")
+                return real_fsync(fd)
+
+            with (
+                unittest.mock.patch.object(os, "replace", replace),
+                unittest.mock.patch.object(os, "fsync", fsync),
+            ):
+                manifest.claim("PCUT001", [(500, 0xABCD)])
+
+            self.assertEqual(events, ["fsync-file", "replace", "fsync-dir"])
 
     def test_manifest_claim_is_idempotent(self):
         import tempfile

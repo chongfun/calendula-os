@@ -470,7 +470,7 @@ async fn upload_server(
                 // the socket's 30 s idle timeout, and `seed` carries the
                 // running hash across the pieces.
                 let from = crate::powercut::parse_u32(path, b"from").unwrap_or(0);
-                let len = crate::powercut::parse_u32(path, b"len").unwrap_or(u32::MAX);
+                let len = crate::powercut::parse_digest_len(path);
                 let seed =
                     crate::powercut::parse_seed(path).unwrap_or(crate::powercut::DIGEST_SEED);
                 let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
@@ -482,8 +482,8 @@ async fn upload_server(
                     .as_mut()
                     .and_then(|p| proto::upload::raw_query_name(p))
                     .and_then(|decoded| valid_short_name(decoded));
-                match name {
-                    Some(name) => {
+                match (name, len) {
+                    (Some(name), Some(len)) => {
                         // Reading the card needs a session for the same
                         // reason a delete does: the storage owner holds the
                         // volume, and nothing else may open it.
@@ -537,9 +537,16 @@ async fn upload_server(
                         }
                         let _ = write_http_response(&mut socket, "200 OK", body.as_str()).await;
                     }
-                    None => {
+                    (None, _) => {
                         let _ =
                             write_http_response(&mut socket, "400 Bad Request", "bad name").await;
+                    }
+                    // Absent or out of range. Refused rather than widened to
+                    // the whole file: an unbounded read is what outlives the
+                    // socket carrying its answer.
+                    (_, None) => {
+                        let _ =
+                            write_http_response(&mut socket, "400 Bad Request", "bad len").await;
                     }
                 }
             }
