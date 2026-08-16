@@ -453,15 +453,22 @@ class Manifest:
             raise
         # The rename itself is not durable until the directory holding it is
         # flushed: fsyncing the file and not the entry that names it leaves
-        # the same crash window one step further along. Best effort, because
-        # opening a directory is a Unix affordance — elsewhere the atomic
-        # replace stands on its own.
-        with contextlib.suppress(OSError, AttributeError):
-            directory = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+        # the same crash window one step further along.
+        #
+        # Skipped only where directories cannot be opened as files at all,
+        # which is a property of the platform and knowable in advance.
+        # Everywhere else a failure here is a failure to deliver the
+        # durability this method exists to provide, so it is raised. Catching
+        # it would leave the caller believing a manifest is on the card's
+        # side of a crash when it is not — the same silence the fsync was
+        # added to remove.
+        if os.name != "posix":
+            return
+        directory = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 class ListingTruncated(Exception):
@@ -1689,6 +1696,41 @@ class TestPowercutCampaign(unittest.TestCase):
                 manifest.claim("PCUT001", [(500, 0xABCD)])
 
             self.assertEqual(events, ["fsync-file", "replace", "fsync-dir"])
+
+    @unittest.skipUnless(os.name == "posix", "directories are only fsynced on POSIX")
+    def test_a_failed_directory_flush_is_raised(self):
+        """A manifest whose durability could not be established must say so.
+        Swallowing this leaves the caller believing the record survived a
+        crash it would not have survived — which is the silence the flush was
+        added to remove."""
+        import tempfile
+        import unittest.mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Manifest(os.path.join(tmp, "m.txt"))
+            manifest.load()
+            real_fsync = os.fsync
+            opened = []
+
+            def fsync(fd):
+                if os.fstat(fd).st_mode & 0o040000:
+                    raise OSError(5, "simulated I/O error flushing the directory")
+                return real_fsync(fd)
+
+            real_close = os.close
+
+            def close(fd):
+                opened.append(fd)
+                return real_close(fd)
+
+            with (
+                unittest.mock.patch.object(os, "fsync", fsync),
+                unittest.mock.patch.object(os, "close", close),
+                self.assertRaises(OSError),
+            ):
+                manifest.claim("PCUT001", [(500, 0xABCD)])
+            # The descriptor is still closed on the way out.
+            self.assertTrue(opened)
 
     def test_manifest_claim_is_idempotent(self):
         import tempfile
