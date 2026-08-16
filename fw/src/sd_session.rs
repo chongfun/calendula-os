@@ -587,6 +587,44 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    /// What woke the session loop.
+    enum SessionInput {
+        Command(UploadBegin),
+        Stop,
+        Display(DisplayCommand),
+        #[cfg(feature = "powercut-selftest")]
+        Digest(crate::powercut::DigestRequest),
+    }
+
+    /// The session's wait. A `powercut-selftest` build listens for a
+    /// readback alongside the ordinary commands; a shipping build compiles
+    /// to exactly the two-way wait it always had.
+    async fn next_session_input() -> SessionInput {
+        let ordinary = async {
+            match select(
+                UPLOAD_BEGINS.receive(),
+                select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+            )
+            .await
+            {
+                Either::First(begin) => SessionInput::Command(begin),
+                Either::Second(Either::First(())) => SessionInput::Stop,
+                Either::Second(Either::Second(command)) => SessionInput::Display(command),
+            }
+        };
+        #[cfg(feature = "powercut-selftest")]
+        {
+            match select(ordinary, crate::powercut::DIGEST_REQUESTS.receive()).await {
+                Either::First(input) => input,
+                Either::Second(request) => SessionInput::Digest(request),
+            }
+        }
+        #[cfg(not(feature = "powercut-selftest"))]
+        {
+            ordinary.await
+        }
+    }
+
     // Finish anything an earlier session left in flight before touching the
     // shelf. A record still on the card owns the names it describes and is
     // the only thing that knows where its files went, so this session must
@@ -597,25 +635,48 @@ where
     // that would tell the next mount a surviving snapshot is stale.
     if !catalog_cleared {
         esp_println::println!("upload: no install is replayed while the old snapshot stands");
-    } else if !upload_store::install::recover_installs(root, books).complete {
-        esp_println::println!("upload: an install is unfinished; refusing changes until it clears");
+    } else {
+        let outcome = upload_store::install::recover_installs(root, books);
+        #[cfg(feature = "powercut-selftest")]
+        crate::powercut::report_recovery(&outcome);
+        if !outcome.complete {
+            esp_println::println!(
+                "upload: an install is unfinished; refusing changes until it clears"
+            );
+        }
     }
 
     loop {
-        let begin = match select(
-            UPLOAD_BEGINS.receive(),
-            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
-        )
-        .await
-        {
-            Either::First(begin) => begin,
-            Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
-            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
+        let begin = match next_session_input().await {
+            // Test-only readback, served from here because this is where the
+            // card's owner already holds `root` and `books` open — a digest
+            // taken anywhere else would be a second task on the bus. It sits
+            // in the wait rather than being polled around it, so a request
+            // arriving at an idle session is answered instead of waiting for
+            // some other command to wake the loop.
+            #[cfg(feature = "powercut-selftest")]
+            SessionInput::Digest(request) => {
+                let result = if request.in_books {
+                    digest_book(books, &request).await
+                } else {
+                    digest_book(root, &request).await
+                };
+                crate::powercut::DIGEST_RESULTS
+                    .send(crate::powercut::DigestReply {
+                        id: request.id,
+                        result,
+                    })
+                    .await;
+                continue;
+            }
+            SessionInput::Command(begin) => begin,
+            SessionInput::Stop => return UploadSessionExit::Wireless,
+            SessionInput::Display(DisplayCommand::Sleep { generation }) => {
                 return UploadSessionExit::Sleep { generation }
             }
             // The wireless screen is already painted; renders queued during
             // the upload phase describe views this session never shows.
-            Either::Second(Either::Second(DisplayCommand::Render(_))) => continue,
+            SessionInput::Display(DisplayCommand::Render(_)) => continue,
         };
         // Asked once per command rather than once per session, because an
         // install that fails part way through leaves a record behind and
@@ -659,6 +720,72 @@ where
         );
         UPLOAD_RESULTS.send(ok).await;
     }
+}
+
+/// Read a book back off the card and digest the bytes that are actually
+/// there (`powercut-selftest` only).
+///
+/// The durability campaign's oracle was the directory entry's recorded
+/// length, which is metadata: an entry of the right size whose chain is
+/// wrong, unreadable, or holding somebody else's clusters satisfies it. This
+/// is the independent evidence — the file is opened, streamed, and hashed,
+/// so what comes back describes the chain rather than the entry over it.
+///
+/// `None` means the book could not be opened or a read failed part way, both
+/// of which the campaign treats as a book that is not there in any useful
+/// sense.
+#[cfg(feature = "powercut-selftest")]
+async fn digest_book<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    request: &crate::powercut::DigestRequest,
+) -> crate::powercut::DigestResult
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = dir
+        .open_file_in_dir(request.name.as_str(), embedded_sdmmc::Mode::ReadOnly)
+        .ok()?;
+    let length = file.length();
+    if request.from > 0 {
+        file.seek_from_start(request.from).ok()?;
+    }
+    let mut hash = request.seed;
+    let mut read_total = 0u32;
+    // One sector at a time, on the session's stack. The campaign is the only
+    // caller and it is waiting on the answer, so this is allowed to be slow;
+    // it is not allowed to be large.
+    let mut buffer = [0u8; 512];
+    // Even a bounded range is seconds of blocking SD work, and the reply
+    // travels over a socket this task's own executor has to service. Without
+    // a yield the network task never runs for the length of the read, and the
+    // connection carrying the answer starves -- measured on an X3 as empty
+    // replies for the larger books, and for whatever request followed them.
+    // Every 32 sectors is 16 KB between yields, which costs nothing
+    // measurable against the SD reads.
+    const SECTORS_PER_YIELD: u32 = 32;
+    let mut since_yield = 0u32;
+    while read_total < request.len && !file.is_eof() {
+        let want = (request.len - read_total).min(buffer.len() as u32) as usize;
+        let read = file.read(&mut buffer[..want]).ok()?;
+        if read == 0 {
+            break;
+        }
+        hash = crate::powercut::digest_chunk(hash, &buffer[..read]);
+        read_total += read as u32;
+        since_yield += 1;
+        if since_yield >= SECTORS_PER_YIELD {
+            since_yield = 0;
+            embassy_futures::yield_now().await;
+        }
+    }
+    Some((length, read_total, hash))
 }
 
 /// Whether the journal leaves the shelf free to change, replaying it once
@@ -832,6 +959,11 @@ where
         staged.abandon(root);
         return UploadWrite::Finished(None);
     }
+    // Test-only: the one place a cut can be timed into the install rather
+    // than aimed at it from outside. Must be the last thing before the call
+    // — anything awaited after it spends the deadline it just armed.
+    #[cfg(feature = "powercut-selftest")]
+    crate::powercut::arm_for_install().await;
     // install closes the file first: a book the card has not finished
     // writing is never published. From the moment the intent is durable the
     // swap completes here or at the next mount, never half way.

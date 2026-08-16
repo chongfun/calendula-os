@@ -421,10 +421,11 @@ async fn upload_server(
         // Reborrow the pieces by index so the buffer stays usable for the
         // body bytes that arrived with the headers.
         let path_at = method_len + 1;
-        let is_upload_post = request_buf
+        let is_post = request_buf
             .get(..method_len)
             .map(|m| m == b"POST")
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let is_upload_post = is_post
             && request_buf
                 .get(path_at..path_at + path_len)
                 .map(|p| p.starts_with(b"/upload"))
@@ -432,13 +433,141 @@ async fn upload_server(
 
         let path = request_buf.get(path_at..path_at + path_len).unwrap_or(b"/");
         let is_list = path.starts_with(b"/list");
-        let is_delete = request_buf
-            .get(..method_len)
-            .map(|m| m == b"POST")
-            .unwrap_or(false)
-            && path.starts_with(b"/delete");
+        let is_delete = is_post && path.starts_with(b"/delete");
+        // Test-only: the abrupt-reset arm for the install durability
+        // campaign. Compiles to `false` (and the branch below to nothing)
+        // outside `powercut-selftest` builds.
+        let is_powercut = {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                is_post && path.starts_with(b"/test-powercut")
+            }
+            #[cfg(not(feature = "powercut-selftest"))]
+            {
+                false
+            }
+        };
+        // Test-only: read a book back off the card and report what is in it.
+        let is_digest = {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                path.starts_with(b"/test-digest")
+            }
+            #[cfg(not(feature = "powercut-selftest"))]
+            {
+                false
+            }
+        };
 
-        if is_list {
+        if is_digest {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                // Read out of the immutable view first: extracting the name
+                // decodes in place and takes the buffer mutably, which ends
+                // this borrow.
+                //
+                // Ranged: `from`/`len` bound the read so no reply outlives
+                // the socket's 30 s idle timeout, and `seed` carries the
+                // running hash across the pieces.
+                let from = crate::powercut::parse_u32(path, b"from").unwrap_or(0);
+                let len = crate::powercut::parse_digest_len(path);
+                let seed =
+                    crate::powercut::parse_seed(path).unwrap_or(crate::powercut::DIGEST_SEED);
+                let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
+                let in_books = path_bytes
+                    .as_ref()
+                    .map(|p| !proto::upload::has_query_param(p, b"root=1"))
+                    .unwrap_or(true);
+                let name = path_bytes
+                    .as_mut()
+                    .and_then(|p| proto::upload::raw_query_name(p))
+                    .and_then(|decoded| valid_short_name(decoded));
+                match (name, len) {
+                    (Some(name), Some(len)) => {
+                        // Reading the card needs a session for the same
+                        // reason a delete does: the storage owner holds the
+                        // volume, and nothing else may open it.
+                        if !session_started {
+                            crate::upload::UPLOAD_SESSION_ACTIVE
+                                .store(true, portable_atomic::Ordering::SeqCst);
+                            STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
+                            session_started = true;
+                        }
+                        let id = crate::powercut::next_digest_id();
+                        crate::powercut::DIGEST_REQUESTS
+                            .send(crate::powercut::DigestRequest {
+                                id,
+                                name,
+                                in_books,
+                                from,
+                                len,
+                                seed,
+                            })
+                            .await;
+                        let reply = loop {
+                            match select(
+                                crate::powercut::DIGEST_RESULTS.receive(),
+                                UPLOAD_INTERRUPTS.wait(),
+                            )
+                            .await
+                            {
+                                Either::First(reply) if reply.id == id => break reply.result,
+                                // An answer to a request some earlier
+                                // connection stopped waiting for. Taking it
+                                // would report another book's contents as
+                                // this one's, so drop it and keep waiting.
+                                Either::First(_) => continue,
+                                Either::Second(()) => {
+                                    reclaim_upload_pipeline(&mut pool);
+                                    session_started = false;
+                                    break None;
+                                }
+                            }
+                        };
+                        let mut body = heapless::String::<64>::new();
+                        match reply {
+                            Some((length, read, hash)) => {
+                                use core::fmt::Write as _;
+                                let _ =
+                                    write!(body, "size={} read={} fnv={:016x}", length, read, hash);
+                            }
+                            None => {
+                                let _ = body.push_str("unreadable");
+                            }
+                        }
+                        let _ = write_http_response(&mut socket, "200 OK", body.as_str()).await;
+                    }
+                    (None, _) => {
+                        let _ =
+                            write_http_response(&mut socket, "400 Bad Request", "bad name").await;
+                    }
+                    // Absent or out of range. Refused rather than widened to
+                    // the whole file: an unbounded read is what outlives the
+                    // socket carrying its answer.
+                    (_, None) => {
+                        let _ =
+                            write_http_response(&mut socket, "400 Bad Request", "bad len").await;
+                    }
+                }
+            }
+        } else if is_powercut {
+            #[cfg(feature = "powercut-selftest")]
+            {
+                // `at_install_ms` defers the arm to the start of the next
+                // install, which is the only way to land a cut inside a
+                // window too narrow to aim at from the host.
+                if let Some(ms) = crate::powercut::parse_at_install_ms(path) {
+                    crate::powercut::CUT_AT_INSTALL_MS.store(ms, portable_atomic::Ordering::SeqCst);
+                    let _ = write_http_response(&mut socket, "200 OK", "armed at install").await;
+                } else if let Some(ms) = crate::powercut::parse_after_ms(path) {
+                    crate::powercut::POWERCUT_ARM.signal(ms);
+                    let _ = write_http_response(&mut socket, "200 OK", "armed").await;
+                } else {
+                    let _ =
+                        write_http_response(&mut socket, "400 Bad Request", "bad after_ms").await;
+                }
+            }
+        } else if is_list {
             let listing =
                 core::str::from_utf8(&catalog[..catalog_len.min(catalog.len())]).unwrap_or("");
             let _ = write_http_response(&mut socket, "200 OK", listing).await;

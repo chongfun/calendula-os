@@ -57,6 +57,11 @@ jobs:
       # this repo keeps arguing against.
       - name: Test bench harness
         run: tools/check.sh test-bench
+      # Same reasoning for the device tooling whose analysis decides a pass
+      # or a fail: the powercut campaign reports green on a broken card if
+      # its landing logic is wrong, and nobody re-derives that by hand.
+      - name: Test device tools
+        run: tools/check.sh test-tools
 
   clippy-firmware:
     runs-on: ubuntu-latest

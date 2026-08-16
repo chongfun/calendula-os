@@ -220,6 +220,17 @@ pub fn has_query_param(path: &[u8], param: &[u8]) -> bool {
         .any(|pair| pair == param)
 }
 
+/// Raw (still percent-encoded) value of a named query parameter.
+///
+/// Matches on the whole `name=` prefix of a parameter, so a request whose
+/// query carries `reset_after_ms=` does not answer a lookup for `after_ms`.
+pub fn query_param<'a>(path: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let query_at = path.iter().position(|byte| *byte == b'?')? + 1;
+    path[query_at..]
+        .split(|byte| *byte == b'&')
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix(b"="))
+}
+
 /// Percent-decoded `name=` value from a path's query string.
 pub fn raw_query_name(path: &mut [u8]) -> Option<&mut [u8]> {
     let query_at = path.iter().position(|byte| *byte == b'?')? + 1;
@@ -699,5 +710,36 @@ mod tests {
         assert!(!has_query_param(b"?name=root=1.epu", b"root=1"));
         assert!(!has_query_param(b"?root=2", b"root=1"));
         assert!(!has_query_param(b"/delete", b"root=1"));
+    }
+
+    #[test]
+    fn query_param_reads_a_value_wherever_it_sits() {
+        assert_eq!(
+            query_param(b"/p?after_ms=250", b"after_ms"),
+            Some(&b"250"[..])
+        );
+        assert_eq!(
+            query_param(b"/p?seed=1&after_ms=40&tail=x", b"after_ms"),
+            Some(&b"40"[..])
+        );
+        // Present but empty is a value, not an absence; parsing it is the
+        // caller's job.
+        assert_eq!(query_param(b"/p?after_ms=", b"after_ms"), Some(&b""[..]));
+    }
+
+    #[test]
+    fn query_param_refuses_absent_and_partial_matches() {
+        assert_eq!(query_param(b"/p", b"after_ms"), None);
+        assert_eq!(query_param(b"/p?seed=1", b"after_ms"), None);
+        // A parameter that merely ends in the name is a different parameter.
+        assert_eq!(query_param(b"/p?reset_after_ms=250", b"after_ms"), None);
+        // As is one that merely starts with it.
+        assert_eq!(query_param(b"/p?after_ms_max=250", b"after_ms"), None);
+        // A bare flag has no value to return, and must not stop the scan.
+        assert_eq!(query_param(b"/p?after_ms", b"after_ms"), None);
+        assert_eq!(
+            query_param(b"/p?after_ms&after_ms=7", b"after_ms"),
+            Some(&b"7"[..])
+        );
     }
 }
