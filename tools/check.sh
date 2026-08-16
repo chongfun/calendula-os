@@ -79,9 +79,16 @@ case "$COMMAND" in
         # The durability campaign's firmware. Never shipped, so nothing above
         # compiles it -- and a bench operator finding it broken is finding it
         # at the worst possible moment, with the device already open and the
-        # card already staged. X3 only: it is the board the campaign runs on.
+        # card already staged. Both boards, for the reason the serial-log
+        # runs above cover both: the feature reaches shared code, and a break
+        # that only shows on the other panel is a break nobody sees until
+        # somebody runs the campaign there. X3 is where it runs today; the
+        # X4 is the default build, so it takes no device feature.
         echo "Running firmware clippy for the powercut campaign for X3..."
         tools/cargo.sh clippy -p fw --features device-x3,powercut-selftest -- -D warnings
+
+        echo "Running firmware clippy for the powercut campaign for X4..."
+        tools/cargo.sh clippy -p fw --features powercut-selftest -- -D warnings
         ;;
     test-host)
         echo "Running host tests..."

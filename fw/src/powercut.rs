@@ -115,6 +115,13 @@ pub async fn arm_for_install() {
 /// request holds a connection open long. Measured on an X3 at ~800 kB/s, a
 /// 4 MB piece answers in about five seconds.
 pub struct DigestRequest {
+    /// Correlates this request with its reply. A connection that stops
+    /// waiting — the session died under it — leaves the storage owner still
+    /// working, and its answer lands in the results channel afterwards.
+    /// Without an ID the next request would take that answer as its own and
+    /// report one book's contents for another, which for an oracle is worse
+    /// than no answer at all.
+    pub id: u32,
     pub name: crate::upload::UploadName,
     pub in_books: bool,
     pub from: u32,
@@ -122,9 +129,23 @@ pub struct DigestRequest {
     pub seed: u64,
 }
 
-/// `(file length, bytes read, digest so far)`, or `None` if the book could
-/// not be opened or the read failed.
-pub type DigestReply = Option<(u32, u32, u64)>;
+/// What one ranged read found: `(file length, bytes read, digest so far)`,
+/// or `None` if the book could not be opened or the read failed.
+pub type DigestResult = Option<(u32, u32, u64)>;
+
+/// An answer to one [`DigestRequest`], carrying that request's `id`.
+pub struct DigestReply {
+    pub id: u32,
+    pub result: DigestResult,
+}
+
+static NEXT_DIGEST_ID: AtomicU32 = AtomicU32::new(1);
+
+/// The next request ID. Wrapping is harmless: only one request is ever in
+/// flight, so an ID has to survive one exchange, not four billion.
+pub fn next_digest_id() -> u32 {
+    NEXT_DIGEST_ID.fetch_add(1, Ordering::SeqCst)
+}
 
 pub static DIGEST_REQUESTS: Channel<CriticalSectionRawMutex, DigestRequest, 1> = Channel::new();
 pub static DIGEST_RESULTS: Channel<CriticalSectionRawMutex, DigestReply, 1> = Channel::new();

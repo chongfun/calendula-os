@@ -656,12 +656,17 @@ where
             // some other command to wake the loop.
             #[cfg(feature = "powercut-selftest")]
             SessionInput::Digest(request) => {
-                let reply = if request.in_books {
+                let result = if request.in_books {
                     digest_book(books, &request).await
                 } else {
                     digest_book(root, &request).await
                 };
-                crate::powercut::DIGEST_RESULTS.send(reply).await;
+                crate::powercut::DIGEST_RESULTS
+                    .send(crate::powercut::DigestReply {
+                        id: request.id,
+                        result,
+                    })
+                    .await;
                 continue;
             }
             SessionInput::Command(begin) => begin,
@@ -739,7 +744,7 @@ async fn digest_book<
 >(
     dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     request: &crate::powercut::DigestRequest,
-) -> crate::powercut::DigestReply
+) -> crate::powercut::DigestResult
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,

@@ -493,8 +493,10 @@ async fn upload_server(
                             STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
                             session_started = true;
                         }
+                        let id = crate::powercut::next_digest_id();
                         crate::powercut::DIGEST_REQUESTS
                             .send(crate::powercut::DigestRequest {
+                                id,
                                 name,
                                 in_books,
                                 from,
@@ -502,17 +504,24 @@ async fn upload_server(
                                 seed,
                             })
                             .await;
-                        let reply = match select(
-                            crate::powercut::DIGEST_RESULTS.receive(),
-                            UPLOAD_INTERRUPTS.wait(),
-                        )
-                        .await
-                        {
-                            Either::First(reply) => reply,
-                            Either::Second(()) => {
-                                reclaim_upload_pipeline(&mut pool);
-                                session_started = false;
-                                None
+                        let reply = loop {
+                            match select(
+                                crate::powercut::DIGEST_RESULTS.receive(),
+                                UPLOAD_INTERRUPTS.wait(),
+                            )
+                            .await
+                            {
+                                Either::First(reply) if reply.id == id => break reply.result,
+                                // An answer to a request some earlier
+                                // connection stopped waiting for. Taking it
+                                // would report another book's contents as
+                                // this one's, so drop it and keep waiting.
+                                Either::First(_) => continue,
+                                Either::Second(()) => {
+                                    reclaim_upload_pipeline(&mut pool);
+                                    session_started = false;
+                                    break None;
+                                }
                             }
                         };
                         let mut body = heapless::String::<64>::new();

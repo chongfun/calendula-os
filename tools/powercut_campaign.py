@@ -428,12 +428,29 @@ class Manifest:
     def _write(self):
         # Rewritten and fsynced on every change: a manifest that lags the
         # card either orphans files or claims books it does not own.
-        with open(self.path, "w", encoding="utf-8") as f:
-            for label, identities in sorted(self.claims.items()):
-                fields = "\t".join(f"{length}:{hash_:016x}" for length, hash_ in sorted(identities))
-                f.write(f"{label}\t{fields}\n")
-            f.flush()
-            os.fsync(f.fileno())
+        #
+        # Written to a sibling and renamed over it, because this file is the
+        # only record of what may be deleted. Truncating it in place leaves a
+        # window in which a killed run -- and killing runs is what this tool
+        # does -- finds a half-written manifest: claims lost are books nothing
+        # will ever clean up, and a torn last line refuses to parse at all.
+        # `os.replace` is atomic within a directory, so a reader sees either
+        # the whole old manifest or the whole new one.
+        temporary = f"{self.path}.new"
+        try:
+            with open(temporary, "w", encoding="utf-8") as f:
+                for label, identities in sorted(self.claims.items()):
+                    fields = "\t".join(
+                        f"{length}:{hash_:016x}" for length, hash_ in sorted(identities)
+                    )
+                    f.write(f"{label}\t{fields}\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
 
 
 class ListingTruncated(Exception):
@@ -1073,13 +1090,22 @@ class Campaign:
         # about recovery. Only a cycle where recovery finished a transaction
         # says the journal's replay path ran.
         install_cycles = [r for r in self.results if r["placement"] == "install"]
-        recovered = [r for r in self.results if r["recovered"]]
+        recovered = [r for r in install_cycles if r["recovered"]]
         moved = [r for r in recovered if r["recovery_moved"]]
         print(
             f"{len(recovered)}/{len(install_cycles)} install-timed cuts left a journal "
             f"record for recovery to replay; {len(moved)} of those needed a file moved "
             f"to finish the transaction."
         )
+        # The ratio above is install-timed only, so its two halves describe
+        # the same set of cycles. The gate below counts every cycle that
+        # reached the journal, because a transfer-placed cut aimed near the
+        # end of a body can land in the install too, and a replay is a replay
+        # whichever window aimed at it.
+        all_replays = [r for r in self.results if r["recovered"]]
+        strays = len(all_replays) - len(recovered)
+        if strays:
+            print(f"  ({strays} more reached it from a transfer-timed cut.)")
 
         # Coverage is a result, not a footnote. A run whose cuts all landed
         # beside the operation checked a device that was doing nothing, and
@@ -1093,9 +1119,9 @@ class Campaign:
                 f"answered normally on the far side of the reboot and one after it hits "
                 f"an idle device — adjust --min-fraction/--max-fraction"
             )
-        if len(recovered) < self.args.min_replays:
+        if len(all_replays) < self.args.min_replays:
             shortfalls.append(
-                f"only {len(recovered)} cut(s) reached the journal's replay path "
+                f"only {len(all_replays)} cut(s) reached the journal's replay path "
                 f"(wanted {self.args.min_replays}); the window is between the record "
                 f"becoming durable and its being cleared — adjust "
                 f"--install-min-ms/--install-max-ms/--install-share"
@@ -1601,6 +1627,26 @@ class TestPowercutCampaign(unittest.TestCase):
                 with self.assertRaises(AssertionError) as caught:
                     Manifest(path).load()
                 self.assertIn(path, str(caught.exception))
+
+    def test_manifest_is_replaced_atomically(self):
+        """The manifest is the only record of what may be deleted, and this
+        tool exists to kill processes. A reader must never see a half-written
+        one, and a failed write must not leave a stray beside it."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.txt")
+            manifest = Manifest(path)
+            manifest.load()
+            manifest.claim("PCUT001", [(500, 0xABCD)])
+            manifest.claim("PCUT002", [(600, 0x1234)])
+            self.assertEqual(os.listdir(tmp), ["m.txt"])
+            # An unwritable target fails without destroying what is there.
+            broken = Manifest(os.path.join(tmp, "nowhere", "m.txt"))
+            broken.claims = {"PCUT003": {(1, 2)}}
+            with self.assertRaises(OSError):
+                broken._write()
+            self.assertEqual(set(Manifest(path).load()), {"PCUT001", "PCUT002"})
 
     def test_manifest_claim_is_idempotent(self):
         import tempfile
