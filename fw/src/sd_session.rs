@@ -700,7 +700,7 @@ where
         // everything after it is in the same position as a session that
         // started with one.
         // Nothing may change while a snapshot of the old shelf might survive.
-        let settled = catalog_cleared && installs_settled(root, books);
+        let settled = catalog_cleared && storage_settled(root, books);
         let ok = if !settled {
             // Writes and deletes alike: a delete could remove the very book
             // an unfinished install parked, or the one it is about to
@@ -826,14 +826,17 @@ where
     Some((length, read_total, hash))
 }
 
-/// Whether the journal leaves the shelf free to change, replaying it once
-/// more if it does not.
+/// Whether the journals leave the shelf free to change, replaying them once
+/// more if they do not.
+///
+/// Both of them: an unsettled reclaim refuses a command as firmly as an
+/// unfinished install, so the name says storage rather than installs.
 ///
 /// A pass that could not finish may only have been the card refusing a read,
 /// and a session that gave up at its first command would then refuse every
 /// command after it. Cheap when there is nothing in flight: one read of the
 /// journal, and no recovery pass at all.
-fn installs_settled<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+fn storage_settled<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
 ) -> bool

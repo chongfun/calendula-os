@@ -101,7 +101,10 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         // it keeps the in-memory catalog when a scan fails, and an emptied
         // one is never non-empty — so a card that would not answer would take
         // the reader's whole shelf rather than postponing the rebuild.
-        let scanned = if !reconciled.may_mutate {
+        let scanned = if !reconciled.shelf_readable {
+            esp_println::println!("sd: shelf unreadable; keeping the catalog for the next mount");
+            Err(())
+        } else if !reconciled.may_mutate {
             // A reclaim that did not settle leaves cluster numbers recorded
             // and possibly already free. Writing the catalog would allocate,
             // and could be handed one of them; the replay that eventually
@@ -109,7 +112,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
             // resident catalog is left alone and the next mount tries again.
             esp_println::println!("sd: storage recovery unfinished; not rebuilding the catalog");
             Err(())
-        } else if reconciled.shelf_readable {
+        } else {
             // The 16 KB section text arena doubles as the scan's staging and
             // identity scratch: a scan runs from the storage dispatcher
             // (boot or an explicit refresh), never while a page render is
@@ -118,9 +121,6 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
             // afterwards.
             library.clear_catalog();
             write_catalog_streaming(root, library.arena_as_scratch())
-        } else {
-            esp_println::println!("sd: shelf unreadable; keeping the catalog for the next mount");
-            Err(())
         };
         let status = match scanned {
             Ok(0) => LibraryScanStatus::Empty,

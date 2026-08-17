@@ -139,15 +139,20 @@ impl TimeSource for StaticTime {
 type Mgr = VolumeManager<SharedDisk, StaticTime, 8, 8, 1>;
 type Dir<'a> = Directory<'a, SharedDisk, StaticTime, 8, 8, 1>;
 
-fn format_disk() -> Vec<u8> {
+/// A formatted FAT16 card image, with the given cluster size.
+///
+/// `bytes_per_cluster` of `None` takes the formatter's default. One sector
+/// per cluster is what makes journal growth allocate, which is the only
+/// configuration where an allocation-ordering mistake is visible.
+fn format_disk_with(bytes_per_cluster: Option<u32>) -> Vec<u8> {
     let mut disk = vec![0u8; DISK_BLOCKS as usize * BLOCK_BYTES];
     let part_blocks = DISK_BLOCKS - PART_START_BLOCK;
     let mut partition = vec![0u8; part_blocks as usize * BLOCK_BYTES];
-    fatfs::format_volume(
-        std::io::Cursor::new(partition.as_mut_slice()),
-        fatfs::FormatVolumeOptions::new().fat_type(fatfs::FatType::Fat16),
-    )
-    .expect("format");
+    let mut options = fatfs::FormatVolumeOptions::new().fat_type(fatfs::FatType::Fat16);
+    if let Some(bytes) = bytes_per_cluster {
+        options = options.bytes_per_cluster(bytes);
+    }
+    fatfs::format_volume(std::io::Cursor::new(partition.as_mut_slice()), options).expect("format");
     disk[PART_START_BLOCK as usize * BLOCK_BYTES..].copy_from_slice(&partition);
     let entry = 446;
     disk[entry + 4] = 0x06;
@@ -158,13 +163,17 @@ fn format_disk() -> Vec<u8> {
     disk
 }
 
-fn new_card() -> SharedDisk {
+fn card_from(image: Vec<u8>) -> SharedDisk {
     SharedDisk(Rc::new(RamDisk {
-        data: RefCell::new(format_disk()),
+        data: RefCell::new(image),
         fail_block: RefCell::new(None),
         fail_writes_from: RefCell::new(None),
         writes_seen: RefCell::new(0),
     }))
+}
+
+fn new_card() -> SharedDisk {
+    card_from(format_disk_with(None))
 }
 
 /// A card whose clusters are a single 512-byte sector.
@@ -174,29 +183,7 @@ fn new_card() -> SharedDisk {
 /// can land inside the first one and the allocation never happens, which
 /// would let a first-use ordering bug pass unnoticed.
 fn new_card_with_tiny_clusters() -> SharedDisk {
-    let mut disk = vec![0u8; DISK_BLOCKS as usize * BLOCK_BYTES];
-    let part_blocks = DISK_BLOCKS - PART_START_BLOCK;
-    let mut partition = vec![0u8; part_blocks as usize * BLOCK_BYTES];
-    fatfs::format_volume(
-        std::io::Cursor::new(partition.as_mut_slice()),
-        fatfs::FormatVolumeOptions::new()
-            .fat_type(fatfs::FatType::Fat16)
-            .bytes_per_cluster(512),
-    )
-    .expect("format");
-    disk[PART_START_BLOCK as usize * BLOCK_BYTES..].copy_from_slice(&partition);
-    let entry = 446;
-    disk[entry + 4] = 0x06;
-    disk[entry + 8..entry + 12].copy_from_slice(&PART_START_BLOCK.to_le_bytes());
-    disk[entry + 12..entry + 16].copy_from_slice(&part_blocks.to_le_bytes());
-    disk[510] = 0x55;
-    disk[511] = 0xAA;
-    SharedDisk(Rc::new(RamDisk {
-        data: RefCell::new(disk),
-        fail_block: RefCell::new(None),
-        fail_writes_from: RefCell::new(None),
-        writes_seen: RefCell::new(0),
-    }))
+    card_from(format_disk_with(Some(512)))
 }
 
 fn root_of(mgr: &Mgr) -> Dir<'_> {
@@ -609,8 +596,12 @@ fn free_clusters(disk: &SharedDisk) -> u32 {
     let boot = PART_START_BLOCK as usize * BLOCK_BYTES;
     let reserved = u16::from_le_bytes([image[boot + 14], image[boot + 15]]) as usize;
     let fat_start = (PART_START_BLOCK as usize + reserved) * BLOCK_BYTES;
+    // The FAT's real length, from the BPB. A fixed window would count a
+    // slice of it and miss frees outside that slice.
+    let sectors_per_fat =
+        u16::from_le_bytes([image[boot + 22], image[boot + 23]]) as usize * BLOCK_BYTES;
     let mut free = 0;
-    for pair in image[fat_start..fat_start + 8192].chunks(2) {
+    for pair in image[fat_start..fat_start + sectors_per_fat].chunks(2) {
         if pair == [0, 0] {
             free += 1;
         }

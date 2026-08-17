@@ -994,6 +994,11 @@ where
         continuation,
     };
     write_slot(root, index, &record.encode())?;
+    // The record is durable, so this handle has done its work. Recovery
+    // opens directories of its own, and the table is small enough that
+    // holding both sets at once exhausts it -- which arrives as a card
+    // error and reads like a failing card.
+    drop(dir);
     recover(root, books).map(|_| ())
 }
 
@@ -1148,6 +1153,17 @@ mod tests {
         let crc = fnv1a(&bytes[..OFF_CRC]);
         bytes[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
         // Whole, and shaped for a slot layout this build does not have.
+        assert_eq!(decode_slot(&bytes), Slot::Unsupported);
+    }
+
+    #[test]
+    fn a_place_this_build_does_not_know_is_unsupported() {
+        // A later build reclaiming from somewhere this one has no name for.
+        // Whole record, so it is waited for rather than stepped over.
+        let mut bytes = batch(3, &[10, 11], 12).encode();
+        bytes[OFF_PLACE] = 0x7F;
+        let crc = fnv1a(&bytes[..OFF_CRC]);
+        bytes[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(decode_slot(&bytes), Slot::Unsupported);
     }
 
