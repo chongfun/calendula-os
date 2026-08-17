@@ -107,7 +107,7 @@ const FLAG_HAS_OLD: u8 = 1 << 0;
 const FNV_OFFSET: u32 = 0x811c_9dc5;
 const FNV_PRIME: u32 = 0x0100_0193;
 
-fn fnv1a(bytes: &[u8]) -> u32 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u32 {
     let mut hash = FNV_OFFSET;
     for byte in bytes {
         hash ^= u32::from(*byte);
@@ -475,7 +475,7 @@ pub struct InstallRecovery {
     pub complete: bool,
 }
 
-type Dir<'a, D, T, const MD: usize, const MF: usize, const MV: usize> =
+pub(crate) type Dir<'a, D, T, const MD: usize, const MF: usize, const MV: usize> =
     Directory<'a, D, T, MD, MF, MV>;
 
 /// The chain this name points at, or `Ok(None)` if the name is not here.
@@ -702,6 +702,10 @@ where
 /// Public because an install and a recovery are the same walk: the caller
 /// that just staged a file writes its intent and then drives the plan
 /// forward exactly as the next mount would.
+///
+/// Requires a settled reclaim journal, for the reason given on
+/// [`recover_installs`]: [`Step::ReclaimRollback`] cannot run while a
+/// reclaim record stands.
 pub fn apply_step<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Dir<'_, D, T, MD, MF, MV>,
     books: &Dir<'_, D, T, MD, MF, MV>,
@@ -757,9 +761,42 @@ where
             let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
                 return Ok(false);
             };
-            match remove_file_reclaiming_clusters(&rollback_dir, alias.as_str()) {
-                RemoveStatus::Removed | RemoveStatus::Absent => Ok(false),
-                RemoveStatus::Failed => Err(InstallError::Card),
+            // Handed to the reclaim journal rather than truncated here.
+            //
+            // The two journals do not need an atomic update between them,
+            // and that is the point of the ordering. This step establishes a
+            // reclaim record, unlinks the parked name, frees its chain and
+            // clears that record. A reset anywhere inside leaves the reclaim
+            // journal describing the rest, and the next mount replays it
+            // *before* this journal -- so by the time the install planner
+            // looks again, the parked copy is either still there, in which
+            // case this step runs afresh, or gone, in which case the planner
+            // observes that and advances. Neither state needs this record to
+            // have been updated in the same breath.
+            //
+            // No shelf is passed: a parked copy lives under the cache root,
+            // which recovery reaches from `root` alone.
+            //
+            // The handles this step opened are given up first. The reclaim
+            // opens its own, and the directory table is small enough that
+            // holding both sets at once exhausts it -- which arrives as a
+            // card error and reads like a failing card rather than a
+            // bookkeeping mistake.
+            drop(rollback_dir);
+            drop(upload);
+            drop(cache_root);
+            match crate::reclaim::reclaim_entry(
+                root,
+                None,
+                crate::reclaim::Place::Rollback,
+                alias.as_str(),
+            ) {
+                Ok(()) => Ok(false),
+                // Not this step's to resolve. A reclaim already outstanding,
+                // or a journal this build cannot read, is settled before any
+                // install step runs -- so meeting one here means the card
+                // changed under this pass, and the next mount starts over.
+                Err(_) => Err(InstallError::Card),
             }
         }
         Step::RestoreOldHolder => {
@@ -918,6 +955,23 @@ where
 /// Retires the catalog snapshot first when there is a record to act on — see
 /// the note inside on why that is a precondition rather than the caller's
 /// housekeeping.
+///
+/// # The reclaim journal must be settled first
+///
+/// A precondition, not a preference, and this function does not check it.
+/// [`Step::ReclaimRollback`] hands a parked predecessor to
+/// [`crate::reclaim::reclaim_entry`], which refuses while a reclaim record
+/// stands — so reaching that step with one outstanding turns the whole pass
+/// into a card error and leaves the install standing for the next mount. And
+/// the steps before it allocate, over a card whose free space an unfinished
+/// reclaim is still deciding.
+///
+/// Every mount-time and session-start caller in the firmware replays
+/// [`crate::reclaim::recover`] before calling this, and refuses outright if
+/// that will not settle. The one caller that does not is
+/// [`StagedUpload::install`], which reaches here after its own record is
+/// durable — and it runs inside an upload session, which settled both
+/// journals on the way in and re-checks before every command.
 pub fn recover_installs<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Dir<'_, D, T, MD, MF, MV>,
     books: &Dir<'_, D, T, MD, MF, MV>,

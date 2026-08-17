@@ -556,7 +556,10 @@ async fn upload_server(
                 // `at_install_ms` defers the arm to the start of the next
                 // install, which is the only way to land a cut inside a
                 // window too narrow to aim at from the host.
-                if let Some(ms) = crate::powercut::parse_at_install_ms(path) {
+                if let Some(ms) = crate::powercut::parse_at_reclaim_ms(path) {
+                    crate::powercut::CUT_AT_RECLAIM_MS.store(ms, portable_atomic::Ordering::SeqCst);
+                    let _ = write_http_response(&mut socket, "200 OK", "armed at reclaim").await;
+                } else if let Some(ms) = crate::powercut::parse_at_install_ms(path) {
                     crate::powercut::CUT_AT_INSTALL_MS.store(ms, portable_atomic::Ordering::SeqCst);
                     let _ = write_http_response(&mut socket, "200 OK", "armed at install").await;
                 } else if let Some(ms) = crate::powercut::parse_after_ms(path) {

@@ -101,7 +101,18 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         // it keeps the in-memory catalog when a scan fails, and an emptied
         // one is never non-empty — so a card that would not answer would take
         // the reader's whole shelf rather than postponing the rebuild.
-        let scanned = if reconciled.shelf_readable {
+        let scanned = if !reconciled.shelf_readable {
+            esp_println::println!("sd: shelf unreadable; keeping the catalog for the next mount");
+            Err(())
+        } else if !reconciled.may_mutate {
+            // A reclaim that did not settle leaves cluster numbers recorded
+            // and possibly already free. Writing the catalog would allocate,
+            // and could be handed one of them; the replay that eventually
+            // runs would then free it back out of `CATALOG.BIN`. The
+            // resident catalog is left alone and the next mount tries again.
+            esp_println::println!("sd: storage recovery unfinished; not rebuilding the catalog");
+            Err(())
+        } else {
             // The 16 KB section text arena doubles as the scan's staging and
             // identity scratch: a scan runs from the storage dispatcher
             // (boot or an explicit refresh), never while a page render is
@@ -110,9 +121,6 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
             // afterwards.
             library.clear_catalog();
             write_catalog_streaming(root, library.arena_as_scratch())
-        } else {
-            esp_println::println!("sd: shelf unreadable; keeping the catalog for the next mount");
-            Err(())
         };
         let status = match scanned {
             Ok(0) => LibraryScanStatus::Empty,
@@ -187,6 +195,15 @@ struct Reconciled {
     /// not answer, where a scan would fail too — and clearing the resident
     /// catalog to run one would cost the reader their shelf for nothing.
     shelf_readable: bool,
+    /// Safe to allocate on this card.
+    ///
+    /// Separate from `shelf_readable`, because a stalled reclaim is readable
+    /// and must not be written over. Its record names clusters that may
+    /// already be free, and those numbers carry no ownership — so anything
+    /// that allocates before it settles can be handed one, and the replay
+    /// that eventually runs will free it back out from under whatever took
+    /// it. A rebuilt catalog is exactly such an allocation.
+    may_mutate: bool,
 }
 
 /// Finish any install an earlier session left in flight.
@@ -219,6 +236,44 @@ where
         // published, whether or not there is a /BOOKS to look at.
         Err(embedded_sdmmc::Error::NotFound) => {
             use upload_store::install::IntentState;
+            // The reclaim journal is consulted whether or not there is a
+            // shelf. A reclaim can name the card root -- the OTA trigger
+            // does -- and one of those is replayable here; a reclaim that
+            // names the shelf is refused rather than assumed finished, since
+            // its clusters are detached and nothing may allocate over them.
+            // Either way this must be asked before the scan is let loose to
+            // write a catalog.
+            match upload_store::reclaim::recover(root, None) {
+                #[cfg(feature = "powercut-selftest")]
+                Ok(true) => esp_println::println!("powercut: recovery replayed a reclaim"),
+                Ok(_) => {}
+                Err(error) => {
+                    // Nothing else is touched. Clearing a truncated install
+                    // record below would mutate this card, and the reclaim
+                    // journal not settling is precisely the state in which this
+                    // build has decided it does not know enough to. When the
+                    // failure is the journal refusing to read, that reader
+                    // deliberately infers nothing from the other slot -- so
+                    // answering it by writing to a second journal would take
+                    // back the fail-stop it just asked for.
+                    esp_println::println!(
+                        "sd: a reclaim is unfinished and there is no shelf ({:?})",
+                        error
+                    );
+                    return Reconciled {
+                        outcome: upload_store::install::InstallRecovery {
+                            touched_shelf: false,
+                            swept: false,
+                            // Conservative: an install may well be
+                            // outstanding, and this pass has not looked.
+                            had_intent: true,
+                            complete: false,
+                        },
+                        shelf_readable: true,
+                        may_mutate: false,
+                    };
+                }
+            }
             let (had_intent, complete) = match upload_store::install::read_intent(root) {
                 Ok(IntentState::Absent) => (false, true),
                 // Nothing to replay, but something was there — and whatever
@@ -241,6 +296,8 @@ where
                 // Nothing to reconcile against, but a scan still has the card
                 // root to walk.
                 shelf_readable: true,
+                // Reclaim settled above, or this branch returned there.
+                may_mutate: true,
             };
         }
         Err(_) => {
@@ -256,9 +313,35 @@ where
                     complete: false,
                 },
                 shelf_readable: false,
+                may_mutate: false,
             };
         }
     };
+    // Reclaim before installs, always. A reclaim may be part way through
+    // freeing a chain, and its record is the only thing that can find the
+    // rest; the install journal's own steps allocate and free, so letting
+    // them run first would be reasoning about a shelf whose spare space is
+    // still being sorted out. Nothing here can proceed over a reclaim
+    // journal this build cannot read, which is what the refusal below says.
+    match upload_store::reclaim::recover(root, Some(&books)) {
+        #[cfg(feature = "powercut-selftest")]
+        Ok(true) => esp_println::println!("powercut: recovery replayed a reclaim"),
+        Ok(_) => {}
+        Err(error) => {
+            esp_println::println!("sd: a reclaim is unfinished ({:?})", error);
+            return Reconciled {
+                outcome: upload_store::install::InstallRecovery {
+                    touched_shelf: false,
+                    swept: false,
+                    had_intent: true,
+                    complete: false,
+                },
+                shelf_readable: true,
+                // Readable, and not to be written on: see `may_mutate`.
+                may_mutate: false,
+            };
+        }
+    }
     let outcome = upload_store::install::recover_installs(root, &books);
     #[cfg(feature = "powercut-selftest")]
     crate::powercut::report_recovery(&outcome);
@@ -296,6 +379,7 @@ where
     Reconciled {
         outcome,
         shelf_readable: true,
+        may_mutate: true,
     }
 }
 

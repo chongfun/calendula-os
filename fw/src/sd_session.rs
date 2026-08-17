@@ -549,19 +549,56 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     // uploads until an exit arrives instead of parking in a forever loop
     // that would acknowledge over live handles.
     let exit = {
-        let books = match root.open_dir("BOOKS") {
-            Ok(books) => Ok(books),
-            Err(_) => match root.make_dir_in_dir("BOOKS") {
-                Ok(()) => root.open_dir("BOOKS"),
-                Err(error) => Err(error),
-            },
+        // Opened, not created, and the reclaim journal settled before the
+        // shelf can be made. Creating a directory allocates, and a live
+        // reclaim holds recorded cluster numbers that carry no ownership --
+        // so an allocation before it settles can be handed one, and the
+        // replay that follows frees it back out of whatever took it.
+        //
+        // Reachable since the OTA trigger began using the journal: a root
+        // reclaim can be outstanding on a card that has never held a book,
+        // and this is the one path that would create the shelf while it
+        // stood. The mount scanner and the command gate already obey this
+        // rule; setup did not.
+        let opened = match root.open_dir("BOOKS") {
+            Ok(books) => Some(Some(books)),
+            Err(embedded_sdmmc::Error::NotFound) => Some(None),
+            // A card that will not answer an open is not one to respond to
+            // with a metadata write.
+            Err(_) => None,
         };
-        match books {
-            Ok(books) => serve_uploads(&root, &books, catalog_cleared).await,
-            Err(_) => {
-                esp_println::println!("upload: BOOKS setup failed");
+        match opened {
+            None => {
+                esp_println::println!("upload: the shelf would not open");
                 refuse_uploads_until_exit().await
             }
+            Some(existing) => match upload_store::reclaim::recover(&root, existing.as_ref()) {
+                Err(error) => {
+                    esp_println::println!(
+                        "upload: a reclaim is unfinished; refusing the session ({:?})",
+                        error
+                    );
+                    refuse_uploads_until_exit().await
+                }
+                Ok(_) => {
+                    // Settled, so the shelf may now be created if it is not
+                    // there.
+                    let books = match existing {
+                        Some(books) => Ok(books),
+                        None => match root.make_dir_in_dir("BOOKS") {
+                            Ok(()) => root.open_dir("BOOKS"),
+                            Err(error) => Err(error),
+                        },
+                    };
+                    match books {
+                        Ok(books) => serve_uploads(&root, &books, catalog_cleared).await,
+                        Err(_) => {
+                            esp_println::println!("upload: BOOKS setup failed");
+                            refuse_uploads_until_exit().await
+                        }
+                    }
+                }
+            },
         }
     };
     drop(root);
@@ -635,6 +672,23 @@ where
     // that would tell the next mount a surviving snapshot is stale.
     if !catalog_cleared {
         esp_println::println!("upload: no install is replayed while the old snapshot stands");
+    } else if let Err(error) =
+        upload_store::reclaim::recover(root, Some(books)).inspect(|_replayed| {
+            #[cfg(feature = "powercut-selftest")]
+            if *_replayed {
+                esp_println::println!("powercut: recovery replayed a reclaim");
+            }
+        })
+    {
+        // Same order as at mount, and the same reason: a reclaim part way
+        // through freeing a chain is the one transaction whose record
+        // cannot be reconstructed, so it settles before anything else
+        // allocates. A journal this build cannot read stops the session
+        // rather than being written over.
+        esp_println::println!(
+            "upload: a reclaim is unfinished; refusing changes until it clears ({:?})",
+            error
+        );
     } else {
         let outcome = upload_store::install::recover_installs(root, books);
         #[cfg(feature = "powercut-selftest")]
@@ -683,20 +737,41 @@ where
         // everything after it is in the same position as a session that
         // started with one.
         // Nothing may change while a snapshot of the old shelf might survive.
-        let settled = catalog_cleared && installs_settled(root, books);
+        let settled = catalog_cleared && storage_settled(root, books);
         let ok = if !settled {
             // Writes and deletes alike: a delete could remove the very book
             // an unfinished install parked, or the one it is about to
             // install over.
-            esp_println::println!("upload: refused, an install is still in flight");
+            // "storage recovery", not "an install": this gate now covers the
+            // reclaim journal too, and a delete refused because a reclaim
+            // has not settled is not an install being in flight.
+            esp_println::println!("upload: refused, storage recovery is still in flight");
             false
         } else if begin.delete {
-            let removed = if begin.in_books {
-                upload_store::remove_file_reclaiming_clusters(books, begin.name.as_str())
-                    == upload_store::RemoveStatus::Removed
+            // Journalled: the name goes before the space, and a reset in
+            // between leaves the book wholly there or wholly gone rather
+            // than listed over clusters that have already been handed back.
+            let place = if begin.in_books {
+                upload_store::reclaim::Place::Books
             } else {
-                upload_store::remove_file_reclaiming_clusters(root, begin.name.as_str())
-                    == upload_store::RemoveStatus::Removed
+                upload_store::reclaim::Place::Root
+            };
+            // Test-only: the one place a cut can be timed into the reclaim
+            // rather than aimed at it from outside. Last thing before the
+            // call, since anything awaited after it spends the deadline.
+            #[cfg(feature = "powercut-selftest")]
+            crate::powercut::arm_for_reclaim().await;
+            let removed = match upload_store::reclaim::reclaim_entry(
+                root,
+                Some(books),
+                place,
+                begin.name.as_str(),
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    esp_println::println!("upload: delete refused: {:?}", error);
+                    false
+                }
             };
             if removed && begin.in_books {
                 upload_store::delete_upload_sidecars(root, begin.name.as_str());
@@ -788,14 +863,17 @@ where
     Some((length, read_total, hash))
 }
 
-/// Whether the journal leaves the shelf free to change, replaying it once
-/// more if it does not.
+/// Whether the journals leave the shelf free to change, replaying them once
+/// more if they do not.
+///
+/// Both of them: an unsettled reclaim refuses a command as firmly as an
+/// unfinished install, so the name says storage rather than installs.
 ///
 /// A pass that could not finish may only have been the card refusing a read,
 /// and a session that gave up at its first command would then refuse every
 /// command after it. Cheap when there is nothing in flight: one read of the
 /// journal, and no recovery pass at all.
-fn installs_settled<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+fn storage_settled<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
 ) -> bool
@@ -803,6 +881,15 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // The reclaim journal first, and it gates every command rather than only
+    // the session's start. A reclaim this build cannot read may be part way
+    // through freeing a chain, and an upload allocating over those clusters
+    // is the one thing that must not happen while that is unresolved. Its
+    // replay is cheap when there is nothing outstanding: one read of a
+    // journal that says so.
+    if upload_store::reclaim::recover(root, Some(books)).is_err() {
+        return false;
+    }
     if journal_is_clear(root) {
         return true;
     }
