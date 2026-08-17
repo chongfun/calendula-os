@@ -702,6 +702,10 @@ where
 /// Public because an install and a recovery are the same walk: the caller
 /// that just staged a file writes its intent and then drives the plan
 /// forward exactly as the next mount would.
+///
+/// Requires a settled reclaim journal, for the reason given on
+/// [`recover_installs`]: [`Step::ReclaimRollback`] cannot run while a
+/// reclaim record stands.
 pub fn apply_step<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Dir<'_, D, T, MD, MF, MV>,
     books: &Dir<'_, D, T, MD, MF, MV>,
@@ -951,6 +955,23 @@ where
 /// Retires the catalog snapshot first when there is a record to act on — see
 /// the note inside on why that is a precondition rather than the caller's
 /// housekeeping.
+///
+/// # The reclaim journal must be settled first
+///
+/// A precondition, not a preference, and this function does not check it.
+/// [`Step::ReclaimRollback`] hands a parked predecessor to
+/// [`crate::reclaim::reclaim_entry`], which refuses while a reclaim record
+/// stands — so reaching that step with one outstanding turns the whole pass
+/// into a card error and leaves the install standing for the next mount. And
+/// the steps before it allocate, over a card whose free space an unfinished
+/// reclaim is still deciding.
+///
+/// Every mount-time and session-start caller in the firmware replays
+/// [`crate::reclaim::recover`] before calling this, and refuses outright if
+/// that will not settle. The one caller that does not is
+/// [`StagedUpload::install`], which reaches here after its own record is
+/// durable — and it runs inside an upload session, which settled both
+/// journals on the way in and re-checks before every command.
 pub fn recover_installs<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Dir<'_, D, T, MD, MF, MV>,
     books: &Dir<'_, D, T, MD, MF, MV>,
