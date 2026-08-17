@@ -135,10 +135,22 @@ pub enum RemoveStatus {
 /// does not release the file's clusters. `Mode::ReadWriteTruncate` calls
 /// `truncate_cluster_chain`, which walks and frees the cluster chain and writes
 /// the zeroed directory entry before returning (embedded-sdmmc d26892f,
-/// `VolumeManager::open_file_in_dir`). A fault in that write-back leaves the
-/// entry at its original length — the chain free is not visible until the entry
-/// lands — so the file stays readable and identity-matched for the next re-upload
-/// to retire.
+/// `VolumeManager::open_file_in_dir`).
+///
+/// # This is not safe to interrupt
+///
+/// It once said here that a fault in that write-back leaves the entry at its
+/// original length, so the file stays readable. That is wrong, and a
+/// durability campaign proved it on hardware: the chain is freed *before* the
+/// entry is rewritten, so a reset in between leaves an entry advertising its
+/// old size over clusters that are already free. The file is listed and
+/// unreadable, and no amount of retrying finds the data again.
+///
+/// So this belongs only where an interruption is invisible to a reader and
+/// costs at most leaked space — clearing a journal, discarding scratch,
+/// sweeping leftovers, evicting a cache. Anything a reader can see the name
+/// of goes through [`crate::reclaim`], which records the chain before
+/// freeing any of it and takes the name away first.
 ///
 /// Files only: opening a directory as a file fails, which would report the
 /// delete as failed without attempting it. Directory entries hold no cluster
@@ -182,10 +194,11 @@ where
 /// the file as still there.
 ///
 /// The distinction matters for the catalog snapshot. A caller about to change
-/// `/BOOKS` invalidates it first, because a clean install clears its journal
-/// and a delete never writes one — so once the change is made, nothing on the
-/// card would tell the next mount that the snapshot describes a shelf that
-/// has moved.
+/// `/BOOKS` invalidates it first, because a transaction that finishes leaves
+/// nothing behind saying it happened: an install clears its journal, and a
+/// delete — which does write one now — clears its reclaim record the same
+/// way. So once the change is made, nothing on the card would tell the next
+/// mount that the snapshot describes a shelf that has moved.
 pub fn clear_cache_file<
     D,
     T,
