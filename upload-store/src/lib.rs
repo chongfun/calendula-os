@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod install;
+pub mod reclaim;
 
 use embedded_sdmmc::{Directory, Mode, TimeSource};
 use heapless::String;
@@ -48,7 +49,7 @@ fn identity_file_name(open_name: &str, out: &mut String<12>) {
 /// A directory handle keeps the volume manager's lifetime, not the borrow of
 /// the parent it was opened through, so a file opened inside it can outlive
 /// the handles walked to reach it.
-fn open_or_make_dir<
+pub(crate) fn open_or_make_dir<
     'a,
     D,
     T,

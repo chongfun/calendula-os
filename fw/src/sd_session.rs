@@ -635,6 +635,23 @@ where
     // that would tell the next mount a surviving snapshot is stale.
     if !catalog_cleared {
         esp_println::println!("upload: no install is replayed while the old snapshot stands");
+    } else if let Err(error) =
+        upload_store::reclaim::recover(root, Some(books)).inspect(|_replayed| {
+            #[cfg(feature = "powercut-selftest")]
+            if *_replayed {
+                esp_println::println!("powercut: recovery replayed a reclaim");
+            }
+        })
+    {
+        // Same order as at mount, and the same reason: a reclaim part way
+        // through freeing a chain is the one transaction whose record
+        // cannot be reconstructed, so it settles before anything else
+        // allocates. A journal this build cannot read stops the session
+        // rather than being written over.
+        esp_println::println!(
+            "upload: a reclaim is unfinished; refusing changes until it clears ({:?})",
+            error
+        );
     } else {
         let outcome = upload_store::install::recover_installs(root, books);
         #[cfg(feature = "powercut-selftest")]
@@ -688,15 +705,36 @@ where
             // Writes and deletes alike: a delete could remove the very book
             // an unfinished install parked, or the one it is about to
             // install over.
-            esp_println::println!("upload: refused, an install is still in flight");
+            // "storage recovery", not "an install": this gate now covers the
+            // reclaim journal too, and a delete refused because a reclaim
+            // has not settled is not an install being in flight.
+            esp_println::println!("upload: refused, storage recovery is still in flight");
             false
         } else if begin.delete {
-            let removed = if begin.in_books {
-                upload_store::remove_file_reclaiming_clusters(books, begin.name.as_str())
-                    == upload_store::RemoveStatus::Removed
+            // Journalled: the name goes before the space, and a reset in
+            // between leaves the book wholly there or wholly gone rather
+            // than listed over clusters that have already been handed back.
+            let place = if begin.in_books {
+                upload_store::reclaim::Place::Books
             } else {
-                upload_store::remove_file_reclaiming_clusters(root, begin.name.as_str())
-                    == upload_store::RemoveStatus::Removed
+                upload_store::reclaim::Place::Root
+            };
+            // Test-only: the one place a cut can be timed into the reclaim
+            // rather than aimed at it from outside. Last thing before the
+            // call, since anything awaited after it spends the deadline.
+            #[cfg(feature = "powercut-selftest")]
+            crate::powercut::arm_for_reclaim().await;
+            let removed = match upload_store::reclaim::reclaim_entry(
+                root,
+                Some(books),
+                place,
+                begin.name.as_str(),
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    esp_println::println!("upload: delete refused: {:?}", error);
+                    false
+                }
             };
             if removed && begin.in_books {
                 upload_store::delete_upload_sidecars(root, begin.name.as_str());
@@ -803,6 +841,15 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // The reclaim journal first, and it gates every command rather than only
+    // the session's start. A reclaim this build cannot read may be part way
+    // through freeing a chain, and an upload allocating over those clusters
+    // is the one thing that must not happen while that is unresolved. Its
+    // replay is cheap when there is nothing outstanding: one read of a
+    // journal that says so.
+    if upload_store::reclaim::recover(root, Some(books)).is_err() {
+        return false;
+    }
     if journal_is_clear(root) {
         return true;
     }

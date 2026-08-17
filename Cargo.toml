@@ -19,7 +19,7 @@ resolver = "2"
 # Our fork: chongfun/embedded-sdmmc-rs, branch
 # calendula/long-names-and-error-fidelity.
 # Upstream v0.10, plus Jon-Vii's create_file_in_dir_lfn so wireless uploads land
-# under a real filename instead of an 8.3 alias, plus five changes of ours.
+# under a real filename instead of an 8.3 alias, plus six changes of ours.
 #
 # Two are the same bug in different clothes: a FAT read that failed was
 # reported as a file that is absent, and elsewhere as a disk that is full.
@@ -58,16 +58,33 @@ resolver = "2"
 # deleted from /BOOKS -- into a lost predecessor. See the note on
 # upload-store's install module.
 #
-# Regression coverage for all five of our changes lives in the fork, not here:
+# The sixth is the pair a reclaim needs to survive being interrupted:
+# next_cluster_in_chain and free_cluster, with ClusterId::new to turn journaled
+# numbers back into clusters. truncate_cluster_chain frees a chain by following
+# it, and freeing is what destroys the links -- so a reclaim cut part way
+# through cannot resume, however carefully its first cluster was recorded. The
+# entry naming the second cluster is exactly what was overwritten. These let a
+# caller read the chain out, write the numbers down, and then free them by
+# name, replaying the list as often as it takes: free_cluster is idempotent,
+# and rewrites the entry even when the primary FAT already reads free, because
+# clearing an entry is two writes and the reset that interrupts one lands
+# between them. Ok(Some(c)) from the walk is always a data cluster on this
+# volume, so a stale journal number is a clean error rather than FAT arithmetic
+# on a number that means nothing. Both are reachable from a Directory, which is
+# what a reclaim already holds; the RawVolume lookup behind that is
+# crate-internal there, because a handle read back from an open directory is not
+# one its holder should close. See upload-store's reclaim module.
+#
+# Regression coverage for all six of our changes lives in the fork, not here:
 # tests/fat_chain_errors.rs for the error-propagation fixes, tests/move_file.rs
-# for the move, the link, and the recorded cluster. A bump that loses them
-# would still compile against this workspace, so re-run the fork's suite when
-# moving the rev. There is no upstream issue or PR to track: the fork we branched from
+# for the move, the link, and the recorded cluster, tests/free_clusters.rs for
+# the reclaim primitives. A bump that loses them would still compile against
+# this workspace, so re-run the fork's suite when moving the rev. There is no upstream issue or PR to track: the fork we branched from
 # is unmaintained, so this rev is where these fixes live.
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "7308883cfe87490e0533d56566162b815c12be76", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "6e7dbe1689da507979a2647a7a6fa3ee033407ff", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an

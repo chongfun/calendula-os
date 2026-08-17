@@ -206,8 +206,19 @@ pub fn apply_pending_update(root: &SdRoot) -> UpdateOutcome {
 /// Delete the one-shot trigger, reclaiming its clusters. Returns whether the
 /// card no longer holds it.
 fn remove_trigger(root: &SdRoot) -> bool {
-    upload_store::remove_file_reclaiming_clusters(root, TRIGGER_FILE)
-        != upload_store::RemoveStatus::Failed
+    // Journalled, like a book delete. This one is control state rather than
+    // a reader's file: the trigger going away is what stops a bad update
+    // being retried on every boot, and an interrupted removal that left the
+    // name over a freed chain would make that decision on a file the card
+    // can no longer read. No shelf is needed -- the trigger lives at the
+    // card root, which recovery reaches without one.
+    upload_store::reclaim::reclaim_entry(
+        root,
+        None,
+        upload_store::reclaim::Place::Root,
+        TRIGGER_FILE,
+    )
+    .is_ok()
 }
 
 /// Point `otadata` at `dest_slot`. Returns whether the write landed.

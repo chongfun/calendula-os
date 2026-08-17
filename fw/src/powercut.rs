@@ -104,6 +104,43 @@ pub fn parse_seed(path: &[u8]) -> Option<u64> {
     u64::from_str_radix(core::str::from_utf8(value).ok()?, 16).ok()
 }
 
+/// A deadline to arm at the start of the next reclaim, or 0 for none.
+///
+/// The delete path's counterpart to [`CUT_AT_INSTALL_MS`], and needed for
+/// the same reason. A delete is short and the journalled part of it shorter
+/// still, so a host aiming at that window from outside mostly lands beside
+/// it: measured on an X3, three deletes cut mid-operation all finished
+/// before their reset fired, which proves the ordering and says nothing
+/// about the journal. The device knows when the reclaim starts.
+pub static CUT_AT_RECLAIM_MS: AtomicU32 = AtomicU32::new(0);
+
+/// `at_reclaim_ms` from the arm request's query string, if in range. Shares
+/// [`MIN_INSTALL_ARM_MS`] and [`MAX_INSTALL_ARM_MS`]: both name a window
+/// inside a short sequence of directory and FAT writes.
+pub fn parse_at_reclaim_ms(path: &[u8]) -> Option<u32> {
+    let value = proto::upload::query_param(path, b"at_reclaim_ms")?;
+    let ms = core::str::from_utf8(value).ok()?.parse::<u32>().ok()?;
+    (MIN_INSTALL_ARM_MS..=MAX_INSTALL_ARM_MS)
+        .contains(&ms)
+        .then_some(ms)
+}
+
+/// Arms a reset timed to land inside the reclaim that is about to start, if
+/// one was requested. Consumes the request: one arm, one reclaim.
+///
+/// The deadline runs from when the power task arms the watchdog, so the cut
+/// lands roughly `ms - ARM_SETTLE_MS` into the reclaim -- a request for 27 ms
+/// is about 22 ms in.
+pub async fn arm_for_reclaim() {
+    let ms = CUT_AT_RECLAIM_MS.swap(0, Ordering::SeqCst);
+    if ms == 0 {
+        return;
+    }
+    esp_println::println!("powercut: arming {} ms at reclaim", ms);
+    POWERCUT_ARM.signal(u64::from(ms));
+    Timer::after(Duration::from_millis(ARM_SETTLE_MS)).await;
+}
+
 /// How long to let the executor run before returning, so the power task can
 /// act on the signal. The install that follows is a blocking SD sequence
 /// embassy cannot preempt, so an arm that has not taken effect by then would

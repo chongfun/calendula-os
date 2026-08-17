@@ -130,6 +130,12 @@ RESET_PATTERN = r"rst:.*(RTC|WDT)|powercut: auto-starting"
 # the transaction required moving a file.
 RECOVERY_PATTERN = r"powercut: recovery replayed a record: moved=(\w+)"
 
+# Mount-time reclaim recovery reporting that it found a live record and
+# finished it. The install marker above says nothing about the reclaim
+# journal, so without this a delete whose reply merely went missing looks
+# exactly like one that was cut mid-transaction.
+RECLAIM_REPLAY_PATTERN = r"powercut: recovery replayed a reclaim"
+
 
 # How much of a book to digest per request. The device answers over a socket
 # with a 30-second idle timeout and reads at ~800 kB/s, so a whole 29 MB book
@@ -568,6 +574,26 @@ def landing_identity(kind, landing, new_identity, old_identity):
     return old_identity if kind == "replace" else None
 
 
+def delete_reclaim_replays(results):
+    """Cycles that prove journalled *delete* recovery ran.
+
+    The reclaim journal is shared: an install's `ReclaimRollback` reclaims a
+    parked predecessor through it too, and a cut there produces the same
+    marker at the next mount. Counting those as delete coverage would let a
+    run whose deletes all completed cleanly claim it had tested the thing
+    this campaign exists for.
+
+    Placement is deliberately not required. A host-timed delete that happens
+    to reach a live record is still evidence that delete recovery ran -- the
+    marker is stronger than the intent behind the aim.
+    """
+    return [
+        result
+        for result in results
+        if result.get("op") == "delete" and result.get("reclaim_replayed")
+    ]
+
+
 def legal_landings(kind, target, mine, answered=None):
     """The campaign-owned label sets an operation may legally leave behind,
     keyed by what that landing is called.
@@ -693,6 +719,14 @@ class Device:
             return None
         return size, hash_
 
+    def arm_at_reclaim(self, ms):
+        """Hand the timing to the device: it arms when the reclaim starts."""
+        status, body = self._request(
+            "POST", f"/test-powercut?at_reclaim_ms={ms}", data=b"", timeout=10
+        )
+        if status != 200 or "armed" not in body:
+            raise AssertionError(f"reclaim arm failed -> {status}: {body}")
+
     def arm_at_install(self, ms):
         """Hand the timing to the device: it arms when the install starts."""
         status, body = self._request(
@@ -762,6 +796,16 @@ class Campaign:
         for pattern, why in (
             # Mount-time, from the boot scan's reconcile.
             (r"an install is still in flight", "recovery could not finish an install at mount"),
+            (
+                r"storage recovery unfinished",
+                "a reclaim did not settle, so the catalog was not rebuilt",
+            ),
+            # Per-command, from the upload session's gate. Covers both
+            # journals, so its wording says storage rather than install.
+            (
+                r"refused, storage recovery is still in flight",
+                "a command was refused because storage recovery had not settled",
+            ),
             (r"shelf unreadable", "recovery reported the shelf unreadable"),
             (
                 r"cannot read; .*refused",
@@ -1107,6 +1151,22 @@ class Campaign:
         # transfer rolls back by abandoning a staged file and proves nothing
         # about recovery. Only a cycle where recovery finished a transaction
         # says the journal's replay path ran.
+        reclaim_cycles = [r for r in self.results if r["placement"] == "reclaim"]
+        reclaim_replays = [r for r in self.results if r["reclaim_replayed"]]
+        delete_replays = delete_reclaim_replays(self.results)
+        if reclaim_cycles or reclaim_replays:
+            others = len(reclaim_replays) - len(delete_replays)
+            print(
+                f"{len(reclaim_cycles)} delete(s) were aimed at the reclaim window; "
+                f"{len(delete_replays)} left a reclaim record the next mount had to "
+                f"replay"
+                + (
+                    f" (and {others} more came from an install's rollback reclaim, which "
+                    f"shares the journal and is not delete coverage)."
+                    if others
+                    else "."
+                )
+            )
         install_cycles = [r for r in self.results if r["placement"] == "install"]
         recovered = [r for r in install_cycles if r["recovered"]]
         moved = [r for r in recovered if r["recovery_moved"]]
@@ -1136,6 +1196,14 @@ class Campaign:
                 f"(wanted {self.args.min_cut_share:.0%}); a reset before the request is "
                 f"answered normally on the far side of the reboot and one after it hits "
                 f"an idle device — adjust --min-fraction/--max-fraction"
+            )
+        if len(delete_replays) < self.args.min_reclaim_replays:
+            shortfalls.append(
+                f"only {len(delete_replays)} cut(s) interrupted a delete's reclaim "
+                f"(wanted {self.args.min_reclaim_replays}); a delete whose reply merely "
+                f"went missing looks the same from outside, so without one of these the "
+                f"journalled delete is untested -- raise --install-share, or widen "
+                f"--install-min-ms/--install-max-ms"
             )
         if len(all_replays) < self.args.min_replays:
             shortfalls.append(
@@ -1192,10 +1260,16 @@ class Campaign:
         )
 
     def placement_for(self, cycle, op):
-        """Which window this cycle cuts. A delete has no body to stream, so
-        there is nothing for the device-timed arm to sit in front of."""
+        """Which window this cycle cuts.
+
+        A delete has no body to aim inside, and the journalled part of it is
+        a few directory and FAT writes -- far too small to hit from the host.
+        Measured: three host-aimed deletes cut mid-operation all completed
+        before their reset fired. So it gets the device-timed arm too, which
+        fires when the reclaim starts.
+        """
         if op["kind"] == "delete":
-            return "transfer"
+            return "reclaim" if self.rng.random() < self.args.install_share else "transfer"
         return "install" if self.rng.random() < self.args.install_share else "transfer"
 
     def delete_mine(self):
@@ -1318,8 +1392,8 @@ class Campaign:
         if op["kind"] != "delete":
             self.manifest.claim(op["label"], [op["new_identity"], op.get("old_identity")])
 
-        # 3. Arm. Two placements, because the upload has two windows worth
-        # cutting and they need different mechanisms.
+        # 3. Arm. Three placements, because an operation has more than one
+        # window worth cutting and they need different mechanisms.
         #
         # `transfer` aims from the measured throughput at the body stream:
         # that proves a half-streamed upload leaves no partial book. It
@@ -1330,12 +1404,16 @@ class Campaign:
         # install actually starts. That is the window the journal exists
         # for, and the only one where recovery has anything to do.
         #
-        # A delete carries no body, so it is always aimed from the host.
+        # A delete has no body to aim inside at all, so it gets the
+        # device-timed arm or nothing worth having.
         placement = self.placement_for(cycle, op)
         mark = self.serial.mark()
         if placement == "install":
             arm_ms = self.rng.randrange(self.args.install_min_ms, self.args.install_max_ms)
             self.device.arm_at_install(arm_ms)
+        elif placement == "reclaim":
+            arm_ms = self.rng.randrange(self.args.install_min_ms, self.args.install_max_ms)
+            self.device.arm_at_reclaim(arm_ms)
         else:
             arm_ms = self.aim(op)
             self.device.arm(arm_ms)
@@ -1381,6 +1459,10 @@ class Campaign:
         replays = self.serial.matches_since(mark, RECOVERY_PATTERN)
         recovered = bool(replays)
         moved = any(m.group(1) == "true" for m, _ in replays)
+        # Evidence, as opposed to intent: the device found a live reclaim
+        # record at mount and finished it. A cycle aimed at the reclaim
+        # window proves only that it was aimed there.
+        reclaim_replayed = bool(self.serial.matches_since(mark, RECLAIM_REPLAY_PATTERN))
 
         # 5. Verify — from a session that opened *after* the operation
         # finished. `/list` is rendered when a session opens, so when the
@@ -1421,11 +1503,14 @@ class Campaign:
             "answered": answered,
             "recovered": recovered,
             "recovery_moved": moved,
+            "reclaim_replayed": reclaim_replayed,
             "landed": landed,
             "outcome": outcome,
         }
         self.results.append(result)
-        if moved:
+        if reclaim_replayed:
+            replay = "RECLAIM-REPLAY"
+        elif moved:
             replay = "REPLAYED+MOVED"
         elif recovered:
             replay = "REPLAYED"
@@ -1556,6 +1641,27 @@ class TestPowercutCampaign(unittest.TestCase):
     def test_scan_returns_every_match_not_just_the_first(self):
         lines = [(1.0, "a=1"), (2.0, "b"), (3.0, "a=2")]
         self.assertEqual([m.group(1) for m, _ in scan(lines, r"a=(\d)")], ["1", "2"])
+
+    def test_a_rollback_reclaim_is_not_delete_coverage(self):
+        """The reclaim journal is shared with install rollback, so a replace
+        cut mid-rollback produces the same mount marker. Counting it would
+        let a run whose deletes all completed cleanly claim it had tested
+        journalled delete."""
+        results = [
+            {"op": "replace", "reclaim_replayed": True},
+            {"op": "create", "reclaim_replayed": False},
+            {"op": "delete", "reclaim_replayed": False},
+        ]
+        self.assertEqual(delete_reclaim_replays(results), [])
+
+    def test_a_delete_replay_is_delete_coverage_whatever_aimed_it(self):
+        # Placement is not required: the marker is stronger evidence than
+        # the intent behind the aim.
+        results = [
+            {"op": "delete", "reclaim_replayed": True, "placement": "transfer"},
+            {"op": "delete", "reclaim_replayed": True, "placement": "reclaim"},
+        ]
+        self.assertEqual(len(delete_reclaim_replays(results)), 2)
 
     def test_manifest_round_trips_identities(self):
         """The file is the record, not the in-memory set: a killed run
@@ -1839,6 +1945,9 @@ def main():
     # pass. Lower them for exploratory bench work, not for a gate.
     parser.add_argument("--min-cut-share", type=float, default=0.5)
     parser.add_argument("--min-replays", type=int, default=1)
+    # A journalled-delete campaign that never interrupted a reclaim has not
+    # tested the thing it exists for.
+    parser.add_argument("--min-reclaim-replays", type=int, default=1)
     # How often the pre-existing library is read back byte for byte. It is a
     # full read of the card — ~4 minutes for a 184 MB shelf at the ~800 kB/s
     # an X3 manages — so per-cycle is opt-in rather than default.
