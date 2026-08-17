@@ -549,19 +549,56 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     // uploads until an exit arrives instead of parking in a forever loop
     // that would acknowledge over live handles.
     let exit = {
-        let books = match root.open_dir("BOOKS") {
-            Ok(books) => Ok(books),
-            Err(_) => match root.make_dir_in_dir("BOOKS") {
-                Ok(()) => root.open_dir("BOOKS"),
-                Err(error) => Err(error),
-            },
+        // Opened, not created, and the reclaim journal settled before the
+        // shelf can be made. Creating a directory allocates, and a live
+        // reclaim holds recorded cluster numbers that carry no ownership --
+        // so an allocation before it settles can be handed one, and the
+        // replay that follows frees it back out of whatever took it.
+        //
+        // Reachable since the OTA trigger began using the journal: a root
+        // reclaim can be outstanding on a card that has never held a book,
+        // and this is the one path that would create the shelf while it
+        // stood. The mount scanner and the command gate already obey this
+        // rule; setup did not.
+        let opened = match root.open_dir("BOOKS") {
+            Ok(books) => Some(Some(books)),
+            Err(embedded_sdmmc::Error::NotFound) => Some(None),
+            // A card that will not answer an open is not one to respond to
+            // with a metadata write.
+            Err(_) => None,
         };
-        match books {
-            Ok(books) => serve_uploads(&root, &books, catalog_cleared).await,
-            Err(_) => {
-                esp_println::println!("upload: BOOKS setup failed");
+        match opened {
+            None => {
+                esp_println::println!("upload: the shelf would not open");
                 refuse_uploads_until_exit().await
             }
+            Some(existing) => match upload_store::reclaim::recover(&root, existing.as_ref()) {
+                Err(error) => {
+                    esp_println::println!(
+                        "upload: a reclaim is unfinished; refusing the session ({:?})",
+                        error
+                    );
+                    refuse_uploads_until_exit().await
+                }
+                Ok(_) => {
+                    // Settled, so the shelf may now be created if it is not
+                    // there.
+                    let books = match existing {
+                        Some(books) => Ok(books),
+                        None => match root.make_dir_in_dir("BOOKS") {
+                            Ok(()) => root.open_dir("BOOKS"),
+                            Err(error) => Err(error),
+                        },
+                    };
+                    match books {
+                        Ok(books) => serve_uploads(&root, &books, catalog_cleared).await,
+                        Err(_) => {
+                            esp_println::println!("upload: BOOKS setup failed");
+                            refuse_uploads_until_exit().await
+                        }
+                    }
+                }
+            },
         }
     };
     drop(root);
