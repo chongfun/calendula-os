@@ -15,8 +15,9 @@ use embedded_sdmmc::{
 };
 use heapless::String;
 use upload_store::install::{
-    self, recover_installs, InstallIntent, Located, Step, ROLLBACK_DIR, UPLOAD_DIR,
+    self, recover_installs, InstallIntent, Located, ShortName, Step, ROLLBACK_DIR, UPLOAD_DIR,
 };
+use upload_store::reclaim;
 
 const BLOCK_BYTES: usize = 512;
 const DISK_BLOCKS: u32 = 32 * 1024;
@@ -24,6 +25,13 @@ const PART_START_BLOCK: u32 = 64;
 
 struct RamDisk {
     data: RefCell<Vec<u8>>,
+    /// Writes from this number onward do nothing and report failure.
+    ///
+    /// The power cut: everything before it reached the card and everything
+    /// after it did not, which is the one thing a reset guarantees and the
+    /// only thing a test may assume.
+    fail_writes_from: RefCell<Option<u32>>,
+    writes_seen: RefCell<u32>,
 }
 
 #[derive(Debug)]
@@ -45,6 +53,44 @@ struct SharedDisk(Rc<RamDisk>);
 impl SharedDisk {
     fn image(&self) -> Vec<u8> {
         self.0.data.borrow().clone()
+    }
+
+    /// Cut the power before the `n`th write from now on.
+    fn cut_writes_from(&self, n: Option<u32>) {
+        *self.0.writes_seen.borrow_mut() = 0;
+        *self.0.fail_writes_from.borrow_mut() = n;
+    }
+
+    fn writes_seen(&self) -> u32 {
+        *self.0.writes_seen.borrow()
+    }
+
+    /// The clusters among `wanted` whose FAT16 entry is not free.
+    ///
+    /// Per cluster rather than by counting free space: the reclaim journal
+    /// allocates while it works, so an aggregate can stay level while a
+    /// batch leaks.
+    fn still_allocated(&self, wanted: &[u32]) -> Vec<u32> {
+        let image = self.image();
+        let boot = PART_START_BLOCK as usize * BLOCK_BYTES;
+        let reserved = u16::from_le_bytes([image[boot + 14], image[boot + 15]]) as usize;
+        let fat_start = (PART_START_BLOCK as usize + reserved) * BLOCK_BYTES;
+        wanted
+            .iter()
+            .copied()
+            .filter(|cluster| {
+                let at = fat_start + *cluster as usize * 2;
+                // Otherwise a cluster number from outside the volume is an
+                // index panic several frames from anything that names it.
+                assert!(
+                    at + 2 <= image.len(),
+                    "cluster {cluster} puts its FAT entry at byte {at}, past the \
+                     end of a {} byte image",
+                    image.len(),
+                );
+                u16::from_le_bytes([image[at], image[at + 1]]) != 0
+            })
+            .collect()
     }
 
     /// Put back the directory entries a move marked deleted, leaving the
@@ -99,6 +145,15 @@ impl BlockDevice for RamDisk {
     }
 
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
+        {
+            let mut seen = self.writes_seen.borrow_mut();
+            *seen += 1;
+            if let Some(from) = *self.fail_writes_from.borrow() {
+                if *seen >= from {
+                    return Err(DiskError);
+                }
+            }
+        }
         let mut data = self.data.borrow_mut();
         for (i, block) in blocks.iter().enumerate() {
             let at = (start.0 as usize + i) * BLOCK_BYTES;
@@ -152,6 +207,8 @@ fn format_disk() -> Vec<u8> {
 fn new_card() -> SharedDisk {
     SharedDisk(Rc::new(RamDisk {
         data: RefCell::new(format_disk()),
+        fail_writes_from: RefCell::new(None),
+        writes_seen: RefCell::new(0),
     }))
 }
 
@@ -2007,5 +2064,173 @@ fn labels_under_the_current_cache_root_are_read() {
     assert_eq!(
         upload_store::read_upload_identity(&root, alias.as_str()),
         Ok(Some(identity))
+    );
+}
+
+/// Every cluster of a file, walked through the driver.
+fn chain_of(dir: &Dir<'_>, name: &str) -> Vec<u32> {
+    let first = dir
+        .find_directory_entry(name)
+        .unwrap_or_else(|e| panic!("no entry {name:?}: {e:?}"))
+        .cluster;
+    let mut chain = vec![first.value()];
+    let mut at = first;
+    while let Some(next) = dir.next_cluster_in_chain(at).expect("walk") {
+        chain.push(next.value());
+        at = next;
+    }
+    chain
+}
+
+/// The rollback directory, opened from the root.
+fn rollback_dir<'a>(root: &Dir<'a>) -> Dir<'a> {
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir")
+}
+
+/// A card walked to the point where only the predecessor's space is left to
+/// reclaim, with the install record still standing.
+///
+/// Reached by applying the real steps rather than by writing a record that
+/// looks like it: a synthetic one lets the planner take some other path, and
+/// then the test proves nothing about the step it is named for.
+fn card_awaiting_rollback_reclaim(disk: &SharedDisk) -> (Vec<u32>, Vec<u32>, ShortName) {
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    for step in [Step::RetireOldHolder, Step::InstallStage] {
+        install::apply_step(&root, &books, &intent, step).expect("step");
+    }
+    let presence = install::observe(&root, &books, &intent).expect("observe");
+    assert_eq!(
+        install::plan(&intent, presence),
+        Step::ReclaimRollback,
+        "the fixture must actually reach the step it is named for",
+    );
+    // By long name: the 8.3 alias a move lands under is the driver's to
+    // derive, which is the whole reason the install record names chains.
+    let rollback = rollback_dir(&root);
+    let parked_alias = holder_of(&rollback, intent.rollback.as_str())
+        .expect("the predecessor is parked")
+        .alias;
+    let parked = chain_of(&rollback, parked_alias.as_str());
+    let shelf = chain_of(
+        &books,
+        holder_of(&books, BOOK_NAME)
+            .expect("installed")
+            .alias
+            .as_str(),
+    );
+    (parked, shelf, intent.rollback)
+}
+
+#[test]
+fn the_two_journals_hand_off_across_a_cut_at_any_write() {
+    // The install journal has to stay sufficient while the reclaim journal
+    // temporarily owns the cleanup. Neither is updated in the same breath as
+    // the other, and the claim is that it does not need to be: whatever the
+    // cut interrupts, replaying reclaim before installs converges.
+    //
+    // Cut before every write the handoff makes, reboot, run the pair in the
+    // order every firmware entry point uses, and require that the reclaim
+    // really ran at least once across the sweep -- the parked copy going
+    // away is also reachable by the leftover sweep, which unlinks without
+    // freeing when the shelf shares the chain, so absence alone proves
+    // nothing about which path did it.
+    let writes = {
+        let probe = new_card();
+        card_awaiting_rollback_reclaim(&probe);
+        let mgr = open_mgr(probe.clone());
+        let (root, books) = open_dirs(&mgr);
+        // Clearing the fault also zeroes the counter, so what follows is
+        // counted from nothing.
+        probe.cut_writes_from(None);
+        assert!(recover_installs(&root, &books).complete);
+        probe.writes_seen()
+    };
+    assert!(
+        writes > 2,
+        "the handoff should take several writes, took {writes}"
+    );
+
+    let mut journals_overlapped = 0;
+    for cut in 1..=writes + 1 {
+        let disk = new_card();
+        let (parked, shelf, rollback_name) = card_awaiting_rollback_reclaim(&disk);
+
+        // The cut, inside install recovery's handoff.
+        {
+            let mgr = open_mgr(disk.clone());
+            let (root, books) = open_dirs(&mgr);
+            disk.cut_writes_from(Some(cut));
+            let _ = recover_installs(&root, &books);
+        }
+        disk.cut_writes_from(None);
+
+        // Did the two journals actually overlap? This is the evidence that
+        // the handoff happened, as opposed to the predecessor having gone by
+        // some other route.
+        //
+        // Both halves are needed. A live reclaim record alone would still be
+        // satisfied by a version that cleared the install record first and
+        // then reclaimed -- the parked copy would vanish, the clusters would
+        // come back, and nothing here would notice that the install journal
+        // stopped covering the work before the reclaim journal started. The
+        // claim this test exists for is that INSTALL.JNL stays sufficient
+        // while RECLAIM.JNL temporarily owns the cleanup, so the install
+        // record must still be standing at the moment the reclaim one is.
+        {
+            let mgr = open_mgr(disk.clone());
+            let (root, _books) = open_dirs(&mgr);
+            if let Ok(reclaim::Journal::Found(live)) = reclaim::read_journal(&root) {
+                if matches!(live.slot, reclaim::Slot::Work(_)) {
+                    assert!(
+                        matches!(
+                            install::read_intent(&root),
+                            Ok(install::IntentState::Valid(_))
+                        ),
+                        "cut at {cut}: a reclaim was live with no install record behind \
+                         it -- the handoff stopped overlapping",
+                    );
+                    journals_overlapped += 1;
+                }
+            }
+        }
+
+        // The reboot: both journals, in the order every entry point uses.
+        let mgr = open_mgr(disk.clone());
+        let (root, books) = open_dirs(&mgr);
+        reclaim::recover(&root, Some(&books))
+            .unwrap_or_else(|e| panic!("cut at {cut}: reclaim would not settle: {e:?}"));
+        let outcome = recover_installs(&root, &books);
+
+        // The reader's book is untouched throughout.
+        let installed = holder_of(&books, BOOK_NAME).expect("the book is still on the shelf");
+        assert_eq!(
+            chain_of(&books, installed.alias.as_str()),
+            shelf,
+            "cut at {cut}: the installed book changed under the handoff",
+        );
+
+        // The predecessor is gone, and its space came back.
+        let parked_gone = holder_of(&rollback_dir(&root), rollback_name.as_str()).is_none();
+        assert!(parked_gone, "cut at {cut}: the parked copy is still there");
+        assert!(outcome.complete, "cut at {cut}: the install did not finish");
+        drop(books);
+        drop(root);
+        drop(mgr);
+        assert!(
+            disk.still_allocated(&parked).is_empty(),
+            "cut at {cut}: the parked copy's clusters were never reclaimed",
+        );
+    }
+
+    assert!(
+        journals_overlapped > 0,
+        "no cut caught both journals live at once, so the handoff itself was never \
+         exercised -- only its end state",
     );
 }
