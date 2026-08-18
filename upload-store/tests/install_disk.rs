@@ -2147,7 +2147,7 @@ fn the_two_journals_hand_off_across_a_cut_at_any_write() {
         "the handoff should take several writes, took {writes}"
     );
 
-    let mut reclaim_was_live = 0;
+    let mut journals_overlapped = 0;
     for cut in 1..=writes + 1 {
         let disk = new_card();
         let (parked, shelf) = card_awaiting_rollback_reclaim(&disk);
@@ -2161,15 +2161,32 @@ fn the_two_journals_hand_off_across_a_cut_at_any_write() {
         }
         disk.cut_writes_from(None);
 
-        // Did the reclaim actually get as far as a durable record? This is
-        // the evidence that the step ran, as opposed to the predecessor
-        // having gone by some other route.
+        // Did the two journals actually overlap? This is the evidence that
+        // the handoff happened, as opposed to the predecessor having gone by
+        // some other route.
+        //
+        // Both halves are needed. A live reclaim record alone would still be
+        // satisfied by a version that cleared the install record first and
+        // then reclaimed -- the parked copy would vanish, the clusters would
+        // come back, and nothing here would notice that the install journal
+        // stopped covering the work before the reclaim journal started. The
+        // claim this test exists for is that INSTALL.JNL stays sufficient
+        // while RECLAIM.JNL temporarily owns the cleanup, so the install
+        // record must still be standing at the moment the reclaim one is.
         {
             let mgr = open_mgr(disk.clone());
             let (root, _books) = open_dirs(&mgr);
             if let Ok(reclaim::Journal::Found(live)) = reclaim::read_journal(&root) {
                 if matches!(live.slot, reclaim::Slot::Work(_)) {
-                    reclaim_was_live += 1;
+                    assert!(
+                        matches!(
+                            install::read_intent(&root),
+                            Ok(install::IntentState::Valid(_))
+                        ),
+                        "cut at {cut}: a reclaim was live with no install record behind \
+                         it -- the handoff stopped overlapping",
+                    );
+                    journals_overlapped += 1;
                 }
             }
         }
@@ -2203,7 +2220,8 @@ fn the_two_journals_hand_off_across_a_cut_at_any_write() {
     }
 
     assert!(
-        reclaim_was_live > 0,
-        "no cut left a live reclaim record, so the handoff itself was never exercised",
+        journals_overlapped > 0,
+        "no cut caught both journals live at once, so the handoff itself was never \
+         exercised -- only its end state",
     );
 }
