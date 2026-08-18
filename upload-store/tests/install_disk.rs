@@ -15,7 +15,7 @@ use embedded_sdmmc::{
 };
 use heapless::String;
 use upload_store::install::{
-    self, recover_installs, InstallIntent, Located, Step, ROLLBACK_DIR, UPLOAD_DIR,
+    self, recover_installs, InstallIntent, Located, ShortName, Step, ROLLBACK_DIR, UPLOAD_DIR,
 };
 use upload_store::reclaim;
 
@@ -80,6 +80,14 @@ impl SharedDisk {
             .copied()
             .filter(|cluster| {
                 let at = fat_start + *cluster as usize * 2;
+                // Otherwise a cluster number from outside the volume is an
+                // index panic several frames from anything that names it.
+                assert!(
+                    at + 2 <= image.len(),
+                    "cluster {cluster} puts its FAT entry at byte {at}, past the \
+                     end of a {} byte image",
+                    image.len(),
+                );
                 u16::from_le_bytes([image[at], image[at + 1]]) != 0
             })
             .collect()
@@ -2088,7 +2096,7 @@ fn rollback_dir<'a>(root: &Dir<'a>) -> Dir<'a> {
 /// Reached by applying the real steps rather than by writing a record that
 /// looks like it: a synthetic one lets the planner take some other path, and
 /// then the test proves nothing about the step it is named for.
-fn card_awaiting_rollback_reclaim(disk: &SharedDisk) -> (Vec<u32>, Vec<u32>) {
+fn card_awaiting_rollback_reclaim(disk: &SharedDisk) -> (Vec<u32>, Vec<u32>, ShortName) {
     let mgr = open_mgr(disk.clone());
     let (root, books) = open_dirs(&mgr);
     let mut intent = intent(true);
@@ -2116,7 +2124,7 @@ fn card_awaiting_rollback_reclaim(disk: &SharedDisk) -> (Vec<u32>, Vec<u32>) {
             .alias
             .as_str(),
     );
-    (parked, shelf)
+    (parked, shelf, intent.rollback)
 }
 
 #[test]
@@ -2137,10 +2145,11 @@ fn the_two_journals_hand_off_across_a_cut_at_any_write() {
         card_awaiting_rollback_reclaim(&probe);
         let mgr = open_mgr(probe.clone());
         let (root, books) = open_dirs(&mgr);
+        // Clearing the fault also zeroes the counter, so what follows is
+        // counted from nothing.
         probe.cut_writes_from(None);
-        let before = probe.writes_seen();
         assert!(recover_installs(&root, &books).complete);
-        probe.writes_seen() - before
+        probe.writes_seen()
     };
     assert!(
         writes > 2,
@@ -2150,7 +2159,7 @@ fn the_two_journals_hand_off_across_a_cut_at_any_write() {
     let mut journals_overlapped = 0;
     for cut in 1..=writes + 1 {
         let disk = new_card();
-        let (parked, shelf) = card_awaiting_rollback_reclaim(&disk);
+        let (parked, shelf, rollback_name) = card_awaiting_rollback_reclaim(&disk);
 
         // The cut, inside install recovery's handoff.
         {
@@ -2207,7 +2216,7 @@ fn the_two_journals_hand_off_across_a_cut_at_any_write() {
         );
 
         // The predecessor is gone, and its space came back.
-        let parked_gone = holder_of(&rollback_dir(&root), "TXN00001.OLD").is_none();
+        let parked_gone = holder_of(&rollback_dir(&root), rollback_name.as_str()).is_none();
         assert!(parked_gone, "cut at {cut}: the parked copy is still there");
         assert!(outcome.complete, "cut at {cut}: the install did not finish");
         drop(books);
