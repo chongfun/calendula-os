@@ -87,6 +87,13 @@ pub fn parse_u32(path: &[u8], name: &[u8]) -> Option<u32> {
 /// socket's idle timeout takes the connection carrying its answer with it,
 /// and the request that follows. Serving an unbounded read on request would
 /// put that failure back within reach of a typo.
+///
+/// Four megabytes is about five seconds of blocking SD work at the ~750
+/// kB/s a card sustains here, and `digest_book` spends it without yielding.
+/// Measured at 1, 2 and 4 MiB against the largest book on a real card:
+/// every size answers, and answers correctly. What does not fit is a whole
+/// 29 MB book in one request, which is where the socket's idle timeout was
+/// originally met -- hence a bound, rather than serving what is asked for.
 pub const MAX_DIGEST_SPAN_BYTES: u32 = 4 * 1024 * 1024;
 
 /// `len` from the query, if present and within the span a single request may
