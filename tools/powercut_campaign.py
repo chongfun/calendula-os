@@ -856,6 +856,38 @@ class Campaign:
                 )
         return by_label
 
+    def stable_identity(self, cycle, book, allowed, what):
+        """`book`'s identity, with no diagnosis ever resting on one read.
+
+        An answer the caller can accept is returned at once. Anything else is
+        read a second time before anyone is blamed, because the two answers
+        mean opposite things: the same answer twice is the card, two
+        different answers are the path to it. Only the caller knows which
+        answers are acceptable, which is why `allowed` comes in rather than
+        being decided here.
+
+        `None` -- a book that would not read back at all -- takes part in
+        that comparison like any other answer, and deliberately so. A book
+        that reads back as nothing once and as itself the next time has an
+        unstable reader, not a directory entry over freed clusters, and those
+        two send whoever reads the failure to opposite ends of the system.
+        `None` is never in `allowed`: callers use it to mean the book should
+        be absent, and a book being read here is one the shelf just listed.
+        """
+        first = self.device.digest_book(book.open_name, book.in_books)
+        if first in allowed:
+            return first
+        second = self.device.digest_book(book.open_name, book.in_books)
+        if second != first:
+            self.fail(
+                cycle,
+                f"{what} read back two different ways in a row: {first} then "
+                f"{second}. The card cannot have changed between them, so this is "
+                f"the device's read path, not a changed book -- no contents check "
+                f"can be trusted until that is fixed.",
+            )
+        return first
+
     def verify_identities(self, cycle, books, expected, what):
         """Read each of `books` back and check it against `expected`.
 
@@ -870,7 +902,7 @@ class Campaign:
             if want is None:
                 continue
             allowed = want if isinstance(want, set) else {want}
-            got = self.device.digest_book(book.open_name, book.in_books)
+            got = self.stable_identity(cycle, book, allowed, f"{what} {label}")
             if got is None:
                 self.fail(
                     cycle,
@@ -880,7 +912,8 @@ class Campaign:
             if got not in allowed:
                 self.fail(
                     cycle,
-                    f"{what} {label} reads back as {got}, not {sorted(allowed)}. "
+                    f"{what} {label} reads back as {got}, not {sorted(allowed)}, "
+                    f"stably across two reads. "
                     f"Nothing this campaign did should have changed it.",
                 )
 
@@ -931,7 +964,14 @@ class Campaign:
             )
 
         landed = by_label.get(target)
-        got = self.device.digest_book(landed.open_name, landed.in_books) if landed else None
+        # Every identity a surviving landing would allow. `landing_identity`
+        # answers None for a landing where the book is absent, and the book
+        # is right here on the shelf, so None is not one of them.
+        allowed = {
+            landing_identity(op["kind"], name, op.get("new_identity"), op.get("old_identity"))
+            for name in by_labels
+        } - {None}
+        got = self.stable_identity(cycle, landed, allowed, target) if landed else None
         # A listed book the device cannot read back is a failure on its own,
         # whatever the label sets say: the entry survived and the data behind
         # it did not.
@@ -1526,6 +1566,38 @@ class Campaign:
                 f.write(json.dumps(result) + "\n")
 
 
+class _Failed(Exception):
+    """What `Campaign.fail` does, made catchable: the real one exits."""
+
+    def __init__(self, why):
+        super().__init__(why)
+        self.why = why
+
+
+class _StubCampaign:
+    """Enough of a `Campaign` for `verify_identities`: a device that answers
+    from a script, and a `fail` that raises instead of ending the process."""
+
+    def __init__(self, answers, mine=None, baseline=None):
+        self.reads = []
+        self.mine = mine or {}
+        self.baseline = baseline or {}
+        outer = self
+
+        class _Device:
+            def digest_book(self, open_name, in_books=True):
+                outer.reads.append(open_name)
+                return answers[min(len(outer.reads) - 1, len(answers) - 1)]
+
+        self.device = _Device()
+
+    def fail(self, cycle, why):
+        raise _Failed(why)
+
+    # The policy under test, not a copy of it.
+    stable_identity = Campaign.stable_identity
+
+
 class TestPowercutCampaign(unittest.TestCase):
     """The decision logic, which is what turns a durability defect into a
     reported failure. Everything else in this file needs a device."""
@@ -1858,6 +1930,100 @@ class TestPowercutCampaign(unittest.TestCase):
         self.assertNotIn(corrupted, {expected[book.label]})
         # And a set-valued expectation (a write in flight) still rejects it.
         self.assertNotIn(corrupted, {(500, 0xAAAA), (300, 0xCCCC)})
+
+    def test_an_unstable_readback_is_reported_as_a_read_fault(self):
+        """A card that answers two different ways for one file has not been
+        changed by anything -- it cannot change between two reads with no
+        write in between. Reported as the device's read path, because the
+        alternative accuses the firmware under test of losing a book.
+
+        This is not hypothetical: a real run reported a book changed, and
+        the book had in fact gone bad on the card, but the message named
+        the campaign as the cause on the strength of a single read."""
+        answers = [(500, 0xBBBB), (500, 0xCCCC)]
+        stub = _StubCampaign(answers)
+        with self.assertRaises(_Failed) as caught:
+            Campaign.verify_identities(
+                stub,
+                "cleanup",
+                {"PCUT001": Book(True, "PCUT001.EPU", "PCUT001", 500)},
+                {"PCUT001": (500, 0xAAAA)},
+                "a book,",
+            )
+        self.assertIn("two different ways", caught.exception.why)
+        self.assertEqual(len(stub.reads), 2, "the mismatch must be re-read")
+
+    def test_a_stable_mismatch_is_still_reported_as_a_changed_book(self):
+        """The re-read must not turn a real corruption into a shrug: the
+        same wrong answer twice is a book that changed."""
+        stub = _StubCampaign([(500, 0xBBBB), (500, 0xBBBB)])
+        with self.assertRaises(_Failed) as caught:
+            Campaign.verify_identities(
+                stub,
+                "cleanup",
+                {"PCUT001": Book(True, "PCUT001.EPU", "PCUT001", 500)},
+                {"PCUT001": (500, 0xAAAA)},
+                "a book,",
+            )
+        self.assertIn("stably across two reads", caught.exception.why)
+        self.assertNotIn("two different ways", caught.exception.why)
+
+    def test_a_book_that_reads_back_as_nothing_then_as_itself_is_a_read_fault(self):
+        """`None` is an answer like any other, and has to be re-read like
+        any other. A book that will not read back at all once and reads
+        back perfectly the next time has an unstable reader; calling that a
+        directory entry over freed clusters sends the reader of the failure
+        into the installer, which is the wrong half of the system."""
+        stub = _StubCampaign([None, (500, 0xAAAA)])
+        with self.assertRaises(_Failed) as caught:
+            Campaign.verify_identities(
+                stub,
+                "cleanup",
+                {"PCUT001": Book(True, "PCUT001.EPU", "PCUT001", 500)},
+                {"PCUT001": (500, 0xAAAA)},
+                "a book,",
+            )
+        self.assertIn("two different ways", caught.exception.why)
+        self.assertNotIn("outlived", caught.exception.why)
+
+    def test_converge_re_reads_before_calling_a_book_half_written(self):
+        """The per-cycle oracle is the one that matters most: it is read
+        every cycle and its accusation names the installer. Two different
+        wrong answers are the read path, not a book published half-written."""
+        target = Book(True, "PCUT007.EPU", "PCUT007", 600)
+        stub = _StubCampaign(
+            [(600, 0xEEEE), (600, 0xFFFF)],
+            mine={"PCUT001": Book(True, "PCUT001.EPU", "PCUT001", 500)},
+        )
+        with self.assertRaises(_Failed) as caught:
+            Campaign.converge(
+                stub,
+                7,
+                {"kind": "create", "label": "PCUT007", "new_identity": (600, 0xDDDD)},
+                {"PCUT001": stub.mine["PCUT001"], "PCUT007": target},
+                None,
+            )
+        self.assertIn("two different ways", caught.exception.why)
+        self.assertNotIn("half-written", caught.exception.why)
+        self.assertEqual(len(stub.reads), 2)
+
+    def test_converge_still_reports_a_stably_wrong_book_as_half_written(self):
+        """And the re-read must not blunt the check it guards: the same
+        wrong bytes twice is the half-written book this oracle exists for."""
+        target = Book(True, "PCUT007.EPU", "PCUT007", 600)
+        stub = _StubCampaign(
+            [(600, 0xEEEE), (600, 0xEEEE)],
+            mine={"PCUT001": Book(True, "PCUT001.EPU", "PCUT001", 500)},
+        )
+        with self.assertRaises(_Failed) as caught:
+            Campaign.converge(
+                stub,
+                7,
+                {"kind": "create", "label": "PCUT007", "new_identity": (600, 0xDDDD)},
+                {"PCUT001": stub.mine["PCUT001"], "PCUT007": target},
+                None,
+            )
+        self.assertIn("half-written", caught.exception.why)
 
     def test_digest_matches_the_firmware_construction(self):
         """FNV-1a 64, same seed and prime as fw::powercut::digest_chunk.
