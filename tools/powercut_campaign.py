@@ -878,9 +878,26 @@ class Campaign:
                     f"The directory entry outlived the data it points at.",
                 )
             if got not in allowed:
+                # A book is only "changed" if it reads back the same wrong way
+                # twice. A device that answers differently on two consecutive
+                # reads of one file is telling us about its read path, not
+                # about the card -- the campaign's own digest endpoint did
+                # exactly this once, and the accusation it printed was aimed
+                # at the wrong component.
+                again = self.device.digest_book(book.open_name, book.in_books)
+                if again != got:
+                    self.fail(
+                        cycle,
+                        f"{what} {label} read back two different ways in a row: "
+                        f"{got} then {again}. The card cannot have changed "
+                        f"between them, so this is the device's read path, not "
+                        f"a changed book -- the contents check cannot be "
+                        f"trusted until that is fixed.",
+                    )
                 self.fail(
                     cycle,
-                    f"{what} {label} reads back as {got}, not {sorted(allowed)}. "
+                    f"{what} {label} reads back as {got}, not {sorted(allowed)}, "
+                    f"stably across two reads. "
                     f"Nothing this campaign did should have changed it.",
                 )
 
@@ -1526,6 +1543,33 @@ class Campaign:
                 f.write(json.dumps(result) + "\n")
 
 
+class _Failed(Exception):
+    """What `Campaign.fail` does, made catchable: the real one exits."""
+
+    def __init__(self, why):
+        super().__init__(why)
+        self.why = why
+
+
+class _StubCampaign:
+    """Enough of a `Campaign` for `verify_identities`: a device that answers
+    from a script, and a `fail` that raises instead of ending the process."""
+
+    def __init__(self, answers):
+        self.reads = []
+        outer = self
+
+        class _Device:
+            def digest_book(self, open_name, in_books=True):
+                outer.reads.append(open_name)
+                return answers[min(len(outer.reads) - 1, len(answers) - 1)]
+
+        self.device = _Device()
+
+    def fail(self, cycle, why):
+        raise _Failed(why)
+
+
 class TestPowercutCampaign(unittest.TestCase):
     """The decision logic, which is what turns a durability defect into a
     reported failure. Everything else in this file needs a device."""
@@ -1858,6 +1902,43 @@ class TestPowercutCampaign(unittest.TestCase):
         self.assertNotIn(corrupted, {expected[book.label]})
         # And a set-valued expectation (a write in flight) still rejects it.
         self.assertNotIn(corrupted, {(500, 0xAAAA), (300, 0xCCCC)})
+
+    def test_an_unstable_readback_is_reported_as_a_read_fault(self):
+        """A card that answers two different ways for one file has not been
+        changed by anything -- it cannot change between two reads with no
+        write in between. Reported as the device's read path, because the
+        alternative accuses the firmware under test of losing a book.
+
+        This is not hypothetical: a real run reported a book changed, and
+        the book had in fact gone bad on the card, but the message named
+        the campaign as the cause on the strength of a single read."""
+        answers = [(500, 0xBBBB), (500, 0xCCCC)]
+        stub = _StubCampaign(answers)
+        with self.assertRaises(_Failed) as caught:
+            Campaign.verify_identities(
+                stub,
+                "cleanup",
+                {"PCUT001": Book(True, "PCUT001.EPU", "PCUT001", 500)},
+                {"PCUT001": (500, 0xAAAA)},
+                "a book,",
+            )
+        self.assertIn("two different ways", caught.exception.why)
+        self.assertEqual(len(stub.reads), 2, "the mismatch must be re-read")
+
+    def test_a_stable_mismatch_is_still_reported_as_a_changed_book(self):
+        """The re-read must not turn a real corruption into a shrug: the
+        same wrong answer twice is a book that changed."""
+        stub = _StubCampaign([(500, 0xBBBB), (500, 0xBBBB)])
+        with self.assertRaises(_Failed) as caught:
+            Campaign.verify_identities(
+                stub,
+                "cleanup",
+                {"PCUT001": Book(True, "PCUT001.EPU", "PCUT001", 500)},
+                {"PCUT001": (500, 0xAAAA)},
+                "a book,",
+            )
+        self.assertIn("stably across two reads", caught.exception.why)
+        self.assertNotIn("two different ways", caught.exception.why)
 
     def test_digest_matches_the_firmware_construction(self):
         """FNV-1a 64, same seed and prime as fw::powercut::digest_chunk.
