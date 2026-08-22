@@ -281,6 +281,14 @@ what the journal owns.
   `(directory, long name)` pairs, and the refusal that protects them has to key
   on both. A record naming `/SciFi/Dune.epub` must not block an upload to
   `/Fantasy/Dune.epub`.
+- **The reclaim journal widens too.** *(added 2026-08-22, after #82)* This
+  section was written before the journalled delete shipped, when one journal
+  owned names. `RECLAIM.JNL` records a `Place` of `Books`, `Root` or
+  `Rollback` beside the name it is reclaiming, and folders turn that
+  three-value enum into a path exactly as `in_books` becomes one. The refusal
+  that keeps a standing record from blocking unrelated work has to key on the
+  pair in both journals, and `Place::Rollback` stays as it is, since staging
+  is not per-folder.
 - Folder creation (R4) happens before the journal record is written, because a
   failed `mkdir` after the record stands is an unresolvable state — it makes
   the record describe a destination that cannot exist.
@@ -518,11 +526,17 @@ shipped.
    record reclaimed automatically, or does the book show as unavailable until
    the user acts? Interacts with R10: a deleted book and a moved book look
    identical until a matching candidate is found.
-2. Does the browser pick from existing folders only, or may it create new ones
-   at upload time? R4 assumes creation is allowed; if not, slice 1 loses the
-   folder-creation ordering constraint in §6.2.
-3. Should sideloaded books receive records in slice 1, or only when slice 2
-   needs to persist something derived from them?
+2. *(answered 2026-08-22)* The browser may create new folders at upload time.
+   R4 stands as written, and slice 1 keeps the folder-creation ordering
+   constraint in §6.2: the `mkdir` completes before the journal record is
+   written, so a record cannot describe a destination that does not exist.
+3. *(answered 2026-08-22)* Only in slice 2, chosen as the smaller change.
+   A record has to point at its book, and §6.4 turns that locator into a path
+   keyed on content identity, which is R6 and slice 2 work. Giving sideloaded
+   books records in slice 1 would pull the locator format change forward and
+   break the property that makes the split clean: slice 1 changes no
+   derived-state format. Sideloaded books stay readable throughout, since
+   nothing about reading them depends on a record.
 4. How is R15's "surface it" presented? A library-level notice, a per-book
    state, or a boot-time screen. The requirement is that it is not silent; the
    form is open.
