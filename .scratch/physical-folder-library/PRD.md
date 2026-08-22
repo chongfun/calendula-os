@@ -25,7 +25,7 @@ Physical folders provide:
 - natural support for large libraries;
 - straightforward interoperability.
 
-The existing fixed `/BOOKS` model can remain the hotspot upload inbox while physical-folder browsing is introduced independently.
+The existing fixed `/BOOKS` model can remain the hotspot upload destination while physical-folder browsing is introduced independently.
 
 ## Goals
 
@@ -56,7 +56,7 @@ Do not treat every directory on the SD card as library content.
 
 Define a library root.
 
-Recommended initial location:
+The library root is:
 
 ```text
 /BOOKS
@@ -71,7 +71,7 @@ Users may organize arbitrary subdirectories beneath it:
   History/
     Rome/
       SPQR.epub
-  Inbox/
+  Reference/
 ```
 
 Firmware-private state remains outside the browsable hierarchy under `/READER`.
@@ -164,7 +164,9 @@ This is required because a live reclaim record contains raw cluster numbers whos
 > by Calendula appear at the library root until the user reorganizes them on a
 > computer.
 
-No `/BOOKS/Inbox`. An inbox reads as tidier and buys little, while creating
+There is no firmware-managed or reserved `/BOOKS/Inbox`, and a user-created
+directory with that name is an ordinary folder like any other. A reserved
+inbox reads as tidier and buys little, while creating
 obligations this release does not want: migration behaviour for existing
 cards, ensuring the directory exists, deciding what happens when the user
 renames or deletes it, and above all putting mkdir on the upload path. This
@@ -197,20 +199,16 @@ If another device edits the FAT while Calendula has a live transaction, correctn
 
 Recognizable interference should fail conservatively where possible, but this PRD does not promise arbitrary outside-writer recovery.
 
-### R11a. Unresolvable recovery state is surfaced, not guessed
+Recovery may contain specific conservative mitigations where interference is
+recognizable. External edits while a journal is live sit outside the
+correctness guarantee, and are not guaranteed to be detectable or reportable.
+Both journals guarantee power loss while Calendula is the only writer, and the
+reclaim journal keeps freeing the clusters a record names even when the name
+has been taken by a stranger, which is correct under that contract and
+hazardous outside it.
 
-*(carried from the superseded PRD, where it was R15 and marked decided.)*
-
-A card edited underneath an open transaction can present a combination the
-recovery plan does not map: a predecessor deleted from a computer mid-install,
-or a destination name now held by a foreign file. In that case the device
-leaves the card alone and says so.
-
-A visible odd state is recoverable by the user. A silent wrong guess costs a
-book.
-
-How this is surfaced is still open: a library-level notice, a per-book state,
-or a boot-time screen. The requirement is that it is not silent.
+Reserve a hard refuse-and-report requirement for states Calendula can identify
+safely, such as a journal record written by an unsupported version.
 
 ### R12. Empty directories are allowed
 
@@ -245,7 +243,7 @@ Initial navigation can remain deliberately simple:
 Library
   > Fiction/
     History/
-    Inbox/
+    Reference/
     Book at root.epub
 ```
 

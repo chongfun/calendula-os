@@ -374,7 +374,10 @@ Recovery strategy should prefer:
 
 ### Replacement tests
 
-- same path + different source does not silently inherit the old `BookId`;
+- a Calendula-managed replacement preserves the existing `BookId` and updates
+  its `SourceDigest`, keeping reading position and other per-book state;
+- an unexplained external replacement at the same locator does not inherit the
+  old `BookId` unless reconciliation establishes continuity;
 - failed replacement preserves the original mapping.
 
 ### Duplicate tests
