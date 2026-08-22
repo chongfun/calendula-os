@@ -480,6 +480,30 @@ page turns differ by controller:
 Waking from the sleep screen and view/context changes use `FastClean`
 instead of the full waveform, since the panel's contents are known.
 
+### Partial-window refresh
+
+Small UI updates (e.g. settings toggles, menu selection changes, dialogs,
+loading plates) only change a fraction of the screen. `Framebuffer::diff_rect`
+derives the byte-aligned bounding rectangle between the current and previous
+framebuffers without requiring UI code to thread damage rects.
+
+When `RefreshMode::Fast` is selected:
+- If `diff_rect` returns `None` (identical frame), display flush is skipped
+  entirely (0 ms flush time).
+- If the bounding rectangle covers $\le 50\%$ of the screen area:
+  - **X3 (UC8253)**: Enters partial window mode (`0x91`, `0x90` with byte-column
+    and row coordinates, gate partial scan enabled), streams only the dirty rows
+    and byte columns into DTM2 (and DTM1 if not prestaged), triggers refresh, and
+    exits partial mode (`0x92`). If the frame was already globally staged before
+    the flush, window prestage writes only the window into DTM1, preserving the
+    global staging invariant; if the frame was initially unstaged, a full prestage
+    executes after Settled off the critical path to restore global DTM1
+    synchronization. If prestaging fails, planner state is invalidated to force
+    clean reinitialization on the next turn.
+  - **X4 (SSD1677)**: Falls back to full-screen fast differential refresh.
+- If the bounding rectangle covers $> 50\%$ (such as full page turns), both
+  controllers execute full-screen fast differential refresh.
+
 `RefreshPolicy` in Settings: `FastOnly`, `FullOnWake` (default), or
 `FullEveryTen` (legacy name — actually every eight fast refreshes).
 

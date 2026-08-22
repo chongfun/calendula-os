@@ -5511,6 +5511,21 @@ mod tests {
     }
 
     #[test]
+    fn refresh_planner_prestage_failure_invalidates_state_and_demands_full_refresh() {
+        let mut planner = RefreshPlanner::new();
+        let request = ReaderState::boot().render_request(RenderKind::Page);
+        planner.record_render(request, RefreshMode::Full);
+        assert!(planner.screen_on());
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+
+        // Prestage fails off the critical path (e.g. stranded partial mode or bus glitch)
+        planner.record_failure();
+        assert!(!planner.screen_on());
+        assert_eq!(planner.last_request(), None);
+        assert_eq!(planner.mode_for(request), RefreshMode::Full);
+    }
+
+    #[test]
     fn refresh_plan_seeded_deep_sleep_wake_uses_fast_clean() {
         let request = ReaderState::boot().render_request(RenderKind::Boot);
 

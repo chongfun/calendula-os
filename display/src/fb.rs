@@ -1,4 +1,4 @@
-use crate::{FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
+use crate::{Rect, FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
 
 /// The upright drawing frame for one render: which way the device is held.
 /// `set_pixel`/`pixel` take coordinates in this frame — x rightward, y
@@ -92,6 +92,55 @@ impl Framebuffer {
         let start = y * ROW_BYTES;
         let end = start + rows.min(HEIGHT - y) * ROW_BYTES;
         &self.data[start..end]
+    }
+
+    /// Calculates the byte-aligned bounding rectangle of differences between `self`
+    /// and `other` in native panel coordinates.
+    ///
+    /// Returns `None` if `self` and `other` have identical byte contents.
+    /// When differences exist, the returned `Rect` is guaranteed to be:
+    /// - byte-aligned horizontally: `x % 8 == 0` and `w % 8 == 0`, with `w >= 8`
+    /// - bounded by native dimensions: `x + w <= WIDTH` and `y + h <= HEIGHT`
+    /// - tightly bounding every changed byte
+    pub fn diff_rect(&self, other: &Self) -> Option<Rect> {
+        let mut min_y = usize::MAX;
+        let mut max_y = 0;
+        let mut min_bx = usize::MAX;
+        let mut max_bx = 0;
+
+        for y in 0..HEIGHT {
+            let row_start = y * ROW_BYTES;
+            let self_row = &self.data[row_start..row_start + ROW_BYTES];
+            let other_row = &other.data[row_start..row_start + ROW_BYTES];
+
+            if self_row == other_row {
+                continue;
+            }
+
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+
+            for (bx, (&s, &o)) in self_row.iter().zip(other_row.iter()).enumerate() {
+                if s != o {
+                    min_bx = min_bx.min(bx);
+                    max_bx = max_bx.max(bx);
+                }
+            }
+        }
+
+        if min_y == usize::MAX {
+            return None;
+        }
+
+        let min_native_byte = ROW_BYTES - 1 - max_bx;
+        let max_native_byte = ROW_BYTES - 1 - min_bx;
+
+        let x = (min_native_byte * 8) as u16;
+        let w = ((max_native_byte - min_native_byte + 1) * 8) as u16;
+        let y = min_y as u16;
+        let h = (max_y - min_y + 1) as u16;
+
+        Some(Rect { x, y, w, h })
     }
 
     /// Frame coordinates → native buffer coordinates. `None` when outside
@@ -1023,5 +1072,74 @@ mod tests {
         // Native bottom-left corner (x=0, y=527) -> byte 527 * 99 + 98 = 52271, mask 0x01
         fb.set_pixel(0, 527, false);
         assert_eq!(fb.bytes()[52271] & 0x01, 0);
+    }
+
+    #[test]
+    fn diff_rect_returns_none_for_identical_framebuffers() {
+        let fb1 = Framebuffer::new();
+        let fb2 = Framebuffer::new();
+        assert_eq!(fb1.diff_rect(&fb2), None);
+
+        let mut fb3 = Framebuffer::new();
+        fb3.clear(false);
+        let mut fb4 = Framebuffer::new();
+        fb4.clear(false);
+        assert_eq!(fb3.diff_rect(&fb4), None);
+    }
+
+    #[test]
+    fn diff_rect_bounds_single_pixel_change() {
+        let fb1 = Framebuffer::new();
+        let mut fb2 = Framebuffer::new();
+
+        // Native (0, 0)
+        fb2.set_pixel(0, 0, false);
+        let diff = fb1.diff_rect(&fb2).expect("diff found");
+        assert_eq!(
+            diff,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 1
+            }
+        );
+
+        // Native bottom-right corner (WIDTH - 1, HEIGHT - 1)
+        let mut fb3 = Framebuffer::new();
+        fb3.set_pixel(WIDTH - 1, HEIGHT - 1, false);
+        let diff3 = fb1.diff_rect(&fb3).expect("diff found");
+        assert_eq!(
+            diff3,
+            Rect {
+                x: (WIDTH - 8) as u16,
+                y: (HEIGHT - 1) as u16,
+                w: 8,
+                h: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn diff_rect_bounds_arbitrary_subrectangle() {
+        let fb1 = Framebuffer::new();
+        let mut fb2 = Framebuffer::new();
+
+        // Change a region from native (100, 50) to (250, 150)
+        for y in 50..=150 {
+            for x in 100..=250 {
+                fb2.set_pixel(x, y, false);
+            }
+        }
+
+        let diff = fb1.diff_rect(&fb2).expect("diff found");
+        assert_eq!(diff.x, (100 / 8 * 8) as u16); // 96
+        assert_eq!(diff.w, ((250 / 8 - 100 / 8 + 1) * 8) as u16); // (31 - 12 + 1) * 8 = 160
+        assert_eq!(diff.y, 50);
+        assert_eq!(diff.h, 101);
+        assert!(diff.x + diff.w <= WIDTH as u16);
+        assert!(diff.y + diff.h <= HEIGHT as u16);
+        assert_eq!(diff.x % 8, 0);
+        assert_eq!(diff.w % 8, 0);
     }
 }

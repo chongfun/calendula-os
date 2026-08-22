@@ -17,6 +17,7 @@
 //! and SPI clock are all hardware-verified on the X3.
 
 use super::{RefreshMode, SpiOp};
+use crate::Rect;
 
 // --- UC8253 command set (subset used by the BW path) ---
 pub const CMD_PANEL_SETTING: u8 = 0x00;
@@ -41,9 +42,32 @@ pub const CMD_RESOLUTION: u8 = 0x61;
 pub const CMD_GATE_SOURCE_START: u8 = 0x65;
 pub const CMD_VCOM_DC: u8 = 0x82;
 pub const CMD_LV_SELECTION: u8 = 0xE1;
+pub const CMD_PARTIAL_WINDOW: u8 = 0x90;
+pub const CMD_PARTIAL_IN: u8 = 0x91;
+pub const CMD_PARTIAL_OUT: u8 = 0x92;
 
 /// Argument to `CMD_DEEP_SLEEP` (check-code the controller requires).
 pub const DEEP_SLEEP_CHECK: u8 = 0xA5;
+
+/// Computes the 9-byte window parameter array for `CMD_PARTIAL_WINDOW` (PTL).
+/// `rect` is in native panel coordinates with byte-aligned horizontal bounds.
+pub const fn partial_window_data(rect: Rect) -> [u8; 9] {
+    let xs = rect.x;
+    let xe = rect.x + rect.w - 1;
+    let ys = rect.y;
+    let ye = rect.y + rect.h - 1;
+    [
+        (xs >> 8) as u8,
+        (xs & 0xFF) as u8,
+        (xe >> 8) as u8,
+        (xe & 0xFF) as u8,
+        (ys >> 8) as u8,
+        (ys & 0xFF) as u8,
+        (ye >> 8) as u8,
+        (ye & 0xFF) as u8,
+        0x01, // PT_SCAN: Gate partial scan enabled
+    ]
+}
 
 /// CDI (`CMD_VCOM_DATA_INTERVAL`) first byte: differential mode (fast/full
 /// diff against DTM1) vs absolute mode (drive to target ignoring DTM1).
@@ -173,6 +197,12 @@ pub enum FlushStep {
         plane: RamPlane,
         source: FrameSource,
     },
+    WriteWindowPlane {
+        plane: RamPlane,
+        source: FrameSource,
+    },
+    SetPartialWindow,
+    PartialOut,
     DataStop,
     PowerOn,
     DisplayRefresh,
@@ -346,6 +376,69 @@ pub const PRESTAGE_STEPS: &[FlushStep] = &[
     },
     FlushStep::DataStop,
 ];
+
+const PARTIAL_FAST_STAGED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::SetPartialWindow,
+    FlushStep::WriteWindowPlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::PartialOut,
+];
+
+const PARTIAL_FAST_UNSTAGED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::SetPartialWindow,
+    FlushStep::WriteWindowPlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Previous,
+    },
+    FlushStep::DataStop,
+    FlushStep::WriteWindowPlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::PartialOut,
+];
+
+pub const PARTIAL_PRESTAGE_STEPS: &[FlushStep] = &[
+    FlushStep::SetPartialWindow,
+    FlushStep::WriteWindowPlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+    FlushStep::PartialOut,
+];
+
+/// Select the controller operation stream for a partial fast refresh.
+/// A differential Fast request cannot run with the charge pump off because
+/// DTM1 is no longer a trustworthy copy of the displayed frame; the proven
+/// driver promotes that case to the absolute FastClean waveform.
+pub const fn partial_flush_plan(screen_powered: bool, previous_staged: bool) -> FlushPlan {
+    if !screen_powered {
+        FlushPlan {
+            requested_mode: RefreshMode::Fast,
+            effective_mode: RefreshMode::FastClean,
+            steps: CLEAN_POWER_ON_STEPS,
+        }
+    } else if previous_staged {
+        FlushPlan {
+            requested_mode: RefreshMode::Fast,
+            effective_mode: RefreshMode::Fast,
+            steps: PARTIAL_FAST_STAGED_STEPS,
+        }
+    } else {
+        FlushPlan {
+            requested_mode: RefreshMode::Fast,
+            effective_mode: RefreshMode::Fast,
+            steps: PARTIAL_FAST_UNSTAGED_STEPS,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SleepStep {
@@ -679,5 +772,48 @@ mod tests {
             &[SleepStep::PowerOff, SleepStep::DeepSleep]
         );
         assert_eq!(sleep_plan(false), &[SleepStep::DeepSleep]);
+    }
+
+    #[test]
+    fn partial_window_data_encodes_hardware_parameters() {
+        let full = partial_window_data(crate::Rect::FULL);
+        assert_eq!(full, [0x00, 0x00, 0x03, 0x17, 0x00, 0x00, 0x02, 0x0F, 0x01]);
+
+        let rect = crate::Rect::new(96, 50, 160, 40);
+        let win = partial_window_data(rect);
+        // xs = 96 = 0x0060, xe = 96 + 160 - 1 = 255 = 0x00FF
+        // ys = 50 = 0x0032, ye = 50 + 40 - 1 = 89 = 0x0059
+        assert_eq!(win, [0x00, 0x60, 0x00, 0xFF, 0x00, 0x32, 0x00, 0x59, 0x01]);
+    }
+
+    #[test]
+    fn partial_flush_plan_promotes_unpowered_and_respects_staging() {
+        // Unpowered panel cannot run differential fast; promotes to FastClean
+        let unpowered = partial_flush_plan(false, true);
+        assert_eq!(unpowered.effective_mode, RefreshMode::FastClean);
+        assert_eq!(unpowered.steps, CLEAN_POWER_ON_STEPS);
+
+        // Powered + prestaged: staged partial fast plan
+        let staged = partial_flush_plan(true, true);
+        assert_eq!(staged.effective_mode, RefreshMode::Fast);
+        assert_eq!(staged.steps, PARTIAL_FAST_STAGED_STEPS);
+
+        // Powered + unstaged: unstaged partial fast plan (writes DTM1 first)
+        let unstaged = partial_flush_plan(true, false);
+        assert_eq!(unstaged.effective_mode, RefreshMode::Fast);
+        assert_eq!(unstaged.steps, PARTIAL_FAST_UNSTAGED_STEPS);
+
+        assert_eq!(
+            PARTIAL_PRESTAGE_STEPS,
+            &[
+                FlushStep::SetPartialWindow,
+                FlushStep::WriteWindowPlane {
+                    plane: RamPlane::Old,
+                    source: FrameSource::Current,
+                },
+                FlushStep::DataStop,
+                FlushStep::PartialOut,
+            ]
+        );
     }
 }

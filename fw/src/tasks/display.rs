@@ -450,28 +450,161 @@ pub async fn run(
                         mode
                     );
                 }
-                let flush_start = Instant::now();
-                if display_flush::flush(
-                    &mut epd,
-                    fb,
-                    prev_fb,
-                    refresh_planner.screen_on(),
-                    mode,
-                    prev_prestaged,
-                )
-                .await
-                .is_ok()
-                {
-                    let flush_ms = flush_start.elapsed().as_millis();
+                let partial_window = if mode == RefreshMode::Fast {
+                    if let Some(rect) = fb.diff_rect(prev_fb) {
+                        let area = (rect.w as u32) * (rect.h as u32);
+                        let total = (display::WIDTH * display::HEIGHT) as u32;
+                        if area * 2 <= total {
+                            Some(Some(rect))
+                        } else {
+                            Some(None)
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(None)
+                };
+
+                if let Some(partial_rect) = partial_window {
+                    let was_prestaged = prev_prestaged;
+                    let flush_start = Instant::now();
+                    let flush_ok = match partial_rect {
+                        Some(rect) => display_flush::flush_window(
+                            &mut epd,
+                            fb,
+                            prev_fb,
+                            refresh_planner.screen_on(),
+                            mode,
+                            rect,
+                            prev_prestaged,
+                        )
+                        .await
+                        .is_ok(),
+                        None => display_flush::flush(
+                            &mut epd,
+                            fb,
+                            prev_fb,
+                            refresh_planner.screen_on(),
+                            mode,
+                            prev_prestaged,
+                        )
+                        .await
+                        .is_ok(),
+                    };
+
+                    if flush_ok {
+                        let flush_ms = flush_start.elapsed().as_millis();
+                        refresh_planner.record_render(request, mode);
+                        prev_fb.copy_from(fb);
+                        // Keep the current chapter tracking the page just shown, past
+                        // the reducer's 128-chapter cap. Cheap in-RAM check; only the
+                        // loaded SD reader has an uncapped page map, so this no-ops on
+                        // other views and reads SD only when the chapter changes. It
+                        // rides out inside Settled: the app must apply it before it
+                        // clears the render lock, and one message is the only way to
+                        // promise that (see DisplayEvent::Settled).
+                        let chapter_cursor = if request.view == AppView::Reading {
+                            book_build::track_reading_chapter(
+                                &mut epd,
+                                &mut sd_cs,
+                                request.page,
+                                sd_library,
+                            )
+                            .map(|current_chapter| ChapterCursor {
+                                book_id: request.book_id,
+                                page: request.page,
+                                current_chapter,
+                            })
+                        } else {
+                            None
+                        };
+                        // Settle before the ~23 ms RED prestage: the panel is visually
+                        // done, so unblock the input/power pipeline. The prestage still
+                        // runs on this task before the next command is dequeued, so
+                        // `prev_prestaged` is always current by the next flush, and a
+                        // Sleep queued by power_task after DisplaySettled waits behind it.
+                        let (display_event, power_event) =
+                            app_core::display_refresh_outcome(true, chapter_cursor);
+                        let settled_at_ms = Instant::now().as_millis();
+                        send_display_event(&display_event);
+                        send_required_power_event(power_event).await;
+                        // Emitted here, at the settle, and not after the prestage
+                        // below. This timestamp is what the bench pairs each input
+                        // against, so printing it later charged the reader for a
+                        // write they never waited on: `Settled` has already gone
+                        // out, and press-to-settled ends on this line.
+                        bench_log!(
+                            "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={}",
+                            request.view,
+                            mode,
+                            request.page,
+                            request.chapter,
+                            layout_ms,
+                            flush_ms,
+                            request.requested_at_ms,
+                            dequeued_at_ms,
+                            settled_at_ms,
+                        );
+                        let prestage_start = Instant::now();
+                        // Unconditional, deliberately. Skipping this write when another
+                        // render is already queued reads like a saving and is the exact
+                        // opposite: it is off the critical path here — Settled has gone
+                        // out, the glass is done, nobody is waiting — while the write it
+                        // defers lands *inside* the next Fast flush, ahead of
+                        // DisplayRefresh, where the reader does wait.
+                        //
+                        // If a partial refresh ran when DTM1 was not already globally
+                        // staged (was_prestaged == false), DTM1 is only synchronized
+                        // inside the partial rectangle. To restore the global invariant
+                        // so future turns can fast-diff without streaming previous RAM,
+                        // we run a full prestage here off the critical path.
+                        let prestage_res = match partial_rect {
+                            Some(rect) if was_prestaged => {
+                                display_flush::prestage_previous_window(&mut epd, fb, rect).await
+                            }
+                            _ => display_flush::prestage_previous(&mut epd, fb).await,
+                        };
+                        match prestage_res {
+                            Ok(()) => {
+                                prev_prestaged = true;
+                            }
+                            Err(err) => {
+                                esp_println::println!("display: prestage failed: {:?}", err);
+                                prev_prestaged = false;
+                                // A failed prestage (e.g. interrupted while in partial mode)
+                                // leaves controller RAM or command sequencing in an uncertain state;
+                                // record failure so the next render fully reinitializes the panel.
+                                refresh_planner.record_failure();
+                            }
+                        }
+                        // Its own event, after the render one above: prestage is
+                        // real work on this task and still gates the next command,
+                        // but it sits outside press-to-settled and is measured
+                        // separately so neither number can absorb the other.
+                        bench_log!(
+                            "bench: prestage staged={} elapsed_ms={} t_ms={}",
+                            prev_prestaged,
+                            prestage_start.elapsed().as_millis(),
+                            Instant::now().as_millis(),
+                        );
+                    } else {
+                        esp_println::println!("display: SPI transfer failed");
+                        prev_prestaged = false;
+                        // The flush may have run partially, so the panel's RAM
+                        // and waveform state no longer match the planner's model;
+                        // forget it so the next render re-inits the panel and
+                        // takes the full waveform instead of fast-diffing
+                        // against a frame that may never have landed.
+                        refresh_planner.record_failure();
+                        let (display_event, power_event) =
+                            app_core::display_refresh_outcome(false, None);
+                        send_display_event(&display_event);
+                        send_required_power_event(power_event).await;
+                    }
+                } else {
+                    // Framebuffer bytes are identical to what is already shown.
                     refresh_planner.record_render(request, mode);
-                    prev_fb.copy_from(fb);
-                    // Keep the current chapter tracking the page just shown, past
-                    // the reducer's 128-chapter cap. Cheap in-RAM check; only the
-                    // loaded SD reader has an uncapped page map, so this no-ops on
-                    // other views and reads SD only when the chapter changes. It
-                    // rides out inside Settled: the app must apply it before it
-                    // clears the render lock, and one message is the only way to
-                    // promise that (see DisplayEvent::Settled).
                     let chapter_cursor = if request.view == AppView::Reading {
                         book_build::track_reading_chapter(
                             &mut epd,
@@ -487,72 +620,22 @@ pub async fn run(
                     } else {
                         None
                     };
-                    // Settle before the ~23 ms RED prestage: the panel is visually
-                    // done, so unblock the input/power pipeline. The prestage still
-                    // runs on this task before the next command is dequeued, so
-                    // `prev_prestaged` is always current by the next flush, and a
-                    // Sleep queued by power_task after DisplaySettled waits behind it.
                     let (display_event, power_event) =
                         app_core::display_refresh_outcome(true, chapter_cursor);
                     let settled_at_ms = Instant::now().as_millis();
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
-                    // Emitted here, at the settle, and not after the prestage
-                    // below. This timestamp is what the bench pairs each input
-                    // against, so printing it later charged the reader for a
-                    // write they never waited on: `Settled` has already gone
-                    // out, and press-to-settled ends on this line.
                     bench_log!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms=0 req_ms={} deq_ms={} t_ms={}",
                         request.view,
                         mode,
                         request.page,
                         request.chapter,
                         layout_ms,
-                        flush_ms,
                         request.requested_at_ms,
                         dequeued_at_ms,
                         settled_at_ms,
                     );
-                    let prestage_start = Instant::now();
-                    // Unconditional, deliberately. Skipping this write when another
-                    // render is already queued reads like a saving and is the exact
-                    // opposite: it is off the critical path here — Settled has gone
-                    // out, the glass is done, nobody is waiting — while the write it
-                    // defers lands *inside* the next Fast flush, ahead of
-                    // DisplayRefresh, where the reader does wait.
-                    // `fast_plan_only_writes_previous_plane_when_not_prestaged`
-                    // (display/src/epd/uc8253.rs) pins the asymmetry: an unstaged
-                    // Fast carries an extra WritePlane(Old, Previous) + DataStop,
-                    // and the X4 writes RED from `prev_fb` for the same reason
-                    // (fw/src/display_flush/ssd1677.rs). The skip is also
-                    // self-sustaining — each skipped turn leaves the next unstaged —
-                    // so a held button would pay the write on-path every turn
-                    // instead of off-path once.
-                    prev_prestaged = display_flush::prestage_previous(&mut epd, fb).await.is_ok();
-                    // Its own event, after the render one above: prestage is
-                    // real work on this task and still gates the next command,
-                    // but it sits outside press-to-settled and is measured
-                    // separately so neither number can absorb the other.
-                    bench_log!(
-                        "bench: prestage staged={} elapsed_ms={} t_ms={}",
-                        prev_prestaged,
-                        prestage_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
-                    );
-                } else {
-                    esp_println::println!("display: SPI transfer failed");
-                    prev_prestaged = false;
-                    // The flush may have run partially, so the panel's RAM
-                    // and waveform state no longer match the planner's model;
-                    // forget it so the next render re-inits the panel and
-                    // takes the full waveform instead of fast-diffing
-                    // against a frame that may never have landed.
-                    refresh_planner.record_failure();
-                    let (display_event, power_event) =
-                        app_core::display_refresh_outcome(false, None);
-                    send_display_event(&display_event);
-                    send_required_power_event(power_event).await;
                 }
             }
             Either5::First(DisplayCommand::Sleep { generation }) => {
@@ -817,17 +900,48 @@ pub async fn run(
                         ) {
                             crate::views::render(fb, loading_request, sd_library);
                             let mode = refresh_planner.mode_for(loading_request);
-                            if display_flush::flush(
-                                &mut epd,
-                                fb,
-                                prev_fb,
-                                refresh_planner.screen_on(),
-                                mode,
-                                prev_prestaged,
-                            )
-                            .await
-                            .is_ok()
-                            {
+                            let partial_window = if mode == RefreshMode::Fast {
+                                if let Some(rect) = fb.diff_rect(prev_fb) {
+                                    let area = (rect.w as u32) * (rect.h as u32);
+                                    let total = (display::WIDTH * display::HEIGHT) as u32;
+                                    if area * 2 <= total {
+                                        Some(Some(rect))
+                                    } else {
+                                        Some(None)
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                Some(None)
+                            };
+
+                            let flush_ok = match partial_window {
+                                None => true,
+                                Some(Some(rect)) => display_flush::flush_window(
+                                    &mut epd,
+                                    fb,
+                                    prev_fb,
+                                    refresh_planner.screen_on(),
+                                    mode,
+                                    rect,
+                                    prev_prestaged,
+                                )
+                                .await
+                                .is_ok(),
+                                Some(None) => display_flush::flush(
+                                    &mut epd,
+                                    fb,
+                                    prev_fb,
+                                    refresh_planner.screen_on(),
+                                    mode,
+                                    prev_prestaged,
+                                )
+                                .await
+                                .is_ok(),
+                            };
+
+                            if flush_ok {
                                 refresh_planner.record_render(loading_request, mode);
                                 prev_fb.copy_from(fb);
                                 prev_prestaged = false;

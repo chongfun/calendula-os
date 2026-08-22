@@ -14,14 +14,16 @@
 
 use super::{Epd, PanelError};
 use display::epd::uc8253::{
-    bank_for, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank, RamPlane, SleepStep,
-    CDI_INTERVAL, CMD_DATA_STOP, CMD_DEEP_SLEEP, CMD_DISPLAY_REFRESH, CMD_DTM1, CMD_DTM2,
-    CMD_LUT_BB, CMD_LUT_BW, CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_POWER_OFF, CMD_POWER_ON,
-    CMD_VCOM_DATA_INTERVAL, DEEP_SLEEP_CHECK, INIT_SEQUENCE, PRESTAGE_STEPS,
+    bank_for, flush_plan, partial_flush_plan, partial_window_data, sleep_plan, FlushStep,
+    FrameSource, LutBank, RamPlane, SleepStep, CDI_INTERVAL, CMD_DATA_STOP, CMD_DEEP_SLEEP,
+    CMD_DISPLAY_REFRESH, CMD_DTM1, CMD_DTM2, CMD_LUT_BB, CMD_LUT_BW, CMD_LUT_VCOM, CMD_LUT_WB,
+    CMD_LUT_WW, CMD_PARTIAL_IN, CMD_PARTIAL_OUT, CMD_PARTIAL_WINDOW, CMD_POWER_OFF, CMD_POWER_ON,
+    CMD_VCOM_DATA_INTERVAL, DEEP_SLEEP_CHECK, INIT_SEQUENCE, PARTIAL_PRESTAGE_STEPS,
+    PRESTAGE_STEPS,
 };
 use display::epd::{RefreshMode, SpiOp};
 use display::fb::Framebuffer;
-use display::{BAND_ROWS, HEIGHT, ROW_BYTES};
+use display::{Rect, BAND_ROWS, HEIGHT, ROW_BYTES};
 use embassy_time::{Instant, Timer};
 // riscv32imc has no CAS; portable-atomic provides plain load/store here.
 use portable_atomic::{AtomicBool, Ordering};
@@ -74,14 +76,77 @@ pub(crate) async fn flush(
         plan.requested_mode,
         plan.effective_mode
     );
-    execute_steps(epd, fb, prev_fb, plan.effective_mode, plan.steps).await
+    execute_steps(epd, fb, prev_fb, plan.effective_mode, plan.steps, None).await?;
+    Ok(())
+}
+
+pub(crate) async fn flush_window(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    _screen_on: bool,
+    _mode: RefreshMode,
+    rect: Rect,
+    prev_staged: bool,
+) -> Result<(), PanelError> {
+    let plan = partial_flush_plan(SCREEN_POWERED.load(Ordering::Relaxed), prev_staged);
+    let window_bytes = (rect.w as usize / 8) * rect.h as usize;
+    let plane_writes = plan
+        .steps
+        .iter()
+        .filter(|s| matches!(s, FlushStep::WriteWindowPlane { .. }))
+        .count();
+    let ram_bytes = window_bytes * plane_writes;
+    let flush_start = Instant::now();
+    let busy_ms = execute_steps(
+        epd,
+        fb,
+        prev_fb,
+        plan.effective_mode,
+        plan.steps,
+        Some(rect),
+    )
+    .await?;
+    let elapsed_ms = flush_start.elapsed().as_millis();
+    bench_log!(
+        "bench: partial_flush mode={:?} rect=(x={},y={},w={},h={}) window_bytes={} ram_bytes={} busy_ms={} elapsed_ms={} t_ms={}",
+        plan.effective_mode,
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        window_bytes,
+        ram_bytes,
+        busy_ms.unwrap_or(0),
+        elapsed_ms,
+        Instant::now().as_millis(),
+    );
+    Ok(())
 }
 
 /// Stage the just-shown frame into DTM1 ("old" RAM) so the next fast turn's
 /// diff base is loaded off the critical path. The X4's `prestage_previous`
 /// analogue (RED RAM there, DTM1 here).
 pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result<(), PanelError> {
-    execute_steps(epd, fb, fb, RefreshMode::Fast, PRESTAGE_STEPS).await
+    execute_steps(epd, fb, fb, RefreshMode::Fast, PRESTAGE_STEPS, None).await?;
+    Ok(())
+}
+
+pub(crate) async fn prestage_previous_window(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    rect: Rect,
+) -> Result<(), PanelError> {
+    execute_steps(
+        epd,
+        fb,
+        fb,
+        RefreshMode::Fast,
+        PARTIAL_PRESTAGE_STEPS,
+        Some(rect),
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
@@ -112,7 +177,9 @@ async fn execute_steps(
     prev_fb: &Framebuffer,
     mode: RefreshMode,
     steps: &[FlushStep],
-) -> Result<(), PanelError> {
+    window: Option<Rect>,
+) -> Result<Option<u64>, PanelError> {
+    let mut busy_ms = None;
     for step in steps {
         match *step {
             FlushStep::LoadBank(mode) => {
@@ -130,13 +197,36 @@ async fn execute_steps(
                     FrameSource::Previous => send_plane(epd, command, prev_fb).await?,
                 }
             }
+            FlushStep::WriteWindowPlane { plane, source } => {
+                let command = match plane {
+                    RamPlane::Old => CMD_DTM1,
+                    RamPlane::New => CMD_DTM2,
+                };
+                let rect = window.unwrap_or(Rect::FULL);
+                match source {
+                    FrameSource::White => fill_plane(epd, command, 0xFF).await?,
+                    FrameSource::Current => send_window_plane(epd, command, fb, rect).await?,
+                    FrameSource::Previous => send_window_plane(epd, command, prev_fb, rect).await?,
+                }
+            }
+            FlushStep::SetPartialWindow => {
+                epd.command(CMD_PARTIAL_IN, &[]).await?;
+                let win = partial_window_data(window.unwrap_or(Rect::FULL));
+                epd.command(CMD_PARTIAL_WINDOW, &win).await?;
+            }
+            FlushStep::PartialOut => {
+                epd.command(CMD_PARTIAL_OUT, &[]).await?;
+            }
             FlushStep::DataStop => epd.command(CMD_DATA_STOP, &[]).await?,
             FlushStep::PowerOn => power_on(epd).await?,
-            FlushStep::DisplayRefresh => display_refresh(epd, mode).await?,
+            FlushStep::DisplayRefresh => {
+                let ms = display_refresh(epd, mode).await?;
+                busy_ms = Some(ms);
+            }
             FlushStep::DelayMs(ms) => Timer::after_millis(u64::from(ms)).await,
         }
     }
-    Ok(())
+    Ok(busy_ms)
 }
 
 async fn power_on(epd: &mut Epd) -> Result<(), PanelError> {
@@ -151,7 +241,7 @@ async fn power_on(epd: &mut Epd) -> Result<(), PanelError> {
     Ok(())
 }
 
-async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), PanelError> {
+async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<u64, PanelError> {
     let start = Instant::now();
     epd.command(CMD_DISPLAY_REFRESH, &[]).await?;
     let ms = epd.wait_two_phase().await?;
@@ -169,7 +259,7 @@ async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), PanelEr
         SCREEN_POWERED.load(Ordering::Relaxed),
         Instant::now().as_millis(),
     );
-    Ok(())
+    Ok(ms)
 }
 
 async fn power_off(epd: &mut Epd, start: Instant) -> Result<(), PanelError> {
@@ -215,6 +305,29 @@ async fn send_plane(epd: &mut Epd, ram_cmd: u8, fb: &Framebuffer) -> Result<(), 
             break;
         }
         y += BAND_ROWS;
+    }
+    epd.end_ram_write();
+    Ok(result?)
+}
+
+/// Stream only the dirty rectangle's rows and byte columns into a RAM plane.
+async fn send_window_plane(
+    epd: &mut Epd,
+    ram_cmd: u8,
+    fb: &Framebuffer,
+    rect: Rect,
+) -> Result<(), PanelError> {
+    epd.begin_ram_write(ram_cmd).await?;
+    let min_bx = (ROW_BYTES - 1) - ((rect.x + rect.w) / 8 - 1) as usize;
+    let max_bx = (ROW_BYTES - 1) - (rect.x / 8) as usize;
+    let mut result = Ok(());
+    for y in (rect.y as usize)..((rect.y + rect.h) as usize) {
+        let row_start = y * ROW_BYTES;
+        let slice = &fb.bytes()[row_start + min_bx..=row_start + max_bx];
+        if let Err(err) = epd.ram_chunk(slice).await {
+            result = Err(err);
+            break;
+        }
     }
     epd.end_ram_write();
     Ok(result?)

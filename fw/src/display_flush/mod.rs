@@ -158,10 +158,39 @@ pub(crate) async fn flush(
     }
 }
 
+pub(crate) async fn flush_window(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    screen_on: bool,
+    mode: RefreshMode,
+    rect: display::Rect,
+    prev_staged: bool,
+) -> Result<(), PanelError> {
+    match active_backend() {
+        DetectedController::Default | DetectedController::UltraChipSibling => {
+            default_backend::flush_window(epd, fb, prev_fb, screen_on, mode, rect, prev_staged)
+                .await
+        }
+    }
+}
+
 pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result<(), PanelError> {
     match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::prestage_previous(epd, fb).await
+        }
+    }
+}
+
+pub(crate) async fn prestage_previous_window(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    rect: display::Rect,
+) -> Result<(), PanelError> {
+    match active_backend() {
+        DetectedController::Default | DetectedController::UltraChipSibling => {
+            default_backend::prestage_previous_window(epd, fb, rect).await
         }
     }
 }
