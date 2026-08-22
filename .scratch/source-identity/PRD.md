@@ -179,12 +179,29 @@ Their temporary FAT/name identity and `SourceDigest` solve different problems.
 
 ### R11. A persisted digest is cached evidence until revalidated
 
-Across any boundary where the card may have been modified outside Calendula,
-a persisted `SourceDigest` is cached evidence rather than trusted identity.
+A digest is trusted only inside a **trust epoch**: while Calendula
+continuously owns the card, or when the current bytes are the known result of
+a Calendula-managed operation. Boot, remount, and card reinsertion each begin a
+new epoch, because a removable card gives the device no way to prove it was
+left alone while absent or powered down.
 
-The first operation that needs authoritative content identity revalidates the
-file by hashing it, unless Calendula holds durable evidence that the file
-stayed under its sole control since the digest was computed.
+Outside its epoch a persisted `SourceDigest` is cached evidence rather than
+trusted identity, and the first operation that needs authoritative content
+identity revalidates the file by hashing it.
+
+```text
+managed upload of Y            -> Y trusted immediately
+same uninterrupted session     -> stored Y stays trusted
+reboot, remount, reinsertion   -> persisted Y becomes cached evidence
+first operation needing
+  content identity             -> hash that book, trusted for this epoch
+```
+
+Stating it as an epoch rather than as evidence of sole control is deliberate.
+No durable marker the device can write survives the test: a generation
+counter, a clean-unmount flag, cached size and timestamps, or FAT metadata can
+all be left untouched by a computer that edits the file, so any such marker
+would report trust the device cannot support.
 
 This stays lazy and does not imply hashing at boot:
 
@@ -269,6 +286,18 @@ Verify:
 - replacement publishes the new digest only when the new body commits;
 - rollback retains the old source identity;
 - interrupted upload does not attach the new digest to the old landing.
+
+### Trust boundary tests
+
+Verify the epoch rule directly:
+
+- compute `X` for a book, reboot, replace the file externally with same-sized
+  `Y` while preserving cheap metadata such as size and timestamps, then
+  require the first content-addressed operation to discover `Y` rather than
+  consume an artifact keyed by `X`;
+- within one uninterrupted session, a digest computed during a managed upload
+  is reused without rehashing;
+- browsing and boot perform no hashing.
 
 ### Sideload tests
 

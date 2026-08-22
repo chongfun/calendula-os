@@ -654,7 +654,8 @@ Require:
 - `BookId` preserved;
 - `SourceDigest` updated;
 - position not discarded;
-- exact or approximate migration performed according to the defined policy.
+- approximate migration performed according to R13, without claiming exact
+  content continuity.
 
 ### Image/non-text anchors
 
@@ -695,8 +696,9 @@ intermediate format that carries a page index under a `BookId`.
 
 - Preserve `BookId` across managed replacement.
 - Detect source change.
-- Map anchor exactly where possible.
-- Add progression fallback.
+- Map the old position by publication and spine progression.
+- Persist and use the progression fallback.
+- Do not claim exact content continuity across a changed `SourceDigest`.
 
 ## Done when
 

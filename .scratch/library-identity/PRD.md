@@ -416,6 +416,33 @@ Library metadata recovery does not run ahead of filesystem recovery. The
 filesystem transaction decides what the card holds, and the library
 transaction only records what that means for identity.
 
+**A live library intent is a storage transaction for the sole-writer
+contract.** External modification while it stands is unsupported exactly as it
+is for `INSTALL.JNL` and `RECLAIM.JNL`, and the intent can outlive both of
+them. Without that, `old: None` has no sound resolution: an unrelated file
+placed at the locator by a computer is indistinguishable from the predecessor
+this transaction was replacing.
+
+Resolution, after filesystem recovery and under that contract:
+
+```text
+destination == new
+    -> new landing
+
+old is Some(X) and destination == X
+    -> old landing
+
+old is None and destination exists and destination != new
+    -> old landing
+
+anything else
+    -> refuse, keep the intent
+```
+
+The third line is the one the contract pays for. It reads a difference as the
+predecessor rather than as a stranger, which holds because nothing else was
+permitted to write while the intent stood.
+
 Establishing which landing occurred requires the destination's content
 identity, so this is one of the operations that revalidates a persisted digest
 under Source Identity R11.
@@ -533,9 +560,12 @@ Recovery strategy should prefer:
 
 ### Durability tests
 
-- a power cut swept across the boundary between the filesystem commit and
-  `BookRecord` publication leaves the managed replacement recoverable, with
-  `BookId` preserved and the position intact;
+- a power cut swept across the whole library-intent protocol, from before the
+  intent is published through to after it clears, leaves the managed
+  replacement recoverable at every point, with `BookId` preserved and the
+  position intact. The install may not begin until the intent is durably
+  recoverable, so the earliest part of that sweep matters as much as the
+  commit boundary;
 - a torn library-metadata write does not cause the copy to be adopted under a
   fresh `BookId`;
 - an interrupted locator repair resumes or rolls back.

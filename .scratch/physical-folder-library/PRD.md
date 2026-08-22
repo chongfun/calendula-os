@@ -202,10 +202,11 @@ Recognizable interference should fail conservatively where possible, but this PR
 Recovery may contain specific conservative mitigations where interference is
 recognizable. External edits while a journal is live sit outside the
 correctness guarantee, and are not guaranteed to be detectable or reportable.
-Both journals guarantee power loss while Calendula is the only writer, and the
-reclaim journal keeps freeing the clusters a record names even when the name
-has been taken by a stranger, which is correct under that contract and
-hazardous outside it.
+The storage transactions guarantee power loss while Calendula is the only
+writer. That covers `INSTALL.JNL`, `RECLAIM.JNL`, and the library-metadata
+intent of Library Identity R17, which can outlive both. The reclaim journal
+keeps freeing the clusters a record names even when the name has been taken by
+a stranger, which is correct under that contract and hazardous outside it.
 
 Reserve a hard refuse-and-report requirement for states Calendula can identify
 safely, such as a journal record written by an unsupported version.
