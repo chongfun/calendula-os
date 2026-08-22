@@ -289,6 +289,106 @@ SourceDigest X
   pagination
 ```
 
+## Library metadata durability
+
+`SourceDigest` is rebuildable derived identity. `BookId` is not. It is random
+by design and cannot be reconstructed from the EPUB, the path, the cluster, or
+the digest. Once a `BookId` owns reading position, the mapping from that id to
+a physical copy becomes durable user state rather than a cache, and it needs a
+crash-durability contract of its own.
+
+Treating the EPUB as authoritative recovers the book. It does not recover the
+identity and position associated with that copy:
+
+```text
+position[7db3...] = chapter 12
+BookRecord for 7db3... is torn
+EPUB is intact
+
+scan sees an unclaimed EPUB, mints BookId 91af...
+position[7db3...] is now unreachable
+```
+
+The position file survived perfectly and the user still lost their place.
+
+Split the persistent library data accordingly:
+
+```text
+Durable identity state
+    BookId <-> adopted physical copy
+    replacement and move handoff state
+    per-BookId user state
+
+Rebuildable index
+    sorted catalog
+    directory acceleration
+    cached metadata
+    SourceDigest lookup indices
+```
+
+The first category needs an explicitly recoverable scheme of the kind reading
+position already uses, such as two generations with a commit record. The
+second may be deleted and rebuilt freely.
+
+### R14. A BookId is durable before user state depends on it
+
+Adopting a copy establishes its `BookId` durably before any per-book state may
+reference it.
+
+### R15. Locator updates are crash recoverable
+
+A move repair that is interrupted resumes or rolls back. It does not leave a
+record pointing at a path that holds a different book.
+
+### R16. An interrupted metadata write does not mint a new id
+
+Losing a single interrupted write must not cause a physical copy to acquire a
+fresh `BookId`. Corruption may leave a book temporarily unassociated, and
+recovery reconnects durable ids where it can. Minting a replacement id is the
+last resort, not the default response to a torn record.
+
+### R17. Managed replacement carries durable intent that outlives INSTALL.JNL
+
+The filesystem transaction and the library metadata update are two
+transactions, and R4's managed-replacement guarantee spans both. Nothing
+bridges them today:
+
+```text
+1. upload replacement Y, digest computed while streaming
+2. INSTALL.JNL written
+3. filesystem commits Y at /BOOKS/Dune.epub
+4. recovery observes Done and clears INSTALL.JNL
+5. power loss
+6. the library update A: X -> Y never happened
+```
+
+On reboot the record says `A / X`, the file holds `Y`, and no journal remains.
+That is observationally identical to the unexplained external replacement of
+R4, which is allowed to mint a new `BookId` and orphan the position. An
+ordinary power cut would therefore break the managed-replacement guarantee in
+this PRD and in Reading Position R12.
+
+**Decided:** a small library-metadata transaction, separate from
+`INSTALL.JNL`. It records at least:
+
+```text
+(BookId, locator, old SourceDigest, new SourceDigest)
+```
+
+written before the install begins, left standing after `INSTALL.JNL` clears,
+and cleared only once the `BookRecord` is updated. Recovery finishes the
+library-side commit from it.
+
+Keeping it separate preserves Source Identity R10: FAT recovery does not need
+to understand semantic book identity, and no SHA-256 or `BookId` enters the
+storage journals.
+
+*Alternatives recorded so they are not relitigated.* A simpler product rule,
+that an existing locator always retains its `BookId` when its bytes change,
+needs no durable intent at all, but it drops the managed and unexplained
+distinction R4 was amended to make. Extending `INSTALL.JNL` with opaque
+library identity also works and costs the separation above.
+
 ## Migration
 
 Existing reading-position data is currently tied to the previous identity scheme.
@@ -356,7 +456,10 @@ Recovery strategy should prefer:
 
 - rebuilding locator/source relationships;
 - preserving opaque user state when identifiable;
-- assigning new `BookId`s rather than mutating/deleting source files.
+- reconnecting a durable `BookId` to its physical copy where the evidence
+  allows;
+- assigning new `BookId`s rather than mutating or deleting source files, as a
+  last resort once reconnection has failed, and subject to R16.
 
 ## Testing
 
@@ -386,6 +489,15 @@ Recovery strategy should prefer:
 - deleting one does not delete the other's position;
 - ambiguous duplicate reorganization does not merge their state.
 
+### Durability tests
+
+- a power cut swept across the boundary between the filesystem commit and
+  `BookRecord` publication leaves the managed replacement recoverable, with
+  `BookId` preserved and the position intact;
+- a torn library-metadata write does not cause the copy to be adopted under a
+  fresh `BookId`;
+- an interrupted locator repair resumes or rolls back.
+
 ### Reconciliation tests
 
 - stable paths require no full-card rehash;
@@ -400,11 +512,16 @@ Recovery strategy should prefer:
 - Persist `BookRecord`.
 - Keep current locator behavior.
 
-### Milestone 2: Position migration
+### Milestone 2: Position ownership
 
-- Address reading positions by `BookId`.
-- Migrate existing data.
+- Expose the `BookId` mapping that positions will be addressed by.
 - Pin duplicate-copy independence.
+
+Migration of persisted reading positions onto `BookId` belongs to the Reading
+Position and Layout Durability PRD, so the ownership-key change and the page
+index to anchor change happen in one position-format migration rather than
+two. This PRD keeps the done-when requirement that positions follow `BookId`,
+and does not schedule the format change itself.
 
 ### Milestone 3: Basic reconciliation
 

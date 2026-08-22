@@ -319,8 +319,8 @@ requires generalizing the transaction journals from fixed places to arbitrary re
 Do not make this a prerequisite for read-only folder browsing.
 
 **What #75 shipped, and what this work must not undo.** The installer in
-`upload-store/src/install.rs` stages under an opaque name in `/XTEINK/UPLOAD`,
-parks any predecessor in `/XTEINK/ROLLBACK`, moves the staged file into place
+`upload-store/src/install.rs` stages under an opaque name in `/READER/UPLOAD`,
+parks any predecessor in `/READER/ROLLBACK`, moves the staged file into place
 under its long name, and reclaims the predecessor's clusters. One `INSTALL.JNL`
 record describes the whole intent, written before anything is touched and
 cleared when everything is done. Two properties of it must survive any

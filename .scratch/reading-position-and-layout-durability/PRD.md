@@ -653,6 +653,11 @@ Use a fixture containing pages/sections dominated by images and verify those loc
 - Persist page-start anchors instead of page indices.
 - Migrate existing positions.
 
+This PRD owns that migration. Library Identity establishes the `BookId`
+mapping and defers the format change here, so a stored position moves to its
+new owner and its new representation in one step rather than through an
+intermediate format that carries a page index under a `BookId`.
+
 ### Milestone 3: LayoutId
 
 - Define canonical layout descriptor.
