@@ -711,9 +711,9 @@ where
             #[cfg(feature = "powercut-selftest")]
             SessionInput::Digest(request) => {
                 let result = if request.in_books {
-                    digest_book(books, &request).await
+                    digest_book(books, &request)
                 } else {
-                    digest_book(root, &request).await
+                    digest_book(root, &request)
                 };
                 crate::powercut::DIGEST_RESULTS
                     .send(crate::powercut::DigestReply {
@@ -810,13 +810,7 @@ where
 /// of which the campaign treats as a book that is not there in any useful
 /// sense.
 #[cfg(feature = "powercut-selftest")]
-async fn digest_book<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
+fn digest_book<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     request: &crate::powercut::DigestRequest,
 ) -> crate::powercut::DigestResult
@@ -837,15 +831,20 @@ where
     // caller and it is waiting on the answer, so this is allowed to be slow;
     // it is not allowed to be large.
     let mut buffer = [0u8; 512];
-    // Even a bounded range is seconds of blocking SD work, and the reply
-    // travels over a socket this task's own executor has to service. Without
-    // a yield the network task never runs for the length of the read, and the
-    // connection carrying the answer starves -- measured on an X3 as empty
-    // replies for the larger books, and for whatever request followed them.
-    // Every 32 sectors is 16 KB between yields, which costs nothing
-    // measurable against the SD reads.
-    const SECTORS_PER_YIELD: u32 = 32;
-    let mut since_yield = 0u32;
+    // No await in this loop, deliberately, and the signature is plain `fn` so
+    // it cannot grow one. This once yielded every 32 sectors, on the reading
+    // that a multi-second read would starve the socket carrying its answer.
+    // That yield sits inside an open file read, and every session builds its
+    // own volume manager over the one card, so whatever runs in the gap can
+    // be holding its own handles on the same volume.
+    //
+    // The starvation it guarded against does not reproduce: a full span,
+    // read straight through, answers correctly at every size up to the
+    // `MAX_DIGEST_SPAN_BYTES` bound -- measured against the 29 MB book on a
+    // real card, checked against a digest computed from an image of that
+    // card rather than from the device's own reading of it. So the window
+    // closes for nothing, which is the only reason to close it: no
+    // corruption was ever traced to it.
     while read_total < request.len && !file.is_eof() {
         let want = (request.len - read_total).min(buffer.len() as u32) as usize;
         let read = file.read(&mut buffer[..want]).ok()?;
@@ -854,11 +853,6 @@ where
         }
         hash = crate::powercut::digest_chunk(hash, &buffer[..read]);
         read_total += read as u32;
-        since_yield += 1;
-        if since_yield >= SECTORS_PER_YIELD {
-            since_yield = 0;
-            embassy_futures::yield_now().await;
-        }
     }
     Some((length, read_total, hash))
 }
