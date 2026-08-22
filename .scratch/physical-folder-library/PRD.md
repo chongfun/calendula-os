@@ -43,6 +43,7 @@ Initial scope does not require:
 
 - moving books from the device UI;
 - renaming books from the device UI;
+- creating directories from the device;
 - deleting arbitrary directories;
 - hotspot upload to arbitrary nested destinations;
 - multiple concurrent storage transactions;
@@ -154,21 +155,28 @@ A path tells a transaction where to act; it does not create a separate lock doma
 
 This is required because a live reclaim record contains raw cluster numbers whose ownership depends on preventing unrelated allocations.
 
-### R9. Initial hotspot uploads remain in a fixed inbox
+### R9. Hotspot uploads land directly under /BOOKS
 
-For the first folder-library milestone, hotspot uploads continue using a known writable destination.
+*(decided 2026-08-22.)* The first release semantics are:
 
-Recommended:
+> `/BOOKS` is the library root and the default hotspot upload destination.
+> User-created subdirectories beneath it are browsed normally. Files uploaded
+> by Calendula appear at the library root until the user reorganizes them on a
+> computer.
 
-```text
-/BOOKS/Inbox
-```
+No `/BOOKS/Inbox`. An inbox reads as tidier and buys little, while creating
+obligations this release does not want: migration behaviour for existing
+cards, ensuring the directory exists, deciding what happens when the user
+renames or deletes it, and above all putting mkdir on the upload path. This
+PRD exists so browsing can ship without generalizing the write and recovery
+model, and auto-creating an inbox hands part of that back.
 
-or retain `/BOOKS` directly if avoiding a migration is preferable.
+Leaving uploads at the root is also a product test. If users find root-level
+uploads annoying once they have folders, that is concrete evidence for
+destination selection later, which is better than guessing at it now.
 
-Users can reorganize files on a computer.
-
-This keeps `INSTALL.JNL` and `RECLAIM.JNL` unchanged while physical-folder browsing ships.
+`INSTALL.JNL` and `RECLAIM.JNL` stay unchanged while physical-folder browsing
+ships.
 
 ### R10. Computer-side reorganization is supported between transactions
 
@@ -342,30 +350,58 @@ When undertaken, that work must separately specify:
 - format versioning;
 - maximum path/depth;
 - recovery when a serialized directory no longer resolves;
-- reclaim-before-allocation ordering during mkdir;
+- behaviour when the chosen destination has been removed between selection
+  and commit;
 - global mutation serialization.
+
+That feature targets directories that already exist, so it needs path-aware
+journals and does not need mkdir recovery. The two architectural changes stay
+separable.
 
 This should be a dedicated storage PRD or milestone.
 
-## Folder creation: deferred milestone
+## Folder creation is out of scope
 
-Calendula does not initially need to create arbitrary folders.
+*(decided 2026-08-22.)* Device-side folder creation is not part of this PRD
+and is not on the planned path. Creating and reorganizing the hierarchy are
+computer-side operations. Calendula discovers and browses what it finds.
 
-**Product intent is settled** *(owner, 2026-08-22)*: when upload placement
-arrives, the browser may create new folders at upload time rather than only
-picking from existing ones. The ordering below therefore matters: a failed
-mkdir behind a standing journal record leaves a record describing a
-destination that cannot exist.
+This supersedes the intent recorded on the same day in the retired
+user-managed library PRD, that the upload browser could create folders. The
+sequencing argument won: arbitrary upload placement, if it is added at all,
+targets directories that already exist.
 
-When device-side mkdir is introduced:
+The intended shape, with each step independently justifiable:
 
-1. all existing storage recovery must settle first because mkdir allocates;
-2. directory creation must use the LFN-safe fork implementation;
-3. power loss during unpublished-directory creation may leak bounded storage even if no corrupt visible folder results.
+```text
+Phase 1:  browse arbitrary existing folders
+          upload -> /BOOKS
 
-The product must explicitly decide whether bounded leak-on-power-loss is acceptable or whether mkdir requires its own recovery mechanism.
+Later:    upload -> user selects an existing folder
+          (path-aware journals, no mkdir recovery)
 
-Do not introduce another journal without measured need.
+Only if wanted: create, rename or move folders on device
+```
+
+**If device-side mkdir is ever wanted**, the crash semantics get designed
+then, against real demand rather than in advance. The owner's position is
+recorded so it is not re-derived: a bounded power-loss leak is acceptable
+there in preference to a third journal, because folder creation is rare,
+explicitly user-triggered metadata work. That trade differs from delete,
+where the old ordering could leave a visible book unreadable during an
+ordinary reader operation.
+
+Accepting it would require proving three properties:
+
+- interruption before publication leaves no visible malformed folder;
+- interruption after publication leaves a valid, usable folder;
+- the only intermediate loss is a bounded unreachable allocation, with no
+  possibility of reclaiming or reusing another chain.
+
+Testing would have to establish a hard bound of one unpublished directory
+cluster per interrupted mkdir. If the fork cannot prove those properties,
+mkdir needs more machinery than a leak, and that is a reason to design it
+properly rather than to ship it cheaply.
 
 ## Testing
 
@@ -404,7 +440,7 @@ Verify:
 Verify:
 
 - browsing respects `shelf_readable`;
-- no mkdir/catalog allocation occurs while reclaim is unsettled;
+- no catalog or index allocation occurs while reclaim is unsettled;
 - entering upload mode continues to replay reclaim before any allocation;
 - computer-created folder structures do not disturb `INSTALL.JNL`/`RECLAIM.JNL`.
 
@@ -450,7 +486,9 @@ Only if direct enumeration proves too slow.
 
 ### Milestone 6: Optional arbitrary upload placement
 
-Separate design/review for path-aware `INSTALL.JNL` and `RECLAIM.JNL`.
+Separate design and review for path-aware `INSTALL.JNL` and `RECLAIM.JNL`,
+targeting existing directories only. No mkdir, and no folder creation on the
+device.
 
 ## Done when
 
@@ -462,3 +500,4 @@ Separate design/review for path-aware `INSTALL.JNL` and `RECLAIM.JNL`.
 - Identical copies can remain separate books.
 - Existing journalled install/delete guarantees are unchanged.
 - No arbitrary-path write support was required merely to ship folder browsing.
+- No device-side directory creation was required either, and none was added.
