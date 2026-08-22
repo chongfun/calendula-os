@@ -1,5 +1,9 @@
 # Physical Folder Library
 
+Supersedes the placement and browsing half of the User-Managed Library PRD,
+deleted in this commit and recoverable at
+`git show 26f7238:.scratch/user-managed-library/PRD.md`.
+
 ## Summary
 
 Allow Calendula to present the user's actual SD-card folder hierarchy as the library.
@@ -185,6 +189,21 @@ If another device edits the FAT while Calendula has a live transaction, correctn
 
 Recognizable interference should fail conservatively where possible, but this PRD does not promise arbitrary outside-writer recovery.
 
+### R11a. Unresolvable recovery state is surfaced, not guessed
+
+*(carried from the superseded PRD, where it was R15 and marked decided.)*
+
+A card edited underneath an open transaction can present a combination the
+recovery plan does not map: a predecessor deleted from a computer mid-install,
+or a destination name now held by a foreign file. In that case the device
+leaves the card alone and says so.
+
+A visible odd state is recoverable by the user. A silent wrong guess costs a
+book.
+
+How this is surfaced is still open: a library-level notice, a per-book state,
+or a boot-time screen. The requirement is that it is not silent.
+
 ### R12. Empty directories are allowed
 
 Empty user-created folders are valid library objects.
@@ -293,6 +312,29 @@ requires generalizing the transaction journals from fixed places to arbitrary re
 
 Do not make this a prerequisite for read-only folder browsing.
 
+**What #75 shipped, and what this work must not undo.** The installer in
+`upload-store/src/install.rs` stages under an opaque name in `/XTEINK/UPLOAD`,
+parks any predecessor in `/XTEINK/ROLLBACK`, moves the staged file into place
+under its long name, and reclaims the predecessor's clusters. One `INSTALL.JNL`
+record describes the whole intent, written before anything is touched and
+cleared when everything is done. Two properties of it must survive any
+later change:
+
+- Only one step frees clusters, and not while two names share a chain. A move
+  puts two names on one chain briefly, and cleanup there unlinks rather than
+  reclaims.
+- The predecessor is identified by cluster chain rather than by name, because
+  retiring it frees its alias and the driver re-derives the same alias for the
+  replacement.
+
+**A retired approach, recorded so it does not return.** An earlier draft staged
+by creating the file under its final long name and hiding it behind a durable
+`.PND`/`.CLN` marker. Four review rounds each found another place where state
+spread across several directory entries could not distinguish absent from
+unknown, old generation from new, or committed from partially cleaned up. It
+was compensating for a missing move primitive, and the fork now has one. Do not
+repropose it.
+
 When undertaken, that work must separately specify:
 
 - the on-disk directory locator format for `INSTALL.JNL`;
@@ -308,6 +350,12 @@ This should be a dedicated storage PRD or milestone.
 ## Folder creation: deferred milestone
 
 Calendula does not initially need to create arbitrary folders.
+
+**Product intent is settled** *(owner, 2026-08-22)*: when upload placement
+arrives, the browser may create new folders at upload time rather than only
+picking from existing ones. The ordering below therefore matters: a failed
+mkdir behind a standing journal record leaves a record describing a
+destination that cannot exist.
 
 When device-side mkdir is introduced:
 

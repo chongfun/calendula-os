@@ -1,5 +1,9 @@
 # Source Identity
 
+Supersedes the content-fingerprint half of the User-Managed Library PRD
+(its §6.3), deleted in this commit and recoverable at
+`git show 26f7238:.scratch/user-managed-library/PRD.md`.
+
 ## Summary
 
 Introduce a stable identity for the bytes of an EPUB, independent of its filesystem path or any particular user-visible copy.

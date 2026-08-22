@@ -1,5 +1,9 @@
 # Reading Position and Layout Durability
 
+Supersedes the derived-state half of the User-Managed Library PRD (its §6.5
+and §6.7), deleted in this commit and recoverable at
+`git show 26f7238:.scratch/user-managed-library/PRD.md`.
+
 ## Summary
 
 Make reading position independent of pagination and typography settings.

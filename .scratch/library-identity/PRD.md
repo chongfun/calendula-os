@@ -1,5 +1,11 @@
 # Library Identity and Reconciliation
 
+Supersedes the identity and reorganization half of the User-Managed Library
+PRD (its §5.2 and §6.6), deleted in this commit and recoverable at
+`git show 26f7238:.scratch/user-managed-library/PRD.md`. That PRD keyed both
+cache and reading position on one content identity, which this model
+deliberately splits.
+
 ## Summary
 
 Introduce a persistent identity for each **physical library copy** of a book, separate from both its current filesystem path and the identity of its EPUB bytes.
