@@ -90,7 +90,7 @@ Canonical path to the current physical EPUB.
 Example:
 
 ```text
-/Books/Fiction/Dune.epub
+/BOOKS/Fiction/Dune.epub
 ```
 
 A locator is mutable.
@@ -143,13 +143,13 @@ If two physical EPUB files contain identical bytes:
 If a known EPUB moves from:
 
 ```text
-/Books/Dune.epub
+/BOOKS/Dune.epub
 ```
 
 to:
 
 ```text
-/Books/Fiction/Dune.epub
+/BOOKS/Fiction/Dune.epub
 ```
 
 and reconciliation determines it is the same physical library instance, update the record's locator while preserving its `BookId`.
@@ -273,12 +273,12 @@ Conceptually:
 Library Index
 
 BookId A
-  locator = /Books/Fiction/Dune.epub
+  locator = /BOOKS/Fiction/Dune.epub
   source  = SHA256(...)
   position = ...
 
 BookId B
-  locator = /Books/Backup/Dune.epub
+  locator = /BOOKS/Backup/Dune.epub
   source  = SHA256(...)   # same source as A
   position = ...          # independent
 ```

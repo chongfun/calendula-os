@@ -196,20 +196,20 @@ Users may:
 - rename EPUBs;
 - copy/delete EPUBs;
 
-while Calendula is not performing a storage transaction.
+while no Calendula mutation operation is live.
 
 On next scan, the library-identity reconciliation layer repairs `BookId` locators where possible.
 
 ### R11. Concurrent outside writes remain unsupported
 
-If another device edits the FAT while Calendula has a live transaction, correctness is not guaranteed.
+If another device edits the FAT while any part of a Calendula mutation protocol is live, correctness is not guaranteed.
 
 Recognizable interference should fail conservatively where possible, but this PRD does not promise arbitrary outside-writer recovery.
 
 Recovery may contain specific conservative mitigations where interference is
-recognizable. External edits while a journal is live sit outside the
+recognizable. External edits while any part of the protocol is live sit outside the
 correctness guarantee, and are not guaranteed to be detectable or reportable.
-The storage transactions guarantee power loss while Calendula is the only
+The mutation protocols guarantee power loss while Calendula is the only
 writer. That covers `INSTALL.JNL`, `RECLAIM.JNL`, and the library-metadata
 intent of Library Identity R17, which can outlive both. The reclaim journal
 keeps freeing the clusters a record names even when the name has been taken by
