@@ -180,7 +180,9 @@ A path is therefore neither permanent identity nor sufficient evidence of replac
 
 Computer-side filesystem edits are supported when no Calendula storage transaction is live.
 
-Concurrent outside edits while `INSTALL.JNL` or `RECLAIM.JNL` is live remain unsupported.
+Concurrent outside edits while any Calendula storage transaction is live remain
+unsupported. That includes `INSTALL.JNL`, `RECLAIM.JNL`, and the
+library-metadata intent of R17, which can outlive both journals.
 
 Where interference is recognizable, Calendula should refuse or require reconciliation rather than guessing.
 
@@ -588,8 +590,11 @@ Recovery strategy should prefer:
 ### Milestone 1b: Managed-replacement transaction
 
 - Add the library-metadata intent and its recovery resolution, per R17.
-- Sweep a power cut across the boundary between the filesystem commit and
-  `BookRecord` publication.
+- Sweep a power cut across every durable write in the library-intent protocol:
+  intent publication, install and reclaim recovery, `BookRecord` publication,
+  and the intent clear. A sweep that starts at the filesystem commit would
+  pass an implementation that begins installing before its intent is durable,
+  and that ordering is the point of the protocol.
 
 Both land before any user state depends on `BookId`, since a `BookId` that can
 be lost or reminted is worse than no `BookId` once a position hangs from it.
@@ -626,4 +631,8 @@ Only if needed:
 - Source-derived artifacts can still be shared.
 - Unique filesystem moves can be repaired automatically.
 - Ambiguous filesystem changes fail conservatively.
-- No new coupling is introduced between library identity and FAT transaction recovery.
+- Library identity stays out of the FAT journal formats: no `BookId` or
+  `SourceDigest` is encoded in `INSTALL.JNL` or `RECLAIM.JNL`, and library
+  metadata recovery runs after filesystem recovery rather than beside it. The
+  protocol ordering in R17 is deliberate coupling; the format separation is
+  what this PRD preserves.
