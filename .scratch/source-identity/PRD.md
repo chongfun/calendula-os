@@ -115,11 +115,46 @@ Suitable triggers include:
 
 Do not require hashing every EPUB on every boot.
 
-### R5. Derived caches may key by source identity
+### R5. Source identity is required for equivalence, not for caching
 
-Artifacts that are purely functions of EPUB contents may use `SourceDigest` as their primary source key.
+`SourceDigest` is required when an artifact is to be reused **across physical
+file identities** on the claim that the source bytes are identical.
 
-Examples:
+Artifacts scoped to one known physical file may use a cheaper per-file cache
+identity, and must not treat that identity as proof of content equivalence.
+
+```text
+LocalCacheIdentity
+    cheap, per physical file
+    decides whether this file's own cache is still usable
+    does not authorize sharing state with another file
+
+SourceDigest
+    full SHA-256 over the whole stream
+    authoritative byte identity
+    authorizes equivalence across files and locators
+```
+
+The distinction already exists in the code and deserves an honest name.
+`reader_cache::store::source_hash(path, byte_size)` is the cheap identity, and
+a cache header is reused only when its hash and size both match the entry.
+That is a local validity check, not a claim about bytes, and calling it a
+source identity would blur the line this PRD draws.
+
+Where each is needed:
+
+| Operation | Needs `SourceDigest` |
+|---|---|
+| Open or reopen a known file's own reader cache | no |
+| Browse, titles, catalog | no |
+| Derived state belonging to one locator | no |
+| Managed upload | already known, computed while streaming |
+| Claiming two files hold identical contents | yes |
+| Confirming a move when the locator changed | yes |
+| Sharing content-derived artifacts between copies | yes |
+| Carrying artifacts across a rename with no other basis | yes |
+
+Artifacts that may be shared once identity is established:
 
 - EPUB structural parse results;
 - table of contents;
@@ -186,8 +221,26 @@ new epoch, because a removable card gives the device no way to prove it was
 left alone while absent or powered down.
 
 Outside its epoch a persisted `SourceDigest` is cached evidence rather than
-trusted identity, and the first operation that needs authoritative content
-identity revalidates the file by hashing it.
+trusted identity, and the first operation that needs to **establish content
+equivalence** revalidates the file by hashing it.
+
+**Opening a book is not such an operation.** Reusing state scoped to one
+physical file follows the local cache validity policy of R5 and requires no
+hashing. Revalidation is owed before a digest is used to claim that two sets
+of bytes are the same, which covers move confirmation, cross-copy artifact
+sharing, and replacement decisions that turn on byte identity.
+
+The measured cost is why this line matters. Reading a 29 MB book off a real
+card runs between roughly 15 and 50 seconds depending on the card and the
+read path, against tens of milliseconds for a cached reopen today. Making
+that a precondition for opening a sideloaded book would trade the reader's
+defining property for certainty nobody asked for at that moment.
+
+Deep sleep sharpens it further. Sleep resets the chip and clears the statics
+an epoch would live in, as the SD acquire path already documents when it
+forgets a remembered `CardType`. Epoch boundaries are therefore ordinary and
+frequent, not rare, and an architecture that hashes a book at every one is
+fighting the hardware.
 
 **Trust attaches to a file, not to a digest value.** It is a property of the
 association between one physical file and its `SourceDigest`, and identical
@@ -326,8 +379,10 @@ Verify the epoch rule directly:
 
 - compute `X` for a book, reboot, replace the file externally with same-sized
   `Y` while preserving cheap metadata such as size and timestamps, then
-  require the first content-addressed operation to discover `Y` rather than
-  consume an artifact keyed by `X`;
+  require the first operation that establishes equivalence to discover `Y`
+  rather than consume an artifact keyed by `X`;
+- opening that book and reusing its own cache does not hash it, and does not
+  wait on identity;
 - two files identical at `X`, then a reboot, then an external replacement of
   only the second with same-sized `Y`: validating the first must not authorize
   the second, and a content-addressed operation on the second discovers `Y`;
@@ -365,9 +420,37 @@ Verify:
 
 ### Milestone 4: First consumer
 
-Use `SourceDigest` for the first content-derived feature, preferably image-rendering artifacts.
+Use `SourceDigest` for the first content-derived feature, preferably
+image-rendering artifacts.
 
-This milestone proves that the identity abstraction is useful without introducing library-instance identity.
+Rendering does not wait on identity. Artifacts start under the local cache
+identity of the file that produced them, and identity adds reuse and
+relocation on top:
+
+```text
+image artifacts for /BOOKS/Dune.epub
+    usable immediately under this file's local cache identity
+
+once SourceDigest X is trusted for that file
+    artifacts may be looked up and promoted under X
+    identical copies may share them
+    a move may recover them
+```
+
+This milestone proves the identity abstraction is useful without introducing
+library-instance identity, and without making a digest an admission ticket to
+rendering an image.
+
+### Opportunistic computation
+
+Computing a digest early is an optimization that makes later identity
+operations cheap. It is not a prerequisite for anything on the reading path,
+and the library is still not hashed at boot.
+
+Reasonable moments: during a managed upload, where it is free; alongside some
+other full sequential read the device is doing anyway; at idle, if battery and
+card ownership make it sensible; and on demand when a move or a cross-copy
+question needs it.
 
 ## Done when
 
@@ -376,4 +459,6 @@ This milestone proves that the identity abstraction is useful without introducin
 - Identical EPUB copies share a `SourceDigest`.
 - Image-rendering or another content-derived cache can use the identity without depending on the EPUB path.
 - Reading position remains unaffected.
+- Opening a book costs what it costs today. No read path waits on a digest,
+  and the reader's cached reopen stays in the tens of milliseconds.
 - Existing install/reclaim power-cut guarantees remain unchanged.
