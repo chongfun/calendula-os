@@ -1,0 +1,416 @@
+# Physical Folder Library
+
+## Summary
+
+Allow Calendula to present the user's actual SD-card folder hierarchy as the library.
+
+The first version is intentionally **read-oriented**: users may organize EPUBs into folders on a computer, and Calendula browses that structure directly.
+
+Writing to arbitrary destination folders from the hotspot is a later milestone, not a prerequisite for folder browsing.
+
+This avoids generalizing the crash-recovery journals before the browsing model has demonstrated value.
+
+## Motivation
+
+A user-managed library should not require Calendula to invent a second organizational database when the SD card already has a portable hierarchy that users can edit with ordinary filesystem tools.
+
+Physical folders provide:
+
+- organization visible both on Calendula and on a computer;
+- no vendor-specific metadata required to understand the card;
+- natural support for large libraries;
+- straightforward interoperability.
+
+The existing fixed `/BOOKS` model can remain the hotspot upload inbox while physical-folder browsing is introduced independently.
+
+## Goals
+
+1. Browse EPUBs through their actual physical folder hierarchy.
+2. Support long directory and EPUB names.
+3. Keep paths as locators rather than durable book identity.
+4. Work with the `BookId`/`SourceDigest` model from the identity PRDs.
+5. Preserve current storage transaction guarantees.
+6. Avoid requiring arbitrary-path writes in the initial milestone.
+7. Keep external organization by a computer simple and supported between Calendula transactions.
+
+## Non-goals
+
+Initial scope does not require:
+
+- moving books from the device UI;
+- renaming books from the device UI;
+- deleting arbitrary directories;
+- hotspot upload to arbitrary nested destinations;
+- multiple concurrent storage transactions;
+- live coexistence with a computer writing to the SD card;
+- a virtual tag/collection hierarchy independent of the filesystem.
+
+## Filesystem root
+
+Do not treat every directory on the SD card as library content.
+
+Define a library root.
+
+Recommended initial location:
+
+```text
+/BOOKS
+```
+
+Users may organize arbitrary subdirectories beneath it:
+
+```text
+/BOOKS/
+  Fiction/
+    Dune.epub
+  History/
+    Rome/
+      SPQR.epub
+  Inbox/
+```
+
+Firmware-private state remains outside the browsable hierarchy under `/READER`.
+
+## Requirements
+
+### R1. Physical directories are the navigation model
+
+The library UI reflects the actual hierarchy below `/BOOKS`.
+
+A directory is not copied into a separate organizational database.
+
+### R2. Only EPUBs and directories participate
+
+At each folder level:
+
+- show child directories;
+- show supported EPUB files;
+- ignore unrelated filesystem artifacts unless future requirements say otherwise.
+
+### R3. Long filenames and directory names are supported
+
+The implementation must use the fork's LFN-aware directory enumeration.
+
+Do not reduce visible names to 8.3 aliases.
+
+### R4. Paths are locators
+
+A selected book resolves to a canonical locator such as:
+
+```text
+/BOOKS/History/Rome/SPQR.epub
+```
+
+That locator is passed to the library-identity layer.
+
+Moving the file later updates the locator without inherently changing `BookId`.
+
+### R5. Directory traversal needs a real LFN resolver
+
+`embedded-sdmmc` does not provide a generic “open this arbitrary long path” abstraction.
+
+Implement a resolver which, for each path component:
+
+1. enumerates the current directory with LFN-aware iteration;
+2. matches the requested long component;
+3. obtains the actual FAT directory entry/short alias;
+4. descends through that entry.
+
+Keep this resolver in one storage-layer abstraction rather than duplicating LFN scans across firmware callers.
+
+### R6. Canonical path rules are explicit
+
+Define and validate:
+
+- maximum path depth;
+- maximum serialized locator length;
+- treatment of `.` and `..`;
+- path separator;
+- root-relative versus absolute representation;
+- case comparison rules appropriate to FAT;
+- illegal/control characters.
+
+The UI may display the original long filename while internal locator representation remains normalized.
+
+### R7. Reads remain available during safe recovery states
+
+The existing storage owner decides whether the shelf is readable versus mutable.
+
+Browsing must respect the current recovery gates.
+
+A live reclaim may still permit some reads, but must prevent any operation that could allocate/reuse clusters.
+
+### R8. Mutations remain globally serialized
+
+Folder support must **not** introduce per-directory transaction concurrency.
+
+There is one globally serialized storage mutation at a time.
+
+A path tells a transaction where to act; it does not create a separate lock domain.
+
+This is required because a live reclaim record contains raw cluster numbers whose ownership depends on preventing unrelated allocations.
+
+### R9. Initial hotspot uploads remain in a fixed inbox
+
+For the first folder-library milestone, hotspot uploads continue using a known writable destination.
+
+Recommended:
+
+```text
+/BOOKS/Inbox
+```
+
+or retain `/BOOKS` directly if avoiding a migration is preferable.
+
+Users can reorganize files on a computer.
+
+This keeps `INSTALL.JNL` and `RECLAIM.JNL` unchanged while physical-folder browsing ships.
+
+### R10. Computer-side reorganization is supported between transactions
+
+Users may:
+
+- create directories;
+- move EPUBs;
+- rename EPUBs;
+- copy/delete EPUBs;
+
+while Calendula is not performing a storage transaction.
+
+On next scan, the library-identity reconciliation layer repairs `BookId` locators where possible.
+
+### R11. Concurrent outside writes remain unsupported
+
+If another device edits the FAT while Calendula has a live transaction, correctness is not guaranteed.
+
+Recognizable interference should fail conservatively where possible, but this PRD does not promise arbitrary outside-writer recovery.
+
+### R12. Empty directories are allowed
+
+Empty user-created folders are valid library objects.
+
+The UI should not require every directory to contain a book.
+
+### R13. Derived state remains outside the library tree
+
+Do not place Calendula caches alongside user EPUBs.
+
+Continue using `/READER` or equivalent firmware-private storage for:
+
+- catalogs;
+- positions;
+- image caches;
+- render caches;
+- journals;
+- library metadata.
+
+### R14. Catalog/cache keys must not depend solely on paths
+
+Any whole-library catalog may cache locators for speed, but authoritative per-book identity follows the Library Identity PRD.
+
+A path change should invalidate/update a locator, not inherently create a different source identity.
+
+## UI model
+
+Initial navigation can remain deliberately simple:
+
+```text
+Library
+  > Fiction/
+    History/
+    Inbox/
+    Book at root.epub
+```
+
+Selecting a directory pushes a new directory view.
+
+Selecting a book opens it through its `BookId`/locator.
+
+Required first-version operations:
+
+- enter folder;
+- go to parent;
+- open book.
+
+Sorting/filtering policy may reuse the current library behavior.
+
+## Storage architecture
+
+Introduce a storage-layer abstraction conceptually like:
+
+```text
+LibraryPath
+resolve_directory(path)
+list_directory(path)
+open_book(path)
+```
+
+This layer owns:
+
+- LFN component resolution;
+- canonical path validation;
+- translation to actual embedded-sdmmc directory handles.
+
+Higher layers should not manually walk FAT directory aliases.
+
+## Catalog strategy
+
+Do not make a global precomputed catalog mandatory for correctness.
+
+Two acceptable approaches:
+
+### Option A: On-demand directory reads
+
+Enumerate the current folder when entered.
+
+Advantages:
+
+- simple;
+- naturally reflects computer-side edits;
+- low global indexing cost.
+
+### Option B: Derived tree index
+
+Maintain a rebuildable index under `/READER` for faster navigation.
+
+If used:
+
+- it is derived state;
+- physical folders remain authoritative;
+- stale/corrupt index data is rebuilt rather than mutating user files.
+
+Start with the simplest version whose on-device latency is acceptable.
+
+## Arbitrary upload placement: deferred milestone
+
+Uploading directly to:
+
+```text
+/BOOKS/History/Rome/
+```
+
+requires generalizing the transaction journals from fixed places to arbitrary resolved directories.
+
+Do not make this a prerequisite for read-only folder browsing.
+
+When undertaken, that work must separately specify:
+
+- the on-disk directory locator format for `INSTALL.JNL`;
+- the locator format/capacity impact for `RECLAIM.JNL`;
+- format versioning;
+- maximum path/depth;
+- recovery when a serialized directory no longer resolves;
+- reclaim-before-allocation ordering during mkdir;
+- global mutation serialization.
+
+This should be a dedicated storage PRD or milestone.
+
+## Folder creation: deferred milestone
+
+Calendula does not initially need to create arbitrary folders.
+
+When device-side mkdir is introduced:
+
+1. all existing storage recovery must settle first because mkdir allocates;
+2. directory creation must use the LFN-safe fork implementation;
+3. power loss during unpublished-directory creation may leak bounded storage even if no corrupt visible folder results.
+
+The product must explicitly decide whether bounded leak-on-power-loss is acceptable or whether mkdir requires its own recovery mechanism.
+
+Do not introduce another journal without measured need.
+
+## Testing
+
+### Directory enumeration
+
+Cover:
+
+- root-level books;
+- nested folders;
+- long names;
+- duplicate filenames in different directories;
+- empty directories;
+- ignored unrelated files.
+
+### LFN path resolution
+
+Cover:
+
+- every path component long;
+- mixed LFN/8.3 components;
+- missing component;
+- file where directory expected;
+- ambiguous/case variants according to FAT semantics;
+- maximum supported depth/length.
+
+### Identity interaction
+
+Verify:
+
+- moving a book between folders preserves `BookId` after reconciliation;
+- identical books in separate folders remain independent library entries;
+- source-derived cache can still be shared.
+
+### Recovery interaction
+
+Verify:
+
+- browsing respects `shelf_readable`;
+- no mkdir/catalog allocation occurs while reclaim is unsettled;
+- entering upload mode continues to replay reclaim before any allocation;
+- computer-created folder structures do not disturb `INSTALL.JNL`/`RECLAIM.JNL`.
+
+### Large-library behavior
+
+Measure:
+
+- time to enter a directory with 10, 100, and 1000 entries;
+- memory use during LFN enumeration;
+- boot impact;
+- navigation latency.
+
+Optimize with derived indexing only if measurement justifies it.
+
+## Milestones
+
+### Milestone 1: LFN path abstraction
+
+- Introduce canonical `LibraryPath`.
+- Implement component-by-component LFN resolution.
+- Add host/disk tests.
+
+### Milestone 2: Folder enumeration
+
+- List child folders and EPUBs below `/BOOKS`.
+- Keep existing flat view available during transition if useful.
+
+### Milestone 3: Folder UI
+
+- Navigate into/out of folders.
+- Open books from arbitrary nested locators.
+- Verify X3 UX with a representative card.
+
+### Milestone 4: Identity reconciliation
+
+Integrate with `BookId` so filesystem moves do not reset reading position.
+
+This may land in parallel with the Library Identity PRD rather than being implemented twice.
+
+### Milestone 5: Optional derived directory index
+
+Only if direct enumeration proves too slow.
+
+### Milestone 6: Optional arbitrary upload placement
+
+Separate design/review for path-aware `INSTALL.JNL` and `RECLAIM.JNL`.
+
+## Done when
+
+- A user can organize EPUBs into nested folders on a computer.
+- Calendula displays and navigates that physical hierarchy.
+- Long directory and EPUB names work.
+- A nested EPUB opens normally.
+- Paths are treated as locators, not book identity.
+- Identical copies can remain separate books.
+- Existing journalled install/delete guarantees are unchanged.
+- No arbitrary-path write support was required merely to ship folder browsing.
