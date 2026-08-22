@@ -107,13 +107,16 @@ The digest does not participate in FAT transaction recovery. It becomes library 
 
 For EPUBs placed on the card by a computer, compute `SourceDigest` lazily.
 
-Suitable triggers include:
+Suitable triggers:
 
-- first open;
-- first operation that needs content-derived caching;
-- an explicit background/indexing operation if one is introduced later.
+- an operation that must establish content equivalence;
+- move reconciliation needing authoritative confirmation;
+- sharing content-derived artifacts across copies;
+- opportunistic or background computation when the device has reason and time.
 
-Do not require hashing every EPUB on every boot.
+Opening a book is not one of them, per R5. Do not require hashing every EPUB
+on every boot, and do not require hashing one merely because a reader opened
+it.
 
 ### R5. Source identity is required for equivalence, not for caching
 
@@ -165,13 +168,23 @@ Artifacts that may be shared once identity is established:
 
 ### R6. Layout-dependent artifacts include layout identity
 
-Anything whose result also depends on reader/display configuration must not key only by `SourceDigest`.
+Anything whose result also depends on reader or display configuration must
+include `LayoutId` alongside whichever source scope authorizes its reuse. The
+two decide different things and neither implies the other:
 
-Conceptually:
+- the source scope decides **how broadly** an artifact may be reused;
+- `LayoutId` decides **under which rendering configuration** it is valid.
 
 ```text
-(SourceDigest, LayoutId) -> pagination/render artifacts
+per file, the ordinary case:
+(LocalCacheIdentity, LayoutId) -> pagination and render artifacts
+
+across files, once equivalence is established:
+(SourceDigest, LayoutId)       -> the same artifacts, shared or recovered
 ```
+
+Reading this as "layout-dependent means `SourceDigest` required" would put
+pagination back behind a full hash, which R5 exists to prevent.
 
 `LayoutId` may include relevant inputs such as:
 
@@ -292,10 +305,10 @@ would report trust the device cannot support.
 This stays lazy and does not imply hashing at boot:
 
 ```text
-boot                          -> no hashing
-browse folders                -> no hashing
-open a book, or need an
-  artifact keyed by content   -> validate that one file
+boot                           -> no hashing
+browse folders                 -> no hashing
+open or reopen a book          -> no hashing, local cache identity decides
+need cross-file equivalence    -> hash that file
 ```
 
 Without this rule the digest is authoritative as an algorithm and not as the
@@ -303,6 +316,20 @@ identity attached to a file. A computer can replace a book with a same-sized
 edition, leaving a cheap scan satisfied that the locator is unchanged, and a
 cache keyed by the stored digest would then serve artifacts belonging to the
 previous bytes.
+
+**The accepted consequence.** A cheap per-file identity is knowingly weaker
+than byte identity. `source_hash(path, byte_size)` cannot see a same-path,
+same-size external replacement, so after a reboot Calendula may reopen its
+existing local cache and reading position for a book a computer quietly
+swapped. Local cache reuse prioritizes open latency and may not immediately
+discover such a replacement. Any later operation requiring byte equivalence
+performs full validation and reconciles the changed source.
+
+That is a bounded false positive within one file, and it is categorically
+different from the failure R11 prevents. Serving A's own stale cache back to A
+costs A a rebuild once the change is noticed. Serving A's artifacts to B
+because an unvalidated digest called them identical crosses file identities,
+and no cheap evidence may authorize it.
 
 Size, timestamps, or a sampled fingerprint may narrow which files need
 revalidation. They cannot stand in for the check itself, since the same-path

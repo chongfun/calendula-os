@@ -283,17 +283,21 @@ BookId B
   position = ...          # independent
 ```
 
-Derived cache:
+Derived cache, in two tiers:
 
 ```text
-SourceDigest X
+LocalCacheIdentity of the file at this locator
+  pagination and render artifacts for this file alone
+  reused on open, with no hashing
+
+SourceDigest X, once equivalence is established
   parsed EPUB
   images
   cover
   ...
 
 (SourceDigest X, LayoutId Y)
-  pagination
+  pagination that identical copies may share, or a move may recover
 ```
 
 ## Library metadata durability

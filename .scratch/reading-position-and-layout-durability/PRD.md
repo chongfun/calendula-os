@@ -23,17 +23,21 @@ BookId
   └── ReadingPosition
         └── ContentAnchor
 
-SourceDigest
+LocalCacheIdentity (one physical file)
+  ├── LayoutId A -> Pagination A
+  └── LayoutId B -> Pagination B
+
+SourceDigest (once equivalence is established)
   ├── source-derived artifacts
-  └── LayoutId A
-  │     └── Pagination A
-  └── LayoutId B
-        └── Pagination B
+  └── LayoutId A -> the same pagination, shared or recovered
 ```
 
 Reading position belongs to a `BookId`.
 
-Pagination belongs to `(SourceDigest, LayoutId)`.
+Pagination belongs to a layout and a source scope. Ordinary opens use the
+cheap per-file scope, so opening a book waits on no hashing. A trusted
+`SourceDigest` widens that scope later, letting identical copies share
+pagination and letting a moved file recover it.
 
 Neither is the other.
 
@@ -120,12 +124,17 @@ A content anchor must not contain a page number.
 
 ### Pagination
 
-A derived mapping:
+A derived mapping from a source scope and a layout to ordered page boundaries
+expressed as `ContentAnchor` values:
 
 ```text
-(SourceDigest, LayoutId)
-    -> ordered page boundaries expressed as ContentAnchor values
+(LocalCacheIdentity, LayoutId) -> page boundaries      // ordinary open
+(SourceDigest, LayoutId)       -> the same boundaries  // shareable
 ```
+
+`LocalCacheIdentity` is the cheap per-file identity of Source Identity R5. It
+decides whether this file's own pagination is still usable, and it authorizes
+nothing about any other file.
 
 ## Requirements
 
@@ -247,17 +256,19 @@ This gives settings reflow a clear semantic meaning:
 
 Persist according to the existing position-write policy rather than introducing an SD write on every rendering operation if one is not already required.
 
-### R8. Layout caches are keyed by SourceDigest and LayoutId
+### R8. Layout caches are keyed by a source scope and LayoutId
 
-Pagination must be stored under:
+Pagination is stored under a source scope together with `LayoutId`, and not
+merely under the book or the current settings.
 
-```text
-(SourceDigest, LayoutId)
-```
+The ordinary scope is `LocalCacheIdentity`, so opening a book and reusing its
+pagination costs no hashing. Once a `SourceDigest` is trusted for a file, its
+pagination may be looked up or promoted under `(SourceDigest, LayoutId)`, and
+identical copies may then share it while keeping independent positions.
 
-not merely under the book or current settings.
-
-Two identical EPUB copies may therefore share pagination for the same layout while keeping independent reading positions.
+Sharing requires established equivalence. A cheap identity matching across two
+files proves nothing about their contents and may not be used to hand one
+file's pagination to another.
 
 ### R9. Settings changes do not eagerly delete other layouts
 
@@ -452,7 +463,7 @@ BookId
   |
   +-> ReadingPosition(ContentAnchor)
   |
-  +-> SourceDigest
+  +-> LocalCacheIdentity of the file at this locator
           |
           +-> active LayoutId
                   |
@@ -462,6 +473,10 @@ BookId
   |
   +-> resolve ContentAnchor to page
 ```
+
+No hashing appears anywhere in that flow. A trusted `SourceDigest` enters only
+when pagination is shared across copies or recovered after a move, which is a
+separate path from opening a book.
 
 ### Turn page
 
@@ -517,13 +532,22 @@ Exact filenames are implementation-specific, but conceptually:
 
 ```text
 /READER/
+  files/
+    <LocalCacheIdentity>/          the ordinary open path
+      layouts/
+        <LayoutId>/
+          pagination
   sources/
-    <SourceDigest>/
+    <SourceDigest>/                shared once equivalence is established
       layouts/
         <LayoutId>/
           pagination
           ...
 ```
+
+An artifact may be promoted from the first tree to the second once a digest is
+trusted for that file. Promotion is an optimization, and losing either tree
+costs a rebuild rather than a reading position.
 
 Per-book state remains separate:
 
@@ -567,6 +591,18 @@ Existing caches may be:
 Their loss must not imply loss of the newly migrated position.
 
 ## Failure handling
+
+### An externally replaced file whose cheap identity still matches
+
+Local cache reuse prioritizes open latency, so a book a computer replaced with
+a same-size edition may reopen against its existing pagination and position
+before anything notices. That is a bounded false positive within one file: the
+cost is a rebuild once a later operation establishes equivalence and
+reconciles the changed source, and the anchor migration rules of R13 apply
+then.
+
+No state is shared with another physical file on that evidence. Cheap identity
+matching decides only whether this file may reuse its own work.
 
 ### Missing pagination
 
@@ -628,7 +664,9 @@ Require:
 Two identical EPUBs:
 
 - share `SourceDigest`;
-- share pagination for a given `LayoutId`;
+- may share pagination for a given `LayoutId` **once content equivalence has
+  been established**, and not before, since a matching cheap identity is not
+  evidence about contents;
 - have distinct `BookId`s;
 - retain independent anchors.
 
@@ -684,7 +722,10 @@ intermediate format that carries a page index under a `BookId`.
 ### Milestone 3: LayoutId
 
 - Define canonical layout descriptor.
-- Key pagination by `(SourceDigest, LayoutId)`.
+- Key pagination by `(LocalCacheIdentity, LayoutId)` for the ordinary open
+  path, with no hashing.
+- Leave `(SourceDigest, LayoutId)` for the sharing and recovery path, which
+  arrives with the identity work rather than here.
 
 ### Milestone 4: Multi-layout cache retention
 
