@@ -559,7 +559,7 @@ where
             CentralLookup::Indexed { records, complete } => {
                 let hash = fnv1a_update(FNV_OFFSET, name.as_bytes());
                 let mut unverified_hit = false;
-                for record in records.chunks_exact(CENTRAL_INDEX_RECORD_BYTES) {
+                for record in records.as_chunks::<CENTRAL_INDEX_RECORD_BYTES>().0 {
                     if read_u32(record, 0)? != hash {
                         continue;
                     }

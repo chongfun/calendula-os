@@ -133,7 +133,7 @@ pub fn parse_ota_layout(table: &[u8], flash_size: u32) -> Result<OtaLayout, Part
     let mut otadata = None;
     let mut slots = [None, None];
 
-    for raw in table.chunks_exact(PARTITION_ENTRY_LEN) {
+    for raw in table.as_chunks::<PARTITION_ENTRY_LEN>().0 {
         let magic = u16::from_le_bytes([raw[0], raw[1]]);
         if magic == u16::MAX || magic == PARTITION_MD5_MAGIC {
             break;
