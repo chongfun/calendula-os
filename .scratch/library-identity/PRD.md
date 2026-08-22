@@ -148,21 +148,27 @@ to:
 
 and reconciliation determines it is the same physical library instance, update the record's locator while preserving its `BookId`.
 
-### R4. Replacement semantics are explicit
+### R4. Replacement semantics distinguish known intent from unexplained path reuse
 
-Replacing the contents at the same path is not automatically the same thing as moving a book.
+Changing the bytes at a locator does not inherently create a new library entry.
 
-If the old locator still exists but its contents now identify a different source:
+For a **Calendula-managed replacement** of an existing `BookId`:
 
-- treat it as a changed/replaced physical entry;
-- apply an explicit policy rather than silently inheriting state.
+- preserve the existing `BookId`;
+- update its `SourceDigest` after the replacement transaction commits;
+- preserve per-book user state, including reading position;
+- allow the position layer to migrate its content anchor onto the new source;
+- retain the old `SourceDigest` only as long as needed for rollback or derived-cache garbage collection.
 
-Recommended initial policy:
+This covers ordinary workflows such as uploading a corrected or updated copy of a book without treating it as an unrelated library entry.
 
-- assign a new `BookId` to the new contents;
-- retain old state only in stale/history metadata until garbage collection.
+For a filesystem change performed outside Calendula where the same locator now contains different bytes and no durable operation establishes replacement intent:
 
-This avoids attaching a prior book's position to unrelated bytes merely because the pathname was reused.
+- do not assume pathname reuse means the same book;
+- reconcile conservatively using available library metadata and source evidence;
+- assign a new `BookId` if continuity cannot be established safely.
+
+A path is therefore neither permanent identity nor sufficient evidence of replacement. Calendula-managed transaction intent may establish continuity that an unexplained external filesystem change cannot.
 
 ### R5. Reconciliation happens between transactions
 
