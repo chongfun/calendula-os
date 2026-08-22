@@ -46,7 +46,7 @@ Initial scope does not require:
 - creating directories from the device;
 - deleting arbitrary directories;
 - hotspot upload to arbitrary nested destinations;
-- multiple concurrent storage transactions;
+- multiple concurrent independent mutation operations;
 - live coexistence with a computer writing to the SD card;
 - a virtual tag/collection hierarchy independent of the filesystem.
 
@@ -149,9 +149,16 @@ A live reclaim may still permit some reads, but must prevent any operation that 
 
 Folder support must **not** introduce per-directory transaction concurrency.
 
-There is one globally serialized storage mutation at a time.
+There is one globally serialized mutation operation at a time. One such
+operation may span several coordinated recovery records: the library-metadata
+intent of Library Identity R17 stands before the install begins, overlaps it,
+may overlap the reclaim it drives, and survives after `INSTALL.JNL` clears.
+Those records describe one logical mutation rather than competing ones.
 
-A path tells a transaction where to act; it does not create a separate lock domain.
+No unrelated allocating mutation may run while any part of that protocol is
+live.
+
+A path tells an operation where to act; it does not create a separate lock domain.
 
 This is required because a live reclaim record contains raw cluster numbers whose ownership depends on preventing unrelated allocations.
 

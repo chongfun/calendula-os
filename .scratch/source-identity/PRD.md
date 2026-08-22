@@ -189,12 +189,45 @@ Outside its epoch a persisted `SourceDigest` is cached evidence rather than
 trusted identity, and the first operation that needs authoritative content
 identity revalidates the file by hashing it.
 
+**Trust attaches to a file, not to a digest value.** It is a property of the
+association between one physical file and its `SourceDigest`, and identical
+bytes deliberately produce identical digests, so validating one copy proves
+nothing about another. Two files whose persisted digests match must each be
+revalidated after an epoch boundary.
+
+Conceptually the trusted fact is:
+
 ```text
-managed upload of Y            -> Y trusted immediately
-same uninterrupted session     -> stored Y stays trusted
-reboot, remount, reinsertion   -> persisted Y becomes cached evidence
+TrustedSource {
+    physical file identity (locator for this milestone),
+    SourceDigest,
+    epoch,
+}
+```
+
+and it is not a set of trusted digest values. A set would allow this:
+
+```text
+/BOOKS/A.epub and /BOOKS/B.epub both hold X, both persisted as X
+a computer replaces only B with same-sized Y
+open A  -> hash gives X, X marked trusted
+open B  -> X already trusted, B is served from the X-keyed cache
+           while B actually holds Y
+```
+
+Locator is a sufficient file identity for this milestone, since moves are out
+of scope here. Once `BookId` exists the association can hang from the
+`BookRecord`, and a Calendula-managed rename or move can transfer or
+re-establish trust as part of a known operation.
+
+Per file, the epoch rule reads:
+
+```text
+managed upload of Y            -> that file trusted at Y immediately
+same uninterrupted session     -> that file stays trusted
+reboot, remount, reinsertion   -> its persisted digest becomes cached evidence
 first operation needing
-  content identity             -> hash that book, trusted for this epoch
+  content identity             -> hash that file, trusted for this epoch
 ```
 
 Stating it as an epoch rather than as evidence of sole control is deliberate.
@@ -295,6 +328,9 @@ Verify the epoch rule directly:
   `Y` while preserving cheap metadata such as size and timestamps, then
   require the first content-addressed operation to discover `Y` rather than
   consume an artifact keyed by `X`;
+- two files identical at `X`, then a reboot, then an external replacement of
+  only the second with same-sized `Y`: validating the first must not authorize
+  the second, and a content-addressed operation on the second discovers `Y`;
 - within one uninterrupted session, a digest computed during a managed upload
   is reused without rehashing;
 - browsing and boot perform no hashing.
