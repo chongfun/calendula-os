@@ -310,16 +310,38 @@ Because its anchor may refer to the previous source, the position layer must att
 
 A `ReadingPosition` should retain enough information to make reasonable migration possible when the source changes.
 
-The first implementation should support at least:
+**Migration across a changed source is approximate in the first version.**
 
-- exact reuse when the logical content coordinate remains valid;
-- an approximate fallback based on publication/spine progression when it does not.
+An offset that remains in range is not evidence that it still points at the
+same content. Inserting a thousand characters early in a chapter leaves
+`(chapter, 10000)` perfectly valid and pointing somewhere else, and once the
+replacement completes the predecessor may already be reclaimed, so there is
+nothing left to compare against.
 
-A future anchor representation may add local content context to improve matching across edited EPUB versions.
+The first implementation therefore promises a best-effort nearby position
+based on publication and spine progression, and does not claim exactness
+merely because an offset resolves. Silently resetting to page 0 remains
+unacceptable.
 
-Failure to map exactly should degrade to an approximate nearby position, not silently reset to page 0.
+Exactness is promised where it is real: an unchanged `SourceDigest`, which
+covers the settings changes this PRD exists for. See R14.
 
-Substantially different books are outside this guarantee.
+A context-bearing anchor would allow exact migration across edited editions,
+by carrying a small stable fingerprint of the content around the anchor so the
+new source can be searched for it:
+
+```text
+ContentAnchor {
+    spine_item,
+    logical_offset,
+    context_before_hash,
+    context_after_hash,
+}
+```
+
+That is deferred until there is evidence that minor-edition updates need to
+preserve an exact place. Substantially different books stay outside any
+guarantee.
 
 ### R14. Source identity validates exact anchor interpretation
 

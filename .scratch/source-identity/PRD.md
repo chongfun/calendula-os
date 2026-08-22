@@ -167,6 +167,8 @@ A stored digest is metadata derived from the EPUB and may be regenerated from th
 
 Its persistence format should be versioned or otherwise safe to invalidate when necessary.
 
+When a stored digest may be revalidated rather than trusted is specified by R11.
+
 ### R10. No new storage-transaction semantics
 
 `INSTALL.JNL` and `RECLAIM.JNL` remain responsible only for making filesystem mutation recoverable.
@@ -174,6 +176,35 @@ Its persistence format should be versioned or otherwise safe to invalidate when 
 Neither journal needs to contain a SHA-256 digest as part of this milestone.
 
 Their temporary FAT/name identity and `SourceDigest` solve different problems.
+
+### R11. A persisted digest is cached evidence until revalidated
+
+Across any boundary where the card may have been modified outside Calendula,
+a persisted `SourceDigest` is cached evidence rather than trusted identity.
+
+The first operation that needs authoritative content identity revalidates the
+file by hashing it, unless Calendula holds durable evidence that the file
+stayed under its sole control since the digest was computed.
+
+This stays lazy and does not imply hashing at boot:
+
+```text
+boot                          -> no hashing
+browse folders                -> no hashing
+open a book, or need an
+  artifact keyed by content   -> validate that one file
+```
+
+Without this rule the digest is authoritative as an algorithm and not as the
+identity attached to a file. A computer can replace a book with a same-sized
+edition, leaving a cheap scan satisfied that the locator is unchanged, and a
+cache keyed by the stored digest would then serve artifacts belonging to the
+previous bytes.
+
+Size, timestamps, or a sampled fingerprint may narrow which files need
+revalidation. They cannot stand in for the check itself, since the same-path
+replacement semantics in Library Identity R4 depend on knowing the current
+bytes.
 
 ## Data model
 

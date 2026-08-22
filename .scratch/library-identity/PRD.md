@@ -194,6 +194,11 @@ On scan:
 
 Do not re-identify every stable file on every boot.
 
+"Appears unchanged" is a cheap filter for reconciliation, not evidence about
+content. A locator that looks stable may hold different bytes after an outside
+edit, so any operation needing authoritative content identity revalidates
+under Source Identity R11 rather than trusting the stored digest.
+
 ### R7. SourceDigest is authoritative confirmation
 
 When a missing known entry and a new unknown file need to be matched, full `SourceDigest` is authoritative evidence that their contents match.
@@ -372,12 +377,48 @@ this PRD and in Reading Position R12.
 `INSTALL.JNL`. It records at least:
 
 ```text
-(BookId, locator, old SourceDigest, new SourceDigest)
+(BookId, locator, old: Option<SourceDigest>, new: SourceDigest)
 ```
 
-written before the install begins, left standing after `INSTALL.JNL` clears,
-and cleared only once the `BookRecord` is updated. Recovery finishes the
-library-side commit from it.
+The old digest is optional because `BookRecord.source` is optional: source
+identity is lazy, and replacing a book should not force a full read of the
+predecessor purely to populate transaction metadata.
+
+The record is written before the install begins, stands after `INSTALL.JNL`
+clears, and is cleared once the `BookRecord` is updated.
+
+**A live intent does not say which side won.** It stands both when the install
+never became durable and when the install completed and cleared, so recovery
+has to ask the card rather than the record:
+
+```text
+recovery order, on mount or at session start:
+
+1. settle RECLAIM.JNL
+2. settle INSTALL.JNL
+3. resolve the library intent
+
+then, against what the destination actually holds:
+
+  matches the new SourceDigest
+      -> publish BookRecord as (BookId, locator, new)
+      -> clear the intent
+
+  still the old landing
+      -> leave the BookRecord unchanged
+      -> clear the intent
+
+  neither legal landing can be established
+      -> keep the intent and fail conservatively
+```
+
+Library metadata recovery does not run ahead of filesystem recovery. The
+filesystem transaction decides what the card holds, and the library
+transaction only records what that means for identity.
+
+Establishing which landing occurred requires the destination's content
+identity, so this is one of the operations that revalidates a persisted digest
+under Source Identity R11.
 
 Keeping it separate preserves Source Identity R10: FAT recovery does not need
 to understand semantic book identity, and no SHA-256 or `BookId` enters the
@@ -448,7 +489,8 @@ This may lose automatic position continuity for ambiguous duplicate moves, but i
 
 ## Failure handling
 
-Library metadata is secondary to the physical EPUB.
+Rebuildable library index metadata is secondary to the EPUB. Durable `BookId`
+identity state and per-book user state are not.
 
 Corrupt library-index metadata must not prevent a user from accessing valid EPUB files where feasible.
 
@@ -506,11 +548,21 @@ Recovery strategy should prefer:
 
 ## Milestones
 
-### Milestone 1: BookId and metadata model
+### Milestone 1: BookId and a recoverable metadata model
 
 - Introduce `BookId`.
-- Persist `BookRecord`.
+- Persist `BookRecord` in a representation that survives an interrupted write,
+  such as two generations with a commit record, per R14 to R16.
 - Keep current locator behavior.
+
+### Milestone 1b: Managed-replacement transaction
+
+- Add the library-metadata intent and its recovery resolution, per R17.
+- Sweep a power cut across the boundary between the filesystem commit and
+  `BookRecord` publication.
+
+Both land before any user state depends on `BookId`, since a `BookId` that can
+be lost or reminted is worse than no `BookId` once a position hangs from it.
 
 ### Milestone 2: Position ownership
 
