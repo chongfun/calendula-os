@@ -442,13 +442,39 @@ Verify:
 ### Milestone 3: Lazy existing-file identity
 
 - Hash sideloaded EPUBs on demand.
-- Persist/reuse the result where appropriate.
-- Invalidate safely if the source can no longer be trusted to match the stored identity.
+- Persist the result as evidence, in a format that degrades to absence when
+  it cannot be trusted.
+
+Establishing trust moves to milestone 4, with the first consumer that needs
+it. A persisted record cannot prove anything about the bytes on the card, and
+building the machinery that decides when it may be believed, before anything
+asks, would be guessing at the shape its consumer wants.
 
 ### Milestone 4: First consumer
 
 Use `SourceDigest` for the first content-derived feature, preferably
 image-rendering artifacts.
+
+**Prerequisite: the trust epoch.** This milestone is where a persisted digest
+first authorizes something, so the association it needs arrives with it:
+
+```text
+trusted associations for the current epoch:
+    (physical file, SourceDigest)
+
+empty after boot, remount, or reinsertion
+
+a managed upload landing inserts its own, free
+an on-demand hash inserts its result
+a persisted record inserts nothing
+a cross-file consumer checks the association, and hashes if it is absent
+```
+
+That costs an ordinary open nothing, because an ordinary open asks no
+question this answers. It also makes alias reuse safe: a record left behind by
+a book a computer deleted describes a file that is gone, and revalidation
+discovers that. Sidecar cleanup cannot, since it does not run when Calendula
+is absent.
 
 Rendering does not wait on identity. Artifacts start under the local cache
 identity of the file that produced them, and identity adds reuse and

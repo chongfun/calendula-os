@@ -87,7 +87,9 @@ Reading position is owned by `BookId`.
 
 Identity of the current EPUB bytes.
 
-Pagination is derived from a source and therefore includes `SourceDigest` in its cache identity.
+`SourceDigest` may provide the source scope for pagination once content
+equivalence has been established. Ordinary pagination uses
+`LocalCacheIdentity` instead, so opening a book waits on no hashing.
 
 ### LayoutId
 
