@@ -422,6 +422,7 @@ use core::ops::ControlFlow;
 use crate::{open_or_make_dir, remove_file_reclaiming_clusters, RemoveStatus};
 use embedded_sdmmc::{Directory, Mode, TimeSource};
 use proto::cache::{CACHE_ROOT_DIR, CATALOG_FILE};
+use proto::source::{SourceDigest, SourceHasher};
 
 /// Why a step could not be carried out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1227,6 +1228,18 @@ fn legacy_alias(prefix: &str, tail: u32) -> ShortName {
 /// Nothing in `/BOOKS` is touched until [`StagedUpload::install`], so an
 /// upload that is interrupted — by a lost connection, a full card, a reset —
 /// leaves a scratch file and no trace in the library.
+/// A book that reached the shelf, and what its bytes are.
+///
+/// Only a landing produces one, so an identity here always describes bytes a
+/// reader can reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Landed {
+    /// The 8.3 name the book now answers to.
+    pub alias: ShortName,
+    /// The identity of the bytes that landed.
+    pub source: SourceDigest,
+}
+
 pub struct StagedUpload<'a, D, T, const MD: usize, const MF: usize, const MV: usize>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1236,6 +1249,10 @@ where
     stage: ShortName,
     long_name: String<64>,
     legacy: Option<LegacyKey>,
+    /// Accumulated over exactly the bytes that reached the file, and it goes
+    /// no further than this struct until a landing publishes it. An abandoned
+    /// upload drops it with everything else it staged.
+    hasher: SourceHasher,
 }
 
 impl<'a, D, T, const MD: usize, const MF: usize, const MV: usize> StagedUpload<'a, D, T, MD, MF, MV>
@@ -1286,11 +1303,18 @@ where
             stage,
             long_name: name,
             legacy,
+            hasher: SourceHasher::new(),
         })
     }
 
-    pub fn write(&self, bytes: &[u8]) -> Result<(), InstallError> {
-        self.file.write(bytes).map_err(|_| InstallError::Card)
+    /// Append to the staged body, and to its identity.
+    ///
+    /// The hash follows the write, so bytes the card refused are absent from
+    /// both and the digest cannot describe a file that failed mid-write.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), InstallError> {
+        self.file.write(bytes).map_err(|_| InstallError::Card)?;
+        self.hasher.update(bytes);
+        Ok(())
     }
 
     /// Give up, leaving the library exactly as it was.
@@ -1306,23 +1330,26 @@ where
     /// Publish the staged file to `/BOOKS` under its long name, replacing any
     /// book already holding that name.
     ///
-    /// `Ok(Some(alias))` is the 8.3 name the book now answers to. `Ok(None)`
-    /// is a transaction that finished and installed nothing — a rollback, or
-    /// a name that turned out to belong to somebody else. `Err` says why it
-    /// could not be finished here, which does not always mean it will not
-    /// happen: once the intent is durable, an install interrupted from this
-    /// point is finished by the next mount.
+    /// `Ok(Some(landed))` carries the 8.3 name the book now answers to and
+    /// the identity of the bytes behind it. `Ok(None)` is a transaction that
+    /// finished and installed nothing, a rollback or a name that turned out to
+    /// belong to somebody else, and carries no identity because those bytes
+    /// are on no shelf. `Err` says why it could not be finished here, which
+    /// does not always mean it will not happen: once the intent is durable, an
+    /// install interrupted from this point is finished by the next mount.
     pub fn install(
         self,
         root: &Directory<'_, D, T, MD, MF, MV>,
         books: &Directory<'_, D, T, MD, MF, MV>,
-    ) -> Result<Option<ShortName>, InstallError> {
+    ) -> Result<Option<Landed>, InstallError> {
         let Self {
             file,
             stage,
             long_name,
             legacy,
+            hasher,
         } = self;
+        let source = hasher.finish();
         // Until the close succeeds the file is not durable, and installing a
         // book the card has not finished writing is the one thing staging
         // exists to prevent.
@@ -1403,6 +1430,13 @@ where
         // The plan is the authority on whether the book landed, not the step
         // count: a transaction that ended in a rollback completed cleanly and
         // still installed nothing.
+        //
+        // No host test reaches this branch. `old` above is whichever file
+        // holds the long name at this moment, so a stranger arriving between
+        // `begin` and here is replaced rather than refused, and a completed
+        // recovery landing elsewhere needs a writer this transaction excludes
+        // or a card that lost the staged file. It stays because recovery after
+        // a reset reaches these states for real.
         if !observe(root, books, &intent)?.dest {
             return Ok(None);
         }
@@ -1414,11 +1448,12 @@ where
                 crate::delete_upload_sidecars(root, retired.alias.as_str());
             }
         }
-        // The alias the driver derived, for the caller's log. It is an
-        // artefact of the format, not the book's name.
+        // The alias the driver derived, an artefact of the format rather than
+        // the book's name. The identity travels with it, so a caller holding a
+        // digest holds one for a book that is on the shelf.
         Ok(holder_of_long_name(books, intent.long_name.as_str())
             .flatten()
-            .map(|(alias, _)| alias))
+            .map(|(alias, _)| Landed { alias, source }))
     }
 }
 

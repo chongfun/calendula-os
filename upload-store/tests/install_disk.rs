@@ -14,8 +14,10 @@ use embedded_sdmmc::{
     VolumeIdx, VolumeManager,
 };
 use heapless::String;
+use proto::source::FileKey;
 use upload_store::install::{
-    self, recover_installs, InstallIntent, Located, ShortName, Step, ROLLBACK_DIR, UPLOAD_DIR,
+    self, recover_installs, InstallIntent, Landed, Located, ShortName, Step, ROLLBACK_DIR,
+    UPLOAD_DIR,
 };
 use upload_store::reclaim;
 
@@ -557,7 +559,7 @@ fn a_replacement_for_an_empty_book_is_refused_rather_than_guessed() {
     let alias = holder_of(&books, BOOK_NAME).expect("on the shelf");
     assert_eq!(alias.chain, 0, "the fixture has to actually be empty");
 
-    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
     staged.write(&new_body()).expect("stream");
     assert!(
         matches!(
@@ -982,7 +984,12 @@ fn scratch_files(root: &Dir<'_>) -> Vec<std::string::String> {
 }
 
 fn upload(root: &Dir<'_>, books: &Dir<'_>, name: &str, body: &[u8]) -> Option<String<12>> {
-    let staged = StagedUpload::begin(root, books, name, None).expect("stage");
+    landing(root, books, name, body).map(|landed| landed.alias)
+}
+
+/// The whole landing, for tests that care what the bytes turned out to be.
+fn landing(root: &Dir<'_>, books: &Dir<'_>, name: &str, body: &[u8]) -> Option<Landed> {
+    let mut staged = StagedUpload::begin(root, books, name, None).expect("stage");
     staged.write(body).expect("stream");
     staged.install(root, books).expect("install")
 }
@@ -1055,7 +1062,7 @@ fn an_abandoned_upload_leaves_the_shelf_exactly_as_it_was() {
     let (root, books) = open_dirs(&mgr);
     let alias = upload(&root, &books, BOOK_NAME, &old_body()).expect("first");
 
-    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
     staged.write(b"half a book").expect("stream");
     staged.abandon(&root);
 
@@ -1081,7 +1088,7 @@ fn an_upload_interrupted_mid_stream_never_reaches_the_shelf() {
     let mgr = open_mgr(new_card());
     let (root, books) = open_dirs(&mgr);
 
-    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
     staged.write(b"the first few chapters").expect("stream");
     drop(staged);
     assert!(
@@ -1277,12 +1284,13 @@ fn re_uploading_a_book_from_before_long_names_replaces_it() {
         alias: short(legacy_alias.as_str()),
         identity,
     };
-    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, Some(key)).expect("stage");
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, Some(key)).expect("stage");
     staged.write(&new_body()).expect("stream");
     let alias = staged
         .install(&root, &books)
         .expect("install")
-        .expect("the book landed");
+        .expect("the book landed")
+        .alias;
 
     assert_ne!(
         alias.as_str(),
@@ -1332,12 +1340,13 @@ fn a_legacy_book_with_another_identity_is_left_alone() {
         alias: short(legacy_alias.as_str()),
         identity: proto::upload::hash_identity(client_name),
     };
-    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, Some(key)).expect("stage");
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, Some(key)).expect("stage");
     staged.write(&new_body()).expect("stream");
     let alias = staged
         .install(&root, &books)
         .expect("install")
-        .expect("the book landed");
+        .expect("the book landed")
+        .alias;
 
     assert_eq!(body(&books, alias.as_str()), new_body());
     assert_eq!(
@@ -1905,7 +1914,7 @@ fn staging_over_a_leftover_never_frees_a_chain_the_shelf_is_reading() {
     );
 
     // The next upload of the same book derives the same scratch name.
-    let staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
     assert_eq!(
         body_named(&books, BOOK_NAME),
         new_body(),
@@ -2125,6 +2134,525 @@ fn card_awaiting_rollback_reclaim(disk: &SharedDisk) -> (Vec<u32>, Vec<u32>, Sho
             .as_str(),
     );
     (parked, shelf, intent.rollback)
+}
+
+/// The digest the upload accumulated describes the file the shelf ended up
+/// holding. Checked against an independent hash of the committed bytes.
+#[test]
+fn a_landing_carries_the_identity_of_the_bytes_that_landed() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+
+    let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("the book landed");
+    let on_card = body(&books, landed.alias.as_str());
+
+    assert_eq!(landed.source, proto::source::digest_of(&on_card));
+    assert_eq!(landed.source.byte_len(), on_card.len() as u64);
+}
+
+/// Chunking is the caller's business, and a socket cuts where it likes.
+#[test]
+fn the_identity_does_not_depend_on_how_the_body_was_chunked() {
+    let whole = {
+        let disk = new_card();
+        let mgr = open_mgr(disk.clone());
+        let (root, books) = open_dirs(&mgr);
+        landing(&root, &books, BOOK_NAME, &old_body())
+            .expect("landed")
+            .source
+    };
+
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    for chunk in old_body().chunks(7) {
+        staged.write(chunk).expect("stream");
+    }
+    let landed = staged
+        .install(&root, &books)
+        .expect("install")
+        .expect("landed");
+
+    assert_eq!(landed.source, whole);
+}
+
+/// Asking whether two books share their bytes writes nothing.
+///
+/// The shelf stays readable while a reclaim is unsettled, which is when a
+/// reader might ask, and an allocation then can be handed a cluster the
+/// journal already recorded.
+#[test]
+fn an_equivalence_question_writes_nothing() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
+    let copy = landing(&root, &books, "Copy.epub", &old_body()).expect("copy");
+
+    // Nothing has recorded a digest for these, so the tempting moment to
+    // write one is exactly now.
+    assert!(upload_store::cached_source_identity(&root, one.alias.as_str()).is_none());
+
+    disk.cut_writes_from(None);
+    let shared = upload_store::may_share_derived_state(
+        &root,
+        &FileKey::new(true, one.alias.as_str()),
+        &FileKey::new(true, copy.alias.as_str()),
+    )
+    .expect("read");
+
+    assert_eq!(shared, Some(true));
+    assert_eq!(disk.writes_seen(), 0, "the question only read");
+    assert!(
+        upload_store::cached_source_identity(&root, one.alias.as_str()).is_none(),
+        "and left no record behind",
+    );
+}
+
+/// A delete between two questions is seen by the second.
+///
+/// Why nothing is remembered between calls: `remove_file_reclaiming_clusters`
+/// mutates through whatever directory it is given, so a remembered digest
+/// could outlive the file it described with nothing in the way.
+#[test]
+fn a_sibling_handle_cannot_leave_a_stale_trusted_entry() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
+    let copy = landing(&root, &books, "Copy.epub", &old_body()).expect("copy");
+
+    assert_eq!(
+        upload_store::source_identity(&root, &FileKey::new(true, one.alias.as_str()))
+            .expect("read"),
+        Some(one.source),
+    );
+
+    // A delete that reaches the card through /BOOKS, needing no root.
+    upload_store::remove_file_reclaiming_clusters(&books, one.alias.as_str());
+
+    assert_eq!(
+        upload_store::may_share_derived_state(
+            &root,
+            &FileKey::new(true, one.alias.as_str()),
+            &FileKey::new(true, copy.alias.as_str()),
+        )
+        .expect("read"),
+        None,
+        "the first book is gone, so there is no equivalence to report",
+    );
+}
+
+/// A file that is not there matches nothing, itself included: the question is
+/// about bytes, and there are none.
+#[test]
+fn a_missing_book_matches_nothing_including_itself() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, _books) = open_dirs(&mgr);
+    let missing = FileKey::new(true, "NOSUCH.EPU");
+
+    assert_eq!(
+        upload_store::may_share_derived_state(&root, &missing, &missing).expect("read"),
+        None,
+    );
+}
+
+/// The key opens the file, so a digest answers for the book the key names.
+/// Asking about one book's key returns that book's bytes with another book
+/// sitting right beside it.
+#[test]
+fn a_digest_is_filed_against_the_file_it_came_from() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
+    let other = landing(&root, &books, "Other.epub", &new_body()).expect("other");
+
+    let key = FileKey::new(true, other.alias.as_str());
+    let digest = upload_store::source_identity(&root, &key)
+        .expect("read")
+        .expect("present");
+
+    assert_eq!(digest, other.source);
+    assert_ne!(
+        digest, one.source,
+        "asking about one book's key reads that book, with another sitting \
+         beside it holding different bytes",
+    );
+}
+
+/// Two copies of the same book may share what was derived from their
+/// contents. Two different books may not.
+#[test]
+fn identical_copies_may_share_and_different_books_may_not() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
+    let copy = landing(&root, &books, "Copy.epub", &old_body()).expect("copy");
+    let other = landing(&root, &books, "Other.epub", &new_body()).expect("other");
+
+    let key = |alias: &str| FileKey::new(true, alias);
+    assert_eq!(
+        upload_store::may_share_derived_state(
+            &root,
+            &key(one.alias.as_str()),
+            &key(copy.alias.as_str()),
+        )
+        .expect("read"),
+        Some(true),
+    );
+    assert_eq!(
+        upload_store::may_share_derived_state(
+            &root,
+            &key(one.alias.as_str()),
+            &key(other.alias.as_str()),
+        )
+        .expect("read"),
+        Some(false),
+    );
+}
+
+/// Agreeing records are not evidence that two files hold the same bytes. The
+/// fresh read in each question settles it.
+#[test]
+fn matching_records_do_not_authorize_sharing() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
+    let other = landing(&root, &books, "Other.epub", &new_body()).expect("other");
+
+    // Somebody wrote a record for the second book claiming the first's bytes,
+    // which is what a computer's delete plus an alias reuse leaves behind.
+    upload_store::record_source_identity(&root, other.alias.as_str(), &one.source);
+    let cached = upload_store::cached_source_identity(&root, other.alias.as_str())
+        .expect("the misleading record is there");
+    assert!(
+        cached.agrees_with(&one.source),
+        "the records agree, which is exactly the trap",
+    );
+
+    assert_eq!(
+        upload_store::may_share_derived_state(
+            &root,
+            &FileKey::new(true, one.alias.as_str()),
+            &FileKey::new(true, other.alias.as_str()),
+        )
+        .expect("read"),
+        Some(false),
+        "the bytes decide, not the records",
+    );
+
+    // The misleading record is still there, and still misleading. Repairing
+    // it would mean writing, and this question is answerable while the card
+    // is readable but must not be mutated.
+    let untouched =
+        upload_store::cached_source_identity(&root, other.alias.as_str()).expect("record");
+    assert!(untouched.agrees_with(&one.source));
+
+    // A caller that knows mutation is safe can repair it.
+    upload_store::record_source_identity(&root, other.alias.as_str(), &other.source);
+    let repaired =
+        upload_store::cached_source_identity(&root, other.alias.as_str()).expect("record");
+    assert!(repaired.agrees_with(&other.source));
+}
+
+/// A book that is not there is an absence, not an answer about equivalence.
+#[test]
+fn sharing_against_a_missing_book_has_no_answer() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let one = landing(&root, &books, BOOK_NAME, &old_body()).expect("one");
+
+    assert_eq!(
+        upload_store::may_share_derived_state(
+            &root,
+            &FileKey::new(true, one.alias.as_str()),
+            &FileKey::new(true, "NOSUCH.EPU"),
+        )
+        .expect("read"),
+        None,
+    );
+}
+
+/// A computed digest can be remembered, so the next question about the book
+/// avoids another full read.
+#[test]
+fn a_recorded_identity_reads_back() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
+
+    upload_store::record_source_identity(&root, landed.alias.as_str(), &landed.source);
+
+    let cached = upload_store::cached_source_identity(&root, landed.alias.as_str())
+        .expect("a record was written");
+    assert!(
+        cached.agrees_with(&landed.source),
+        "the record describes the bytes that landed",
+    );
+}
+
+/// Nothing recorded and a record this build cannot trust both mean the same
+/// thing to a caller: read the file.
+#[test]
+fn an_unreadable_record_is_an_absence() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
+
+    assert_eq!(
+        upload_store::cached_source_identity(&root, landed.alias.as_str()),
+        None,
+        "nothing has been recorded yet, and no directory for one either",
+    );
+
+    // Record one so the directories exist, then put something else entirely
+    // under the name a record would use.
+    upload_store::record_source_identity(&root, landed.alias.as_str(), &landed.source);
+    let cache_root = root.open_dir("READER").expect("cache root");
+    let labels = cache_root.open_dir("LABELS").expect("labels");
+    let stem = landed.alias.as_str().split('.').next().expect("stem");
+    let mut name = String::<12>::new();
+    name.push_str(stem).expect("stem");
+    name.push_str(".SRC").expect("ext");
+    let file = labels
+        .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
+        .expect("open over the record just written");
+    file.write(b"not a record at all").expect("write");
+    file.close().expect("close");
+
+    assert_eq!(
+        upload_store::cached_source_identity(&root, landed.alias.as_str()),
+        None,
+    );
+}
+
+/// The record goes when the book does, since a freed alias goes to whatever
+/// is written next.
+#[test]
+fn deleting_a_book_takes_its_recorded_identity_with_it() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
+    upload_store::record_source_identity(&root, landed.alias.as_str(), &landed.source);
+
+    upload_store::delete_upload_sidecars(&root, landed.alias.as_str());
+
+    assert_eq!(
+        upload_store::cached_source_identity(&root, landed.alias.as_str()),
+        None,
+    );
+}
+
+/// A replacement retires the predecessor's sidecars along with it.
+#[test]
+fn replacing_a_book_does_not_leave_the_old_record_behind() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let first = landing(&root, &books, BOOK_NAME, &old_body()).expect("first");
+    upload_store::record_source_identity(&root, first.alias.as_str(), &first.source);
+
+    let second = landing(&root, &books, BOOK_NAME, &new_body()).expect("replacement");
+    upload_store::record_source_identity(&root, second.alias.as_str(), &second.source);
+
+    let cached = upload_store::cached_source_identity(&root, second.alias.as_str())
+        .expect("a record was written");
+    assert!(cached.agrees_with(&second.source));
+    if second.alias != first.alias {
+        assert_eq!(
+            upload_store::cached_source_identity(&root, first.alias.as_str()),
+            None,
+            "the retired alias keeps no record",
+        );
+    }
+}
+
+/// A sideloaded book has an identity too, read out of it rather than
+/// accumulated while it was written.
+#[test]
+fn a_sideloaded_book_can_be_hashed_on_demand() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (_root, books) = open_dirs(&mgr);
+
+    // Written directly, the way a computer would leave it.
+    let file = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("sideloaded book");
+    file.write(&old_body()).expect("write");
+    file.close().expect("close");
+
+    let alias = holder_of(&books, BOOK_NAME).expect("shelved").alias;
+    let digest = upload_store::digest_of_file(&books, alias.as_str())
+        .expect("read")
+        .expect("the book is there");
+
+    assert_eq!(digest, proto::source::digest_of(&old_body()));
+    assert_eq!(digest.byte_len(), old_body().len() as u64);
+}
+
+/// The same file hashes the same whether its bytes arrived through the
+/// upload path or were read back off the card afterwards.
+#[test]
+fn reading_a_book_back_agrees_with_the_upload_that_wrote_it() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+
+    let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
+    let reread = upload_store::digest_of_file(&books, landed.alias.as_str())
+        .expect("read")
+        .expect("the book is there");
+
+    assert_eq!(reread, landed.source);
+}
+
+/// A name that is not there is an absence, not a failure. Callers ask about
+/// books the catalog listed, and a book can go between the listing and the
+/// question.
+#[test]
+fn hashing_a_missing_book_is_an_absence() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (_root, books) = open_dirs(&mgr);
+
+    assert!(upload_store::digest_of_file(&books, "NOSUCH.EPU")
+        .expect("read")
+        .is_none());
+}
+
+/// An empty file is a legitimate zero-length identity rather than an error,
+/// so the caller decides what an empty book means.
+#[test]
+fn an_empty_file_hashes_to_the_empty_identity() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (_root, books) = open_dirs(&mgr);
+
+    let file = books.create_file_in_dir_lfn("Empty.epub").expect("create");
+    file.close().expect("close");
+    let alias = holder_of(&books, "Empty.epub").expect("shelved").alias;
+
+    let digest = upload_store::digest_of_file(&books, alias.as_str())
+        .expect("read")
+        .expect("present");
+    assert_eq!(digest, proto::source::digest_of(&[]));
+    assert_eq!(digest.byte_len(), 0);
+}
+
+/// A replacement carries the identity of what replaced, not of what was
+/// there. The first landing's digest describes bytes no reader can reach any
+/// more.
+#[test]
+fn a_replacement_carries_the_identity_of_the_new_bytes() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+
+    let first = landing(&root, &books, BOOK_NAME, &old_body()).expect("first landed");
+    let second = landing(&root, &books, BOOK_NAME, &new_body()).expect("replacement landed");
+
+    assert_eq!(second.source, proto::source::digest_of(&new_body()));
+    assert_ne!(second.source, first.source);
+    assert_eq!(body(&books, second.alias.as_str()), new_body());
+}
+
+/// The check that decides whether an identity is published: a staged upload,
+/// a standing intent, and a destination on none of this transaction's chains.
+///
+/// Reached through `observe` rather than `install`, because `install` records
+/// whichever file holds the name at that moment as the predecessor, so a
+/// stranger arriving mid-upload is replaced rather than refused.
+#[test]
+fn a_stranger_holding_the_destination_is_not_a_landing() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(false);
+    prepare(&root, &books, &mut intent);
+
+    let intruder = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("somebody else's book");
+    intruder.write(b"not ours").expect("write");
+    intruder.close().expect("close");
+
+    let presence = install::observe(&root, &books, &intent).expect("observe");
+    assert!(
+        !presence.dest,
+        "the destination is not on the upload's chain"
+    );
+    assert!(presence.foreign, "and it belongs to somebody else");
+    assert_eq!(
+        install::plan(&intent, presence),
+        Step::Done,
+        "nothing of this transaction is off the shelf, so it gives up",
+    );
+}
+
+/// A rollback has no landing, so nothing is published and the shelf still
+/// holds the predecessor's bytes.
+#[test]
+fn a_rollback_publishes_no_identity_and_leaves_the_old_bytes() {
+    let disk = new_card();
+    let old_identity = {
+        let mgr = open_mgr(disk.clone());
+        let (root, books) = open_dirs(&mgr);
+        let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("first landed");
+        assert_eq!(landed.source, proto::source::digest_of(&old_body()));
+        landed.source
+    };
+
+    // Cut the replacement before its intent is durable: the transaction
+    // finishes, installs nothing, and reports no landing.
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    staged.write(&new_body()).expect("stream");
+    staged.abandon(&root);
+
+    let alias = holder_of(&books, BOOK_NAME).expect("still shelved").alias;
+    let on_card = body(&books, alias.as_str());
+    assert_eq!(
+        proto::source::digest_of(&on_card),
+        old_identity,
+        "the predecessor's identity still describes what the shelf holds",
+    );
+    assert_ne!(on_card, new_body(), "the replacement did not land");
+}
+
+/// The digest lives on the staged upload and dies with it, so an interrupted
+/// upload leaves nothing describing the book that is still there.
+#[test]
+fn an_interrupted_upload_attaches_no_identity_to_the_old_landing() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+    let first = landing(&root, &books, BOOK_NAME, &old_body()).expect("first landed");
+
+    // Stream the replacement, then lose the session before install runs.
+    let mut staged = StagedUpload::begin(&root, &books, BOOK_NAME, None).expect("stage");
+    staged.write(&new_body()).expect("stream");
+    drop(staged);
+
+    // Recovery has no record to replay, and the shelf is untouched.
+    assert!(recover_installs(&root, &books).complete);
+    let alias = holder_of(&books, BOOK_NAME).expect("still shelved").alias;
+    assert_eq!(alias, first.alias);
+    assert_eq!(
+        proto::source::digest_of(&body(&books, alias.as_str())),
+        first.source,
+    );
 }
 
 #[test]
