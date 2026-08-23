@@ -255,3 +255,9 @@ the working pattern.
 - **Judging text quality from emulator PNGs alone.** They are the right oracle
   for *layout* — that nothing moved — and the wrong one for *rendering*, which
   is a question about a reflective display under real light.
+
+**2026-08-22 sibling-repo sweep note.** crosspoint-reader carries an
+`upstream/feat-aa-fonts` branch (not merged into any release) targeting
+antialiased font rendering. Not reviewed in detail, but worth reading when H5
+or H7 is next revisited — it may carry device findings on the same thresholds
+and optical sizing questions this workstream owns.

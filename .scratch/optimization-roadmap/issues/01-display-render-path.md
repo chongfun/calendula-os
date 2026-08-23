@@ -375,6 +375,35 @@ for ghost accumulation).
   edge wait returning `NeverAsserted`, and the comment records the change. It
   never applied to the X3 in any case, which uses `wait_two_phase`.
 
+### A17 (S, X4 only, needs device A/B): unconditional Fast-DU `0x1C` shortcut
+
+**New 2026-08-22, surfaced from the sibling-repo cross-reference sweep.** The
+`RefreshMode::Fast` arm in `display/src/epd/ssd1677.rs:143` uses the `0x1C`
+display-update shortcut unconditionally. Upstream (crosspoint-reader) **made
+this opt-in after ghosting and blotching reports on real X4 units**. The
+neighbouring `FastClean` arm carries a "deliberately" comment explaining its
+bit choice; the `Fast` arm carries none, so the unconditional `0x1C` currently
+reads as considered when it is inherited.
+
+crosspoint-reader's implementation lives on branch
+`origin/feature/fast-du-setting` (tip `7463c78`), which makes the shortcut a
+user-configurable setting rather than a constant. The reasoning was recovered
+from a dangling `ssd1677-production-fixes` PRD (commit `bc96b25` in this
+repo's UC8179 PRD comments).
+
+- Impact: quality, not speed. The shortcut may cause ghosting or blotching on
+  some X4 panels; disabling it would use the full DU waveform, which is
+  correct but carries the same BUSY time.
+- **The one measurement:** photograph 20 consecutive Fast turns on an X4 unit
+  with `0x1C`, then repeat with the full DU command, and compare ghost
+  residue. **Kills it:** no visible difference.
+- Risk: **the owner has no X4 hardware**, so this cannot be validated here.
+  Record it and leave it for someone with an X4 to photograph.
+- Cross-reference: UC8179 PRD comments (2026-08-13 rescued PRD paragraph),
+  `origin/fix-rst-pin-hold` (`d34a733`).
+
+## Do not re-propose
+
 - Partial-window refresh (shelved twice), SPI above 40 MHz (rated ceiling),
   `MIRROR_Y=true` (tested, wrong), software work on the Full waveform (noise).
   RED prestaging itself already exists — A1 and A3 build on it.

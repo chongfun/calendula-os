@@ -211,6 +211,17 @@ after a hand-issued `CMD_POWER_OFF`, and the plateau during a page turn** —
 that resolves C2, C6, C10 and the premise underneath C4 together, in under an
 hour of bench time.
 
+**SSD1677 shutdown sequence, surfaced 2026-08-22 from sibling-repo sweep.**
+freeink-sdk `c60987a` added two changes to the SSD1677 backend our X4 builds
+ship: a **10 ms wait after SWRESET**, and a documented **FAST/`0xFC`
+`turnOff=true` shutdown path** (`0x3C=0x80`, `0x22=0x03`, `0x20`, 200 ms wait)
+with async updates deferring shutdown until refresh completion. Neither exists
+in our sleep-entry path. The SWRESET wait is cheap to try; the shutdown
+sequence is a candidate for the C2 measurement session — if the panel's
+internal charge pump is being left in a state that leaks during deep sleep,
+this is where it would show up. Record, do not implement without the
+measurement.
+
 ### C8 (M, hardware sign-off): sleep entry pays a second full-panel pass the next boot throws away
 
 **New 2026-07-30.** The X3 sleep-screen flush runs `FULL_POWERED_STEPS`. The

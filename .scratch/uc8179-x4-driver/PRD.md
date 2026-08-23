@@ -186,3 +186,32 @@ The implementation is not lost: `origin/feature/fast-du-setting` (tip
 that was dangling, which is why it is written here rather than left as a branch
 nobody would think to read. Anyone picking up X4 display work should start from
 those two branches rather than from scratch.
+
+**2026-08-22 upstream sweep (freeink `f4441d2`, window `61f0b2b..f4441d2`).**
+One commit on SDK main since the last sweep. It adds a **field-validated
+`Uc8279X4Driver`** (tested 2026-08-19) alongside the existing `Uc8179Driver`.
+Implementation details not previously recorded:
+
+- **Post-PON PSR latch:** PSR (`0x37, 0x4D`) must be written *after* `0x04 PON`
+  because PON reloads MTP defaults — a protocol difference from both UC8179 and
+  UC8279d X3.
+- **120-gate offset:** the active 480 rows start at gate 120 within the 600-gate
+  scan; rows 0..119 and 600+ are padded `0xFF`.
+- **PLL:** `0x0E` (vs X3's `0x0F`).
+- **AA waveform variants:** selects between `kXtfAa02` and `kXtfAa68` based on
+  the probed LUT_VER byte.
+- A `MurphyM4` board profile was also added: ESP32-S3R8, SSD1677, FT6336U
+  capacitive touch, dual frontlight channels, 4-bit SDMMC — a second S3
+  reference implementation alongside Sticky.
+
+All scoped out: this PRD covers UC8179 only, and the X4 Pro is a separate
+controller requiring its own PRD if it is ever targeted. The details are
+recorded here because this PRD's comment 4 already tracked the driver's
+existence and this is where someone looking for it would start.
+
+**Submodule pin check resolved:** crosspoint-reader pins freeink-sdk at
+`fa06239`, which diverged from our `f4441d2` at common ancestor `e62f6c1`.
+The delta is 6 FreeInkUI styling headers (corner radii, delete icon, capsule
+slider props). All `libs/hardware`, `libs/display`, `libs/book`, and
+`libs/network` modules are byte-identical. No driver, power, or hardware
+changes affect the baselines recorded in this PRD.
