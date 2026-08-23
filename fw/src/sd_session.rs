@@ -1,5 +1,5 @@
 use crate::display_flush::Epd;
-use crate::upload::{UploadBegin, UploadChunk, UploadName};
+use crate::upload::{UploadBegin, UploadChunk};
 use crate::{
     DISPLAY_COMMANDS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS, UPLOAD_STOPPED,
     UPLOAD_STOP_REQUESTS,
@@ -779,7 +779,7 @@ where
             removed
         } else {
             match write_one_book(root, books, &begin).await {
-                UploadWrite::Finished(name) => name.is_some(),
+                UploadWrite::Finished(landed) => landed.is_some(),
                 UploadWrite::Interrupted(exit) => return exit,
             }
         };
@@ -959,7 +959,9 @@ enum UploadSessionExit {
 }
 
 enum UploadWrite {
-    Finished(Option<UploadName>),
+    /// `Some` carries the landing: the alias the book answers to and the
+    /// identity of its bytes. A rollback or a refused install has none.
+    Finished(Option<upload_store::install::Landed>),
     Interrupted(UploadSessionExit),
 }
 
@@ -982,7 +984,7 @@ where
     // can leave a partial file on the shelf. Choosing the alias, retiring
     // whatever held the name, and surviving a reset mid-swap all belong to
     // the installer in upload-store, where the host tests exercise them.
-    let staged = match upload_store::install::StagedUpload::begin(
+    let mut staged = match upload_store::install::StagedUpload::begin(
         root,
         books,
         begin.long_name.as_str(),
@@ -1049,7 +1051,15 @@ where
     // writing is never published. From the moment the intent is durable the
     // swap completes here or at the next mount, never half way.
     match staged.install(root, books) {
-        Ok(alias) => UploadWrite::Finished(alias),
+        Ok(landed) => {
+            // Free here and expensive later: the bytes were hashed as they
+            // streamed. Best-effort and outside the transaction, so a card
+            // that will not take the record still leaves the book installed.
+            if let Some(landed) = &landed {
+                upload_store::record_source_identity(root, landed.alias.as_str(), &landed.source);
+            }
+            UploadWrite::Finished(landed)
+        }
         Err(error) => {
             // Worth naming: from the outside every one of these is the same
             // silent `ok=false`, and they call for different things — Card is
