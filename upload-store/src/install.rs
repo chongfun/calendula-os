@@ -1456,11 +1456,24 @@ where
             }
         }
         // The alias the driver derived, an artefact of the format rather than
-        // the book's name. The identity travels with it, so a caller holding a
-        // digest holds one for a book that is on the shelf.
-        Ok(holder_of_long_name(books, intent.long_name.as_str())
-            .flatten()
-            .map(|(alias, _)| Landed { alias, source }))
+        // the book's name. Checked against the chain `observe` just proved, so
+        // the digest travels with the file that was verified rather than with
+        // whatever holds the name by the time this reads it.
+        //
+        // A failed walk is an error rather than an empty answer: reporting no
+        // landing for a book that landed would lose the identity and log a
+        // success as a failure.
+        let holder =
+            holder_of_long_name(books, intent.long_name.as_str()).ok_or(InstallError::Card)?;
+        match holder {
+            Some((alias, chain)) if chain.value() == intent.stage.chain => {
+                Ok(Some(Landed { alias, source }))
+            }
+            // `observe` proved the destination was on this upload's chain a
+            // moment ago, so the name being gone or on another chain means
+            // something outside this transaction wrote to the card.
+            _ => Err(InstallError::Card),
+        }
     }
 }
 

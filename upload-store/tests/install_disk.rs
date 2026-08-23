@@ -2601,6 +2601,27 @@ fn a_stranger_holding_the_destination_is_not_a_landing() {
     );
 }
 
+/// The alias handed back is the one on the chain the install verified, so the
+/// digest describes the file that was checked rather than whatever answers to
+/// the name afterwards.
+#[test]
+fn a_landing_names_the_file_on_the_verified_chain() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let (root, books) = open_dirs(&mgr);
+
+    let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
+    let holder = holder_of(&books, BOOK_NAME).expect("shelved");
+
+    assert_eq!(landed.alias, holder.alias);
+    assert_eq!(
+        chain_of(&books, holder.alias.as_str()).first().copied(),
+        Some(holder.chain),
+        "and that alias is the chain the shelf entry points at",
+    );
+    assert_eq!(landed.source, proto::source::digest_of(&old_body()));
+}
+
 /// A rollback has no landing, so nothing is published and the shelf still
 /// holds the predecessor's bytes.
 #[test]
