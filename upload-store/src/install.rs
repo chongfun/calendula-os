@@ -1252,6 +1252,13 @@ where
     /// Accumulated over exactly the bytes that reached the file, and it goes
     /// no further than this struct until a landing publishes it. An abandoned
     /// upload drops it with everything else it staged.
+    ///
+    /// Costs 240 B of `.bss` on both boards, measured by building with this
+    /// field stubbed out: X3 247536 against 247296, X4 242736 against 242496.
+    /// It lands in static task storage rather than on a stack because
+    /// `write_one_book` holds the `StagedUpload` across its awaits. Stack
+    /// frames are unaffected, with the largest still 13.8 KB against a 24 KB
+    /// budget.
     hasher: SourceHasher,
 }
 

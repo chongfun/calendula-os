@@ -221,13 +221,18 @@ impl FileKey {
         self.in_books
     }
 
-    pub fn new(in_books: bool, alias: &str) -> Self {
+    /// `None` for a name too long to be an 8.3 alias.
+    ///
+    /// Fallible because the alternative is worse: `push_str` is all or
+    /// nothing, so a long name would silently produce an empty key, and every
+    /// long name would produce the same one.
+    pub fn new(in_books: bool, alias: &str) -> Option<Self> {
         let mut owned = heapless::String::new();
-        let _ = owned.push_str(alias);
-        Self {
+        owned.push_str(alias).ok()?;
+        Some(Self {
             in_books,
             alias: owned,
-        }
+        })
     }
 }
 
@@ -319,6 +324,20 @@ mod tests {
         assert!(!evidence.agrees_with(&digest_of(b"abd")));
         // And the only way back to a SourceDigest is to have hashed one.
         assert_eq!(evidence.sha256(), digest.sha256());
+    }
+
+    #[test]
+    fn a_key_refuses_a_name_that_is_not_an_alias() {
+        assert!(FileKey::new(true, "DUNE~1.EPU").is_some());
+        assert!(
+            FileKey::new(true, "ABCDEFGH.EPU").is_some(),
+            "a full 8.3 fits"
+        );
+        assert_eq!(
+            FileKey::new(true, "Dune.epub is a long name"),
+            None,
+            "silently emptying this would make every long name one key",
+        );
     }
 
     #[test]

@@ -2198,8 +2198,8 @@ fn an_equivalence_question_writes_nothing() {
     disk.cut_writes_from(None);
     let shared = upload_store::may_share_derived_state(
         &root,
-        &FileKey::new(true, one.alias.as_str()),
-        &FileKey::new(true, copy.alias.as_str()),
+        &FileKey::new(true, one.alias.as_str()).expect("alias fits"),
+        &FileKey::new(true, copy.alias.as_str()).expect("alias fits"),
     )
     .expect("read");
 
@@ -2225,8 +2225,11 @@ fn a_sibling_handle_cannot_leave_a_stale_trusted_entry() {
     let copy = landing(&root, &books, "Copy.epub", &old_body()).expect("copy");
 
     assert_eq!(
-        upload_store::source_identity(&root, &FileKey::new(true, one.alias.as_str()))
-            .expect("read"),
+        upload_store::source_identity(
+            &root,
+            &FileKey::new(true, one.alias.as_str()).expect("alias fits")
+        )
+        .expect("read"),
         Some(one.source),
     );
 
@@ -2236,8 +2239,8 @@ fn a_sibling_handle_cannot_leave_a_stale_trusted_entry() {
     assert_eq!(
         upload_store::may_share_derived_state(
             &root,
-            &FileKey::new(true, one.alias.as_str()),
-            &FileKey::new(true, copy.alias.as_str()),
+            &FileKey::new(true, one.alias.as_str()).expect("alias fits"),
+            &FileKey::new(true, copy.alias.as_str()).expect("alias fits"),
         )
         .expect("read"),
         None,
@@ -2252,7 +2255,7 @@ fn a_missing_book_matches_nothing_including_itself() {
     let disk = new_card();
     let mgr = open_mgr(disk.clone());
     let (root, _books) = open_dirs(&mgr);
-    let missing = FileKey::new(true, "NOSUCH.EPU");
+    let missing = FileKey::new(true, "NOSUCH.EPU").expect("alias fits");
 
     assert_eq!(
         upload_store::may_share_derived_state(&root, &missing, &missing).expect("read"),
@@ -2271,7 +2274,7 @@ fn a_digest_is_filed_against_the_file_it_came_from() {
     let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
     let other = landing(&root, &books, "Other.epub", &new_body()).expect("other");
 
-    let key = FileKey::new(true, other.alias.as_str());
+    let key = FileKey::new(true, other.alias.as_str()).expect("alias fits");
     let digest = upload_store::source_identity(&root, &key)
         .expect("read")
         .expect("present");
@@ -2295,7 +2298,7 @@ fn identical_copies_may_share_and_different_books_may_not() {
     let copy = landing(&root, &books, "Copy.epub", &old_body()).expect("copy");
     let other = landing(&root, &books, "Other.epub", &new_body()).expect("other");
 
-    let key = |alias: &str| FileKey::new(true, alias);
+    let key = |alias: &str| FileKey::new(true, alias).expect("alias fits");
     assert_eq!(
         upload_store::may_share_derived_state(
             &root,
@@ -2339,8 +2342,8 @@ fn matching_records_do_not_authorize_sharing() {
     assert_eq!(
         upload_store::may_share_derived_state(
             &root,
-            &FileKey::new(true, one.alias.as_str()),
-            &FileKey::new(true, other.alias.as_str()),
+            &FileKey::new(true, one.alias.as_str()).expect("alias fits"),
+            &FileKey::new(true, other.alias.as_str()).expect("alias fits"),
         )
         .expect("read"),
         Some(false),
@@ -2372,8 +2375,8 @@ fn sharing_against_a_missing_book_has_no_answer() {
     assert_eq!(
         upload_store::may_share_derived_state(
             &root,
-            &FileKey::new(true, one.alias.as_str()),
-            &FileKey::new(true, "NOSUCH.EPU"),
+            &FileKey::new(true, one.alias.as_str()).expect("alias fits"),
+            &FileKey::new(true, "NOSUCH.EPU").expect("alias fits"),
         )
         .expect("read"),
         None,
@@ -2468,13 +2471,11 @@ fn replacing_a_book_does_not_leave_the_old_record_behind() {
     let cached = upload_store::cached_source_identity(&root, second.alias.as_str())
         .expect("a record was written");
     assert!(cached.agrees_with(&second.source));
-    if second.alias != first.alias {
-        assert_eq!(
-            upload_store::cached_source_identity(&root, first.alias.as_str()),
-            None,
-            "the retired alias keeps no record",
-        );
-    }
+    assert_eq!(
+        second.alias, first.alias,
+        "the predecessor is retired, so its alias is derived again for the \
+         replacement",
+    );
 }
 
 /// A sideloaded book has an identity too, read out of it rather than
