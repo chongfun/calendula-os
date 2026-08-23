@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_refuses_a_name_that_is_not_an_alias() {
+    fn a_key_refuses_a_name_that_cannot_fit_an_alias() {
         assert!(FileKey::new(true, "DUNE~1.EPU").is_some());
         assert!(
             FileKey::new(true, "ABCDEFGH.EPU").is_some(),
@@ -336,8 +336,11 @@ mod tests {
         assert_eq!(
             FileKey::new(true, "Dune.epub is a long name"),
             None,
-            "silently emptying this would make every long name one key",
+            "silently emptying this would make every longer name one key",
         );
+        // Fitting is the whole check. This one is not a valid 8.3 name, is
+        // accepted here, and fails at the driver, staying distinct meanwhile.
+        assert!(FileKey::new(true, "123456789").is_some());
     }
 
     #[test]
