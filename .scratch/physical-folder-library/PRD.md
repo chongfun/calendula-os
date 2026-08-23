@@ -100,13 +100,17 @@ Do not reduce visible names to 8.3 aliases.
 
 ### R4. Paths are locators
 
-A selected book resolves to a canonical locator such as:
+A selected book resolves to a canonical locator, stored relative to the
+library root:
 
 ```text
-/BOOKS/History/Rome/SPQR.epub
+/BOOKS/History/Rome/SPQR.epub    where the book sits on the card
+History/Rome/SPQR.epub           the locator, as stored and compared
 ```
 
-That locator is passed to the library-identity layer.
+Root-relative because `/BOOKS` is a product decision that may move, and a
+locator naming it would have to be rewritten if it did. That locator is passed
+to the library-identity layer.
 
 Moving the file later updates the locator without inherently changing `BookId`.
 
