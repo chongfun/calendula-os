@@ -141,6 +141,23 @@ Define and validate:
 
 The UI may display the original long filename while internal locator representation remains normalized.
 
+**Settled in milestone 1**, since the rules turned out to have a sharp edge:
+
+- structure is normalized, spelling is preserved, and locator equality is
+  exact;
+- matching the way the card matches belongs to the resolver, which can see
+  whether a component names a long entry or a short one.
+
+Those two namespaces compare differently in the pinned driver. Long names use
+a scalar-by-scalar lowercase mapping, and short names are built with
+`to_ascii_uppercase` over ISO-8859-1 and then compared as bytes, so `Ü.EPU`
+and `ü.EPU` are two files. A single rule in the locator type would merge files
+the card keeps apart, which is a book opened in place of another. Exact
+equality risks the opposite, one file under two keys, which costs a rebuild.
+
+Locators should therefore be built from the names a scan read off the card,
+so a stored locator carries the card's own spelling.
+
 ### R7. Reads remain available during safe recovery states
 
 The existing storage owner decides whether the shelf is readable versus mutable.
