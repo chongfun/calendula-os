@@ -455,26 +455,34 @@ asks, would be guessing at the shape its consumer wants.
 Use `SourceDigest` for the first content-derived feature, preferably
 image-rendering artifacts.
 
-**Prerequisite: the trust epoch.** This milestone is where a persisted digest
-first authorizes something, so the association it needs arrives with it:
+**Prerequisite: validation before any claim of equivalence.** This milestone
+is where a persisted digest first authorizes something, so the reading it
+needs arrives with it:
 
 ```text
-trusted associations for the current epoch:
-    (physical file, SourceDigest)
-
-empty after boot, remount, or reinsertion
-
-a managed upload landing inserts its own, free
-an on-demand hash inserts its result
-a persisted record inserts nothing
-a cross-file consumer checks the association, and hashes if it is absent
+a cross-file question reads both files, in the call that asks it
+a persisted record contributes nothing to the answer
+an ordinary open asks no such question, and pays nothing
 ```
 
-That costs an ordinary open nothing, because an ordinary open asks no
-question this answers. It also makes alias reuse safe: a record left behind by
-a book a computer deleted describes a file that is gone, and revalidation
-discovers that. Sidecar cleanup cannot, since it does not run when Calendula
-is absent.
+That makes alias reuse safe: a record left behind by a book a computer deleted
+describes a file that is gone, and reading discovers that. Sidecar cleanup
+cannot, since it does not run when Calendula is absent.
+
+**A remembered table is deferred, with the reason recorded.** An epoch holding
+`(physical file, SourceDigest)` across calls would amortize several questions,
+and it is only sound while the files behind those keys cannot change. That is
+harder to guarantee than it looks: directory handles are tied to the volume
+manager rather than to a parent, so a sibling handle can delete or replace a
+file without touching the handle an epoch was built from, and this repository
+has such a mutator in `remove_file_reclaiming_clusters`.
+
+Making it structural wants one session object owning the handles and mediating
+both reads and writes, so a mutation either updates the table or ends the
+read-only phase. That is worth building when a consumer asks several
+equivalence questions at once. Until then, reading per call costs a read and
+cannot cost an answer, and a convention asking every mutator to invalidate a
+cache is not an acceptable substitute.
 
 Rendering does not wait on identity. Artifacts start under the local cache
 identity of the file that produced them, and identity adds reuse and
