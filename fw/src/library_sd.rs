@@ -829,6 +829,42 @@ where
     .flatten()
 }
 
+/// Find the catalog index of the book at an exact place on the card.
+///
+/// One streamed pass, like the identity lookups, because ruling out a second
+/// match means reading every record either way. What differs is what is
+/// being matched: a place, which is unique on a filesystem, rather than 32
+/// bits derived from one.
+fn find_in_catalog_at<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    at: BookRoot,
+    locator: &str,
+    byte_size: u32,
+) -> Option<u16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_catalog_file(root, |file, count| {
+        seek_to_record(file, 0)?;
+        let mut scan = proto::catalog::LocatorScan::new(at, locator, byte_size);
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        for index in 0..count {
+            read_exact_file(file, &mut record)?;
+            scan.offer(index, &record);
+        }
+        Ok(scan.finish())
+    })
+    .ok()
+    .flatten()
+}
+
 /// Find the catalog index of the book a pre-v8 `(path-hash, byte-size)`
 /// names, by reconstructing each record's frozen legacy identity from its
 /// stored display name. Exactly one record may answer; several is a guess
@@ -1013,13 +1049,18 @@ pub(crate) fn ensure_folder_page(
 /// Act on the Library row at `index`: enter a folder, or find the catalog row
 /// that opens a book.
 ///
-/// A book is resolved by identity rather than by position. The listing gives
-/// the locator, the root it is relative to, and the size the card holds now,
-/// and those are exactly what a catalog record's identity was derived from,
-/// so [`find_index_by_identity`] answers with the row or refuses. Position
+/// A book is resolved by where it is rather than by position in the list.
+/// The listing gives the locator, the root it is relative to, and the size
+/// the card holds now, which is exactly the place a catalog record stores,
+/// so [`find_index_by_locator`] answers with the row or refuses. Position
 /// would be cheaper and wrong: it would tie two independent walks' orderings
 /// together as a correctness requirement, and a card edited between them
 /// would open some other book.
+///
+/// By the place and not by the identity derived from it. The identity is 32
+/// bits, two legal locators at one size can collide in them, and a reader
+/// who picked a row has already said which book without any ambiguity to
+/// resolve.
 #[inline(never)]
 pub(crate) fn choose_library_row(
     epd: &mut Epd,
@@ -1048,8 +1089,7 @@ pub(crate) fn choose_library_row(
             RowChoice::Entered(listing)
         }
         Ok(reader_cache::browse::RowChoice::Book { at, locator, size }) => {
-            let hash = proto::cache::source_hash_at(at, locator.as_str(), size);
-            match find_index_by_identity(epd, sd_cs, hash, size, false) {
+            match find_index_by_locator(epd, sd_cs, at, locator.as_str(), size) {
                 Some(index) => RowChoice::Book(index),
                 None => {
                     esp_println::println!(
@@ -1276,6 +1316,29 @@ pub(crate) fn find_index_by_identity(
     .flatten()
 }
 
+/// The catalog row for a book a reader just picked out of a listing, which
+/// named its exact place.
+///
+/// Deliberately not [`find_index_by_identity`]. That lookup is for state
+/// whose only persisted identity is `(hash, size)`, and it must refuse when
+/// two records share those bits. A picked row is not ambiguous, and putting
+/// it through the identity would manufacture the ambiguity and then fail on
+/// it, leaving two perfectly good books unopenable.
+#[inline(never)]
+pub(crate) fn find_index_by_locator(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    at: BookRoot,
+    locator: &str,
+    byte_size: u32,
+) -> Option<u16> {
+    sd_session::with_root(epd, sd_cs, |root| {
+        find_in_catalog_at(root, at, locator, byte_size)
+    })
+    .ok()
+    .flatten()
+}
+
 /// Empty every book cache under CACHE2 whose book is no longer in the freshly
 /// written catalog -- the orphans left when a book is deleted (through the shelf
 /// or by pulling the card). Each cache is matched by its stored source identity,
@@ -1290,43 +1353,6 @@ pub(crate) fn find_index_by_identity(
 /// cache dir. Should the catalog outgrow the scratch (2,048 books against
 /// the 16 KB arena), the overflow falls back to the streamed per-cache
 /// lookup, keeping the sweep exact.
-/// Whether a claimed cache directory's owner still exists on the card and
-/// still keys to this directory. The file itself is asked, not the catalog:
-/// the catalog's 32-bit identities cannot tell a twin from the owner, and
-/// the sweep exists to be exact where the hashes cannot be. A book whose
-/// size changed keys elsewhere now, so its old directory reads as dead here
-/// and retires like any other.
-fn claimant_still_keys_here<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    at: BookRoot,
-    locator: &str,
-    key: &str,
-) -> bool
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let Ok(path) = proto::library_path::LibraryPath::parse(locator) else {
-        return false;
-    };
-    let size = upload_store::library::with_book_at(root, at, &path, |dir, alias| {
-        dir.open_file_in_dir(alias, Mode::ReadOnly)
-            .ok()
-            .map(|file| file.length())
-    });
-    let Ok(Some(Some(size))) = size else {
-        return false;
-    };
-    let current = proto::cache::cache_key_from(proto::cache::source_hash_at(at, locator, size));
-    current.as_str() == key
-}
-
 fn sweep_orphan_caches<
     D,
     T,
@@ -1340,38 +1366,44 @@ fn sweep_orphan_caches<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    use core::fmt::Write;
-    const SWEEP_MAX_PER_PASS: usize = 48;
     let (staged, truncated) = stage_catalog_identities(root, scratch);
-    // Collect cache-dir names up front: embedded-sdmmc forbids opening files
-    // while a directory iteration holds the lock.
-    let mut keys: heapless::Vec<String<8>, SWEEP_MAX_PER_PASS> = heapless::Vec::new();
-    if let Ok(cache_root) = root.open_dir(proto::cache::CACHE_ROOT_DIR) {
-        if let Ok(cache) = cache_root.open_dir(proto::cache::CACHE_V2_DIR) {
-            let _ = cache.iterate_dir(|entry| {
-                if !entry.attributes.is_directory() {
-                    return ControlFlow::Continue(());
-                }
-                let mut name = String::<8>::new();
-                // A name that does not fit would be truncated into a
-                // *different* key, and everything downstream -- the header
-                // read, the reclaim -- would act on whatever that names.
-                if write!(name, "{}", entry.name).is_err() {
-                    return ControlFlow::Continue(());
-                }
-                if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
-                    return ControlFlow::Continue(());
-                }
-                // A full batch is this pass's quota; the rest sweep next scan.
-                if keys.push(name).is_err() {
-                    return ControlFlow::Break(());
-                }
-                ControlFlow::Continue(())
-            });
-        }
-    }
     let mut swept = 0u32;
-    for key in &keys {
+    // The walk carries its own cursor, so a card with more caches than one
+    // batch holds still reaches all of them. It used to stop after the first
+    // batch and start from the top next scan, which meant a moved book's
+    // directory sitting past the first few dozen was reconciled on no scan
+    // at all.
+    reader_cache::files::for_each_cache_dir(root, reader_cache::files::CACHE_SWEEP_BATCH, |keys| {
+        sweep_cache_batch(root, keys, scratch, staged, truncated, &mut swept);
+    });
+    if swept > 0 {
+        esp_println::println!("cache: swept {} orphan cache(s)", swept);
+    }
+}
+
+/// One batch of cache directory names, judged and reclaimed.
+///
+/// Split out so the walk above holds only names and a cursor: this is where
+/// the file opens happen, and they cannot happen inside the iteration that
+/// produced the names.
+fn sweep_cache_batch<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    keys: &[String<8>],
+    scratch: &[u8],
+    staged: usize,
+    truncated: bool,
+    swept: &mut u32,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    for key in keys {
         // A claimed directory is judged by its exact owner, not by the
         // 32-bit identity: a full-hash twin in the catalog would vouch for
         // a departed owner's directory forever, stranding the surviving
@@ -1383,10 +1415,23 @@ fn sweep_orphan_caches<
                 root: at,
                 locator,
                 released,
+                ..
             } => {
-                let live = claimant_still_keys_here(root, at, locator.as_str(), key.as_str());
-                if live {
-                    continue;
+                match reader_cache::files::claimant_place(root, at, locator.as_str(), key.as_str())
+                {
+                    reader_cache::files::ClaimantPlace::Live => continue,
+                    // Leave the directory exactly as it is, the way an
+                    // unreadable claim does. Nothing here is evidence that
+                    // its owner went anywhere, and retiring a claim is what
+                    // ends a book's cache and gives up its place.
+                    reader_cache::files::ClaimantPlace::Unreadable => continue,
+                    // The card answered and the file is not there. This
+                    // milestone stops here: whether the book was deleted or
+                    // moved is a question about which copy a file is, and
+                    // nothing available can answer it, so the cache retires
+                    // and the position stays in its directory waiting for
+                    // the book to come back to where it was.
+                    reader_cache::files::ClaimantPlace::Gone => {}
                 }
                 // The owner is gone. Release the claim rather than delete
                 // it, so the evidence keeps naming the owner: a return
@@ -1398,7 +1443,7 @@ fn sweep_orphan_caches<
                     continue;
                 }
                 let _ = reader_cache::files::empty_cache_dir(root, key.as_str());
-                swept += 1;
+                *swept += 1;
             }
             reader_cache::files::DirClaimant::Unclaimed => {
                 // Pre-claim compatibility: judged by identity, as always. A
@@ -1425,15 +1470,12 @@ fn sweep_orphan_caches<
                 // sections forever. The delete lists the directory now, so
                 // it needs nothing from the header.
                 let _ = reader_cache::files::empty_cache_dir(root, key.as_str());
-                swept += 1;
+                *swept += 1;
             }
             // Failure to read the claim is not evidence of anything; the
             // directory keeps whatever it has until the card answers.
             reader_cache::files::DirClaimant::Fault => continue,
         }
-    }
-    if swept > 0 {
-        esp_println::println!("cache: swept {} orphan cache(s)", swept);
     }
 }
 

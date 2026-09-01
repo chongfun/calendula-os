@@ -715,6 +715,33 @@ snapshot immediately. It may show “Library unavailable” before any successfu
 cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
 
+A cache key is derived from where a book is, so tidying one into a folder on
+a computer re-keys it away from its own reading position. Recognising that as
+a move rather than a deletion is a question about *which copy* a file is, and
+the firmware has no fact that answers it. Bytes say which book: a card can
+hold two copies, and deleting the one being read leaves the other agreeing
+perfectly. The FAT chain says which cluster, and clusters are reused: delete
+a book and a file written afterwards can be handed its first cluster, so
+equality with a recorded cluster number cannot separate the file that kept it
+from the file that inherited it.
+
+So the sweep establishes locator-loss semantics and stops there. A claim
+whose locator still resolves and still keys here is live. A claim whose
+locator cannot be read is unresolved, and the directory is left exactly as it
+is, because an I/O failure is not evidence that a book departed. A claim
+whose locator is definitively gone retires: the cache is reclaimed, and the
+reading position stays in its directory, waiting for the book to come back to
+where it was.
+
+Moves therefore do not carry a reading position, and the full-file witness is
+not computed either. It could only ever narrow a search, since a digest
+identifies bytes rather than a copy, so it waits on the same thing the carry
+does: durable library identity, the record of which copy a file is, written
+before the operation rather than inferred after it. The pure parts are built and tested
+against that arrival: the candidate search, the verdict rule that refuses
+every inference available today, `carry_position`, and the version 2 claim
+that has somewhere to put evidence. None of them runs on the card.
+
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN
 /READER/CACHE2/E<hash>/TOC.BIN

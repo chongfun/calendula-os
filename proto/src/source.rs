@@ -35,7 +35,7 @@ impl SourceDigest {
     /// Private on purpose: every public way to obtain one reads bytes. Stored
     /// fields assembled into this type would be evidence wearing the shape of
     /// a fact.
-    const fn from_parts(byte_len: u64, sha256: [u8; SHA256_BYTES]) -> Self {
+    pub(crate) const fn from_parts(byte_len: u64, sha256: [u8; SHA256_BYTES]) -> Self {
         Self { byte_len, sha256 }
     }
 

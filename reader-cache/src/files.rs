@@ -273,6 +273,158 @@ where
     .map_err(|_| ClaimDenied::Fault)
 }
 
+/// Record what a copy is, beside the claim that says whose directory it is.
+///
+/// Takes a freshly hashed digest for the reason [`carry_position`] does: a
+/// writer that accepted the cached form could persist a claim about bytes
+/// nobody read.
+///
+/// Merged rather than replaced, so an absence cannot erase a fact. A witness
+/// that reads the bytes and cannot read the directory entry has a digest and
+/// no chain, and a claim written before the field existed has neither and
+/// may still learn one, so what is already held outranks what a call does
+/// not have.
+///
+/// No firmware path calls this. It is kept for the identity-authorised
+/// reconciliation that would populate a claim's evidence; on the card today
+/// claims carry none.
+pub fn record_cache_evidence<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    cluster: Option<u32>,
+    digest: Option<proto::source::SourceDigest>,
+) -> Result<(), ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let book = claim_v2_book_dir(root, owner)?;
+    // A failed read is refused rather than merged over: defaulting it to
+    // empty would let one transient fault erase the half of the evidence
+    // this call is not the one supplying.
+    let held = match read_stored_claim(&book) {
+        StoredClaim::Present { evidence, .. } => evidence,
+        StoredClaim::Absent => proto::cache::CacheEvidence::default(),
+        StoredClaim::Fault => return Err(ClaimDenied::Fault),
+    };
+    let merged = proto::cache::CacheEvidence {
+        cluster: cluster.or(held.cluster),
+        // Downgraded on the way onto the card, which is the only direction
+        // the fence allows: what comes back off a card is evidence, and what
+        // goes onto one has to have been read from the bytes.
+        digest: digest
+            .map(proto::source::CachedSourceDigest::new)
+            .or(held.digest),
+    };
+    if merged == held {
+        return Ok(());
+    }
+    write_book_dir_claim(&book, owner, false, Some(&merged)).map_err(|_| ClaimDenied::Fault)
+}
+
+/// Carry a reading position from the key a book used to have to the key it
+/// has now, on the evidence of the bytes it holds.
+///
+/// The digest is a parameter rather than a field of the evidence because it
+/// is required. A chain cannot stand in for it: the claim records a
+/// *historical* cluster, and between two sessions a computer may delete the
+/// book, free its chain, and hand that first cluster to an unrelated file of
+/// the same size. The card is consistent at every instant and the match is
+/// still wrong, so carrying a position on chain evidence alone would move a
+/// durable place onto a different book. The chain narrows candidates; only
+/// the bytes confirm one.
+///
+/// And a [`proto::source::SourceDigest`] rather than the cached form, which
+/// is the point of the parameter. The cached type is what a claim gives back:
+/// a record that survived whatever happened to the file beside it, fit for
+/// narrowing and not for concluding. Accepting it here would let a caller
+/// hand this function the departed book's own stored digest and carry a
+/// position onto a candidate nobody hashed. Every public way to hold a
+/// `SourceDigest` reads bytes, so the type carries the requirement.
+///
+/// The whole repair. The rest of the departed directory is left to whoever
+/// found it: pagination is keyed on the locator too, so a move invalidates it
+/// whatever happens here, and shuttling section files during a scan the
+/// reader is waiting on would spend that wait on artifacts that rebuild
+/// themselves.
+///
+/// The claim lands before the position does, because without a claim the
+/// position cannot be read back: one written into a directory whose claim did
+/// not land sits on the card unreachable, which is this feature's own failure
+/// mode turned inward. Nothing here deletes the old copy, so an interruption
+/// anywhere leaves the place where it was, for a later attempt to find.
+///
+/// Unreachable from the firmware. Nothing on the card may conclude that a
+/// book moved, so nothing calls this; it is kept, and exercised by tests,
+/// for the identity work that will be able to.
+///
+/// `Ok(false)` is a departed directory with no position to carry, which is
+/// most of them.
+pub fn carry_position<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    from: &proto::cache::CacheOwner<'_>,
+    to: &proto::cache::CacheOwner<'_>,
+    confirmed: proto::source::SourceDigest,
+    cluster: Option<u32>,
+) -> Result<bool, ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let evidence = &proto::cache::CacheEvidence {
+        cluster,
+        digest: Some(proto::source::CachedSourceDigest::new(confirmed)),
+    };
+    let Some((chapter, screen)) = read_position_file(root, from) else {
+        return Ok(false);
+    };
+    if from.key == to.key {
+        // The book moved and its key did not follow. Keys are 28 bits of a
+        // hash of the place, so two locators can share one, and then the
+        // place the reader left is already in the directory the moved book
+        // will use. Nothing is carried. What has to change is whose
+        // directory it is, because the claim still names a locator that is
+        // gone, and the ordinary adoption path reads a claim naming another
+        // locator as another book's and clears the positions under it.
+        //
+        // Re-attributing without going through the claim gate is the whole
+        // point: the gate would refuse, since by its reading this is a
+        // stranger. The digest is what says otherwise, and having one means
+        // somebody read these bytes and found the departed owner's witness
+        // in them.
+        let mut book = root
+            .open_dir(CACHE_ROOT_DIR)
+            .map_err(|_| ClaimDenied::Fault)?;
+        book.change_dir(CACHE_V2_DIR)
+            .map_err(|_| ClaimDenied::Fault)?;
+        book.change_dir(to.key).map_err(|_| ClaimDenied::Fault)?;
+        write_book_dir_claim(&book, to, false, Some(evidence)).map_err(|_| ClaimDenied::Fault)?;
+        return Ok(true);
+    }
+    let book = claim_v2_book_dir(root, to)?;
+    write_book_dir_claim(&book, to, false, Some(evidence)).map_err(|_| ClaimDenied::Fault)?;
+    write_two_generation(
+        &book,
+        POSITION_GENERATIONS,
+        POSITION_DURABLE_MAGIC,
+        &encode_position(chapter, screen),
+    )
+    .map_err(|_| ClaimDenied::Fault)?;
+    Ok(true)
+}
+
 /// The position files inside an open book directory.
 fn read_position_in<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
@@ -323,6 +475,405 @@ where
         // positions have their own explicit path: the legacy-key fallback,
         // whose directories no claim-aware firmware ever wrote.
         _ => None,
+    }
+}
+
+/// Cache directory names held in RAM at once. The whole listing does not
+/// fit: one name per opened book, against a frame that has room for a few
+/// dozen.
+pub const CACHE_SWEEP_BATCH: usize = 48;
+
+/// Hand a listing to `on_batch` a batch at a time, until the listing runs
+/// out.
+///
+/// The batching rule on its own, over a listing it does not know how to
+/// read, so it can be walked at any size without a card. `collect` fills the
+/// batch from a given cursor, and `survives` says whether a name the
+/// callback has seen is still in the listing.
+///
+/// The cursor counts entries that survived rather than entries handed over.
+/// A caller that removes an entry shortens the listing behind it, and
+/// counting the ones it asked about would step over whatever moved up.
+///
+/// It walks to the end rather than to a batch count. A cap on batches is a
+/// cap on how far the walk reaches, and one that resets on every call
+/// starves whatever lies past it just as surely as no cursor at all.
+///
+/// Termination does not rest on a count. Each batch either moves the cursor
+/// or shortens the listing, and both are bounded for a caller whose
+/// additions are finite. The one behaviour that defeats that is a listing
+/// that reports an entry gone while still listing it, which would hand the
+/// same names over forever; a batch that neither moved the cursor nor
+/// changed the name it starts with is that, and it stops.
+pub fn walk_in_batches(
+    batch: usize,
+    mut collect: impl FnMut(usize, usize, &mut heapless::Vec<heapless::String<8>, CACHE_SWEEP_BATCH>),
+    mut survives: impl FnMut(&str) -> bool,
+    mut on_batch: impl FnMut(&[heapless::String<8>]),
+) {
+    let batch = batch.clamp(1, CACHE_SWEEP_BATCH);
+    let mut handled = 0usize;
+    let mut previous_first: Option<heapless::String<8>> = None;
+    loop {
+        let mut keys: heapless::Vec<heapless::String<8>, CACHE_SWEEP_BATCH> = heapless::Vec::new();
+        collect(handled, batch, &mut keys);
+        if keys.is_empty() {
+            return;
+        }
+        let full = keys.len() == batch;
+        let first = keys[0].clone();
+        on_batch(&keys);
+        let before = handled;
+        handled += keys.iter().filter(|key| survives(key.as_str())).count();
+        // Neither moved on, nor moved up.
+        if handled == before && previous_first.as_ref() == Some(&first) {
+            return;
+        }
+        previous_first = Some(first);
+        if !full {
+            return;
+        }
+    }
+}
+
+/// Hand every cache directory name to `on_batch`, a batch at a time.
+///
+/// The batch size is a memory bound and not a quota. Enumeration has to
+/// restart from the top for each batch, because embedded-sdmmc forbids
+/// opening files while a directory iteration holds the lock and the caller's
+/// whole job is opening files, so the walk carries a cursor of how many
+/// names it has already handed over. Without one it would hand over the same
+/// first names for the life of the card and anything past them would be
+/// unreachable: for the sweep, that is a moved book's directory sitting
+/// unreconciled forever behind directories that are perfectly healthy.
+///
+/// The rule itself is [`walk_in_batches`]; this supplies the card. `batch`
+/// is how many names to hold at once, capped at [`CACHE_SWEEP_BATCH`], and
+/// it is a parameter so the rule can be walked at a size that makes the
+/// number of batches worth counting.
+pub fn for_each_cache_dir<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    batch: usize,
+    on_batch: impl FnMut(&[heapless::String<8>]),
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    walk_in_batches(
+        batch,
+        |skip, want, keys| {
+            let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
+                return;
+            };
+            let Ok(cache) = cache_root.open_dir(CACHE_V2_DIR) else {
+                return;
+            };
+            let mut seen = 0usize;
+            let _ = cache.iterate_dir(|entry| {
+                if !entry.attributes.is_directory() {
+                    return core::ops::ControlFlow::Continue(());
+                }
+                let mut name = heapless::String::<8>::new();
+                // A name that does not fit would be truncated into a
+                // *different* key, and everything downstream would act on
+                // whatever that names.
+                if write!(name, "{}", entry.name).is_err() {
+                    return core::ops::ControlFlow::Continue(());
+                }
+                if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
+                    return core::ops::ControlFlow::Continue(());
+                }
+                seen += 1;
+                if seen <= skip {
+                    return core::ops::ControlFlow::Continue(());
+                }
+                if keys.push(name).is_err() || keys.len() == want {
+                    return core::ops::ControlFlow::Break(());
+                }
+                core::ops::ControlFlow::Continue(())
+            });
+        },
+        |key| book_dir_exists(root, key),
+        on_batch,
+    );
+}
+
+/// Whether a book's cache directory is still on the card./// Whether a book's cache directory is still on the card.
+///
+/// For a caller walking `CACHE2` in batches: a pass that reclaims a
+/// directory shortens the listing behind it, and a cursor counting entries
+/// has to know by how much or it steps over the ones it has not reached.
+pub fn book_dir_exists<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
+        return false;
+    };
+    let Ok(cache) = cache_root.open_dir(CACHE_V2_DIR) else {
+        return false;
+    };
+    cache.open_dir(key).is_ok()
+}
+
+/// What a cache directory has to say about holding a reading position.
+///
+/// Three-valued for the reason every other read here is: a carry that reads
+/// "no position" acts by writing one, and the directory it writes into is
+/// adopted, which deletes what was already there. Absence and a card that
+/// stumbled have to be different answers, or one transient read turns a
+/// guard against destroying a place into the thing that destroys it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionPresence {
+    /// No position files. A carry may write here.
+    Absent,
+    /// Position files are there. Whether they decode is not the question:
+    /// a carry overwrites the bytes either way, so their existence is what
+    /// makes this somewhere not to write.
+    Present,
+    /// The card would not say. Not an answer, and not a licence to write.
+    Unreadable,
+}
+
+/// Whether a claimed cache directory's owner still exists on the card and
+/// still keys to this directory. The file itself is asked, not the catalog:
+/// the catalog's 32-bit identities cannot tell a twin from the owner, and
+/// the sweep exists to be exact where the hashes cannot be. A book whose
+/// size changed keys elsewhere now, so its old directory reads as dead here
+/// and retires like any other.
+pub fn claimant_place<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    at: proto::library_path::BookRoot,
+    locator: &str,
+    key: &str,
+) -> ClaimantPlace
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // A locator this build cannot parse is one it cannot ever resolve, so
+    // waiting for a better answer would keep the directory forever.
+    let Ok(path) = proto::library_path::LibraryPath::parse(locator) else {
+        return ClaimantPlace::Gone;
+    };
+    let probed = upload_store::library::with_book_at(root, at, &path, |dir, alias| {
+        match dir.open_file_in_dir(alias, Mode::ReadOnly) {
+            Ok(file) => FileProbe::Length(file.length()),
+            Err(embedded_sdmmc::Error::NotFound) => FileProbe::Absent,
+            Err(_) => FileProbe::Unreadable,
+        }
+    });
+    let size = match probed {
+        // A component of the path is missing or is not the kind of thing the
+        // locator says. The walk answered.
+        Ok(None) => return ClaimantPlace::Gone,
+        Ok(Some(FileProbe::Absent)) => return ClaimantPlace::Gone,
+        Ok(Some(FileProbe::Unreadable)) | Err(_) => return ClaimantPlace::Unreadable,
+        Ok(Some(FileProbe::Length(size))) => size,
+    };
+    let current = proto::cache::cache_key_from(proto::cache::source_hash_at(at, locator, size));
+    if current.as_str() == key {
+        ClaimantPlace::Live
+    } else {
+        // The file is there and keys elsewhere now, which is a change the
+        // card stated plainly: its size is not what it was.
+        ClaimantPlace::Gone
+    }
+}
+
+/// What one probe of a book file found.
+enum FileProbe {
+    Length(u32),
+    Absent,
+    Unreadable,
+}
+
+/// Whether a claim's owner is still where the claim says, still with the
+/// size that keys it here.
+///
+/// Three-valued for the reason the claim reads are, and this one is runtime
+/// behaviour: the answer decides whether the sweep retires a claim, which
+/// ends a book's cache and gives up the place it was keeping. A card that
+/// stumbled while opening a book sitting right there would otherwise read as
+/// a book that left, and the book would lose its cache to a bad block.
+///
+/// The distinction outlives the move reconciliation it was built beside. An
+/// I/O failure is not evidence that a book departed, whatever the caller
+/// goes on to do about a departure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimantPlace {
+    /// There, and still keying to this directory.
+    Live,
+    /// The card answered, and the book is not there or is not this
+    /// directory's any more.
+    Gone,
+    /// A read failed. Not evidence of anything.
+    Unreadable,
+}
+
+/// Whether a cache directory already holds a reading position, asked of the
+/// directory itself rather than of the claim over it.
+///
+/// The question a carry has to answer before it writes. Overwriting the
+/// position generations destroys whatever is in them, and a claim says
+/// nothing about whether they are empty: a book gets its claim when its
+/// cache is built, long before it has a place to remember, and a carry that
+/// was interrupted leaves a claim standing over generations that were never
+/// written.
+///
+/// The ordinary position read collapses a torn record and a card that
+/// stumbled into one absence, and this has to keep them apart, so it reads
+/// the generations itself. A record that answered and was not valid counts
+/// as absent: it holds no place a reader could return to, and treating it
+/// as occupied would strand a destination whose own carry tore half way.
+pub fn book_dir_position_presence<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> PositionPresence
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // Absence is stated plainly at every level, and a card holding no cache
+    // at all holds no position in it.
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return PositionPresence::Absent,
+        Err(_) => return PositionPresence::Unreadable,
+    };
+    let cache = match cache_root.open_dir(CACHE_V2_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return PositionPresence::Absent,
+        Err(_) => return PositionPresence::Unreadable,
+    };
+    let book = match cache.open_dir(key) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return PositionPresence::Absent,
+        Err(_) => return PositionPresence::Unreadable,
+    };
+    // Any generation that holds a place makes this somewhere not to write.
+    // Otherwise a card that stumbled outranks a clean absence, because the
+    // one thing this must not do is report a place that is there as gone.
+    let mut stumbled = false;
+    for name in POSITION_GENERATIONS {
+        match position_generation_presence(&book, name) {
+            PositionPresence::Present => return PositionPresence::Present,
+            PositionPresence::Unreadable => stumbled = true,
+            PositionPresence::Absent => {}
+        }
+    }
+    // The legacy single file counts: it is a place a reader left, and the
+    // carry's adoption removes it with the rest.
+    match legacy_position_presence(&book) {
+        PositionPresence::Present => return PositionPresence::Present,
+        PositionPresence::Unreadable => stumbled = true,
+        PositionPresence::Absent => {}
+    }
+    if stumbled {
+        PositionPresence::Unreadable
+    } else {
+        PositionPresence::Absent
+    }
+}
+
+/// One durable generation, answered three ways.
+///
+/// Mirrors [`read_generation_file`] rather than calling it, because that
+/// path deliberately reports only whether it came back with a record, and
+/// the whole question here is which kind of nothing it came back with.
+///
+/// A file whose length is wrong or whose checksum fails reads as `Absent`.
+/// It holds no place anybody can return to, and adoption would clear it the
+/// same way; what has to be kept apart from absence is a card that would
+/// not answer, not a record that answered and was not one.
+fn position_generation_presence<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> PositionPresence
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let total = POSITION_BYTES + DURABLE_OVERHEAD;
+    let file = match book.open_file_in_dir(name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return PositionPresence::Absent,
+        Err(_) => return PositionPresence::Unreadable,
+    };
+    if file.length() as usize != total {
+        return PositionPresence::Absent;
+    }
+    let mut bytes = [0u8; DURABLE_MAX_BYTES];
+    if read_exact_file(&file, &mut bytes[..total]).is_err() {
+        return PositionPresence::Unreadable;
+    }
+    let mut payload = [0u8; POSITION_BYTES];
+    if decode_durable_record(POSITION_DURABLE_MAGIC, &bytes[..total], &mut payload).is_some() {
+        PositionPresence::Present
+    } else {
+        PositionPresence::Absent
+    }
+}
+
+/// The pre-durable single position file, answered the same three ways.
+fn legacy_position_presence<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> PositionPresence
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = match book.open_file_in_dir(POSITION_FILE, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return PositionPresence::Absent,
+        Err(_) => return PositionPresence::Unreadable,
+    };
+    let mut bytes = [0u8; POSITION_BYTES];
+    match file.read(&mut bytes) {
+        Ok(len) if decode_position(&bytes[..len]).is_some() => PositionPresence::Present,
+        Ok(_) => PositionPresence::Absent,
+        Err(_) => PositionPresence::Unreadable,
     }
 }
 
@@ -1937,6 +2488,74 @@ where
     }
 }
 
+/// What is stored in an open directory's claim file.
+///
+/// Three-valued on purpose. A card that would not answer is not the same
+/// thing as a directory with no claim, and collapsing them into one absence
+/// is how a rewrite comes to erase the evidence it was meant to preserve: a
+/// single failed read would look exactly like a claim that had none.
+// One decoded claim beside two empty variants, so the enum is the size of a
+// locator. The same trade `DirClaimant` makes and for the same reason: one
+// instance lives briefly on a shallow frame, not in a collection.
+#[allow(clippy::large_enum_variant)]
+enum StoredClaim {
+    /// A well-formed claim, decoded.
+    Present {
+        root: proto::library_path::BookRoot,
+        locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
+        released: bool,
+        evidence: proto::cache::CacheEvidence,
+    },
+    /// No claim file, or bytes that are not a claim.
+    Absent,
+    /// The card would not answer. Evidence of nothing.
+    Fault,
+}
+
+/// Read an open directory's claim file.
+fn read_stored_claim<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> StoredClaim
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = match book.open_file_in_dir(proto::cache::CACHE_CLAIM_FILE, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return StoredClaim::Absent,
+        Err(_) => return StoredClaim::Fault,
+    };
+    let stored_len = file.length() as usize;
+    if stored_len > proto::cache::CACHE_CLAIM_MAX_BYTES {
+        return StoredClaim::Absent;
+    }
+    let mut bytes = [0u8; proto::cache::CACHE_CLAIM_MAX_BYTES];
+    if read_exact_file(&file, &mut bytes[..stored_len]).is_err() {
+        return StoredClaim::Fault;
+    }
+    match proto::cache::decode_cache_claimant(&bytes[..stored_len]) {
+        Some(claim) => {
+            let mut locator = String::new();
+            if locator.push_str(claim.locator).is_err() {
+                return StoredClaim::Absent;
+            }
+            StoredClaim::Present {
+                root: claim.root,
+                locator,
+                released: claim.released,
+                evidence: claim.evidence,
+            }
+        }
+        None => StoredClaim::Absent,
+    }
+}
+
 /// Claim an open book directory for this owner: write the claim file so
 /// every later access can prove whose directory it is.
 fn write_book_dir_claim<
@@ -1949,21 +2568,69 @@ fn write_book_dir_claim<
     book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
     released: bool,
+    evidence: Option<&proto::cache::CacheEvidence>,
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // Every other claim write is about ownership, not about what the file is,
+    // and must leave the evidence where it found it. A position write that
+    // quietly erased the chain would take a later move's only witness with it.
+    //
+    // A card that would not answer is refused rather than read as a claim
+    // with no evidence: that reading would let one transient read failure
+    // destroy the witness during the very rewrite meant to preserve it.
+    let carried;
+    let evidence = match evidence {
+        Some(evidence) => evidence,
+        None => {
+            carried = match read_stored_claim(book) {
+                StoredClaim::Present { evidence, .. } => evidence,
+                StoredClaim::Absent => proto::cache::CacheEvidence::default(),
+                StoredClaim::Fault => return Err(()),
+            };
+            &carried
+        }
+    };
     let mut bytes = [0u8; proto::cache::CACHE_CLAIM_MAX_BYTES];
-    let len = proto::cache::encode_cache_claim(owner.root, owner.locator, released, &mut bytes)
-        .ok_or(())?;
-    let file = book
-        .open_file_in_dir(
-            proto::cache::CACHE_CLAIM_FILE,
-            Mode::ReadWriteCreateOrTruncate,
-        )
-        .map_err(|_| ())?;
-    file.write(&bytes[..len]).map_err(|_| ())
+    let len =
+        proto::cache::encode_cache_claim(owner.root, owner.locator, released, evidence, &mut bytes)
+            .ok_or(())?;
+    {
+        let file = book
+            .open_file_in_dir(
+                proto::cache::CACHE_CLAIM_FILE,
+                Mode::ReadWriteCreateOrTruncate,
+            )
+            .map_err(|_| ())?;
+        file.write(&bytes[..len]).map_err(|_| ())?;
+    }
+    // Read it back, the way every other durable write here does, and compare
+    // the whole claim rather than the evidence alone. A torn claim leaves the
+    // position it gates on the card and unreadable, and evidence alone cannot
+    // see that: a release keeps its evidence identical by design, so an
+    // evidence-only check passes whether or not the released bit landed.
+    //
+    // Comparing the owner and the state is defensive rather than pinned. No
+    // fault this layer models leaves the previous claim standing intact after
+    // a write reports success, because the open truncates before the write,
+    // so the reachable failures are a torn file or an outright error. The
+    // check costs one comparison and does not depend on that staying true.
+    match read_stored_claim(book) {
+        StoredClaim::Present {
+            root,
+            locator,
+            released: stored_released,
+            evidence: stored_evidence,
+        } => (root == owner.root
+            && locator.as_str() == owner.locator
+            && stored_released == released
+            && stored_evidence == *evidence)
+            .then_some(())
+            .ok_or(()),
+        StoredClaim::Absent | StoredClaim::Fault => Err(()),
+    }
 }
 
 /// Open the book's cache directory (`READER/CACHE2/<key>`) with one handle
@@ -2046,7 +2713,7 @@ where
         // card; the owner is back. Reactivating resumes the positions the
         // claim proves are its own.
         ClaimState::MineReleased => {
-            write_book_dir_claim(&book, owner, false).map_err(|_| ClaimDenied::Fault)?;
+            write_book_dir_claim(&book, owner, false, None).map_err(|_| ClaimDenied::Fault)?;
             Ok(book)
         }
         ClaimState::OtherActive => Err(ClaimDenied::Foreign),
@@ -2058,7 +2725,7 @@ where
             if !empty_book_dir_artifacts(&book) || !remove_position_files(&book) {
                 return Err(ClaimDenied::Fault);
             }
-            write_book_dir_claim(&book, owner, false).map_err(|_| ClaimDenied::Fault)?;
+            write_book_dir_claim(&book, owner, false, None).map_err(|_| ClaimDenied::Fault)?;
             Ok(book)
         }
         // No evidence at all. Rebuildables go as before, and surviving
@@ -2069,7 +2736,7 @@ where
             if !empty_book_dir_artifacts(&book) || !remove_position_files(&book) {
                 return Err(ClaimDenied::Fault);
             }
-            write_book_dir_claim(&book, owner, false).map_err(|_| ClaimDenied::Fault)?;
+            write_book_dir_claim(&book, owner, false, None).map_err(|_| ClaimDenied::Fault)?;
             Ok(book)
         }
         // Failure to read the claim is not evidence that there is no owner.
@@ -2083,12 +2750,17 @@ where
 // answer the sweep asked for, and one instance lives briefly on a shallow
 // sweep frame, not in a collection.
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum DirClaimant {
     /// A well-formed claim; whether it was released, and who holds it.
     Claimed {
         root: proto::library_path::BookRoot,
         locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
         released: bool,
+        /// What the claim records about the physical file. Read back for the
+        /// identity-authorised reconciliation this is kept for; nothing on
+        /// the card writes it today, so it is empty in practice.
+        evidence: proto::cache::CacheEvidence,
     },
     /// No claim, or bytes that are not one: the pre-claim compatibility
     /// shape, swept by identity as before.
@@ -2141,15 +2813,16 @@ where
         return DirClaimant::Fault;
     }
     match proto::cache::decode_cache_claimant(&bytes[..stored_len]) {
-        Some((claim_root, claim_locator, released)) => {
+        Some(claim) => {
             let mut locator = String::new();
-            if locator.push_str(claim_locator).is_err() {
+            if locator.push_str(claim.locator).is_err() {
                 return DirClaimant::Unclaimed;
             }
             DirClaimant::Claimed {
-                root: claim_root,
+                root: claim.root,
                 locator,
-                released,
+                released: claim.released,
+                evidence: claim.evidence,
             }
         }
         None => DirClaimant::Unclaimed,
@@ -2178,6 +2851,7 @@ where
         root: claim_root,
         locator,
         released,
+        evidence,
     } = read_book_dir_claimant(root, key)
     else {
         return false;
@@ -2196,7 +2870,9 @@ where
         root: claim_root,
         locator: locator.as_str(),
     };
-    write_book_dir_claim(&dir, &owner, true).is_ok()
+    // Hand back the evidence already in hand rather than letting the write
+    // read it again: a second read is a second chance to lose it.
+    write_book_dir_claim(&dir, &owner, true, Some(&evidence)).is_ok()
 }
 
 /// What a directory's claim says about one expected owner, for callers

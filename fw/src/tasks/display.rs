@@ -1751,9 +1751,16 @@ fn handle_storage_command(
             let ok = if browse_epoch == sd_library.browse_epoch() {
                 match reader_cache::browse::row_book(sd_library, index) {
                     Some((at, locator, size)) => {
-                        let hash = proto::cache::source_hash_at(at, locator.as_str(), size);
-                        match crate::library_sd::find_index_by_identity(
-                            epd, sd_cs, hash, size, false,
+                        // By the place the row named, for the same reason the
+                        // open does: the identity derived from it is 32 bits
+                        // and can collide, and clearing nothing is the mild
+                        // end of that.
+                        match crate::library_sd::find_index_by_locator(
+                            epd,
+                            sd_cs,
+                            at,
+                            locator.as_str(),
+                            size,
                         ) {
                             Some(row) => book_build::clear_book_cache(epd, sd_cs, sd_library, row),
                             None => false,

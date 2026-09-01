@@ -328,6 +328,218 @@ impl IdentityScan {
     }
 }
 
+/// Which catalogued row holds the book at an exact place.
+///
+/// For a caller that has a locator, which is every caller acting on a row a
+/// reader just picked out of a listing. [`IdentityScan`] is for the other
+/// case, where the only thing that was persisted is a 32-bit identity.
+///
+/// The distinction is not stylistic. That identity is a lossy projection of
+/// this locator, and two legal locators at one size can share it, so
+/// resolving a live row through it turns an unambiguous choice into a
+/// refusal and makes both books unopenable. Reaching for the identity when
+/// the locator is in hand is throwing away the answer and then failing to
+/// guess it.
+///
+/// The size is matched too, and it is the listing's live size rather than
+/// anything remembered. A record whose size disagrees with the card is a
+/// record written before the file was replaced, and it would open the old
+/// book's metadata over the new book's bytes.
+pub struct LocatorScan<'a> {
+    root: BookRoot,
+    locator: &'a str,
+    byte_size: u32,
+    found: Option<u16>,
+    matches: usize,
+}
+
+impl<'a> LocatorScan<'a> {
+    pub fn new(root: BookRoot, locator: &'a str, byte_size: u32) -> Self {
+        Self {
+            root,
+            locator,
+            byte_size,
+            found: None,
+            matches: 0,
+        }
+    }
+
+    pub fn offer(&mut self, index: u16, record: &[u8; CATALOG_RECORD_BYTES]) {
+        if u32::from_le_bytes([record[4], record[5], record[6], record[7]]) != self.byte_size {
+            return;
+        }
+        if book_root(record[0]) != Some(self.root) {
+            return;
+        }
+        let stored = fixed_str(
+            &record[CATALOG_RECORD_PATH_OFFSET..CATALOG_RECORD_PATH_OFFSET + CATALOG_PATH_BYTES],
+        );
+        if stored != self.locator {
+            return;
+        }
+        self.matches += 1;
+        if self.found.is_none() {
+            self.found = Some(index);
+        }
+    }
+
+    /// Exactly one row, or nothing. A walk of a filesystem cannot produce
+    /// one path twice, so two matches mean a catalog this has no model for,
+    /// and refusing is what the rest of this module does when it stops
+    /// understanding what it is reading.
+    pub fn finish(self) -> Option<u16> {
+        (self.matches == 1).then_some(self.found).flatten()
+    }
+}
+
+/// Whether a candidate sits on the chain the departed claim recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainMatch {
+    /// The same first cluster. On this filesystem a move within one volume
+    /// rewrites directory entries and leaves the chain alone, so this is the
+    /// same physical file under a new name.
+    Same,
+    /// A different chain, or a claim that recorded none. Whatever holds
+    /// these bytes, it is not the file the claim was watching.
+    Different,
+    /// The card would not say.
+    Unknown,
+}
+
+/// What a finished move search concludes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveVerdict {
+    /// This row is the departed copy under a new name.
+    Moved(u16),
+    /// Nothing on the card is this copy.
+    Gone,
+    /// The card holds an answer this cannot read as one book.
+    Undecided,
+}
+
+/// Decide from the rows whose bytes agreed with the witness.
+///
+/// Nothing here concludes that a book moved, and that is the finding rather
+/// than an oversight. A move is a claim about *which copy* a file is, and
+/// every fact this branch can reach speaks about content or about the
+/// filesystem's bookkeeping instead.
+///
+/// Bytes say which book. One copy of them existing now is not evidence that
+/// it is the copy the reader was in: delete a book that had a twin and
+/// exactly one row agrees, and that row has been sitting there the whole
+/// time with a reading life of its own.
+///
+/// The chain says which cluster, and a cluster number is reused. Delete the
+/// book and the chain is freed; a file written afterwards can be handed the
+/// same first cluster, and if it holds the same book's bytes it matches the
+/// claim in both respects while being a file that did not exist when the
+/// claim was written. Equality with a recorded cluster number cannot
+/// distinguish the file that kept it from the file that inherited it,
+/// because a freed cluster carries no record of who held it before.
+///
+/// So the chain is refusal-only. It is consulted after the bytes have picked
+/// out a single row, which stops it selecting between two agreeing rows, and
+/// even then it authorises nothing. What it still does is keep an unreadable
+/// answer apart from an answer: a card that would not say leaves the claim
+/// standing, and a card that answered lets it go.
+///
+/// The missing fact is a durable record of which copy is which, written
+/// before the operation rather than inferred after it. That is the opaque
+/// book identity the Library Identity work owns. Until it exists the answer
+/// for a departed book is that it is gone: its place stays in its old
+/// directory, waiting for the book to come back to where it was, rather than
+/// moving onto a file that cannot be shown to be the same one.
+pub fn move_verdict(agreements: &[(u16, ChainMatch)]) -> MoveVerdict {
+    match agreements {
+        [] => MoveVerdict::Gone,
+        // A chain that matches is a chain that may have been recycled, so
+        // this is the same answer as a chain that does not.
+        [(_, ChainMatch::Same)] | [(_, ChainMatch::Different)] => MoveVerdict::Gone,
+        [(_, ChainMatch::Unknown)] => MoveVerdict::Undecided,
+        _ => MoveVerdict::Undecided,
+    }
+}
+
+/// The most same-size books one search will read through before it gives up
+/// on telling them apart. A card holding more copies than this of one book
+/// refuses rather than reading all of them.
+pub const MOVE_CANDIDATES_MAX: usize = 4;
+
+/// Which catalogued rows could be the departed book, gathered across the
+/// whole catalog rather than settled by the first row that looks right.
+///
+/// Constructed from the witness the departed claim recorded, because the
+/// bytes are what authorises a move and a search without them has no
+/// conclusion to reach. The length comes from the witness for the same
+/// reason: it is the one cheap filter that comes free with the evidence.
+///
+/// It gathers rather than chooses, and the caller reads the bytes of every
+/// row it hands back. That is the whole of the rule, and it is deliberately
+/// less clever than it could be. A claim also records the chain the book
+/// occupied, and a chain looks like it could separate two byte-identical
+/// copies, which a digest cannot. It cannot be trusted to: between two
+/// sessions a computer may delete the book, free that chain, and hand its
+/// first cluster to a file created afterwards. Letting the chain rule other
+/// rows out means the bytes are then read from the one row the chain chose,
+/// and agreeing bytes prove only that the file is a copy, not that it is the
+/// copy whose place is being carried. So a recycled chain could hand a
+/// reader's position to an unrelated duplicate, which is the one outcome
+/// this layer exists to prevent.
+///
+/// Exactly one row whose bytes agree, or nothing. Two are two books that
+/// cannot be told apart, and losing the continuity of a move is the better
+/// half of that trade.
+pub struct MoveSearch {
+    want_bytes: u64,
+    found: heapless::Vec<u16, MOVE_CANDIDATES_MAX>,
+    seen: usize,
+}
+
+impl MoveSearch {
+    pub fn new(witness: &crate::source::CachedSourceDigest) -> Self {
+        Self {
+            want_bytes: witness.byte_len(),
+            found: heapless::Vec::new(),
+            seen: 0,
+        }
+    }
+
+    /// Offer one catalogued row the caller has already established is
+    /// neither the departed book itself nor a directory holding a place of
+    /// its own.
+    pub fn offer(&mut self, index: u16, byte_size: u32) {
+        if u64::from(byte_size) != self.want_bytes {
+            return;
+        }
+        self.seen += 1;
+        let _ = self.found.push(index);
+    }
+
+    /// The rows to read bytes from.
+    ///
+    /// Two answers rather than a list and an absence, because declining to
+    /// look is not the same fact as having looked and found nothing, and the
+    /// caller retires a reader's place on the second one.
+    pub fn finish(self) -> MoveCandidates {
+        if self.seen > MOVE_CANDIDATES_MAX {
+            MoveCandidates::TooMany
+        } else {
+            MoveCandidates::Rows(self.found)
+        }
+    }
+}
+
+/// What a [`MoveSearch`] has to say when it is done.
+pub enum MoveCandidates {
+    /// Every row of the witnessed length, to be read in turn. Empty means
+    /// the card holds no book of that length, which is a book that is gone.
+    Rows(heapless::Vec<u16, MOVE_CANDIDATES_MAX>),
+    /// More rows of that length than this will read through. It has looked
+    /// at none of their bytes, so it knows nothing about where the book is,
+    /// and in particular has not established that it left.
+    TooMany,
+}
+
 /// Resolves a pre-v8 saved identity against v8 records, offered one at a
 /// time in catalog order.
 ///
@@ -489,6 +701,328 @@ fn fixed_str(bytes: &[u8]) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two collision fixtures, as catalog records. Same size, same
+    /// 32-bit identity, different places on the card.
+    fn colliding_twins() -> (u32, [u8; CATALOG_RECORD_BYTES], [u8; CATALOG_RECORD_BYTES]) {
+        let size = 1_234_567;
+        let a = "Fiction/zIx6RBhQEK.epub";
+        let b = "Fiction/nTfOyBwYzX.epub";
+        let hash = crate::cache::source_hash_at(BookRoot::Library, a, size);
+        assert_eq!(
+            hash,
+            crate::cache::source_hash_at(BookRoot::Library, b, size),
+            "the collision these fixtures exist for"
+        );
+        let mut twin_a = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(&mut twin_a, "a", BookRoot::Library, a, "", "", size, hash);
+        let mut twin_b = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(&mut twin_b, "b", BookRoot::Library, b, "", "", size, hash);
+        (size, twin_a, twin_b)
+    }
+
+    /// The two lookups answer differently on purpose, and this is the case
+    /// that separates them. Restoring a saved identity has only 32 bits and
+    /// a size, so with both books on the card it has to refuse. A reader who
+    /// picked one of them out of a folder listing named it exactly, and
+    /// there is nothing to be ambiguous about.
+    #[test]
+    fn a_picked_row_resolves_where_a_saved_identity_has_to_refuse() {
+        let (size, twin_a, twin_b) = colliding_twins();
+        let hash = catalog_record_identity(&twin_a).0;
+
+        let mut saved = IdentityScan::new(hash, size);
+        saved.offer(0, &twin_a);
+        saved.offer(1, &twin_b);
+        assert_eq!(saved.finish(), None, "32 bits cannot choose between them");
+
+        for (index, locator) in [
+            (0, "Fiction/zIx6RBhQEK.epub"),
+            (1, "Fiction/nTfOyBwYzX.epub"),
+        ] {
+            let mut picked = LocatorScan::new(BookRoot::Library, locator, size);
+            picked.offer(0, &twin_a);
+            picked.offer(1, &twin_b);
+            assert_eq!(picked.finish(), Some(index), "{locator} opens its own row");
+        }
+    }
+
+    /// The root is part of the place. Two cards' worth of books can carry the
+    /// same relative locator, and the shelf copy is not the card-root one.
+    #[test]
+    fn the_same_locator_under_another_root_is_another_book() {
+        let mut shelved = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut shelved,
+            "d",
+            BookRoot::Library,
+            "Dune.epub",
+            "",
+            "",
+            40,
+            7,
+        );
+        let mut loose = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut loose,
+            "d",
+            BookRoot::CardRoot,
+            "Dune.epub",
+            "",
+            "",
+            40,
+            9,
+        );
+
+        let mut scan = LocatorScan::new(BookRoot::CardRoot, "Dune.epub", 40);
+        scan.offer(0, &shelved);
+        scan.offer(1, &loose);
+        assert_eq!(scan.finish(), Some(1));
+    }
+
+    /// A record written before the file was replaced names the right place
+    /// and the wrong book, so the live size refuses it rather than opening
+    /// the old book's metadata over the new book's bytes.
+    #[test]
+    fn a_record_stale_about_the_size_does_not_answer_for_the_file_there_now() {
+        let mut stale = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut stale,
+            "d",
+            BookRoot::Library,
+            "Dune.epub",
+            "",
+            "",
+            40,
+            7,
+        );
+
+        let mut scan = LocatorScan::new(BookRoot::Library, "Dune.epub", 41);
+        scan.offer(0, &stale);
+        assert_eq!(scan.finish(), None);
+    }
+
+    /// A walk of a filesystem cannot produce one path twice, so a catalog
+    /// that names a place twice is one this code has no model for. It
+    /// refuses rather than opening whichever record it happened to read
+    /// first, which is the same answer the identity lookups give when they
+    /// stop being able to tell two records apart.
+    #[test]
+    fn a_catalog_naming_one_place_twice_refuses() {
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut record,
+            "d",
+            BookRoot::Library,
+            "Dune.epub",
+            "",
+            "",
+            40,
+            7,
+        );
+
+        let mut scan = LocatorScan::new(BookRoot::Library, "Dune.epub", 40);
+        scan.offer(0, &record);
+        scan.offer(1, &record);
+        assert_eq!(scan.finish(), None);
+    }
+
+    /// A locator that is a prefix of a catalogued one is a different place.
+    /// The stored field is fixed width and zero padded, so a comparison that
+    /// read the whole field rather than its text would match nothing, and one
+    /// that stopped at the shorter length would match too much.
+    #[test]
+    fn a_locator_that_merely_starts_the_same_is_not_a_match() {
+        let mut nested = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut nested,
+            "d",
+            BookRoot::Library,
+            "Fiction/Dune.epub",
+            "",
+            "",
+            40,
+            7,
+        );
+
+        for probe in ["Fiction/Dune", "Fiction/Dune.epub2", "Fiction"] {
+            let mut scan = LocatorScan::new(BookRoot::Library, probe, 40);
+            scan.offer(0, &nested);
+            assert_eq!(scan.finish(), None, "{probe} is not the nested book");
+        }
+
+        let mut exact = LocatorScan::new(BookRoot::Library, "Fiction/Dune.epub", 40);
+        exact.offer(0, &nested);
+        assert_eq!(exact.finish(), Some(0));
+    }
+
+    /// A digest of real bytes, since that is the only way to hold one.
+    fn witness(bytes: &[u8], repeat: usize) -> crate::source::CachedSourceDigest {
+        let mut hasher = crate::source::SourceHasher::new();
+        for _ in 0..repeat {
+            hasher.update(bytes);
+        }
+        crate::source::CachedSourceDigest::new(hasher.finish())
+    }
+
+    /// A reader is in A, an identical B sits on the card untouched, and A is
+    /// deleted. Exactly one row now holds those bytes, and it is a book with
+    /// a reading life of its own that was there the whole time. Bytes say
+    /// which book, not which copy.
+    #[test]
+    fn a_lone_twin_does_not_inherit_a_deleted_books_place() {
+        assert_eq!(
+            move_verdict(&[(7, ChainMatch::Different)]),
+            MoveVerdict::Gone,
+            "the twin keeps its own reading life",
+        );
+    }
+
+    /// And the recorded chain does not rescue it. Delete the book, and the
+    /// cluster it held is free for the next file; a copy of the same book
+    /// written afterwards can be handed it, and then it matches the claim on
+    /// bytes and on chain while being a file that did not exist when the
+    /// claim was written. A freed cluster carries no record of who held it,
+    /// so equality with the recorded number proves nothing about which copy
+    /// this is.
+    #[test]
+    fn a_recycled_chain_cannot_authorise_a_carry_either() {
+        assert_eq!(
+            move_verdict(&[(7, ChainMatch::Same)]),
+            MoveVerdict::Gone,
+            "a matching cluster number is not a matching copy",
+        );
+    }
+
+    /// Which leaves nothing that says a book moved. That is the shape of the
+    /// milestone without a durable per-copy identity, and it is pinned so
+    /// the conclusion cannot drift back in one branch at a time.
+    #[test]
+    fn no_arrangement_of_evidence_concludes_a_move() {
+        for chain in [ChainMatch::Same, ChainMatch::Different, ChainMatch::Unknown] {
+            assert!(
+                !matches!(move_verdict(&[(1, chain)]), MoveVerdict::Moved(_)),
+                "{chain:?} authorised a carry",
+            );
+            for other in [ChainMatch::Same, ChainMatch::Different, ChainMatch::Unknown] {
+                assert!(
+                    !matches!(
+                        move_verdict(&[(1, chain), (2, other)]),
+                        MoveVerdict::Moved(_)
+                    ),
+                    "{chain:?} beside {other:?} authorised a carry",
+                );
+            }
+        }
+    }
+
+    /// Two rows holding the bytes is undecided before the chain is consulted
+    /// at all, which is what stops a freed chain handed to a newer file from
+    /// selecting that file over the real continuation.
+    #[test]
+    fn the_chain_is_asked_last_and_can_only_refuse() {
+        assert_eq!(
+            move_verdict(&[(3, ChainMatch::Same), (9, ChainMatch::Different)]),
+            MoveVerdict::Undecided,
+            "a chain match does not break a tie the bytes could not break",
+        );
+        assert_eq!(
+            move_verdict(&[(3, ChainMatch::Different), (9, ChainMatch::Different)]),
+            MoveVerdict::Undecided
+        );
+    }
+
+    /// A card that would not say which chain a row sits on has not said the
+    /// book left, so the claim stays for the next scan.
+    #[test]
+    fn an_unreadable_chain_leaves_the_question_open() {
+        assert_eq!(
+            move_verdict(&[(7, ChainMatch::Unknown)]),
+            MoveVerdict::Undecided
+        );
+    }
+
+    /// Nothing holds the bytes, so nothing on the card is this copy.
+    #[test]
+    fn no_agreement_is_a_book_that_is_gone() {
+        assert_eq!(move_verdict(&[]), MoveVerdict::Gone);
+    }
+
+    /// Two rows of the length the witness records are two books that have to
+    /// be read before either can be chosen, and the chain the claim recorded
+    /// is not allowed to break the tie. A computer can delete the book, free
+    /// that chain, and hand it to a file created afterwards, and then the row
+    /// the chain points at is a stranger whose bytes agree for the ordinary
+    /// reason that it is another copy of the same book. Ruling the others out
+    /// on it would carry a reader's place to that stranger.
+    #[test]
+    fn every_row_of_the_length_is_gathered_for_the_bytes_to_judge() {
+        let w = witness(b"x", 8);
+        let mut search = MoveSearch::new(&w);
+        search.offer(3, 8);
+        search.offer(9, 8);
+        let MoveCandidates::Rows(rows) = search.finish() else {
+            panic!("within the cap")
+        };
+        assert_eq!(
+            rows.as_slice(),
+            &[3, 9],
+            "both are read; neither is ruled out unread"
+        );
+    }
+
+    /// More copies than the search will read through. It cannot show that
+    /// only one of them is this book without reading all of them, so it
+    /// declines rather than reading an unbounded number or choosing early.
+    #[test]
+    fn more_copies_than_it_will_read_is_a_refusal() {
+        let w = witness(b"x", 8);
+        let mut search = MoveSearch::new(&w);
+        for index in 0..=MOVE_CANDIDATES_MAX as u16 {
+            search.offer(index, 8);
+        }
+        assert!(matches!(search.finish(), MoveCandidates::TooMany));
+
+        let mut just_fits = MoveSearch::new(&w);
+        for index in 0..MOVE_CANDIDATES_MAX as u16 {
+            just_fits.offer(index, 8);
+        }
+        let MoveCandidates::Rows(rows) = just_fits.finish() else {
+            panic!("exactly the cap is not too many")
+        };
+        assert_eq!(rows.len(), 4);
+    }
+
+    /// The length comes from the witness, and it is the only filter, so a row
+    /// of another size is not gathered and every row of that size is.
+    #[test]
+    fn only_rows_of_the_witnessed_length_are_gathered() {
+        let w = witness(b"x", 8);
+        let mut search = MoveSearch::new(&w);
+        search.offer(1, 9);
+        let MoveCandidates::Rows(none) = search.finish() else {
+            panic!("within the cap")
+        };
+        assert!(none.is_empty());
+
+        let mut right = MoveSearch::new(&w);
+        right.offer(1, 8);
+        let MoveCandidates::Rows(one) = right.finish() else {
+            panic!("within the cap")
+        };
+        assert_eq!(one.as_slice(), &[1]);
+    }
+
+    /// Nothing offered is nothing found. A departed book is usually a
+    /// deleted book.
+    #[test]
+    fn an_empty_search_finds_nothing() {
+        let w = witness(b"x", 8);
+        let MoveCandidates::Rows(rows) = MoveSearch::new(&w).finish() else {
+            panic!("nothing offered is not too many")
+        };
+        assert!(rows.is_empty());
+    }
 
     /// The count is where a library too large for the format has to stop.
     /// Clamping here would publish the first 65,535 books as the whole set,

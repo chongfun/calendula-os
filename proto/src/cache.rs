@@ -708,13 +708,24 @@ pub struct CacheOwner<'a> {
 pub const CACHE_CLAIM_FILE: &str = "WHO.BIN";
 
 const CLAIM_MAGIC: [u8; 4] = *b"X4WH";
-const CLAIM_VERSION: u8 = 1;
+/// The claim as first written: who owns this directory, and nothing about
+/// which physical file that owner is. Still read, so a card written by an
+/// older build keeps its caches and its positions.
+const CLAIM_VERSION_NAMED: u8 = 1;
+/// Adds room for evidence about the file itself. A locator says where a book
+/// was, which is exactly what a move invalidates, so the record has space for
+/// the chain it occupies and the bytes it holds. Nothing on the card writes
+/// either today; the room is here for the identity work that will.
+const CLAIM_VERSION: u8 = 2;
 const CLAIM_ACTIVE: u8 = 1;
 const CLAIM_RELEASED: u8 = 2;
 const CLAIM_HEADER: usize = 4 + 1 + 1 + 1 + 2;
+/// first cluster + digest-present flag + byte length + sha256.
+const CLAIM_EVIDENCE: usize = 4 + 1 + 8 + crate::source::SHA256_BYTES;
 /// magic + version + state + root byte + locator length + locator +
-/// checksum.
-pub const CACHE_CLAIM_MAX_BYTES: usize = CLAIM_HEADER + crate::library_path::MAX_PATH_BYTES + 4;
+/// evidence + checksum.
+pub const CACHE_CLAIM_MAX_BYTES: usize =
+    CLAIM_HEADER + crate::library_path::MAX_PATH_BYTES + CLAIM_EVIDENCE + 4;
 
 /// What a directory's stored claim says about one owner. The claim has a
 /// lifecycle, not just a name: ownership evidence must live exactly as long
@@ -741,12 +752,33 @@ pub enum CacheClaimReading {
     Invalid,
 }
 
+/// What a claim records about the physical file its owner names, beyond
+/// where that file was.
+///
+/// Two halves that answer different questions, and neither answers the one a
+/// move turns on. The digest says *what bytes it held*, which identifies a
+/// book and not a copy of it: a card can hold the same bytes twice. The
+/// chain says *which cluster it started at*, which a rename leaves alone but
+/// a deletion frees, so a file written afterwards can be handed the same
+/// number and equality with it proves nothing about which copy this is.
+///
+/// So both narrow and neither concludes, which is why nothing on the card
+/// acts on them. Either may also be absent: a claim written before this
+/// field existed has neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheEvidence {
+    /// The FAT first cluster of the file when the claim was written.
+    pub cluster: Option<u32>,
+    pub digest: Option<crate::source::CachedSourceDigest>,
+}
+
 /// Encode the claim for one book. `None` when the locator does not fit,
 /// which a legal [`crate::library_path::LibraryPath`] cannot reach.
 pub fn encode_cache_claim(
     root: crate::library_path::BookRoot,
     locator: &str,
     released: bool,
+    evidence: &CacheEvidence,
     out: &mut [u8; CACHE_CLAIM_MAX_BYTES],
 ) -> Option<usize> {
     if locator.len() > crate::library_path::MAX_PATH_BYTES {
@@ -763,7 +795,19 @@ pub fn encode_cache_claim(
     let len = locator.len();
     out[7..9].copy_from_slice(&(len as u16).to_le_bytes());
     out[9..9 + len].copy_from_slice(locator.as_bytes());
-    let body = CLAIM_HEADER + len;
+    let at = CLAIM_HEADER + len;
+    // Cluster zero is the FAT's own "no chain", so it doubles as "not
+    // recorded" without a second flag to keep in step with it.
+    out[at..at + 4].copy_from_slice(&evidence.cluster.unwrap_or(0).to_le_bytes());
+    match &evidence.digest {
+        Some(digest) => {
+            out[at + 4] = 1;
+            out[at + 5..at + 13].copy_from_slice(&digest.byte_len().to_le_bytes());
+            out[at + 13..at + 13 + crate::source::SHA256_BYTES].copy_from_slice(digest.sha256());
+        }
+        None => out[at + 4..at + CLAIM_EVIDENCE].fill(0),
+    }
+    let body = at + CLAIM_EVIDENCE;
     let mut hash = 0x811c_9dc5u32;
     for byte in &out[..body] {
         hash ^= *byte as u32;
@@ -773,13 +817,31 @@ pub fn encode_cache_claim(
     Some(body + 4)
 }
 
+/// One decoded claim: who owns the directory, and what is known about the
+/// physical file that owner named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheClaimant<'a> {
+    pub root: crate::library_path::BookRoot,
+    pub locator: &'a str,
+    pub released: bool,
+    pub evidence: CacheEvidence,
+}
+
 /// The book a well-formed stored claim names, its locator borrowed from the
-/// stored bytes, and whether the claim was released. `None` for anything
-/// that is not a claim.
-pub fn decode_cache_claimant(stored: &[u8]) -> Option<(crate::library_path::BookRoot, &str, bool)> {
-    if stored.len() < CLAIM_HEADER + 4 || stored[..4] != CLAIM_MAGIC || stored[4] != CLAIM_VERSION {
+/// stored bytes. `None` for anything that is not a claim.
+///
+/// A version 1 claim decodes with empty evidence rather than failing: it is a
+/// well-formed statement of ownership, which is all it ever claimed to be,
+/// and refusing it would cost a reader the position it protects.
+pub fn decode_cache_claimant(stored: &[u8]) -> Option<CacheClaimant<'_>> {
+    if stored.len() < CLAIM_HEADER + 4 || stored[..4] != CLAIM_MAGIC {
         return None;
     }
+    let evidence_bytes = match stored[4] {
+        CLAIM_VERSION_NAMED => 0,
+        CLAIM_VERSION => CLAIM_EVIDENCE,
+        _ => return None,
+    };
     let released = match stored[5] {
         CLAIM_ACTIVE => false,
         CLAIM_RELEASED => true,
@@ -791,10 +853,12 @@ pub fn decode_cache_claimant(stored: &[u8]) -> Option<(crate::library_path::Book
         _ => return None,
     };
     let len = u16::from_le_bytes([stored[7], stored[8]]) as usize;
-    if len > crate::library_path::MAX_PATH_BYTES || stored.len() != CLAIM_HEADER + len + 4 {
+    if len > crate::library_path::MAX_PATH_BYTES
+        || stored.len() != CLAIM_HEADER + len + evidence_bytes + 4
+    {
         return None;
     }
-    let body = CLAIM_HEADER + len;
+    let body = CLAIM_HEADER + len + evidence_bytes;
     let mut hash = 0x811c_9dc5u32;
     for byte in &stored[..body] {
         hash ^= *byte as u32;
@@ -804,7 +868,34 @@ pub fn decode_cache_claimant(stored: &[u8]) -> Option<(crate::library_path::Book
         return None;
     }
     let locator = core::str::from_utf8(&stored[CLAIM_HEADER..CLAIM_HEADER + len]).ok()?;
-    Some((root, locator, released))
+    let evidence = if evidence_bytes == 0 {
+        CacheEvidence::default()
+    } else {
+        let at = CLAIM_HEADER + len;
+        let cluster = u32::from_le_bytes(stored[at..at + 4].try_into().ok()?);
+        let digest = if stored[at + 4] == 1 {
+            let byte_len = u64::from_le_bytes(stored[at + 5..at + 13].try_into().ok()?);
+            let sha256: [u8; crate::source::SHA256_BYTES] = stored
+                [at + 13..at + 13 + crate::source::SHA256_BYTES]
+                .try_into()
+                .ok()?;
+            Some(crate::source::CachedSourceDigest::new(
+                crate::source::SourceDigest::from_parts(byte_len, sha256),
+            ))
+        } else {
+            None
+        };
+        CacheEvidence {
+            cluster: (cluster != 0).then_some(cluster),
+            digest,
+        }
+    };
+    Some(CacheClaimant {
+        root,
+        locator,
+        released,
+        evidence,
+    })
 }
 
 /// Classify stored claim bytes against one owner.
@@ -814,9 +905,9 @@ pub fn read_cache_claim(
     locator: &str,
 ) -> CacheClaimReading {
     match decode_cache_claimant(stored) {
-        Some((stored_root, stored_locator, released)) => {
-            let mine = stored_root == root && stored_locator == locator;
-            match (mine, released) {
+        Some(claim) => {
+            let mine = claim.root == root && claim.locator == locator;
+            match (mine, claim.released) {
                 (true, false) => CacheClaimReading::MineActive,
                 (true, true) => CacheClaimReading::MineReleased,
                 (false, false) => CacheClaimReading::OtherActive,
@@ -2151,6 +2242,109 @@ mod tests {
 
     /// The claim names exactly one book across its whole lifecycle: the
     /// same locator under the same root matches whether active or released,
+    /// The evidence a move is recognised by survives a round trip, and a
+    /// claim written before it existed still reads as the statement of
+    /// ownership it always was. Refusing a version 1 claim would cost its
+    /// owner the position it protects, over a field that claim never
+    /// promised.
+    #[test]
+    fn a_claim_carries_its_move_evidence_and_still_reads_one_without_any() {
+        use crate::library_path::BookRoot;
+        use crate::source::{CachedSourceDigest, SourceDigest};
+
+        let digest = CachedSourceDigest::new(SourceDigest::from_parts(50_033, [7u8; 32]));
+        let evidence = CacheEvidence {
+            cluster: Some(4_211),
+            digest: Some(digest),
+        };
+        let mut bytes = [0u8; CACHE_CLAIM_MAX_BYTES];
+        let len = encode_cache_claim(
+            BookRoot::Library,
+            "Fiction/Dune.epub",
+            false,
+            &evidence,
+            &mut bytes,
+        )
+        .expect("encodes");
+        let claim = decode_cache_claimant(&bytes[..len]).expect("a claim");
+        assert_eq!(claim.locator, "Fiction/Dune.epub");
+        assert_eq!(claim.evidence.cluster, Some(4_211));
+        assert_eq!(claim.evidence.digest, Some(digest));
+
+        // Evidence changes nothing about who the claim names.
+        assert_eq!(
+            read_cache_claim(&bytes[..len], BookRoot::Library, "Fiction/Dune.epub"),
+            CacheClaimReading::MineActive,
+        );
+
+        // A cluster of zero is the FAT's own "no chain", so it reads back as
+        // absent rather than as chain zero.
+        let mut none = [0u8; CACHE_CLAIM_MAX_BYTES];
+        let none_len = encode_cache_claim(
+            BookRoot::Library,
+            "Fiction/Dune.epub",
+            false,
+            &CacheEvidence::default(),
+            &mut none,
+        )
+        .expect("encodes");
+        let bare = decode_cache_claimant(&none[..none_len]).expect("a claim");
+        assert_eq!(bare.evidence, CacheEvidence::default());
+
+        // A version 1 claim: the same bytes without the evidence block, and
+        // with the checksum taken over the shorter body.
+        let locator = b"Fiction/Dune.epub";
+        let mut v1 = [0u8; CACHE_CLAIM_MAX_BYTES];
+        v1[..4].copy_from_slice(&CLAIM_MAGIC);
+        v1[4] = CLAIM_VERSION_NAMED;
+        v1[5] = CLAIM_ACTIVE;
+        v1[6] = 0;
+        v1[7..9].copy_from_slice(&(locator.len() as u16).to_le_bytes());
+        v1[9..9 + locator.len()].copy_from_slice(locator);
+        let body = CLAIM_HEADER + locator.len();
+        let mut hash = 0x811c_9dc5u32;
+        for byte in &v1[..body] {
+            hash ^= *byte as u32;
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        v1[body..body + 4].copy_from_slice(&hash.to_le_bytes());
+        let old = decode_cache_claimant(&v1[..body + 4]).expect("a version 1 claim still reads");
+        assert_eq!(old.locator, "Fiction/Dune.epub");
+        assert_eq!(old.evidence, CacheEvidence::default());
+        assert_eq!(
+            read_cache_claim(&v1[..body + 4], BookRoot::Library, "Fiction/Dune.epub"),
+            CacheClaimReading::MineActive,
+            "an older claim still protects its owner's position",
+        );
+    }
+
+    /// A version 2 claim whose evidence block is torn is not a claim at all.
+    /// Reading it as ownership with empty evidence would hand a directory to
+    /// whoever the surviving bytes happened to name.
+    #[test]
+    fn a_torn_claim_is_not_a_claim() {
+        use crate::library_path::BookRoot;
+
+        let evidence = CacheEvidence {
+            cluster: Some(9),
+            digest: None,
+        };
+        let mut bytes = [0u8; CACHE_CLAIM_MAX_BYTES];
+        let len = encode_cache_claim(BookRoot::Library, "Dune.epub", false, &evidence, &mut bytes)
+            .expect("encodes");
+
+        for cut in 1..CLAIM_EVIDENCE + 4 {
+            assert_eq!(
+                decode_cache_claimant(&bytes[..len - cut]),
+                None,
+                "a claim cut {cut} bytes short is not a claim",
+            );
+        }
+        let mut flipped = bytes;
+        flipped[len - CLAIM_EVIDENCE - 2] ^= 0xFF;
+        assert_eq!(decode_cache_claimant(&flipped[..len]), None);
+    }
+
     /// everything else is another book, and torn bytes are not a claim at
     /// all, so one bad sector cannot read as somebody and brick the
     /// directory for everyone.
@@ -2159,8 +2353,14 @@ mod tests {
         use crate::library_path::BookRoot;
 
         let mut bytes = [0u8; CACHE_CLAIM_MAX_BYTES];
-        let len = encode_cache_claim(BookRoot::Library, "Fiction/Dune.epub", false, &mut bytes)
-            .expect("a legal locator encodes");
+        let len = encode_cache_claim(
+            BookRoot::Library,
+            "Fiction/Dune.epub",
+            false,
+            &CacheEvidence::default(),
+            &mut bytes,
+        )
+        .expect("a legal locator encodes");
         let stored = &bytes[..len];
 
         assert_eq!(
@@ -2177,15 +2377,21 @@ mod tests {
             CacheClaimReading::OtherActive,
             "the same locator under the other root is another book",
         );
-        assert_eq!(
-            decode_cache_claimant(stored),
-            Some((BookRoot::Library, "Fiction/Dune.epub", false)),
-        );
+        let claim = decode_cache_claimant(stored).expect("a claim");
+        assert_eq!(claim.root, BookRoot::Library);
+        assert_eq!(claim.locator, "Fiction/Dune.epub");
+        assert!(!claim.released);
+        assert_eq!(claim.evidence, CacheEvidence::default());
 
         let mut released = [0u8; CACHE_CLAIM_MAX_BYTES];
-        let released_len =
-            encode_cache_claim(BookRoot::Library, "Fiction/Dune.epub", true, &mut released)
-                .expect("encodes");
+        let released_len = encode_cache_claim(
+            BookRoot::Library,
+            "Fiction/Dune.epub",
+            true,
+            &CacheEvidence::default(),
+            &mut released,
+        )
+        .expect("encodes");
         assert_eq!(
             read_cache_claim(
                 &released[..released_len],
