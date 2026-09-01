@@ -28,6 +28,7 @@
 #[macro_use]
 mod log;
 
+pub mod browse;
 pub mod files;
 pub mod layout;
 pub mod publish;

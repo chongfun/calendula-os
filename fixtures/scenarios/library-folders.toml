@@ -1,0 +1,22 @@
+# A folder library: the current folder's books, then its folders, each
+# folder marked by the trailing separator it wears on a computer. The
+# reader is at the library root, so the rail still offers home.
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 5
+
+# Three books at the root with two folders below them.
+[[steps]]
+library = "FolderListed"
+count = 5
+books = 3
+depth = 0
+
+[expect]
+view = "Library"
+selection = 0
+library_count = 5

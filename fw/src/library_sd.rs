@@ -963,29 +963,136 @@ where
     }
 }
 
-/// Refill the resident list window so it covers the visible rows around
-/// `selection`, reading from the card only when the window doesn't already
-/// cover them. Called before each Library render; cheap behind the panel.
+pub(crate) use reader_cache::browse::Listing;
+
+/// What the row a reader pressed turned out to be, once the catalog has had
+/// its say about a book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowChoice {
+    /// A folder, now listed.
+    Entered(Listing),
+    /// A book, at this catalog row.
+    Book(u16),
+    /// Gone since the listing, unnameable from here, absent from the catalog,
+    /// or a card that would not answer. Nothing moved.
+    Failed,
+}
+
+/// Refill the resident folder page so it covers the visible rows around
+/// `selection`, reading from the card only when the page does not already
+/// cover them. Windowed the way the catalog snapshot is, and called before
+/// each Library render.
 #[inline(never)]
-pub(crate) fn ensure_library_window(
+pub(crate) fn ensure_folder_page(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
     selection: u16,
     portrait: bool,
 ) {
-    let total = library.catalog_count();
-    if total == 0 {
-        library.begin_window(0);
-        return;
+    let started = Instant::now();
+    let read = sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache::browse::ensure_page(library, root, selection, portrait)
+    })
+    .unwrap_or(false);
+    // Only the crossings. A scroll inside the loaded page reads nothing, and
+    // logging those would bury the number this is here to show under one line
+    // per Library paint.
+    if read {
+        bench_log!(
+            "bench: folder_page rows={} start={} depth={} ms={} t_ms={}",
+            library.browse().count(),
+            library.folder_start(),
+            library.browse().path().depth(),
+            started.elapsed().as_millis(),
+            Instant::now().as_millis(),
+        );
     }
-    let selection = (selection as usize).min(total - 1);
-    let start = ui::render::library_scroll_start(selection, total, portrait);
-    let need = ui::render::library_visible_rows(portrait).min(total - start);
-    if library.window_covers(start, need) {
-        return;
+}
+
+/// Act on the Library row at `index`: enter a folder, or find the catalog row
+/// that opens a book.
+///
+/// A book is resolved by identity rather than by position. The listing gives
+/// the locator, the root it is relative to, and the size the card holds now,
+/// and those are exactly what a catalog record's identity was derived from,
+/// so [`find_index_by_identity`] answers with the row or refuses. Position
+/// would be cheaper and wrong: it would tie two independent walks' orderings
+/// together as a correctness requirement, and a card edited between them
+/// would open some other book.
+#[inline(never)]
+pub(crate) fn choose_library_row(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: u16,
+    portrait: bool,
+) -> RowChoice {
+    let started = Instant::now();
+    let chosen = sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache::browse::choose_row(library, root, index, portrait)
+    });
+    match chosen {
+        Ok(reader_cache::browse::RowChoice::Entered(listing)) => {
+            // Entering is the number the folder-size question is about: it
+            // counts the whole directory before it can page it, so this grows
+            // with the folder while `folder_page` does not.
+            bench_log!(
+                "bench: folder_enter rows={} books={} depth={} ms={} t_ms={}",
+                listing.count,
+                listing.books,
+                listing.depth,
+                started.elapsed().as_millis(),
+                Instant::now().as_millis(),
+            );
+            RowChoice::Entered(listing)
+        }
+        Ok(reader_cache::browse::RowChoice::Book { at, locator, size }) => {
+            let hash = proto::cache::source_hash_at(at, locator.as_str(), size);
+            match find_index_by_identity(epd, sd_cs, hash, size, false) {
+                Some(index) => RowChoice::Book(index),
+                None => {
+                    esp_println::println!(
+                        "library: {} is not in the catalog at {} bytes",
+                        locator.as_str(),
+                        size
+                    );
+                    RowChoice::Failed
+                }
+            }
+        }
+        Ok(reader_cache::browse::RowChoice::Failed) | Err(_) => RowChoice::Failed,
     }
-    let _ = sd_session::with_root(epd, sd_cs, |root| read_catalog_window(root, library, start));
+}
+
+/// Go up one folder and list the parent, landing back on the folder just
+/// left: by name where the parent still holds it, else on the row it was
+/// entered from.
+#[inline(never)]
+pub(crate) fn leave_library_folder(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    portrait: bool,
+) -> Option<Listing> {
+    let started = Instant::now();
+    let listed = sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache::browse::leave_folder(library, root, portrait)
+    })
+    .ok()
+    .flatten();
+    // Leaving walks the whole parent past the returning name before it
+    // commits, so this is the other end of the folder-size question: it grows
+    // with the parent rather than with the folder being left.
+    bench_log!(
+        "bench: folder_leave rows={} depth={} ok={} ms={} t_ms={}",
+        listed.map_or(0, |listing| listing.count),
+        listed.map_or(0, |listing| listing.depth),
+        listed.is_some(),
+        started.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
+    listed
 }
 
 /// Make `index` the active book by reading its catalog record into the store,

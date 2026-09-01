@@ -947,7 +947,7 @@ pub(crate) fn load_chapters_into_store(
 
 /// Make the TOC window cover the Chapters rows visible around `selection`,
 /// reloading it from TOC.BIN only on a miss — the overview analogue of
-/// `ensure_library_window`. Cheap when the window already covers.
+/// `ensure_folder_page`. Cheap when the window already covers.
 pub(crate) fn ensure_toc_window(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,

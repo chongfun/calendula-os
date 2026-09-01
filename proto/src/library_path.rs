@@ -99,8 +99,10 @@ pub struct LibraryPath {
 
 impl LibraryPath {
     /// The library root.
-    pub fn root() -> Self {
-        Self::default()
+    pub const fn root() -> Self {
+        Self {
+            text: String::new(),
+        }
     }
 
     /// Parse and normalize, accepting an optional leading separator so a

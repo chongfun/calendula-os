@@ -90,6 +90,17 @@ pub struct UiTocItem<'a> {
     pub page: u32,
 }
 
+/// One row of the Library list: a book to open, or a folder to go into.
+///
+/// The kind is drawn as a mark on the name rather than as any difference in
+/// weight or shade, because the panel is one bit deep and a reader with low
+/// vision has only shape to go on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiLibraryRow<'a> {
+    pub name: &'a str,
+    pub is_folder: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiShell<'a> {
     pub view: UiView,
@@ -114,12 +125,17 @@ pub struct UiShell<'a> {
     pub battery_percent: u8,
     pub active_book: UiBook<'a>,
     pub library_status: UiLibraryStatus,
-    /// The resident slice of the on-disk catalog the Library list draws from:
-    /// `library_entries[i]` is the book at absolute index
-    /// `library_window_start + i`. The full catalog is streamed from the card,
-    /// so this window holds only the rows around the selection.
-    pub library_entries: &'a [&'a str],
+    /// The resident slice of the current folder's listing:
+    /// `library_entries[i]` is row `library_window_start + i`, and rows are
+    /// the folder's books followed by its folders. The folder is read from
+    /// the card a page at a time, so this holds only the rows around the
+    /// selection.
+    pub library_entries: &'a [UiLibraryRow<'a>],
     pub library_window_start: u16,
+    /// The folder being shown, or empty at the library root. Names the
+    /// screen and decides whether Back goes up a level or leaves for Home,
+    /// so the rail never promises the wrong one.
+    pub library_folder: &'a str,
     /// Total book count across the whole catalog, independent of the resident
     /// window — drives the "x of N" footer and the scroll math.
     pub library_total: u16,
@@ -174,6 +190,7 @@ mod tests {
             library_status: UiLibraryStatus::NotScanned,
             library_entries: &[],
             library_window_start: 0,
+            library_folder: "",
             library_total: 0,
             chapters: &[],
             chapters_window_start: 0,

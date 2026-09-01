@@ -11,8 +11,8 @@ use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, Mode, TimeSource,
 use embedded_sdmmc::{Directory, VolumeIdx, VolumeManager};
 use proto::library_path::{BookRoot, LibraryPath};
 use upload_store::library::{
-    count_children, entry_in, for_each_child, open_library_root, page_children, with_book,
-    with_book_at, with_dir,
+    count_children, count_children_split, count_library_rows, entry_in, for_each_child,
+    open_library_root, page_library_rows, with_book, with_book_at, with_dir, LibraryRow, RowCounts,
 };
 
 const BLOCK_BYTES: usize = 512;
@@ -626,12 +626,46 @@ fn a_folder_that_cannot_be_read_is_an_error() {
     ));
 }
 
+/// Walk a whole Library listing a page at a time, as the screen does.
+fn walk_rows(root: &Dir<'_>, at: &str, width: usize) -> Vec<(String, bool, BookRoot)> {
+    let counts = count_library_rows(root, &path(at))
+        .expect("walk")
+        .expect("a directory");
+    let mut window = vec![LibraryRow::default(); width];
+    let mut rows = Vec::new();
+    let mut skip = 0;
+    loop {
+        let filled = page_library_rows(root, &path(at), counts, skip, &mut window)
+            .expect("walk")
+            .expect("a directory");
+        if filled == 0 {
+            break;
+        }
+        rows.extend(window[..filled].iter().map(|row| {
+            (
+                row.child.name.as_str().to_string(),
+                row.child.is_dir,
+                row.at,
+            )
+        }));
+        skip += filled;
+    }
+    assert_eq!(
+        rows.len(),
+        counts.total(),
+        "every row handed over exactly once"
+    );
+    rows
+}
+
 #[test]
 fn a_window_walks_a_large_folder_a_page_at_a_time() {
     let mgr = open_mgr(new_card());
     let root = open_root(&mgr);
-    root.make_dir_in_dir_lfn("Many").expect("mkdir");
-    let many = child(&root, "Many");
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    books.make_dir_in_dir_lfn("Many").expect("mkdir");
+    let many = child(&books, "Many");
     for i in 0..100 {
         let file = many
             .create_file_in_dir_lfn(&format!("Book {i:03}.epub"))
@@ -640,28 +674,210 @@ fn a_window_walks_a_large_folder_a_page_at_a_time() {
     }
 
     assert_eq!(
-        count_children(&root, &path("Many")).expect("walk"),
+        count_children(&books, &path("Many")).expect("walk"),
         Some(100)
     );
 
-    let mut seen: Vec<String> = Vec::new();
-    let mut window = vec![upload_store::library::Child::default(); 8];
-    let mut skip = 0;
-    loop {
-        let filled = page_children(&root, &path("Many"), skip, &mut window)
-            .expect("walk")
-            .expect("a directory");
-        if filled == 0 {
-            break;
-        }
-        seen.extend(window[..filled].iter().map(|c| c.name.as_str().to_string()));
-        skip += filled;
-    }
-
+    let mut seen: Vec<String> = walk_rows(&root, "Many", 8)
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
     seen.sort();
     assert_eq!(seen.len(), 100, "every book was handed over exactly once");
     assert_eq!(seen.first().map(String::as_str), Some("Book 000.epub"));
     assert_eq!(seen.last().map(String::as_str), Some("Book 099.epub"));
+}
+
+/// The library screen orders books above folders, so it has to know how many
+/// of each a folder holds before a row number means anything. One walk
+/// answers both, since asking twice would read the directory twice to learn
+/// one number.
+#[test]
+fn a_folder_counts_its_books_and_its_folders_apart() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    seed_mixed(&root);
+
+    assert_eq!(
+        count_children_split(&root, &path("Fiction")).expect("walk"),
+        Some((2, 1)),
+        "Dune.epub and Old Book.EPU, and the Space Opera folder",
+    );
+    assert_eq!(
+        count_children(&root, &path("Fiction")).expect("walk"),
+        Some(3),
+        "and the total is still the two together",
+    );
+    assert_eq!(
+        count_children_split(&root, &path("Fiction/Space Opera")).expect("walk"),
+        Some((0, 0)),
+        "an empty folder counts as empty on both sides",
+    );
+}
+
+/// The library root's own listing, at every window width that could split
+/// it: the shelf's books, then the card root's loose ones, then the shelf's
+/// folders, with no row shown twice or skipped where the regions meet.
+#[test]
+fn the_library_root_lists_both_roots_books_before_folders() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    for name in ["A.epub", "B.epub"] {
+        let file = books.create_file_in_dir_lfn(name).expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+    for name in ["Fiction", "History"] {
+        books.make_dir_in_dir_lfn(name).expect("mkdir");
+    }
+    // Loose at the card root, from before the shelf existed.
+    for name in ["Old One.epub", "Old Two.epub"] {
+        let file = root.create_file_in_dir_lfn(name).expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+
+    let counts = count_library_rows(&root, &path(""))
+        .expect("walk")
+        .expect("a directory");
+    assert_eq!(
+        counts,
+        RowCounts {
+            shelf_books: 2,
+            root_books: 2,
+            shelf_folders: 2
+        }
+    );
+    assert_eq!((counts.books(), counts.total()), (4, 6));
+
+    for width in 1..=7 {
+        let rows = walk_rows(&root, "", width);
+        let shape: Vec<(bool, BookRoot)> = rows.iter().map(|(_, d, at)| (*d, *at)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (false, BookRoot::Library),
+                (false, BookRoot::Library),
+                (false, BookRoot::CardRoot),
+                (false, BookRoot::CardRoot),
+                (true, BookRoot::Library),
+                (true, BookRoot::Library),
+            ],
+            "width {width}: shelf books, card-root books, shelf folders",
+        );
+        let mut names: Vec<String> = rows.into_iter().map(|(name, _, _)| name).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "A.epub",
+                "B.epub",
+                "Fiction",
+                "History",
+                "Old One.epub",
+                "Old Two.epub"
+            ],
+            "width {width}: no row shown twice or skipped",
+        );
+    }
+}
+
+/// A card that predates the shelf still has a library: its loose books are
+/// the whole of it, and they list without a `/BOOKS` to hang them under.
+#[test]
+fn a_card_with_no_shelf_still_lists_its_loose_books() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    for name in ["Old One.epub", "Old Two.epub"] {
+        let file = root.create_file_in_dir_lfn(name).expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+
+    let counts = count_library_rows(&root, &path(""))
+        .expect("walk")
+        .expect("a shelfless card still has a library");
+    assert_eq!(
+        counts,
+        RowCounts {
+            shelf_books: 0,
+            root_books: 2,
+            shelf_folders: 0
+        }
+    );
+    let rows = walk_rows(&root, "", 4);
+    assert!(rows
+        .iter()
+        .all(|(_, is_dir, at)| !is_dir && *at == BookRoot::CardRoot));
+
+    // There is nothing below the root to name, though.
+    assert_eq!(
+        count_library_rows(&root, &path("Fiction")).expect("walk"),
+        None,
+    );
+}
+
+/// Card-root books belong to the library root's listing alone. Nothing nests
+/// at the card root, so no deeper listing could hold one.
+#[test]
+fn a_nested_folder_lists_only_the_shelf() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    books.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = child(&books, "Fiction");
+    let dune = fiction.create_file_in_dir_lfn("Dune.epub").expect("create");
+    dune.write(b"x").expect("write");
+    dune.close().expect("close");
+    let loose = root.create_file_in_dir_lfn("Old.epub").expect("create");
+    loose.write(b"x").expect("write");
+    loose.close().expect("close");
+
+    let counts = count_library_rows(&root, &path("Fiction"))
+        .expect("walk")
+        .expect("a directory");
+    assert_eq!(
+        counts,
+        RowCounts {
+            shelf_books: 1,
+            root_books: 0,
+            shelf_folders: 0
+        },
+        "the loose book is the root's row, not this folder's",
+    );
+    let rows = walk_rows(&root, "Fiction", 4);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "Dune.epub");
+    assert_eq!(rows[0].2, BookRoot::Library);
+}
+
+/// A card that stops answering fails the page rather than reporting a short
+/// one, the same way the walk and the count do.
+#[test]
+fn a_library_page_the_card_interrupts_is_an_error() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    let file = books.create_file_in_dir_lfn("A.epub").expect("create");
+    file.write(b"x").expect("write");
+    file.close().expect("close");
+
+    let counts = RowCounts {
+        shelf_books: 1,
+        root_books: 0,
+        shelf_folders: 0,
+    };
+    let mut window = vec![LibraryRow::default(); 8];
+    disk.fail_reads_from(Some(1));
+    assert!(matches!(
+        page_library_rows(&root, &path(""), counts, 0, &mut window),
+        Err(upload_store::install::InstallError::Card)
+    ));
 }
 
 /// A folder at the depth limit lists nothing, because nothing inside it has a
@@ -894,9 +1110,16 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
     let paging = {
         let mgr = open_mgr(disk.clone());
         let root = open_root(&mgr);
-        let mut window = vec![upload_store::library::Child::default(); 8];
+        // Every child of `Many` is a book, so the first page never reaches a
+        // second region and the read count is one region's.
+        let counts = RowCounts {
+            shelf_books: 100,
+            root_books: 0,
+            shelf_folders: 0,
+        };
+        let mut window = vec![LibraryRow::default(); 8];
         disk.reset_reads();
-        let filled = page_children(&root, &path("Many"), 0, &mut window)
+        let filled = page_library_rows(&root, &path("Many"), counts, 0, &mut window)
             .expect("walk")
             .expect("a directory");
         assert_eq!(filled, 8);
@@ -908,7 +1131,9 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
         let root = open_root(&mgr);
         disk.reset_reads();
         assert_eq!(
-            count_children(&root, &path("Many")).expect("walk"),
+            count_library_rows(&root, &path("Many"))
+                .expect("walk")
+                .map(RowCounts::total),
             Some(100)
         );
         disk.reads()
@@ -922,8 +1147,10 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
 }
 
 fn seed_many(root: &Dir<'_>, count: usize) {
-    root.make_dir_in_dir_lfn("Many").expect("mkdir");
-    let many = child(root, "Many");
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(root, "BOOKS");
+    books.make_dir_in_dir_lfn("Many").expect("mkdir");
+    let many = child(&books, "Many");
     for index in 0..count {
         let file = many
             .create_file_in_dir_lfn(&format!("Book {index:03}.epub"))

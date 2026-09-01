@@ -388,6 +388,20 @@ pub enum StorageCommand {
         request_id: u32,
         book_id: u32,
         index: u16,
+        /// The catalog the row was resolved in, when this open came from
+        /// resolving one. A catalog index is only a book inside the catalog
+        /// that produced it, and this open crosses a queue: the row is
+        /// resolved, the answer goes to the app, the app comes back with the
+        /// open, and a rebuild in that window leaves a different book sitting
+        /// under the same number. The storage task refuses rather than opens
+        /// it.
+        ///
+        /// `None` for every other open, whose index came from the app's own
+        /// active book rather than from a row just looked up. Those cross the
+        /// same window, and fencing them here would refuse a boot restore
+        /// whose `Scanned` the app has not folded yet; the index they carry
+        /// is Milestone 4's problem, where a book stops being a row number.
+        catalog_epoch: Option<u32>,
         chapter: u16,
         target_pages: u16,
         type_settings: TypeSettings,
@@ -454,15 +468,14 @@ pub enum StorageCommand {
     /// when the user confirms "Clear cache?" on a Library row.
     ///
     /// A row number alone is not a book. This command can be parked, and the
-    /// storage task resolves the row against whatever catalog it holds when
-    /// the command finally runs — a catalog that a scan in between may have
-    /// reordered, putting a different book under the same row. `catalog_epoch`
-    /// is the catalog the *screen* was showing when the user picked (the epoch
-    /// last reported by [`LibraryEvent::Scanned`]); the storage task refuses
-    /// the clear unless its own catalog still carries that epoch, so a stale
-    /// row deletes nothing instead of deleting the wrong book. Identity is
-    /// then checked a second time against the cache header, which catches a
-    /// key collision the epoch cannot see.
+    /// storage task resolves the row against whatever folder it is standing
+    /// in when the command finally runs, which a scan in between may have
+    /// taken back to the library root, putting a different book under the
+    /// same row. `browse_epoch` is the position the *screen* was listing when
+    /// the user picked; the storage task refuses the clear unless it is still
+    /// standing there, so a stale row deletes nothing instead of deleting the
+    /// wrong book. Identity is then checked a second time against the cache
+    /// header, which catches a key collision the generation cannot see.
     ///
     /// `request_id` is what the answering `LibraryEvent::CacheCleared` echoes
     /// back; the epoch guards which book gets deleted, not which wait the
@@ -470,7 +483,34 @@ pub enum StorageCommand {
     ClearBookCache {
         request_id: u32,
         index: u16,
-        catalog_epoch: u32,
+        browse_epoch: u32,
+    },
+    /// Say what the Library row at `index` is, and act on it: a folder is
+    /// entered and its children listed back, a book is resolved to the
+    /// catalog row that opens it.
+    ///
+    /// The app holds a row count, not a listing, so only the card can tell
+    /// the two apart. `browse_epoch` travels because a parked command runs
+    /// against whatever folder the storage task is standing in by then, and a
+    /// row picked in another one names a different child of a different
+    /// place. The catalog's own epoch cannot answer that: a scan whose
+    /// recovery is unfinished declines to rebuild the catalog and takes
+    /// browsing back to the root anyway.
+    ChooseLibraryRow {
+        request_id: u32,
+        index: u16,
+        browse_epoch: u32,
+    },
+    /// Go up one folder and list the parent, so Back below the library root
+    /// zooms out a level rather than leaving for Home.
+    ///
+    /// Carries no row: the folder being left is the one the storage task is
+    /// already in, and naming it again from the app would be the app's copy
+    /// of a position storage owns. It carries the generation of that position
+    /// for the same reason [`StorageCommand::ChooseLibraryRow`] does.
+    LeaveLibraryFolder {
+        request_id: u32,
+        browse_epoch: u32,
     },
 }
 
@@ -976,13 +1016,50 @@ pub fn library_action_command_for_transition(
     Some(match action {
         LibraryAction::ClearCache => StorageCommand::ClearBookCache {
             request_id,
-            // The row and the catalog it was a row *in*, together: neither
+            // The row and the listing it was a row *in*, together: neither
             // half means anything without the other by the time the storage
             // task gets to it.
             index,
-            catalog_epoch: next.catalog_epoch,
+            browse_epoch: next.library_browse_epoch,
         },
     })
+}
+
+/// Moving through the folder tree owes storage one command: the transition
+/// out of `Idle` is the press.
+///
+/// Same shape as [`library_action_command_for_transition`], and for the same
+/// reason: a wait the app enters is a promise that some command is on its way
+/// to end it, and deriving the command from the transition is what keeps the
+/// two from being added apart.
+pub fn library_browse_command_for_transition(
+    previous: &ReaderState,
+    next: &ReaderState,
+) -> Option<StorageCommand> {
+    if !previous.library_browse.is_idle() {
+        return None;
+    }
+    // Exhaustive on purpose, like the actions sheet's: a wait added without a
+    // command here would hold the Library rail forever.
+    match next.library_browse {
+        LibraryBrowse::Idle => None,
+        LibraryBrowse::Choosing {
+            index,
+            request_id,
+            browse_epoch,
+        } => Some(StorageCommand::ChooseLibraryRow {
+            request_id,
+            index,
+            browse_epoch,
+        }),
+        LibraryBrowse::Leaving {
+            request_id,
+            browse_epoch,
+        } => Some(StorageCommand::LeaveLibraryFolder {
+            request_id,
+            browse_epoch,
+        }),
+    }
 }
 
 /// An open of `state`'s book, closing out `previous` when this changes books.
@@ -996,6 +1073,7 @@ pub fn open_book_command(
         request_id,
         book_id: state.book_id,
         index,
+        catalog_epoch: None,
         chapter: state.chapter,
         target_pages: state.page.min(u16::MAX as u32) as u16,
         type_settings: state.type_settings(),
@@ -1443,6 +1521,66 @@ pub enum LibraryEvent {
         request_id: u32,
         ok: bool,
     },
+    /// A folder was listed: entered through `ChooseLibraryRow`, or arrived at
+    /// by `LeaveLibraryFolder`. Carries everything the list is drawn from, so
+    /// one event settles a move.
+    ///
+    /// `selection` is where the cursor lands, which the storage task decides:
+    /// going in starts at the top, and coming out returns to the row the
+    /// folder was entered from, found by name.
+    FolderListed {
+        /// The move this answers, or `None` for a listing nobody asked for:
+        /// a scan replaces the catalog and relists wherever the reader is,
+        /// with no press behind it.
+        request_id: Option<u32>,
+        /// The position generation this listing was taken in. An unsolicited
+        /// listing outranks a move issued in an older one, because the scan
+        /// has already taken the storage task back to the root and the move
+        /// can only come back refused, or worse land on a row number that now
+        /// names a different child of a different place. Without this the two
+        /// would end up browsing different folders, with the screen describing
+        /// one and every later command landing on the other.
+        browse_epoch: u32,
+        depth: u8,
+        count: u16,
+        /// How many of `count` are books; the rest are folders, below them.
+        books: u16,
+        selection: u16,
+    },
+    /// The chosen row was a book, and it is the catalog's row `index` in the
+    /// catalog named by `catalog_epoch`.
+    ///
+    /// Storage answers and stops there. Opening is the app's, because an open
+    /// is more than the command: it commits the reader request id the storage
+    /// task checks a later open against, arms the gate that keeps input off
+    /// the panel until the book lands, and keeps the rollback that puts the
+    /// reader back on the previous book if the command is refused. A storage
+    /// task opening on its own initiative has none of that, and its command
+    /// carries an id from the wrong counter besides.
+    RowIsBook {
+        request_id: u32,
+        index: u16,
+        catalog_epoch: u32,
+    },
+    /// The chosen row could not be acted on: gone since the listing, deeper
+    /// than a locator can name, or absent from the catalog because the card
+    /// changed under the scan. Nothing moves, and the wait ends.
+    RowFailed {
+        request_id: u32,
+    },
+    /// The library could not be listed at all: the card answered the scan and
+    /// then stopped answering for the rows. Carries the position generation
+    /// the failed relist moved to, for the reason
+    /// [`LibraryEvent::FolderListed`] does.
+    ///
+    /// Distinct from a listing of zero rows, which is a card that answered and
+    /// had nothing to show. The reader is at the root either way, and with
+    /// nothing loaded either way; what differs is whether the screen offers to
+    /// add books or says the library is unavailable, and that is a lie the
+    /// count alone cannot avoid telling.
+    LibraryUnreadable {
+        browse_epoch: u32,
+    },
 }
 
 /// Slots in the library-event channel. Lives here because the eviction walk
@@ -1731,6 +1869,13 @@ impl LibraryEvent {
                 | Self::BookOpenFailed { .. }
                 | Self::CacheCleared { .. }
                 | Self::Restored { .. }
+                // The three that settle a `LibraryBrowse`. Dropping one
+                // leaves the Library rail waiting on a move that already
+                // happened, with no second press able to start another.
+                | Self::FolderListed { .. }
+                | Self::RowIsBook { .. }
+                | Self::RowFailed { .. }
+                | Self::LibraryUnreadable { .. }
         )
     }
 }
@@ -1773,6 +1918,57 @@ pub enum LibraryMenu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibraryAction {
     ClearCache,
+}
+
+/// A Library row press waiting on the card.
+///
+/// A row is a book or a folder, and only the card knows which: the app holds
+/// a count, not a listing. So a press asks, and the answer decides what
+/// happens. Both waits look the same from the app's side, which is why they
+/// are one type: something is in flight, the rail says so, and no second
+/// press starts another one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryBrowse {
+    /// Nothing in flight.
+    Idle,
+    /// This row was chosen, and storage is resolving it.
+    Choosing {
+        index: u16,
+        request_id: u32,
+        /// The position the rows were counted in when the press happened. A
+        /// scan in between takes the storage task back to the library root,
+        /// and a listing from the newer position outranks a move from the
+        /// older one, whose row number now means something else.
+        browse_epoch: u32,
+    },
+    /// Back was pressed below the root, and storage is listing the parent.
+    Leaving { request_id: u32, browse_epoch: u32 },
+}
+
+impl LibraryBrowse {
+    /// The id of the command this is waiting on, if any.
+    pub const fn request_id(self) -> Option<u32> {
+        match self {
+            Self::Idle => None,
+            Self::Choosing { request_id, .. } | Self::Leaving { request_id, .. } => {
+                Some(request_id)
+            }
+        }
+    }
+
+    /// The position generation this move was issued against, if any.
+    pub const fn browse_epoch(self) -> Option<u32> {
+        match self {
+            Self::Idle => None,
+            Self::Choosing { browse_epoch, .. } | Self::Leaving { browse_epoch, .. } => {
+                Some(browse_epoch)
+            }
+        }
+    }
+
+    pub const fn is_idle(self) -> bool {
+        matches!(self, Self::Idle)
+    }
 }
 
 /// The sheet's rows, top to bottom.
@@ -1947,6 +2143,21 @@ pub struct ReaderState {
     pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u16,
+    /// How many of `library_count` are books. The Library list shows a
+    /// folder's books above its folders, so this one number says which kind
+    /// any row is, without the app holding a row-by-row copy of a listing
+    /// that slides as the reader scrolls.
+    pub library_books: u16,
+    /// How far below the library root the list is. Zero is the root, where
+    /// Back leaves for Home rather than going up.
+    pub library_depth: u8,
+    /// A Library row press waiting on storage to say what it was.
+    pub library_browse: LibraryBrowse,
+    /// The position the resident rows were counted in, as reported by the
+    /// last listing. Row-addressed browse commands carry it so the storage
+    /// task can tell a row picked where it is standing from one picked
+    /// somewhere it has since left.
+    pub library_browse_epoch: u32,
     /// The catalog the Library list is currently drawn from, as reported by
     /// the last [`LibraryEvent::Scanned`]. Row-addressed storage commands
     /// carry it so the storage task can tell a live row from a stale one.
@@ -2002,6 +2213,10 @@ impl ReaderState {
             battery_mv: 0,
             battery_percent: 100,
             library_count: 0,
+            library_books: 0,
+            library_depth: 0,
+            library_browse: LibraryBrowse::Idle,
+            library_browse_epoch: 0,
             catalog_epoch: 0,
             sd_page_count: 1,
             sd_chapter_count: 1,
@@ -2142,6 +2357,25 @@ impl ReaderState {
                     Some(_) => return next,
                 }
             }
+            // A move through the tree holds the list still for the same
+            // reason: the rows are about to be replaced, so a press against
+            // the ones on screen would act on a listing that is already
+            // gone. Back is the same deliberate exception, and it leaves
+            // Library outright rather than stacking a second move: the
+            // `library_browse` reset below drops the claim to the answer.
+            if !self.library_browse.is_idle() {
+                match button {
+                    Some(Button::Back) => {
+                        next.library_browse = LibraryBrowse::Idle;
+                        next.view = AppView::Home;
+                        next.selection = 0;
+                        next.read_request_pending = false;
+                        return next;
+                    }
+                    Some(Button::Power) | None => {}
+                    Some(_) => return next,
+                }
+            }
         }
 
         match (self.view, button) {
@@ -2163,7 +2397,9 @@ impl ReaderState {
             // key that arms "forget" on the Wireless screen. Only a real
             // catalog row has actions.
             (AppView::Library, Some(Button::PagePrevious)) => {
-                if self.selection < self.library_count {
+                // Books have actions; a folder is a place, not a book, and
+                // "clear cache" means nothing on it.
+                if self.selection < self.library_books {
                     next.library_menu = LibraryMenu::Sheet { row: 0 };
                 }
             }
@@ -2171,21 +2407,32 @@ impl ReaderState {
             // Confirm always affirms the screen's primary action.
             (AppView::Library, Some(Button::Confirm)) => {
                 if self.selection < self.library_count {
-                    next.book_id = ReaderSource::sd(self.selection).book_id();
-                    next.view = AppView::Reading;
-                    next.chapter = 0;
-                    next.selection = 0;
-                    next.page = 0;
-                    next.sd_page_count = 1;
-                    next.sd_chapter_count = 1;
-                    next.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
-                    next.read_request_pending = false;
+                    // The app holds a row count, not a listing, so the card
+                    // decides what this row is and acts on it. A fresh id per
+                    // press, never reused, so an answer to a press the reader
+                    // walked away from cannot settle this one.
+                    next.library_request_seq = self.library_request_seq.wrapping_add(1);
+                    next.library_browse = LibraryBrowse::Choosing {
+                        index: self.selection,
+                        request_id: next.library_request_seq,
+                        browse_epoch: self.library_browse_epoch,
+                    };
                 }
             }
             (AppView::Library, Some(Button::Back)) => {
-                next.view = AppView::Home;
-                next.selection = 0;
-                next.read_request_pending = false;
+                if self.library_depth > 0 {
+                    // Back zooms out one level, and below the root a level is
+                    // a folder rather than the whole screen.
+                    next.library_request_seq = self.library_request_seq.wrapping_add(1);
+                    next.library_browse = LibraryBrowse::Leaving {
+                        request_id: next.library_request_seq,
+                        browse_epoch: self.library_browse_epoch,
+                    };
+                } else {
+                    next.view = AppView::Home;
+                    next.selection = 0;
+                    next.read_request_pending = false;
+                }
             }
             (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
@@ -2322,6 +2569,11 @@ impl ReaderState {
         // shows to someone still looking at Library).
         if next.view != AppView::Library {
             next.library_menu = LibraryMenu::None;
+            // And so is a move through the tree. The command is still out
+            // there and its answer still comes back; dropping the wait here
+            // is what makes that answer land on nobody, which is what the
+            // request id in every reply is for.
+            next.library_browse = LibraryBrowse::Idle;
         }
 
         next
@@ -2474,6 +2726,102 @@ impl ReaderState {
                         self.library_menu = LibraryMenu::Done { action, ok };
                         self.dirty = Rect::FULL;
                     }
+                }
+            }
+            // The three answers to a move. Each checks the id for the reason
+            // `CacheCleared` does: a move walked away from leaves an older
+            // answer in flight, and it describes a folder this wait never
+            // asked about.
+            LibraryEvent::FolderListed {
+                request_id,
+                browse_epoch,
+                depth,
+                count,
+                books,
+                selection,
+            } => {
+                let mine = match request_id {
+                    Some(id) => self.library_browse.request_id() == Some(id),
+                    // Adopted when nothing is in flight, and over a move issued
+                    // from a position this listing has left: that move is
+                    // already doomed, and holding the old rows until its
+                    // refusal arrives would leave the screen naming a folder
+                    // the storage task is not in.
+                    None => match self.library_browse.browse_epoch() {
+                        None => true,
+                        Some(issued_in) => issued_in != browse_epoch,
+                    },
+                };
+                if mine {
+                    self.library_browse = LibraryBrowse::Idle;
+                    self.library_browse_epoch = browse_epoch;
+                    self.library_depth = depth;
+                    self.library_count = count;
+                    self.library_books = books.min(count);
+                    // Where the storage task put the cursor: the top on the
+                    // way in, and on the way out the row the folder was
+                    // entered from, found by name.
+                    self.selection = selection.min(count.saturating_sub(1));
+                    self.dirty = Rect::FULL;
+                }
+            }
+            LibraryEvent::RowIsBook {
+                request_id,
+                index,
+                catalog_epoch,
+            } => {
+                // The row was resolved against a catalog the app may since
+                // have been told was replaced, in which case the number it
+                // carries names some other book. The open the transition
+                // below owes is fenced too, because this event can arrive
+                // before the `Scanned` that would have caught it here.
+                let fresh = catalog_epoch == self.catalog_epoch;
+                if !fresh {
+                    self.library_browse = LibraryBrowse::Idle;
+                    self.dirty = Rect::FULL;
+                }
+                if fresh && self.library_browse.request_id() == Some(request_id) {
+                    self.library_browse = LibraryBrowse::Idle;
+                    // What Confirm used to do the moment it was pressed, now
+                    // that the row has a catalog number. The transition into
+                    // Reading is what owes the open, and the caller dispatches
+                    // it the same way it dispatches one from a keypress.
+                    self.book_id = ReaderSource::sd(index).book_id();
+                    self.view = AppView::Reading;
+                    self.chapter = 0;
+                    self.selection = 0;
+                    self.page = 0;
+                    self.sd_page_count = 1;
+                    self.sd_chapter_count = 1;
+                    self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
+                    self.read_request_pending = false;
+                    self.dirty = Rect::FULL;
+                }
+            }
+            LibraryEvent::LibraryUnreadable { browse_epoch } => {
+                // Nobody pressed anything, so this is read the way an
+                // unsolicited listing is: adopted when nothing is in flight,
+                // and over a move issued from the position this scan left.
+                let mine = match self.library_browse.browse_epoch() {
+                    None => true,
+                    Some(issued_in) => issued_in != browse_epoch,
+                };
+                if mine {
+                    self.library_browse = LibraryBrowse::Idle;
+                    self.library_browse_epoch = browse_epoch;
+                    self.library_depth = 0;
+                    self.library_count = 0;
+                    self.library_books = 0;
+                    self.selection = 0;
+                    self.dirty = Rect::FULL;
+                }
+            }
+            LibraryEvent::RowFailed { request_id } => {
+                if self.library_browse.request_id() == Some(request_id) {
+                    // Nothing moved. The rows on screen are the rows that are
+                    // there, and the repaint puts the rail back.
+                    self.library_browse = LibraryBrowse::Idle;
+                    self.dirty = Rect::FULL;
                 }
             }
             LibraryEvent::Restored {
@@ -2688,6 +3036,22 @@ impl ReaderState {
     /// with nothing on its way to answer — until the battery ran out. The
     /// caller that saw the refusal is the only one who knows, so it says so
     /// here.
+    /// Settles a move through the folder tree whose command never left the
+    /// app, as the standstill it is.
+    ///
+    /// A non-idle `library_browse` holds the list still while it waits, and
+    /// the wait is a promise that some command is on its way to end it. A
+    /// command the queue refused breaks that promise, and only the caller
+    /// that saw the refusal knows. Nothing moved, so nothing changes but the
+    /// wait ending and the rail coming back.
+    pub fn library_browse_rejected(mut self) -> Self {
+        if !self.library_browse.is_idle() {
+            self.library_browse = LibraryBrowse::Idle;
+            self.dirty = Rect::FULL;
+        }
+        self
+    }
+
     pub fn library_action_rejected(mut self) -> Self {
         if let LibraryMenu::Busy { action, .. } = self.library_menu {
             self.library_menu = LibraryMenu::Done { action, ok: false };
@@ -3725,12 +4089,26 @@ mod tests {
     }
 
     /// A reader parked on a Library row, as if it had scanned real books.
+    /// At the library root with `count` rows, all of them books: the shape a
+    /// card with no folders on it has, and the one every test here predates
+    /// folders by assuming.
     fn in_library(selection: u16, count: u16) -> ReaderState {
         let mut state = ReaderState::boot();
         state.view = AppView::Library;
         state.library_count = count;
+        state.library_books = count;
         state.catalog_epoch = EPOCH;
+        state.library_browse_epoch = EPOCH;
         state.selection = selection;
+        state
+    }
+
+    /// The same, one folder down, with `books` of the rows being books and
+    /// the rest folders below them.
+    fn in_folder(selection: u16, books: u16, folders: u16) -> ReaderState {
+        let mut state = in_library(selection, books + folders);
+        state.library_books = books;
+        state.library_depth = 1;
         state
     }
 
@@ -3775,7 +4153,7 @@ mod tests {
             Some(StorageCommand::ClearBookCache {
                 request_id: 1,
                 index: 1,
-                catalog_epoch: EPOCH
+                browse_epoch: EPOCH
             })
         );
 
@@ -4783,16 +5161,496 @@ mod tests {
 
     #[test]
     fn library_open_key_opens_sd_book() {
-        let state = press(ReaderState::boot(), Button::Back).apply_library_event(
+        let state = in_library(0, 2);
+        let previous = state;
+        // A row is a book or a folder, and the app holds a count rather than
+        // a listing, so the press asks the card instead of opening blind.
+        let state = press(press(state, Button::Next), Button::Confirm);
+        assert_eq!(state.selection, 1);
+        assert_eq!(
+            state.library_browse,
+            LibraryBrowse::Choosing {
+                index: 1,
+                request_id: 1,
+                browse_epoch: EPOCH
+            }
+        );
+        assert_eq!(
+            state.view,
+            AppView::Library,
+            "the screen holds until the card answers"
+        );
+        assert!(matches!(
+            library_browse_command_for_transition(&previous, &state),
+            Some(StorageCommand::ChooseLibraryRow {
+                request_id: 1,
+                index: 1,
+                browse_epoch: EPOCH,
+                ..
+            })
+        ));
+
+        // A book, at that catalog row. The open is already running on the
+        // storage side, which is why folding this dispatches nothing.
+        let state = state.apply_library_event(
             CTX,
-            LibraryEvent::Scanned {
-                count: 2,
-                catalog_epoch: 0,
+            LibraryEvent::RowIsBook {
+                request_id: 1,
+                index: 1,
+                catalog_epoch: EPOCH,
             },
         );
-        let state = press(press(state, Button::Next), Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
-        assert_eq!(state.book_id, 3);
+        assert_eq!(state.book_id, ReaderSource::sd(1).book_id());
+        assert!(state.library_browse.is_idle());
+    }
+
+    /// Confirm on a folder row lists it instead of opening anything, and the
+    /// cursor lands where the storage task put it.
+    #[test]
+    fn confirming_a_folder_row_enters_it() {
+        // Two books above one folder, and the cursor on the folder.
+        let state = in_library(2, 3);
+        let mut state = state;
+        state.library_books = 2;
+        let entered = press(state, Button::Confirm);
+        assert_eq!(
+            entered.library_browse,
+            LibraryBrowse::Choosing {
+                index: 2,
+                request_id: 1,
+                browse_epoch: EPOCH
+            }
+        );
+
+        let listed = entered.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: Some(1),
+                browse_epoch: EPOCH,
+                depth: 1,
+                count: 4,
+                books: 3,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.view, AppView::Library, "entering opens no book");
+        assert_eq!(listed.library_depth, 1);
+        assert_eq!((listed.library_count, listed.library_books), (4, 3));
+        assert_eq!(listed.selection, 0, "a folder is entered at its top");
+        assert!(listed.library_browse.is_idle());
+    }
+
+    /// Back zooms out one level, which below the root is a folder rather
+    /// than the whole screen.
+    #[test]
+    fn back_leaves_a_folder_before_it_leaves_library() {
+        let state = in_folder(1, 2, 1);
+        let previous = state;
+        let leaving = press(state, Button::Back);
+        assert_eq!(
+            leaving.view,
+            AppView::Library,
+            "at depth, Back is a level, not the screen"
+        );
+        assert_eq!(
+            leaving.library_browse,
+            LibraryBrowse::Leaving {
+                request_id: 1,
+                browse_epoch: EPOCH
+            }
+        );
+        assert_eq!(
+            library_browse_command_for_transition(&previous, &leaving),
+            Some(StorageCommand::LeaveLibraryFolder {
+                request_id: 1,
+                browse_epoch: EPOCH
+            })
+        );
+
+        // Back at the root is still the way out of Library.
+        let out = leaving.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: Some(1),
+                browse_epoch: EPOCH,
+                depth: 0,
+                count: 3,
+                books: 2,
+                selection: 2,
+            },
+        );
+        assert_eq!(out.library_depth, 0);
+        assert_eq!(out.selection, 2, "returning lands on the row left from");
+        assert_eq!(press(out, Button::Back).view, AppView::Home);
+    }
+
+    /// A move holds the list still: the rows are about to be replaced, so a
+    /// press against the ones on screen would act on a listing already gone.
+    /// Back is the exception, and it leaves rather than stacking a move.
+    #[test]
+    fn a_move_in_flight_holds_the_list() {
+        let waiting = press(in_folder(1, 2, 1), Button::Confirm);
+        assert!(!waiting.library_browse.is_idle());
+
+        assert_eq!(
+            press(waiting, Button::Next).selection,
+            waiting.selection,
+            "the cursor cannot move off the rows being replaced"
+        );
+        assert_eq!(
+            press(waiting, Button::Confirm).library_browse,
+            waiting.library_browse,
+            "and no second move starts"
+        );
+        assert_eq!(
+            press(waiting, Button::PagePrevious).library_menu,
+            LibraryMenu::None,
+            "nor does the actions sheet"
+        );
+
+        let left = press(waiting, Button::Back);
+        assert_eq!(left.view, AppView::Home);
+        assert!(
+            left.library_browse.is_idle(),
+            "leaving drops the claim to the answer"
+        );
+    }
+
+    /// The answer to a move nobody is waiting on any more changes nothing.
+    #[test]
+    fn a_move_walked_away_from_settles_on_nobody() {
+        let waiting = press(in_folder(1, 2, 1), Button::Confirm);
+        let left = press(waiting, Button::Back);
+        let late = left.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: Some(1),
+                browse_epoch: EPOCH,
+                depth: 4,
+                count: 9,
+                books: 9,
+                selection: 8,
+            },
+        );
+        assert_eq!(late.view, AppView::Home);
+        assert_eq!(late.library_depth, left.library_depth);
+        assert_eq!(late.library_count, left.library_count);
+    }
+
+    /// A relist nobody asked for, which a scan produces, is adopted only
+    /// when nothing is in flight.
+    #[test]
+    fn an_unsolicited_listing_yields_to_a_move() {
+        let unsolicited = LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: EPOCH,
+            depth: 0,
+            count: 5,
+            books: 4,
+            selection: 0,
+        };
+
+        let idle = in_folder(1, 2, 1).apply_library_event(CTX, unsolicited);
+        assert_eq!((idle.library_count, idle.library_books), (5, 4));
+        assert_eq!(idle.library_depth, 0);
+
+        let waiting = press(in_folder(1, 2, 1), Button::Confirm);
+        let held = waiting.apply_library_event(CTX, unsolicited);
+        assert_eq!(
+            (held.library_count, held.library_books),
+            (waiting.library_count, waiting.library_books),
+            "a move still resolving is not overwritten by a relist",
+        );
+        assert!(!held.library_browse.is_idle());
+    }
+
+    /// A card that answered the scan and then would not answer for the rows
+    /// is not a card with no books on it. The reader is at the root with
+    /// nothing loaded either way; what the screen says about it differs, and
+    /// the count alone cannot carry that.
+    #[test]
+    fn an_unreadable_library_is_not_an_empty_one() {
+        let listed = in_library(2, 5).apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH,
+                depth: 0,
+                count: 0,
+                books: 0,
+                selection: 0,
+            },
+        );
+        let unreadable = in_library(2, 5).apply_library_event(
+            CTX,
+            LibraryEvent::LibraryUnreadable {
+                browse_epoch: EPOCH,
+            },
+        );
+        assert_eq!(
+            (listed.library_count, listed.library_depth),
+            (unreadable.library_count, unreadable.library_depth),
+            "both leave the reader at the root with nothing loaded",
+        );
+        assert_eq!(unreadable.selection, 0);
+        assert!(unreadable.library_browse.is_idle());
+    }
+
+    /// A move is doomed by the storage task being repositioned, not by the
+    /// catalog being replaced. The two come apart: a scan whose recovery is
+    /// unfinished declines to rebuild the catalog, so its epoch stands, and
+    /// goes back to the library root anyway. A move issued in the folder that
+    /// scan just left would be read against the root if it were allowed to
+    /// run, where the same row number names a different child of a different
+    /// place.
+    #[test]
+    fn an_unreadable_library_overrules_a_move_from_the_position_it_left() {
+        let mut at = in_folder(1, 2, 1);
+        at.library_browse_epoch = EPOCH;
+        let moving = press(at, Button::Confirm);
+        assert_eq!(moving.library_browse.browse_epoch(), Some(EPOCH));
+
+        let newer = moving.apply_library_event(
+            CTX,
+            LibraryEvent::LibraryUnreadable {
+                browse_epoch: EPOCH + 1,
+            },
+        );
+        assert!(
+            newer.library_browse.is_idle(),
+            "the move was issued somewhere the storage task is not any more",
+        );
+        assert_eq!(newer.library_depth, 0);
+        assert_eq!(newer.library_count, 0);
+        assert_eq!(newer.library_browse_epoch, EPOCH + 1);
+
+        // A report from the position the move was issued in leaves it alone,
+        // because it can still land there.
+        let same = moving.apply_library_event(
+            CTX,
+            LibraryEvent::LibraryUnreadable {
+                browse_epoch: EPOCH,
+            },
+        );
+        assert!(!same.library_browse.is_idle());
+        assert_eq!(same.library_depth, moving.library_depth);
+    }
+
+    /// The whole sequence, with the catalog deliberately held still: a move
+    /// pressed in a folder, a scan that rebuilds nothing but repositions to
+    /// the root, and the move's own refusal arriving afterwards. Both ends
+    /// have to finish at the root.
+    #[test]
+    fn a_scan_that_only_repositions_still_dooms_a_move() {
+        let mut at = in_folder(1, 2, 1);
+        at.library_browse_epoch = EPOCH;
+        let moving = press(at, Button::Confirm);
+        let outstanding = moving.library_browse.request_id().expect("a move is out");
+
+        // The catalog is untouched, so `Scanned` carries the epoch it always
+        // had. It settles nothing on its own.
+        let scanned = moving.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: EPOCH,
+            },
+        );
+        assert!(!scanned.library_browse.is_idle());
+
+        let relisted = scanned.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH + 1,
+                depth: 0,
+                count: 4,
+                books: 4,
+                selection: 0,
+            },
+        );
+        assert!(
+            relisted.library_browse.is_idle(),
+            "the reposition doomed the move even though the catalog stood still",
+        );
+        assert_eq!(relisted.library_depth, 0);
+
+        // And the doomed move's refusal lands on nobody.
+        let refused = relisted.apply_library_event(
+            CTX,
+            LibraryEvent::RowFailed {
+                request_id: outstanding,
+            },
+        );
+        assert_eq!(refused.library_depth, 0);
+        assert_eq!(refused.library_count, 4);
+        assert_eq!(refused.library_browse_epoch, EPOCH + 1);
+    }
+
+    /// A row picked in one folder cannot be spent in another: the command
+    /// carries the position it was picked in, which is what lets the storage
+    /// task refuse it.
+    #[test]
+    fn a_browse_command_carries_the_position_its_row_was_picked_in() {
+        let mut at = in_folder(1, 2, 1);
+        at.library_browse_epoch = EPOCH + 3;
+        let previous = at;
+        let pressed = press(at, Button::Confirm);
+        assert!(matches!(
+            library_browse_command_for_transition(&previous, &pressed),
+            Some(StorageCommand::ChooseLibraryRow { browse_epoch: e, .. }) if e == EPOCH + 3
+        ));
+
+        let leaving = press(at, Button::Back);
+        assert!(matches!(
+            library_browse_command_for_transition(&previous, &leaving),
+            Some(StorageCommand::LeaveLibraryFolder { browse_epoch: e, .. }) if e == EPOCH + 3
+        ));
+    }
+
+    /// A row resolved in a catalog the app has since been told was replaced
+    /// opens nothing. This is the half of the fence that catches the ordering
+    /// where the scan's `Scanned` overtakes the resolution; the other half is
+    /// on the storage side, for the ordering where it does not.
+    #[test]
+    fn a_row_resolved_in_a_replaced_catalog_opens_nothing() {
+        let waiting = press(in_library(1, 3), Button::Confirm);
+        let outstanding = waiting.library_browse.request_id().expect("a move is out");
+        let rebuilt = waiting.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 3,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+
+        let answered = rebuilt.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: outstanding,
+                index: 1,
+                catalog_epoch: EPOCH,
+            },
+        );
+        assert_eq!(
+            answered.view,
+            AppView::Library,
+            "the row number was resolved in a catalog that is gone",
+        );
+        assert_eq!(
+            answered.book_id, rebuilt.book_id,
+            "and the reader is left on the book they were already on",
+        );
+        assert!(answered.library_browse.is_idle(), "and the wait ends");
+
+        // Resolved in the catalog the app holds, it opens as usual.
+        let fresh = rebuilt.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: outstanding,
+                index: 1,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(fresh.view, AppView::Reading);
+        assert_eq!(fresh.book_id, ReaderSource::sd(1).book_id());
+    }
+
+    /// A row that cannot be acted on ends the wait and moves nothing.
+    #[test]
+    fn a_row_that_fails_leaves_the_list_alone() {
+        let waiting = press(in_folder(1, 2, 1), Button::Confirm);
+        let failed = waiting.apply_library_event(CTX, LibraryEvent::RowFailed { request_id: 1 });
+        assert!(failed.library_browse.is_idle());
+        assert_eq!(failed.view, AppView::Library);
+        assert_eq!(failed.selection, waiting.selection);
+        assert_eq!(failed.library_count, waiting.library_count);
+    }
+
+    /// A move the storage queue refused settles here, or the list stays
+    /// frozen on rows nothing is coming to replace.
+    #[test]
+    fn a_move_whose_command_never_left_settles_as_a_standstill() {
+        let waiting = press(in_folder(1, 2, 1), Button::Confirm);
+        assert!(!waiting.library_browse.is_idle());
+
+        let settled = waiting.library_browse_rejected();
+        assert!(settled.library_browse.is_idle());
+        assert_eq!(settled.view, AppView::Library, "nothing moved");
+        assert_eq!(settled.selection, waiting.selection);
+        assert_eq!(settled.library_count, waiting.library_count);
+        // And the list takes presses again.
+        assert_eq!(
+            press(settled, Button::Next).selection,
+            waiting.selection + 1
+        );
+    }
+
+    /// A rescan landing on top of a move: the scan replaces the catalog and
+    /// puts the storage task back at the root, so its relist outranks a move
+    /// issued against the catalog it replaced. Without that, the move can
+    /// only come back refused, and the screen would keep describing a folder
+    /// the storage task has already left while every later command landed on
+    /// the root it is actually in.
+    #[test]
+    fn a_rescan_takes_the_screen_back_from_a_move_it_doomed() {
+        let moving = press(in_folder(1, 2, 1), Button::Confirm);
+        assert_eq!(moving.library_browse.browse_epoch(), Some(EPOCH));
+
+        let scanned = moving.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert!(
+            !scanned.library_browse.is_idle(),
+            "the scan alone does not settle the wait",
+        );
+
+        let relisted = scanned.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH + 1,
+                depth: 0,
+                count: 4,
+                books: 4,
+                selection: 0,
+            },
+        );
+        assert!(
+            relisted.library_browse.is_idle(),
+            "the newer listing cancels the move it doomed",
+        );
+        assert_eq!(relisted.library_depth, 0);
+        assert_eq!((relisted.library_count, relisted.library_books), (4, 4));
+
+        // The doomed move's refusal then lands on nobody, and the screen
+        // still describes the root the storage task is in.
+        let refused = relisted.apply_library_event(CTX, LibraryEvent::RowFailed { request_id: 1 });
+        assert_eq!(refused.library_depth, 0);
+        assert_eq!((refused.library_count, refused.library_books), (4, 4));
+        assert!(refused.library_browse.is_idle());
+    }
+
+    /// A folder is a place, not a book: the per-book actions sheet does not
+    /// open on one.
+    #[test]
+    fn the_actions_sheet_does_not_open_on_a_folder_row() {
+        let on_book = in_folder(1, 2, 1);
+        assert_eq!(
+            press(on_book, Button::PagePrevious).library_menu,
+            LibraryMenu::Sheet { row: 0 }
+        );
+
+        let on_folder = in_folder(2, 2, 1);
+        assert_eq!(
+            press(on_folder, Button::PagePrevious).library_menu,
+            LibraryMenu::None,
+        );
     }
 
     #[test]
@@ -5171,6 +6029,7 @@ mod tests {
         // ways and side-forward wraps, so navigation survives).
         let mut library = press(state, Button::Back);
         library.library_count = 3;
+        library.library_books = 3;
         let next = press(library, Button::PageNext);
         assert_eq!(next.selection, 1);
         let asked = press(next, Button::PagePrevious);
@@ -5251,6 +6110,7 @@ mod tests {
     fn landscape_top_swaps_page_buttons() {
         let mut state = press(ReaderState::boot(), Button::Back);
         state.library_count = 3;
+        state.library_books = 3;
         state.orientation = DisplayOrientation::LandscapeButtonsTop;
 
         let next = press(state, Button::PagePrevious);
@@ -5613,6 +6473,7 @@ mod tests {
                 request_id: 1,
                 book_id: 1,
                 index: 0,
+                catalog_epoch: None,
                 chapter: 0,
                 target_pages: 0,
                 type_settings: TypeSettings::DEFAULT,
@@ -5648,7 +6509,7 @@ mod tests {
             StorageCommand::ClearBookCache {
                 request_id: 1,
                 index: 0,
-                catalog_epoch: 0,
+                browse_epoch: 0,
             },
         ]
     }

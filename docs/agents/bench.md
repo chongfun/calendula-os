@@ -11,9 +11,10 @@ board-specific timing, SD/cache, sleep, and soak questions.
   refresh plan, or queue/coalescing behavior. This needs no hardware.
 - Run short hardware confidence checks before trusting a flashed firmware after
   display flush, input debounce, sleep/power, reader rendering, SD session,
-  section cache, or progress-write changes:
+  section cache, folder browsing, or progress-write changes:
 
 ```sh
+tools/bench/bench.py folder-nav --port /dev/cu.usbmodem101 --entries 20
 tools/bench/bench.py page-turn --port /dev/cu.usbmodem101 --turns 50
 tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 5
 tools/bench/bench.py storage-cache --port /dev/cu.usbmodem101 --reset-before --seconds 20 --strict

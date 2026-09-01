@@ -44,6 +44,9 @@ const HEADING_CX: i16 = 480;
 const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
+/// Room kept at the end of a folder row for its trailing separator, so the
+/// mark that makes it a folder is never the part that gets truncated away.
+const FOLDER_MARK_WIDTH: usize = 16;
 /// Rows the Library list shows at once. Public so the firmware slides the
 /// resident catalog window over the visible range it must stream in. The
 /// portrait page runs the long axis upright, so it seats more rows above
@@ -353,6 +356,8 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     let layout = shell_layout(shell);
+    let in_folder = !shell.library_folder.is_empty();
+    let back_label = if in_folder { "up" } else { "home" };
     // While the actions sheet is up, the rail answers only it: no label
     // may promise an action the press will not take.
     match shell.library_menu {
@@ -367,18 +372,28 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         // promising exactly what will not happen, so only the one that works
         // is drawn; the rest of the rail stays bare for the moment it takes.
         app_core::LibraryMenu::Busy { .. } => {
-            dash_key(fb, layout, 0, "home", false);
+            dash_key(fb, layout, 0, back_label, false);
         }
         // A settled note is dismissed by any press, and that press still
         // acts, so the ordinary rail is honest again.
         app_core::LibraryMenu::Done { .. } | app_core::LibraryMenu::None => {
-            dash_key(fb, layout, 0, "home", false);
+            dash_key(fb, layout, 0, back_label, false);
             dash_key(fb, layout, 1, "open", true);
             dash_key(fb, layout, 2, "previous", false);
             dash_key(fb, layout, 3, "next", false);
         }
     }
-    heading(fb, layout, "Library");
+    // Inside a folder the screen is that folder, and Back is a level rather
+    // than the way out; the rail says which so the label matches the press.
+    heading(
+        fb,
+        layout,
+        if in_folder {
+            shell.library_folder
+        } else {
+            "Library"
+        },
+    );
 
     match shell.library_status {
         UiLibraryStatus::NotScanned | UiLibraryStatus::Scanning => {
@@ -429,15 +444,28 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         if abs == selected_index {
             selection_arrow(fb, layout, y);
         }
-        draw_text_truncated(
-            fb,
-            body,
-            entry,
-            layout.content_x,
-            y,
-            layout.content_width() as usize,
-            false,
-        );
+        // A folder wears a trailing separator, the way it does on a computer.
+        // Shape rather than weight or shade: the panel is one bit deep, and a
+        // reader who cannot pick out a subtle difference still reads a slash.
+        let width = layout.content_width() as usize;
+        let name_width = if entry.is_folder {
+            width.saturating_sub(FOLDER_MARK_WIDTH)
+        } else {
+            width
+        };
+        let drawn =
+            draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false);
+        if entry.is_folder {
+            draw_text_truncated(
+                fb,
+                body,
+                "/",
+                layout.content_x + drawn as i16,
+                y,
+                FOLDER_MARK_WIDTH,
+                false,
+            );
+        }
         y += ROW_STEP;
     }
 
@@ -448,7 +476,7 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         let selected_entry = (shell.selection as usize)
             .checked_sub(window_start)
             .and_then(|offset| shell.library_entries.get(offset))
-            .copied()
+            .map(|entry| entry.name)
             .unwrap_or("this book");
         render_library_sheet(fb, layout, selected_entry, row);
     }
@@ -1236,6 +1264,8 @@ fn fmt_numbered_chapter(number: usize, buf: &mut [u8; 32]) -> &str {
     core::str::from_utf8(&buf[..cursor]).unwrap_or("Chapter")
 }
 
+/// Draws `text` clipped to `max_w`, and reports the width it actually took,
+/// so a caller can put something immediately after it.
 fn draw_text_truncated(
     fb: &mut Framebuffer,
     font: &BitmapFont,
@@ -1244,9 +1274,10 @@ fn draw_text_truncated(
     y: i16,
     max_w: usize,
     white: bool,
-) {
+) -> u16 {
     let text = fit_text(font, text, max_w.min(u16::MAX as usize) as u16);
     draw_text(fb, font, text, x, y, white);
+    measure_text(font, text)
 }
 
 /// Greedy two-line word wrap for the display-face title. Returns the

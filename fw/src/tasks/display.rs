@@ -24,7 +24,7 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Output;
 use proto::nvm::AppStateRecord;
 use reader_cache::store::{
-    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
+    BookLoadStatus, LibraryScanStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
 };
 use reader_cache::{
     READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
@@ -376,7 +376,10 @@ pub async fn run(
                 // Skipped once the sync session is running.
                 if !sync_session.active() {
                     if request.view == AppView::Library {
-                        crate::library_sd::ensure_library_window(
+                        // The list is the folder the reader is in, not a
+                        // window over the flat catalog: slide the page over
+                        // the rows this render will show.
+                        crate::library_sd::ensure_folder_page(
                             &mut epd,
                             &mut sd_cs,
                             sd_library,
@@ -610,6 +613,10 @@ pub async fn run(
                                         &mut last_progress_write,
                                         &mut state_restored,
                                         &mut background_build,
+                                        refresh_planner
+                                            .last_request()
+                                            .map(|last| app_core::is_portrait(last.orientation))
+                                            .unwrap_or(true),
                                     );
                                     sleep.applied();
                                     may_keep_draining = holder().sleep_may_proceed();
@@ -803,13 +810,18 @@ pub async fn run(
                     // too -- otherwise a superseded open would spend a
                     // multi-second full flush painting a plate for a target the
                     // reader has already navigated past, then be skipped.
-                    if refresh_planner.screen_on()
-                        && OpenSequence::begin(
-                            &command,
-                            LATEST_READER_REQUEST_ID.load(Ordering::Relaxed),
-                        )
-                        .is_some()
-                    {
+                    // A fenced-out open begins straight into its refusal, so
+                    // this asks whether the sequence will actually stage a
+                    // book rather than merely whether it begins: a plate for
+                    // an open that is about to be refused would spend a
+                    // multi-second flush on a book nobody opens.
+                    let will_stage = OpenSequence::begin(
+                        &command,
+                        LATEST_READER_REQUEST_ID.load(Ordering::Relaxed),
+                        sd_library.catalog_epoch(),
+                    )
+                    .is_some_and(|open| !matches!(open.next(), OpenAction::Refuse { .. }));
+                    if refresh_planner.screen_on() && will_stage {
                         if let Some(loading_request) = open_loading_plate_request(
                             &command,
                             sd_library,
@@ -855,9 +867,68 @@ pub async fn run(
                         &mut last_progress_write,
                         &mut state_restored,
                         &mut background_build,
+                        refresh_planner
+                            .last_request()
+                            .map(|last| app_core::is_portrait(last.orientation))
+                            .unwrap_or(true),
                     );
                 }
             },
+        }
+    }
+}
+
+/// List the library root again after a scan, and tell the app.
+///
+/// A scan replaces the catalog, and the rows on screen came off the card it
+/// was built from. Nobody pressed anything, so what goes out is unsolicited,
+/// naming the catalog it was taken from. A move already in flight against
+/// that same catalog keeps the screen, since it can still land; a move
+/// against the catalog this scan replaced is overruled, because the reset has
+/// already taken the storage task somewhere else and the move can only come
+/// back refused.
+///
+/// A card that answered the scan and then would not answer for the rows is
+/// reported as unreadable rather than as an empty library. The two look
+/// identical in a row count and are not the same thing: one is a library to
+/// add books to, the other is a library that could not be read, and the
+/// screen says different things about them.
+fn relist_library_folder(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &mut ReaderStore,
+    portrait: bool,
+) {
+    let started = Instant::now();
+    let listed = crate::sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache::browse::relist_root(sd_library, root, portrait)
+    })
+    .ok()
+    .flatten();
+    // Part of what a boot costs, and the one listing nobody pressed for.
+    bench_log!(
+        "bench: folder_relist rows={} ok={} ms={} t_ms={}",
+        listed.map_or(0, |listing| listing.count),
+        listed.is_some(),
+        started.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
+    let browse_epoch = sd_library.browse_epoch();
+    match listed {
+        Some(listing) => send_required_library_event(&LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch,
+            depth: listing.depth,
+            count: listing.count,
+            books: listing.books,
+            selection: listing.selection,
+        }),
+        None => {
+            esp_println::println!("library: the card would not list the root after a scan");
+            // The scan's own verdict stands for the catalog; this one is
+            // about whether the library can be shown at all, and it cannot.
+            sd_library.status = LibraryScanStatus::Error;
+            send_required_library_event(&LibraryEvent::LibraryUnreadable { browse_epoch });
         }
     }
 }
@@ -1168,6 +1239,7 @@ fn handle_storage_command(
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
     background_build: &mut Option<BackgroundBuild>,
+    portrait: bool,
 ) {
     // The session decides what may run: progress writes stay alive during a
     // sync session (they are cheap and harmless); everything
@@ -1269,6 +1341,7 @@ fn handle_storage_command(
                     count,
                     catalog_epoch: sd_library.catalog_epoch(),
                 });
+                relist_library_folder(epd, sd_cs, sd_library, portrait);
             } else {
                 let _ = STORAGE_COMMANDS.try_send(StorageCommand::RefreshCatalog);
             }
@@ -1284,6 +1357,7 @@ fn handle_storage_command(
                 count: sd_library.catalog_count_u16(),
                 catalog_epoch: sd_library.catalog_epoch(),
             });
+            relist_library_folder(epd, sd_cs, sd_library, portrait);
         }
         StorageCommand::OpenBook {
             request_id,
@@ -1302,7 +1376,9 @@ fn handle_storage_command(
             // The transaction's order lives in `OpenSequence` so a host test can
             // drive it against a card model that fails whichever write it likes;
             // this arm supplies a real card and reports back what it did.
-            let Some(mut open) = OpenSequence::begin(&command, latest_request_id) else {
+            let Some(mut open) =
+                OpenSequence::begin(&command, latest_request_id, sd_library.catalog_epoch())
+            else {
                 esp_println::println!(
                     "storage: stale open skipped request={} latest={} book_id={} index={}",
                     request_id,
@@ -1646,7 +1722,7 @@ fn handle_storage_command(
         StorageCommand::ClearBookCache {
             request_id,
             index,
-            catalog_epoch,
+            browse_epoch,
         } => {
             // Deleting a cache dir out from under a background build would
             // leave it writing an index for section files that no longer
@@ -1662,18 +1738,36 @@ fn handle_storage_command(
             if let Some(scratch) = epub_scratch.as_mut() {
                 book_build::clear_build_resume(scratch);
             }
-            // The row was picked against a catalog this task may since have
-            // replaced, which would leave a different book sitting under it.
-            // Refuse rather than guess: the user can pick again from the list
-            // they can actually see.
-            let ok = if catalog_epoch == sd_library.catalog_epoch() {
-                book_build::clear_book_cache(epd, sd_cs, sd_library, index)
+            // The row was picked in a folder this task may since have left,
+            // which would leave a different book sitting under it. Refuse
+            // rather than guess: the user can pick again from the list they
+            // can actually see.
+            //
+            // A Library row is a row of the folder listing, not a catalog
+            // index, so it is resolved the way an open resolves one: by the
+            // identity its locator, root, and size give, which is what the
+            // catalog record was written under. Reading it as a catalog index
+            // would clear whatever book happened to sit at that number.
+            let ok = if browse_epoch == sd_library.browse_epoch() {
+                match reader_cache::browse::row_book(sd_library, index) {
+                    Some((at, locator, size)) => {
+                        let hash = proto::cache::source_hash_at(at, locator.as_str(), size);
+                        match crate::library_sd::find_index_by_identity(
+                            epd, sd_cs, hash, size, false,
+                        ) {
+                            Some(row) => book_build::clear_book_cache(epd, sd_cs, sd_library, row),
+                            None => false,
+                        }
+                    }
+                    // A folder, or a row the resident page does not cover.
+                    None => false,
+                }
             } else {
                 esp_println::println!(
-                    "storage: clear cache index={} stale epoch={} now={}",
+                    "storage: clear cache index={} stale browse epoch={} now={}",
                     index,
-                    catalog_epoch,
-                    sd_library.catalog_epoch()
+                    browse_epoch,
+                    sd_library.browse_epoch()
                 );
                 false
             };
@@ -1684,6 +1778,78 @@ fn handle_storage_command(
                 ok
             );
             send_library_event(&LibraryEvent::CacheCleared { request_id, ok });
+        }
+        StorageCommand::ChooseLibraryRow {
+            request_id,
+            index,
+            browse_epoch,
+        } => {
+            // The row was picked in a folder this task may since have left: a
+            // scan takes browsing back to the root, and the same row number
+            // there names a different child of a different place. Refuse
+            // rather than guess, and the reader picks again from the list
+            // they can see.
+            let choice = if browse_epoch == sd_library.browse_epoch() {
+                crate::library_sd::choose_library_row(epd, sd_cs, sd_library, index, portrait)
+            } else {
+                esp_println::println!(
+                    "storage: choose row={} stale browse epoch={} now={}",
+                    index,
+                    browse_epoch,
+                    sd_library.browse_epoch()
+                );
+                crate::library_sd::RowChoice::Failed
+            };
+            match choice {
+                crate::library_sd::RowChoice::Entered(listing) => {
+                    send_required_library_event(&LibraryEvent::FolderListed {
+                        request_id: Some(request_id),
+                        browse_epoch: sd_library.browse_epoch(),
+                        depth: listing.depth,
+                        count: listing.count,
+                        books: listing.books,
+                        selection: listing.selection,
+                    });
+                }
+                crate::library_sd::RowChoice::Book(index) => {
+                    // Answer and stop. The app owns opening: it commits the
+                    // reader request id a later open is checked against, arms
+                    // the gate that keeps input off the panel until the book
+                    // lands, and keeps the rollback that puts the reader back
+                    // if the command is refused. An open sent from here would
+                    // have none of that, and would carry an id from the browse
+                    // counter that the staleness check reads as old.
+                    send_required_library_event(&LibraryEvent::RowIsBook {
+                        request_id,
+                        index,
+                        catalog_epoch: sd_library.catalog_epoch(),
+                    });
+                }
+                crate::library_sd::RowChoice::Failed => {
+                    send_required_library_event(&LibraryEvent::RowFailed { request_id });
+                }
+            }
+        }
+        StorageCommand::LeaveLibraryFolder {
+            request_id,
+            browse_epoch,
+        } => {
+            let listed = if browse_epoch == sd_library.browse_epoch() {
+                crate::library_sd::leave_library_folder(epd, sd_cs, sd_library, portrait)
+            } else {
+                None
+            };
+            match listed {
+                Some(listing) => send_required_library_event(&LibraryEvent::FolderListed {
+                    request_id: Some(request_id),
+                    browse_epoch: sd_library.browse_epoch(),
+                    depth: listing.depth,
+                    count: listing.count,
+                    books: listing.books,
+                    selection: listing.selection,
+                }),
+                None => send_required_library_event(&LibraryEvent::RowFailed { request_id }),
+            }
         }
         StorageCommand::StoreProgress(record) => {
             let record = record_for_persisted(sd_library, record);

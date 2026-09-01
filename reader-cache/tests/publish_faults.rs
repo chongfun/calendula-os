@@ -1226,3 +1226,312 @@ fn an_unreadable_claim_refuses_adoption_rather_than_granting_it() {
     assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
     assert!(files::open_v2_book_dir(&root, &owner_a).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Moving through the folder tree, against a card that stops answering.
+//
+// The whole contract is one sentence: a move either lands with a page of rows
+// in front of the reader, or browsing is exactly where it was. The app keeps
+// its own depth and rows on that word, so a move that reported success after
+// a read it could not make would leave the two halves describing different
+// folders, with the screen naming one and every later command landing on the
+// other.
+
+/// Descend by long name, since making a directory hands back nothing to
+/// descend through and the alias need not be the name.
+fn open_child<'a>(dir: &Dir<'a>, name: &str) -> Dir<'a> {
+    let entry = upload_store::library::entry_in(dir, name)
+        .expect("read")
+        .expect("present");
+    dir.open_dir(entry.alias).expect("open")
+}
+
+/// A shelf with `Fiction/` under it, holding `books` books.
+fn seed_shelf(root: &Dir<'_>, books: usize) {
+    root.make_dir_in_dir("BOOKS").expect("mkdir");
+    let shelf = open_child(root, "BOOKS");
+    let top = shelf.create_file_in_dir_lfn("Top.epub").expect("create");
+    top.write(b"top").expect("write");
+    top.close().expect("close");
+    shelf.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = open_child(&shelf, "Fiction");
+    for index in 0..books {
+        let file = fiction
+            .create_file_in_dir_lfn(&std::format!("Book {index:03}.epub"))
+            .expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+}
+
+/// At the library root with its listing loaded, which is where every move
+/// below starts.
+fn at_library_root(root: &Dir<'_>) -> Box<ReaderStore> {
+    let mut store = Box::new(ReaderStore::new());
+    reader_cache::browse::list_here(&mut store, root, true).expect("the root lists");
+    store
+}
+
+/// The move that motivated the checkpoint. Every read the move makes is
+/// failed in turn, and each outcome has to be one of exactly two things: the
+/// move landed with the page it was supposed to validate itself against, or
+/// browsing is where it started. The middle case is the bug: a count that
+/// answered, a page that did not, and both halves committed to a folder with
+/// no rows in it.
+#[test]
+fn a_move_either_lands_with_its_rows_or_does_not_move() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 4);
+
+    let folder = {
+        let store = at_library_root(&root);
+        let folder = store.browse().count() - 1;
+        assert_eq!(
+            store.folder_row(folder as usize).map(|row| row.is_dir),
+            Some(true),
+            "the last row is the folder"
+        );
+        folder
+    };
+
+    let mut refusals = 0usize;
+    let mut arrivals = 0usize;
+    for probe in 0..64 {
+        let mut attempt = at_library_root(&root);
+        let was_at = attempt.browse().path().clone();
+        let was_count = attempt.browse().count();
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let outcome = reader_cache::browse::choose_row(&mut attempt, &root, folder, true);
+        disk.fault.fail_read_in.set(None);
+
+        match outcome {
+            reader_cache::browse::RowChoice::Entered(listing) => {
+                arrivals += 1;
+                assert_eq!(attempt.browse().path().as_str(), "Fiction");
+                assert!(listing.count > 0, "probe {probe}: the folder has books");
+                assert!(
+                    !attempt.folder_rows().is_empty(),
+                    "probe {probe}: entered a folder whose page was never read",
+                );
+            }
+            reader_cache::browse::RowChoice::Failed => {
+                refusals += 1;
+                assert_eq!(
+                    attempt.browse().path().as_str(),
+                    was_at.as_str(),
+                    "probe {probe}: a refused move moved anyway",
+                );
+                assert_eq!(attempt.browse().count(), was_count, "probe {probe}");
+            }
+            other => panic!("probe {probe}: {other:?}"),
+        }
+    }
+    assert!(refusals > 0, "no read in the move could be failed");
+    assert!(arrivals > 0, "no read in the move was survivable");
+}
+
+/// The same sweep for Back, whose parent walk spans several pages. A
+/// departure that lands has to have walked the whole parent: one that stopped
+/// early could pass over the very name the cursor was going back to, and
+/// report a shorter folder than the card holds.
+#[test]
+fn a_departure_either_walks_the_whole_parent_or_does_not_move() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    // More books than one page holds, so the parent walk takes several.
+    seed_shelf(&root, 40);
+
+    let (folder, root_rows) = {
+        let store = at_library_root(&root);
+        (store.browse().count() - 1, store.browse().count())
+    };
+
+    let mut refusals = 0usize;
+    let mut arrivals = 0usize;
+    for probe in 0..96 {
+        let mut attempt = at_library_root(&root);
+        assert!(matches!(
+            reader_cache::browse::choose_row(&mut attempt, &root, folder, true),
+            reader_cache::browse::RowChoice::Entered(_)
+        ));
+        let inside = attempt.browse().path().clone();
+        let inside_count = attempt.browse().count();
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let left = reader_cache::browse::leave_folder(&mut attempt, &root, true);
+        disk.fault.fail_read_in.set(None);
+
+        match left {
+            Some(listing) => {
+                arrivals += 1;
+                assert!(attempt.browse().is_root(), "probe {probe}");
+                assert_eq!(
+                    listing.count, root_rows,
+                    "probe {probe}: a departure that landed walked a short parent",
+                );
+                assert_eq!(
+                    listing.selection,
+                    root_rows - 1,
+                    "probe {probe}: and lost the folder it was going back to",
+                );
+            }
+            None => {
+                refusals += 1;
+                assert_eq!(
+                    attempt.browse().path().as_str(),
+                    inside.as_str(),
+                    "probe {probe}: a refused departure left anyway",
+                );
+                assert_eq!(attempt.browse().count(), inside_count, "probe {probe}");
+            }
+        }
+    }
+    assert!(refusals > 0, "no read in the departure could be failed");
+    assert!(arrivals > 0, "no read in the departure was survivable");
+}
+
+/// The relist a scan owes, under the same oracle as a move. A card that
+/// answered the scan and then would not answer for the rows must not come
+/// back looking like a card with no books on it: those are different states,
+/// and the row count alone cannot tell them apart.
+#[test]
+fn a_post_scan_relist_either_lists_or_reports_it_could_not() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 4);
+
+    // What the root really holds, read cleanly.
+    let truth = {
+        let mut store = Box::new(ReaderStore::new());
+        reader_cache::browse::relist_root(&mut store, &root, true).expect("a readable root lists")
+    };
+    assert!(truth.count > 0, "the card has books and a folder on it");
+
+    let mut refusals = 0usize;
+    let mut arrivals = 0usize;
+    for probe in 0..64 {
+        let mut store = Box::new(ReaderStore::new());
+        // Somewhere else entirely, the way a scan finds browsing.
+        reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+        let folder = store.browse().count() - 1;
+        assert!(matches!(
+            reader_cache::browse::choose_row(&mut store, &root, folder, true),
+            reader_cache::browse::RowChoice::Entered(_)
+        ));
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let listed = reader_cache::browse::relist_root(&mut store, &root, true);
+        disk.fault.fail_read_in.set(None);
+
+        match listed {
+            Some(listing) => {
+                arrivals += 1;
+                assert_eq!(
+                    listing, truth,
+                    "probe {probe}: a relist that landed described a different root",
+                );
+                assert!(
+                    !store.folder_rows().is_empty(),
+                    "probe {probe}: listed a root whose page was never read",
+                );
+            }
+            None => {
+                refusals += 1;
+                assert!(
+                    store.browse().is_root(),
+                    "probe {probe}: a scan puts browsing at the root either way",
+                );
+                assert_eq!(
+                    store.browse().count(),
+                    0,
+                    "probe {probe}: a root that could not be read holds no rows",
+                );
+                assert!(store.folder_rows().is_empty(), "probe {probe}");
+            }
+        }
+    }
+    assert!(refusals > 0, "no read in the relist could be failed");
+    assert!(arrivals > 0, "no read in the relist was survivable");
+}
+
+/// The relist retires every row number picked before it, whether or not the
+/// catalog moved. A scan whose recovery is unfinished rebuilds nothing, so
+/// the catalog epoch stands, and browsing goes back to the root anyway: a row
+/// picked in the folder it left names a different child of a different place.
+#[test]
+fn a_relist_retires_the_rows_picked_before_it() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 4);
+
+    let mut store = Box::new(ReaderStore::new());
+    reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+    let before = store.browse_epoch();
+    let catalog_before = store.catalog_epoch();
+
+    let folder = store.browse().count() - 1;
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, folder, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+    assert_eq!(
+        store.browse_epoch(),
+        before,
+        "a move the reader asked for is not a reposition",
+    );
+
+    reader_cache::browse::relist_root(&mut store, &root, true).expect("root lists");
+    assert!(store.browse().is_root());
+    assert_ne!(
+        store.browse_epoch(),
+        before,
+        "the reposition retires the rows the reader was looking at",
+    );
+    assert_eq!(
+        store.catalog_epoch(),
+        catalog_before,
+        "and it does so without the catalog having moved at all",
+    );
+}
+
+/// A failed relist retires them too: it has left the folder either way, so a
+/// row picked there is just as stale.
+#[test]
+fn a_relist_that_could_not_read_still_retires_them() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 4);
+
+    let mut refused = 0usize;
+    for probe in 0..64 {
+        let mut store = Box::new(ReaderStore::new());
+        reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+        let folder = store.browse().count() - 1;
+        assert!(matches!(
+            reader_cache::browse::choose_row(&mut store, &root, folder, true),
+            reader_cache::browse::RowChoice::Entered(_)
+        ));
+        let before = store.browse_epoch();
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let listed = reader_cache::browse::relist_root(&mut store, &root, true);
+        disk.fault.fail_read_in.set(None);
+
+        assert_ne!(
+            store.browse_epoch(),
+            before,
+            "probe {probe}: the folder was left whether or not the root read",
+        );
+        if listed.is_none() {
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "no read in the relist could be failed");
+}

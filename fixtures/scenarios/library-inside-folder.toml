@@ -1,0 +1,34 @@
+# Inside a folder: the screen is named for the folder rather than for the
+# library, and the back key says "up" because that is what it does here.
+# The cursor sits on the folder row this listing came from.
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 5
+
+[[steps]]
+library = "FolderListed"
+count = 5
+books = 3
+depth = 0
+
+# Onto the first folder row, then into it.
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Library"
+selection = 0
+library_count = 4

@@ -743,54 +743,264 @@ where
     }
 }
 
-/// How many books and folders a directory shows.
+/// Which of a folder's children a listing is asking about.
 ///
-/// Counts by walking, since the answer is what [`for_each_child`] would hand
-/// over and no total is stored anywhere.
-pub fn count_children<D, T, const MD: usize, const MF: usize, const MV: usize>(
-    root: &Directory<'_, D, T, MD, MF, MV>,
-    path: &LibraryPath,
-) -> Result<Option<usize>, InstallError>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let mut seen = 0usize;
-    let listed = for_each_child(root, path, |_| {
-        seen += 1;
-        ControlFlow::Continue(())
-    })?;
-    Ok(listed.map(|()| seen))
+/// A screen orders the two apart, so it also counts and pages them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Book,
+    Folder,
 }
 
-/// Fill `window` with the children after `skip`, and say how many landed.
+impl Kind {
+    /// Whether `child` is of this kind.
+    const fn holds(self, child: &Child) -> bool {
+        match self {
+            Self::Book => !child.is_dir,
+            Self::Folder => child.is_dir,
+        }
+    }
+}
+
+/// How many books and how many folders a directory shows, in that order.
 ///
-/// What a screen of rows needs. The walk stops once the window is full, so
-/// showing the first page of a large folder does not read the rest of it.
-pub fn page_children<D, T, const MD: usize, const MF: usize, const MV: usize>(
-    root: &Directory<'_, D, T, MD, MF, MV>,
+/// Counts by walking, since the answer is what [`for_each_child`] would hand
+/// over and no total is stored anywhere. Both come from one walk: a caller
+/// showing books above folders needs the split to know which row is which,
+/// and asking twice would read the directory twice to learn one number.
+pub fn count_children_split<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    library: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,
-    skip: usize,
-    window: &mut [Child],
+) -> Result<Option<(usize, usize)>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut books = 0usize;
+    let mut folders = 0usize;
+    let listed = for_each_child(library, path, |child| {
+        if child.is_dir {
+            folders += 1;
+        } else {
+            books += 1;
+        }
+        ControlFlow::Continue(())
+    })?;
+    Ok(listed.map(|()| (books, folders)))
+}
+
+/// How many books and folders a directory shows, together.
+pub fn count_children<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    library: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
 ) -> Result<Option<usize>, InstallError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    Ok(count_children_split(library, path)?.map(|(books, folders)| books + folders))
+}
+
+/// One row of the Library listing: a child, and which root its locator is
+/// relative to.
+///
+/// The root travels with the row because the library root's own listing shows
+/// two of them at once. A locator alone cannot say which, by design: it is
+/// relative to a root rather than absolute, so the pair is the address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LibraryRow {
+    pub child: Child,
+    pub at: BookRoot,
+}
+
+/// How many rows of each kind a library listing shows, in the order it shows
+/// them: the shelf's books, then the card root's, then the shelf's folders.
+///
+/// Card-root books appear only in the library root's own listing. Nothing
+/// nests at the card root by contract, so there is no folder there to descend
+/// into and no deeper listing that could hold one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowCounts {
+    pub shelf_books: usize,
+    pub root_books: usize,
+    pub shelf_folders: usize,
+}
+
+impl RowCounts {
+    pub const fn total(self) -> usize {
+        self.shelf_books + self.root_books + self.shelf_folders
+    }
+
+    /// Rows below this are books, rows from here on are folders.
+    pub const fn books(self) -> usize {
+        self.shelf_books + self.root_books
+    }
+}
+
+/// Count the card-root books, which are the library's oldest half: loose
+/// EPUBs copied on before the shelf existed. Folders there are not counted,
+/// because nothing nests at the card root and the catalog scan does not look.
+fn count_root_books<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+) -> Result<usize, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut books = 0usize;
+    let listed = for_each_child(card_root, &LibraryPath::root(), |child| {
+        if !child.is_dir {
+            books += 1;
+        }
+        ControlFlow::Continue(())
+    })?;
+    Ok(listed.map_or(0, |()| books))
+}
+
+/// How many rows the Library screen shows for `path`, split by region.
+///
+/// Takes the card's own root and opens the shelf itself, so a caller cannot
+/// hand a library-root-relative locator to the wrong directory. That is the
+/// whole reason this exists rather than the caller composing the pieces: a
+/// locator says which root it belongs to only by being paired with one.
+///
+/// `Ok(None)` is a path that is not a directory under the shelf. A card with
+/// no shelf at all still has a library, made of whatever sits loose at its
+/// root.
+pub fn count_library_rows<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+) -> Result<Option<RowCounts>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let root_books = if path.is_root() {
+        count_root_books(card_root)?
+    } else {
+        0
+    };
+    let Some(shelf) = open_library_root(card_root)? else {
+        return Ok(path.is_root().then_some(RowCounts {
+            shelf_books: 0,
+            root_books,
+            shelf_folders: 0,
+        }));
+    };
+    let Some((shelf_books, shelf_folders)) = count_children_split(&shelf, path)? else {
+        return Ok(None);
+    };
+    Ok(Some(RowCounts {
+        shelf_books,
+        root_books,
+        shelf_folders,
+    }))
+}
+
+/// Fill what is left of `window` from one region, and say how many landed.
+fn fill_region<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+    kind: Kind,
+    at: BookRoot,
+    skip: usize,
+    window: &mut [LibraryRow],
+    filled: &mut usize,
+) -> Result<Option<()>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     let mut seen = 0usize;
-    let mut filled = 0usize;
-    let listed = for_each_child(root, path, |child| {
-        if seen >= skip && filled < window.len() {
-            window[filled] = child.clone();
-            filled += 1;
+    for_each_child(dir, path, |child| {
+        if !kind.holds(child) {
+            return ControlFlow::Continue(());
+        }
+        if seen >= skip && *filled < window.len() {
+            window[*filled].child = child.clone();
+            window[*filled].at = at;
+            *filled += 1;
         }
         seen += 1;
-        if filled == window.len() {
+        if *filled == window.len() {
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
-    })?;
-    Ok(listed.map(|()| filled))
+    })
+}
+
+/// Fill `window` with the Library rows after `skip`, and say how many landed.
+///
+/// The order the screen shows: the shelf's books, then the card root's loose
+/// ones, then the shelf's folders. A reader who made no folders sees the list
+/// they always saw, and one who did sees their books above the folders they
+/// made.
+///
+/// The catalog's order is its own: it takes the card root first and then walks
+/// the shelf. The two are free to differ because a row is resolved to a book
+/// by identity rather than by position, which is the whole reason that
+/// resolution costs a catalog scan instead of an index.
+///
+/// `counts` comes from [`count_library_rows`], read once on entering a folder
+/// rather than per page: it is what tells a row number which region it is in.
+/// A count left over from before the card changed shows a list shifted by the
+/// drift, which the next listing corrects; it cannot name a child that is not
+/// there, since every row still comes from a walk taken now.
+///
+/// One walk per region the window reaches, and no more: a page inside the
+/// first region reads one. That is the price of ordering the regions apart
+/// without storage proportional to the folder, which [`for_each_child`]
+/// deliberately refuses to spend.
+pub fn page_library_rows<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+    counts: RowCounts,
+    skip: usize,
+    window: &mut [LibraryRow],
+) -> Result<Option<usize>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let shelf = open_library_root(card_root)?;
+    let mut filled = 0usize;
+    // The shelf's books, then the card root's, then the shelf's folders. Each
+    // region takes whatever of the skip it covers; what is left over belongs
+    // to the next.
+    let mut at = skip;
+    for (region, kind, root) in [
+        (counts.shelf_books, Kind::Book, BookRoot::Library),
+        (counts.root_books, Kind::Book, BookRoot::CardRoot),
+        (counts.shelf_folders, Kind::Folder, BookRoot::Library),
+    ] {
+        if filled == window.len() {
+            break;
+        }
+        if at >= region {
+            at -= region;
+            continue;
+        }
+        let listed = match root {
+            BookRoot::CardRoot => fill_region(
+                card_root,
+                &LibraryPath::root(),
+                kind,
+                root,
+                at,
+                window,
+                &mut filled,
+            )?,
+            BookRoot::Library => match shelf.as_ref() {
+                Some(shelf) => fill_region(shelf, path, kind, root, at, window, &mut filled)?,
+                None => Some(()),
+            },
+        };
+        if listed.is_none() {
+            return Ok(None);
+        }
+        at = 0;
+    }
+    Ok(Some(filled))
 }
 
 #[cfg(test)]

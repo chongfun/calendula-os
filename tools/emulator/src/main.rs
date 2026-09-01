@@ -232,7 +232,11 @@ pub struct Emulator {
     prev_prestaged: bool,
     sleeping: bool,
     _sd_root: Option<PathBuf>,
-    library_entries: Vec<String>,
+    /// The Library list the scenario is showing: the name of each row and
+    /// whether it is a folder, books first the way the firmware lists them.
+    library_entries: Vec<(String, bool)>,
+    /// The folder being shown, empty at the library root.
+    library_folder: String,
     last_storage: Option<StorageCommand>,
     /// Scenario-driven: leave picked per-book actions unsettled so `Busy`
     /// reaches a frame. Off for interactive use, where a clear that never
@@ -261,6 +265,7 @@ impl Emulator {
             sleeping: false,
             _sd_root: sd_root,
             library_entries: Vec::new(),
+            library_folder: String::new(),
             last_storage: None,
             hold_storage: false,
             sd_reader_status: EmulatedReaderStatus::Empty,
@@ -323,19 +328,120 @@ impl Emulator {
                 }
             }
         }
+        if let Some(command) =
+            app_core::library_browse_command_for_transition(&previous, &self.state)
+        {
+            self.last_storage = Some(command);
+            // The emulated card answers a move at once, the way it answers a
+            // clear: a scenario holding storage is the only way the wait
+            // survives long enough to be drawn.
+            if !self.hold_storage {
+                self.answer_library_move(command);
+            }
+        }
+    }
+
+    /// Stand in for the storage task's half of a move through the tree.
+    ///
+    /// Rows here are synthetic, so what a row *is* comes from the list the
+    /// scenario built: rows below the book count are books, the rest folders.
+    fn answer_library_move(&mut self, command: StorageCommand) {
+        let depth = self.state.library_depth;
+        match command {
+            StorageCommand::ChooseLibraryRow {
+                request_id, index, ..
+            } => match self.library_entries.get(index as usize) {
+                Some((_, true)) => self.library_event(LibraryEvent::FolderListed {
+                    request_id: Some(request_id),
+                    browse_epoch: self.state.library_browse_epoch,
+                    depth: depth.saturating_add(1),
+                    count: 4,
+                    books: 3,
+                    selection: 0,
+                }),
+                // Storage answers the row and stops; the open is the app's,
+                // and `library_event` dispatches it off the transition into
+                // Reading, the same way a keypress into Reading does.
+                Some((_, false)) => self.library_event(LibraryEvent::RowIsBook {
+                    request_id,
+                    index,
+                    catalog_epoch: self.state.catalog_epoch,
+                }),
+                None => self.library_event(LibraryEvent::RowFailed { request_id }),
+            },
+            StorageCommand::LeaveLibraryFolder { request_id, .. } => {
+                self.library_event(LibraryEvent::FolderListed {
+                    request_id: Some(request_id),
+                    browse_epoch: self.state.library_browse_epoch,
+                    depth: depth.saturating_sub(1),
+                    count: self.library_entries.len().min(u16::MAX as usize) as u16,
+                    books: self.library_entries.len().min(u16::MAX as usize) as u16,
+                    selection: 0,
+                })
+            }
+            _ => {}
+        }
     }
 
     pub fn library_event(&mut self, event: LibraryEvent) {
         if let LibraryEvent::Scanned { count, .. } = event {
+            // A scan puts the reader at the library root, with every
+            // catalogued book as a row: the shape of a card with no folders.
+            self.library_entries.clear();
+            self.library_folder.clear();
+            self.library_entries
+                .extend((0..count).map(|index| (format!("SD Book {}", index + 1), false)));
+        }
+        if let LibraryEvent::FolderListed {
+            depth,
+            count,
+            books,
+            ..
+        } = event
+        {
             self.library_entries.clear();
             self.library_entries
-                .extend((0..count).map(|index| format!("SD Book {}", index + 1)));
+                .extend((0..books).map(|index| (format!("SD Book {}", index + 1), false)));
+            self.library_entries.extend(
+                (0..count.saturating_sub(books))
+                    .map(|index| (format!("Folder {}", index + 1), true)),
+            );
+            self.library_folder = if depth > 0 {
+                "Fiction".to_string()
+            } else {
+                String::new()
+            };
         }
         if matches!(event, LibraryEvent::Loaded { .. }) {
             self.sd_reader_status = EmulatedReaderStatus::Ready;
         }
+        let before = self.state;
         self.state = self.state.apply_library_event(self.ctx, event);
+        // A library event can move the reader onto a different book, which
+        // owes an open exactly as a keypress into Reading does.
+        if let Some(command) = storage_command_for_transition(before, self.state) {
+            if matches!(command, StorageCommand::OpenBook { .. }) {
+                self.sd_reader_status = EmulatedReaderStatus::Loading;
+            }
+            self.last_storage = Some(command);
+        }
         self.render(app_core::RenderKind::Page);
+        // A scan says how many books the catalog holds; what the Library
+        // screen shows is a folder listing, which the storage task sends
+        // straight after. Mirrored here so a scripted scan leaves the same
+        // state a real one does.
+        if let LibraryEvent::Scanned { count, .. } = event {
+            self.library_event(LibraryEvent::FolderListed {
+                request_id: None,
+                // A scripted scan repositions to the root, retiring the rows
+                // the reader was looking at, the way a real one does.
+                browse_epoch: self.state.library_browse_epoch.wrapping_add(1),
+                depth: 0,
+                count,
+                books: count,
+                selection: self.state.selection,
+            });
+        }
     }
 
     pub fn sync_event(&mut self, event: app_core::SyncEvent) {
@@ -386,6 +492,8 @@ impl Emulator {
             Some(StorageCommand::LoadChapters { .. }) => Some("LoadChapters"),
             Some(StorageCommand::JumpChapter { .. }) => Some("JumpChapter"),
             Some(StorageCommand::ClearBookCache { .. }) => Some("ClearBookCache"),
+            Some(StorageCommand::ChooseLibraryRow { .. }) => Some("ChooseLibraryRow"),
+            Some(StorageCommand::LeaveLibraryFolder { .. }) => Some("LeaveLibraryFolder"),
             None => None,
         }
     }
@@ -411,7 +519,12 @@ impl Emulator {
             self.fb.clear(true);
             display::render::draw_ascii(&mut self.fb, "OPENING EPUB", 20, 72, false);
         } else {
-            crate::render::render_request(&mut self.fb, request, &self.library_entries);
+            crate::render::render_request(
+                &mut self.fb,
+                request,
+                &self.library_entries,
+                &self.library_folder,
+            );
         }
         let mode = self.refresh_planner.mode_for(request);
         let effective_mode = self
@@ -431,6 +544,7 @@ impl Emulator {
             &mut self.fb,
             self.state.render_request(app_core::RenderKind::Page),
             &self.library_entries,
+            &self.library_folder,
         );
         self.panel
             .flush(
@@ -461,6 +575,9 @@ fn storage_command_for_transition(
         || previous.view != AppView::Reading
     {
         return Some(StorageCommand::OpenBook {
+            // The emulated shelf is one catalog that stands still, so no open
+            // here is fenced to a generation it could fall out of.
+            catalog_epoch: None,
             request_id: 0,
             book_id: next.book_id,
             index,

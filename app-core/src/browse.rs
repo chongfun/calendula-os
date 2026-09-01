@@ -54,8 +54,19 @@ pub struct Browse {
 }
 
 impl Browse {
-    pub fn root() -> Self {
-        Self::default()
+    /// At the library root, with nothing listed yet.
+    ///
+    /// `const` because the firmware holds this inside a store that is all
+    /// zero bytes by construction, so the whole thing lives in `.bss` rather
+    /// than being copied out of flash at boot.
+    pub const fn root() -> Self {
+        Self {
+            path: LibraryPath::root(),
+            selection: 0,
+            count: 0,
+            trail: heapless::Vec::new(),
+            returning: None,
+        }
     }
 
     pub fn path(&self) -> &LibraryPath {

@@ -1,3 +1,4 @@
+use app_core::browse::Browse;
 use app_core::{ReaderSource, MAX_SD_CHAPTERS};
 use display::font::{FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings};
 use heapless::String;
@@ -139,6 +140,48 @@ impl LibraryBookEntry {
     }
 }
 
+/// One row of the resident folder listing the Library screen draws.
+///
+/// The name is the whole component rather than a display-trimmed copy: a row
+/// is what a locator gets built from, and a trimmed name would build a
+/// locator naming nothing. The list truncates it at draw time like any other
+/// label.
+pub struct FolderRow {
+    pub name: String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
+    pub is_dir: bool,
+    /// Bytes, from the directory entry; zero for a folder. Pairs with the
+    /// locator to give a book the identity its catalog row was written under.
+    pub size: u32,
+    /// Which root this row's locator is relative to. The library root shows
+    /// the shelf and the card root's loose books in one list, and a locator
+    /// says which it belongs to only by being paired with one.
+    pub at: proto::library_path::BookRoot,
+}
+
+impl FolderRow {
+    // No `Default`: only ever built as a const array element, which `Default`
+    // cannot do. Same reason as `LibraryBookEntry`.
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        Self {
+            name: String::new(),
+            is_dir: false,
+            size: 0,
+            at: proto::library_path::BookRoot::Library,
+        }
+    }
+}
+
+/// Where browsing was before a move, from [`ReaderStore::browse_checkpoint`].
+///
+/// Opaque and not `Copy`: on any one path it is taken once and either dropped,
+/// when the move landed, or spent restoring, which are the only two things
+/// that may happen to it.
+pub struct BrowseCheckpoint {
+    browse: Browse,
+    counts: upload_store::library::RowCounts,
+}
+
 pub struct ReaderCover<'a> {
     pub width: u16,
     pub height: u16,
@@ -180,6 +223,38 @@ pub struct ReaderStore {
     /// refused once this has moved on. Scrolling the window is not a change:
     /// the same rows still name the same books.
     catalog_epoch: u32,
+    /// Where the reader is in the folder tree, and the rules for moving
+    /// through it. Lives here rather than in `ReaderState` because that is a
+    /// `Copy` struct the reducer duplicates on every input event, and a
+    /// locator plus a returning name is more than four hundred bytes to copy
+    /// per keypress. The display task owns this store, and it already holds
+    /// the catalog window on the same terms.
+    browse: Browse,
+    /// Resident folder listing: `folder_rows[i]` is row `folder_start + i` of
+    /// the folder `browse` is in, for `i < folder_len`. Windowed exactly like
+    /// the catalog above it, and refilled from the card before each Library
+    /// render, so a folder of a thousand children costs the same as a folder
+    /// of ten.
+    folder_rows: [FolderRow; LIBRARY_WINDOW],
+    folder_start: usize,
+    folder_len: usize,
+    /// Bumped every time browsing is repositioned by something other than a
+    /// move the reader asked for, which today means a scan's forced return to
+    /// the library root. Row numbers only address a row within one of these,
+    /// so a command that names a row carries the generation it was picked in
+    /// and is refused once this has moved on.
+    ///
+    /// Held apart from `catalog_epoch` because the two answer different
+    /// questions. That one says whether the catalog was replaced; this one
+    /// says whether the folder a row was counted in is still the folder this
+    /// store is standing in. A scan that declines to rebuild, which is what
+    /// an unfinished recovery leaves, moves the second without the first.
+    browse_epoch: u32,
+    /// How many rows of each region the current listing holds: the shelf's
+    /// books, then the card root's loose ones, then the shelf's folders. The
+    /// screen shows them in that order, so this is what tells a row number
+    /// which region it is in.
+    folder_counts: upload_store::library::RowCounts,
     /// The one book currently being opened/read. Held apart from the list
     /// window so the reading path never depends on where the Library list
     /// happens to be scrolled; `catalog_entry` returns it for `active_index`.
@@ -302,6 +377,16 @@ impl ReaderStore {
             window_start: 0,
             window_len: 0,
             catalog_epoch: 0,
+            browse: Browse::root(),
+            folder_rows: [const { FolderRow::new() }; LIBRARY_WINDOW],
+            folder_start: 0,
+            folder_len: 0,
+            browse_epoch: 0,
+            folder_counts: upload_store::library::RowCounts {
+                shelf_books: 0,
+                root_books: 0,
+                shelf_folders: 0,
+            },
             active_entry: LibraryBookEntry::new(),
             active_root: None,
             active_path: String::new(),
@@ -471,6 +556,11 @@ impl ReaderStore {
         self.window_len = 0;
         self.active_index = None;
         self.current_index = None;
+        // The rows the reader is looking at came off the card the catalog is
+        // being rebuilt from, so they are as stale as it is. Where the reader
+        // is stays: a locator outlives a rescan, and a folder that went away
+        // fails its next listing rather than showing another folder's rows.
+        self.clear_folder_page();
         // Every catalog replacement starts here, so this is the one place the
         // epoch has to move. Wrapping is harmless: a row command in flight
         // across 2^32 catalog rebuilds is not a case worth a wider counter.
@@ -540,6 +630,128 @@ impl ReaderStore {
             label_override,
         );
         self.window_len += 1;
+    }
+
+    /// Where the reader is in the folder tree.
+    pub fn browse(&self) -> &Browse {
+        &self.browse
+    }
+
+    pub fn browse_mut(&mut self) -> &mut Browse {
+        &mut self.browse
+    }
+
+    /// The resident folder listing and its absolute start, for the Library
+    /// view. Mirrors [`ReaderStore::catalog_window`].
+    pub fn folder_rows(&self) -> &[FolderRow] {
+        &self.folder_rows[..self.folder_len]
+    }
+
+    pub fn folder_start(&self) -> usize {
+        self.folder_start
+    }
+
+    /// The generation of the position the resident rows were counted in.
+    pub fn browse_epoch(&self) -> u32 {
+        self.browse_epoch
+    }
+
+    /// Take browsing somewhere the reader did not ask to go, retiring every
+    /// row number picked before it.
+    ///
+    /// Wrapping is harmless: a row command in flight across 2^32 forced
+    /// repositions is not a case worth a wider counter, which is the same
+    /// trade `clear_catalog` makes.
+    pub fn reposition_browse(&mut self) {
+        self.browse.reset();
+        self.set_folder_counts(upload_store::library::RowCounts::default());
+        self.clear_folder_page();
+        self.browse_epoch = self.browse_epoch.wrapping_add(1);
+    }
+
+    /// Where browsing is, kept so a move that fails can be put back.
+    ///
+    /// A move that reports failure means standstill to everything that reads
+    /// it, and the app keeps its own depth and rows on that word. A recovery
+    /// that quietly left this store somewhere else would make the two halves
+    /// describe different folders, with the screen naming one and every later
+    /// command landing on the other. So a move either lands or comes back
+    /// here.
+    pub fn browse_checkpoint(&self) -> BrowseCheckpoint {
+        BrowseCheckpoint {
+            browse: self.browse.clone(),
+            counts: self.folder_counts,
+        }
+    }
+
+    /// Put browsing back where [`ReaderStore::browse_checkpoint`] found it.
+    ///
+    /// The resident rows go rather than being restored with it: they are read
+    /// again on the next render, and what has to come back is the position
+    /// they are read from.
+    pub fn restore_browse(&mut self, point: BrowseCheckpoint) {
+        self.browse = point.browse;
+        self.folder_counts = point.counts;
+        self.clear_folder_page();
+    }
+
+    /// How many rows of each region the current listing holds.
+    pub fn folder_counts(&self) -> upload_store::library::RowCounts {
+        self.folder_counts
+    }
+
+    pub fn set_folder_counts(&mut self, counts: upload_store::library::RowCounts) {
+        self.folder_counts = counts;
+    }
+
+    /// True when the loaded page already covers `[start, start+len)`, so the
+    /// firmware can skip a re-read while scrolling inside it.
+    pub fn folder_covers(&self, start: usize, len: usize) -> bool {
+        self.folder_len > 0
+            && start >= self.folder_start
+            && start + len <= self.folder_start + self.folder_len
+    }
+
+    /// Begin filling a fresh folder page at `start`; `push_folder_row`
+    /// appends.
+    pub fn begin_folder_page(&mut self, start: usize) {
+        self.folder_start = start;
+        self.folder_len = 0;
+    }
+
+    pub fn push_folder_row(
+        &mut self,
+        name: &str,
+        is_dir: bool,
+        size: u32,
+        at: proto::library_path::BookRoot,
+    ) {
+        if self.folder_len >= self.folder_rows.len() {
+            return;
+        }
+        let slot = &mut self.folder_rows[self.folder_len];
+        slot.name.clear();
+        let _ = slot.name.push_str(name);
+        slot.is_dir = is_dir;
+        slot.size = size;
+        slot.at = at;
+        self.folder_len += 1;
+    }
+
+    /// The row at absolute index `index`, or `None` when the resident page
+    /// does not reach it. A press acts through this, so a row the page never
+    /// covered is a press that does nothing rather than one that acts on a
+    /// neighbour.
+    pub fn folder_row(&self, index: usize) -> Option<&FolderRow> {
+        let offset = index.checked_sub(self.folder_start)?;
+        self.folder_rows().get(offset)
+    }
+
+    /// Forget the resident page, without moving where the reader is. The next
+    /// Library render reads the folder again.
+    pub fn clear_folder_page(&mut self) {
+        self.folder_start = 0;
+        self.folder_len = 0;
     }
 
     /// Adopt `index` as the active book whose entry the reading path reads
@@ -1573,6 +1785,97 @@ mod tests {
     extern crate std;
     use super::*;
     use std::boxed::Box;
+
+    /// Invariant: a move that fails leaves browsing exactly where it was.
+    ///
+    /// The failure word every reader of it takes to mean standstill is only
+    /// honest if this holds. Without it the app keeps a depth and a row set
+    /// for one folder while the store sits in another, and every later
+    /// command lands somewhere the screen is not describing.
+    #[test]
+    fn a_restored_checkpoint_puts_browsing_back_exactly() {
+        let mut store = Box::new(ReaderStore::new());
+        store.set_folder_counts(upload_store::library::RowCounts {
+            shelf_books: 2,
+            root_books: 1,
+            shelf_folders: 3,
+        });
+        store.browse_mut().set_count(6);
+        store.browse_mut().move_by(4);
+        store.begin_folder_page(0);
+        store.push_folder_row(
+            "Dune.epub",
+            false,
+            12,
+            proto::library_path::BookRoot::Library,
+        );
+
+        let point = store.browse_checkpoint();
+        let was = (
+            store.browse().path().clone(),
+            store.browse().selection(),
+            store.browse().count(),
+            store.folder_counts(),
+        );
+
+        // Descend, and list the folder that was entered.
+        assert_eq!(
+            store
+                .browse_mut()
+                .choose("Fiction", app_core::browse::Row::Folder),
+            app_core::browse::Chosen::Entered
+        );
+        store.set_folder_counts(upload_store::library::RowCounts {
+            shelf_books: 9,
+            root_books: 0,
+            shelf_folders: 0,
+        });
+        store.browse_mut().set_count(9);
+        assert_ne!(store.browse().path().as_str(), was.0.as_str());
+
+        // The listing fails, so the move is undone.
+        store.restore_browse(point);
+        assert_eq!(store.browse().path().as_str(), was.0.as_str());
+        assert_eq!(store.browse().selection(), was.1);
+        assert_eq!(store.browse().count(), was.2);
+        assert_eq!(store.folder_counts(), was.3);
+        assert!(
+            store.folder_rows().is_empty(),
+            "the rows are read again from the position that came back",
+        );
+    }
+
+    /// Leaving is undone the same way, trail included: a return that could
+    /// not list its parent must not have spent the row it was going back to.
+    #[test]
+    fn a_restored_checkpoint_puts_a_departure_back_too() {
+        let mut store = Box::new(ReaderStore::new());
+        store.browse_mut().set_count(4);
+        store.browse_mut().move_by(2);
+        assert_eq!(
+            store
+                .browse_mut()
+                .choose("Fiction", app_core::browse::Row::Folder),
+            app_core::browse::Chosen::Entered
+        );
+        store.browse_mut().set_count(3);
+        store.browse_mut().move_by(1);
+
+        let point = store.browse_checkpoint();
+        let inside = store.browse().path().clone();
+        assert!(store.browse_mut().leave());
+        assert!(store.browse().is_root());
+
+        store.restore_browse(point);
+        assert_eq!(store.browse().path().as_str(), inside.as_str());
+        assert_eq!(store.browse().selection(), 1);
+        // And leaving still works afterwards, landing on the row it was
+        // entered from: the trail came back with the path.
+        assert!(store.browse_mut().leave());
+        assert!(store.browse().is_root());
+        store.browse_mut().set_count(4);
+        assert_eq!(store.browse().selection(), 2);
+    }
 
     /// Invariant: a trim/restore round trip returns all three arena counters.
     ///
