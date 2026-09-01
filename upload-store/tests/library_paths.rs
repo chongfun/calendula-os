@@ -1119,3 +1119,149 @@ fn an_exact_shelf_file_does_not_hide_a_case_variant_library() {
     );
     assert!(outcome.is_err(), "the mix is a refusal");
 }
+
+/// The tree the depth-first walk tests build under a shelf: books at three
+/// depths, a short-only book, and every kind of entry the walk must skip.
+fn seed_shelf_tree(root: &Dir<'_>) {
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(root, "BOOKS");
+
+    let file = books.create_file_in_dir_lfn("A.epub").expect("create");
+    file.write(b"a").expect("write");
+    file.close().expect("close");
+    let skip = books.create_file_in_dir_lfn("notes.txt").expect("create");
+    skip.write(b"n").expect("write");
+    skip.close().expect("close");
+    let short = books
+        .open_file_in_dir("SHORT.EPU", Mode::ReadWriteCreate)
+        .expect("create");
+    short.write(b"sh").expect("write");
+    short.close().expect("close");
+
+    books.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = child(&books, "Fiction");
+    let dune = fiction.create_file_in_dir_lfn("Dune.epub").expect("create");
+    dune.write(b"du").expect("write");
+    dune.close().expect("close");
+    fiction.make_dir_in_dir_lfn("Classics").expect("mkdir");
+    let classics = child(&fiction, "Classics");
+    let iliad = classics
+        .create_file_in_dir_lfn("Iliad.epub")
+        .expect("create");
+    iliad.write(b"il").expect("write");
+    iliad.close().expect("close");
+
+    books.make_dir_in_dir_lfn(".hidden").expect("mkdir");
+    let hidden = child(&books, ".hidden");
+    let secret = hidden
+        .create_file_in_dir_lfn("Secret.epub")
+        .expect("create");
+    secret.write(b"se").expect("write");
+    secret.close().expect("close");
+
+    books.make_dir_in_dir_lfn("Empty").expect("mkdir");
+}
+
+/// Collect one full walk of the shelf as (locator, size) pairs.
+fn walked_books(root: &Dir<'_>) -> Vec<(String, u32)> {
+    let books = open_library_root(root)
+        .expect("read")
+        .expect("the shelf is there");
+    let mut seen = Vec::new();
+    upload_store::library::for_each_book_depth_first(books, &mut |path, _alias, size| {
+        seen.push((path.as_str().to_string(), size));
+    })
+    .expect("walk");
+    seen
+}
+
+/// Milestone 2's contract: every book below the shelf is found at its full
+/// locator, depth first, a directory's files before its subfolders'
+/// contents, in the order the card stores them, and identically on every
+/// walk, which the scan's fingerprint depends on. Hidden entries, non-EPUBs,
+/// and everything below a hidden folder stay out, exactly as browsing would
+/// leave them out.
+#[test]
+fn the_shelf_walk_finds_every_book_at_its_locator_depth_first() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let root = open_root(&mgr);
+    seed_shelf_tree(&root);
+
+    let seen = walked_books(&root);
+    assert_eq!(
+        seen,
+        vec![
+            ("A.epub".to_string(), 1),
+            ("SHORT.EPU".to_string(), 2),
+            ("Fiction/Dune.epub".to_string(), 2),
+            ("Fiction/Classics/Iliad.epub".to_string(), 2),
+        ],
+        "files before subfolder contents, card order, filters applied",
+    );
+
+    assert_eq!(
+        seen,
+        walked_books(&root),
+        "an unchanged card walks identically"
+    );
+}
+
+/// The walk honors the locator bounds the way browsing does: a book whose
+/// locator would be deeper than MAX_DEPTH is not cataloged, and the folder
+/// that could only hold such books is not even entered.
+#[test]
+fn the_shelf_walk_stops_at_the_locator_depth_floor() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    {
+        let mut dir = child(&root, "BOOKS");
+        // d1 through d8: a folder at every depth the locator rules allow.
+        for depth in 1..=proto::library_path::MAX_DEPTH {
+            let name = format!("d{depth}");
+            dir.make_dir_in_dir_lfn(&name).expect("mkdir");
+            let next = child(&dir, &name);
+            dir = next;
+            if depth == proto::library_path::MAX_DEPTH - 1 {
+                // Depth 8 for the book itself: the deepest legal locator.
+                let book = dir.create_file_in_dir_lfn("Edge.epub").expect("create");
+                book.write(b"edge").expect("write");
+                book.close().expect("close");
+            }
+            if depth == proto::library_path::MAX_DEPTH {
+                // Depth 9 for this one: no legal locator can name it.
+                let book = dir.create_file_in_dir_lfn("Below.epub").expect("create");
+                book.write(b"below").expect("write");
+                book.close().expect("close");
+            }
+        }
+    }
+
+    let seen = walked_books(&root);
+    assert_eq!(
+        seen,
+        vec![("d1/d2/d3/d4/d5/d6/d7/Edge.epub".to_string(), 4)],
+        "the deepest legal book is found and the unreachable one is not",
+    );
+}
+
+/// A card that stops answering mid-walk fails the walk: committing a
+/// catalog missing whatever went unread would hand the orphan sweep every
+/// unread book's caches.
+#[test]
+fn a_walk_the_card_interrupts_is_an_error_not_a_short_catalog() {
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let root = open_root(&mgr);
+    seed_shelf_tree(&root);
+
+    let books = open_library_root(&root)
+        .expect("read")
+        .expect("the shelf is there");
+    disk.fail_reads_from(Some(4));
+    let walked = upload_store::library::for_each_book_depth_first(books, &mut |_, _, _| {});
+    disk.fail_reads_from(None);
+    assert!(walked.is_err(), "an unread subtree must fail the walk");
+}

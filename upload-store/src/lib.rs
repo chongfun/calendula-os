@@ -13,6 +13,12 @@
 //! Books written that way are still on people's cards, so the catalog scan
 //! still falls back to reading their labels, and deleting a book still clears
 //! them. Nothing writes new ones.
+//!
+//! They are filed under the alias alone, which was an identity when every book
+//! the scheme wrote sat directly in one of two directories. It is not one now
+//! that the shelf nests: FAT hands out 8.3 names per directory, so the reader
+//! takes a book's position as well as its alias and answers only where a label
+//! could have been written.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -83,9 +89,19 @@ where
     }
 }
 
-/// Read an uploaded book's stashed label into `out`. Returns false (leaving
-/// `out` untouched) when the book has no sidecar -- i.e. it wasn't uploaded, so
-/// the caller falls back to the file-stem label.
+/// Read the stashed label for the book at `locator` under `at`, whose 8.3
+/// alias is `open_name`, into `out`. Returns false (leaving `out` untouched)
+/// when the book has no sidecar -- i.e. it wasn't uploaded, so the caller falls
+/// back to the file-stem label.
+///
+/// The position is part of the question, not context the caller is trusted to
+/// have checked. A label is filed under the alias alone, and an alias is only
+/// unique within one directory, so the file name it names is only an answer
+/// where the scheme that wrote these could have put a book: directly under the
+/// shelf, or at the card root. A book in a folder a reader made on a computer
+/// is outside that reach ([`shelf_placement`]), and a label matching its alias
+/// belongs to some other file -- one still sitting in the shelf, or one deleted
+/// from a computer, which cannot clear what it left in `LABELS`.
 pub fn read_upload_label<
     D,
     T,
@@ -94,6 +110,8 @@ pub fn read_upload_label<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    at: BookRoot,
+    locator: &str,
     open_name: &str,
     out: &mut String<64>,
 ) -> bool
@@ -101,6 +119,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if shelf_placement(at, locator).is_none() {
+        return false;
+    }
     let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
         return false;
     };

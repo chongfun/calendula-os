@@ -77,12 +77,12 @@ impl Browse {
     /// Tell it how many rows the current folder has, ending a listing.
     ///
     /// A pending return ends here. If [`Browse::note_row`] placed the folder
-    /// that was left, the selection sits where the name was found. Failing
-    /// that, a single row differing only in case is taken, since that is the
-    /// same folder renamed. Two such rows name no folder in particular and are
-    /// declined, as the resolver declines them. Failing all of it, the folder
-    /// is gone and the selection is still the row it was entered from, which
-    /// [`Browse::leave`] set.
+    /// that was left, the selection sits where its name was found, spelled
+    /// exactly as it was on the way in. Failing that, the folder is gone as
+    /// far as browsing can tell, and the selection is still the row it was
+    /// entered from, which [`Browse::leave`] set. A folder renamed under any
+    /// other spelling, case included, is a different locator and takes the
+    /// fallback like any other disappearance.
     ///
     /// Then clamps, because a folder can be listed again after the card
     /// changed underneath, and a selection past the end would open whatever is

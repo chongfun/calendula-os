@@ -44,7 +44,14 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// carry new hashes the old records cannot vouch for, and the orphan sweep
 /// would reclaim them on the next scan. Rejecting v7 forces the rescan that
 /// rewrites records and caches under one derivation.
-pub const CATALOG_VERSION: u8 = 8;
+///
+/// v9 changes no bytes either. It retires v8 snapshots written by the
+/// flat-only scan, which walked just the card root and the shelf's first
+/// level. Boot only rescans when a snapshot fails to load, so a flat v8
+/// catalog would keep serving a library with every nested book missing
+/// until a manual refresh; rejecting it makes the first boot on the
+/// recursive scan list the whole tree.
+pub const CATALOG_VERSION: u8 = 9;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 419;
 /// Byte range of the title field inside a record, exposed so the firmware
@@ -107,6 +114,26 @@ const fn book_root(byte: u8) -> Option<BookRoot> {
         ROOT_CARD => Some(BookRoot::CardRoot),
         _ => None,
     }
+}
+
+/// The most books one catalog can name, because the header counts them in
+/// two bytes.
+pub const CATALOG_MAX_BOOKS: usize = u16::MAX as usize;
+
+/// The header count for a scan that found `books`, or `None` for a card
+/// holding more than this format can name.
+///
+/// Not a clamp, deliberately. A committed catalog is the whole book set: the
+/// list reads no further than the count, and the orphan sweep treats every
+/// identity outside it as garbage. Writing the first
+/// [`CATALOG_MAX_BOOKS`] and calling that a complete catalog would hide the
+/// rest of the library and hand the sweep the caches of books still on the
+/// card, which is the failure
+/// [`encode_catalog_placeholder_header`] exists to prevent for an
+/// interrupted write. A card past the limit is a scan that fails, and a
+/// snapshot that fails to load is a rescan.
+pub fn catalog_count(books: usize) -> Option<u16> {
+    u16::try_from(books).ok()
 }
 
 pub fn encode_catalog_header(count: u16, out: &mut [u8; CATALOG_HEADER_BYTES]) {
@@ -462,6 +489,17 @@ fn fixed_str(bytes: &[u8]) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The count is where a library too large for the format has to stop.
+    /// Clamping here would publish the first 65,535 books as the whole set,
+    /// which hides the rest and tells the orphan sweep that their caches
+    /// belong to nothing.
+    #[test]
+    fn a_library_past_the_count_field_has_no_catalog_rather_than_a_short_one() {
+        assert_eq!(catalog_count(0), Some(0));
+        assert_eq!(catalog_count(CATALOG_MAX_BOOKS), Some(u16::MAX));
+        assert_eq!(catalog_count(CATALOG_MAX_BOOKS + 1), None);
+    }
 
     #[test]
     fn header_roundtrips_and_rejects_other_versions() {

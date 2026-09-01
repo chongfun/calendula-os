@@ -290,9 +290,9 @@ mod tests {
     }
 
     /// Uploads permit a 59-byte stem while `/books/` leaves 52, so two legal
-    /// uploads can agree through the trim. The trimmed path is hashed for
-    /// both catalog identity and cache key, so letting them collide would
-    /// hand two books one cache.
+    /// uploads can agree through the trim. Identity no longer hashes the
+    /// label, so the tag is what keeps two such books apart in the list
+    /// rather than what keeps them out of one cache.
     #[test]
     fn trimmed_paths_stay_distinct_for_distinct_names() {
         let shared = "A".repeat(52);
@@ -306,7 +306,7 @@ mod tests {
         );
         assert_ne!(
             first, second,
-            "names differing only past the trim must not share an identity"
+            "names differing only past the trim must not share a display path"
         );
         assert!(first.len() <= 64 && second.len() <= 64);
         assert!(first.ends_with(".epub") && second.ends_with(".epub"));

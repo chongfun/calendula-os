@@ -14,10 +14,10 @@ use reader_cache::store::{derive_catalog_label, LibraryScanStatus, ReaderStore, 
 pub(crate) use proto::cache::CACHE_ROOT_DIR as CATALOG_ROOT_DIR;
 use proto::cache::CATALOG_FILE;
 use proto::catalog::{
-    catalog_file_len, catalog_identity_staged, catalog_record_identity, decode_catalog_record,
-    encode_catalog_header, encode_catalog_placeholder_header, encode_catalog_record,
-    encode_catalog_title, sort_catalog_identities, stage_catalog_identity, CatalogRecord,
-    CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
+    catalog_count, catalog_file_len, catalog_identity_staged, catalog_record_identity,
+    decode_catalog_record, encode_catalog_header, encode_catalog_placeholder_header,
+    encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
+    CatalogRecord, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
     CATALOG_RECORD_TITLE_OFFSET, CATALOG_TITLE_BYTES,
 };
 use proto::library_path::BookRoot;
@@ -485,8 +485,16 @@ where
     // (SD/FAT flakiness, or a shelf that resolved and then would not open)
     // must fail the walk, or the scan would commit a catalog missing every
     // shelved book and the orphan sweep would reclaim their caches.
+    //
+    // The shelf is walked depth first to any legal locator depth; the card
+    // root deliberately stays flat, since nothing nests there by contract.
     match upload_store::library::open_library_root(root) {
-        Ok(Some(books)) => collect_epubs(&books, "/books/", BookRoot::Library, visit)?,
+        Ok(Some(books)) => {
+            upload_store::library::for_each_book_depth_first(books, &mut |path, alias, size| {
+                visit_located(BookRoot::Library, "/books/", path, alias, size, visit);
+            })
+            .map_err(|_| ())?;
+        }
         Ok(None) => {}
         Err(_) => return Err(()),
     }
@@ -536,9 +544,11 @@ fn fold_walk_entry(
 /// record is 419 bytes since it started carrying a locator and a widened
 /// alias, so the idle 16 KB section arena stages 39 of them per pass:
 /// ordinary libraries still take two walks, a 1,000-book one takes 27. That is the price of nesting until a
-/// derived index earns its place, and it is the number to watch when the walk
-/// itself becomes recursive, since each pass will then descend the tree as
-/// well as re-read it.
+/// derived index earns its place. The walk is depth first over the shelf
+/// now, so each pass descends the tree as well as re-reading it, and
+/// finding each next subfolder re-iterates its parent; a directory with `s`
+/// subfolders is read `s + 1` times per pass. That multiplier is the number
+/// to watch before reaching for the derived index.
 fn write_catalog_streaming<
     D,
     T,
@@ -578,7 +588,18 @@ where
         };
         walk_epubs(root, &mut count)?;
     }
-    let count = counted.min(u16::MAX as usize) as u16;
+    // A card holding more books than the header can count is a failed scan,
+    // not a shortened one. Everything downstream reads a committed catalog as
+    // the whole book set: the list stops at the count, and the orphan sweep
+    // reclaims every cache whose identity is missing from it.
+    let Some(count) = catalog_count(counted) else {
+        esp_println::println!(
+            "sd: {} epub(s) is past the {} this catalog can hold",
+            counted,
+            proto::catalog::CATALOG_MAX_BOOKS
+        );
+        return Err(());
+    };
 
     // Keep the header deliberately invalid while records are being written;
     // the real version and count are committed only after every directory
@@ -879,7 +900,9 @@ where
 /// The list label override for a catalog record, read into `title` in place,
 /// in order of authority: the EPUB title saved in the book's cache when it was
 /// last opened, then the readable filename stashed at upload (for uploads not
-/// yet opened, whose 8.3 name is unreadable). Returns `None` (file-stem
+/// yet opened, whose 8.3 name is unreadable), which only answers for the flat
+/// positions that scheme could write and so passes the record's own position
+/// along. Returns `None` (file-stem
 /// fallback) when neither exists. Resolved once per book at scan time -- the
 /// result persists in the record's title field, so window reads never call
 /// this. Cheap for the common case -- each lookup is a dir open that fails
@@ -918,8 +941,21 @@ where
         )
     });
     if cached_title {
-        Some(title.as_str())
-    } else if upload_store::read_upload_label(root, decoded.upload_alias.as_str(), &mut raw_name) {
+        return Some(title.as_str());
+    }
+    // Same unknown root, same answer: a record this build cannot place has no
+    // position to hand the label reader, and the label is filed under an alias
+    // that only means anything together with one.
+    let labelled = decoded.root.is_some_and(|at| {
+        upload_store::read_upload_label(
+            root,
+            at,
+            decoded.path.as_str(),
+            decoded.upload_alias.as_str(),
+            &mut raw_name,
+        )
+    });
+    if labelled {
         reader_cache::store::derive_catalog_label(raw_name.as_str(), title);
         Some(title.as_str())
     } else {
@@ -1548,15 +1584,55 @@ fn visit_prefixed(
     byte_size: u32,
     visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
 ) {
-    let mut path = String::<64>::new();
-    proto::storage::catalog_display_path(prefix, name, &mut path);
-    // The locator is relative to the root it is stored with, and carries the
-    // name as the card spells it. `path` is only the display label now:
-    // identity and the cache key hash the root and the locator
-    // (`proto::cache::source_hash_at`), so the label is free to trim without
-    // folding two books together.
     let Ok(locator) = proto::library_path::LibraryPath::root().child(name) else {
         return;
     };
-    visit(&path, at, locator.as_str(), open_name, byte_size);
+    let mut rendered = String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
+    let _ = rendered.push_str(open_name);
+    visit_located_rendered(at, prefix, &locator, rendered, byte_size, visit);
+}
+
+/// Report one located book to the scan: the display label, built over the
+/// whole locator so a nested path never passes the legacy position shape
+/// gate, then the visit itself.
+fn visit_located(
+    at: BookRoot,
+    prefix: &str,
+    locator: &proto::library_path::LibraryPath,
+    alias: &embedded_sdmmc::ShortFileName,
+    byte_size: u32,
+    visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
+) {
+    use core::fmt::Write;
+    let mut rendered = String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
+    // Cannot overflow: the buffer is sized for the widest rendered alias.
+    if write!(rendered, "{}", alias).is_err() {
+        return;
+    }
+    visit_located_rendered(at, prefix, locator, rendered, byte_size, visit);
+}
+
+fn visit_located_rendered(
+    at: BookRoot,
+    prefix: &str,
+    locator: &proto::library_path::LibraryPath,
+    rendered_alias: String<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>,
+    byte_size: u32,
+    visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
+) {
+    // The display label covers the whole locator, not just the file name:
+    // identity and the cache key hash the root and locator
+    // (`proto::cache::source_hash_at`), so the label is free to trim, and a
+    // nested label keeps a separator in it, which is what keeps
+    // `legacy_position_cache_key` from ever treating a nested book as a
+    // pre-v8 flat one.
+    let mut path = String::<64>::new();
+    proto::storage::catalog_display_path(prefix, locator.as_str(), &mut path);
+    visit(
+        &path,
+        at,
+        locator.as_str(),
+        rendered_alias.as_str(),
+        byte_size,
+    );
 }

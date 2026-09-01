@@ -561,6 +561,188 @@ impl Default for Child {
     }
 }
 
+/// Hand every book in a directory to `on_book`, in the order the card
+/// stores them, each with its full locator built on `path`.
+///
+/// The same filters as [`for_each_child`]: dot-led names, non-EPUBs, names
+/// the driver could not decode, and any child whose whole locator would be
+/// illegal are all left out, so the catalog can only ever hold what
+/// browsing can reach.
+fn visit_books_in<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+    on_book: &mut impl FnMut(&LibraryPath, &embedded_sdmmc::ShortFileName, u32),
+) -> Result<(), InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut storage = [0u8; LFN_SCAN_BYTES];
+    let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
+    let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
+        if entry.attributes.is_directory() || entry.attributes.is_volume() {
+            return ControlFlow::Continue(());
+        }
+        let mut rendered = heapless::String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
+        if write!(rendered, "{}", entry.name).is_err() {
+            return ControlFlow::Continue(());
+        }
+        let Some(shown) = proto::storage::catalog_scan_name(long, rendered.as_str()) else {
+            return ControlFlow::Continue(());
+        };
+        let Ok(locator) = path.child(shown) else {
+            return ControlFlow::Continue(());
+        };
+        on_book(&locator, &entry.name, entry.size);
+        ControlFlow::Continue(())
+    });
+    walked.map_err(|_| InstallError::Card)
+}
+
+/// The `n`th subfolder of a directory the walk may descend into, as its
+/// component and its alias.
+///
+/// A subfolder qualifies by the listing's own rules: not dot-led, which
+/// also covers the `.` and `..` entries every FAT subdirectory carries, its
+/// name decoded and small enough to be a component, and its whole locator
+/// legal. It must also sit above the depth floor: a folder at the maximum
+/// depth is itself addressable, but nothing inside it can be, so the walk
+/// has no business going in.
+fn nth_walkable_subdir<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+    n: usize,
+) -> Result<
+    Option<(
+        heapless::String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
+        embedded_sdmmc::ShortFileName,
+    )>,
+    InstallError,
+>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut storage = [0u8; LFN_SCAN_BYTES];
+    let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
+    let mut seen: usize = 0;
+    let mut found = None;
+    let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
+        if !entry.attributes.is_directory() || entry.attributes.is_volume() {
+            return ControlFlow::Continue(());
+        }
+        let mut rendered = heapless::String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
+        if write!(rendered, "{}", entry.name).is_err() {
+            return ControlFlow::Continue(());
+        }
+        let shown = match long {
+            // A folder whose long name this build could not decode has no
+            // component, so nothing below it has a locator: skip the
+            // subtree.
+            Some("") => return ControlFlow::Continue(()),
+            Some(long) => long,
+            None => rendered.as_str(),
+        };
+        if proto::storage::is_hidden_entry(shown) {
+            return ControlFlow::Continue(());
+        }
+        let Ok(child) = path.child(shown) else {
+            return ControlFlow::Continue(());
+        };
+        if child.depth() >= proto::library_path::MAX_DEPTH {
+            return ControlFlow::Continue(());
+        }
+        if seen == n {
+            let mut component = heapless::String::new();
+            if component.push_str(shown).is_err() {
+                return ControlFlow::Continue(());
+            }
+            found = Some((component, entry.name));
+            return ControlFlow::Break(());
+        }
+        seen += 1;
+        ControlFlow::Continue(())
+    });
+    if walked.is_err() {
+        return Err(InstallError::Card);
+    }
+    Ok(found)
+}
+
+/// Hand every book below the library root to `on_book`, depth first, a
+/// directory's files before its subfolders' contents, in the order the card
+/// stores them.
+///
+/// One directory handle walks the whole tree: descending through a child's
+/// alias, ascending through the `..` entry every FAT subdirectory carries.
+/// The walk therefore holds one directory slot at any depth and keeps no
+/// per-level name storage; finding the next subfolder re-iterates the
+/// current directory instead, so a directory with `s` subfolders is read
+/// `s + 1` times. The scan's cost model already pays per walk, and this
+/// trades a bounded number of extra block reads for a flat, fixed memory
+/// footprint with no recursion for the stack tooling to lose track of.
+///
+/// The traversal is deterministic for an unchanged card, which the scan's
+/// walk fingerprint depends on.
+///
+/// `library` is consumed: descending mutates the handle, and handing it
+/// back mid-tree would be handing back an arbitrary subfolder.
+///
+/// `Err` is a card that would not answer, anywhere in the tree: a scan must
+/// not commit a catalog missing whatever went unread.
+pub fn for_each_book_depth_first<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    mut library: Directory<'_, D, T, MD, MF, MV>,
+    on_book: &mut impl FnMut(&LibraryPath, &embedded_sdmmc::ShortFileName, u32),
+) -> Result<(), InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut path = LibraryPath::root();
+    // The subfolder ordinal to hunt next, per level below the root. A book
+    // sits at most at MAX_DEPTH, so a descended-into folder sits at most at
+    // MAX_DEPTH - 1 and the root's slot makes the array whole.
+    //
+    // Counted in `usize` rather than something sized to what a directory
+    // ought to hold: nothing here bounds a directory's subfolder count, and
+    // an ordinal that wrapped would send the walk back to the first child
+    // and around that directory forever. Eight words of stack, against a
+    // 128-byte name buffer and a 256-byte path in the same walk.
+    let mut next_child = [0usize; proto::library_path::MAX_DEPTH];
+    let mut level: usize = 0;
+    visit_books_in(&library, &path, on_book)?;
+    loop {
+        match nth_walkable_subdir(&library, &path, next_child[level])? {
+            Some((component, alias)) => {
+                next_child[level] += 1;
+                let child = path.child(component.as_str()).map_err(|_| {
+                    // `nth_walkable_subdir` proved this legal a moment ago,
+                    // so failing here is the card changing under the walk.
+                    InstallError::Card
+                })?;
+                library.change_dir(alias).map_err(|_| InstallError::Card)?;
+                path = child;
+                level += 1;
+                next_child[level] = 0;
+                visit_books_in(&library, &path, on_book)?;
+            }
+            None => {
+                if level == 0 {
+                    return Ok(());
+                }
+                library
+                    .change_dir(embedded_sdmmc::ShortFileName::parent_dir())
+                    .map_err(|_| InstallError::Card)?;
+                let Some(parent) = path.parent() else {
+                    return Err(InstallError::Card);
+                };
+                path = parent;
+                level -= 1;
+            }
+        }
+    }
+}
+
 /// How many books and folders a directory shows.
 ///
 /// Counts by walking, since the answer is what [`for_each_child`] would hand

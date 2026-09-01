@@ -613,10 +613,13 @@ reparse.
 
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
 file names in the firmware path. The library list is a windowed catalog
-snapshot at `/READER/CATALOG.BIN` (v6: `X4CT` magic, u16 book count, 156-byte
+snapshot at `/READER/CATALOG.BIN` (v9: `X4CT` magic, u16 book count, 419-byte
 records). Firmware streams it `LIBRARY_WINDOW` (16) entries at a time instead
 of holding the whole list in RAM, so library size is bounded by the card, and
-only window crossings re-read it. The currently open book sits in a separate
+only window crossings re-read it. That count field is also the library's
+ceiling: 65,535 books. A card holding more fails the scan rather than
+committing the first 65,535 as a complete catalog, since every reader treats a
+committed catalog as the whole book set, the orphan sweep included. The currently open book sits in a separate
 `active_entry` so the reading path never depends on where the list is
 scrolled. On boot/refresh, firmware first loads a window from the cached
 snapshot, then refreshes `/BOOKS` and card-root discovery in a storage
@@ -629,7 +632,12 @@ long name does not fit is presented under its short name, and the sidecar's
 short name (`_BOOK~1.EPU`) no longer carries the dot that identifies it.
 Entries are labeled with the book's real title from its cached
 `BOOK.BIN`, falling back to the stored original-filename label for uploaded
-8.3-named books, then to the prettified file stem. Each fresh catalog write
+8.3-named books, then to the prettified file stem. That label sidecar is filed
+under the 8.3 alias alone, and an alias is only unique inside one directory, so
+it is read only for the two flat positions the upload scheme that wrote it
+could reach: directly under `/BOOKS`, or the card root. A book in a folder a
+reader made on a computer takes the file-stem label instead, rather than a name
+belonging to whichever file the matching alias came from. Each fresh catalog write
 also sweeps `CACHE2` and reclaims caches whose stored source identity no
 longer matches any catalogued book, deleting the data files and the emptied
 directories while leaving the durable state files intact. Files renders the current
