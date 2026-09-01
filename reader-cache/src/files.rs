@@ -279,15 +279,12 @@ where
 /// writer that accepted the cached form could persist a claim about bytes
 /// nobody read.
 ///
-/// Merged rather than replaced, so an absence cannot erase a fact. A witness
-/// that reads the bytes and cannot read the directory entry has a digest and
-/// no chain, and a claim written before the field existed has neither and
-/// may still learn one, so what is already held outranks what a call does
-/// not have.
+/// Merged rather than replaced, so an absence cannot erase a fact: a witness
+/// that read the bytes but not the directory entry has a digest and no
+/// chain, and an older claim has neither and may still learn one.
 ///
-/// No firmware path calls this. It is kept for the identity-authorised
-/// reconciliation that would populate a claim's evidence; on the card today
-/// claims carry none.
+/// No firmware path calls this; claims on the card carry no evidence. Kept
+/// for the identity-authorised reconciliation that would populate it.
 pub fn record_cache_evidence<
     D,
     T,
@@ -329,43 +326,26 @@ where
 }
 
 /// Carry a reading position from the key a book used to have to the key it
-/// has now, on the evidence of the bytes it holds.
+/// has now.
 ///
-/// The digest is a parameter rather than a field of the evidence because it
-/// is required. A chain cannot stand in for it: the claim records a
-/// *historical* cluster, and between two sessions a computer may delete the
-/// book, free its chain, and hand that first cluster to an unrelated file of
-/// the same size. The card is consistent at every instant and the match is
-/// still wrong, so carrying a position on chain evidence alone would move a
-/// durable place onto a different book. The chain narrows candidates; only
-/// the bytes confirm one.
+/// Takes a [`proto::source::SourceDigest`] rather than the cached form so
+/// the caller must have read the destination's bytes. The cached type comes
+/// off a claim and describes a file that may since have changed, so
+/// accepting it would let a caller pass the departed book's own stored
+/// digest and carry a place onto a candidate nobody hashed.
 ///
-/// And a [`proto::source::SourceDigest`] rather than the cached form, which
-/// is the point of the parameter. The cached type is what a claim gives back:
-/// a record that survived whatever happened to the file beside it, fit for
-/// narrowing and not for concluding. Accepting it here would let a caller
-/// hand this function the departed book's own stored digest and carry a
-/// position onto a candidate nobody hashed. Every public way to hold a
-/// `SourceDigest` reads bytes, so the type carries the requirement.
+/// Position only. Pagination is keyed on the locator too, so a move
+/// invalidates it whatever happens here, and rebuilding is cheaper than
+/// shuttling section files during a scan the reader is waiting on.
 ///
-/// The whole repair. The rest of the departed directory is left to whoever
-/// found it: pagination is keyed on the locator too, so a move invalidates it
-/// whatever happens here, and shuttling section files during a scan the
-/// reader is waiting on would spend that wait on artifacts that rebuild
-/// themselves.
+/// The claim lands before the position, because a position in a directory
+/// whose claim did not land cannot be read back. Nothing here deletes the
+/// old copy, so an interruption leaves the place where it was.
 ///
-/// The claim lands before the position does, because without a claim the
-/// position cannot be read back: one written into a directory whose claim did
-/// not land sits on the card unreachable, which is this feature's own failure
-/// mode turned inward. Nothing here deletes the old copy, so an interruption
-/// anywhere leaves the place where it was, for a later attempt to find.
+/// `Ok(false)` is a departed directory with no position to carry.
 ///
-/// Unreachable from the firmware. Nothing on the card may conclude that a
-/// book moved, so nothing calls this; it is kept, and exercised by tests,
-/// for the identity work that will be able to.
-///
-/// `Ok(false)` is a departed directory with no position to carry, which is
-/// most of them.
+/// Unreachable from the firmware, which may not conclude that a book moved.
+/// Kept and tested for the identity work that will be able to.
 pub fn carry_position<
     D,
     T,
@@ -483,28 +463,21 @@ where
 /// dozen.
 pub const CACHE_SWEEP_BATCH: usize = 48;
 
-/// Hand a listing to `on_batch` a batch at a time, until the listing runs
-/// out.
+/// Hand a listing to `on_batch` a batch at a time, until it runs out.
 ///
-/// The batching rule on its own, over a listing it does not know how to
-/// read, so it can be walked at any size without a card. `collect` fills the
-/// batch from a given cursor, and `survives` says whether a name the
-/// callback has seen is still in the listing.
+/// The batching rule over a listing it cannot read, so it can be walked at
+/// any size without a card. `collect` fills a batch from a cursor;
+/// `survives` says whether a name handed over is still listed.
 ///
-/// The cursor counts entries that survived rather than entries handed over.
-/// A caller that removes an entry shortens the listing behind it, and
-/// counting the ones it asked about would step over whatever moved up.
+/// The cursor counts entries that survived, not entries handed over: a
+/// caller that removes one shortens the listing behind it, and counting
+/// what it asked about would step over whatever moved up.
 ///
-/// It walks to the end rather than to a batch count. A cap on batches is a
-/// cap on how far the walk reaches, and one that resets on every call
-/// starves whatever lies past it just as surely as no cursor at all.
-///
-/// Termination does not rest on a count. Each batch either moves the cursor
-/// or shortens the listing, and both are bounded for a caller whose
-/// additions are finite. The one behaviour that defeats that is a listing
-/// that reports an entry gone while still listing it, which would hand the
+/// No cap on batches. Each batch either moves the cursor or shortens the
+/// listing, so it ends, given a caller whose additions are finite. A
+/// listing that reports an entry gone while still listing it would hand the
 /// same names over forever; a batch that neither moved the cursor nor
-/// changed the name it starts with is that, and it stops.
+/// changed its first name is that, and stops.
 pub fn walk_in_batches(
     batch: usize,
     mut collect: impl FnMut(usize, usize, &mut heapless::Vec<heapless::String<8>, CACHE_SWEEP_BATCH>),
@@ -538,19 +511,14 @@ pub fn walk_in_batches(
 
 /// Hand every cache directory name to `on_batch`, a batch at a time.
 ///
-/// The batch size is a memory bound and not a quota. Enumeration has to
-/// restart from the top for each batch, because embedded-sdmmc forbids
-/// opening files while a directory iteration holds the lock and the caller's
-/// whole job is opening files, so the walk carries a cursor of how many
-/// names it has already handed over. Without one it would hand over the same
-/// first names for the life of the card and anything past them would be
-/// unreachable: for the sweep, that is a moved book's directory sitting
-/// unreconciled forever behind directories that are perfectly healthy.
+/// The batching rule is [`walk_in_batches`]; this supplies the card.
+/// Enumeration restarts from the top for each batch, because embedded-sdmmc
+/// forbids opening files while a directory iteration holds the lock and the
+/// caller's whole job is opening files.
 ///
-/// The rule itself is [`walk_in_batches`]; this supplies the card. `batch`
-/// is how many names to hold at once, capped at [`CACHE_SWEEP_BATCH`], and
-/// it is a parameter so the rule can be walked at a size that makes the
-/// number of batches worth counting.
+/// `batch` is how many names to hold at once, capped at
+/// [`CACHE_SWEEP_BATCH`]. It is a parameter so the rule can be walked at a
+/// size that makes the number of batches worth counting.
 pub fn for_each_cache_dir<
     D,
     T,
@@ -737,18 +705,16 @@ pub enum ClaimantPlace {
 /// Whether a cache directory already holds a reading position, asked of the
 /// directory itself rather than of the claim over it.
 ///
-/// The question a carry has to answer before it writes. Overwriting the
-/// position generations destroys whatever is in them, and a claim says
-/// nothing about whether they are empty: a book gets its claim when its
-/// cache is built, long before it has a place to remember, and a carry that
-/// was interrupted leaves a claim standing over generations that were never
-/// written.
+/// The question a carry answers before it writes, since overwriting the
+/// generations destroys whatever is in them. A claim says nothing about
+/// this: a book is claimed when its cache is built, long before it has a
+/// place to remember.
 ///
-/// The ordinary position read collapses a torn record and a card that
-/// stumbled into one absence, and this has to keep them apart, so it reads
-/// the generations itself. A record that answered and was not valid counts
-/// as absent: it holds no place a reader could return to, and treating it
-/// as occupied would strand a destination whose own carry tore half way.
+/// It reads the generations itself, because the ordinary position read
+/// collapses a torn record and a card that stumbled into one absence. A
+/// record that arrived whole and invalid counts as absent: nobody can return
+/// to it, and treating it as occupied would strand a destination whose own
+/// carry tore half way.
 pub fn book_dir_position_presence<
     D,
     T,

@@ -6,19 +6,15 @@
 //! actually answers to, and descend through that. This is the one place that
 //! does it, so callers hold paths rather than scattering LFN scans.
 //!
-//! Matching is exact: a locator names exactly the directory entry it was
-//! obtained from, so a component matches the displayed long name, or the
-//! rendered alias text when there is no long name, byte for byte. The
-//! driver's forgiving name equivalence is deliberately not reproduced;
-//! every divergence between a copy of that rule and the driver itself was a
-//! wrong book, and a durable locator has no business carrying it. A card
-//! holding `Foo.epub` beside `foo.epub` holds two locators, each opening
-//! its own entry.
+//! Matching is exact, per [`LibraryPath`]: a component matches the displayed
+//! long name, or the rendered alias text when there is no long name, byte
+//! for byte. A card holding `Foo.epub` beside `foo.epub` holds two locators,
+//! each opening its own entry.
 //!
 //! The one forgiving lookup left is the shelf: `/BOOKS` is a fixed product
-//! name being discovered, not a locator being resolved, and a computer can
-//! legally leave it spelled `Books`. That rule is plain ASCII case, owned
-//! here, and refuses ambiguity; see [`open_library_root`].
+//! name being discovered rather than a locator being resolved, and a
+//! computer can legally leave it spelled `Books`. Plain ASCII case, owned
+//! here, refusing ambiguity; see [`open_library_root`].
 
 use core::fmt::Write as _;
 use core::ops::ControlFlow;
@@ -363,21 +359,18 @@ where
 ///
 /// The library directory is an entry like any other: a card that spells it
 /// with a long name gives it an alias that is not its name, so opening it by
-/// name misses it. Every path that looks for the shelf goes through here, so
-/// scanning, recovery, and opening agree about whether a card has one. They
-/// disagreed before, and the scan's answer is load-bearing: a library read as
-/// absent is committed as an empty catalog, and the orphan sweep reclaims the
-/// caches of the books it left out.
+/// name misses it. Every path that looks for the shelf comes here, so
+/// scanning, recovery and opening agree about whether a card has one. The
+/// answer is load-bearing, because a library read as absent is committed as
+/// an empty catalog and the orphan sweep then reclaims the caches of every
+/// book it left out.
 ///
-/// `Ok(None)` is a card with no library, which is what a card holding only
-/// loose EPUBs looks like, and also what a lone file sitting where the
-/// library should be looks like. `Err` is a card that would not answer,
-/// which is not the same thing and must not be recorded as one. A card
-/// where the shelf name is contested is also `Err`
-/// ([`InstallError::Ambiguous`]): several case-variant directories with no
-/// exact spelling, or an exact file beside a case-variant directory. A
-/// plausible shelf is not zero shelves, and reading it as zero would commit
-/// the empty catalog this doc warns about.
+/// `Ok(None)` is a card with no library: only loose EPUBs, or a lone file
+/// sitting where the library should be. `Err` is a card that would not
+/// answer, which must not be recorded as the same thing. A contested shelf
+/// name is `Err` too ([`InstallError::Ambiguous`]): several case-variant
+/// directories with no exact spelling, or an exact file beside a
+/// case-variant directory. A plausible shelf is not zero shelves.
 pub fn open_library_root<'a, D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'a, D, T, MD, MF, MV>,
 ) -> Result<Option<Directory<'a, D, T, MD, MF, MV>>, InstallError>
@@ -454,23 +447,14 @@ pub struct Child {
 /// Hand every book and folder in a directory to `on_child`, in the order the
 /// card stores them.
 ///
-/// Order is the card's, and sorting is the caller's: sorting needs storage
-/// proportional to the folder, and this deliberately uses none. Nothing is
-/// collected here, so a folder of a thousand books costs the same as a folder
-/// of ten.
+/// Order is the card's and sorting is the caller's, because sorting needs
+/// storage proportional to the folder and this collects nothing.
 ///
-/// What is left out, and why each:
-///
-/// - anything that is not a directory or an EPUB, by the same rule the catalog
-///   scan uses, so the two agree about what a book is;
-/// - names beginning with a dot, which covers `.` and `..` as well as the
-///   `._name` sidecars a Mac leaves beside every copied file, and which the
-///   catalog scan already skips for the same reason;
-/// - anything with no locator from here, which covers a name the driver could
-///   not decode, a name too long to be a component, and a name that fits while
-///   the path to it does not, because this folder is already at the depth
-///   limit or close to the length one. A book that cannot be named cannot be
-///   opened, and showing it would be a row that does nothing.
+/// Left out: anything that is not a directory or an EPUB, and anything
+/// starting with a dot, both by the rules the catalog scan uses so the two
+/// agree about what a book is. Also anything with no locator from here, a
+/// name the driver could not decode or one the depth and length limits
+/// cannot fit, since a book that cannot be named cannot be opened.
 ///
 /// `Ok(None)` is a path that is not a directory. `Err` is a card that would
 /// not answer.
@@ -673,17 +657,15 @@ where
 /// directory's files before its subfolders' contents, in the order the card
 /// stores them.
 ///
-/// One directory handle walks the whole tree: descending through a child's
-/// alias, ascending through the `..` entry every FAT subdirectory carries.
-/// The walk therefore holds one directory slot at any depth and keeps no
-/// per-level name storage; finding the next subfolder re-iterates the
-/// current directory instead, so a directory with `s` subfolders is read
-/// `s + 1` times. The scan's cost model already pays per walk, and this
-/// trades a bounded number of extra block reads for a flat, fixed memory
-/// footprint with no recursion for the stack tooling to lose track of.
+/// One directory handle walks the whole tree, descending through a child's
+/// alias and ascending through the `..` entry every FAT subdirectory
+/// carries, so the walk holds one slot at any depth and keeps no per-level
+/// storage. Finding the next subfolder re-iterates the current directory, so
+/// one with `s` subfolders is read `s + 1` times: bounded extra block reads
+/// for a flat memory footprint and no recursion.
 ///
-/// The traversal is deterministic for an unchanged card, which the scan's
-/// walk fingerprint depends on.
+/// Deterministic for an unchanged card, which the scan's walk fingerprint
+/// depends on.
 ///
 /// `library` is consumed: descending mutates the handle, and handing it
 /// back mid-tree would be handing back an arbitrary subfolder.
@@ -936,21 +918,17 @@ where
 /// they always saw, and one who did sees their books above the folders they
 /// made.
 ///
-/// The catalog's order is its own: it takes the card root first and then walks
-/// the shelf. The two are free to differ because a row is resolved to a book
-/// by identity rather than by position, which is the whole reason that
-/// resolution costs a catalog scan instead of an index.
+/// The catalog's order is its own, card root first. The two may differ
+/// because a row resolves to a book by where it is rather than by position.
 ///
-/// `counts` comes from [`count_library_rows`], read once on entering a folder
-/// rather than per page: it is what tells a row number which region it is in.
-/// A count left over from before the card changed shows a list shifted by the
-/// drift, which the next listing corrects; it cannot name a child that is not
-/// there, since every row still comes from a walk taken now.
+/// `counts` comes from [`count_library_rows`], read once on entering a
+/// folder rather than per page, and tells a row number which region it is
+/// in. A stale count shows a list shifted by the drift, which the next
+/// listing corrects; it cannot name a child that is not there, since every
+/// row comes from a walk taken now.
 ///
-/// One walk per region the window reaches, and no more: a page inside the
-/// first region reads one. That is the price of ordering the regions apart
-/// without storage proportional to the folder, which [`for_each_child`]
-/// deliberately refuses to spend.
+/// One walk per region the window reaches, which is the price of ordering
+/// regions apart without storage proportional to the folder.
 pub fn page_library_rows<D, T, const MD: usize, const MF: usize, const MV: usize>(
     card_root: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,

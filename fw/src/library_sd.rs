@@ -1049,18 +1049,12 @@ pub(crate) fn ensure_folder_page(
 /// Act on the Library row at `index`: enter a folder, or find the catalog row
 /// that opens a book.
 ///
-/// A book is resolved by where it is rather than by position in the list.
-/// The listing gives the locator, the root it is relative to, and the size
-/// the card holds now, which is exactly the place a catalog record stores,
-/// so [`find_index_by_locator`] answers with the row or refuses. Position
-/// would be cheaper and wrong: it would tie two independent walks' orderings
-/// together as a correctness requirement, and a card edited between them
-/// would open some other book.
-///
-/// By the place and not by the identity derived from it. The identity is 32
-/// bits, two legal locators at one size can collide in them, and a reader
-/// who picked a row has already said which book without any ambiguity to
-/// resolve.
+/// A book is resolved by where it is, through [`find_index_by_locator`].
+/// Position would be cheaper and wrong: it ties two independent walks'
+/// orderings together as a correctness requirement, and a card edited
+/// between them opens some other book. The 32-bit identity derived from the
+/// place would be wrong too, since two legal locators at one size can
+/// collide in it and a reader who picked a row has already said which book.
 #[inline(never)]
 pub(crate) fn choose_library_row(
     epd: &mut Epd,

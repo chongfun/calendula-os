@@ -27,30 +27,22 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// rebuild applies.
 ///
 /// v7 replaces the 8.3 alias and the "which of the two directories" flag
-/// with a root and a locator, because a book can now live at any depth
-/// under the library root and neither field can say where. The root stays a
-/// field rather than a prefix on the locator: a locator is library-root
-/// relative by contract, so spelling the library directory into it would
-/// give one type two coordinate systems. Records grow by the locator's
-/// width, so a scan stages fewer of them per walk; the walk count is what
-/// pays for nesting until a derived index earns its place.
+/// with a root and a locator, since a book can now live at any depth and
+/// neither field can say where. The root stays a separate field because a
+/// locator is library-root relative by contract, and spelling the library
+/// directory into it would give one type two coordinate systems.
 ///
-/// v8 changes no bytes. It retires v7 snapshots whose `source_hash` was
-/// derived from the 64-byte display path rather than from the root plus the
-/// full locator. A nested locator can spend the whole display budget before
-/// the filename, so two books could share a truncated label, and with sizes
-/// equal they shared an identity and a cache. Loading a v7 snapshot under
-/// the new derivation would be worse than a stale label: rebuilt caches
-/// carry new hashes the old records cannot vouch for, and the orphan sweep
-/// would reclaim them on the next scan. Rejecting v7 forces the rescan that
-/// rewrites records and caches under one derivation.
+/// v8 changes no bytes. It retires v7 snapshots whose `source_hash` came
+/// from the 64-byte display path rather than the root plus the full
+/// locator: a nested locator can spend that budget before the filename, so
+/// two books could share a truncated label and, at equal sizes, an identity
+/// and a cache. Rejecting v7 forces the rescan that rewrites records and
+/// caches under one derivation.
 ///
 /// v9 changes no bytes either. It retires v8 snapshots written by the
-/// flat-only scan, which walked just the card root and the shelf's first
-/// level. Boot only rescans when a snapshot fails to load, so a flat v8
-/// catalog would keep serving a library with every nested book missing
-/// until a manual refresh; rejecting it makes the first boot on the
-/// recursive scan list the whole tree.
+/// flat-only scan. Boot rescans only when a snapshot fails to load, so a
+/// flat v8 catalog would keep serving a library with every nested book
+/// missing until a manual refresh.
 pub const CATALOG_VERSION: u8 = 9;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 419;
@@ -331,20 +323,16 @@ impl IdentityScan {
 /// Which catalogued row holds the book at an exact place.
 ///
 /// For a caller that has a locator, which is every caller acting on a row a
-/// reader just picked out of a listing. [`IdentityScan`] is for the other
-/// case, where the only thing that was persisted is a 32-bit identity.
+/// reader just picked. [`IdentityScan`] is for the other case, where the
+/// only persisted thing is a 32-bit identity.
 ///
-/// The distinction is not stylistic. That identity is a lossy projection of
+/// The distinction is not stylistic: that identity is a lossy projection of
 /// this locator, and two legal locators at one size can share it, so
-/// resolving a live row through it turns an unambiguous choice into a
-/// refusal and makes both books unopenable. Reaching for the identity when
-/// the locator is in hand is throwing away the answer and then failing to
-/// guess it.
+/// resolving a live row through it makes both books unopenable.
 ///
-/// The size is matched too, and it is the listing's live size rather than
-/// anything remembered. A record whose size disagrees with the card is a
-/// record written before the file was replaced, and it would open the old
-/// book's metadata over the new book's bytes.
+/// The size matched is the listing's live one. A record that disagrees was
+/// written before the file was replaced, and would open the old book's
+/// metadata over the new book's bytes.
 pub struct LocatorScan<'a> {
     root: BookRoot,
     locator: &'a str,
@@ -419,36 +407,26 @@ pub enum MoveVerdict {
 
 /// Decide from the rows whose bytes agreed with the witness.
 ///
-/// Nothing here concludes that a book moved, and that is the finding rather
-/// than an oversight. A move is a claim about *which copy* a file is, and
-/// every fact this branch can reach speaks about content or about the
-/// filesystem's bookkeeping instead.
+/// Nothing here returns [`MoveVerdict::Moved`], which is the finding rather
+/// than an oversight: a move is a claim about *which copy* a file is, and
+/// neither fact available says that.
 ///
-/// Bytes say which book. One copy of them existing now is not evidence that
-/// it is the copy the reader was in: delete a book that had a twin and
-/// exactly one row agrees, and that row has been sitting there the whole
-/// time with a reading life of its own.
+/// Bytes say which book. Delete a book that had a twin and exactly one row
+/// agrees, and that row has its own reading life.
 ///
-/// The chain says which cluster, and a cluster number is reused. Delete the
-/// book and the chain is freed; a file written afterwards can be handed the
-/// same first cluster, and if it holds the same book's bytes it matches the
-/// claim in both respects while being a file that did not exist when the
-/// claim was written. Equality with a recorded cluster number cannot
-/// distinguish the file that kept it from the file that inherited it,
-/// because a freed cluster carries no record of who held it before.
+/// The chain says which cluster, and clusters are reused. Delete the book
+/// and a file written afterwards can be handed its first cluster; a freed
+/// cluster carries no record of who held it, so equality cannot separate
+/// the file that kept it from the file that inherited it.
 ///
-/// So the chain is refusal-only. It is consulted after the bytes have picked
-/// out a single row, which stops it selecting between two agreeing rows, and
-/// even then it authorises nothing. What it still does is keep an unreadable
-/// answer apart from an answer: a card that would not say leaves the claim
-/// standing, and a card that answered lets it go.
+/// So the chain only refuses. It is consulted after the bytes have picked
+/// out one row, which stops it choosing between two, and there it separates
+/// an unreadable answer from an answer: a card that would not say leaves
+/// the claim standing, one that answered lets it go.
 ///
-/// The missing fact is a durable record of which copy is which, written
-/// before the operation rather than inferred after it. That is the opaque
-/// book identity the Library Identity work owns. Until it exists the answer
-/// for a departed book is that it is gone: its place stays in its old
-/// directory, waiting for the book to come back to where it was, rather than
-/// moving onto a file that cannot be shown to be the same one.
+/// Concluding a move needs a durable record of which copy is which, written
+/// before the operation, which is the opaque book identity the Library
+/// Identity work owns.
 pub fn move_verdict(agreements: &[(u16, ChainMatch)]) -> MoveVerdict {
     match agreements {
         [] => MoveVerdict::Gone,
@@ -465,30 +443,13 @@ pub fn move_verdict(agreements: &[(u16, ChainMatch)]) -> MoveVerdict {
 /// refuses rather than reading all of them.
 pub const MOVE_CANDIDATES_MAX: usize = 4;
 
-/// Which catalogued rows could be the departed book, gathered across the
-/// whole catalog rather than settled by the first row that looks right.
+/// Which catalogued rows could be the departed book.
 ///
-/// Constructed from the witness the departed claim recorded, because the
-/// bytes are what authorises a move and a search without them has no
-/// conclusion to reach. The length comes from the witness for the same
-/// reason: it is the one cheap filter that comes free with the evidence.
-///
-/// It gathers rather than chooses, and the caller reads the bytes of every
-/// row it hands back. That is the whole of the rule, and it is deliberately
-/// less clever than it could be. A claim also records the chain the book
-/// occupied, and a chain looks like it could separate two byte-identical
-/// copies, which a digest cannot. It cannot be trusted to: between two
-/// sessions a computer may delete the book, free that chain, and hand its
-/// first cluster to a file created afterwards. Letting the chain rule other
-/// rows out means the bytes are then read from the one row the chain chose,
-/// and agreeing bytes prove only that the file is a copy, not that it is the
-/// copy whose place is being carried. So a recycled chain could hand a
-/// reader's position to an unrelated duplicate, which is the one outcome
-/// this layer exists to prevent.
-///
-/// Exactly one row whose bytes agree, or nothing. Two are two books that
-/// cannot be told apart, and losing the continuity of a move is the better
-/// half of that trade.
+/// Gathers rather than chooses: the caller reads the bytes of every row it
+/// hands back, and [`move_verdict`] decides. Length is the only filter, and
+/// it comes free with the witness. Narrowing by the claim's recorded chain
+/// would let a recycled cluster rule out the real continuation and leave
+/// the bytes to be read from a stranger.
 pub struct MoveSearch {
     want_bytes: u64,
     found: heapless::Vec<u16, MOVE_CANDIDATES_MAX>,

@@ -15,12 +15,11 @@
 //!   locator that can climb out of the library;
 //! - characters FAT reserves, and control characters, are refused.
 //!
-//! Spelling is preserved exactly, and equality is exact UTF-8 equality:
-//! a locator names exactly the directory entry it was obtained from. FAT's
-//! case-insensitive name equivalence is deliberately not reproduced here or
-//! in the resolver; a locator is where a copy was observed, not an identity,
-//! and sameness across renames belongs to library identity. Nothing in this
-//! layer consults Unicode case mappings.
+//! Spelling is preserved exactly and equality is exact UTF-8 equality, so a
+//! locator names exactly the directory entry it was obtained from. FAT's
+//! case-insensitive equivalence is deliberately not reproduced: a locator is
+//! where a copy was observed rather than an identity, and sameness across
+//! renames belongs to library identity.
 //!
 //! The bounds exist because a locator ends up in fixed-size records. A path
 //! deeper or longer than these is refused rather than truncated, since a
