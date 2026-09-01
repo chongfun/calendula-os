@@ -46,6 +46,13 @@ const PART_START_BLOCK: u32 = 64;
 /// the thing a mismatched file is rejected on.
 const KEY: &str = "TESTBOOK";
 const IDENTITY: (u32, u32) = (0xABCD_1234, 4096);
+/// The owner every keyed access proves itself against; the claim gate is
+/// exercised on its own in the twin tests below.
+const OWNER: proto::cache::CacheOwner<'static> = proto::cache::CacheOwner {
+    key: KEY,
+    root: proto::library_path::BookRoot::Library,
+    locator: "Fiction/Test.epub",
+};
 
 // ---------------------------------------------------------------------------
 // Fault-injecting in-memory block device
@@ -266,7 +273,7 @@ fn write_section(
     // only once a test reached past the first section.
     store.set_cached_spine(section);
     let page_count = store.page_count().min(u16::MAX as usize) as u16;
-    let wrote = files::with_v2_sections_dir(root, KEY, |sections| {
+    let wrote = files::with_v2_sections_dir(root, &OWNER, |sections| {
         let sections = sections.expect("sections dir should exist");
         files::write_v2_section_cache_in(sections, IDENTITY, section, store)
     });
@@ -287,7 +294,7 @@ fn build_book(
     store: &mut ReaderStore,
     sections: usize,
 ) -> Vec<BookV2SectionRecord> {
-    files::ensure_v2_cache_dirs(root, KEY).expect("cache dirs");
+    files::ensure_v2_cache_dirs(root, &OWNER).expect("cache dirs");
     let mut records = Vec::new();
     let mut start_page = 0;
     for n in 0..sections {
@@ -311,7 +318,7 @@ fn sections_still_on_card(root: &Dir<'_>, count: usize) -> bool {
 
 /// Whether one named file exists in the book's `SECTIONS/` directory.
 fn file_in_sections_dir(root: &Dir<'_>, name: &str) -> bool {
-    files::with_v2_sections_dir(root, KEY, |sections| {
+    files::with_v2_sections_dir(root, &OWNER, |sections| {
         let Some(sections) = sections else {
             return false;
         };
@@ -324,7 +331,7 @@ fn file_in_sections_dir(root: &Dir<'_>, name: &str) -> bool {
 /// Put a file that is not one of ours into `SECTIONS/`, to prove the prune
 /// deletes by parsed ordinal rather than by "everything that is here".
 fn write_stray_file(root: &Dir<'_>, name: &str) {
-    files::with_v2_sections_dir(root, KEY, |sections| {
+    files::with_v2_sections_dir(root, &OWNER, |sections| {
         let sections = sections.expect("sections dir should exist");
         let file = sections
             .open_file_in_dir(name, embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
@@ -337,7 +344,7 @@ fn write_stray_file(root: &Dir<'_>, name: &str) {
 /// There is no public writer for it, so this encodes the header and body
 /// directly — which also means the test is pinning the format the loader reads.
 fn write_cover(root: &Dir<'_>) {
-    let dir = files::open_v2_book_dir(root, KEY).expect("book cache dir");
+    let dir = files::open_v2_book_dir(root, &OWNER).expect("book cache dir");
     let file = dir
         .open_file_in_dir(
             CACHE_COVER_FILE,
@@ -397,7 +404,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
     store.set_book_index(pages, false, &records);
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
     assert!(matches!(
-        files::load_v2_section_by_global_page(&root, KEY, IDENTITY, reader_page, &mut store),
+        files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, reader_page, &mut store),
         CacheLoadResult::Hit { .. }
     ));
     assert!(store.covers_global_page(0, reader_page));
@@ -406,7 +413,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
     // The builder borrows the arena for a later section, which is the state a
     // step is in when its final publish runs.
     assert!(matches!(
-        files::load_v2_section_by_global_page(&root, KEY, IDENTITY, builder_page, &mut store),
+        files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, builder_page, &mut store),
         CacheLoadResult::Hit { .. }
     ));
     assert_eq!(
@@ -418,7 +425,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
     disk.fault.fail_write_in.set(Some(0));
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         reader_page,
         &mut store,
@@ -432,7 +439,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
 
     let tail = publish::finish_background_walk(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         reader_page,
         outcome.outcome,
@@ -472,7 +479,7 @@ fn a_failed_first_open_index_write_clears_the_cache_nobody_is_holding() {
 
     disk.fault.fail_write_in.set(Some(0));
     let result = publish::publish_first_open(
-        &root, KEY, IDENTITY, 0, &mut store, &records, pages,
+        &root, &OWNER, IDENTITY, 0, &mut store, &records, pages,
         // A provisional publish carries a non-zero cursor.
         1,
     );
@@ -504,7 +511,7 @@ fn a_section_that_will_not_read_back_marks_the_window_unusable() {
     let records = build_book(&root, &mut store, 2);
     let pages = total_pages(&records);
     assert!(files::write_v2_book_index(
-        &root, KEY, IDENTITY, pages, &records, &store, false, 0,
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
     ));
 
     // Put the store in the state a completed open leaves it. The order is the
@@ -518,7 +525,7 @@ fn a_section_that_will_not_read_back_marks_the_window_unusable() {
     // Baseline: a clean load covers the page.
     assert!(
         matches!(
-            files::load_v2_section_by_global_page(&root, KEY, IDENTITY, 0, &mut store),
+            files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, 0, &mut store),
             CacheLoadResult::Hit { .. }
         ),
         "fixture must be able to load a section, or the negative case below is vacuous"
@@ -534,7 +541,7 @@ fn a_section_that_will_not_read_back_marks_the_window_unusable() {
     // reader's page; that restore is what must fail and be reported.
     disk.fault.fail_read_in.set(Some(0));
     let extended = publish::extend_background_index(
-        &root, KEY, IDENTITY, 1, 2, 0, &mut store, &records, pages,
+        &root, &OWNER, IDENTITY, 1, 2, 0, &mut store, &records, pages,
     );
     assert_eq!(
         extended,
@@ -568,9 +575,9 @@ fn an_index_a_build_abandoned_is_recognisable_as_one() {
 
     // A provisional publish stamps the cursor it will resume from.
     assert!(files::write_v2_book_index(
-        &root, KEY, IDENTITY, pages, &records, &store, true, 7,
+        &root, &OWNER, IDENTITY, pages, &records, &store, true, 7,
     ));
-    let loaded = files::load_v2_book_index(&root, KEY, IDENTITY, &mut store);
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut store);
     assert!(
         matches!(loaded, files::BookIndexLoadResult::Hit { unfinished: true }),
         "an index stamped with a resume cursor must read back as unfinished, got {loaded:?}"
@@ -587,11 +594,11 @@ fn an_index_a_build_abandoned_is_recognisable_as_one() {
     // A completed publish stamps zero, which is what says the missing pages --
     // if any -- are missing for good.
     assert!(files::write_v2_book_index(
-        &root, KEY, IDENTITY, pages, &records, &store, false, 0,
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
     ));
     assert!(
         matches!(
-            files::load_v2_book_index(&root, KEY, IDENTITY, &mut store),
+            files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut store),
             files::BookIndexLoadResult::Hit { unfinished: false }
         ),
         "a finished index must not read back as unfinished"
@@ -618,7 +625,7 @@ fn a_clean_publish_leaves_the_requested_page_resident() {
 
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
-        &root, KEY, IDENTITY, requested, &mut store, &records, pages, false, 0,
+        &root, &OWNER, IDENTITY, requested, &mut store, &records, pages, false, 0,
     );
     assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
@@ -658,7 +665,7 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         0,
         &mut store,
@@ -678,7 +685,7 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         0,
         &mut store,
@@ -721,7 +728,7 @@ fn a_suspended_walk_keeps_the_sections_past_its_frontier() {
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         0,
         &mut store,
@@ -759,7 +766,7 @@ fn the_prune_leaves_names_it_does_not_recognise() {
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         0,
         &mut store,
@@ -808,7 +815,7 @@ fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
     assert!(sections_still_on_card(&root, 5));
 
     disk.fault.fail_write_in.set(Some(0));
-    let removed = files::prune_orphan_sections(&root, KEY, 2);
+    let removed = files::prune_orphan_sections(&root, &OWNER, 2);
 
     assert!(
         file_in_sections_dir(&root, "S000.BIN") && file_in_sections_dir(&root, "S001.BIN"),
@@ -855,7 +862,7 @@ fn a_progressive_first_open_adopts_the_cover() {
 
     store.begin_book_load();
     let result = publish::publish_first_open(
-        &root, KEY, IDENTITY, 0, &mut store, first, pages,
+        &root, &OWNER, IDENTITY, 0, &mut store, first, pages,
         // Non-zero: the walk is coming back for the rest.
         1,
     );
@@ -904,7 +911,7 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
     // the walk has built.
     let published = publish::extend_background_index(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         reader_page,
         // The spine cursor the resume would carry.
@@ -926,7 +933,7 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
     disk.fault.fail_write_in.set(Some(0));
     let refused = publish::extend_background_index(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         reader_page,
         sections as u16,
@@ -948,4 +955,274 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
         store.covers_global_page(0, reader_page),
         "the reader's page must still be resident after the refused write"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Position survival across the v8 re-key
+// ---------------------------------------------------------------------------
+
+/// A card upgraded across catalog v8 holds every inactive book's reading
+/// position under the key pre-v8 firmware derived from the display path.
+/// Position is the one non-rebuildable thing under a key, so the new lookup
+/// must recover it from the old directory; a mutation that drops the legacy
+/// layer resumes every such book at the beginning.
+#[test]
+fn a_position_saved_under_the_old_key_survives_the_re_key() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    // What old firmware left behind: a position under the display-path key.
+    // Seeded through the current writer, whose claim the legacy reader
+    // ignores the way it ignores everything pre-claim firmware did not
+    // write.
+    let display = "/books/dune.epub";
+    let size = 4_096u32;
+    let old_key = proto::cache::legacy_position_cache_key(display, size)
+        .expect("a direct shelf book has a legacy key");
+    let old_owner = proto::cache::CacheOwner {
+        key: old_key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "dune.epub",
+    };
+    files::write_position_file(&root, &old_owner, 17, 3).expect("seed the old position");
+
+    // The book's current key holds nothing yet; the lookup must fall back.
+    let owner = proto::cache::CacheOwner {
+        key: "E0000001",
+        root: proto::library_path::BookRoot::Library,
+        locator: "dune.epub",
+    };
+    assert_eq!(
+        files::read_position_file_or_legacy(&root, &owner, display, size),
+        Some((17, 3)),
+        "an upgrade must not strand the reader's place under the old key"
+    );
+
+    // The next ordinary save lands under the current key, which then wins.
+    files::write_position_file(&root, &owner, 21, 9).expect("save under the current key");
+    assert_eq!(
+        files::read_position_file_or_legacy(&root, &owner, display, size),
+        Some((21, 9)),
+        "a position saved under the current key must shadow the legacy one"
+    );
+
+    // A nested display shape has no legacy key: old firmware could not have
+    // written one, and a lookalike must not adopt the flat book's position.
+    let nested = proto::cache::CacheOwner {
+        key: "E0000002",
+        root: proto::library_path::BookRoot::Library,
+        locator: "fiction/dune.epub",
+    };
+    assert_eq!(
+        files::read_position_file_or_legacy(&root, &nested, "/books/fiction/dune.epub", size),
+        None,
+        "a nested book must not inherit a flat book's old position"
+    );
+}
+
+/// A full-hash twin shares the key, the identity, and therefore every
+/// `(hash, size)` check, so the directory claim is the only thing keeping
+/// it out of the other book's cache. The pair is the verified same-domain
+/// collision from `proto::catalog`'s tests.
+#[test]
+fn a_full_hash_twin_cannot_touch_the_other_books_cache() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let size = 1_234_567u32;
+    let hash = proto::cache::source_hash_at(
+        proto::library_path::BookRoot::Library,
+        "Fiction/zIx6RBhQEK.epub",
+        size,
+    );
+    assert_eq!(
+        hash,
+        proto::cache::source_hash_at(
+            proto::library_path::BookRoot::Library,
+            "Fiction/nTfOyBwYzX.epub",
+            size,
+        ),
+        "the collision this test exists for",
+    );
+    let key = proto::cache::cache_key_from(hash);
+    let owner_a = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/zIx6RBhQEK.epub",
+    };
+    let twin_b = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/nTfOyBwYzX.epub",
+    };
+
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A claims its directory");
+    files::write_position_file(&root, &owner_a, 5, 7).expect("A writes its position");
+
+    // Every hash agrees for B; the claim alone must hold the line, in both
+    // directions.
+    assert!(
+        files::ensure_v2_cache_dirs(&root, &twin_b).is_err(),
+        "the twin cannot claim the directory"
+    );
+    assert!(
+        files::write_position_file(&root, &twin_b, 9, 9).is_err(),
+        "the twin cannot write into it"
+    );
+    assert!(
+        files::open_v2_book_dir(&root, &twin_b).is_none(),
+        "the twin cannot open it, so no artifact under it can load"
+    );
+    assert_eq!(
+        files::read_position_file(&root, &twin_b),
+        None,
+        "the twin reads no position from it"
+    );
+
+    // The owner is untouched by the refusals.
+    assert!(files::open_v2_book_dir(&root, &owner_a).is_some());
+    assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
+}
+
+/// Clearing a book's cache keeps its position, so it must keep the claim
+/// that proves whose position it is: with the claim gone, the surviving
+/// place would read as anyone's, and the full-hash twin would inherit it.
+#[test]
+fn a_cleared_cache_keeps_its_claim_with_its_position() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let size = 1_234_567u32;
+    let hash = proto::cache::source_hash_at(
+        proto::library_path::BookRoot::Library,
+        "Fiction/zIx6RBhQEK.epub",
+        size,
+    );
+    let key = proto::cache::cache_key_from(hash);
+    let owner_a = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/zIx6RBhQEK.epub",
+    };
+    let twin_b = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/nTfOyBwYzX.epub",
+    };
+
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A claims");
+    files::write_position_file(&root, &owner_a, 5, 7).expect("A writes its position");
+    files::empty_cache_dir(&root, key.as_str());
+
+    // The ordinary supported clear ran; the twin still gets nothing.
+    assert_eq!(
+        files::read_position_file(&root, &twin_b),
+        None,
+        "the cleared cache must not surrender A's position to the twin"
+    );
+    assert!(
+        files::write_position_file(&root, &twin_b, 9, 9).is_err(),
+        "nor may the twin adopt the directory"
+    );
+    // A itself still owns the place it kept.
+    assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
+}
+
+/// The sweep releases a departed owner's claim rather than leaving it armed
+/// or deleting it. The evidence keeps naming the owner: the owner returning
+/// resumes its position, while a twin adopting the key knows the surviving
+/// place is not its own and starts clean.
+#[test]
+fn a_released_claim_lets_the_owner_resume_and_a_twin_adopt_clean() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let size = 1_234_567u32;
+    let hash = proto::cache::source_hash_at(
+        proto::library_path::BookRoot::Library,
+        "Fiction/zIx6RBhQEK.epub",
+        size,
+    );
+    let key = proto::cache::cache_key_from(hash);
+    let owner_a = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/zIx6RBhQEK.epub",
+    };
+    let twin_b = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/nTfOyBwYzX.epub",
+    };
+
+    // The owner-returns half: release, then the owner comes back.
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A claims");
+    files::write_position_file(&root, &owner_a, 5, 7).expect("A writes its position");
+    assert!(files::release_book_dir_claim(&root, key.as_str()));
+    assert_eq!(
+        files::read_position_file(&root, &owner_a),
+        Some((5, 7)),
+        "a released claim still names A, so A still reads its place"
+    );
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A reactivates its released claim");
+    assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
+
+    // The twin-adopts half: release again, then the twin takes the key.
+    assert!(files::release_book_dir_claim(&root, key.as_str()));
+    files::ensure_v2_cache_dirs(&root, &twin_b).expect("a released key is adoptable");
+    assert_eq!(
+        files::read_position_file(&root, &twin_b),
+        None,
+        "the adopted directory starts clean: A's place was provably not B's"
+    );
+    files::write_position_file(&root, &twin_b, 9, 9).expect("B owns the key now");
+    assert_eq!(files::read_position_file(&root, &twin_b), Some((9, 9)));
+    // And A is the refused twin from here on.
+    assert!(files::ensure_v2_cache_dirs(&root, &owner_a).is_err());
+}
+
+/// Failing to read WHO.BIN is not evidence that there is no owner: a
+/// transient card error must refuse the writer rather than authorize it to
+/// erase and adopt a directory somebody may hold.
+#[test]
+fn an_unreadable_claim_refuses_adoption_rather_than_granting_it() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let size = 1_234_567u32;
+    let hash = proto::cache::source_hash_at(
+        proto::library_path::BookRoot::Library,
+        "Fiction/zIx6RBhQEK.epub",
+        size,
+    );
+    let key = proto::cache::cache_key_from(hash);
+    let owner_a = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/zIx6RBhQEK.epub",
+    };
+    let twin_b = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/nTfOyBwYzX.epub",
+    };
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A claims");
+    files::write_position_file(&root, &owner_a, 5, 7).expect("A writes its position");
+
+    // Every read from here on fails, wherever in the claim path it lands.
+    disk.fault.fail_read_in.set(Some(0));
+    assert!(
+        files::write_position_file(&root, &twin_b, 9, 9).is_err(),
+        "a card that would not answer authorizes nothing"
+    );
+    disk.fault.fail_read_in.set(None);
+
+    // A's ownership and place survived the twin's faulted attempt.
+    assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
+    assert!(files::open_v2_book_dir(&root, &owner_a).is_some());
 }

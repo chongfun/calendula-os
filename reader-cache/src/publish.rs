@@ -104,7 +104,7 @@ pub fn publish_book_cache<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
+    cache_key: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     requested_global_page: u32,
     library: &mut ReaderStore,
@@ -207,7 +207,7 @@ pub fn publish_first_open<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
+    cache_key: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     requested_global_page: u32,
     library: &mut ReaderStore,
@@ -241,7 +241,7 @@ where
         // truncated one is exactly as unusable and gets the same cleanup.
         BookPublishOutcome::SectionReadFailed => Err(PublishError::SectionRead),
         BookPublishOutcome::IndexWriteFailed => {
-            let _ = files::empty_cache_dir(root, cache_key);
+            let _ = files::empty_cache_dir(root, cache_key.key);
             Err(PublishError::IndexWrite)
         }
     }
@@ -274,7 +274,7 @@ fn restore_reader_page<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
+    cache_key: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     reader_page: u32,
     library: &mut ReaderStore,
@@ -318,7 +318,7 @@ pub fn finish_background_walk<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
+    cache_key: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     reader_page: u32,
     published: BookPublishOutcome,
@@ -395,7 +395,7 @@ pub fn extend_background_index<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
+    cache_key: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     reader_page: u32,
     next_spine: u16,
@@ -475,7 +475,7 @@ pub fn refresh_chapter_tracking<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
+    cache_key: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     global_page: u32,
     library: &mut ReaderStore,

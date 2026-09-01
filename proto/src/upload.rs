@@ -93,17 +93,16 @@ pub fn readable_filename(client_name: &[u8]) -> UploadLabel {
 /// the epub extension and prettify the stem the same way for copied and
 /// uploaded books. Non-injective — distinct filenames can map to the same
 /// label — so identity must come from the sidecar hash, never a label match.
-pub fn derive_catalog_label(display_name: &str, open_name: &str, out: &mut String<64>) {
-    if open_name.eq_ignore_ascii_case("HPMOR.EPU") || open_name.eq_ignore_ascii_case("HPMOR.EPUB") {
-        let _ = out.push_str("Harry Potter and the Methods of Rationality");
-        return;
-    }
-
+pub fn derive_catalog_label(display_name: &str, out: &mut String<64>) {
     let file_name = display_name
         .rsplit('/')
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or(display_name);
+    if file_name.eq_ignore_ascii_case("hpmor.epub") || file_name.eq_ignore_ascii_case("hpmor.epu") {
+        let _ = out.push_str("Harry Potter and the Methods of Rationality");
+        return;
+    }
     let stem = strip_epub_suffix(file_name).unwrap_or(file_name);
     push_pretty_file_stem(stem, out);
     if out.is_empty() {
@@ -475,15 +474,11 @@ mod tests {
     #[test]
     fn catalog_labels_preserve_utf8() {
         let mut label = String::<64>::new();
-        derive_catalog_label(
-            "/books/marigold_wireless_Caf\u{e9}_Test.epub",
-            "X.EPU",
-            &mut label,
-        );
+        derive_catalog_label("/books/marigold_wireless_Caf\u{e9}_Test.epub", &mut label);
         assert_eq!(label, "Marigold Wireless Caf\u{e9} Test");
 
         label.clear();
-        derive_catalog_label("/books/M\u{e4}rchen \u{1f600}.epub", "X.EPU", &mut label);
+        derive_catalog_label("/books/M\u{e4}rchen \u{1f600}.epub", &mut label);
         assert_eq!(label, "M\u{e4}rchen \u{1f600}");
 
         // A stem long enough to hit the 64-byte cap mid-character must stop
@@ -495,7 +490,7 @@ mod tests {
             let _ = long_path.push('\u{1f600}');
         }
         let _ = long_path.push_str(".epub");
-        derive_catalog_label(long_path.as_str(), "X.EPU", &mut label);
+        derive_catalog_label(long_path.as_str(), &mut label);
         assert!(core::str::from_utf8(label.as_bytes()).is_ok());
     }
 
@@ -598,10 +593,10 @@ mod tests {
         // Because of this ambiguity, we cannot safely migrate or overwrite a legacy book
         // based on a normalized label match alone.
         let mut label1 = String::<64>::new();
-        derive_catalog_label("MyCoolBook-One.epub", "MYCOOLBO.EPU", &mut label1);
+        derive_catalog_label("MyCoolBook-One.epub", &mut label1);
 
         let mut label2 = String::<64>::new();
-        derive_catalog_label("MyCoolBook_One.epub", "MYCOOLBO.EPU", &mut label2);
+        derive_catalog_label("MyCoolBook_One.epub", &mut label2);
 
         assert_eq!(label1.as_str(), "MyCoolBook One");
         assert_eq!(label1, label2);

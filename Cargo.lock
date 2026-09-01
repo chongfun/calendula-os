@@ -37,6 +37,8 @@ name = "app-core"
 version = "0.1.0"
 dependencies = [
  "display",
+ "heapless 0.9.3",
+ "proto",
 ]
 
 [[package]]

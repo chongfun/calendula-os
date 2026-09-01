@@ -193,15 +193,13 @@ pub fn ensure_v2_cache_dirs<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR)?;
-    let cache = open_or_make_dir(&cache_root, CACHE_V2_DIR)?;
-    let book = open_or_make_dir(&cache, key)?;
+    let book = claim_v2_book_dir(root, owner).map_err(|_| ())?;
     let _ = open_or_make_dir(&book, CACHE_SECTIONS_DIR)?;
     Ok(())
 }
@@ -239,8 +237,13 @@ fn decode_position(bytes: &[u8]) -> Option<(u16, u32)> {
 }
 
 /// Per-book reading position beside the book's cache records, so
-/// switching books no longer abandons the previous one's place.
-#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
+/// switching books does not abandon the previous one's place.
+///
+/// The error distinguishes a card fault, which is retryable and worth
+/// failing a transaction over, from a foreign active claim, which is
+/// deliberate and durable: while a full-hash twin holds the key this book's
+/// position is unpersistable by design, and blocking every book switch on
+/// that would trade a lost place for a stuck reader.
 pub fn write_position_file<
     D,
     T,
@@ -249,26 +252,84 @@ pub fn write_position_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     chapter: u16,
     screen: u32,
-) -> Result<(), ()>
+) -> Result<(), ClaimDenied>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR)?;
-    let cache = open_or_make_dir(&cache_root, CACHE_V2_DIR)?;
-    let book = open_or_make_dir(&cache, key)?;
+    // Claims: a position write may be the first thing to create the
+    // directory, and a full-hash twin's directory must not take another
+    // book's place in it.
+    let book = claim_v2_book_dir(root, owner)?;
     write_two_generation(
         &book,
         POSITION_GENERATIONS,
         POSITION_DURABLE_MAGIC,
         &encode_position(chapter, screen),
     )
+    .map_err(|_| ClaimDenied::Fault)
+}
+
+/// The position files inside an open book directory.
+fn read_position_in<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<(u16, u32)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut bytes = [0u8; POSITION_BYTES];
+    if read_two_generation(
+        book,
+        POSITION_GENERATIONS,
+        POSITION_DURABLE_MAGIC,
+        &mut bytes,
+    ) {
+        return decode_position(&bytes);
+    }
+    // Legacy single-file fallback, kept readable so an upgrade resumes at
+    // the pre-durable position; the next write lands on the A/B pair.
+    let file = book.open_file_in_dir(POSITION_FILE, Mode::ReadOnly).ok()?;
+    let len = file.read(&mut bytes).ok()?;
+    decode_position(&bytes[..len])
 }
 
 pub fn read_position_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> Option<(u16, u32)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
+    let book = cache.open_dir(owner.key).ok()?;
+    // A directory a twin holds is not this book's, whatever it contains. An
+    // unclaimed one is readable: no other book has asserted over it, so the
+    // read is as safe as it ever was, and the next write claims it.
+    match book_dir_claim(&book, owner) {
+        ClaimState::MineActive | ClaimState::MineReleased => read_position_in(&book),
+        // Anything else is not provably this book's place. Pre-claim
+        // positions have their own explicit path: the legacy-key fallback,
+        // whose directories no claim-aware firmware ever wrote.
+        _ => None,
+    }
+}
+
+/// The position under a key alone, with no ownership check: only for keys
+/// derived by firmware before claims existed, whose directories are read as
+/// found. Current keys go through [`read_position_file`].
+fn read_position_file_at_legacy_key<
     D,
     T,
     const MAX_DIRS: usize,
@@ -285,20 +346,44 @@ where
     let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
     let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
     let book = cache.open_dir(key).ok()?;
-    let mut bytes = [0u8; POSITION_BYTES];
-    if read_two_generation(
-        &book,
-        POSITION_GENERATIONS,
-        POSITION_DURABLE_MAGIC,
-        &mut bytes,
-    ) {
-        return decode_position(&bytes);
+    read_position_in(&book)
+}
+
+/// [`read_position_file`], with a second layer of the same compatibility it
+/// already applies inside one directory: when the book's current key holds
+/// no position, look under the key firmware before catalog v8 derived for
+/// it. Position is the one non-rebuildable thing under a key, and the v8
+/// re-key would otherwise strand every inactive book's place in a directory
+/// nothing asks for.
+///
+/// Read-only: the next ordinary position save lands under the current key,
+/// and the old directory stays an orphan. `display_name` and `byte_size`
+/// come from the book's catalog record; books with no legacy-representable
+/// display shape skip the fallback (see
+/// `proto::cache::legacy_position_cache_key`). The legacy directory is read
+/// without an ownership check, since pre-claim firmware wrote nothing to
+/// check.
+pub fn read_position_file_or_legacy<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    display_name: &str,
+    byte_size: u32,
+) -> Option<(u16, u32)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if let Some(found) = read_position_file(root, owner) {
+        return Some(found);
     }
-    // Legacy single-file fallback, kept readable so an upgrade resumes at
-    // the pre-durable position; the next write lands on the A/B pair.
-    let file = book.open_file_in_dir(POSITION_FILE, Mode::ReadOnly).ok()?;
-    let len = file.read(&mut bytes).ok()?;
-    decode_position(&bytes[..len])
+    let legacy = proto::cache::legacy_position_cache_key(display_name, byte_size)?;
+    read_position_file_at_legacy_key(root, legacy.as_str())
 }
 
 #[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
@@ -582,14 +667,14 @@ pub fn load_v2_cover_cache<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     library: &mut ReaderStore,
 ) -> CoverLoadResult
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_cover_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_cover_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; COVER_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return CoverLoadResult::Invalid;
@@ -621,7 +706,7 @@ pub fn read_v2_book_total_pages<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     library: &ReaderStore,
 ) -> u32
@@ -629,7 +714,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_book_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return 0;
@@ -766,7 +851,7 @@ pub fn load_v2_book_index<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     library: &mut ReaderStore,
 ) -> BookIndexLoadResult
@@ -774,7 +859,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_book_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return BookIndexLoadResult::Invalid;
@@ -843,7 +928,7 @@ pub fn read_cached_book_title<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     out: &mut String<64>,
 ) -> bool
@@ -851,7 +936,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_book_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return false;
@@ -987,6 +1072,56 @@ const SHORT_NAME_BYTES: usize = 12;
 /// rather than a header advertising sections that are no longer there.
 ///
 /// The global reading position in READER/STATE.BIN is never touched.
+/// Delete every rebuildable artifact in an open book directory. Positions
+/// are untouched, and so is the claim: ownership evidence must live exactly
+/// as long as the positions it vouches for, so its lifecycle belongs to the
+/// callers, not to this sweep of derivables. True when everything named
+/// went.
+fn empty_book_dir_artifacts<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut cleared = true;
+    for name in [
+        CACHE_BOOK_FILE,
+        CACHE_TOC_FILE,
+        CACHE_COVER_FILE,
+        CACHE_CONTENT_FILE,
+    ] {
+        if upload_store::remove_file_reclaiming_clusters(book, name)
+            == upload_store::RemoveStatus::Failed
+        {
+            cleared = false;
+        }
+    }
+    match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => {
+            if !empty_sections_dir(&sections) {
+                cleared = false;
+            }
+        }
+        Err(embedded_sdmmc::Error::NotFound) => {}
+        Err(_) => cleared = false,
+    }
+    if cleared {
+        // The SECTIONS handle has dropped; the empty directory can go now
+        // (a directory entry has no chain to reclaim). A refusal here
+        // leaves an empty directory, not cache data, so it does not make
+        // the clear a failure.
+        let _ = book.delete_entry_in_dir(CACHE_SECTIONS_DIR);
+    }
+    cleared
+}
+
 pub fn empty_cache_dir<
     D,
     T,
@@ -1021,33 +1156,19 @@ where
             Err(embedded_sdmmc::Error::NotFound) => return true,
             Err(_) => return false,
         };
-        for name in [
-            CACHE_BOOK_FILE,
-            CACHE_TOC_FILE,
-            CACHE_COVER_FILE,
-            CACHE_CONTENT_FILE,
-        ] {
-            if upload_store::remove_file_reclaiming_clusters(&book, name)
+        if !empty_book_dir_artifacts(&book) {
+            cleared = false;
+        }
+        // The claim outlives the clear exactly as long as the positions it
+        // vouches for: with them gone, the evidence has nothing left to
+        // prove and the directory can be reclaimed; with them kept, the
+        // claim stays, or the surviving place would become adoptable by a
+        // full-hash twin.
+        if !has_position_file(&book)
+            && upload_store::remove_file_reclaiming_clusters(&book, proto::cache::CACHE_CLAIM_FILE)
                 == upload_store::RemoveStatus::Failed
-            {
-                cleared = false;
-            }
-        }
-        match book.open_dir(CACHE_SECTIONS_DIR) {
-            Ok(sections) => {
-                if !empty_sections_dir(&sections) {
-                    cleared = false;
-                }
-            }
-            Err(embedded_sdmmc::Error::NotFound) => {}
-            Err(_) => cleared = false,
-        }
-        if cleared {
-            // The SECTIONS handle has dropped; the empty directory can go now
-            // (a directory entry has no chain to reclaim). A refusal here
-            // leaves an empty directory, not cache data, so it does not make
-            // the clear a failure.
-            let _ = book.delete_entry_in_dir(CACHE_SECTIONS_DIR);
+        {
+            cleared = false;
         }
         // Everything above worked from a list of names. This is the part that
         // does not: it asks the directory what is actually left, which is the
@@ -1206,14 +1327,14 @@ pub fn prune_orphan_sections<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     keep_count: u16,
 ) -> usize
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_sections_dir(root, key, |sections| match sections {
+    with_v2_sections_dir(root, owner, |sections| match sections {
         Some(sections) => prune_orphan_sections_in(sections, keep_count),
         None => 0,
     })
@@ -1296,6 +1417,7 @@ fn is_kept_after_clear(name: &str) -> bool {
     POSITION_GENERATIONS
         .iter()
         .chain(core::iter::once(&POSITION_FILE))
+        .chain(core::iter::once(&proto::cache::CACHE_CLAIM_FILE))
         .any(|kept| name.eq_ignore_ascii_case(kept))
 }
 
@@ -1370,7 +1492,7 @@ pub fn write_v2_book_index<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     total_pages: u32,
     sections: &[BookV2SectionRecord],
@@ -1389,10 +1511,10 @@ where
     if total_pages == 0 || sections.is_empty() || sections.len() > MAX_BOOK_SECTIONS {
         return false;
     }
-    if ensure_v2_cache_dirs(root, key).is_err() {
+    if ensure_v2_cache_dirs(root, owner).is_err() {
         return false;
     }
-    with_v2_book_file(root, key, Mode::ReadWriteCreateOrTruncate, |file| {
+    with_v2_book_file(root, owner, Mode::ReadWriteCreateOrTruncate, |file| {
         let toc_count = library
             .toc_count
             .min(MAX_SD_TOC_ITEMS)
@@ -1496,7 +1618,7 @@ pub fn load_v2_section_by_global_page<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     global_page: u32,
     library: &mut ReaderStore,
@@ -1510,7 +1632,7 @@ where
     };
     let result = load_v2_section_cache(
         root,
-        key,
+        owner,
         source_identity,
         section.section,
         section.spine,
@@ -1520,7 +1642,7 @@ where
     if let CacheLoadResult::Hit { pages, repaginated } = result {
         library.set_current_section_range(section.start_page, pages);
         if repaginated {
-            let _ = write_v2_section_cache(root, key, source_identity, section.section, library);
+            let _ = write_v2_section_cache(root, owner, source_identity, section.section, library);
         }
     }
     result
@@ -1558,7 +1680,7 @@ pub(crate) fn load_v2_section_cache<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     section: u16,
     expected_spine: u16,
@@ -1569,7 +1691,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_section_file(root, key, section, Mode::ReadOnly, |file| {
+    with_v2_section_file(root, owner, section, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return CacheLoadResult::Invalid;
@@ -1622,7 +1744,7 @@ pub(crate) fn write_v2_section_cache<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     section: u16,
     library: &ReaderStore,
@@ -1631,13 +1753,13 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if ensure_v2_cache_dirs(root, key).is_err() {
-        cache_log!("cache: v2 ensure dirs failed key={}", key);
+    if ensure_v2_cache_dirs(root, owner).is_err() {
+        cache_log!("cache: v2 ensure dirs failed key={}", owner.key);
         return false;
     }
     with_v2_section_file(
         root,
-        key,
+        owner,
         section,
         Mode::ReadWriteCreateOrTruncate,
         |file| write_v2_section_body(file, source_identity, library.cached_spine, library),
@@ -1645,7 +1767,7 @@ where
     .unwrap_or_else(|| {
         cache_log!(
             "cache: v2 open section failed key={} section={}",
-            key,
+            owner.key,
             section
         );
         false
@@ -1666,7 +1788,7 @@ pub fn with_v2_sections_dir<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     f: impl for<'a> FnOnce(Option<&Directory<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>) -> R,
 ) -> R
 where
@@ -1678,7 +1800,7 @@ where
     // responsible for `ensure_v2_cache_dirs` when the tree might not exist
     // yet (the full build runs it once up front); a missing tree lands in
     // the `f(None)` fallback like any other open failure.
-    let Some(mut dir) = open_v2_book_dir(root, key) else {
+    let Some(mut dir) = open_v2_book_dir(root, owner) else {
         return f(None);
     };
     if dir.change_dir(CACHE_SECTIONS_DIR).is_err() {
@@ -1717,11 +1839,144 @@ where
     }
 }
 
+/// What a book directory's claim says about one owner.
+pub enum ClaimState {
+    /// An active claim names this owner.
+    MineActive,
+    /// A claim naming this owner that a sweep released after the book left
+    /// the card. The returning owner resumes the directory and the
+    /// positions the evidence proves are its own.
+    MineReleased,
+    /// A well-formed active claim names another book: a full-hash twin
+    /// holds the directory, and nothing here may read or write it.
+    OtherActive,
+    /// Another book's claim, released after its owner left the card.
+    /// Adoptable, but the surviving positions are provably not the
+    /// adopter's and go with the adoption.
+    OtherReleased,
+    /// No claim, or bytes that are not a claim at all. A writer repairs
+    /// this by emptying the directory, positions included since nothing
+    /// vouches for them, and claiming it; a reader treats it as a miss.
+    Unclaimed,
+    /// The card would not answer an open or a read. Failure to read the
+    /// claim is not evidence that there is no owner, so a writer refuses
+    /// rather than adopts, and a reader misses.
+    Fault,
+}
+
+/// Why a writer was refused the directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimDenied {
+    /// Another book's active claim holds the key. Deliberate and durable:
+    /// retrying without the card changing cannot help, and callers must not
+    /// treat it like a card fault.
+    Foreign,
+    /// The card would not answer, or a write failed. Retryable.
+    Fault,
+}
+
+/// Delete the position files in an open book directory: the A/B pair and
+/// the legacy single file. Only claim adoption does this, and only because
+/// the surviving place provably or unprovably belongs to somebody else.
+fn remove_position_files<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut cleared = true;
+    for name in POSITION_GENERATIONS
+        .iter()
+        .chain(core::iter::once(&POSITION_FILE))
+    {
+        if upload_store::remove_file_reclaiming_clusters(book, name)
+            == upload_store::RemoveStatus::Failed
+        {
+            cleared = false;
+        }
+    }
+    cleared
+}
+
+/// Read the claim of an already-open book directory against one owner.
+fn book_dir_claim<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> ClaimState
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = match book.open_file_in_dir(proto::cache::CACHE_CLAIM_FILE, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return ClaimState::Unclaimed,
+        Err(_) => return ClaimState::Fault,
+    };
+    let stored_len = file.length() as usize;
+    if stored_len > proto::cache::CACHE_CLAIM_MAX_BYTES {
+        // Readable and absurd: not a claim, like any other alien bytes.
+        return ClaimState::Unclaimed;
+    }
+    let mut bytes = [0u8; proto::cache::CACHE_CLAIM_MAX_BYTES];
+    if read_exact_file(&file, &mut bytes[..stored_len]).is_err() {
+        return ClaimState::Fault;
+    }
+    match proto::cache::read_cache_claim(&bytes[..stored_len], owner.root, owner.locator) {
+        proto::cache::CacheClaimReading::MineActive => ClaimState::MineActive,
+        proto::cache::CacheClaimReading::MineReleased => ClaimState::MineReleased,
+        proto::cache::CacheClaimReading::OtherActive => ClaimState::OtherActive,
+        proto::cache::CacheClaimReading::OtherReleased => ClaimState::OtherReleased,
+        proto::cache::CacheClaimReading::Invalid => ClaimState::Unclaimed,
+    }
+}
+
+/// Claim an open book directory for this owner: write the claim file so
+/// every later access can prove whose directory it is.
+fn write_book_dir_claim<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    released: bool,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut bytes = [0u8; proto::cache::CACHE_CLAIM_MAX_BYTES];
+    let len = proto::cache::encode_cache_claim(owner.root, owner.locator, released, &mut bytes)
+        .ok_or(())?;
+    let file = book
+        .open_file_in_dir(
+            proto::cache::CACHE_CLAIM_FILE,
+            Mode::ReadWriteCreateOrTruncate,
+        )
+        .map_err(|_| ())?;
+    file.write(&bytes[..len]).map_err(|_| ())
+}
+
 /// Open the book's cache directory (`READER/CACHE2/<key>`) with one handle
 /// walked via `change_dir` — the single owner of that path walk. Opening a
 /// directory another walk also passes through is fine: this embedded-sdmmc
 /// rev allows duplicate directory opens (directories hold no cached
 /// state); only deleting an open directory errors.
+///
+/// The directory is handed back only when its claim names this owner: the
+/// key and every artifact identity are 32-bit hashes two legal books can
+/// share, and the claim is what keeps a full-hash twin from reading the
+/// other book's cache. An unclaimed directory is a miss here; only
+/// [`claim_v2_book_dir`] may adopt one.
 pub fn open_v2_book_dir<
     'v,
     D,
@@ -1731,7 +1986,7 @@ pub fn open_v2_book_dir<
     const MAX_VOLUMES: usize,
 >(
     root: &'v Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
 ) -> Option<Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1739,8 +1994,243 @@ where
 {
     let mut dir = root.open_dir(CACHE_ROOT_DIR).ok()?;
     dir.change_dir(CACHE_V2_DIR).ok()?;
-    dir.change_dir(key).ok()?;
-    Some(dir)
+    dir.change_dir(owner.key).ok()?;
+    match book_dir_claim(&dir, owner) {
+        ClaimState::MineActive => Some(dir),
+        // A released mine holds no artifacts (the release emptied them);
+        // everything else is either not this book's or not provable. All of
+        // it is a miss, and the build path re-claims.
+        _ => None,
+    }
+}
+
+/// Open, creating if needed, the book's cache directory as a writer: verify
+/// or establish the claim. A directory claimed by another book is refused,
+/// so a full-hash twin cannot overwrite the holder's cache; the refused
+/// book still reads, it just keeps nothing on the card while the twin
+/// holds the key. An unclaimed directory is emptied of cache artifacts
+/// before it is claimed, so a repaired or torn claim can never assert over
+/// another book's leftovers. Positions survive the emptying, as they do
+/// everywhere.
+pub fn claim_v2_book_dir<
+    'v,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &'v Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> Result<Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>, ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    {
+        let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|_| ClaimDenied::Fault)?;
+        let cache = open_or_make_dir(&cache_root, CACHE_V2_DIR).map_err(|_| ClaimDenied::Fault)?;
+        let _ = open_or_make_dir(&cache, owner.key).map_err(|_| ClaimDenied::Fault)?;
+    }
+    // Re-walk with one handle borrowing only the root, like
+    // `open_v2_book_dir`, so the directory can be handed back.
+    let mut book = root
+        .open_dir(CACHE_ROOT_DIR)
+        .map_err(|_| ClaimDenied::Fault)?;
+    book.change_dir(CACHE_V2_DIR)
+        .map_err(|_| ClaimDenied::Fault)?;
+    book.change_dir(owner.key).map_err(|_| ClaimDenied::Fault)?;
+    match book_dir_claim(&book, owner) {
+        ClaimState::MineActive => Ok(book),
+        // The sweep retired this directory while its owner was off the
+        // card; the owner is back. Reactivating resumes the positions the
+        // claim proves are its own.
+        ClaimState::MineReleased => {
+            write_book_dir_claim(&book, owner, false).map_err(|_| ClaimDenied::Fault)?;
+            Ok(book)
+        }
+        ClaimState::OtherActive => Err(ClaimDenied::Foreign),
+        // Adoptable, but the surviving positions provably belong to the
+        // departed owner, and adopting a place in another book is the
+        // wrong-book failure this whole layer exists to refuse. They go
+        // with the adoption.
+        ClaimState::OtherReleased => {
+            if !empty_book_dir_artifacts(&book) || !remove_position_files(&book) {
+                return Err(ClaimDenied::Fault);
+            }
+            write_book_dir_claim(&book, owner, false).map_err(|_| ClaimDenied::Fault)?;
+            Ok(book)
+        }
+        // No evidence at all. Rebuildables go as before, and surviving
+        // positions are ambiguous evidence nobody may adopt: with a claim
+        // torn, whose they were is exactly the question that cannot be
+        // answered.
+        ClaimState::Unclaimed => {
+            if !empty_book_dir_artifacts(&book) || !remove_position_files(&book) {
+                return Err(ClaimDenied::Fault);
+            }
+            write_book_dir_claim(&book, owner, false).map_err(|_| ClaimDenied::Fault)?;
+            Ok(book)
+        }
+        // Failure to read the claim is not evidence that there is no owner.
+        ClaimState::Fault => Err(ClaimDenied::Fault),
+    }
+}
+
+/// What a cache directory's claim says, read by key alone: for the sweep,
+/// which has no expected owner and must ask who is there.
+// The 257-byte locator dwarfs the other variants by design: it is the
+// answer the sweep asked for, and one instance lives briefly on a shallow
+// sweep frame, not in a collection.
+#[allow(clippy::large_enum_variant)]
+pub enum DirClaimant {
+    /// A well-formed claim; whether it was released, and who holds it.
+    Claimed {
+        root: proto::library_path::BookRoot,
+        locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
+        released: bool,
+    },
+    /// No claim, or bytes that are not one: the pre-claim compatibility
+    /// shape, swept by identity as before.
+    Unclaimed,
+    /// The card would not answer. Not evidence; the sweep leaves the
+    /// directory alone.
+    Fault,
+}
+
+/// Read who claims `READER/CACHE2/<key>`, if anyone.
+pub fn read_book_dir_claimant<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> DirClaimant
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return DirClaimant::Unclaimed,
+        Err(_) => return DirClaimant::Fault,
+    };
+    if let Err(error) = dir
+        .change_dir(CACHE_V2_DIR)
+        .and_then(|()| dir.change_dir(key))
+    {
+        return match error {
+            embedded_sdmmc::Error::NotFound => DirClaimant::Unclaimed,
+            _ => DirClaimant::Fault,
+        };
+    }
+    let file = match dir.open_file_in_dir(proto::cache::CACHE_CLAIM_FILE, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return DirClaimant::Unclaimed,
+        Err(_) => return DirClaimant::Fault,
+    };
+    let stored_len = file.length() as usize;
+    if stored_len > proto::cache::CACHE_CLAIM_MAX_BYTES {
+        return DirClaimant::Unclaimed;
+    }
+    let mut bytes = [0u8; proto::cache::CACHE_CLAIM_MAX_BYTES];
+    if read_exact_file(&file, &mut bytes[..stored_len]).is_err() {
+        return DirClaimant::Fault;
+    }
+    match proto::cache::decode_cache_claimant(&bytes[..stored_len]) {
+        Some((claim_root, claim_locator, released)) => {
+            let mut locator = String::new();
+            if locator.push_str(claim_locator).is_err() {
+                return DirClaimant::Unclaimed;
+            }
+            DirClaimant::Claimed {
+                root: claim_root,
+                locator,
+                released,
+            }
+        }
+        None => DirClaimant::Unclaimed,
+    }
+}
+
+/// Release a directory's claim: the sweep found its owner gone from the
+/// card. The claim is rewritten, not deleted, so it keeps naming the owner:
+/// a returning owner resumes its positions, and any other adopter knows the
+/// surviving place is not its own. True when the release landed.
+pub fn release_book_dir_claim<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let DirClaimant::Claimed {
+        root: claim_root,
+        locator,
+        released,
+    } = read_book_dir_claimant(root, key)
+    else {
+        return false;
+    };
+    if released {
+        return true;
+    }
+    let Ok(mut dir) = root.open_dir(CACHE_ROOT_DIR) else {
+        return false;
+    };
+    if dir.change_dir(CACHE_V2_DIR).is_err() || dir.change_dir(key).is_err() {
+        return false;
+    }
+    let owner = proto::cache::CacheOwner {
+        key,
+        root: claim_root,
+        locator: locator.as_str(),
+    };
+    write_book_dir_claim(&dir, &owner, true).is_ok()
+}
+
+/// What a directory's claim says about one expected owner, for callers
+/// outside this module that gate destructive operations: the row-selected
+/// cache clear, most of all.
+pub fn cache_dir_claim<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> ClaimState
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return ClaimState::Unclaimed,
+        Err(_) => return ClaimState::Fault,
+    };
+    if let Err(error) = dir
+        .change_dir(CACHE_V2_DIR)
+        .and_then(|()| dir.change_dir(owner.key))
+    {
+        return match error {
+            embedded_sdmmc::Error::NotFound => ClaimState::Unclaimed,
+            _ => ClaimState::Fault,
+        };
+    }
+    book_dir_claim(&dir, owner)
 }
 
 /// Open the book's `CONT.BIN` (settings-independent content cache) and run
@@ -1754,7 +2244,7 @@ pub fn with_v2_content_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
 ) -> Option<R>
@@ -1762,7 +2252,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let dir = open_v2_book_dir(root, key)?;
+    let dir = open_v2_book_dir(root, owner)?;
     let file = dir.open_file_in_dir(CACHE_CONTENT_FILE, mode).ok()?;
     Some(f(&file))
 }
@@ -1778,12 +2268,12 @@ pub fn delete_v2_content_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
 ) where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Some(dir) = open_v2_book_dir(root, key) else {
+    let Some(dir) = open_v2_book_dir(root, owner) else {
         return;
     };
     let _ = upload_store::remove_file_reclaiming_clusters(&dir, CACHE_CONTENT_FILE);
@@ -2066,7 +2556,7 @@ pub fn load_v2_book_labels_and_toc<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     library: &mut ReaderStore,
 ) -> bool
@@ -2074,7 +2564,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_book_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return false;
@@ -2109,7 +2599,7 @@ fn with_v2_section_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     spine: u16,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
@@ -2118,9 +2608,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
-    let book_dir = cache.open_dir(key).ok()?;
+    let book_dir = open_v2_book_dir(root, owner)?;
     let sections = book_dir.open_dir(CACHE_SECTIONS_DIR).ok()?;
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
     section_file_name(spine, &mut name);
@@ -2137,7 +2625,7 @@ fn with_v2_book_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
 ) -> Option<R>
@@ -2145,9 +2633,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
-    let book_dir = cache.open_dir(key).ok()?;
+    let book_dir = open_v2_book_dir(root, owner)?;
     let file = book_dir.open_file_in_dir(CACHE_BOOK_FILE, mode).ok()?;
     Some(f(&file))
 }
@@ -2161,7 +2647,7 @@ fn with_v2_toc_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
 ) -> Option<R>
@@ -2169,9 +2655,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
-    let book_dir = cache.open_dir(key).ok()?;
+    let book_dir = open_v2_book_dir(root, owner)?;
     let file = book_dir.open_file_in_dir(CACHE_TOC_FILE, mode).ok()?;
     Some(f(&file))
 }
@@ -2187,7 +2671,7 @@ pub fn load_v2_toc_into_text<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     library: &mut ReaderStore,
     window_start: usize,
@@ -2196,7 +2680,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_toc_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_toc_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             cache_log!("toc window: header read failed");
@@ -2245,7 +2729,7 @@ pub fn load_v2_toc_chapter_map<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     library: &mut ReaderStore,
 ) -> bool
@@ -2253,7 +2737,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_toc_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_toc_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return false;
@@ -2301,7 +2785,7 @@ pub fn read_v2_toc_chapter_title<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     chapter: u16,
     library: &mut ReaderStore,
@@ -2310,7 +2794,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_toc_file(root, key, Mode::ReadOnly, |file| {
+    with_v2_toc_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return false;
@@ -2353,7 +2837,7 @@ pub fn write_v2_toc_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     chapter_count: usize,
     records: &[u8],
@@ -2362,10 +2846,10 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if ensure_v2_cache_dirs(root, key).is_err() {
+    if ensure_v2_cache_dirs(root, owner).is_err() {
         return false;
     }
-    with_v2_toc_file(root, key, Mode::ReadWriteCreateOrTruncate, |file| {
+    with_v2_toc_file(root, owner, Mode::ReadWriteCreateOrTruncate, |file| {
         let header = TocFileHeader {
             source_hash: source_identity.0,
             source_size: source_identity.1,
@@ -2391,7 +2875,7 @@ fn with_v2_cover_file<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
 ) -> Option<R>
@@ -2399,9 +2883,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
-    let book_dir = cache.open_dir(key).ok()?;
+    let book_dir = open_v2_book_dir(root, owner)?;
     let file = book_dir.open_file_in_dir(CACHE_COVER_FILE, mode).ok()?;
     Some(f(&file))
 }

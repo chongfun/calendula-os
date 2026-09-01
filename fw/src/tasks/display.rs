@@ -2081,6 +2081,10 @@ fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppS
         front_buttons: state.front_buttons,
         source_hash,
         source_size,
+        // Freshly derived from the active entry, so always the current
+        // interpretation; the flag exists for records read back from the
+        // card.
+        legacy_source_identity: false,
     }
 }
 
@@ -2134,13 +2138,12 @@ fn restore_saved_state(
         esp_println::println!("restore: no usable durable state");
         return;
     };
-    let hint = ReaderSource::from_book_id(record.book_id).sd_index();
     let Some(index) = crate::library_sd::find_index_by_identity(
         epd,
         sd_cs,
         record.source_hash,
         record.source_size,
-        hint,
+        record.legacy_source_identity,
     ) else {
         esp_println::println!(
             "restore: no catalog match hash={:08x} size={}",
@@ -2195,13 +2198,12 @@ fn sleep_request_from_saved_state(
         Some(record) => (record, true),
         None => (book_build::load_app_state(epd, sd_cs)?, false),
     };
-    let hint = ReaderSource::from_book_id(record.book_id).sd_index();
     let index = crate::library_sd::find_index_by_identity(
         epd,
         sd_cs,
         record.source_hash,
         record.source_size,
-        hint,
+        record.legacy_source_identity,
     )?;
     crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
     let (chapter, screen) = if unflushed {

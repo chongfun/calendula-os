@@ -131,6 +131,18 @@ pub fn is_hidden_entry(path: &str) -> bool {
 /// underscore. A buffer that cannot overflow removes the question.
 pub const MAX_LFN_UTF8_BYTES: usize = 255 * 3;
 
+/// Bytes an 8.3 short name takes once rendered as UTF-8.
+///
+/// A short name is 11 bytes of ISO-8859-1 plus a dot, and the driver renders
+/// each byte as the Unicode scalar of the same value, so a byte at or above
+/// 0x80 becomes two UTF-8 bytes: 11 * 2 + 1.
+///
+/// Sized so it cannot overflow, because an alias that does not fit is an
+/// entry a scan drops. Cards written elsewhere can carry short names full of
+/// accented characters, and one of those is a book that would go missing from
+/// the library rather than merely be spelled oddly in it.
+pub const MAX_ALIAS_UTF8_BYTES: usize = 11 * 2 + 1;
+
 /// The name a scanned directory entry belongs in the catalog under, or `None`
 /// when the entry is not a book the library should list.
 ///
@@ -162,9 +174,9 @@ pub fn catalog_scan_name<'a>(long_name: Option<&'a str>, short_name: &'a str) ->
     (is_epub_path(name) && !is_hidden_entry(name)).then_some(name)
 }
 
-/// Store the catalog's display path in its fixed-size field. The FAT short
-/// name remains the open handle; this only provides the user-facing label and
-/// a stable cache identity.
+/// Store the catalog's display label in its fixed-size field. Presentation
+/// only: the locator is the open handle, and identity hashes the root plus
+/// the full locator (`proto::cache::source_hash_at`), not this string.
 pub fn catalog_display_path<const N: usize>(prefix: &str, name: &str, out: &mut String<N>) {
     out.clear();
     push_utf8_prefix(prefix, N, out);
@@ -184,13 +196,13 @@ pub fn catalog_display_path<const N: usize>(prefix: &str, name: &str, out: &mut 
     let stem = &name[..name.len() - suffix.len()];
     let stem_capacity = N.saturating_sub(out.len() + suffix.len());
 
-    // A trimmed path must still name exactly one book. This string is not
-    // only shown: `source_hash` and `cache_key_for` both hash it, so two
-    // files whose names agree up to the trim and whose sizes match would
-    // otherwise share a catalog identity *and* a cache. Uploads make that
-    // reachable — they permit a 59-byte stem while `/books/` leaves 52 — so
-    // a trim spends its last few bytes on a discriminator over the whole
-    // name instead of more of a prefix the two already share.
+    // A trimmed label should still read as exactly one book. Identity no
+    // longer hashes this string, but two files whose names agree up to the
+    // trim would otherwise wear one label, and a list showing the same row
+    // twice for different books reads as a duplicate. Uploads make that
+    // reachable (they permit a 59-byte stem while `/books/` leaves 52), so a
+    // trim spends its last few bytes on a discriminator over the whole name
+    // instead of more of a prefix the two already share.
     if out.len() + stem.len() + suffix.len() > N {
         let tag = discriminator(name);
         let kept = stem_capacity.saturating_sub(tag.len());
@@ -206,13 +218,14 @@ pub fn catalog_display_path<const N: usize>(prefix: &str, name: &str, out: &mut 
 /// prefix: base-36 over an FNV-1a of the whole name.
 ///
 /// Seven digits, because 36^7 exceeds `u32::MAX` and so carries the hash
-/// whole. That is what keeps trimming from weakening identity: this string
-/// feeds `source_hash` and `cache_key_for`, so a trimmed path must not
-/// collide more readily than those 32-bit hashes do by themselves. Five
-/// digits folded the hash into 36^5 and made trims collide roughly seventy
-/// times sooner than the identity they feed — a real pair being
+/// whole. The width dates from when this string fed `source_hash` and the
+/// cache key, where five digits made trims collide roughly seventy times
+/// sooner than the 32-bit identity they fed; a real pair being
 /// `A*46 + "000000007328"` and `A*46 + "000000085285"`, distinct names with
-/// one display path.
+/// one display path. Identity now hashes the root and the full locator
+/// (`proto::cache::source_hash_at`), so a collision here costs a
+/// duplicate-looking label rather than a shared cache. The full width stays
+/// because narrowing it saves nothing.
 ///
 /// Exactness is not on offer at this layer while identity is a 32-bit FNV;
 /// content-addressed identity is the fix, and it belongs to the
@@ -249,9 +262,10 @@ fn push_utf8_prefix<const N: usize>(text: &str, end: usize, out: &mut String<N>)
 #[cfg(test)]
 mod tests {
 
-    /// Two names that shared a display path under a five-digit tag. The tag
-    /// feeds `source_hash` and `cache_key_for`, so an identical path here
-    /// means one catalog identity and one cache for two books.
+    /// Two names that shared a display path under a five-digit tag. Identity
+    /// no longer hashes the label, so an identical path here now costs a
+    /// duplicate-looking row rather than a shared cache; the tag still keeps
+    /// the two labels apart.
     #[test]
     fn trimmed_paths_survive_a_tag_that_would_have_folded() {
         let stem = "A".repeat(46);

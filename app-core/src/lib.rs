@@ -4,6 +4,8 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
+/// Where the reader is in the library's folder tree.
+pub mod browse;
 /// The resistive button ladders, shared by the input task and the boot-time
 /// recovery-combo check.
 pub mod buttons;

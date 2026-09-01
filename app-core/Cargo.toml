@@ -8,3 +8,5 @@ workspace = true
 
 [dependencies]
 display = { path = "../display" }
+heapless = "0.9.0"
+proto = { path = "../proto" }

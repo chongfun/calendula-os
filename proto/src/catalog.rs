@@ -3,6 +3,7 @@
 //! Lives here (not in firmware) so the encode/decode round-trip, the title
 //! field layout, and the orphan-sweep identity staging are host-testable.
 
+use crate::library_path::BookRoot;
 use heapless::String;
 
 pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
@@ -24,27 +25,88 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// user forced a rescan. Bumping the version is how this format retires a
 /// snapshot; see `is_hidden_entry` in `proto::storage` for the rule the
 /// rebuild applies.
-pub const CATALOG_VERSION: u8 = 6;
+///
+/// v7 replaces the 8.3 alias and the "which of the two directories" flag
+/// with a root and a locator, because a book can now live at any depth
+/// under the library root and neither field can say where. The root stays a
+/// field rather than a prefix on the locator: a locator is library-root
+/// relative by contract, so spelling the library directory into it would
+/// give one type two coordinate systems. Records grow by the locator's
+/// width, so a scan stages fewer of them per walk; the walk count is what
+/// pays for nesting until a derived index earns its place.
+///
+/// v8 changes no bytes. It retires v7 snapshots whose `source_hash` was
+/// derived from the 64-byte display path rather than from the root plus the
+/// full locator. A nested locator can spend the whole display budget before
+/// the filename, so two books could share a truncated label, and with sizes
+/// equal they shared an identity and a cache. Loading a v7 snapshot under
+/// the new derivation would be worse than a stale label: rebuilt caches
+/// carry new hashes the old records cannot vouch for, and the orphan sweep
+/// would reclaim them on the next scan. Rejecting v7 forces the rescan that
+/// rewrites records and caches under one derivation.
+pub const CATALOG_VERSION: u8 = 8;
 pub const CATALOG_HEADER_BYTES: usize = 8;
-pub const CATALOG_RECORD_BYTES: usize = 156;
+pub const CATALOG_RECORD_BYTES: usize = 419;
 /// Byte range of the title field inside a record, exposed so the firmware
 /// can rewrite just the title in place when a book open learns the real
 /// EPUB title.
-pub const CATALOG_RECORD_TITLE_OFFSET: usize = 92;
+pub const CATALOG_RECORD_TITLE_OFFSET: usize = 76;
 pub const CATALOG_TITLE_BYTES: usize = 64;
+/// Byte range of the locator, which is `LibraryPath` text.
+const CATALOG_RECORD_PATH_OFFSET: usize = 140;
+const CATALOG_PATH_BYTES: usize = crate::library_path::MAX_PATH_BYTES;
+/// Byte range of the 8.3 alias an uploaded book landed under.
+const CATALOG_RECORD_ALIAS_OFFSET: usize = 396;
+const CATALOG_ALIAS_BYTES: usize = crate::storage::MAX_ALIAS_UTF8_BYTES;
 
 /// One catalog record decoded into owned fields, so it outlives the file
 /// handle it was read through.
 pub struct CatalogRecord {
+    /// The label a row falls back to when no title is known. Presentation
+    /// only: identity and the cache key derive from `root`, `path`, and
+    /// `byte_size` (see `proto::cache::source_hash_at`), because this field
+    /// truncates at 64 bytes and a truncated label can collide where the
+    /// locator does not.
     pub display_name: String<64>,
-    pub open_name: String<16>,
+    /// Which directory `path` is relative to. `None` is a byte this build
+    /// does not recognize, which makes the record unopenable rather than
+    /// resolvable against the wrong root, where it could name a real but
+    /// different file.
+    pub root: Option<BookRoot>,
+    /// Where the book is, as `LibraryPath` text. A locator, not identity:
+    /// moving the file on a computer changes this and nothing else.
+    pub path: String<{ crate::library_path::MAX_PATH_BYTES }>,
     /// The EPUB title learned when the book was last opened (or the upload
     /// label stashed at upload). Empty when unknown; readers fall back to a
     /// label derived from the file stem.
     pub title: String<64>,
-    pub in_books_dir: bool,
+    /// The 8.3 alias the book landed under, which is what names its upload
+    /// label sidecar. Not how the book is opened: that is `path`. Wide enough
+    /// for an alias of accented characters, which takes two bytes each.
+    pub upload_alias: String<{ crate::storage::MAX_ALIAS_UTF8_BYTES }>,
     pub byte_size: u32,
     pub source_hash: u32,
+}
+
+/// The library root is 0, so the common book costs a zero byte and a record
+/// whose root byte was lost reads as unopenable rather than as a card-root
+/// book that is not there.
+const ROOT_LIBRARY: u8 = 0;
+const ROOT_CARD: u8 = 1;
+
+const fn root_byte(root: BookRoot) -> u8 {
+    match root {
+        BookRoot::Library => ROOT_LIBRARY,
+        BookRoot::CardRoot => ROOT_CARD,
+    }
+}
+
+const fn book_root(byte: u8) -> Option<BookRoot> {
+    match byte {
+        ROOT_LIBRARY => Some(BookRoot::Library),
+        ROOT_CARD => Some(BookRoot::CardRoot),
+        _ => None,
+    }
 }
 
 pub fn encode_catalog_header(count: u16, out: &mut [u8; CATALOG_HEADER_BYTES]) {
@@ -121,38 +183,54 @@ pub fn decode_catalog_header(header: &[u8; CATALOG_HEADER_BYTES]) -> Option<u16>
 pub fn encode_catalog_record(
     out: &mut [u8; CATALOG_RECORD_BYTES],
     display_name: &str,
-    open_name: &str,
+    root: BookRoot,
+    path: &str,
     title: &str,
-    in_books_dir: bool,
+    upload_alias: &str,
     byte_size: u32,
     source_hash: u32,
 ) {
     out.fill(0);
-    out[0] = in_books_dir as u8;
+    out[0] = root_byte(root);
     out[4..8].copy_from_slice(&byte_size.to_le_bytes());
     out[8..12].copy_from_slice(&source_hash.to_le_bytes());
     copy_fixed(display_name.as_bytes(), &mut out[12..76]);
-    copy_fixed(open_name.as_bytes(), &mut out[76..92]);
     copy_fixed(
         title.as_bytes(),
         &mut out[CATALOG_RECORD_TITLE_OFFSET..CATALOG_RECORD_TITLE_OFFSET + CATALOG_TITLE_BYTES],
+    );
+    copy_fixed(
+        path.as_bytes(),
+        &mut out[CATALOG_RECORD_PATH_OFFSET..CATALOG_RECORD_PATH_OFFSET + CATALOG_PATH_BYTES],
+    );
+    copy_fixed(
+        upload_alias.as_bytes(),
+        &mut out[CATALOG_RECORD_ALIAS_OFFSET..CATALOG_RECORD_ALIAS_OFFSET + CATALOG_ALIAS_BYTES],
     );
 }
 
 pub fn decode_catalog_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogRecord {
     let mut display_name = String::<64>::new();
     let _ = display_name.push_str(fixed_str(&record[12..76]));
-    let mut open_name = String::<16>::new();
-    let _ = open_name.push_str(fixed_str(&record[76..92]));
     let mut title = String::<64>::new();
     let _ = title.push_str(fixed_str(
         &record[CATALOG_RECORD_TITLE_OFFSET..CATALOG_RECORD_TITLE_OFFSET + CATALOG_TITLE_BYTES],
     ));
+    let root = book_root(record[0]);
+    let mut path = String::new();
+    let _ = path.push_str(fixed_str(
+        &record[CATALOG_RECORD_PATH_OFFSET..CATALOG_RECORD_PATH_OFFSET + CATALOG_PATH_BYTES],
+    ));
+    let mut upload_alias = String::new();
+    let _ = upload_alias.push_str(fixed_str(
+        &record[CATALOG_RECORD_ALIAS_OFFSET..CATALOG_RECORD_ALIAS_OFFSET + CATALOG_ALIAS_BYTES],
+    ));
     CatalogRecord {
         display_name,
-        open_name,
+        root,
+        path,
         title,
-        in_books_dir: record[0] != 0,
+        upload_alias,
         byte_size: u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
         source_hash: u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
     }
@@ -164,6 +242,105 @@ pub fn catalog_record_identity(record: &[u8; CATALOG_RECORD_BYTES]) -> (u32, u32
         u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
         u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
     )
+}
+
+/// The `(source_hash, byte_size)` identity pre-v8 firmware would have given
+/// this record's book, when its display shape is one that firmware could
+/// address; `None` for nested books, which have no pre-v8 identity to
+/// answer to. Derived from the stored display name through the frozen rule
+/// in [`crate::cache::legacy_source_hash`].
+pub fn catalog_record_legacy_identity(record: &[u8; CATALOG_RECORD_BYTES]) -> Option<(u32, u32)> {
+    let byte_size = u32::from_le_bytes([record[4], record[5], record[6], record[7]]);
+    let display_name = fixed_str(&record[12..76]);
+    Some((
+        crate::cache::legacy_source_hash(display_name, byte_size)?,
+        byte_size,
+    ))
+}
+
+/// Resolves a current identity against records, offered one at a time in
+/// catalog order, with the same one-match discipline as
+/// [`LegacyIdentityScan`]: exactly one record may answer.
+///
+/// The identity is a 32-bit hash of the root, locator, and size, and two
+/// legal locators can share it; a verified pair exists in the tests below.
+/// Accepting the first or the hinted match would open one book as the
+/// other, and the next save would persist that choice. Zero matches is a
+/// book no longer on the card; two or more is a question the identity
+/// cannot answer, so resolution refuses rather than guesses.
+pub struct IdentityScan {
+    wanted: (u32, u32),
+    found: Option<u16>,
+    matches: usize,
+}
+
+impl IdentityScan {
+    pub fn new(source_hash: u32, byte_size: u32) -> Self {
+        Self {
+            wanted: (source_hash, byte_size),
+            found: None,
+            matches: 0,
+        }
+    }
+
+    pub fn offer(&mut self, index: u16, record: &[u8; CATALOG_RECORD_BYTES]) {
+        if catalog_record_identity(record) == self.wanted {
+            self.matches += 1;
+            if self.found.is_none() {
+                self.found = Some(index);
+            }
+        }
+    }
+
+    pub fn finish(self) -> Option<u16> {
+        if self.matches == 1 {
+            self.found
+        } else {
+            None
+        }
+    }
+}
+
+/// Resolves a pre-v8 saved identity against v8 records, offered one at a
+/// time in catalog order.
+///
+/// The global state record written by pre-v8 firmware still decodes after
+/// the upgrade, carrying the identity that firmware derived, while the
+/// rebuilt catalog holds only v8 identities. Restoring the active book
+/// therefore needs this second reading. Exactly one record may answer:
+/// zero is a book no longer on the card, and two or more is a guess
+/// between real books, which restoration refuses rather than opens.
+pub struct LegacyIdentityScan {
+    wanted: (u32, u32),
+    found: Option<u16>,
+    matches: usize,
+}
+
+impl LegacyIdentityScan {
+    pub fn new(source_hash: u32, byte_size: u32) -> Self {
+        Self {
+            wanted: (source_hash, byte_size),
+            found: None,
+            matches: 0,
+        }
+    }
+
+    pub fn offer(&mut self, index: u16, record: &[u8; CATALOG_RECORD_BYTES]) {
+        if catalog_record_legacy_identity(record) == Some(self.wanted) {
+            self.matches += 1;
+            if self.found.is_none() {
+                self.found = Some(index);
+            }
+        }
+    }
+
+    pub fn finish(self) -> Option<u16> {
+        if self.matches == 1 {
+            self.found
+        } else {
+            None
+        }
+    }
 }
 
 /// Encode `title` into a standalone 64-byte title field, for rewriting the
@@ -366,9 +543,10 @@ mod tests {
         encode_catalog_record(
             &mut record,
             "/books/wuthering-heights.epub",
-            "WUTHE~01.EPU",
+            BookRoot::Library,
+            "Bront\u{eb}/wuthering-heights.epub",
             "Wuthering Heights",
-            true,
+            "WUTHE~01.EPU",
             123_456,
             0xdead_beef,
         );
@@ -377,9 +555,12 @@ mod tests {
             decoded.display_name.as_str(),
             "/books/wuthering-heights.epub"
         );
-        assert_eq!(decoded.open_name.as_str(), "WUTHE~01.EPU");
+        // Library-root relative: the library directory's own name is not a
+        // component, so the record and a listing of it agree.
+        assert_eq!(decoded.root, Some(BookRoot::Library));
+        assert_eq!(decoded.path.as_str(), "Bront\u{eb}/wuthering-heights.epub");
         assert_eq!(decoded.title.as_str(), "Wuthering Heights");
-        assert!(decoded.in_books_dir);
+        assert_eq!(decoded.upload_alias.as_str(), "WUTHE~01.EPU");
         assert_eq!(decoded.byte_size, 123_456);
         assert_eq!(decoded.source_hash, 0xdead_beef);
         assert_eq!(catalog_record_identity(&record), (0xdead_beef, 123_456));
@@ -388,23 +569,62 @@ mod tests {
     #[test]
     fn empty_title_decodes_empty_for_the_stem_fallback() {
         let mut record = [0u8; CATALOG_RECORD_BYTES];
-        encode_catalog_record(&mut record, "/plain.epub", "PLAIN.EPU", "", false, 9, 7);
+        encode_catalog_record(
+            &mut record,
+            "/plain.epub",
+            BookRoot::CardRoot,
+            "plain.epub",
+            "",
+            "PLAIN.EPU",
+            9,
+            7,
+        );
         let decoded = decode_catalog_record(&record);
         assert!(decoded.title.is_empty());
-        assert!(!decoded.in_books_dir);
+        assert_eq!(decoded.root, Some(BookRoot::CardRoot));
+        assert_eq!(decoded.path.as_str(), "plain.epub");
     }
 
     #[test]
     fn overlong_fields_truncate_to_their_budgets() {
-        // 100 bytes: over every field budget (64/16/64).
-        let long = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
-                    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        // Over every field budget, including the widest.
+        let long = "x".repeat(CATALOG_PATH_BYTES + 10);
         let mut record = [0u8; CATALOG_RECORD_BYTES];
-        encode_catalog_record(&mut record, long, long, long, false, 1, 2);
+        encode_catalog_record(
+            &mut record,
+            &long,
+            BookRoot::Library,
+            &long,
+            &long,
+            &long,
+            1,
+            2,
+        );
         let decoded = decode_catalog_record(&record);
         assert_eq!(decoded.display_name.len(), 64);
-        assert_eq!(decoded.open_name.len(), 16);
         assert_eq!(decoded.title.len(), 64);
+        assert_eq!(decoded.path.len(), CATALOG_PATH_BYTES);
+        assert_eq!(decoded.upload_alias.len(), CATALOG_ALIAS_BYTES);
+    }
+
+    #[test]
+    fn an_unknown_root_makes_a_record_unopenable_rather_than_misplaced() {
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut record,
+            "/books/d.epub",
+            BookRoot::Library,
+            "d.epub",
+            "",
+            "D.EPU",
+            1,
+            2,
+        );
+        record[0] = 0x7f;
+
+        // Resolving "d.epub" against the wrong root can name a real file that
+        // is not this book, so an unreadable root answers nothing at all.
+        assert_eq!(decode_catalog_record(&record).root, None);
     }
 
     #[test]
@@ -412,7 +632,16 @@ mod tests {
         // The book-open path patches only the 64-byte title field; it must
         // land exactly where a from-scratch encode puts the title.
         let mut record = [0u8; CATALOG_RECORD_BYTES];
-        encode_catalog_record(&mut record, "/b.epub", "B.EPU", "", true, 10, 20);
+        encode_catalog_record(
+            &mut record,
+            "/b.epub",
+            BookRoot::Library,
+            "b.epub",
+            "",
+            "B.EPU",
+            10,
+            20,
+        );
         let mut field = [0u8; CATALOG_TITLE_BYTES];
         encode_catalog_title("Bleak House", &mut field);
         record[CATALOG_RECORD_TITLE_OFFSET..CATALOG_RECORD_TITLE_OFFSET + CATALOG_TITLE_BYTES]
@@ -422,9 +651,10 @@ mod tests {
         encode_catalog_record(
             &mut expected,
             "/b.epub",
-            "B.EPU",
+            BookRoot::Library,
+            "b.epub",
             "Bleak House",
-            true,
+            "B.EPU",
             10,
             20,
         );
@@ -491,5 +721,187 @@ mod tests {
         assert!(stage_catalog_identity(&mut scratch, 0, 1, 1));
         assert!(stage_catalog_identity(&mut scratch, 1, 2, 2));
         assert!(!stage_catalog_identity(&mut scratch, 2, 3, 3));
+    }
+
+    /// A v8 record for a book pre-v8 firmware could address, alongside the
+    /// identity that firmware would have saved for it.
+    fn flat_record(display: &str, size: u32) -> ([u8; CATALOG_RECORD_BYTES], u32) {
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        let name = display.rsplit('/').next().unwrap_or(display);
+        encode_catalog_record(
+            &mut record,
+            display,
+            BookRoot::Library,
+            name,
+            "",
+            "",
+            size,
+            crate::cache::source_hash_at(BookRoot::Library, name, size),
+        );
+        let old_hash =
+            crate::cache::legacy_source_hash(display, size).expect("flat shape has a legacy hash");
+        (record, old_hash)
+    }
+
+    /// A record's pre-v8 identity is reconstructible exactly when its
+    /// display shape is one old firmware could have produced.
+    #[test]
+    fn a_records_legacy_identity_follows_its_display_shape() {
+        let (record, old_hash) = flat_record("/books/Book.epub", 12_345);
+        assert_eq!(
+            catalog_record_legacy_identity(&record),
+            Some((old_hash, 12_345)),
+        );
+
+        let mut nested = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut nested,
+            "/books/fiction/dune.epub",
+            BookRoot::Library,
+            "fiction/dune.epub",
+            "",
+            "",
+            12_345,
+            crate::cache::source_hash_at(BookRoot::Library, "fiction/dune.epub", 12_345),
+        );
+        assert_eq!(
+            catalog_record_legacy_identity(&nested),
+            None,
+            "a nested book has no pre-v8 identity to answer to",
+        );
+    }
+
+    /// The reviewer's upgrade sequence: a pre-v8 state record's identity
+    /// against a v8 catalog holding the same flat book under its new
+    /// identity must resolve to that book, and only that shape may answer.
+    #[test]
+    fn a_pre_v8_saved_identity_resolves_against_the_v8_catalog() {
+        let (dune, old_dune) = flat_record("/books/dune.epub", 4_096);
+        let (other, _) = flat_record("/books/other.epub", 9_000);
+        // A nested book whose display text and size mirror the flat one as
+        // closely as v8 allows; it must not be eligible.
+        let mut nested = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut nested,
+            "/books/shelf/dune.epub",
+            BookRoot::Library,
+            "shelf/dune.epub",
+            "",
+            "",
+            4_096,
+            crate::cache::source_hash_at(BookRoot::Library, "shelf/dune.epub", 4_096),
+        );
+
+        let mut scan = LegacyIdentityScan::new(old_dune, 4_096);
+        scan.offer(0, &other);
+        scan.offer(1, &nested);
+        scan.offer(2, &dune);
+        assert_eq!(scan.finish(), Some(2), "the flat book resolves");
+
+        // Two records answering the same legacy identity is a guess between
+        // real books, which restoration refuses.
+        let mut ambiguous = LegacyIdentityScan::new(old_dune, 4_096);
+        ambiguous.offer(0, &dune);
+        ambiguous.offer(1, &dune);
+        assert_eq!(ambiguous.finish(), None);
+
+        // An identity naming nothing on the card stays a miss.
+        let mut missing = LegacyIdentityScan::new(old_dune ^ 1, 4_096);
+        missing.offer(0, &dune);
+        assert_eq!(missing.finish(), None);
+    }
+
+    /// The current rule collides with itself too: this pair of legal
+    /// library locators shares one 32-bit identity at one size. A lookup
+    /// that trusted a hint or the first match could resolve a saved
+    /// identity to the other book after the catalog was rebuilt in a
+    /// different order, and the next save would persist the swap. One
+    /// match resolves; two refuse.
+    #[test]
+    fn a_same_domain_hash_collision_refuses_rather_than_guesses() {
+        let size = 1_234_567;
+        let hash_a =
+            crate::cache::source_hash_at(BookRoot::Library, "Fiction/zIx6RBhQEK.epub", size);
+        let hash_b =
+            crate::cache::source_hash_at(BookRoot::Library, "Fiction/nTfOyBwYzX.epub", size);
+        assert_eq!(hash_a, hash_b, "the collision this test exists for");
+
+        let mut twin_a = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut twin_a,
+            "/books/fiction/zix6rbhqek.epub",
+            BookRoot::Library,
+            "Fiction/zIx6RBhQEK.epub",
+            "",
+            "",
+            size,
+            hash_a,
+        );
+        let mut twin_b = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut twin_b,
+            "/books/fiction/ntfoybwyzx.epub",
+            BookRoot::Library,
+            "Fiction/nTfOyBwYzX.epub",
+            "",
+            "",
+            size,
+            hash_b,
+        );
+
+        let mut alone = IdentityScan::new(hash_a, size);
+        alone.offer(0, &twin_a);
+        assert_eq!(alone.finish(), Some(0), "one match resolves");
+
+        let mut twins = IdentityScan::new(hash_a, size);
+        twins.offer(0, &twin_a);
+        twins.offer(1, &twin_b);
+        assert_eq!(
+            twins.finish(),
+            None,
+            "two rows answering one identity is a guess between real books",
+        );
+    }
+
+    /// The two hash domains genuinely collide: this pair of legal books
+    /// shares one 32-bit value across the pre-v8 and v8 rules. An
+    /// unversioned saved identity read under the current rule first would
+    /// restore the unrelated nested book and then persist that mistake at
+    /// the next save. The record's version byte says which rule wrote the
+    /// identity, and the legacy reading cannot see the nested book at all.
+    #[test]
+    fn a_cross_domain_hash_collision_cannot_steal_a_restoration() {
+        let size = 1_234_567;
+        let legacy_a = crate::cache::legacy_source_hash("/books/6HawKebl.epub", size)
+            .expect("flat shape has a legacy identity");
+        let current_b =
+            crate::cache::source_hash_at(BookRoot::Library, "Fiction/XpipGrkt.epub", size);
+        assert_eq!(legacy_a, current_b, "the collision this test exists for");
+
+        let (a, old_a) = flat_record("/books/6HawKebl.epub", size);
+        assert_eq!(old_a, legacy_a);
+        let mut b = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut b,
+            "/books/fiction/xpipgrkt.epub",
+            BookRoot::Library,
+            "Fiction/XpipGrkt.epub",
+            "",
+            "",
+            size,
+            current_b,
+        );
+        // The nested book owns the colliding value as its current identity.
+        assert_eq!(catalog_record_identity(&b), (legacy_a, size));
+
+        // Read under the rule that wrote the saved identity, only A answers.
+        let mut scan = LegacyIdentityScan::new(legacy_a, size);
+        scan.offer(0, &b);
+        scan.offer(1, &a);
+        assert_eq!(
+            scan.finish(),
+            Some(1),
+            "the legacy reading finds the flat book, not the collider",
+        );
     }
 }

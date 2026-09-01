@@ -121,8 +121,6 @@ pub enum BookLoadStatus {
 pub struct LibraryBookEntry {
     pub display_name: String<64>,
     pub display_label: String<64>,
-    pub open_name: String<16>,
-    pub in_books_dir: bool,
     pub byte_size: u32,
     pub source_hash: u32,
 }
@@ -135,8 +133,6 @@ impl LibraryBookEntry {
         Self {
             display_name: String::new(),
             display_label: String::new(),
-            open_name: String::new(),
-            in_books_dir: false,
             byte_size: 0,
             source_hash: 0,
         }
@@ -188,6 +184,13 @@ pub struct ReaderStore {
     /// window so the reading path never depends on where the Library list
     /// happens to be scrolled; `catalog_entry` returns it for `active_index`.
     active_entry: LibraryBookEntry,
+    /// Where the active book is: the root its locator is relative to, and
+    /// the locator. Only the active entry carries one, since list rows are
+    /// labels and identity and every open stages its row here first, so
+    /// paying a path's width sixteen times over for the window would buy
+    /// nothing. `None` is a record this build could not place.
+    active_root: Option<proto::library_path::BookRoot>,
+    active_path: String<{ proto::library_path::MAX_PATH_BYTES }>,
     active_index: Option<usize>,
     pub(crate) current_index: Option<usize>,
     pub loaded_index: Option<usize>,
@@ -300,6 +303,8 @@ impl ReaderStore {
             window_len: 0,
             catalog_epoch: 0,
             active_entry: LibraryBookEntry::new(),
+            active_root: None,
+            active_path: String::new(),
             active_index: None,
             current_index: None,
             loaded_index: None,
@@ -519,8 +524,6 @@ impl ReaderStore {
     pub fn push_window_entry(
         &mut self,
         display_name: &str,
-        open_name: &str,
-        in_books_dir: bool,
         byte_size: u32,
         source_hash: u32,
         label_override: Option<&str>,
@@ -532,8 +535,6 @@ impl ReaderStore {
         fill_entry(
             &mut self.window[slot],
             display_name,
-            open_name,
-            in_books_dir,
             byte_size,
             source_hash,
             label_override,
@@ -548,8 +549,8 @@ impl ReaderStore {
         &mut self,
         index: usize,
         display_name: &str,
-        open_name: &str,
-        in_books_dir: bool,
+        root: Option<proto::library_path::BookRoot>,
+        path: &str,
         byte_size: u32,
         source_hash: u32,
         label_override: Option<&str>,
@@ -557,13 +558,28 @@ impl ReaderStore {
         fill_entry(
             &mut self.active_entry,
             display_name,
-            open_name,
-            in_books_dir,
             byte_size,
             source_hash,
             label_override,
         );
+        self.active_root = root;
+        self.active_path.clear();
+        let _ = self.active_path.push_str(path);
         self.active_index = Some(index);
+    }
+
+    /// Where row `index` is on the card, for a path that is about to open it:
+    /// the root its locator is relative to, and the locator.
+    ///
+    /// Answers for the active book alone. A row the list merely shows has no
+    /// locator resident, and an open reaches this only after staging its row
+    /// as active, so `None` here means the staging failed or the record named
+    /// a root this build cannot place.
+    pub fn book_location(&self, index: usize) -> Option<(proto::library_path::BookRoot, &str)> {
+        if self.active_index != Some(index) || self.active_path.is_empty() {
+            return None;
+        }
+        Some((self.active_root?, self.active_path.as_str()))
     }
 
     /// Copy the loaded book's title into the resident catalog entries for
@@ -1433,24 +1449,19 @@ impl ReaderStore {
 fn fill_entry(
     entry: &mut LibraryBookEntry,
     display_name: &str,
-    open_name: &str,
-    in_books_dir: bool,
     byte_size: u32,
     source_hash: u32,
     label_override: Option<&str>,
 ) {
     entry.display_name.clear();
     entry.display_label.clear();
-    entry.open_name.clear();
     let _ = entry.display_name.push_str(display_name);
     match label_override {
         Some(label) if !label.is_empty() => {
             let _ = entry.display_label.push_str(label);
         }
-        _ => derive_catalog_label(display_name, open_name, &mut entry.display_label),
+        _ => derive_catalog_label(display_name, &mut entry.display_label),
     }
-    let _ = entry.open_name.push_str(open_name);
-    entry.in_books_dir = in_books_dir;
     entry.byte_size = byte_size;
     entry.source_hash = source_hash;
 }
@@ -1555,15 +1566,6 @@ pub fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
         }
     }
     pages
-}
-
-pub fn source_hash(path: &str, byte_size: u32) -> u32 {
-    let mut hash = 0x811c_9dc5u32;
-    for byte in path.bytes().chain(byte_size.to_le_bytes()) {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
 }
 
 #[cfg(test)]
