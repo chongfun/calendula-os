@@ -417,7 +417,15 @@ impl WebEmulator {
             .unwrap_or(0) as usize
             % SHELF.len();
         let source = &SHELF[book_index];
-        let titles: Vec<&str> = SHELF.iter().map(|book| book.title).collect();
+        // The web shelf is a flat set of demo books, so every row is a book
+        // and the listing is the library root.
+        let titles: Vec<ui::UiLibraryRow<'_>> = SHELF
+            .iter()
+            .map(|book| ui::UiLibraryRow {
+                name: book.title,
+                is_folder: false,
+            })
+            .collect();
 
         let mut toc: Vec<UiTocItem<'_>> = Vec::new();
         let mut chapter_title = "";
@@ -452,6 +460,7 @@ impl WebEmulator {
             },
             library_status: UiLibraryStatus::Ready,
             library_entries: &titles,
+            library_folder: "",
             library_window_start: 0,
             chapters: &toc,
             chapters_window_start: 0,
@@ -560,6 +569,9 @@ fn storage_command_for_transition(
         || previous.view != AppView::Reading
     {
         return Some(StorageCommand::OpenBook {
+            // The emulated shelf is one catalog that stands still, so no open
+            // here is fenced to a generation it could fall out of.
+            catalog_epoch: None,
             request_id: 0,
             book_id: next.book_id,
             index,

@@ -12,6 +12,7 @@ use proto::epub::{
     EpubZipOps, NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
+use proto::library_path::{BookRoot, LibraryPath};
 use proto::nvm::AppStateRecord;
 use proto::text::{TextAlign, TextRole};
 use reader_cache::files;
@@ -19,7 +20,7 @@ use reader_cache::files::{BookIndexLoadResult, CacheLoadResult};
 use reader_cache::layout;
 use reader_cache::publish;
 use reader_cache::store::{
-    source_hash, BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
+    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
     MAX_READER_BLOCK_TEXT,
 };
 use reader_cache::{
@@ -485,35 +486,24 @@ pub(crate) fn continue_book_build(
         esp_println::println!("epub: build continue entry changed, dropping");
         return BackgroundStep::Abandoned;
     }
-    let in_books_dir = entry.in_books_dir;
-    let mut open_name = String::<16>::new();
     let mut display_name = String::<64>::new();
-    let _ = open_name.push_str(&entry.open_name);
     let _ = display_name.push_str(&entry.display_name);
+    let Some((at, path)) = book_locator(library, resume.index as usize) else {
+        esp_println::println!("epub: build continue lost locator, dropping");
+        return BackgroundStep::Abandoned;
+    };
 
     let step = sd_session::with_root(epd, sd_cs, |root| {
-        // The BOOKS handle has to outlive the file that borrows it, so it is
-        // bound here rather than inside the match, mirroring the open path.
-        let books = if in_books_dir {
-            match root.open_dir("BOOKS") {
-                Ok(books) => Some(books),
-                Err(err) => {
-                    esp_println::println!("epub: build continue /books failed: {:?}", err);
-                    return StepAttempt::NeverBegan(ReaderCacheError::MissingSpine);
-                }
-            }
-        } else {
-            None
-        };
-        let file = match &books {
-            Some(books) => books.open_file_in_dir(open_name.as_str(), Mode::ReadOnly),
-            None => root.open_file_in_dir(open_name.as_str(), Mode::ReadOnly),
-        };
-        match file {
-            Ok(file) => StepAttempt::Ran(build_or_load_epub_cache_from_file(
+        // The file borrows the directory the walk opened, so the step runs
+        // inside the walk rather than carrying a handle out of it.
+        let ran = upload_store::library::with_book_at(root, at, &path, |dir, alias| {
+            let file = dir.open_file_in_dir(alias, Mode::ReadOnly).ok()?;
+            Some(build_or_load_epub_cache_from_file(
                 file,
                 root,
                 &display_name,
+                at,
+                &path,
                 resume.index,
                 0,
                 // The step's "requested page" is where the reader is now: it
@@ -524,9 +514,12 @@ pub(crate) fn continue_book_build(
                 library,
                 scratch,
                 font_metrics,
-            )),
-            Err(err) => {
-                esp_println::println!("epub: build continue open failed: {:?}", err);
+            ))
+        });
+        match ran.ok().flatten().flatten() {
+            Some(outcome) => StepAttempt::Ran(outcome),
+            None => {
+                esp_println::println!("epub: build continue open failed");
                 StepAttempt::NeverBegan(ReaderCacheError::MissingSpine)
             }
         }
@@ -586,26 +579,31 @@ where
 {
     esp_println::println!("epub: card init begin");
     esp_println::println!("epub: open root");
-    let mut open_name = String::<16>::new();
     let mut display_name = String::<64>::new();
     let Some(entry) = library.catalog_entry(index) else {
         return BookLoadStatus::Error;
     };
-    let in_books_dir = entry.in_books_dir;
     let source_identity = (entry.source_hash, entry.byte_size);
     // The row a suspended build re-resolves itself from between steps. The
     // catalog is bounded well below u16, so the clamp is a formality.
     let catalog_index = index.min(u16::MAX as usize) as u16;
-    let _ = open_name.push_str(&entry.open_name);
     let _ = display_name.push_str(&entry.display_name);
+    let located = book_locator(library, index);
     esp_println::println!(
-        "epub: catalog entry display='{}' open='{}' books={}",
+        "epub: catalog entry display='{}' at='{}'",
         display_name,
-        open_name,
-        in_books_dir
+        located.as_ref().map_or("", |(_, path)| path.as_str()),
     );
-    let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
+    let cache_key = proto::cache::cache_key_from(source_identity.0);
     library.set_cache_key(cache_key.as_str());
+    // The cache is reachable only with a provable owner: the key and every
+    // artifact identity are 32-bit hashes a twin can share, so a row whose
+    // locator is not resident gets no cache access, only the build path.
+    let owner = located.as_ref().map(|(at, path)| proto::cache::CacheOwner {
+        key: cache_key.as_str(),
+        root: *at,
+        locator: path.as_str(),
+    });
     esp_println::println!("epub: stage ResolveCatalogEntry key={}", cache_key.as_str());
     esp_println::println!(
         "epub: stage TryV2BookIndexFast page={}",
@@ -623,16 +621,18 @@ where
     let walk_is_live = scratch
         .resume
         .is_some_and(|state| state.belongs_to(index, source_identity));
-    let fast_hit = try_load_v2_book_cache(
-        root,
-        cache_key.as_str(),
-        source_identity,
-        target_pages as u32,
-        library,
-        Instant::now(),
-        "fast",
-        walk_is_live,
-    );
+    let fast_hit = owner.as_ref().is_some_and(|owner| {
+        try_load_v2_book_cache(
+            root,
+            owner,
+            source_identity,
+            target_pages as u32,
+            library,
+            Instant::now(),
+            "fast",
+            walk_is_live,
+        )
+    });
     if !fast_hit {
         // Every remaining route rewrites those records, so whatever build owned
         // them is over. Cleared before the first writer runs rather than after,
@@ -641,24 +641,31 @@ where
         scratch.resume = None;
     }
     let replayed = !fast_hit
-        && try_replay_content_cache(
-            root,
-            cache_key.as_str(),
-            source_identity,
-            target_pages as u32,
-            library,
-            scratch,
-            font_metrics,
-        );
+        && owner.as_ref().is_some_and(|owner| {
+            try_replay_content_cache(
+                root,
+                owner,
+                source_identity,
+                target_pages as u32,
+                library,
+                scratch,
+                font_metrics,
+            )
+        });
     let status = if fast_hit || replayed {
         BookLoadStatus::Ready
-    } else if in_books_dir {
-        let load_result = match root.open_dir("BOOKS") {
-            Ok(books) => match books.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
-                Ok(file) => Some(build_or_load_epub_cache_from_file(
+    } else {
+        // The file borrows the directory the walk opened, so the build runs
+        // inside the walk rather than carrying a handle out of it.
+        let load_result = located.as_ref().and_then(|(at, path)| {
+            upload_store::library::with_book_at(root, *at, path, |dir, alias| {
+                let file = dir.open_file_in_dir(alias, Mode::ReadOnly).ok()?;
+                Some(build_or_load_epub_cache_from_file(
                     file,
                     root,
                     &display_name,
+                    *at,
+                    path,
                     catalog_index,
                     requested_chapter,
                     target_pages,
@@ -666,40 +673,19 @@ where
                     library,
                     scratch,
                     font_metrics,
-                )),
-                Err(err) => {
-                    esp_println::println!("epub: open file failed: {:?}", err);
-                    set_preview_error(library, "FILE");
-                    None
-                }
-            },
-            Err(err) => {
-                esp_println::println!("epub: open /books failed: {:?}", err);
-                set_preview_error(library, "BOOKS DIR");
-                None
-            }
-        };
-        status_for_load_result(load_result, library)
-    } else {
-        let load_result = match root.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
-            Ok(file) => Some(build_or_load_epub_cache_from_file(
-                file,
-                root,
-                &display_name,
-                catalog_index,
-                requested_chapter,
-                target_pages,
-                None,
-                library,
-                scratch,
-                font_metrics,
-            )),
-            Err(err) => {
-                esp_println::println!("epub: open file failed: {:?}", err);
-                set_preview_error(library, "FILE");
-                None
-            }
-        };
+                ))
+            })
+            .ok()
+            .flatten()
+            .flatten()
+        });
+        // A directory that would not answer is not the same as a book that is
+        // not there, but neither can be read, and the reader is told the same
+        // thing either way.
+        if load_result.is_none() {
+            esp_println::println!("epub: open failed");
+            set_preview_error(library, "FILE");
+        }
         status_for_load_result(load_result, library)
     };
     if matches!(status, BookLoadStatus::Ready) && !library.title.is_empty() {
@@ -717,7 +703,45 @@ where
     status
 }
 
+/// Where row `index` is on the card, ready to open: the root its locator is
+/// relative to, and the locator.
+///
+/// Only the active book has a resident locator, and every open stages its row
+/// as active first, so `None` means that staging did not happen or the record
+/// held nothing openable.
+fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, LibraryPath)> {
+    let (at, path) = library.book_location(index)?;
+    Some((at, LibraryPath::parse(path).ok()?))
+}
+
 #[inline(never)]
+/// Row `index`'s location as its catalog record states it, verified against
+/// the expected identity: the root, the locator, and the display name the
+/// legacy position fallback derives from. Read from the card because the
+/// resident window keeps only labels and identity; one record read on paths
+/// that already run whole SD sessions. `None` when the record is unreadable,
+/// names a root this build does not know, or no longer carries this
+/// identity, in which case no keyed cache access can prove ownership.
+fn record_location<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    index: usize,
+    identity: (u32, u32),
+) -> Option<(
+    BookRoot,
+    String<{ proto::library_path::MAX_PATH_BYTES }>,
+    String<64>,
+)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let record = crate::library_sd::read_catalog_record_at(root, index)?;
+    if (record.source_hash, record.byte_size) != identity {
+        return None;
+    }
+    Some((record.root?, record.path, record.display_name))
+}
+
 /// Persists a reading position to both places it lives, in one card session.
 ///
 /// The per-book position file is what this firmware reads back; the copy inside
@@ -732,16 +756,48 @@ pub(crate) fn store_app_state(
     record: AppStateRecord,
 ) -> bool {
     // The same session lands the global record and, for SD books, the
-    // per-book position beside that book's cache, so switching books
-    // never abandons the previous one's place.
-    let book_key = app_core::ReaderSource::from_book_id(record.book_id)
+    // per-book position beside that book's cache, so switching books does
+    // not abandon the previous one's place.
+    let book = app_core::ReaderSource::from_book_id(record.book_id)
         .sd_index()
-        .and_then(|index| library.catalog_entry(index as usize))
-        .map(|entry| proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size));
+        .and_then(|index| {
+            library
+                .catalog_entry(index as usize)
+                .map(|entry| (index as usize, (entry.source_hash, entry.byte_size)))
+        });
     sd_session::with_root(epd, sd_cs, |root| {
         let state = files::write_state_file(root, record);
-        let position = if let Some(key) = &book_key {
-            files::write_position_file(root, key.as_str(), record.chapter, record.screen)
+        let position = if let Some((index, identity)) = book {
+            match record_location(root, index, identity) {
+                Some((at, path, _)) => {
+                    let key = proto::cache::cache_key_from(identity.0);
+                    let owner = proto::cache::CacheOwner {
+                        key: key.as_str(),
+                        root: at,
+                        locator: path.as_str(),
+                    };
+                    match files::write_position_file(root, &owner, record.chapter, record.screen) {
+                        Ok(()) => Ok(()),
+                        // A full-hash twin's active claim holds the key.
+                        // Deliberate and durable, not a card fault: this
+                        // book's position is unpersistable while the twin
+                        // holds it, and the global record above still
+                        // carries the active book's place. Failing here
+                        // would block every save over a place that cannot
+                        // be stored anyway.
+                        Err(files::ClaimDenied::Foreign) => {
+                            esp_println::println!(
+                                "storage: position write refused by a foreign claim"
+                            );
+                            Ok(())
+                        }
+                        Err(files::ClaimDenied::Fault) => Err(()),
+                    }
+                }
+                // No provable location means no directory this write can
+                // claim; the global record above still carries the place.
+                None => Err(()),
+            }
         } else {
             Ok(())
         };
@@ -782,9 +838,28 @@ pub(crate) fn store_book_position(
         );
         return false;
     };
-    let key = proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size);
+    let identity = (entry.source_hash, entry.byte_size);
     sd_session::with_root(epd, sd_cs, |root| {
-        files::write_position_file(root, key.as_str(), record.chapter, record.screen)
+        let (at, path, _) = record_location(root, index as usize, identity).ok_or(())?;
+        let key = proto::cache::cache_key_from(identity.0);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        match files::write_position_file(root, &owner, record.chapter, record.screen) {
+            Ok(()) => Ok(()),
+            // A twin's active claim holds the key: the departing book's
+            // place cannot be stored while it does, and refusing the whole
+            // book-open transaction over it would leave the reader stuck on
+            // this book. The loss is bounded to this book's place, which no
+            // write can land anyway.
+            Err(files::ClaimDenied::Foreign) => {
+                esp_println::println!("storage: departing position refused by a foreign claim");
+                Ok(())
+            }
+            Err(files::ClaimDenied::Fault) => Err(()),
+        }
     })
     .ok()
     .is_some_and(|result| result.is_ok())
@@ -808,6 +883,11 @@ pub(crate) fn store_global_state(
 }
 
 /// The saved per-book position for a catalog entry, if any.
+///
+/// Reads through the legacy-key fallback: a card upgraded across the v8
+/// re-key holds every inactive book's position under its old key, and the
+/// place a reader left off is not rebuildable. The next save publishes
+/// under the current key.
 #[inline(never)]
 pub(crate) fn load_position(
     epd: &mut Epd,
@@ -815,11 +895,17 @@ pub(crate) fn load_position(
     library: &ReaderStore,
     index: usize,
 ) -> Option<(u16, u32)> {
-    let key = library
-        .catalog_entry(index)
-        .map(|entry| proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size))?;
+    let entry = library.catalog_entry(index)?;
+    let identity = (entry.source_hash, entry.byte_size);
     sd_session::with_root(epd, sd_cs, |root| {
-        files::read_position_file(root, key.as_str())
+        let (at, path, display_name) = record_location(root, index, identity)?;
+        let key = proto::cache::cache_key_from(identity.0);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        files::read_position_file_or_legacy(root, &owner, display_name.as_str(), entry.byte_size)
     })
     .ok()
     .flatten()
@@ -839,19 +925,29 @@ pub(crate) fn load_chapters_into_store(
         return false;
     };
     let source_identity = (entry.source_hash, entry.byte_size);
-    let key = proto::cache::cache_key_for(entry.display_name.as_str(), source_identity.1);
+    let key = proto::cache::cache_key_from(source_identity.0);
+    // The chapters view opens for the loaded book, whose locator is
+    // resident; a row with no resident locator has no provable directory.
+    let Some((at, path)) = book_locator(library, index) else {
+        return false;
+    };
     // Center the window on the selection so scrolling either way has slack
     // before the next reload.
     let window_start = selection.saturating_sub(reader_cache::store::TOC_WINDOW_CAPACITY / 2);
     sd_session::with_root(epd, sd_cs, |root| {
-        files::load_v2_toc_into_text(root, key.as_str(), source_identity, library, window_start)
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        files::load_v2_toc_into_text(root, &owner, source_identity, library, window_start)
     })
     .unwrap_or(false)
 }
 
 /// Make the TOC window cover the Chapters rows visible around `selection`,
 /// reloading it from TOC.BIN only on a miss — the overview analogue of
-/// `ensure_library_window`. Cheap when the window already covers.
+/// `ensure_folder_page`. Cheap when the window already covers.
 pub(crate) fn ensure_toc_window(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
@@ -930,7 +1026,7 @@ pub(crate) fn clear_book_cache(
     let index = index as usize;
     let resolved = match library.catalog_entry(index) {
         Some(entry) => Some((
-            proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size),
+            proto::cache::cache_key_from(entry.source_hash),
             entry.source_hash,
             entry.byte_size,
         )),
@@ -948,6 +1044,26 @@ pub(crate) fn clear_book_cache(
     // BOOK.BIN and stall on a section, and the resident state has to be
     // dropped in that case as surely as in the clean one.
     let (attempted, cleared) = sd_session::with_root(epd, sd_cs, |root| {
+        // The row is a specific book, so its exact ownership is checkable
+        // where the sweep's is not: a full 32-bit twin passes the header
+        // identity test below, and without this gate the wrong row could
+        // clear the claim holder's cache. Unclaimed directories fall through
+        // to the identity test, which is all pre-claim caches ever had.
+        if let Some((at, path, _)) = record_location(root, index, (source_hash, source_size)) {
+            let owner = proto::cache::CacheOwner {
+                key: cache_key.as_str(),
+                root: at,
+                locator: path.as_str(),
+            };
+            match files::cache_dir_claim(root, &owner) {
+                files::ClaimState::MineActive
+                | files::ClaimState::MineReleased
+                | files::ClaimState::Unclaimed => {}
+                files::ClaimState::OtherActive
+                | files::ClaimState::OtherReleased
+                | files::ClaimState::Fault => return (false, false),
+            }
+        }
         match files::read_cache_header(root, cache_key.as_str()) {
             files::CacheHeader::Present(header) => {
                 if header.source_hash != source_hash || header.source_size != source_size {
@@ -1114,19 +1230,21 @@ pub(crate) fn load_chapter_title(
         return;
     };
     let source_identity = (entry.source_hash, entry.byte_size);
-    let mut display_name = String::<64>::new();
-    let _ = display_name.push_str(&entry.display_name);
-    let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
-    let found = sd_session::with_root(epd, sd_cs, |root| {
-        files::read_v2_toc_chapter_title(
-            root,
-            cache_key.as_str(),
-            source_identity,
-            chapter,
-            library,
-        )
-    })
-    .unwrap_or(false);
+    let cache_key = proto::cache::cache_key_from(source_identity.0);
+    // A book with no locator is not found, the same as one whose title would
+    // not read: either way the fallback below runs.
+    let found = match book_locator(library, index) {
+        Some((at, path)) => sd_session::with_root(epd, sd_cs, |root| {
+            let owner = proto::cache::CacheOwner {
+                key: cache_key.as_str(),
+                root: at,
+                locator: path.as_str(),
+            };
+            files::read_v2_toc_chapter_title(root, &owner, source_identity, chapter, library)
+        })
+        .unwrap_or(false),
+        None => false,
+    };
     if !found {
         // Tag the source even on a miss so a stale title from another book is
         // never shown; the colophon falls back to a numeral for this chapter.
@@ -1148,11 +1266,17 @@ pub(crate) fn restore_book_page_count(
         return 0;
     };
     let source_identity = (entry.source_hash, entry.byte_size);
-    let mut display_name = String::<64>::new();
-    let _ = display_name.push_str(&entry.display_name);
-    let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
+    let cache_key = proto::cache::cache_key_from(source_identity.0);
+    let Some((at, path)) = book_locator(library, index) else {
+        return 0;
+    };
     sd_session::with_root(epd, sd_cs, |root| {
-        files::read_v2_book_total_pages(root, cache_key.as_str(), source_identity, library)
+        let owner = proto::cache::CacheOwner {
+            key: cache_key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        files::read_v2_book_total_pages(root, &owner, source_identity, library)
     })
     .unwrap_or(0)
 }
@@ -1167,7 +1291,7 @@ fn try_load_v2_book_cache<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     requested_global_page: u32,
     library: &mut ReaderStore,
@@ -1181,7 +1305,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    match files::load_v2_book_index(root, cache_key, source_identity, library) {
+    match files::load_v2_book_index(root, owner, source_identity, library) {
         BookIndexLoadResult::Hit { unfinished }
             if !app_core::storage_loop::partial_index_is_usable(unfinished, walk_is_live) =>
         {
@@ -1198,7 +1322,7 @@ where
         BookIndexLoadResult::Hit { .. } => {
             match files::load_v2_section_by_global_page(
                 root,
-                cache_key,
+                owner,
                 source_identity,
                 requested_global_page,
                 library,
@@ -1207,12 +1331,12 @@ where
                     layout::rebuild_toc_page_targets(library);
                     publish::refresh_chapter_tracking(
                         root,
-                        cache_key,
+                        owner,
                         source_identity,
                         requested_global_page,
                         library,
                     );
-                    let cover = files::load_v2_cover_cache(root, cache_key, library);
+                    let cover = files::load_v2_cover_cache(root, owner, library);
                     esp_println::println!(
                         "epub: v2 {label} book cache ready after {} ms (total={} section_pages={} toc={} cover={:?})",
                         started.elapsed().as_millis(),
@@ -1397,6 +1521,8 @@ fn build_or_load_epub_cache_from_file<
     file: File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     source_path: &str,
+    at: BookRoot,
+    locator: &LibraryPath,
     catalog_index: u16,
     _requested_chapter: u16,
     target_pages: usize,
@@ -1411,9 +1537,21 @@ where
 {
     let open_started = Instant::now();
     let source_len = file.length();
-    let source_identity = (source_hash(source_path, source_len), source_len);
-    let cache_key = proto::cache::cache_key_for(source_path, source_len);
+    // Identity hashes where the book is and the length the file has now,
+    // rather than the catalog's copy of it, so a file replaced on the card
+    // re-keys instead of answering from the old book's cache. `source_path`
+    // stays a label from here on.
+    let source_identity = (
+        proto::cache::source_hash_at(at, locator.as_str(), source_len),
+        source_len,
+    );
+    let cache_key = proto::cache::cache_key_from(source_identity.0);
     library.set_cache_key(cache_key.as_str());
+    let owner = proto::cache::CacheOwner {
+        key: cache_key.as_str(),
+        root: at,
+        locator: locator.as_str(),
+    };
 
     esp_println::println!("epub: stage OpenSdFile len={}", source_len);
     let requested_global_page = target_pages as u32;
@@ -1436,7 +1574,7 @@ where
         root,
         source_path,
         source_identity,
-        cache_key.as_str(),
+        &owner,
         catalog_index,
         requested_global_page,
         resume,
@@ -1488,7 +1626,7 @@ fn build_or_load_epub_cache_from_zip<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     source_path: &str,
     source_identity: (u32, u32),
-    cache_key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     catalog_index: u16,
     requested_global_page: u32,
     resume: Option<BookBuildResume>,
@@ -1589,7 +1727,7 @@ where
             .min(scratch.xhtml.len());
         let wrote_toc = files::write_v2_toc_file(
             root,
-            cache_key,
+            owner,
             source_identity,
             toc_record_count,
             &scratch.xhtml[..toc_bytes],
@@ -1664,9 +1802,9 @@ where
 
     // The whole cache tree is created here, once; the capture and the
     // sections walk below only open what already exists.
-    let cache_dirs_ok = files::ensure_v2_cache_dirs(root, cache_key).is_ok();
+    let cache_dirs_ok = files::ensure_v2_cache_dirs(root, owner).is_ok();
     if !cache_dirs_ok {
-        esp_println::println!("cache: v2 ensure dirs failed key={}", cache_key);
+        esp_println::println!("cache: v2 ensure dirs failed key={}", owner.key);
     }
     // Capture the push_block stream into CONT.BIN alongside the build, so a
     // type-settings change can replay it without re-parsing the EPUB. The
@@ -1674,7 +1812,7 @@ where
     // never fails the build. Its directory handle outlives the whole walk
     // because the capture's file handle borrows it.
     let content_dir = if cache_dirs_ok {
-        files::open_v2_book_dir(root, cache_key)
+        files::open_v2_book_dir(root, owner)
     } else {
         None
     };
@@ -1707,7 +1845,7 @@ where
     //
     // `Ok(Some(next_spine))` means the walk suspended and owes a continuation
     // from that spine item; `Ok(None)` means it reached the end of the book.
-    let walk = files::with_v2_sections_dir(root, cache_key, |sections_dir| {
+    let walk = files::with_v2_sections_dir(root, owner, |sections_dir| {
         for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
             *index >= start_spine_index
                 && *index >= resume_spine_index
@@ -1861,7 +1999,7 @@ where
         return if resume.is_none() {
             publish::publish_first_open(
                 root,
-                cache_key,
+                owner,
                 source_identity,
                 requested_global_page,
                 library,
@@ -1876,7 +2014,7 @@ where
                     open_started.elapsed().as_millis(),
                     total_pages,
                     section_count,
-                    cache_key
+                    owner.key
                 );
             })
             .map(|()| {
@@ -1886,7 +2024,7 @@ where
         } else {
             publish::extend_background_index(
                 root,
-                cache_key,
+                owner,
                 source_identity,
                 requested_global_page,
                 next_spine,
@@ -1930,7 +2068,7 @@ where
         let continuing = resume.is_some();
         let published = publish::publish_book_cache(
             root,
-            cache_key,
+            owner,
             source_identity,
             requested_global_page,
             library,
@@ -1943,7 +2081,7 @@ where
         );
         if published.outcome == publish::BookPublishOutcome::Ready {
             report_publish(
-                cache_key,
+                owner.key,
                 if continuing { "final" } else { "full" },
                 open_started,
                 spine_started,
@@ -1963,7 +2101,7 @@ where
             // the one below, which is written for a book nobody is holding.
             return publish::finish_background_walk(
                 root,
-                cache_key,
+                owner,
                 source_identity,
                 requested_global_page,
                 published.outcome,
@@ -1990,7 +2128,7 @@ where
                 // the next open rebuilds from the EPUB cleanly. Safe only
                 // because this arm is the *open* path: the book never became
                 // readable, so nothing is holding these files.
-                let _ = files::empty_cache_dir(root, cache_key);
+                let _ = files::empty_cache_dir(root, owner.key);
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -2062,7 +2200,7 @@ fn try_replay_content_cache<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    cache_key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     requested_global_page: u32,
     library: &mut ReaderStore,
@@ -2093,10 +2231,10 @@ where
     let mut book_partial = false;
     let mut section_write_micros: u64 = 0;
 
-    let replayed = files::with_v2_sections_dir(root, cache_key, |sections_dir| {
+    let replayed = files::with_v2_sections_dir(root, owner, |sections_dir| {
         // One open serves both the header validation and the record
         // stream; the handle stays live for the whole replay.
-        files::with_v2_content_file(root, cache_key, Mode::ReadOnly, |file| {
+        files::with_v2_content_file(root, owner, Mode::ReadOnly, |file| {
             let mut header_bytes = [0u8; CONTENT_HEADER_BYTES];
             if files::read_exact_file(file, &mut header_bytes).is_err() {
                 return Err(ReplayFail::Corrupt);
@@ -2116,7 +2254,7 @@ where
             // copy are settings-independent; carry them into the rewritten
             // index. Bail to the full build when they can't be recovered —
             // it re-parses them.
-            if !files::load_v2_book_labels_and_toc(root, cache_key, source_identity, library) {
+            if !files::load_v2_book_labels_and_toc(root, owner, source_identity, library) {
                 return Err(ReplayFail::Bail);
             }
             library.clear_cover();
@@ -2150,19 +2288,19 @@ where
         Err(ReplayFail::Bail) => return false,
         Err(ReplayFail::Corrupt) => {
             esp_println::println!("epub: content replay failed, falling back to full build");
-            files::delete_v2_content_file(root, cache_key);
+            files::delete_v2_content_file(root, owner);
             return false;
         }
         Ok(()) if section_count == 0 || total_pages == 0 => {
             esp_println::println!("epub: content replay failed, falling back to full build");
-            files::delete_v2_content_file(root, cache_key);
+            files::delete_v2_content_file(root, owner);
             return false;
         }
         Ok(()) => {}
     }
     let published = publish::publish_book_cache(
         root,
-        cache_key,
+        owner,
         source_identity,
         requested_global_page,
         library,
@@ -2174,7 +2312,7 @@ where
     );
     if published.outcome == publish::BookPublishOutcome::Ready {
         report_publish(
-            cache_key,
+            owner.key,
             "replay",
             open_started,
             spine_started,
@@ -2191,7 +2329,7 @@ where
         // truncated BOOK.BIN or an unreadable section); the full build
         // rewrites everything, so clear it all either way.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        let _ = files::empty_cache_dir(root, cache_key);
+        let _ = files::empty_cache_dir(root, owner.key);
         return false;
     }
     true

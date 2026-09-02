@@ -14,6 +14,7 @@ use embedded_sdmmc::{
     VolumeIdx, VolumeManager,
 };
 use heapless::String;
+use proto::library_path::BookRoot;
 use proto::source::FileKey;
 use upload_store::install::{
     self, recover_installs, InstallIntent, Landed, Located, ShortName, Step, ROLLBACK_DIR,
@@ -2065,7 +2066,13 @@ fn labels_under_the_current_cache_root_are_read() {
 
     let mut label = String::<64>::new();
     assert!(
-        upload_store::read_upload_label(&root, alias.as_str(), &mut label),
+        upload_store::read_upload_label(
+            &root,
+            BookRoot::Library,
+            alias.as_str(),
+            alias.as_str(),
+            &mut label
+        ),
         "a label under {} must be found",
         proto::cache::CACHE_ROOT_DIR
     );
@@ -2074,6 +2081,58 @@ fn labels_under_the_current_cache_root_are_read() {
         upload_store::read_upload_identity(&root, alias.as_str()),
         Ok(Some(identity))
     );
+}
+
+/// A label names an alias, and an alias only means anything inside one
+/// directory. The scheme that wrote these put every book straight into
+/// `/BOOKS`, so a nested book wearing the same alias is a different file, and
+/// a computer that deleted or moved the labelled one cannot clear what it left
+/// behind. Reading the label for it would put another book's name in the list.
+#[test]
+fn a_nested_book_does_not_inherit_a_flat_alias_label() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    let alias = proto::upload::sanitized_name(b"Middlemarch.epub");
+    let existing = books
+        .open_file_in_dir(alias.as_str(), Mode::ReadWriteCreate)
+        .expect("a book from before long names");
+    existing.write(&old_body()).expect("write");
+    existing.close().expect("close");
+    write_legacy_sidecars(
+        &root,
+        alias.as_str(),
+        proto::upload::hash_identity(b"Middlemarch.epub"),
+        "Middlemarch",
+    );
+
+    // The same alias, legally, one directory down: FAT hands out 8.3 names
+    // per directory, not per card.
+    let mut label = String::<64>::new();
+    let mut nested = std::string::String::from("Fiction/");
+    nested.push_str(alias.as_str());
+    assert!(
+        !upload_store::read_upload_label(
+            &root,
+            BookRoot::Library,
+            nested.as_str(),
+            alias.as_str(),
+            &mut label
+        ),
+        "a nested book has no label in a flat alias namespace"
+    );
+    assert!(label.is_empty(), "and nothing is written into the label");
+
+    // The card root is the other place the old scheme could name, so it still
+    // asks; only depth is out of reach.
+    assert!(upload_store::read_upload_label(
+        &root,
+        BookRoot::CardRoot,
+        alias.as_str(),
+        alias.as_str(),
+        &mut label
+    ));
+    assert_eq!(label.as_str(), "Middlemarch");
 }
 
 /// Every cluster of a file, walked through the driver.

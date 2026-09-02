@@ -44,6 +44,9 @@ const HEADING_CX: i16 = 480;
 const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
+/// Room kept at the end of a folder row for its trailing separator, so the
+/// mark that makes it a folder is never the part that gets truncated away.
+const FOLDER_MARK_WIDTH: usize = 16;
 /// Rows the Library list shows at once. Public so the firmware slides the
 /// resident catalog window over the visible range it must stream in. The
 /// portrait page runs the long axis upright, so it seats more rows above
@@ -350,35 +353,106 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
     }
 }
 
+/// Which line the Library footer carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryFooterLine {
+    /// A picked action's wait or its result has something of its own to say.
+    Note,
+    /// Just the position. The teaching line names the sheet key, and that
+    /// press does something else here, or nothing.
+    Position,
+    /// The resting line, which teaches the sheet key.
+    Hint,
+}
+
+/// What the footer may say, given what the sheet key would do.
+///
+/// The teaching line is the only thing here that promises a press, so it
+/// only appears when that press opens the sheet. A move through the tree
+/// swallows it exactly as the sheet being up already redirects it, and
+/// neither wait has a note of its own to show instead.
+fn library_footer_line(menu: app_core::LibraryMenu, move_pending: bool) -> LibraryFooterLine {
+    match menu {
+        app_core::LibraryMenu::Busy { .. } | app_core::LibraryMenu::Done { .. } => {
+            LibraryFooterLine::Note
+        }
+        app_core::LibraryMenu::Sheet { .. } => LibraryFooterLine::Position,
+        app_core::LibraryMenu::None if move_pending => LibraryFooterLine::Position,
+        app_core::LibraryMenu::None => LibraryFooterLine::Hint,
+    }
+}
+
+/// Which Library controls the reducer will honour on the next press.
+///
+/// The rail draws what this says and nothing else, because a label is a
+/// promise: every key it names has to do what it says when pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryRail {
+    /// The actions sheet is up and owns the keys.
+    Sheet,
+    /// Something is outstanding, either a picked action or a move through the
+    /// tree. The reducer swallows every press but Back, and Back leaves
+    /// Library rather than going up a level, so one live key and one word.
+    Held,
+    /// Nothing outstanding. Back is a level inside a folder and the way out
+    /// at the root, and the other three act.
+    Live { back: &'static str },
+}
+
+/// What the rail may offer, given what a press would actually do.
+///
+/// A wait outranks the sheet: while a move or an action is outstanding the
+/// reducer swallows the sheet's keys too, so a rail drawn from the sheet
+/// alone would name three presses that go nowhere.
+fn library_rail(in_folder: bool, menu: app_core::LibraryMenu, move_pending: bool) -> LibraryRail {
+    if move_pending || matches!(menu, app_core::LibraryMenu::Busy { .. }) {
+        LibraryRail::Held
+    } else if matches!(menu, app_core::LibraryMenu::Sheet { .. }) {
+        LibraryRail::Sheet
+    } else {
+        LibraryRail::Live {
+            back: if in_folder { "up" } else { "home" },
+        }
+    }
+}
+
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     let layout = shell_layout(shell);
-    // While the actions sheet is up, the rail answers only it: no label
-    // may promise an action the press will not take.
-    match shell.library_menu {
-        app_core::LibraryMenu::Sheet { .. } => {
+    let in_folder = !shell.library_folder.is_empty();
+    // No label may promise an action the press will not take.
+    match library_rail(in_folder, shell.library_menu, shell.library_move_pending) {
+        LibraryRail::Sheet => {
             dash_key(fb, layout, 0, "cancel", false);
             dash_key(fb, layout, 1, "select", true);
             dash_key(fb, layout, 2, "previous", false);
             dash_key(fb, layout, 3, "next", false);
         }
-        // A picked action freezes the list until it settles, and the reducer
-        // swallows every press but Back. Three of the four labels would be
-        // promising exactly what will not happen, so only the one that works
-        // is drawn; the rest of the rail stays bare for the moment it takes.
-        app_core::LibraryMenu::Busy { .. } => {
+        // Only the key that works is drawn; the rest of the rail stays bare
+        // for the moment the wait takes.
+        LibraryRail::Held => {
             dash_key(fb, layout, 0, "home", false);
         }
         // A settled note is dismissed by any press, and that press still
         // acts, so the ordinary rail is honest again.
-        app_core::LibraryMenu::Done { .. } | app_core::LibraryMenu::None => {
-            dash_key(fb, layout, 0, "home", false);
+        LibraryRail::Live { back } => {
+            dash_key(fb, layout, 0, back, false);
             dash_key(fb, layout, 1, "open", true);
             dash_key(fb, layout, 2, "previous", false);
             dash_key(fb, layout, 3, "next", false);
         }
     }
-    heading(fb, layout, "Library");
+    // Inside a folder the screen is that folder, and Back is a level rather
+    // than the way out; the rail says which so the label matches the press.
+    heading(
+        fb,
+        layout,
+        if in_folder {
+            fitted_heading(shell.library_folder)
+        } else {
+            "Library"
+        },
+    );
 
     match shell.library_status {
         UiLibraryStatus::NotScanned | UiLibraryStatus::Scanning => {
@@ -429,15 +503,28 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         if abs == selected_index {
             selection_arrow(fb, layout, y);
         }
-        draw_text_truncated(
-            fb,
-            body,
-            entry,
-            layout.content_x,
-            y,
-            layout.content_width() as usize,
-            false,
-        );
+        // A folder wears a trailing separator, the way it does on a computer.
+        // Shape rather than weight or shade: the panel is one bit deep, and a
+        // reader who cannot pick out a subtle difference still reads a slash.
+        let width = layout.content_width() as usize;
+        let name_width = if entry.is_folder {
+            width.saturating_sub(FOLDER_MARK_WIDTH)
+        } else {
+            width
+        };
+        let drawn =
+            draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false);
+        if entry.is_folder {
+            draw_text_truncated(
+                fb,
+                body,
+                "/",
+                layout.content_x + drawn as i16,
+                y,
+                FOLDER_MARK_WIDTH,
+                false,
+            );
+        }
         y += ROW_STEP;
     }
 
@@ -448,26 +535,32 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         let selected_entry = (shell.selection as usize)
             .checked_sub(window_start)
             .and_then(|offset| shell.library_entries.get(offset))
-            .copied()
+            .map(|entry| entry.name)
             .unwrap_or("this book");
         render_library_sheet(fb, layout, selected_entry, row);
     }
-    match shell.library_menu {
-        app_core::LibraryMenu::Busy { action, .. } => match action {
-            app_core::LibraryAction::ClearCache => footer_note(fb, layout, "clearing\u{2026}"),
+    match library_footer_line(shell.library_menu, shell.library_move_pending) {
+        LibraryFooterLine::Note => match shell.library_menu {
+            app_core::LibraryMenu::Busy {
+                action: app_core::LibraryAction::ClearCache,
+                ..
+            } => footer_note(fb, layout, "clearing\u{2026}"),
+            app_core::LibraryMenu::Done {
+                action: app_core::LibraryAction::ClearCache,
+                ok,
+            } => footer_note(
+                fb,
+                layout,
+                if ok {
+                    "cache cleared"
+                } else {
+                    "cache not cleared"
+                },
+            ),
+            _ => position_footer(fb, layout, selected_index + 1, total),
         },
-        app_core::LibraryMenu::Done { action, ok } => match (action, ok) {
-            (app_core::LibraryAction::ClearCache, true) => footer_note(fb, layout, "cache cleared"),
-            (app_core::LibraryAction::ClearCache, false) => {
-                footer_note(fb, layout, "cache not cleared")
-            }
-        },
-        // While the sheet is up the page-back key dismisses it, so the
-        // teaching line below would lie; the plain position stands in.
-        app_core::LibraryMenu::Sheet { .. } => {
-            position_footer(fb, layout, selected_index + 1, total)
-        }
-        app_core::LibraryMenu::None => library_footer(fb, layout, selected_index + 1, total),
+        LibraryFooterLine::Position => position_footer(fb, layout, selected_index + 1, total),
+        LibraryFooterLine::Hint => library_footer(fb, layout, selected_index + 1, total),
     }
     finish_working_screen(fb, shell, layout);
 }
@@ -1030,11 +1123,37 @@ pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pa
     dash_key(fb, layout, 3, "next", false);
 }
 
+/// Width of the rule under a heading, and so the width a heading has.
+const HEADING_RULE_W: i16 = 320;
+
 fn heading(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
     let small = literata_small(FontStyle::Regular);
     let width = ls_width(small, text, 5);
     ls_caps(fb, small, text, layout.heading_cx - width / 2, 42, 5);
-    hline(fb, layout.heading_cx - 160, 56, 320);
+    hline(
+        fb,
+        layout.heading_cx - HEADING_RULE_W / 2,
+        56,
+        HEADING_RULE_W,
+    );
+}
+
+/// The longest prefix of `text` that fits under the rule.
+///
+/// Headings are a fixed word until a folder name becomes one, and a name is
+/// whatever a reader called a directory. Measured with the letterspacing the
+/// draw uses, or the fit would be computed for a narrower string than the one
+/// that lands.
+fn fitted_heading(text: &str) -> &str {
+    let small = literata_small(FontStyle::Regular);
+    let mut end = text.len();
+    while end > 0 {
+        if text.is_char_boundary(end) && ls_width(small, &text[..end], 5) <= HEADING_RULE_W {
+            return &text[..end];
+        }
+        end -= 1;
+    }
+    ""
 }
 
 /// Letterspaced all-caps, the small-caps stand-in for this bitmap set.
@@ -1236,6 +1355,8 @@ fn fmt_numbered_chapter(number: usize, buf: &mut [u8; 32]) -> &str {
     core::str::from_utf8(&buf[..cursor]).unwrap_or("Chapter")
 }
 
+/// Draws `text` clipped to `max_w`, and reports the width it actually took,
+/// so a caller can put something immediately after it.
 fn draw_text_truncated(
     fb: &mut Framebuffer,
     font: &BitmapFont,
@@ -1244,9 +1365,10 @@ fn draw_text_truncated(
     y: i16,
     max_w: usize,
     white: bool,
-) {
+) -> u16 {
     let text = fit_text(font, text, max_w.min(u16::MAX as usize) as u16);
     draw_text(fb, font, text, x, y, white);
+    measure_text(font, text)
 }
 
 /// Greedy two-line word wrap for the display-face title. Returns the
@@ -1421,6 +1543,80 @@ fn font_family_label(family: display::font::FontFamily, custom_name: &str) -> &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BUSY: app_core::LibraryMenu = app_core::LibraryMenu::Busy {
+        action: app_core::LibraryAction::ClearCache,
+        index: 0,
+        request_id: 1,
+    };
+
+    /// Every label is a promise. Both kinds of wait swallow every press but
+    /// Back, and Back then leaves Library rather than going up a level, so
+    /// the rail offers one key and calls it home.
+    #[test]
+    fn a_wait_leaves_one_live_key_whatever_the_depth() {
+        for in_folder in [true, false] {
+            assert_eq!(
+                library_rail(in_folder, BUSY, false),
+                LibraryRail::Held,
+                "a picked action, in_folder={in_folder}"
+            );
+            assert_eq!(
+                library_rail(in_folder, app_core::LibraryMenu::None, true),
+                LibraryRail::Held,
+                "a move through the tree, in_folder={in_folder}"
+            );
+        }
+    }
+
+    /// The teaching line names the sheet key, so it may only show when that
+    /// press opens the sheet. A move through the tree swallows it, and that
+    /// wait has no note of its own, so the plain position stands in exactly
+    /// as it does while the sheet is up.
+    #[test]
+    fn a_pending_move_drops_the_line_that_teaches_a_swallowed_key() {
+        assert_eq!(
+            library_footer_line(app_core::LibraryMenu::None, true),
+            LibraryFooterLine::Position
+        );
+        assert_eq!(
+            library_footer_line(app_core::LibraryMenu::None, false),
+            LibraryFooterLine::Hint,
+            "at rest the key it names works"
+        );
+        assert_eq!(
+            library_footer_line(app_core::LibraryMenu::Sheet { row: 0 }, false),
+            LibraryFooterLine::Position
+        );
+        assert_eq!(
+            library_footer_line(BUSY, false),
+            LibraryFooterLine::Note,
+            "a picked action says what it is doing"
+        );
+    }
+
+    /// A move outstanding swallows the sheet's keys too, so a rail drawn
+    /// from the sheet alone would name three presses that go nowhere.
+    #[test]
+    fn a_move_outranks_the_sheet() {
+        let sheet = app_core::LibraryMenu::Sheet { row: 0 };
+        assert_eq!(library_rail(true, sheet, false), LibraryRail::Sheet);
+        assert_eq!(library_rail(true, sheet, true), LibraryRail::Held);
+    }
+
+    /// With nothing outstanding the whole rail acts, and Back is a level
+    /// inside a folder and the way out at the root.
+    #[test]
+    fn an_idle_library_offers_the_rail_it_can_keep() {
+        assert_eq!(
+            library_rail(true, app_core::LibraryMenu::None, false),
+            LibraryRail::Live { back: "up" }
+        );
+        assert_eq!(
+            library_rail(false, app_core::LibraryMenu::None, false),
+            LibraryRail::Live { back: "home" }
+        );
+    }
 
     #[test]
     fn wrap_title_lines_fits_alice_on_three_portrait_lines() {

@@ -5,9 +5,7 @@ use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, LfnBuffer, Mode, TimeSource};
 use esp_hal::gpio::Output;
 use heapless::String;
-use reader_cache::store::{
-    derive_catalog_label, source_hash, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW,
-};
+use reader_cache::store::{derive_catalog_label, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 
 /// Every file this firmware owns on the card lives here, catalog and
 /// diagnostics alike (see `crate::probe_report`). One definition, shared with
@@ -16,12 +14,13 @@ use reader_cache::store::{
 pub(crate) use proto::cache::CACHE_ROOT_DIR as CATALOG_ROOT_DIR;
 use proto::cache::CATALOG_FILE;
 use proto::catalog::{
-    catalog_file_len, catalog_identity_staged, catalog_record_identity, decode_catalog_record,
-    encode_catalog_header, encode_catalog_placeholder_header, encode_catalog_record,
-    encode_catalog_title, sort_catalog_identities, stage_catalog_identity, CatalogRecord,
-    CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
+    catalog_count, catalog_file_len, catalog_identity_staged, catalog_record_identity,
+    decode_catalog_record, encode_catalog_header, encode_catalog_placeholder_header,
+    encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
+    CatalogRecord, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
     CATALOG_RECORD_TITLE_OFFSET, CATALOG_TITLE_BYTES,
 };
+use proto::library_path::BookRoot;
 
 /// Why a catalog read did not hand back a catalog.
 ///
@@ -53,6 +52,24 @@ enum CatalogFault {
     /// catalog written before it may name a file that is now gone. The
     /// rescan that follows is the repair, not a symptom.
     Reclaimed,
+}
+
+/// What a lookup of one place in the catalog found.
+///
+/// Three-valued because the caller acts on the difference. A catalog that
+/// answered and holds no such place is a catalog older than the card, and
+/// rebuilding it is the repair. A catalog that would not answer says nothing
+/// about the card, and rebuilding on it would retire a usable snapshot
+/// because one read failed.
+pub(crate) enum CatalogRow {
+    /// The catalog holds this place, at this row.
+    Found(u16),
+    /// The catalog was read through and holds no such place. Also a catalog
+    /// that is absent, or written by another version, or damaged: each of
+    /// those is a snapshot that has to be rebuilt before it can answer.
+    Rebuild,
+    /// The card refused a read. Not evidence about what the catalog holds.
+    Unreadable,
 }
 
 /// A failed open is only a missing catalog when the card said so.
@@ -228,13 +245,13 @@ where
     // The same distinction `walk_epubs` draws: a genuinely absent /BOOKS
     // holds nothing to finish, while one that will not open has not answered.
     // Only the first is a clean shelf.
-    let books = match root.open_dir("BOOKS") {
-        Ok(books) => books,
+    let books = match upload_store::library::open_library_root(root) {
+        Ok(Some(books)) => books,
         // No shelf means no install can be finished here, but a record may
         // still be describing one -- and a record that stands must keep a
         // cached catalog from being trusted and keep a fresh one from being
         // published, whether or not there is a /BOOKS to look at.
-        Err(embedded_sdmmc::Error::NotFound) => {
+        Ok(None) => {
             use upload_store::install::IntentState;
             // The reclaim journal is consulted whether or not there is a
             // shelf. A reclaim can name the card root -- the OTA trigger
@@ -472,23 +489,31 @@ pub(crate) fn load_catalog_cache(
 }
 
 /// Walk both book locations (card root and `/BOOKS`), invoking `visit` with
-/// each EPUB's `(display_path, open_name, in_books_dir, byte_size)`.
+/// each EPUB's `(display_path, root, locator, alias, byte_size)`.
 fn walk_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    visit: &mut impl FnMut(&str, &str, bool, u32),
+    visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    collect_epubs(root, "/", false, visit)?;
-    // Only a genuinely absent /BOOKS is an empty result; any other failure
-    // (SD/FAT flakiness) must fail the walk, or the scan would commit a
-    // catalog missing every /BOOKS book and the orphan sweep would reclaim
-    // their caches.
-    match root.open_dir("BOOKS") {
-        Ok(books) => collect_epubs(&books, "/books/", true, visit)?,
-        Err(embedded_sdmmc::Error::NotFound) => {}
+    collect_epubs(root, "/", BookRoot::CardRoot, visit)?;
+    // Only a genuinely absent library is an empty result; any other failure
+    // (SD/FAT flakiness, or a shelf that resolved and then would not open)
+    // must fail the walk, or the scan would commit a catalog missing every
+    // shelved book and the orphan sweep would reclaim their caches.
+    //
+    // The shelf is walked depth first to any legal locator depth; the card
+    // root deliberately stays flat, since nothing nests there by contract.
+    match upload_store::library::open_library_root(root) {
+        Ok(Some(books)) => {
+            upload_store::library::for_each_book_depth_first(books, &mut |path, alias, size| {
+                visit_located(BookRoot::Library, "/books/", path, alias, size, visit);
+            })
+            .map_err(|_| ())?;
+        }
+        Ok(None) => {}
         Err(_) => return Err(()),
     }
     Ok(())
@@ -503,16 +528,19 @@ const WALK_FINGERPRINT_SEED: u32 = 0x811c_9dc5;
 fn fold_walk_entry(
     hash: &mut u32,
     path: &str,
-    open_name: &str,
-    in_books_dir: bool,
+    at: BookRoot,
+    locator: &str,
+    alias: &str,
     byte_size: u32,
 ) {
     for byte in path
         .bytes()
         .chain(core::iter::once(0))
-        .chain(open_name.bytes())
+        .chain(core::iter::once(at as u8))
+        .chain(locator.bytes())
         .chain(core::iter::once(0))
-        .chain(core::iter::once(in_books_dir as u8))
+        .chain(alias.bytes())
+        .chain(core::iter::once(0))
         .chain(byte_size.to_le_bytes())
     {
         *hash ^= byte as u32;
@@ -524,12 +552,21 @@ fn fold_walk_entry(
 /// RAM. embedded-sdmmc locks the volume across a directory walk, so records
 /// cannot be written mid-iteration; instead one walk counts the books (for the
 /// header), then each later walk stages the next batch of records into the
-/// caller's scratch region (the idle 16 KB section arena -- ~105 records per
-/// pass, so ordinary libraries take two walks total) and appends them once the
-/// walk has returned. Each staged record also gets its display title (the EPUB
-/// title cached at last open, or the upload label) resolved once here, so
-/// Library window reads never probe per-book files again. Returns the book
-/// count actually written.
+/// caller's scratch region and appends them once the walk has returned. Each
+/// staged record also gets its display title (the EPUB title cached at last
+/// open, or the upload label) resolved once here, so Library window reads
+/// never probe per-book files again. Returns the book count actually written.
+///
+/// Every batch is another complete walk, and every walk re-reads the whole
+/// tree, so the scan costs one counting walk plus one walk per batch. A
+/// record is 419 bytes since it started carrying a locator and a widened
+/// alias, so the idle 16 KB section arena stages 39 of them per pass:
+/// ordinary libraries still take two walks, a 1,000-book one takes 27. That is the price of nesting until a
+/// derived index earns its place. The walk is depth first over the shelf
+/// now, so each pass descends the tree as well as re-reading it, and
+/// finding each next subfolder re-iterates its parent; a directory with `s`
+/// subfolders is read `s + 1` times per pass. That multiplier is the number
+/// to watch before reaching for the derived index.
 fn write_catalog_streaming<
     D,
     T,
@@ -556,19 +593,31 @@ where
     let mut counted = 0usize;
     let mut counted_fingerprint = WALK_FINGERPRINT_SEED;
     {
-        let mut count = |path: &str, open_name: &str, in_books_dir: bool, byte_size: u32| {
+        let mut count = |path: &str, at: BookRoot, locator: &str, alias: &str, byte_size: u32| {
             counted += 1;
             fold_walk_entry(
                 &mut counted_fingerprint,
                 path,
-                open_name,
-                in_books_dir,
+                at,
+                locator,
+                alias,
                 byte_size,
             );
         };
         walk_epubs(root, &mut count)?;
     }
-    let count = counted.min(u16::MAX as usize) as u16;
+    // A card holding more books than the header can count is a failed scan,
+    // not a shortened one. Everything downstream reads a committed catalog as
+    // the whole book set: the list stops at the count, and the orphan sweep
+    // reclaims every cache whose identity is missing from it.
+    let Some(count) = catalog_count(counted) else {
+        esp_println::println!(
+            "sd: {} epub(s) is past the {} this catalog can hold",
+            counted,
+            proto::catalog::CATALOG_MAX_BOOKS
+        );
+        return Err(());
+    };
 
     // Keep the header deliberately invalid while records are being written;
     // the real version and count are committed only after every directory
@@ -585,27 +634,29 @@ where
         let mut seen = 0usize;
         let mut fingerprint = WALK_FINGERPRINT_SEED;
         {
-            let mut collect = |path: &str, open_name: &str, in_books_dir: bool, byte_size: u32| {
-                fold_walk_entry(&mut fingerprint, path, open_name, in_books_dir, byte_size);
-                if seen >= cursor && batch_len < batch_capacity {
-                    let at = batch_len * CATALOG_RECORD_BYTES;
-                    let record: &mut [u8; CATALOG_RECORD_BYTES] = (&mut scratch
-                        [at..at + CATALOG_RECORD_BYTES])
-                        .try_into()
-                        .expect("record slice is exactly one record");
-                    encode_catalog_record(
-                        record,
-                        path,
-                        open_name,
-                        "",
-                        in_books_dir,
-                        byte_size,
-                        source_hash(path, byte_size),
-                    );
-                    batch_len += 1;
-                }
-                seen += 1;
-            };
+            let mut collect =
+                |path: &str, at: BookRoot, locator: &str, alias: &str, byte_size: u32| {
+                    fold_walk_entry(&mut fingerprint, path, at, locator, alias, byte_size);
+                    if seen >= cursor && batch_len < batch_capacity {
+                        let offset = batch_len * CATALOG_RECORD_BYTES;
+                        let record: &mut [u8; CATALOG_RECORD_BYTES] = (&mut scratch
+                            [offset..offset + CATALOG_RECORD_BYTES])
+                            .try_into()
+                            .expect("record slice is exactly one record");
+                        encode_catalog_record(
+                            record,
+                            path,
+                            at,
+                            locator,
+                            "",
+                            alias,
+                            byte_size,
+                            proto::cache::source_hash_at(at, locator, byte_size),
+                        );
+                        batch_len += 1;
+                    }
+                    seen += 1;
+                };
             walk_epubs(root, &mut collect)?;
         }
         // Every pass over a card that hasn't changed must reproduce the
@@ -728,8 +779,6 @@ where
             let label = (!decoded.title.is_empty()).then_some(decoded.title.as_str());
             library.push_window_entry(
                 decoded.display_name.as_str(),
-                decoded.open_name.as_str(),
-                decoded.in_books_dir,
                 decoded.byte_size,
                 decoded.source_hash,
                 label,
@@ -740,7 +789,7 @@ where
 }
 
 /// Read a single catalog record by absolute index.
-fn read_catalog_record_at<
+pub(crate) fn read_catalog_record_at<
     D,
     T,
     const MAX_DIRS: usize,
@@ -767,13 +816,15 @@ where
 }
 
 /// Find the catalog index of the book with the given (path-hash, byte-size).
-/// Tries `hint` (last-known index) first so an unchanged catalog resolves in
-/// one read; only a miss streams the whole file.
+///
+/// One streamed pass with the one-match rule: the identity is a 32-bit
+/// hash and two legal books can share it, so a hinted or first match could
+/// be the other one. There is no hint fast path for the same reason, since
+/// ruling out a second match requires reading every record anyway.
 fn find_in_catalog<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     source_hash: u32,
     byte_size: u32,
-    hint: Option<u16>,
 ) -> Option<u16>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -783,25 +834,97 @@ where
         return None;
     }
     with_catalog_file(root, |file, count| {
-        if let Some(h) = hint {
-            if (h as usize) < count as usize {
-                if let Ok((rh, rs)) = record_identity(file, h as usize) {
-                    if rh == source_hash && rs == byte_size {
-                        return Ok(Some(h));
-                    }
-                }
-            }
-        }
         seek_to_record(file, 0)?;
+        let mut scan = proto::catalog::IdentityScan::new(source_hash, byte_size);
         let mut record = [0u8; CATALOG_RECORD_BYTES];
         for index in 0..count as usize {
             read_exact_file(file, &mut record)?;
-            let (rh, rs) = catalog_record_identity(&record);
-            if rh == source_hash && rs == byte_size {
-                return Ok(Some(index as u16));
-            }
+            scan.offer(index as u16, &record);
         }
-        Ok(None)
+        Ok(scan.finish())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Find the catalog index of the book at an exact place on the card.
+///
+/// One streamed pass, like the identity lookups, because ruling out a second
+/// match means reading every record either way. What differs is what is
+/// being matched: a place, which is unique on a filesystem, rather than 32
+/// bits derived from one.
+fn find_in_catalog_at<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    at: BookRoot,
+    locator: &str,
+    byte_size: u32,
+) -> CatalogRow
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match with_catalog_file(root, |file, count| {
+        seek_to_record(file, 0)?;
+        let mut scan = proto::catalog::LocatorScan::new(at, locator, byte_size);
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        for index in 0..count {
+            read_exact_file(file, &mut record)?;
+            scan.offer(index, &record);
+        }
+        Ok(scan.finish())
+    }) {
+        Ok(Some(index)) => CatalogRow::Found(index),
+        Ok(None) => CatalogRow::Rebuild,
+        // A snapshot that is absent, outdated, damaged, or invalidated by
+        // recovery cannot answer until it is rebuilt, which is the same
+        // repair a stale one needs. Only a refused read is unknown.
+        Err(CatalogFault::Device) => CatalogRow::Unreadable,
+        Err(_) => CatalogRow::Rebuild,
+    }
+}
+
+/// Find the catalog index of the book a pre-v8 `(path-hash, byte-size)`
+/// names, by reconstructing each record's frozen legacy identity from its
+/// stored display name. Exactly one record may answer; several is a guess
+/// between real books, and the scan refuses it.
+///
+/// Only saved-state restoration reads identities this way. The orphan sweep
+/// must not: a re-keyed old cache directory carries the old hash in its
+/// header, and a sweep that matched it against legacy identities would keep
+/// every old directory alive forever instead of reclaiming it.
+fn find_in_catalog_by_legacy_identity<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    source_hash: u32,
+    byte_size: u32,
+) -> Option<u16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if source_hash == 0 && byte_size == 0 {
+        return None;
+    }
+    with_catalog_file(root, |file, count| {
+        seek_to_record(file, 0)?;
+        let mut scan = proto::catalog::LegacyIdentityScan::new(source_hash, byte_size);
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        for index in 0..count as usize {
+            read_exact_file(file, &mut record)?;
+            scan.offer(index as u16, &record);
+        }
+        Ok(scan.finish())
     })
     .ok()
     .flatten()
@@ -837,7 +960,9 @@ where
 /// The list label override for a catalog record, read into `title` in place,
 /// in order of authority: the EPUB title saved in the book's cache when it was
 /// last opened, then the readable filename stashed at upload (for uploads not
-/// yet opened, whose 8.3 name is unreadable). Returns `None` (file-stem
+/// yet opened, whose 8.3 name is unreadable), which only answers for the flat
+/// positions that scheme could write and so passes the record's own position
+/// along. Returns `None` (file-stem
 /// fallback) when neither exists. Resolved once per book at scan time -- the
 /// result persists in the record's title field, so window reads never call
 /// this. Cheap for the common case -- each lookup is a dir open that fails
@@ -858,50 +983,194 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let key = proto::cache::cache_key_for(decoded.display_name.as_str(), decoded.byte_size);
+    let key = proto::cache::cache_key_from(decoded.source_hash);
     let mut raw_name = String::<64>::new();
-    if reader_cache::files::read_cached_book_title(
-        root,
-        key.as_str(),
-        (decoded.source_hash, decoded.byte_size),
-        title,
-    ) {
-        Some(title.as_str())
-    } else if upload_store::read_upload_label(root, decoded.open_name.as_str(), &mut raw_name) {
-        reader_cache::store::derive_catalog_label(
-            raw_name.as_str(),
-            decoded.open_name.as_str(),
+    // A record whose root byte this build does not know has no provable
+    // cache directory; its label falls back like any other miss.
+    let cached_title = decoded.root.is_some_and(|at| {
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: decoded.path.as_str(),
+        };
+        reader_cache::files::read_cached_book_title(
+            root,
+            &owner,
+            (decoded.source_hash, decoded.byte_size),
             title,
-        );
+        )
+    });
+    if cached_title {
+        return Some(title.as_str());
+    }
+    // Same unknown root, same answer: a record this build cannot place has no
+    // position to hand the label reader, and the label is filed under an alias
+    // that only means anything together with one.
+    let labelled = decoded.root.is_some_and(|at| {
+        upload_store::read_upload_label(
+            root,
+            at,
+            decoded.path.as_str(),
+            decoded.upload_alias.as_str(),
+            &mut raw_name,
+        )
+    });
+    if labelled {
+        reader_cache::store::derive_catalog_label(raw_name.as_str(), title);
         Some(title.as_str())
     } else {
         None
     }
 }
 
-/// Refill the resident list window so it covers the visible rows around
-/// `selection`, reading from the card only when the window doesn't already
-/// cover them. Called before each Library render; cheap behind the panel.
+pub(crate) use reader_cache::browse::Listing;
+
+/// What the row a reader pressed turned out to be, once the catalog has had
+/// its say about a book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowChoice {
+    /// A folder, now listed.
+    Entered(Listing),
+    /// A book, at this catalog row.
+    Book(u16),
+    /// The row named a book the card holds and the catalog does not, which
+    /// is a catalog written before somebody edited the card on a computer.
+    /// The caller rescans and asks again.
+    Stale,
+    /// Gone since the listing, unnameable from here, or a card that would
+    /// not answer. Nothing moved.
+    Failed,
+}
+
+/// Refill the resident folder page so it covers the visible rows around
+/// `selection`, reading from the card only when the page does not already
+/// cover them. Windowed the way the catalog snapshot is, and called before
+/// each Library render.
 #[inline(never)]
-pub(crate) fn ensure_library_window(
+pub(crate) fn ensure_folder_page(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
     selection: u16,
     portrait: bool,
 ) {
-    let total = library.catalog_count();
-    if total == 0 {
-        library.begin_window(0);
-        return;
+    let started = Instant::now();
+    let read = sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache::browse::ensure_page(library, root, selection, portrait)
+    })
+    .unwrap_or(false);
+    // Only the crossings. A scroll inside the loaded page reads nothing, and
+    // logging those would bury the number this is here to show under one line
+    // per Library paint.
+    if read {
+        bench_log!(
+            "bench: folder_page rows={} start={} depth={} ms={} t_ms={}",
+            library.browse().count(),
+            library.folder_start(),
+            library.browse().path().depth(),
+            started.elapsed().as_millis(),
+            Instant::now().as_millis(),
+        );
     }
-    let selection = (selection as usize).min(total - 1);
-    let start = ui::render::library_scroll_start(selection, total, portrait);
-    let need = ui::render::library_visible_rows(portrait).min(total - start);
-    if library.window_covers(start, need) {
-        return;
+}
+
+/// Act on the Library row at `index`: enter a folder, or find the catalog row
+/// that opens a book.
+///
+/// A book is resolved by where it is, through [`find_index_by_locator`].
+/// Position would be cheaper and wrong: it ties two independent walks'
+/// orderings together as a correctness requirement, and a card edited
+/// between them opens some other book. The 32-bit identity derived from the
+/// place would be wrong too, since two legal locators at one size can
+/// collide in it and a reader who picked a row has already said which book.
+#[inline(never)]
+pub(crate) fn choose_library_row(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: u16,
+    portrait: bool,
+) -> RowChoice {
+    let started = Instant::now();
+    let chosen = sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache::browse::choose_row(library, root, index, portrait)
+    });
+    match chosen {
+        Ok(reader_cache::browse::RowChoice::Entered(listing)) => {
+            // Entering is the number the folder-size question is about: it
+            // counts the whole directory before it can page it, so this grows
+            // with the folder while `folder_page` does not.
+            bench_log!(
+                "bench: folder_enter rows={} books={} depth={} ms={} t_ms={}",
+                listing.count,
+                listing.books,
+                listing.depth,
+                started.elapsed().as_millis(),
+                Instant::now().as_millis(),
+            );
+            RowChoice::Entered(listing)
+        }
+        Ok(reader_cache::browse::RowChoice::Book { at, locator, size }) => {
+            match find_index_by_locator(epd, sd_cs, at, locator.as_str(), size) {
+                CatalogRow::Found(index) => RowChoice::Book(index),
+                CatalogRow::Unreadable => {
+                    // The card would not answer about the catalog. That is
+                    // not evidence the catalog is behind the card, and
+                    // rebuilding on it would retire a usable snapshot
+                    // because one read failed.
+                    esp_println::println!(
+                        "library: catalog would not answer for {}",
+                        locator.as_str()
+                    );
+                    RowChoice::Failed
+                }
+                CatalogRow::Rebuild => {
+                    // The card lists this book and the catalog does not, so
+                    // the catalog is older than the card: boot keeps a
+                    // snapshot that still loads, and a computer can add or
+                    // move books while the device is off. Browsing walks the
+                    // card and finds them; only the catalog has to catch up.
+                    esp_println::println!(
+                        "library: {} at {} bytes is not in the catalog, which is stale",
+                        locator.as_str(),
+                        size
+                    );
+                    RowChoice::Stale
+                }
+            }
+        }
+        Ok(reader_cache::browse::RowChoice::Failed) | Err(_) => RowChoice::Failed,
     }
-    let _ = sd_session::with_root(epd, sd_cs, |root| read_catalog_window(root, library, start));
+}
+
+/// Go up one folder and list the parent, landing back on the folder just
+/// left: by name where the parent still holds it, else on the row it was
+/// entered from.
+#[inline(never)]
+pub(crate) fn leave_library_folder(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    portrait: bool,
+) -> Option<Listing> {
+    let started = Instant::now();
+    let listed = sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache::browse::leave_folder(library, root, portrait)
+    })
+    .ok()
+    .flatten();
+    // Leaving walks the whole parent past the returning name before it
+    // commits, so this is the other end of the folder-size question: it grows
+    // with the parent rather than with the folder being left.
+    bench_log!(
+        "bench: folder_leave rows={} depth={} ok={} ms={} t_ms={}",
+        listed.map_or(0, |listing| listing.count),
+        listed.map_or(0, |listing| listing.depth),
+        listed.is_some(),
+        started.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
+    listed
 }
 
 /// Make `index` the active book by reading its catalog record into the store,
@@ -928,8 +1197,8 @@ pub(crate) fn load_active_entry(
             library.set_active_entry(
                 index,
                 record.display_name.as_str(),
-                record.open_name.as_str(),
-                record.in_books_dir,
+                record.root,
+                record.path.as_str(),
                 record.byte_size,
                 record.source_hash,
                 (!record.title.is_empty()).then_some(record.title.as_str()),
@@ -960,7 +1229,7 @@ pub(crate) fn read_row_cache_identity(
         .ok()
         .flatten()?;
     Some((
-        proto::cache::cache_key_for(record.display_name.as_str(), record.byte_size),
+        proto::cache::cache_key_from(record.source_hash),
         record.source_hash,
         record.byte_size,
     ))
@@ -1008,9 +1277,13 @@ where
     let Some(count) = proto::catalog::decode_catalog_header(&header) else {
         return false;
     };
-    // Trust the caller's index only if the record identity still matches;
-    // otherwise resolve by identity on the already-open file (one streamed
-    // pass, rare -- the catalog was rewritten under a stale index).
+    // Trust the caller's index only if the record identity still matches:
+    // the index names the row this session actually opened, so a twin
+    // sharing the identity elsewhere in the catalog cannot mislead it.
+    // Otherwise resolve by identity on the already-open file (one streamed
+    // pass, rare -- the catalog was rewritten under a stale index), where
+    // the one-match rule applies: with two rows answering, patching either
+    // could retitle the other book.
     let hinted = index < count as usize
         && record_identity(&file, index)
             .map(|identity| identity == source_identity)
@@ -1018,24 +1291,21 @@ where
     let target = if hinted {
         index
     } else {
-        let mut found = None;
         if seek_to_record(&file, 0).is_err() {
             return false;
         }
+        let mut scan = proto::catalog::IdentityScan::new(source_identity.0, source_identity.1);
         let mut record = [0u8; CATALOG_RECORD_BYTES];
         for candidate in 0..count as usize {
             if read_exact_file(&file, &mut record).is_err() {
                 return false;
             }
-            if catalog_record_identity(&record) == source_identity {
-                found = Some(candidate);
-                break;
-            }
+            scan.offer(candidate as u16, &record);
         }
-        let Some(found) = found else {
+        let Some(found) = scan.finish() else {
             return false;
         };
-        found
+        found as usize
     };
     let mut field = [0u8; CATALOG_TITLE_BYTES];
     encode_catalog_title(title, &mut field);
@@ -1052,21 +1322,60 @@ where
 }
 
 /// Resolve a saved (path-hash, byte-size) back to its catalog index, the
-/// reverse of `source_identity`. `hint` is the last-known index (from the saved
-/// book_id); an unchanged catalog resolves in one read.
+/// reverse of `source_identity`.
+///
+/// `legacy` is the saved record's own claim about which rule produced its
+/// hash (`AppStateRecord::legacy_source_identity`), and exactly one reading
+/// runs. Not a fallback: the two hash domains can collide on the same 32
+/// bits, so trying the current reading first could resolve a pre-v8
+/// identity to an unrelated nested book and then persist that mistake at
+/// the next save. A legacy resolution stops being needed after one save,
+/// since saves derive a fresh identity from the active entry.
+///
+/// Both readings stream the whole catalog and refuse more than one match:
+/// the same 32 bits can also collide between two current books, and a
+/// hinted or first match could be the other one.
 #[inline(never)]
 pub(crate) fn find_index_by_identity(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     source_hash: u32,
     byte_size: u32,
-    hint: Option<u16>,
+    legacy: bool,
 ) -> Option<u16> {
     sd_session::with_root(epd, sd_cs, |root| {
-        find_in_catalog(root, source_hash, byte_size, hint)
+        if legacy {
+            find_in_catalog_by_legacy_identity(root, source_hash, byte_size)
+        } else {
+            find_in_catalog(root, source_hash, byte_size)
+        }
     })
     .ok()
     .flatten()
+}
+
+/// The catalog row for a book a reader just picked out of a listing, which
+/// named its exact place.
+///
+/// Deliberately not [`find_index_by_identity`]. That lookup is for state
+/// whose only persisted identity is `(hash, size)`, and it must refuse when
+/// two records share those bits. A picked row is not ambiguous, and putting
+/// it through the identity would manufacture the ambiguity and then fail on
+/// it, leaving two perfectly good books unopenable.
+#[inline(never)]
+pub(crate) fn find_index_by_locator(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    at: BookRoot,
+    locator: &str,
+    byte_size: u32,
+) -> CatalogRow {
+    // A session that would not open is a card that did not answer, which is
+    // the same unknown as a refused read.
+    sd_session::with_root(epd, sd_cs, |root| {
+        find_in_catalog_at(root, at, locator, byte_size)
+    })
+    .unwrap_or(CatalogRow::Unreadable)
 }
 
 /// Empty every book cache under CACHE2 whose book is no longer in the freshly
@@ -1075,7 +1384,8 @@ pub(crate) fn find_index_by_identity(
 /// not its key name, so a live book's cache is never swept. Reading position is
 /// never swept either: `empty_cache_dir` leaves POS*.BIN and the directory
 /// holding it, so a book that leaves the card and comes back resumes where it
-/// was. Bounded per pass; any excess is handled by the next scan.
+/// was. The walk carries a cursor across batches, so one pass reaches every
+/// cache directory rather than the first few dozen.
 ///
 /// The catalog's identities (8 B each) load into `scratch` once, sorted, so
 /// each cache dir checks membership with an in-RAM binary search --
@@ -1096,66 +1406,116 @@ fn sweep_orphan_caches<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    use core::fmt::Write;
-    const SWEEP_MAX_PER_PASS: usize = 48;
     let (staged, truncated) = stage_catalog_identities(root, scratch);
-    // Collect cache-dir names up front: embedded-sdmmc forbids opening files
-    // while a directory iteration holds the lock.
-    let mut keys: heapless::Vec<String<8>, SWEEP_MAX_PER_PASS> = heapless::Vec::new();
-    if let Ok(cache_root) = root.open_dir(proto::cache::CACHE_ROOT_DIR) {
-        if let Ok(cache) = cache_root.open_dir(proto::cache::CACHE_V2_DIR) {
-            let _ = cache.iterate_dir(|entry| {
-                if !entry.attributes.is_directory() {
-                    return ControlFlow::Continue(());
-                }
-                let mut name = String::<8>::new();
-                // A name that does not fit would be truncated into a
-                // *different* key, and everything downstream -- the header
-                // read, the reclaim -- would act on whatever that names.
-                if write!(name, "{}", entry.name).is_err() {
-                    return ControlFlow::Continue(());
-                }
-                if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
-                    return ControlFlow::Continue(());
-                }
-                // A full batch is this pass's quota; the rest sweep next scan.
-                if keys.push(name).is_err() {
-                    return ControlFlow::Break(());
-                }
-                ControlFlow::Continue(())
-            });
-        }
-    }
     let mut swept = 0u32;
-    for key in &keys {
-        // A readable cache that still maps to a catalog book stays. Anything
-        // else -- no book, or an unreadable BOOK.BIN -- is reclaimed. The
-        // clear path fails closed on an unreadable header because it deletes
-        // against a key the user named and a collision would be its mistake;
-        // the sweep runs against a catalog it has just proven fresh, and a
-        // cache it cannot match to any book on the card is garbage whoever
-        // wrote it. Keeping it would strand the shells forever.
-        let live = match reader_cache::files::read_cache_header(root, key.as_str()) {
-            reader_cache::files::CacheHeader::Present(h) => {
-                catalog_identity_staged(scratch, staged, h.source_hash, h.source_size)
-                    || (truncated
-                        && find_in_catalog(root, h.source_hash, h.source_size, None).is_some())
-            }
-            reader_cache::files::CacheHeader::Absent
-            | reader_cache::files::CacheHeader::Unreadable => false,
-        };
-        if live {
-            continue;
-        }
-        // An unreadable header is exactly the case that used to defeat the
-        // sweep: it named section files from the header's own count, so a
-        // cache with no BOOK.BIN kept its sections forever. The delete lists
-        // the directory now, so it needs nothing from the header.
-        let _ = reader_cache::files::empty_cache_dir(root, key.as_str());
-        swept += 1;
-    }
+    // The walk carries its own cursor, so a card with more caches than one
+    // batch holds still reaches all of them. It used to stop after the first
+    // batch and start from the top next scan, which meant a moved book's
+    // directory sitting past the first few dozen was reconciled on no scan
+    // at all.
+    reader_cache::files::for_each_cache_dir(root, reader_cache::files::CACHE_SWEEP_BATCH, |keys| {
+        sweep_cache_batch(root, keys, scratch, staged, truncated, &mut swept);
+    });
     if swept > 0 {
         esp_println::println!("cache: swept {} orphan cache(s)", swept);
+    }
+}
+
+/// One batch of cache directory names, judged and reclaimed.
+///
+/// Split out so the walk above holds only names and a cursor: this is where
+/// the file opens happen, and they cannot happen inside the iteration that
+/// produced the names.
+fn sweep_cache_batch<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    keys: &[String<8>],
+    scratch: &[u8],
+    staged: usize,
+    truncated: bool,
+    swept: &mut u32,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    for key in keys {
+        // A claimed directory is judged by its exact owner, not by the
+        // 32-bit identity: a full-hash twin in the catalog would vouch for
+        // a departed owner's directory forever, stranding the surviving
+        // twin behind a claim nobody can adopt. The filesystem is the
+        // source of truth for the owner existing: the file is there and
+        // still keys here, or it does not.
+        match reader_cache::files::read_book_dir_claimant(root, key.as_str()) {
+            reader_cache::files::DirClaimant::Claimed {
+                root: at,
+                locator,
+                released,
+                ..
+            } => {
+                match reader_cache::files::claimant_place(root, at, locator.as_str(), key.as_str())
+                {
+                    reader_cache::files::ClaimantPlace::Live => continue,
+                    // Leave the directory exactly as it is, the way an
+                    // unreadable claim does. Nothing here is evidence that
+                    // its owner went anywhere, and retiring a claim is what
+                    // ends a book's cache and gives up its place.
+                    reader_cache::files::ClaimantPlace::Unreadable => continue,
+                    // The card answered and the file is not there. This
+                    // milestone stops here: whether the book was deleted or
+                    // moved is a question about which copy a file is, and
+                    // nothing available can answer it, so the cache retires
+                    // and the position stays in its directory waiting for
+                    // the book to come back to where it was.
+                    reader_cache::files::ClaimantPlace::Gone => {}
+                }
+                // The owner is gone. Release the claim rather than delete
+                // it, so the evidence keeps naming the owner: a return
+                // resumes the surviving position, and any twin adopting the
+                // key knows the place is not its own. Then reclaim the
+                // rebuildables; the release keeps the claim through the
+                // clear because the positions survive it.
+                if !released && !reader_cache::files::release_book_dir_claim(root, key.as_str()) {
+                    continue;
+                }
+                let _ = reader_cache::files::empty_cache_dir(root, key.as_str());
+                *swept += 1;
+            }
+            reader_cache::files::DirClaimant::Unclaimed => {
+                // Pre-claim compatibility: judged by identity, as always. A
+                // readable cache that still maps to a catalog book stays;
+                // anything else is reclaimed. The sweep runs against a
+                // catalog it has just proven fresh, and a cache it cannot
+                // match to any book on the card is garbage whoever wrote
+                // it. Keeping it would strand the shells forever.
+                let live = match reader_cache::files::read_cache_header(root, key.as_str()) {
+                    reader_cache::files::CacheHeader::Present(h) => {
+                        catalog_identity_staged(scratch, staged, h.source_hash, h.source_size)
+                            || (truncated
+                                && find_in_catalog(root, h.source_hash, h.source_size).is_some())
+                    }
+                    reader_cache::files::CacheHeader::Absent
+                    | reader_cache::files::CacheHeader::Unreadable => false,
+                };
+                if live {
+                    continue;
+                }
+                // An unreadable header is exactly the case that used to
+                // defeat the sweep: it named section files from the
+                // header's own count, so a cache with no BOOK.BIN kept its
+                // sections forever. The delete lists the directory now, so
+                // it needs nothing from the header.
+                let _ = reader_cache::files::empty_cache_dir(root, key.as_str());
+                *swept += 1;
+            }
+            // Failure to read the claim is not evidence of anything; the
+            // directory keeps whatever it has until the card answers.
+            reader_cache::files::DirClaimant::Fault => continue,
+        }
     }
 }
 
@@ -1255,22 +1615,30 @@ pub(crate) fn write_catalog_listing(
                 // persisted title when the book has one, else the stem label.
                 let mut label = String::<64>::new();
                 if decoded.title.is_empty() {
-                    derive_catalog_label(
-                        decoded.display_name.as_str(),
-                        decoded.open_name.as_str(),
-                        &mut label,
-                    );
+                    derive_catalog_label(decoded.display_name.as_str(), &mut label);
                 } else {
                     let _ = label.push_str(decoded.title.as_str());
                 }
-                let open_name = decoded.open_name.as_bytes();
+                // The shelf addresses a book by flag and alias, which can
+                // only name the two directories uploads have ever landed in.
+                // A book deeper than that has no line in this format, so it
+                // is left out rather than given a line naming something else.
+                let flag = match decoded
+                    .root
+                    .and_then(|at| upload_store::shelf_placement(at, decoded.path.as_str()))
+                {
+                    Some(upload_store::ShelfPlacement::Shelf) => b'B',
+                    Some(upload_store::ShelfPlacement::Root) => b'R',
+                    None => continue,
+                };
+                let open_name = decoded.upload_alias.as_bytes();
                 let size_field = listing_size_field(&decoded);
                 let line_len = 1 + 1 + open_name.len() + 1 + label.len() + size_field.len() + 1;
                 if at + line_len > budget {
                     truncated = true;
                     break;
                 }
-                out[at] = if decoded.in_books_dir { b'B' } else { b'R' };
+                out[at] = flag;
                 at += 1;
                 out[at] = b'|';
                 at += 1;
@@ -1354,8 +1722,8 @@ where
 fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     dir: &embedded_sdmmc::Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     prefix: &str,
-    in_books_dir: bool,
-    visit: &mut impl FnMut(&str, &str, bool, u32),
+    at: BookRoot,
+    visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1380,8 +1748,10 @@ where
 
         // The 8.3 name stays the open handle whichever name is catalogued, so
         // a prefix of one is worse than no entry: it names a different file,
-        // or none.
-        let mut open_name = String::<16>::new();
+        // or none. Sized so it cannot be one: a short name of accented
+        // characters renders to two bytes each, and a buffer that overflowed
+        // would drop the book out of the catalog rather than misname it.
+        let mut open_name = String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
         use core::fmt::Write;
         if write!(open_name, "{}", entry.name).is_err() {
             return ControlFlow::Continue(());
@@ -1389,7 +1759,7 @@ where
         let Some(name) = proto::storage::catalog_scan_name(long_name, &open_name) else {
             return ControlFlow::Continue(());
         };
-        visit_prefixed(prefix, name, &open_name, in_books_dir, entry.size, visit);
+        visit_prefixed(prefix, at, name, &open_name, entry.size, visit);
         ControlFlow::Continue(())
     })
     .map_err(|_| ())
@@ -1397,13 +1767,61 @@ where
 
 fn visit_prefixed(
     prefix: &str,
+    at: BookRoot,
     name: &str,
     open_name: &str,
-    in_books_dir: bool,
     byte_size: u32,
-    visit: &mut impl FnMut(&str, &str, bool, u32),
+    visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
 ) {
+    let Ok(locator) = proto::library_path::LibraryPath::root().child(name) else {
+        return;
+    };
+    let mut rendered = String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
+    let _ = rendered.push_str(open_name);
+    visit_located_rendered(at, prefix, &locator, rendered, byte_size, visit);
+}
+
+/// Report one located book to the scan: the display label, built over the
+/// whole locator so a nested path never passes the legacy position shape
+/// gate, then the visit itself.
+fn visit_located(
+    at: BookRoot,
+    prefix: &str,
+    locator: &proto::library_path::LibraryPath,
+    alias: &embedded_sdmmc::ShortFileName,
+    byte_size: u32,
+    visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
+) {
+    use core::fmt::Write;
+    let mut rendered = String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
+    // Cannot overflow: the buffer is sized for the widest rendered alias.
+    if write!(rendered, "{}", alias).is_err() {
+        return;
+    }
+    visit_located_rendered(at, prefix, locator, rendered, byte_size, visit);
+}
+
+fn visit_located_rendered(
+    at: BookRoot,
+    prefix: &str,
+    locator: &proto::library_path::LibraryPath,
+    rendered_alias: String<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>,
+    byte_size: u32,
+    visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
+) {
+    // The display label covers the whole locator, not just the file name:
+    // identity and the cache key hash the root and locator
+    // (`proto::cache::source_hash_at`), so the label is free to trim, and a
+    // nested label keeps a separator in it, which is what keeps
+    // `legacy_position_cache_key` from ever treating a nested book as a
+    // pre-v8 flat one.
     let mut path = String::<64>::new();
-    proto::storage::catalog_display_path(prefix, name, &mut path);
-    visit(&path, open_name, in_books_dir, byte_size);
+    proto::storage::catalog_display_path(prefix, locator.as_str(), &mut path);
+    visit(
+        &path,
+        at,
+        locator.as_str(),
+        rendered_alias.as_str(),
+        byte_size,
+    );
 }

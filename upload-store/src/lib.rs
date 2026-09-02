@@ -13,16 +13,24 @@
 //! Books written that way are still on people's cards, so the catalog scan
 //! still falls back to reading their labels, and deleting a book still clears
 //! them. Nothing writes new ones.
+//!
+//! They are filed under the alias alone, which was an identity when every book
+//! the scheme wrote sat directly in one of two directories. It is not one now
+//! that the shelf nests: FAT hands out 8.3 names per directory, so the reader
+//! takes a book's position as well as its alias and answers only where a label
+//! could have been written.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 pub mod install;
+pub mod library;
 pub mod reclaim;
 
 use embedded_sdmmc::{Directory, Mode, TimeSource};
 use heapless::String;
 use proto::cache::CACHE_ROOT_DIR;
+use proto::library_path::BookRoot;
 
 /// Subdir under the cache root holding one `<8.3-stem>.TXT` per book uploaded before
 /// uploads carried a long name of their own, each with that book's real
@@ -81,9 +89,19 @@ where
     }
 }
 
-/// Read an uploaded book's stashed label into `out`. Returns false (leaving
-/// `out` untouched) when the book has no sidecar -- i.e. it wasn't uploaded, so
-/// the caller falls back to the file-stem label.
+/// Read the stashed label for the book at `locator` under `at`, whose 8.3
+/// alias is `open_name`, into `out`. Returns false (leaving `out` untouched)
+/// when the book has no sidecar -- i.e. it wasn't uploaded, so the caller falls
+/// back to the file-stem label.
+///
+/// The position is part of the question, not context the caller is trusted to
+/// have checked. A label is filed under the alias alone, and an alias is only
+/// unique within one directory, so the file name it names is only an answer
+/// where the scheme that wrote these could have put a book: directly under the
+/// shelf, or at the card root. A book in a folder a reader made on a computer
+/// is outside that reach ([`shelf_placement`]), and a label matching its alias
+/// belongs to some other file -- one still sitting in the shelf, or one deleted
+/// from a computer, which cannot clear what it left in `LABELS`.
 pub fn read_upload_label<
     D,
     T,
@@ -92,6 +110,8 @@ pub fn read_upload_label<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    at: BookRoot,
+    locator: &str,
     open_name: &str,
     out: &mut String<64>,
 ) -> bool
@@ -99,6 +119,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if shelf_placement(at, locator).is_none() {
+        return false;
+    }
     let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
         return false;
     };
@@ -337,14 +360,36 @@ where
     proto::source::parse_record(&buf[..read])
 }
 
-/// The identity a pre-long-name upload recorded for the book at `open_name`.
-///
-/// `Ok(None)` is no usable sidecar — absent, or the wrong length, which no
-/// retry will fix. [`install::InstallError::Card`] is a card that would not
-/// answer, which must not be read as "this is not that book": that would
-/// install a second copy beside the one already there.
 /// The shelf, opened through the caller's own root so it is that card's.
-const SHELF_DIR: &str = "BOOKS";
+pub const SHELF_DIR: &str = "BOOKS";
+
+/// Where a book sits, as far as the browser shelf can say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShelfPlacement {
+    /// At the card root.
+    Root,
+    /// Directly under the shelf.
+    Shelf,
+}
+
+/// Which of the two places the shelf can name a book in, or `None` for one it
+/// cannot.
+///
+/// The shelf addresses a book by a placement flag and an 8.3 alias, which
+/// between them reach the library root and the card root and nothing below
+/// either. A book in a folder a reader made on a computer is outside that
+/// reach, and saying `Root` or `Shelf` for it would name a different file or
+/// none.
+pub fn shelf_placement(at: BookRoot, path: &str) -> Option<ShelfPlacement> {
+    // One component: a book sitting directly in the root it is relative to.
+    if path.is_empty() || path.contains(proto::library_path::SEPARATOR) {
+        return None;
+    }
+    Some(match at {
+        BookRoot::Library => ShelfPlacement::Shelf,
+        BookRoot::CardRoot => ShelfPlacement::Root,
+    })
+}
 
 /// What this file holds, read from the card now.
 ///
@@ -376,10 +421,11 @@ where
     T: TimeSource,
 {
     let found = if key.in_books() {
-        let books = root
-            .open_dir(SHELF_DIR)
-            .map_err(|_| install::InstallError::Card)?;
-        digest_of_file(&books, key.alias())?
+        match library::open_library_root(root)? {
+            Some(books) => digest_of_file(&books, key.alias())?,
+            // No shelf holds no sidecar, which reads as no recorded identity.
+            None => None,
+        }
     } else {
         digest_of_file(root, key.alias())?
     };
@@ -550,6 +596,45 @@ fn same_long_name(left: &str, right: &str) -> bool {
 /// name too large for the buffer comes back empty, so an oversized entry — a
 /// hand-copied file with a very long name — is not recognised as the holder.
 /// It cannot be a false negative, since a name that could equal ours is at
-/// most 64 bytes and always decodes. Resize this if the comparison ever has
-/// to handle names this crate did not write.
+/// most 64 bytes and always decodes.
+///
+/// That proof rests on comparing only names this crate wrote. The library
+/// resolver's job is different: it matches computer-written components up
+/// to `proto::library_path::MAX_COMPONENT_BYTES`, so it sizes its own
+/// buffer to that bound rather than borrowing this one. Names longer than
+/// that are outside the locator model there, and outside the upload
+/// namespace here.
 const LFN_SCAN_BYTES: usize = 256;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shelf_names_the_two_places_uploads_land() {
+        assert_eq!(
+            shelf_placement(BookRoot::CardRoot, "Dune.epub"),
+            Some(ShelfPlacement::Root)
+        );
+        assert_eq!(
+            shelf_placement(BookRoot::Library, "Dune.epub"),
+            Some(ShelfPlacement::Shelf)
+        );
+    }
+
+    #[test]
+    fn a_book_the_shelf_cannot_address_gets_no_placement() {
+        // Deeper than the flag can say, so the shelf leaves it out rather
+        // than naming a file it did not mean.
+        assert_eq!(
+            shelf_placement(BookRoot::Library, "Fiction/Dune.epub"),
+            None
+        );
+        assert_eq!(
+            shelf_placement(BookRoot::CardRoot, "Fiction/Dune.epub"),
+            None
+        );
+        // No locator names no book.
+        assert_eq!(shelf_placement(BookRoot::Library, ""), None);
+    }
+}

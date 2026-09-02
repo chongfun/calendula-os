@@ -9,7 +9,7 @@ use reader_cache::layout;
 use reader_cache::store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 use ui::{
     app_render::{self, UiRenderModel},
-    UiBook, UiCover, UiLibraryStatus, UiTocItem,
+    UiBook, UiCover, UiLibraryRow, UiLibraryStatus, UiTocItem,
 };
 
 const SHOW_INPUT_DEBUG: bool = false;
@@ -24,7 +24,10 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         draw_sd_reader_page(fb, request, sd_library);
         app_render::render_reading_sheet_overlay(fb, request);
     } else {
-        let mut library_entries = [""; LIBRARY_WINDOW];
+        let mut library_entries = [UiLibraryRow {
+            name: "",
+            is_folder: false,
+        }; LIBRARY_WINDOW];
         let mut chapters = [UiTocItem {
             title: "",
             level: 1,
@@ -62,7 +65,10 @@ pub(crate) fn render_custom_reader_from_root(
 }
 
 pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    let mut library_entries = [""; LIBRARY_WINDOW];
+    let mut library_entries = [UiLibraryRow {
+        name: "",
+        is_folder: false,
+    }; LIBRARY_WINDOW];
     let mut chapters = [UiTocItem {
         title: "",
         level: 1,
@@ -88,23 +94,21 @@ pub(crate) fn render_sleep_blank(fb: &mut Framebuffer) {
 fn ui_model<'a>(
     request: RenderRequest,
     sd_library: &'a ReaderStore,
-    library_entries: &'a mut [&'a str; LIBRARY_WINDOW],
+    library_entries: &'a mut [UiLibraryRow<'a>; LIBRARY_WINDOW],
     chapters: &'a mut [UiTocItem<'a>; MAX_UI_CHAPTERS],
 ) -> UiRenderModel<'a> {
-    // The resident list window over the streamed catalog: `library_entries[i]`
-    // is the book at absolute index `window_start + i`. The firmware refills
-    // this window from the card before each Library render.
-    let window = sd_library.catalog_window();
-    let window_start = sd_library.catalog_window_start();
+    // The resident page of the folder the reader is in: `library_entries[i]`
+    // is row `window_start + i`, the folder's books followed by its folders.
+    // The firmware refills this page from the card before each Library
+    // render.
+    let window = sd_library.folder_rows();
+    let window_start = sd_library.folder_start();
     let library_count = window.len().min(library_entries.len());
-    for (i, entry) in window.iter().take(library_count).enumerate() {
-        let absolute = window_start + i;
-        library_entries[i] =
-            if sd_library.loaded_index == Some(absolute) && !sd_library.title.is_empty() {
-                sd_library.title.as_str()
-            } else {
-                entry.display_label.as_str()
-            };
+    for (i, row) in window.iter().take(library_count).enumerate() {
+        library_entries[i] = UiLibraryRow {
+            name: row.name.as_str(),
+            is_folder: row.is_dir,
+        };
     }
     let (chapter_count, chapters_window_start, chapters_total) =
         fill_chapters(chapters, request, sd_library);
@@ -141,6 +145,7 @@ fn ui_model<'a>(
         },
         library_status: ui_library_status(sd_library.status),
         library_entries: &library_entries[..library_count],
+        library_folder: sd_library.browse().path().file_name().unwrap_or(""),
         library_window_start: window_start as u16,
         chapters: &chapters[..chapter_count],
         chapters_window_start: chapters_window_start as u16,

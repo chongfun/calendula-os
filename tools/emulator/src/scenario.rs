@@ -36,6 +36,12 @@ struct Step {
     error: Option<String>,
     ssid: Option<String>,
     ok: Option<bool>,
+    /// Folder listing: how many of `count` rows are books, how deep the
+    /// folder sits, and where the cursor lands. The folder's own name is the
+    /// emulator's, since a scripted listing has no card behind it.
+    books: Option<u16>,
+    depth: Option<u8>,
+    selection: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -348,6 +354,23 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             book_id: step.book_id.unwrap_or(2),
             chapter: step.chapter.unwrap_or(0),
             page: step.page.unwrap_or(0),
+        }),
+        "FolderListed" | "folder-listed" | "folder_listed" => Ok(LibraryEvent::FolderListed {
+            // A scripted listing always answers the scenario, never a press
+            // that is still out; the app has nothing in flight here.
+            request_id: None,
+            // The emulated card has one position to be in, so every scripted
+            // listing names the generation the state is already holding.
+            browse_epoch: 0,
+            depth: step.depth.unwrap_or(0),
+            count: step.count.unwrap_or(0),
+            // A listing cannot hold more books than rows, which is what
+            // `reader_cache::browse::list_here` guarantees on the device.
+            books: step
+                .books
+                .unwrap_or_else(|| step.count.unwrap_or(0))
+                .min(step.count.unwrap_or(0)),
+            selection: step.selection.unwrap_or(0),
         }),
         _ => Err(format!("unknown library event: {kind}")),
     }

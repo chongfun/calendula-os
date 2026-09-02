@@ -612,11 +612,89 @@ cache-encoding change; a spacing-only change re-walks line heights without a
 reparse.
 
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
-file names in the firmware path. The library list is a windowed catalog
-snapshot at `/READER/CATALOG.BIN` (v6: `X4CT` magic, u16 book count, 156-byte
-records). Firmware streams it `LIBRARY_WINDOW` (16) entries at a time instead
-of holding the whole list in RAM, so library size is bounded by the card, and
-only window crossings re-read it. The currently open book sits in a separate
+file names in the firmware path.
+
+The Library screen is the card's own folder tree. It shows one folder at a
+time: that folder's books, then the folders inside it, each folder marked by a
+trailing separator rather than by any difference in weight or shade, since the
+panel is one bit deep. The library root shows a third region between those
+two, the loose EPUBs sitting at the card root from before `/BOOKS` existed, so
+a card that predates the shelf still has a library and a card with no `/BOOKS`
+at all still lists one. Each row carries the root its locator is relative to,
+because the pair is the address: a locator says which root it belongs to only
+by being paired with one. Nothing nests at the card root, so its books appear
+in the root listing alone. Confirm on a book opens it and Confirm on a folder goes
+in; Back goes up a level, and leaves for Home at the library root. While a
+per-book action is in flight Back leaves Library whatever the depth, since a
+folder move is one of the presses that action is holding, and the rail says
+home rather than up for the moment it takes. A card
+with no folders on it therefore reads exactly as a flat list did. The rows are
+read from the card a page at a time through
+`upload_store::library::page_library_rows`, so what a folder costs in
+RAM is one screenful whatever its size, and scrolling inside a loaded page
+reads nothing. Entering one is not constant, though: showing books above
+folders means knowing the split before a row number means anything, so
+`count_library_rows` walks the whole directory once before the first page is
+filled, taking the split from `count_children_split`. Measured on an X3 at
+1,129 books, entering a folder costs 41 ms plus 0.356 ms per row and paging
+inside it is flat at about 35 ms, so the ordering is affordable and no derived
+index is warranted. Where the reader is lives in
+`app_core::browse::Browse` inside the display task's store rather than in the
+reducer's `Copy` state.
+
+A move through the tree either lands with a page of rows in front of the
+reader, or browsing is put back exactly where it was: the transaction takes a
+checkpoint before it descends or ascends, and restores it when any read the
+move depends on will not answer, the page included. Going up walks the whole
+parent past the returning name before it commits, since a walk that stopped
+early could pass over the very row the cursor was going back to. The relist a scan owes is the same transaction: it takes browsing back to the
+root and either lists it or reports that it could not, because a card that
+answered the scan and then would not answer for the rows is not a card with no
+books on it, and a row count alone cannot tell those two apart. All of it
+lives in `reader_cache::browse` rather than the firmware for the reason the
+publish tail does: a fault arriving after the state has already moved is the
+shape that keeps getting written wrong, and it cannot be tested inside a
+`#![no_main]` binary. The failure the app hears means
+standstill, and it keeps its own depth and rows on that word, so a recovery
+that quietly moved the storage task somewhere else would leave the two halves
+describing different folders.
+
+A press cannot tell a book from a folder on its own: the app holds a row count,
+not a listing. So Confirm and a Back at depth send a row-addressed command
+(`ChooseLibraryRow`, `LeaveLibraryFolder`, and the actions sheet's
+`ClearBookCache`) carrying the position generation the rows were counted in,
+and the storage task answers with the new listing, the catalog row a book
+turned out to be, or a refusal. That generation, not the catalog epoch, is
+what guards a row: the catalog epoch says whether the catalog was replaced,
+and a scan whose recovery is unfinished declines to rebuild it while going
+back to the library root anyway. A row picked in the folder that scan left
+names a different child of a different place, so the reposition retires it and
+an unsolicited listing from the newer generation overrules the move. A book is resolved by identity,
+hashing the root and the locator with the size the directory entry holds now
+and matching that against the catalog, not by counting rows: two independent
+walks agreeing on order is not something a card edited between them will
+honour.
+
+The catalog row that resolution produces is fenced to the catalog it was
+resolved in, and the fence is carried on the open it leads to. The answer
+crosses a queue on its way to the app and the open crosses one coming back, so
+a rebuild in that window would leave a different book sitting under the same
+number. Both ends check it, because the answer and the scan's own event can
+arrive in either order, and a fenced-out open is refused rather than skipped:
+the reader is already on the book they asked for and waiting to hear. Opens
+that did not come from resolving a row carry no fence, since their index comes
+from the app's own active book and refusing those would refuse a boot restore
+whose scan the app has not folded yet.
+
+Behind that list, `/READER/CATALOG.BIN` (v9: `X4CT` magic, u16 book count,
+419-byte records) is the whole book set, and stays the source of identity, the
+orphan sweep's ledger, the wifi shelf listing, and what a chosen locator
+resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
+instead of holding the whole list in RAM, so library size is bounded by the
+card. That count field is also the library's
+ceiling: 65,535 books. A card holding more fails the scan rather than
+committing the first 65,535 as a complete catalog, since every reader treats a
+committed catalog as the whole book set, the orphan sweep included. The currently open book sits in a separate
 `active_entry` so the reading path never depends on where the list is
 scrolled. On boot/refresh, firmware first loads a window from the cached
 snapshot, then refreshes `/BOOKS` and card-root discovery in a storage
@@ -629,13 +707,53 @@ long name does not fit is presented under its short name, and the sidecar's
 short name (`_BOOK~1.EPU`) no longer carries the dot that identifies it.
 Entries are labeled with the book's real title from its cached
 `BOOK.BIN`, falling back to the stored original-filename label for uploaded
-8.3-named books, then to the prettified file stem. Each fresh catalog write
+8.3-named books, then to the prettified file stem. That label sidecar is filed
+under the 8.3 alias alone, and an alias is only unique inside one directory, so
+it is read only for the two flat positions the upload scheme that wrote it
+could reach: directly under `/BOOKS`, or the card root. A book in a folder a
+reader made on a computer takes the file-stem label instead, rather than a name
+belonging to whichever file the matching alias came from. Each fresh catalog write
 also sweeps `CACHE2` and reclaims caches whose stored source identity no
 longer matches any catalogued book, deleting the data files and the emptied
 directories while leaving the durable state files intact. Files renders the current
 snapshot immediately. It may show “Library unavailable” before any successful
 cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
+
+Boot keeps a catalog that still loads, so a card edited on a computer while
+the device was off has a snapshot older than its contents. Browsing walks the
+card and shows the edits; the catalog is what has to catch up. A row the card
+lists and the catalog cannot resolve is taken as proof of exactly that: the
+scan runs, the listing is rebuilt, and the reader picks again from a list
+that now opens. Only a card that changed pays for it, and only once per
+change, which is what keeps an unchanged card on the warm snapshot.
+
+A cache key is derived from where a book is, so tidying one into a folder on
+a computer re-keys it away from its own reading position. Recognising that as
+a move rather than a deletion is a question about *which copy* a file is, and
+the firmware has no fact that answers it. Bytes say which book: a card can
+hold two copies, and deleting the one being read leaves the other agreeing
+perfectly. The FAT chain says which cluster, and clusters are reused: delete
+a book and a file written afterwards can be handed its first cluster, so
+equality with a recorded cluster number cannot separate the file that kept it
+from the file that inherited it.
+
+So the sweep establishes locator-loss semantics and stops there. A claim
+whose locator still resolves and still keys here is live. A claim whose
+locator cannot be read is unresolved, and the directory is left exactly as it
+is, because an I/O failure is not evidence that a book departed. A claim
+whose locator is definitively gone retires: the cache is reclaimed, and the
+reading position stays in its directory, waiting for the book to come back to
+where it was.
+
+Moves therefore do not carry a reading position, and the full-file witness is
+not computed either. It could only ever narrow a search, since a digest
+identifies bytes rather than a copy, so it waits on the same thing the carry
+does: durable library identity, the record of which copy a file is, written
+before the operation rather than inferred after it. The pure parts are built and tested
+against that arrival: the candidate search, the verdict rule that refuses
+every inference available today, `carry_position`, and the version 2 claim
+that has somewhere to put evidence. None of them runs on the card.
 
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN

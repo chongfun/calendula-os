@@ -30,6 +30,7 @@ use proto::cache::{
     BookV2SectionRecord, CoverCacheHeader, CACHE_COVER_FILE, COVER_BYTES, COVER_HEIGHT,
     COVER_STRIDE, COVER_WIDTH,
 };
+use proto::source::CachedSourceDigest;
 use proto::text::{TextAlign, TextRole};
 use reader_cache::files::{self, CacheLoadResult};
 use reader_cache::layout;
@@ -46,6 +47,13 @@ const PART_START_BLOCK: u32 = 64;
 /// the thing a mismatched file is rejected on.
 const KEY: &str = "TESTBOOK";
 const IDENTITY: (u32, u32) = (0xABCD_1234, 4096);
+/// The owner every keyed access proves itself against; the claim gate is
+/// exercised on its own in the twin tests below.
+const OWNER: proto::cache::CacheOwner<'static> = proto::cache::CacheOwner {
+    key: KEY,
+    root: proto::library_path::BookRoot::Library,
+    locator: "Fiction/Test.epub",
+};
 
 // ---------------------------------------------------------------------------
 // Fault-injecting in-memory block device
@@ -266,7 +274,7 @@ fn write_section(
     // only once a test reached past the first section.
     store.set_cached_spine(section);
     let page_count = store.page_count().min(u16::MAX as usize) as u16;
-    let wrote = files::with_v2_sections_dir(root, KEY, |sections| {
+    let wrote = files::with_v2_sections_dir(root, &OWNER, |sections| {
         let sections = sections.expect("sections dir should exist");
         files::write_v2_section_cache_in(sections, IDENTITY, section, store)
     });
@@ -287,7 +295,7 @@ fn build_book(
     store: &mut ReaderStore,
     sections: usize,
 ) -> Vec<BookV2SectionRecord> {
-    files::ensure_v2_cache_dirs(root, KEY).expect("cache dirs");
+    files::ensure_v2_cache_dirs(root, &OWNER).expect("cache dirs");
     let mut records = Vec::new();
     let mut start_page = 0;
     for n in 0..sections {
@@ -311,7 +319,7 @@ fn sections_still_on_card(root: &Dir<'_>, count: usize) -> bool {
 
 /// Whether one named file exists in the book's `SECTIONS/` directory.
 fn file_in_sections_dir(root: &Dir<'_>, name: &str) -> bool {
-    files::with_v2_sections_dir(root, KEY, |sections| {
+    files::with_v2_sections_dir(root, &OWNER, |sections| {
         let Some(sections) = sections else {
             return false;
         };
@@ -324,7 +332,7 @@ fn file_in_sections_dir(root: &Dir<'_>, name: &str) -> bool {
 /// Put a file that is not one of ours into `SECTIONS/`, to prove the prune
 /// deletes by parsed ordinal rather than by "everything that is here".
 fn write_stray_file(root: &Dir<'_>, name: &str) {
-    files::with_v2_sections_dir(root, KEY, |sections| {
+    files::with_v2_sections_dir(root, &OWNER, |sections| {
         let sections = sections.expect("sections dir should exist");
         let file = sections
             .open_file_in_dir(name, embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
@@ -337,7 +345,7 @@ fn write_stray_file(root: &Dir<'_>, name: &str) {
 /// There is no public writer for it, so this encodes the header and body
 /// directly — which also means the test is pinning the format the loader reads.
 fn write_cover(root: &Dir<'_>) {
-    let dir = files::open_v2_book_dir(root, KEY).expect("book cache dir");
+    let dir = files::open_v2_book_dir(root, &OWNER).expect("book cache dir");
     let file = dir
         .open_file_in_dir(
             CACHE_COVER_FILE,
@@ -397,7 +405,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
     store.set_book_index(pages, false, &records);
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
     assert!(matches!(
-        files::load_v2_section_by_global_page(&root, KEY, IDENTITY, reader_page, &mut store),
+        files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, reader_page, &mut store),
         CacheLoadResult::Hit { .. }
     ));
     assert!(store.covers_global_page(0, reader_page));
@@ -406,7 +414,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
     // The builder borrows the arena for a later section, which is the state a
     // step is in when its final publish runs.
     assert!(matches!(
-        files::load_v2_section_by_global_page(&root, KEY, IDENTITY, builder_page, &mut store),
+        files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, builder_page, &mut store),
         CacheLoadResult::Hit { .. }
     ));
     assert_eq!(
@@ -418,7 +426,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
     disk.fault.fail_write_in.set(Some(0));
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         reader_page,
         &mut store,
@@ -432,7 +440,7 @@ fn a_failed_final_index_write_restores_the_reader_and_keeps_their_sections() {
 
     let tail = publish::finish_background_walk(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         reader_page,
         outcome.outcome,
@@ -472,7 +480,7 @@ fn a_failed_first_open_index_write_clears_the_cache_nobody_is_holding() {
 
     disk.fault.fail_write_in.set(Some(0));
     let result = publish::publish_first_open(
-        &root, KEY, IDENTITY, 0, &mut store, &records, pages,
+        &root, &OWNER, IDENTITY, 0, &mut store, &records, pages,
         // A provisional publish carries a non-zero cursor.
         1,
     );
@@ -504,7 +512,7 @@ fn a_section_that_will_not_read_back_marks_the_window_unusable() {
     let records = build_book(&root, &mut store, 2);
     let pages = total_pages(&records);
     assert!(files::write_v2_book_index(
-        &root, KEY, IDENTITY, pages, &records, &store, false, 0,
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
     ));
 
     // Put the store in the state a completed open leaves it. The order is the
@@ -518,7 +526,7 @@ fn a_section_that_will_not_read_back_marks_the_window_unusable() {
     // Baseline: a clean load covers the page.
     assert!(
         matches!(
-            files::load_v2_section_by_global_page(&root, KEY, IDENTITY, 0, &mut store),
+            files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, 0, &mut store),
             CacheLoadResult::Hit { .. }
         ),
         "fixture must be able to load a section, or the negative case below is vacuous"
@@ -534,7 +542,7 @@ fn a_section_that_will_not_read_back_marks_the_window_unusable() {
     // reader's page; that restore is what must fail and be reported.
     disk.fault.fail_read_in.set(Some(0));
     let extended = publish::extend_background_index(
-        &root, KEY, IDENTITY, 1, 2, 0, &mut store, &records, pages,
+        &root, &OWNER, IDENTITY, 1, 2, 0, &mut store, &records, pages,
     );
     assert_eq!(
         extended,
@@ -568,9 +576,9 @@ fn an_index_a_build_abandoned_is_recognisable_as_one() {
 
     // A provisional publish stamps the cursor it will resume from.
     assert!(files::write_v2_book_index(
-        &root, KEY, IDENTITY, pages, &records, &store, true, 7,
+        &root, &OWNER, IDENTITY, pages, &records, &store, true, 7,
     ));
-    let loaded = files::load_v2_book_index(&root, KEY, IDENTITY, &mut store);
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut store);
     assert!(
         matches!(loaded, files::BookIndexLoadResult::Hit { unfinished: true }),
         "an index stamped with a resume cursor must read back as unfinished, got {loaded:?}"
@@ -587,11 +595,11 @@ fn an_index_a_build_abandoned_is_recognisable_as_one() {
     // A completed publish stamps zero, which is what says the missing pages --
     // if any -- are missing for good.
     assert!(files::write_v2_book_index(
-        &root, KEY, IDENTITY, pages, &records, &store, false, 0,
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
     ));
     assert!(
         matches!(
-            files::load_v2_book_index(&root, KEY, IDENTITY, &mut store),
+            files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut store),
             files::BookIndexLoadResult::Hit { unfinished: false }
         ),
         "a finished index must not read back as unfinished"
@@ -618,7 +626,7 @@ fn a_clean_publish_leaves_the_requested_page_resident() {
 
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
-        &root, KEY, IDENTITY, requested, &mut store, &records, pages, false, 0,
+        &root, &OWNER, IDENTITY, requested, &mut store, &records, pages, false, 0,
     );
     assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
@@ -658,7 +666,7 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         0,
         &mut store,
@@ -678,7 +686,7 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         0,
         &mut store,
@@ -721,7 +729,7 @@ fn a_suspended_walk_keeps_the_sections_past_its_frontier() {
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         0,
         &mut store,
@@ -759,7 +767,7 @@ fn the_prune_leaves_names_it_does_not_recognise() {
     store.begin_book_load();
     let outcome = publish::publish_book_cache(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         0,
         &mut store,
@@ -808,7 +816,7 @@ fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
     assert!(sections_still_on_card(&root, 5));
 
     disk.fault.fail_write_in.set(Some(0));
-    let removed = files::prune_orphan_sections(&root, KEY, 2);
+    let removed = files::prune_orphan_sections(&root, &OWNER, 2);
 
     assert!(
         file_in_sections_dir(&root, "S000.BIN") && file_in_sections_dir(&root, "S001.BIN"),
@@ -855,7 +863,7 @@ fn a_progressive_first_open_adopts_the_cover() {
 
     store.begin_book_load();
     let result = publish::publish_first_open(
-        &root, KEY, IDENTITY, 0, &mut store, first, pages,
+        &root, &OWNER, IDENTITY, 0, &mut store, first, pages,
         // Non-zero: the walk is coming back for the rest.
         1,
     );
@@ -904,7 +912,7 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
     // the walk has built.
     let published = publish::extend_background_index(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         reader_page,
         // The spine cursor the resume would carry.
@@ -926,7 +934,7 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
     disk.fault.fail_write_in.set(Some(0));
     let refused = publish::extend_background_index(
         &root,
-        KEY,
+        &OWNER,
         IDENTITY,
         reader_page,
         sections as u16,
@@ -948,4 +956,1462 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
         store.covers_global_page(0, reader_page),
         "the reader's page must still be resident after the refused write"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Position survival across the v8 re-key
+// ---------------------------------------------------------------------------
+
+/// A card upgraded across catalog v8 holds every inactive book's reading
+/// position under the key pre-v8 firmware derived from the display path.
+/// Position is the one non-rebuildable thing under a key, so the new lookup
+/// must recover it from the old directory; a mutation that drops the legacy
+/// layer resumes every such book at the beginning.
+#[test]
+fn a_position_saved_under_the_old_key_survives_the_re_key() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    // What old firmware left behind: a position under the display-path key.
+    // Seeded through the current writer, whose claim the legacy reader
+    // ignores the way it ignores everything pre-claim firmware did not
+    // write.
+    let display = "/books/dune.epub";
+    let size = 4_096u32;
+    let old_key = proto::cache::legacy_position_cache_key(display, size)
+        .expect("a direct shelf book has a legacy key");
+    let old_owner = proto::cache::CacheOwner {
+        key: old_key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "dune.epub",
+    };
+    files::write_position_file(&root, &old_owner, 17, 3).expect("seed the old position");
+
+    // The book's current key holds nothing yet; the lookup must fall back.
+    let owner = proto::cache::CacheOwner {
+        key: "E0000001",
+        root: proto::library_path::BookRoot::Library,
+        locator: "dune.epub",
+    };
+    assert_eq!(
+        files::read_position_file_or_legacy(&root, &owner, display, size),
+        Some((17, 3)),
+        "an upgrade must not strand the reader's place under the old key"
+    );
+
+    // The next ordinary save lands under the current key, which then wins.
+    files::write_position_file(&root, &owner, 21, 9).expect("save under the current key");
+    assert_eq!(
+        files::read_position_file_or_legacy(&root, &owner, display, size),
+        Some((21, 9)),
+        "a position saved under the current key must shadow the legacy one"
+    );
+
+    // A nested display shape has no legacy key: old firmware could not have
+    // written one, and a lookalike must not adopt the flat book's position.
+    let nested = proto::cache::CacheOwner {
+        key: "E0000002",
+        root: proto::library_path::BookRoot::Library,
+        locator: "fiction/dune.epub",
+    };
+    assert_eq!(
+        files::read_position_file_or_legacy(&root, &nested, "/books/fiction/dune.epub", size),
+        None,
+        "a nested book must not inherit a flat book's old position"
+    );
+}
+
+/// A full-hash twin shares the key, the identity, and therefore every
+/// `(hash, size)` check, so the directory claim is the only thing keeping
+/// it out of the other book's cache. The pair is the verified same-domain
+/// collision from `proto::catalog`'s tests.
+#[test]
+fn a_full_hash_twin_cannot_touch_the_other_books_cache() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let size = 1_234_567u32;
+    let hash = proto::cache::source_hash_at(
+        proto::library_path::BookRoot::Library,
+        "Fiction/zIx6RBhQEK.epub",
+        size,
+    );
+    assert_eq!(
+        hash,
+        proto::cache::source_hash_at(
+            proto::library_path::BookRoot::Library,
+            "Fiction/nTfOyBwYzX.epub",
+            size,
+        ),
+        "the collision this test exists for",
+    );
+    let key = proto::cache::cache_key_from(hash);
+    let owner_a = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/zIx6RBhQEK.epub",
+    };
+    let twin_b = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/nTfOyBwYzX.epub",
+    };
+
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A claims its directory");
+    files::write_position_file(&root, &owner_a, 5, 7).expect("A writes its position");
+
+    // Every hash agrees for B; the claim alone must hold the line, in both
+    // directions.
+    assert!(
+        files::ensure_v2_cache_dirs(&root, &twin_b).is_err(),
+        "the twin cannot claim the directory"
+    );
+    assert!(
+        files::write_position_file(&root, &twin_b, 9, 9).is_err(),
+        "the twin cannot write into it"
+    );
+    assert!(
+        files::open_v2_book_dir(&root, &twin_b).is_none(),
+        "the twin cannot open it, so no artifact under it can load"
+    );
+    assert_eq!(
+        files::read_position_file(&root, &twin_b),
+        None,
+        "the twin reads no position from it"
+    );
+
+    // The owner is untouched by the refusals.
+    assert!(files::open_v2_book_dir(&root, &owner_a).is_some());
+    assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
+}
+
+/// Clearing a book's cache keeps its position, so it must keep the claim
+/// that proves whose position it is: with the claim gone, the surviving
+/// place would read as anyone's, and the full-hash twin would inherit it.
+#[test]
+fn a_cleared_cache_keeps_its_claim_with_its_position() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let size = 1_234_567u32;
+    let hash = proto::cache::source_hash_at(
+        proto::library_path::BookRoot::Library,
+        "Fiction/zIx6RBhQEK.epub",
+        size,
+    );
+    let key = proto::cache::cache_key_from(hash);
+    let owner_a = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/zIx6RBhQEK.epub",
+    };
+    let twin_b = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/nTfOyBwYzX.epub",
+    };
+
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A claims");
+    files::write_position_file(&root, &owner_a, 5, 7).expect("A writes its position");
+    files::empty_cache_dir(&root, key.as_str());
+
+    // The ordinary supported clear ran; the twin still gets nothing.
+    assert_eq!(
+        files::read_position_file(&root, &twin_b),
+        None,
+        "the cleared cache must not surrender A's position to the twin"
+    );
+    assert!(
+        files::write_position_file(&root, &twin_b, 9, 9).is_err(),
+        "nor may the twin adopt the directory"
+    );
+    // A itself still owns the place it kept.
+    assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
+}
+
+/// The sweep releases a departed owner's claim rather than leaving it armed
+/// or deleting it. The evidence keeps naming the owner: the owner returning
+/// resumes its position, while a twin adopting the key knows the surviving
+/// place is not its own and starts clean.
+#[test]
+fn a_released_claim_lets_the_owner_resume_and_a_twin_adopt_clean() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let size = 1_234_567u32;
+    let hash = proto::cache::source_hash_at(
+        proto::library_path::BookRoot::Library,
+        "Fiction/zIx6RBhQEK.epub",
+        size,
+    );
+    let key = proto::cache::cache_key_from(hash);
+    let owner_a = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/zIx6RBhQEK.epub",
+    };
+    let twin_b = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/nTfOyBwYzX.epub",
+    };
+
+    // The owner-returns half: release, then the owner comes back.
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A claims");
+    files::write_position_file(&root, &owner_a, 5, 7).expect("A writes its position");
+    assert!(files::release_book_dir_claim(&root, key.as_str()));
+    assert_eq!(
+        files::read_position_file(&root, &owner_a),
+        Some((5, 7)),
+        "a released claim still names A, so A still reads its place"
+    );
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A reactivates its released claim");
+    assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
+
+    // The twin-adopts half: release again, then the twin takes the key.
+    assert!(files::release_book_dir_claim(&root, key.as_str()));
+    files::ensure_v2_cache_dirs(&root, &twin_b).expect("a released key is adoptable");
+    assert_eq!(
+        files::read_position_file(&root, &twin_b),
+        None,
+        "the adopted directory starts clean: A's place was provably not B's"
+    );
+    files::write_position_file(&root, &twin_b, 9, 9).expect("B owns the key now");
+    assert_eq!(files::read_position_file(&root, &twin_b), Some((9, 9)));
+    // And A is the refused twin from here on.
+    assert!(files::ensure_v2_cache_dirs(&root, &owner_a).is_err());
+}
+
+/// Failing to read WHO.BIN is not evidence that there is no owner: a
+/// transient card error must refuse the writer rather than authorize it to
+/// erase and adopt a directory somebody may hold.
+#[test]
+fn an_unreadable_claim_refuses_adoption_rather_than_granting_it() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let size = 1_234_567u32;
+    let hash = proto::cache::source_hash_at(
+        proto::library_path::BookRoot::Library,
+        "Fiction/zIx6RBhQEK.epub",
+        size,
+    );
+    let key = proto::cache::cache_key_from(hash);
+    let owner_a = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/zIx6RBhQEK.epub",
+    };
+    let twin_b = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/nTfOyBwYzX.epub",
+    };
+    files::ensure_v2_cache_dirs(&root, &owner_a).expect("A claims");
+    files::write_position_file(&root, &owner_a, 5, 7).expect("A writes its position");
+
+    // Every read from here on fails, wherever in the claim path it lands.
+    disk.fault.fail_read_in.set(Some(0));
+    assert!(
+        files::write_position_file(&root, &twin_b, 9, 9).is_err(),
+        "a card that would not answer authorizes nothing"
+    );
+    disk.fault.fail_read_in.set(None);
+
+    // A's ownership and place survived the twin's faulted attempt.
+    assert_eq!(files::read_position_file(&root, &owner_a), Some((5, 7)));
+    assert!(files::open_v2_book_dir(&root, &owner_a).is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Moving through the folder tree, against a card that stops answering.
+//
+// The whole contract is one sentence: a move either lands with a page of rows
+// in front of the reader, or browsing is exactly where it was. The app keeps
+// its own depth and rows on that word, so a move that reported success after
+// a read it could not make would leave the two halves describing different
+// folders, with the screen naming one and every later command landing on the
+// other.
+
+/// Descend by long name, since making a directory hands back nothing to
+/// descend through and the alias need not be the name.
+fn open_child<'a>(dir: &Dir<'a>, name: &str) -> Dir<'a> {
+    let entry = upload_store::library::entry_in(dir, name)
+        .expect("read")
+        .expect("present");
+    dir.open_dir(entry.alias).expect("open")
+}
+
+/// A shelf with `Fiction/` under it, holding `books` books.
+fn seed_shelf(root: &Dir<'_>, books: usize) {
+    root.make_dir_in_dir("BOOKS").expect("mkdir");
+    let shelf = open_child(root, "BOOKS");
+    let top = shelf.create_file_in_dir_lfn("Top.epub").expect("create");
+    top.write(b"top").expect("write");
+    top.close().expect("close");
+    shelf.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = open_child(&shelf, "Fiction");
+    for index in 0..books {
+        let file = fiction
+            .create_file_in_dir_lfn(&std::format!("Book {index:03}.epub"))
+            .expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+}
+
+/// At the library root with its listing loaded, which is where every move
+/// below starts.
+fn at_library_root(root: &Dir<'_>) -> Box<ReaderStore> {
+    let mut store = Box::new(ReaderStore::new());
+    reader_cache::browse::list_here(&mut store, root, true).expect("the root lists");
+    store
+}
+
+/// The move that motivated the checkpoint. Every read the move makes is
+/// failed in turn, and each outcome has to be one of exactly two things: the
+/// move landed with the page it was supposed to validate itself against, or
+/// browsing is where it started. The middle case is the bug: a count that
+/// answered, a page that did not, and both halves committed to a folder with
+/// no rows in it.
+#[test]
+fn a_move_either_lands_with_its_rows_or_does_not_move() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 4);
+
+    let folder = {
+        let store = at_library_root(&root);
+        let folder = store.browse().count() - 1;
+        assert_eq!(
+            store.folder_row(folder as usize).map(|row| row.is_dir),
+            Some(true),
+            "the last row is the folder"
+        );
+        folder
+    };
+
+    let mut refusals = 0usize;
+    let mut arrivals = 0usize;
+    for probe in 0..64 {
+        let mut attempt = at_library_root(&root);
+        let was_at = attempt.browse().path().clone();
+        let was_count = attempt.browse().count();
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let outcome = reader_cache::browse::choose_row(&mut attempt, &root, folder, true);
+        disk.fault.fail_read_in.set(None);
+
+        match outcome {
+            reader_cache::browse::RowChoice::Entered(listing) => {
+                arrivals += 1;
+                assert_eq!(attempt.browse().path().as_str(), "Fiction");
+                assert!(listing.count > 0, "probe {probe}: the folder has books");
+                assert!(
+                    !attempt.folder_rows().is_empty(),
+                    "probe {probe}: entered a folder whose page was never read",
+                );
+            }
+            reader_cache::browse::RowChoice::Failed => {
+                refusals += 1;
+                assert_eq!(
+                    attempt.browse().path().as_str(),
+                    was_at.as_str(),
+                    "probe {probe}: a refused move moved anyway",
+                );
+                assert_eq!(attempt.browse().count(), was_count, "probe {probe}");
+            }
+            other => panic!("probe {probe}: {other:?}"),
+        }
+    }
+    assert!(refusals > 0, "no read in the move could be failed");
+    assert!(arrivals > 0, "no read in the move was survivable");
+}
+
+/// The same sweep for Back, whose parent walk spans several pages. A
+/// departure that lands has to have walked the whole parent: one that stopped
+/// early could pass over the very name the cursor was going back to, and
+/// report a shorter folder than the card holds.
+#[test]
+fn a_departure_either_walks_the_whole_parent_or_does_not_move() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    // More books than one page holds, so the parent walk takes several.
+    seed_shelf(&root, 40);
+
+    let (folder, root_rows) = {
+        let store = at_library_root(&root);
+        (store.browse().count() - 1, store.browse().count())
+    };
+
+    let mut refusals = 0usize;
+    let mut arrivals = 0usize;
+    for probe in 0..96 {
+        let mut attempt = at_library_root(&root);
+        assert!(matches!(
+            reader_cache::browse::choose_row(&mut attempt, &root, folder, true),
+            reader_cache::browse::RowChoice::Entered(_)
+        ));
+        let inside = attempt.browse().path().clone();
+        let inside_count = attempt.browse().count();
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let left = reader_cache::browse::leave_folder(&mut attempt, &root, true);
+        disk.fault.fail_read_in.set(None);
+
+        match left {
+            Some(listing) => {
+                arrivals += 1;
+                assert!(attempt.browse().is_root(), "probe {probe}");
+                assert_eq!(
+                    listing.count, root_rows,
+                    "probe {probe}: a departure that landed walked a short parent",
+                );
+                assert_eq!(
+                    listing.selection,
+                    root_rows - 1,
+                    "probe {probe}: and lost the folder it was going back to",
+                );
+            }
+            None => {
+                refusals += 1;
+                assert_eq!(
+                    attempt.browse().path().as_str(),
+                    inside.as_str(),
+                    "probe {probe}: a refused departure left anyway",
+                );
+                assert_eq!(attempt.browse().count(), inside_count, "probe {probe}");
+            }
+        }
+    }
+    assert!(refusals > 0, "no read in the departure could be failed");
+    assert!(arrivals > 0, "no read in the departure was survivable");
+}
+
+/// The relist a scan owes, under the same oracle as a move. A card that
+/// answered the scan and then would not answer for the rows must not come
+/// back looking like a card with no books on it: those are different states,
+/// and the row count alone cannot tell them apart.
+#[test]
+fn a_post_scan_relist_either_lists_or_reports_it_could_not() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 4);
+
+    // What the root really holds, read cleanly.
+    let truth = {
+        let mut store = Box::new(ReaderStore::new());
+        reader_cache::browse::relist_root(&mut store, &root, true).expect("a readable root lists")
+    };
+    assert!(truth.count > 0, "the card has books and a folder on it");
+
+    let mut refusals = 0usize;
+    let mut arrivals = 0usize;
+    for probe in 0..64 {
+        let mut store = Box::new(ReaderStore::new());
+        // Somewhere else entirely, the way a scan finds browsing.
+        reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+        let folder = store.browse().count() - 1;
+        assert!(matches!(
+            reader_cache::browse::choose_row(&mut store, &root, folder, true),
+            reader_cache::browse::RowChoice::Entered(_)
+        ));
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let listed = reader_cache::browse::relist_root(&mut store, &root, true);
+        disk.fault.fail_read_in.set(None);
+
+        match listed {
+            Some(listing) => {
+                arrivals += 1;
+                assert_eq!(
+                    listing, truth,
+                    "probe {probe}: a relist that landed described a different root",
+                );
+                assert!(
+                    !store.folder_rows().is_empty(),
+                    "probe {probe}: listed a root whose page was never read",
+                );
+            }
+            None => {
+                refusals += 1;
+                assert!(
+                    store.browse().is_root(),
+                    "probe {probe}: a scan puts browsing at the root either way",
+                );
+                assert_eq!(
+                    store.browse().count(),
+                    0,
+                    "probe {probe}: a root that could not be read holds no rows",
+                );
+                assert!(store.folder_rows().is_empty(), "probe {probe}");
+            }
+        }
+    }
+    assert!(refusals > 0, "no read in the relist could be failed");
+    assert!(arrivals > 0, "no read in the relist was survivable");
+}
+
+/// The relist retires every row number picked before it, whether or not the
+/// catalog moved. A scan whose recovery is unfinished rebuilds nothing, so
+/// the catalog epoch stands, and browsing goes back to the root anyway: a row
+/// picked in the folder it left names a different child of a different place.
+#[test]
+fn a_relist_retires_the_rows_picked_before_it() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 4);
+
+    let mut store = Box::new(ReaderStore::new());
+    reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+    let before = store.browse_epoch();
+    let catalog_before = store.catalog_epoch();
+
+    let folder = store.browse().count() - 1;
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, folder, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+    assert_eq!(
+        store.browse_epoch(),
+        before,
+        "a move the reader asked for is not a reposition",
+    );
+
+    reader_cache::browse::relist_root(&mut store, &root, true).expect("root lists");
+    assert!(store.browse().is_root());
+    assert_ne!(
+        store.browse_epoch(),
+        before,
+        "the reposition retires the rows the reader was looking at",
+    );
+    assert_eq!(
+        store.catalog_epoch(),
+        catalog_before,
+        "and it does so without the catalog having moved at all",
+    );
+}
+
+/// A failed relist retires them too: it has left the folder either way, so a
+/// row picked there is just as stale.
+#[test]
+fn a_relist_that_could_not_read_still_retires_them() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 4);
+
+    let mut refused = 0usize;
+    for probe in 0..64 {
+        let mut store = Box::new(ReaderStore::new());
+        reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+        let folder = store.browse().count() - 1;
+        assert!(matches!(
+            reader_cache::browse::choose_row(&mut store, &root, folder, true),
+            reader_cache::browse::RowChoice::Entered(_)
+        ));
+        let before = store.browse_epoch();
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let listed = reader_cache::browse::relist_root(&mut store, &root, true);
+        disk.fault.fail_read_in.set(None);
+
+        assert_ne!(
+            store.browse_epoch(),
+            before,
+            "probe {probe}: the folder was left whether or not the root read",
+        );
+        if listed.is_none() {
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "no read in the relist could be failed");
+}
+
+// ---------------------------------------------------------------------------
+// Recognising a moved book.
+//
+// A cache key is derived from the locator, so a reader who tidies a book into
+// a folder re-keys it away from its own position. The position survives on
+// the card and becomes unreachable. The claim records what the file *is* so
+// the sweep can put the two back together.
+
+/// A digest of real bytes. `SourceDigest` is only constructible by hashing a
+/// stream, which is the point of it: the writers below take that type
+/// precisely so a caller cannot reach them with a value read off a card.
+fn hashed(bytes: &[u8]) -> proto::source::SourceDigest {
+    let mut hasher = proto::source::SourceHasher::new();
+    hasher.update(bytes);
+    hasher.finish()
+}
+
+/// A book at `locator`, keyed as the firmware keys it, so the tests move real
+/// keys rather than made-up ones.
+fn moved_owner(locator: &str, size: u32) -> (String, proto::library_path::BookRoot) {
+    let hash = proto::cache::source_hash_at(proto::library_path::BookRoot::Library, locator, size);
+    (
+        proto::cache::cache_key_from(hash).as_str().to_string(),
+        proto::library_path::BookRoot::Library,
+    )
+}
+
+/// A listing far longer than any number of batches somebody might write
+/// down, walked one name at a time.
+///
+/// The point is the count of batches, so the batch is one and the listing is
+/// thousands: what ends the walk has to be the end of the listing. A test
+/// that merely runs deeper than one batch proves only that the ceiling is
+/// higher than the test, which is how the ceiling this replaces survived
+/// its own regression.
+#[test]
+fn no_number_of_batches_is_what_ends_the_walk() {
+    let listing: Vec<String> = (0..4_000).map(|i| std::format!("E{i:07x}")).collect();
+    let mut seen: Vec<String> = Vec::new();
+    let mut batches = 0usize;
+
+    files::walk_in_batches(
+        1,
+        |skip, want, keys| {
+            for name in listing.iter().skip(skip).take(want) {
+                keys.push(heapless::String::try_from(name.as_str()).expect("8 bytes"))
+                    .expect("within the batch");
+            }
+        },
+        |_| true,
+        |keys| {
+            batches += 1;
+            for key in keys {
+                seen.push(key.as_str().to_string());
+            }
+        },
+    );
+
+    assert_eq!(
+        batches,
+        listing.len(),
+        "one name per batch, and all of them"
+    );
+    assert_eq!(seen, listing, "in order, none skipped");
+}
+
+/// A listing that keeps naming an entry it reports as gone would be handed
+/// over forever. The walk stops instead, on the batch that neither moved the
+/// cursor nor changed the name it starts with.
+#[test]
+fn a_listing_that_contradicts_itself_stops_the_walk() {
+    let listing: Vec<String> = (0..8).map(|i| std::format!("E{i:07x}")).collect();
+    let mut handed = 0usize;
+
+    files::walk_in_batches(
+        2,
+        |skip, want, keys| {
+            for name in listing.iter().skip(skip).take(want) {
+                keys.push(heapless::String::try_from(name.as_str()).expect("8 bytes"))
+                    .expect("within the batch");
+            }
+        },
+        // Everything is reported gone, and nothing leaves the listing.
+        |_| false,
+        |keys| {
+            handed += keys.len();
+            // Without the guard this walk does not end. Say so as a failure
+            // rather than as a test run that hangs.
+            assert!(
+                handed <= 8,
+                "the walk is handing the same names over forever"
+            );
+        },
+    );
+
+    assert_eq!(
+        handed, 4,
+        "two batches of the same names, and then it gives up",
+    );
+}
+
+/// A folder with more rows than a cursor can address is refused, not
+/// truncated. Clamping would publish a listing that stops at 65,535 and
+/// leave every child after it unreachable, which is the failure the catalog
+/// refuses an oversized library to avoid. Folders count their
+/// subdirectories as rows, so a card whose catalog is comfortably legal can
+/// still hold a folder past this.
+#[test]
+fn a_folder_past_the_cursor_is_refused_rather_than_shortened() {
+    assert_eq!(reader_cache::browse::addressable_rows(0), Some(0));
+    assert_eq!(
+        reader_cache::browse::addressable_rows(u16::MAX as usize),
+        Some(u16::MAX),
+        "exactly full still lists"
+    );
+    assert_eq!(
+        reader_cache::browse::addressable_rows(u16::MAX as usize + 1),
+        None,
+        "one past it hides a child, so it refuses"
+    );
+}
+
+/// Every cache directory is reached, including the ones past a batch.
+///
+/// The walk holds a few dozen names at a time and has to restart
+/// enumeration for each batch, because files cannot be opened while a
+/// directory iteration holds the lock. Without a cursor it hands over the
+/// same first names on every scan, and the sweep that consumes it is what
+/// reconciles a moved book: a directory sitting past the first batch behind
+/// perfectly healthy ones would be reconciled on no scan at all, and its
+/// reader's place would stay stranded under the old key for the life of the
+/// card.
+#[test]
+fn the_walk_reaches_past_its_first_batch() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    // Several batches deep, not one. A walk capped at any fixed number of
+    // batches is the same starvation further out, so what this pins is that
+    // the count of batches is not what stops it.
+    let wanted = files::CACHE_SWEEP_BATCH * 5 + 1;
+    let mut made: Vec<String> = Vec::new();
+    for index in 0..wanted {
+        let locator = std::format!("Book {index:03}.epub");
+        let (key, book_root) = moved_owner(&locator, 4096);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: book_root,
+            locator: &locator,
+        };
+        // A position makes the directory one nothing reclaims, which is the
+        // shape that starves the walk: healthy directories that stay.
+        files::write_position_file(&root, &owner, 1, 1).expect("seed");
+        made.push(key);
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut batches = 0;
+    files::for_each_cache_dir(&root, files::CACHE_SWEEP_BATCH, |keys| {
+        batches += 1;
+        for key in keys {
+            seen.push(key.as_str().to_string());
+        }
+    });
+
+    assert!(batches > 1, "the point is that it took more than one batch");
+    seen.sort();
+    made.sort();
+    assert_eq!(seen.len(), wanted, "every directory was handed over once");
+    assert_eq!(seen, made, "and they were the ones on the card");
+}
+
+/// A caller that reclaims directories shortens the listing behind it. The
+/// cursor counts what survived rather than what it asked about, or the
+/// entries that moved up into the gap would be stepped over.
+#[test]
+fn reclaiming_inside_the_walk_does_not_skip_what_moves_up() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let wanted = files::CACHE_SWEEP_BATCH + 3;
+    for index in 0..wanted {
+        let locator = std::format!("Book {index:03}.epub");
+        let (key, book_root) = moved_owner(&locator, 4096);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: book_root,
+            locator: &locator,
+        };
+        // A claim and no place to keep, so reclaiming takes the whole
+        // directory rather than leaving one behind for its position.
+        files::record_cache_evidence(&root, &owner, Some(9), Some(hashed(b"x"))).expect("seed");
+    }
+
+    // Reclaim each directory as it is handed over, the way the sweep does
+    // for a cache whose book is gone. Every one leaves the listing, so a
+    // cursor counting what it asked about rather than what survived would
+    // walk straight past the entries that moved up.
+    let mut seen = 0usize;
+    files::for_each_cache_dir(&root, files::CACHE_SWEEP_BATCH, |keys| {
+        seen += keys.len();
+        for key in keys {
+            assert!(
+                files::empty_cache_dir(&root, key.as_str()),
+                "a claim-only directory is reclaimable"
+            );
+            assert!(
+                !files::book_dir_exists(&root, key.as_str()),
+                "and it left the listing"
+            );
+        }
+    });
+
+    assert_eq!(
+        seen, wanted,
+        "every directory was handed over even as the listing shrank under the walk",
+    );
+}
+
+/// A book that is sitting right there, probed through a card that stumbles.
+///
+/// This answer decides whether a directory enters move reconciliation, and
+/// reconciliation ends by retiring a claim. Worse, the search that follows
+/// excludes the owner's own locator, so a live book falsely called gone
+/// cannot be found again; what can be found is a byte-identical copy
+/// somewhere else, which is the state merge this layer exists to refuse. So
+/// no read fault may turn a book that is present into one that left.
+#[test]
+fn a_read_fault_cannot_report_a_present_book_as_departed() {
+    let mut stumbled = 0;
+    // The probe costs three reads. The range runs well past that so a change
+    // that adds one is still covered; the extra rounds fault nothing and
+    // assert the clean answer.
+    for probe in 0..24 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        seed_shelf(&root, 1);
+
+        let locator = "Fiction/Book 000.epub";
+        let size = 1;
+        let key = proto::cache::cache_key_from(proto::cache::source_hash_at(
+            proto::library_path::BookRoot::Library,
+            locator,
+            size,
+        ));
+
+        // With no fault at all it is plainly there, or the probe below
+        // proves nothing about faults.
+        assert_eq!(
+            files::claimant_place(
+                &root,
+                proto::library_path::BookRoot::Library,
+                locator,
+                key.as_str()
+            ),
+            files::ClaimantPlace::Live,
+            "the seeded book reads as present",
+        );
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let seen = files::claimant_place(
+            &root,
+            proto::library_path::BookRoot::Library,
+            locator,
+            key.as_str(),
+        );
+        disk.fault.fail_read_in.set(None);
+
+        assert_ne!(
+            seen,
+            files::ClaimantPlace::Gone,
+            "probe {probe}: a book on the card reported as departed",
+        );
+        if seen == files::ClaimantPlace::Unreadable {
+            stumbled += 1;
+        }
+    }
+    assert!(
+        stumbled > 0,
+        "no probe made the card stumble, so this proves nothing",
+    );
+}
+
+/// A book that really is not there is not a card that stumbled. Reclaiming
+/// a deleted book's cache depends on saying so.
+#[test]
+fn a_book_that_is_gone_reads_as_gone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 1);
+
+    assert_eq!(
+        files::claimant_place(
+            &root,
+            proto::library_path::BookRoot::Library,
+            "Fiction/Not Here.epub",
+            "E0000000"
+        ),
+        files::ClaimantPlace::Gone,
+    );
+}
+
+/// A move whose destination lands on the departed book's own cache key.
+///
+/// A key is 28 bits of a hash of a place, so two locators can share one, and
+/// `proto` carries a pair that collide outright. Then the place the reader
+/// left is already in the directory the moved book will use, and there is
+/// nothing to carry: what is wrong is the claim, which still names a locator
+/// that is gone. Left alone, the next open reads that claim as another
+/// book's, adopts the directory, and clears the position on the way in.
+///
+/// So the carry re-attributes in place. The gate that would refuse this,
+/// seeing a stranger, is the one the confirmed digest exists to answer.
+#[test]
+fn a_move_onto_its_own_key_keeps_the_place_by_changing_whose_it_is() {
+    let size = 1_234_567;
+    let from_locator = "Fiction/zIx6RBhQEK.epub";
+    let to_locator = "Fiction/nTfOyBwYzX.epub";
+    let (from_key, book_root) = moved_owner(from_locator, size);
+    let (to_key, _) = moved_owner(to_locator, size);
+    assert_eq!(
+        from_key, to_key,
+        "the collision this test exists for; proto pins the pair"
+    );
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let from = proto::cache::CacheOwner {
+        key: from_key.as_str(),
+        root: book_root,
+        locator: from_locator,
+    };
+    let to = proto::cache::CacheOwner {
+        key: to_key.as_str(),
+        root: book_root,
+        locator: to_locator,
+    };
+    files::write_position_file(&root, &from, 12, 340).expect("a place to keep");
+
+    assert_eq!(
+        files::carry_position(&root, &from, &to, hashed(b"the book"), Some(9)),
+        Ok(true),
+    );
+
+    assert_eq!(
+        files::read_position_file(&root, &to),
+        Some((12, 340)),
+        "the moved book reads the place it left",
+    );
+    match files::read_book_dir_claimant(&root, to_key.as_str()) {
+        files::DirClaimant::Claimed {
+            locator, released, ..
+        } => {
+            assert_eq!(
+                locator.as_str(),
+                to_locator,
+                "the directory is the new one's"
+            );
+            assert!(!released, "and it is held, not retired");
+        }
+        other => panic!("the directory should be claimed by the mover, got {other:?}"),
+    }
+
+    // The evidence goes with it, or the next move has no witness.
+    let files::DirClaimant::Claimed { evidence, .. } =
+        files::read_book_dir_claimant(&root, to_key.as_str())
+    else {
+        unreachable!()
+    };
+    assert!(evidence.digest.is_some(), "a witness for the next move");
+}
+
+/// The repair, end to end: a position written under one locator is readable
+/// under the other, and the evidence goes with it so a second move still has
+/// a witness. Losing that on the first carry is how this works once and then
+/// silently stops.
+#[test]
+fn a_carried_position_arrives_with_the_evidence_that_found_it() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let (from_key, book_root) = moved_owner("Dune.epub", 4096);
+    let (to_key, _) = moved_owner("Fiction/Dune.epub", 4096);
+    let from = proto::cache::CacheOwner {
+        key: from_key.as_str(),
+        root: book_root,
+        locator: "Dune.epub",
+    };
+    let to = proto::cache::CacheOwner {
+        key: to_key.as_str(),
+        root: book_root,
+        locator: "Fiction/Dune.epub",
+    };
+    assert_ne!(
+        from.key, to.key,
+        "a move re-keys the book, which is the bug"
+    );
+
+    files::write_position_file(&root, &from, 12, 340).expect("seed a position");
+    let digest = hashed(b"the bytes this copy holds");
+    assert!(files::carry_position(&root, &from, &to, digest, Some(77)).expect("carry"));
+    assert_eq!(
+        files::read_position_file(&root, &to),
+        Some((12, 340)),
+        "the reader resumes where they left off, under the new key",
+    );
+
+    match files::read_book_dir_claimant(&root, to.key) {
+        files::DirClaimant::Claimed {
+            locator, evidence, ..
+        } => {
+            assert_eq!(locator.as_str(), "Fiction/Dune.epub");
+            assert_eq!(evidence.cluster, Some(77));
+            assert_eq!(
+                evidence.digest,
+                Some(CachedSourceDigest::new(digest)),
+                "a second move still has a witness"
+            );
+        }
+        other => panic!("the carried directory must be claimed: {other:?}"),
+    }
+}
+
+/// A departed directory with nothing in it is the ordinary case, and it is
+/// not a failure. Reporting one as carried would have the sweep believe it
+/// repaired something.
+#[test]
+fn a_departed_directory_with_no_position_carries_nothing() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let (from_key, book_root) = moved_owner("Dune.epub", 4096);
+    let (to_key, _) = moved_owner("Fiction/Dune.epub", 4096);
+    let from = proto::cache::CacheOwner {
+        key: from_key.as_str(),
+        root: book_root,
+        locator: "Dune.epub",
+    };
+    let to = proto::cache::CacheOwner {
+        key: to_key.as_str(),
+        root: book_root,
+        locator: "Fiction/Dune.epub",
+    };
+    assert!(!files::carry_position(&root, &from, &to, hashed(b"anything"), None).expect("carry"));
+    assert_eq!(files::read_position_file(&root, &to), None);
+}
+
+/// Evidence arrives in two pieces at two different times: the chain when the
+/// book is resolved, the digest when it is read. Recording one must not erase
+/// the other, and neither must an ordinary position write.
+#[test]
+fn evidence_accumulates_and_ordinary_writes_leave_it_alone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    files::record_cache_evidence(&root, &OWNER, Some(512), None).expect("chain first");
+    let digest = hashed(b"some other bytes");
+    files::record_cache_evidence(&root, &OWNER, None, Some(digest)).expect("digest after");
+
+    let held = match files::read_book_dir_claimant(&root, OWNER.key) {
+        files::DirClaimant::Claimed { evidence, .. } => evidence,
+        other => panic!("claimed: {other:?}"),
+    };
+    assert_eq!(
+        held.cluster,
+        Some(512),
+        "the digest did not erase the chain"
+    );
+    assert_eq!(held.digest, Some(CachedSourceDigest::new(digest)));
+
+    // A position write re-claims the directory. It is about ownership, not
+    // about what the file is, and must carry the evidence through untouched.
+    files::write_position_file(&root, &OWNER, 4, 9).expect("position");
+    let after = match files::read_book_dir_claimant(&root, OWNER.key) {
+        files::DirClaimant::Claimed { evidence, .. } => evidence,
+        other => panic!("claimed: {other:?}"),
+    };
+    assert_eq!(after, held, "an ordinary claim write is not an erasure");
+}
+
+/// The release is where the evidence has to survive. The sweep releases a
+/// departed owner's claim, and that release rewrites the claim: if it wrote
+/// an empty record it would destroy the witness in the very pass that needs
+/// it, and a book that moved twice would be unrecognisable the second time.
+#[test]
+fn releasing_a_claim_keeps_the_evidence_the_sweep_reads() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let digest = hashed(b"bytes worth recognising later");
+    files::record_cache_evidence(&root, &OWNER, Some(4_211), Some(digest)).expect("record");
+    files::write_position_file(&root, &OWNER, 8, 100).expect("position");
+
+    assert!(files::release_book_dir_claim(&root, OWNER.key), "release");
+
+    match files::read_book_dir_claimant(&root, OWNER.key) {
+        files::DirClaimant::Claimed {
+            released, evidence, ..
+        } => {
+            assert!(released, "the sweep released it");
+            assert_eq!(evidence.cluster, Some(4_211), "and kept what the file is");
+            assert_eq!(evidence.digest, Some(CachedSourceDigest::new(digest)));
+        }
+        other => panic!("a released claim still names its owner: {other:?}"),
+    }
+    assert_eq!(
+        files::read_position_file(&root, &OWNER),
+        Some((8, 100)),
+        "and the place it was protecting",
+    );
+}
+
+/// A read fault during the release must not be read as a claim that had no
+/// evidence. The release rewrites the claim in the very pass that wants to
+/// recognise a move, so one unanswered read there would destroy the witness
+/// on the way past, and the rewrite would report success having done it.
+#[test]
+fn a_read_fault_during_release_cannot_erase_the_evidence() {
+    let digest = hashed(b"bytes worth recognising later");
+    for probe in 0..30 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        files::record_cache_evidence(&root, &OWNER, Some(4_211), Some(digest)).expect("record");
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let released = files::release_book_dir_claim(&root, OWNER.key);
+        disk.fault.fail_read_in.set(None);
+
+        // A fault can tear the claim mid-write, and a torn claim is not a
+        // claim: the sweep reads it as unclaimed and nothing inherits from
+        // it. What must not happen is a well-formed claim that survived with
+        // its evidence stripped, because that reads as authoritative.
+        if let files::DirClaimant::Claimed { evidence, .. } =
+            files::read_book_dir_claimant(&root, OWNER.key)
+        {
+            assert_eq!(
+                (evidence.cluster, evidence.digest),
+                (Some(4_211), Some(CachedSourceDigest::new(digest))),
+                "probe {probe}: released={released} left a valid claim with no witness",
+            );
+        }
+    }
+}
+
+/// A departed book coming back reactivates its released claim, and that
+/// rewrite is the one that has to re-read the evidence rather than being
+/// handed it. A read fault there must refuse, not write a well-formed active
+/// claim with the witness stripped out.
+#[test]
+fn a_returning_owner_does_not_reactivate_over_its_own_evidence() {
+    let digest = hashed(b"the bytes this copy holds");
+    for probe in 0..30 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        files::record_cache_evidence(&root, &OWNER, Some(4_211), Some(digest)).expect("record");
+        assert!(files::release_book_dir_claim(&root, OWNER.key), "depart");
+
+        // Coming back: the position write reclaims, which reactivates.
+        disk.fault.fail_read_in.set(Some(probe));
+        let back = files::write_position_file(&root, &OWNER, 3, 4);
+        disk.fault.fail_read_in.set(None);
+
+        if let files::DirClaimant::Claimed { evidence, .. } =
+            files::read_book_dir_claimant(&root, OWNER.key)
+        {
+            assert_eq!(
+                (evidence.cluster, evidence.digest),
+                (Some(4_211), Some(CachedSourceDigest::new(digest))),
+                "probe {probe}: back={back:?} reactivated over the witness",
+            );
+        }
+    }
+}
+
+/// Adding one half of the evidence must not erase the other when the read of
+/// what is already there fails.
+#[test]
+fn a_read_fault_while_accumulating_refuses_rather_than_forgets() {
+    let digest = hashed(b"the second half");
+    for probe in 0..30 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        files::record_cache_evidence(&root, &OWNER, Some(4_211), None).expect("chain");
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let added = files::record_cache_evidence(&root, &OWNER, None, Some(digest));
+        disk.fault.fail_read_in.set(None);
+
+        if let files::DirClaimant::Claimed { evidence, .. } =
+            files::read_book_dir_claimant(&root, OWNER.key)
+        {
+            assert_eq!(
+                evidence.cluster,
+                Some(4_211),
+                "probe {probe}: added={added:?} left a valid claim missing the chain \
+                 it was adding to",
+            );
+        }
+    }
+}
+
+/// The readback has to prove the transition, not merely the evidence. A
+/// release keeps its evidence identical by design, so a verifier comparing
+/// evidence alone cannot tell whether the released bit ever landed.
+#[test]
+fn a_release_that_does_not_land_is_not_reported_as_landed() {
+    let digest = hashed(b"unchanged across the release");
+    for probe in 0..30 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        files::record_cache_evidence(&root, &OWNER, Some(7), Some(digest)).expect("record");
+
+        disk.fault.fail_write_in.set(Some(probe));
+        let released = files::release_book_dir_claim(&root, OWNER.key);
+        disk.fault.fail_write_in.set(None);
+
+        if released {
+            match files::read_book_dir_claimant(&root, OWNER.key) {
+                files::DirClaimant::Claimed {
+                    released: on_card, ..
+                } => assert!(
+                    on_card,
+                    "probe {probe}: reported a release the card did not take",
+                ),
+                other => panic!("probe {probe}: reported a release, card says {other:?}"),
+            }
+        }
+    }
+}
+
+/// The presence question asks the directory, not the claim over it, and has
+/// to answer in both directions: a built book that has not been read to a
+/// place yet is a directory a carry may write, and one that remembers a
+/// place is not.
+#[test]
+fn a_directory_holds_a_position_only_once_one_is_written() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let (key, book_root) = moved_owner("Dune.epub", 4096);
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: book_root,
+        locator: "Dune.epub",
+    };
+
+    assert_eq!(
+        files::book_dir_position_presence(&root, key.as_str()),
+        files::PositionPresence::Absent,
+        "no directory at all"
+    );
+
+    files::record_cache_evidence(&root, &owner, Some(9), Some(hashed(b"the book")))
+        .expect("claim the directory");
+    assert_eq!(
+        files::book_dir_position_presence(&root, key.as_str()),
+        files::PositionPresence::Absent,
+        "claimed, and nothing yet to lose"
+    );
+
+    files::write_position_file(&root, &owner, 12, 340).expect("a place to keep");
+    assert_eq!(
+        files::book_dir_position_presence(&root, key.as_str()),
+        files::PositionPresence::Present,
+        "a place a carry would destroy"
+    );
+}
+
+/// A generation the card hands over whole, that is not a valid record, is
+/// no place to return to. It reads as absent so a carry may clear it, which
+/// is what lets a destination whose own carry tore half way be carried to
+/// again. Only a card that would not answer is kept apart from absence.
+#[test]
+fn a_generation_that_reads_but_does_not_decode_is_no_place() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let (key, book_root) = moved_owner("Dune.epub", 4096);
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: book_root,
+        locator: "Dune.epub",
+    };
+    files::write_position_file(&root, &owner, 12, 340).expect("a place to keep");
+    assert_eq!(
+        files::book_dir_position_presence(&root, key.as_str()),
+        files::PositionPresence::Present,
+    );
+
+    // Rewrite the generation at its own length, so it is whole and wrong
+    // rather than short. A write fault leaves the short kind; this is the
+    // kind a write fault cannot make.
+    {
+        let mut book = root.open_dir("READER").expect("reader dir");
+        book.change_dir("CACHE2").expect("cache dir");
+        book.change_dir(key.as_str()).expect("book dir");
+        let len = book
+            .open_file_in_dir("POSA.BIN", embedded_sdmmc::Mode::ReadOnly)
+            .expect("the generation just written")
+            .length() as usize;
+        let file = book
+            .open_file_in_dir("POSA.BIN", embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+            .expect("rewrite it");
+        file.write(&vec![0xAA; len])
+            .expect("same length, no record");
+    }
+
+    assert_eq!(
+        files::book_dir_position_presence(&root, key.as_str()),
+        files::PositionPresence::Absent,
+        "whole, and not a record anyone can return to",
+    );
+}
+
+/// The answer that matters is the one given about a place that is really
+/// there. Reconciliation reads "no position" as permission to write, and
+/// writing adopts the directory, which deletes what was in it. So a card
+/// that stumbles while being asked has to say so: a position that exists is
+/// allowed to read as Present or as Unreadable, and not as Absent.
+///
+/// Read faults rather than write faults, because the destructive path here
+/// opens with a read. Nothing is written in this test at all.
+#[test]
+fn a_read_fault_cannot_report_a_position_that_exists_as_absent() {
+    let mut stumbled = 0;
+    for probe in 0..24 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+
+        let (key, book_root) = moved_owner("Dune.epub", 4096);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: book_root,
+            locator: "Dune.epub",
+        };
+        files::write_position_file(&root, &owner, 12, 340).expect("a place to keep");
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let seen = files::book_dir_position_presence(&root, key.as_str());
+        disk.fault.fail_read_in.set(None);
+
+        assert_ne!(
+            seen,
+            files::PositionPresence::Absent,
+            "probe {probe}: a place that is on the card read as no place at all",
+        );
+        if seen == files::PositionPresence::Unreadable {
+            stumbled += 1;
+        }
+    }
+    assert!(
+        stumbled > 0,
+        "no probe made the card stumble, so this proves nothing",
+    );
+}
+
+/// A carry that does not land has to leave the retry possible, and the
+/// destination is where that can quietly stop being true. The claim is
+/// written before the position, so an interruption in between leaves a
+/// claimed directory holding nothing. Reconciliation used to read any claim
+/// as somebody's place and skip the row, which made a torn carry lock out
+/// the only path that could finish it, on a card where the reader's place
+/// is the one thing that cannot be rebuilt.
+///
+/// So every landing converges: the destination holds exactly the carried
+/// place, or it holds none and is open to being carried to again.
+#[test]
+fn an_interrupted_carry_leaves_its_destination_open_to_the_retry() {
+    let mut trap = 0;
+    for probe in 0..40 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+
+        let (from_key, book_root) = moved_owner("Dune.epub", 4096);
+        let (to_key, _) = moved_owner("Fiction/Dune.epub", 4096);
+        let from = proto::cache::CacheOwner {
+            key: from_key.as_str(),
+            root: book_root,
+            locator: "Dune.epub",
+        };
+        let to = proto::cache::CacheOwner {
+            key: to_key.as_str(),
+            root: book_root,
+            locator: "Fiction/Dune.epub",
+        };
+        files::write_position_file(&root, &from, 12, 340).expect("seed");
+
+        disk.fault.fail_write_in.set(Some(probe));
+        let carried = files::carry_position(&root, &from, &to, hashed(b"the book"), Some(9));
+        disk.fault.fail_write_in.set(None);
+
+        let landed = files::read_position_file(&root, &to);
+        let occupied = files::book_dir_position_presence(&root, to_key.as_str())
+            != files::PositionPresence::Absent;
+        assert!(
+            landed == Some((12, 340)) || !occupied,
+            "probe {probe}: destination neither carried nor open to a retry",
+        );
+
+        // The state the skip-any-claim rule used to strand: claimed, and
+        // empty of any place to keep.
+        if carried != Ok(true)
+            && !occupied
+            && matches!(
+                files::read_book_dir_claimant(&root, to_key.as_str()),
+                files::DirClaimant::Claimed { .. }
+            )
+        {
+            trap += 1;
+        }
+    }
+    assert!(
+        trap > 0,
+        "no probe produced a claimed destination with no position, so this proves nothing",
+    );
+}
+
+/// Under a fault anywhere in the carry, reporting success has to mean the
+/// position really is readable at the new key. Reporting failure is always
+/// safe: nothing here deletes the old copy, so the place is still where it
+/// was and the next scan can try again.
+#[test]
+fn a_carry_that_reports_success_really_carried() {
+    for probe in 0..40 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+
+        let (from_key, book_root) = moved_owner("Dune.epub", 4096);
+        let (to_key, _) = moved_owner("Fiction/Dune.epub", 4096);
+        let from = proto::cache::CacheOwner {
+            key: from_key.as_str(),
+            root: book_root,
+            locator: "Dune.epub",
+        };
+        let to = proto::cache::CacheOwner {
+            key: to_key.as_str(),
+            root: book_root,
+            locator: "Fiction/Dune.epub",
+        };
+        files::write_position_file(&root, &from, 12, 340).expect("seed");
+
+        disk.fault.fail_write_in.set(Some(probe));
+        let carried = files::carry_position(&root, &from, &to, hashed(b"the book"), Some(9));
+        disk.fault.fail_write_in.set(None);
+
+        if carried == Ok(true) {
+            assert_eq!(
+                files::read_position_file(&root, &to),
+                Some((12, 340)),
+                "probe {probe}: reported a carry that did not land",
+            );
+        }
+        assert_eq!(
+            files::read_position_file(&root, &from),
+            Some((12, 340)),
+            "probe {probe}: the carry is not allowed to be destructive",
+        );
+    }
 }

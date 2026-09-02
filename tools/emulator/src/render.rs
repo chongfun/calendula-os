@@ -41,20 +41,33 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
 pub fn render_request(
     fb: &mut Framebuffer,
     request: app_core::RenderRequest,
-    library_entries: &[String],
+    library_entries: &[(String, bool)],
+    library_folder: &str,
 ) {
-    let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
-    let model = demo_model(request, &borrowed_entries);
+    let rows = library_rows(library_entries);
+    let model = demo_model(request, &rows, library_folder);
     render_shared_request(fb, request, &model);
+}
+
+/// The scenario's rows in the shape the shell draws them.
+fn library_rows(entries: &[(String, bool)]) -> Vec<ui::UiLibraryRow<'_>> {
+    entries
+        .iter()
+        .map(|(name, is_folder)| ui::UiLibraryRow {
+            name: name.as_str(),
+            is_folder: *is_folder,
+        })
+        .collect()
 }
 
 pub fn render_sleep(
     fb: &mut Framebuffer,
     request: app_core::RenderRequest,
-    library_entries: &[String],
+    library_entries: &[(String, bool)],
+    library_folder: &str,
 ) {
-    let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
-    let model = demo_model(request, &borrowed_entries);
+    let rows = library_rows(library_entries);
+    let model = demo_model(request, &rows, library_folder);
     render_shared_sleep(fb, request, &model);
 }
 
@@ -142,13 +155,15 @@ pub fn encode_presented_png<W: Write>(
 
 fn demo_model<'a>(
     request: app_core::RenderRequest,
-    library_entries: &'a [&'a str],
+    library_entries: &'a [ui::UiLibraryRow<'a>],
+    library_folder: &'a str,
 ) -> UiRenderModel<'a> {
     // SD books take their title from the scanned entry, mirroring the
     // firmware's catalog labels; the built-in demo book keeps its own.
     let sd_entry = app_core::ReaderSource::from_book_id(request.book_id)
         .sd_index()
-        .and_then(|index| library_entries.get(index as usize).copied());
+        .and_then(|index| library_entries.get(index as usize))
+        .map(|row| row.name);
     let (title, author) = match sd_entry {
         Some(entry) => (entry, ""),
         None => (DEMO_TITLE, DEMO_AUTHOR),
@@ -166,8 +181,9 @@ fn demo_model<'a>(
             UiLibraryStatus::Ready
         },
         library_entries,
-        // The emulator keeps the whole catalog resident, so the window is the
-        // full list starting at index 0.
+        library_folder,
+        // The emulator keeps the whole listing resident, so the window is the
+        // full list starting at row 0.
         library_window_start: 0,
         chapters: &DEMO_CHAPTERS,
         chapters_window_start: 0,

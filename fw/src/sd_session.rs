@@ -560,18 +560,23 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
         // and this is the one path that would create the shelf while it
         // stood. The mount scanner and the command gate already obey this
         // rule; setup did not.
-        let opened = match root.open_dir("BOOKS") {
-            Ok(books) => Some(Some(books)),
-            Err(embedded_sdmmc::Error::NotFound) => Some(None),
-            // A card that will not answer an open is not one to respond to
-            // with a metadata write.
-            Err(_) => None,
+        // Resolved rather than opened by name. A shelf carrying a long name
+        // sits under an alias that is not its name, and missing it here would
+        // make a second shelf beside the real one a moment later.
+        // A card that will not answer an open is not one to respond to with a
+        // metadata write, so the fault and the absence stay apart here.
+        let opened = match upload_store::library::open_library_root(&root) {
+            Ok(shelf) => Some(shelf),
+            Err(error) => {
+                // Both refuse an upload, and they refuse it for different
+                // reasons: a card that would not answer, against a card
+                // holding more than one plausible shelf.
+                esp_println::println!("upload: the shelf would not open: {error:?}");
+                None
+            }
         };
         match opened {
-            None => {
-                esp_println::println!("upload: the shelf would not open");
-                refuse_uploads_until_exit().await
-            }
+            None => refuse_uploads_until_exit().await,
             Some(existing) => match upload_store::reclaim::recover(&root, existing.as_ref()) {
                 Err(error) => {
                     esp_println::println!(
@@ -584,15 +589,20 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
                     // Settled, so the shelf may now be created if it is not
                     // there.
                     let books = match existing {
-                        Some(books) => Ok(books),
-                        None => match root.make_dir_in_dir("BOOKS") {
-                            Ok(()) => root.open_dir("BOOKS"),
-                            Err(error) => Err(error),
+                        Some(books) => Some(books),
+                        // Resolution said there is none, so this creates the
+                        // only one, and is read back through the resolver so
+                        // the handle is the same one every other path finds.
+                        None => match root.make_dir_in_dir(upload_store::SHELF_DIR) {
+                            Ok(()) => upload_store::library::open_library_root(&root)
+                                .ok()
+                                .flatten(),
+                            Err(_) => None,
                         },
                     };
                     match books {
-                        Ok(books) => serve_uploads(&root, &books, catalog_cleared).await,
-                        Err(_) => {
+                        Some(books) => serve_uploads(&root, &books, catalog_cleared).await,
+                        None => {
                             esp_println::println!("upload: BOOKS setup failed");
                             refuse_uploads_until_exit().await
                         }

@@ -19,6 +19,15 @@ pub struct AppStateRecord {
     pub front_buttons: u8,
     pub source_hash: u32,
     pub source_size: u32,
+    /// Which rule produced `source_hash`: set when the record predates the
+    /// catalog-v8 re-key, whose identity was FNV over the display path
+    /// rather than the root and locator. The two hash domains can collide
+    /// on the same 32 bits, so a reader must resolve an identity under the
+    /// rule that wrote it, not try one and fall back to the other. Derived
+    /// at decode from the version byte and not persisted: saves derive a
+    /// fresh identity from the active entry, so every record this firmware
+    /// writes carries the current interpretation.
+    pub legacy_source_identity: bool,
 }
 
 impl AppStateRecord {
@@ -26,7 +35,12 @@ impl AppStateRecord {
     const V3_ENCODED_LEN: usize = 32;
     const V1_ENCODED_LEN: usize = 24;
     const MAGIC: u32 = 0x5834_4F53;
-    const VERSION: u8 = 4;
+    /// V5 marks the catalog-v8 identity reinterpretation: `source_hash` in
+    /// a v5 record derives from the root and locator, while v4 and older
+    /// records carry the display-path hash. The 36-byte layout is identical
+    /// to v4; the version byte is what says which rule wrote the identity.
+    const VERSION: u8 = 5;
+    const V4_VERSION: u8 = 4;
     const V3_VERSION: u8 = 3;
     const V2_VERSION: u8 = 2;
     const V1_VERSION: u8 = 1;
@@ -52,6 +66,7 @@ impl AppStateRecord {
             front_buttons: 0,
             source_hash: 0,
             source_size: 0,
+            legacy_source_identity: false,
         }
     }
 
@@ -90,7 +105,9 @@ impl AppStateRecord {
             return None;
         }
         match bytes[4] {
-            Self::VERSION => {
+            // V4 shares the v5 layout byte for byte; only the identity
+            // interpretation differs, and the flag carries that.
+            Self::VERSION | Self::V4_VERSION => {
                 if bytes.len() < Self::ENCODED_LEN {
                     return None;
                 }
@@ -112,6 +129,7 @@ impl AppStateRecord {
                     front_buttons: bytes[30],
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
+                    legacy_source_identity: bytes[4] == Self::V4_VERSION,
                 })
             }
             Self::V3_VERSION | Self::V2_VERSION => {
@@ -141,6 +159,7 @@ impl AppStateRecord {
                     front_buttons: 0,
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
+                    legacy_source_identity: true,
                 })
             }
             Self::V1_VERSION => {
@@ -162,6 +181,9 @@ impl AppStateRecord {
                     front_buttons: 0,
                     source_hash: 0,
                     source_size: 0,
+                    // Predates the re-key, though with no identity stored
+                    // there is nothing to interpret.
+                    legacy_source_identity: true,
                 })
             }
             _ => None,
@@ -482,6 +504,7 @@ mod tests {
             front_buttons: 1,
             source_hash: 0xDEAD_BEEF,
             source_size: 123_456,
+            legacy_source_identity: false,
         }
     }
 
@@ -494,6 +517,14 @@ mod tests {
     /// two firmwares, and every compatibility test in this module would still
     /// pass if the whole envelope shifted underneath them in lockstep.
     const STATE_GOLDEN: [u8; AppStateRecord::ENCODED_LEN] = [
+        0x53, 0x4f, 0x34, 0x58, 0x05, 0x02, 0x01, 0x02, 0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x29,
+        0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x40, 0xe2, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
+        0x01, 0x00, 0x1e, 0x1a, 0xaa, 0xd7,
+    ];
+
+    /// The same state as `record()`, as v4 firmware wrote it: version byte 4
+    /// and its checksum, identical layout otherwise.
+    const STATE_GOLDEN_V4: [u8; AppStateRecord::ENCODED_LEN] = [
         0x53, 0x4f, 0x34, 0x58, 0x04, 0x02, 0x01, 0x02, 0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x29,
         0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x40, 0xe2, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
         0x01, 0x00, 0xa7, 0x76, 0x1e, 0x60,
@@ -503,6 +534,19 @@ mod tests {
     fn app_state_encodes_to_the_agreed_bytes() {
         assert_eq!(record().encode(), STATE_GOLDEN);
         assert_eq!(AppStateRecord::decode(&STATE_GOLDEN), Some(record()));
+    }
+
+    /// A record pre-v8 firmware wrote decodes unchanged, and its identity is
+    /// marked for the legacy interpretation. The two hash domains can
+    /// collide on the same 32 bits, so the version byte is the only thing
+    /// keeping a pre-v8 identity from resolving as an unrelated v8 book.
+    #[test]
+    fn v4_records_decode_with_the_legacy_identity_interpretation() {
+        let expected = AppStateRecord {
+            legacy_source_identity: true,
+            ..record()
+        };
+        assert_eq!(AppStateRecord::decode(&STATE_GOLDEN_V4), Some(expected));
     }
 
     /// `PositionRecord { chapter: 3, screen: 41 }` at an unsalted checksum.
@@ -587,6 +631,7 @@ mod tests {
         assert_eq!(decoded.line_spacing, 0);
         assert_eq!(decoded.font_weight, AppStateRecord::DEFAULT_FONT_WEIGHT);
         assert_eq!(decoded.book_id, 7);
+        assert!(decoded.legacy_source_identity);
     }
 
     #[test]
@@ -607,6 +652,7 @@ mod tests {
         assert_eq!(decoded.font_weight, AppStateRecord::DEFAULT_FONT_WEIGHT);
         assert_eq!(decoded.book_id, 7);
         assert_eq!(decoded.source_hash, 0xDEAD_BEEF);
+        assert!(decoded.legacy_source_identity);
     }
 
     #[test]
@@ -614,6 +660,7 @@ mod tests {
         // V4 records written before the Font setting carry the reserved zero
         // at byte 29; that must decode as the default (Literata) family.
         let mut encoded = record().encode();
+        encoded[4] = AppStateRecord::V4_VERSION;
         encoded[29] = 0;
         let checksum = checksum(&encoded[..32]);
         write_u32(&mut encoded, 32, checksum);
@@ -629,6 +676,7 @@ mod tests {
         // reserved zero at byte 30; that must decode as the default
         // (pages right) layout.
         let mut encoded = record().encode();
+        encoded[4] = AppStateRecord::V4_VERSION;
         encoded[30] = 0;
         let checksum = checksum(&encoded[..32]);
         write_u32(&mut encoded, 32, checksum);

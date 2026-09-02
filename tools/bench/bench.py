@@ -110,6 +110,16 @@ SUITES = {
         stop_count_arg="cycles",
         stop_count_default=10,
     ),
+    "folder-nav": Suite(
+        "folder-nav",
+        "Enter and leave folders of varying size, and scroll across page boundaries.",
+        # Entries, not renders: what this suite exists to time is the walk a
+        # folder costs to enter, and a Library repaint that answered no press
+        # is not one of those.
+        stop_event="folder_enter",
+        stop_count_arg="entries",
+        stop_count_default=20,
+    ),
     "thermal-run": Suite(
         "thermal-run",
         "Run the named underlying workflow while recording temperature/ambient notes in the run metadata.",
@@ -218,6 +228,10 @@ def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser],
     p.add_argument("--book", default=None, help="operator label for the book under test")
     if name == "page-turn":
         p.add_argument("--turns", type=positive_int, default=None, help="default 50; see --seconds")
+    if name == "folder-nav":
+        p.add_argument(
+            "--entries", type=positive_int, default=None, help="default 20; see --seconds"
+        )
     if name == "reader-soak":
         p.add_argument("--minutes", type=positive_int, default=30)
     if name == "sleep-sync":
@@ -462,6 +476,7 @@ COMPLETED_STOP_REASONS = {"count", "duration", "operator"}
 STOP_EVENT_REQUEST_KEYS = {
     "page_turn": "page_turns",
     "sleep_complete": "sleep_cycles",
+    "folder_enter": "folder_entries",
 }
 
 
@@ -2372,6 +2387,11 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                     f"result this bench.py does not know ({', '.join(seen)}); "
                     f"known results are {', '.join(sorted(CATALOG_LOAD_RESULTS))}"
                 )
+        elif workflow == "folder-nav":
+            # Entering a folder is the walk this suite times. A capture with
+            # none of them measured nothing it was run for.
+            if "folder_enter" not in event_names:
+                warnings.append(f"{label}: no folder entry telemetry captured")
         elif workflow == "sleep-sync":
             if not any(is_terminal_sleep(event) for event in signal_events):
                 warnings.append(
@@ -2529,6 +2549,16 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
                 f"{run.label}: {paired} of {turns} requested page turns "
                 "captured; the run is short of the sample count it was asked "
                 "for"
+            )
+
+    entries = requested.get("folder_entries")
+    if isinstance(entries, int):
+        entered = sum(1 for event in run.events if event.get("event") == "folder_enter")
+        if entered < entries:
+            warnings.append(
+                f"{run.label}: {entered} of {entries} requested folder "
+                "entries captured; the run is short of the sample count it "
+                "was asked for"
             )
 
     cycles = requested.get("sleep_cycles")

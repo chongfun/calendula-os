@@ -515,7 +515,22 @@ impl OpenSequence {
     /// Begins the transaction `command` describes, or returns `None` when the
     /// request lost to a newer one — a stale open has touched nothing, so there
     /// is no sequence to run and nothing to undo.
-    pub fn begin(command: &StorageCommand, latest_request_id: u32) -> Option<Self> {
+    pub fn begin(
+        command: &StorageCommand,
+        latest_request_id: u32,
+        catalog_epoch: u32,
+    ) -> Option<Self> {
+        // A catalog index is only a book inside the catalog that produced it.
+        // An open that says which catalog that was is refused when this is not
+        // it, and refused rather than skipped: the app is already on the book
+        // it asked for and waiting to hear, so silence would strand it.
+        let fenced_out = matches!(
+            *command,
+            StorageCommand::OpenBook {
+                catalog_epoch: Some(named),
+                ..
+            } if named != catalog_epoch
+        );
         let (request_id, book_id, index, chapter, target_pages, type_settings, portrait, previous) =
             match *command {
                 StorageCommand::OpenBook {
@@ -527,6 +542,7 @@ impl OpenSequence {
                     type_settings,
                     portrait,
                     previous,
+                    catalog_epoch: _,
                 } => (
                     request_id,
                     book_id,
@@ -566,9 +582,13 @@ impl OpenSequence {
         let resumable =
             matches!(command, StorageCommand::OpenBook { .. }) && chapter == 0 && target_pages == 0;
         Some(Self {
-            phase: match previous {
-                Some(previous) => OpenPhase::CloseOut(previous),
-                None => OpenPhase::Stage,
+            phase: match (fenced_out, previous) {
+                // Nothing has been touched yet, so the refusal is clean: the
+                // departing book keeps its position and the reader goes back
+                // to it.
+                (true, _) => OpenPhase::Refuse,
+                (false, Some(previous)) => OpenPhase::CloseOut(previous),
+                (false, None) => OpenPhase::Stage,
             },
             book_id,
             index,
@@ -777,6 +797,7 @@ mod tests {
             book_id,
             index: ReaderSource::from_book_id(book_id).sd_index().unwrap(),
             chapter,
+            catalog_epoch: None,
             target_pages: page,
             type_settings: SETTINGS,
             portrait: false,
@@ -919,11 +940,42 @@ mod tests {
         latest_request_id: u32,
         ram_hit: bool,
     ) -> Trace {
+        run_open_at(card, command, latest_request_id, ram_hit, CATALOG)
+    }
+
+    /// The catalog these traces run against. Named so a fenced open can be
+    /// given a different one.
+    const CATALOG: u32 = 4;
+
+    /// An open of a row resolved in `catalog`, which is what a Library press
+    /// produces once the storage task has looked the row up.
+    fn row_open(book_id: u32, catalog: u32) -> StorageCommand {
+        StorageCommand::OpenBook {
+            request_id: 7,
+            book_id,
+            index: ReaderSource::from_book_id(book_id).sd_index().unwrap(),
+            chapter: 0,
+            target_pages: 0,
+            catalog_epoch: Some(catalog),
+            type_settings: TypeSettings::default(),
+            portrait: false,
+            previous: None,
+        }
+    }
+
+    fn run_open_at(
+        card: &mut Card,
+        command: &StorageCommand,
+        latest_request_id: u32,
+        ram_hit: bool,
+        catalog_epoch: u32,
+    ) -> Trace {
         let mut trace = Trace::default();
         // As in the firmware: `None` until a section load is reached at all, so
         // a refused transaction never claims to have read from RAM.
         let mut section_loaded = None;
-        let Some(mut sequence) = OpenSequence::begin(command, latest_request_id) else {
+        let Some(mut sequence) = OpenSequence::begin(command, latest_request_id, catalog_epoch)
+        else {
             return trace;
         };
         loop {
@@ -1152,6 +1204,63 @@ mod tests {
     // Invariant: interrupted writes never substitute one book's position for
     // another's.
     #[test]
+    fn a_row_open_against_a_rebuilt_catalog_is_refused_rather_than_opened() {
+        let mut card = Card::default();
+
+        // The row was resolved in CATALOG and the open arrives after a
+        // rebuild, so the number it carries names some other book now.
+        let trace = run_open_at(
+            &mut card,
+            &row_open(3, CATALOG),
+            7,
+            false,
+            CATALOG.wrapping_add(1),
+        );
+
+        assert!(trace.contains(Step::Refuse(3)));
+        assert!(
+            trace
+                .position_of(|step| matches!(step, Step::Stage(_)))
+                .is_none(),
+            "a row number from another catalog may not open anything: {:?}",
+            trace
+        );
+        assert!(trace
+            .position_of(|step| matches!(step, Step::Announce { .. }))
+            .is_none());
+    }
+
+    /// The fence is the catalog the row was resolved in, not any catalog: the
+    /// same open against the catalog it named stages and announces as usual.
+    #[test]
+    fn a_row_open_against_its_own_catalog_opens() {
+        let mut card = Card::default();
+        let trace = run_open_at(&mut card, &row_open(3, CATALOG), 7, false, CATALOG);
+        assert!(trace
+            .position_of(|step| matches!(step, Step::Stage(_)))
+            .is_some());
+        assert!(!trace.contains(Step::Refuse(3)));
+    }
+
+    /// Every other open carries no catalog, and a rebuild cannot refuse it.
+    /// Fencing those here would refuse a boot restore whose `Scanned` the app
+    /// has not folded yet; the index they carry is Milestone 4's problem.
+    #[test]
+    fn an_unfenced_open_is_indifferent_to_the_catalog() {
+        let mut card = Card::default();
+        let trace = run_open_at(
+            &mut card,
+            &open(3, 0, 0, None),
+            7,
+            false,
+            CATALOG.wrapping_add(9),
+        );
+        assert!(trace
+            .position_of(|step| matches!(step, Step::Stage(_)))
+            .is_some());
+    }
+
+    #[test]
     fn a_refused_departing_write_abandons_the_whole_switch() {
         let mut card = Card {
             refuse_position_write: true,
@@ -1238,7 +1347,8 @@ mod tests {
     fn a_deep_saved_position_is_clamped_to_the_page_field() {
         let mut card = Card::default();
         assert!(card.store_position(persisted(3, 11, u32::MAX)));
-        let mut sequence = OpenSequence::begin(&open(3, 0, 0, None), 7).expect("fresh request");
+        let mut sequence =
+            OpenSequence::begin(&open(3, 0, 0, None), 7, CATALOG).expect("fresh request");
         sequence.staged();
         sequence.saved_position(card.position_of(3));
         assert_eq!(sequence.target_page(), u16::MAX);

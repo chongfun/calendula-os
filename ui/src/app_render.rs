@@ -14,8 +14,10 @@ use display::render::draw_ascii;
 pub struct UiRenderModel<'a> {
     pub active_book: UiBook<'a>,
     pub library_status: UiLibraryStatus,
-    pub library_entries: &'a [&'a str],
-    /// Absolute catalog index of `library_entries[0]`; the resident window
+    pub library_entries: &'a [crate::UiLibraryRow<'a>],
+    /// The folder being shown, or empty at the library root.
+    pub library_folder: &'a str,
+    /// Absolute row number of `library_entries[0]`; the resident window
     /// the firmware streamed in around the current selection.
     pub library_window_start: u16,
     pub chapters: &'a [UiTocItem<'a>],
@@ -84,6 +86,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         active_book: model.active_book,
         library_status: model.library_status,
         library_entries: model.library_entries,
+        library_folder: model.library_folder,
         library_window_start: model.library_window_start,
         library_total: request.library_count,
         chapters: model.chapters,
@@ -95,6 +98,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         )
         .unwrap_or(""),
         library_menu: request.library_menu,
+        library_move_pending: request.library_move_pending,
     };
     render_shell(fb, &shell);
 }

@@ -446,6 +446,14 @@ pub enum InstallError {
     /// alike. No EPUB is zero bytes, and an empty one on the shelf can be
     /// deleted and the upload retried.
     Empty,
+    /// A fixed name resolved to more than one plausible entry: case
+    /// variants of the shelf with no exact spelling, or an exact
+    /// non-directory squatting on the name beside a case-variant directory.
+    /// A computer can legally leave either behind. Nothing here can pick a
+    /// reading without risking the wrong library, so the card is refused
+    /// until it is fixed on a computer. Unlike [`Self::Card`] a retry
+    /// without changing the card cannot help.
+    Ambiguous,
 }
 
 /// What a recovery pass did, for the caller that has to decide whether its

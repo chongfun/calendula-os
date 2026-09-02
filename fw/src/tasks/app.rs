@@ -5,9 +5,10 @@ use crate::{
     SYNC_EVENTS,
 };
 use app_core::{
-    extend_section_command, library_action_command_for_transition, storage_command_for_transition,
-    AppView, BookOpenRollback, ParkedStorage, ReaderState, ReducerContext, RepaintRetry,
-    SleepBlockers, SleepGate, StorageDispatch, SyncStatus,
+    extend_section_command, library_action_command_for_transition,
+    library_browse_command_for_transition, storage_command_for_transition, AppView,
+    BookOpenRollback, ParkedStorage, ReaderState, ReducerContext, RepaintRetry, SleepBlockers,
+    SleepGate, StorageDispatch, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select, select4, Either, Either4};
@@ -37,8 +38,10 @@ pub async fn run() {
     // send an extend even though page and chapter are unchanged.
     let mut reader_relayout_pending = false;
     let mut opening_book: Option<u32> = None;
-    // Where to put the reader back if the inflight open aborts. Set only for
-    // a book change, the one open that has somewhere else to return to.
+    // Where to put the reader back if the inflight open is refused rather
+    // than answered. Set for a book change, which leaves the reader between
+    // two books, and for a catalog-fenced row open, which storage refuses
+    // outright when that catalog has been replaced. See `app_core::open_hold`.
     let mut open_rollback: Option<BookOpenRollback> = None;
     // A Power press arriving while the app still owes the storage task work.
     let mut sleep_gate = SleepGate::new();
@@ -180,62 +183,20 @@ pub async fn run() {
                         storage_command = Some(extend_section_command(&state, index, request_id));
                     }
                 }
-                // A book change closes out the departing book inside its own
-                // open. The separate progress record that used to follow named
-                // the *new* book, so it wrote that book's position file at the
-                // page the open had not resolved yet — erasing the very place
-                // the reader was about to resume from.
-                let open_owns_the_switch = matches!(
+                let dispatched = dispatch_transition_storage(
+                    &mut pending_storage,
+                    &mut state,
+                    &previous,
                     storage_command,
-                    Some(StorageCommand::OpenBook {
-                        previous: Some(_),
-                        ..
-                    })
+                    request_id,
+                    &mut opening_book,
+                    &mut suppress_input_until_open_settled,
+                    &mut open_rollback,
+                    &mut reader_relayout_pending,
+                    None,
                 );
-                // The chapter overview can't paint its rows until the on-disk
-                // list lands; hold the current frame and let the Loaded event
-                // render once, rather than flashing a partial first frame and
-                // spending an extra panel refresh. Only when the command is
-                // truly in flight -- a queued command relies on the render's
-                // Settled to be drained, so it must still render.
-                let mut awaiting_chapter_list = false;
-                let mut switch_dispatched = false;
-                if let Some(command) = storage_command {
-                    match dispatch_storage(&mut pending_storage, command) {
-                        StorageDispatch::Rejected => {
-                            // Nothing reached the storage task, so nothing is
-                            // coming back. Arming the open lock here would wait
-                            // on a Loaded that cannot arrive and ignore every
-                            // button until the battery is pulled; put the reader
-                            // back on the book it never actually left instead.
-                            // The render below then redraws that book.
-                            if open_book_id(command).is_some() {
-                                state = state.restore_after_failed_open(previous.open_rollback());
-                            }
-                        }
-                        outcome => {
-                            // Open/extend commands carry the current type
-                            // settings, so any dispatched command syncs the
-                            // reader store.
-                            reader_relayout_pending = false;
-                            commit_reader_request_id(request_id);
-                            switch_dispatched = open_owns_the_switch;
-                            if let Some(book_id) = open_book_id(command) {
-                                opening_book = Some(book_id);
-                                suppress_input_until_open_settled = true;
-                                // Only a switch can abort, and only a switch
-                                // has a book to go back to.
-                                open_rollback =
-                                    open_owns_the_switch.then(|| previous.open_rollback());
-                            }
-                            if outcome == StorageDispatch::Sent
-                                && matches!(command, StorageCommand::LoadChapters { .. })
-                            {
-                                awaiting_chapter_list = true;
-                            }
-                        }
-                    }
-                }
+                let awaiting_chapter_list = dispatched.awaiting_chapter_list;
+                let switch_dispatched = dispatched.switch_dispatched;
                 // Read back after the dispatch: a rejected open has rolled the
                 // state to where it started, which leaves nothing to persist
                 // and no risk of writing the arriving book's position for a
@@ -249,6 +210,16 @@ pub async fn run() {
                 }
                 if let Some(command) = forget_command_for_transition(&previous, &state) {
                     dispatch_storage(&mut pending_storage, command);
+                }
+                if let Some(command) = library_browse_command_for_transition(&previous, &state) {
+                    if dispatch_storage(&mut pending_storage, command) == StorageDispatch::Rejected
+                    {
+                        // The reducer has already frozen the Library list on a
+                        // move, waiting for an answer that only the storage
+                        // task sends -- and it never got the command. Settle
+                        // the wait here or the list stays frozen for good.
+                        state = state.library_browse_rejected();
+                    }
                 }
                 if let Some(command) = library_action_command_for_transition(&previous, &state) {
                     if dispatch_storage(&mut pending_storage, command) == StorageDispatch::Rejected
@@ -439,7 +410,8 @@ pub async fn run() {
                         &mut suppress_input_until_open_settled,
                         &mut block_confirm_until,
                         &mut sleep_gate,
-                        &pending_storage,
+                        &mut pending_storage,
+                        &mut reader_relayout_pending,
                         &event,
                     )
                     .await
@@ -460,7 +432,8 @@ pub async fn run() {
                     &mut suppress_input_until_open_settled,
                     &mut block_confirm_until,
                     &mut sleep_gate,
-                    &pending_storage,
+                    &mut pending_storage,
+                    &mut reader_relayout_pending,
                     &event,
                 )
                 .await
@@ -564,9 +537,19 @@ async fn handle_library_event(
     suppress_input_until_open_settled: &mut bool,
     block_confirm_until: &mut Option<Instant>,
     sleep_gate: &mut SleepGate,
-    parked: &ParkedStorage,
+    parked: &mut ParkedStorage,
+    reader_relayout_pending: &mut bool,
     event: &crate::LibraryEvent,
 ) -> bool {
+    // A library event can put the reader on a different book: `RowIsBook`
+    // answers a Library press with the catalog row it resolved to, and the
+    // fold moves into Reading on it. That transition owes an open exactly as a
+    // keypress into Reading does, and the app is the only place that can pay
+    // it: the request id it commits is the one a later open is checked
+    // against, the gate it arms keeps input off the panel until the book
+    // lands, and the rollback it keeps is what puts the reader back if the
+    // command is refused.
+    let before = *state;
     if !fold_library_event(
         ctx,
         state,
@@ -585,6 +568,31 @@ async fn handle_library_event(
         )
         .await;
         return false;
+    }
+    let request_id = peek_reader_request_id();
+    let command = storage_command_for_transition(&before, state, request_id);
+    let previous_persisted = before.persisted();
+    // The one event whose index came from a row the storage task just looked
+    // up. The open it owes is fenced to the catalog that lookup ran against.
+    let catalog_fence = match event {
+        crate::LibraryEvent::RowIsBook { catalog_epoch, .. } => Some(*catalog_epoch),
+        _ => None,
+    };
+    let dispatched = dispatch_transition_storage(
+        parked,
+        state,
+        &before,
+        command,
+        request_id,
+        opening_book,
+        suppress_input_until_open_settled,
+        open_rollback,
+        reader_relayout_pending,
+        catalog_fence,
+    );
+    let next_persisted = state.persisted();
+    if previous_persisted != next_persisted && !dispatched.switch_dispatched {
+        dispatch_storage(parked, StorageCommand::StoreProgress(next_persisted));
     }
     if *rendering {
         *render_pending = true;
@@ -658,6 +666,24 @@ fn library_event_affects_view(
                     app_core::LibraryMenu::Busy { request_id: outstanding, .. }
                         if outstanding == request_id
                 )
+        }
+        // A move through the tree replaces the rows, and a book found under
+        // one leaves Library outright. Compare the fold rather than the
+        // event: an answer nobody is waiting on any more changes nothing,
+        // and must not cost a panel refresh either.
+        // Always: the status it travels with is what the screen reads, and
+        // the fold cannot see it, so a repaint that waited on the fold moving
+        // would leave the panel showing rows the store no longer has.
+        crate::LibraryEvent::LibraryUnreadable { .. } => true,
+        crate::LibraryEvent::FolderListed { .. }
+        | crate::LibraryEvent::RowIsBook { .. }
+        | crate::LibraryEvent::RowFailed { .. } => {
+            folded.view != state.view
+                || folded.library_depth != state.library_depth
+                || folded.library_count != state.library_count
+                || folded.library_books != state.library_books
+                || folded.selection != state.selection
+                || folded.library_browse != state.library_browse
         }
     }
 }
@@ -860,6 +886,132 @@ async fn send_render(kind: RenderKind, state: &ReaderState) {
     DISPLAY_COMMANDS.send(DisplayCommand::Render(request)).await;
 }
 
+/// What a dispatched transition owes the rest of the loop.
+struct OpenDispatch {
+    /// The open carried the departing book's position, so no separate
+    /// progress write may follow it.
+    switch_dispatched: bool,
+    /// A chapter list is genuinely in flight, so the current frame holds
+    /// until it lands.
+    awaiting_chapter_list: bool,
+}
+
+/// Dispatch the storage command a transition owes, with the bookkeeping an
+/// open comes with.
+///
+/// Shared by the two paths that can put the reader on a different book: a
+/// keypress, and a library event that resolves a Library row to one. Both owe
+/// exactly the same things, and the reason this is one function rather than
+/// two is that they drifted apart the moment they were two: the row-open path
+/// sent its command from the storage task instead, which committed no reader
+/// request id (so the open read as stale and was skipped), armed no open gate,
+/// and kept no rollback for a refusal.
+#[expect(clippy::too_many_arguments)] // The parked storage, the state, the transition and the four sinks it needs; fires in every X4 and X3 build
+fn dispatch_transition_storage(
+    parked: &mut ParkedStorage,
+    state: &mut ReaderState,
+    previous: &ReaderState,
+    storage_command: Option<StorageCommand>,
+    request_id: u32,
+    opening_book: &mut Option<u32>,
+    suppress_input_until_open_settled: &mut bool,
+    open_rollback: &mut Option<BookOpenRollback>,
+    reader_relayout_pending: &mut bool,
+    catalog_fence: Option<u32>,
+) -> OpenDispatch {
+    // An open that came from resolving a Library row says which catalog the
+    // row was resolved in, so the storage task can refuse it when a rebuild
+    // has put a different book under that number in the meantime. Stamped
+    // here rather than inside the transition, because only the caller knows
+    // where the index came from.
+    let storage_command = match storage_command {
+        Some(StorageCommand::OpenBook {
+            request_id,
+            book_id,
+            index,
+            chapter,
+            target_pages,
+            type_settings,
+            portrait,
+            previous,
+            catalog_epoch,
+        }) => Some(StorageCommand::OpenBook {
+            request_id,
+            book_id,
+            index,
+            chapter,
+            target_pages,
+            type_settings,
+            portrait,
+            previous,
+            // The event is the better witness: it carries the epoch the row
+            // was resolved in, including for a row naming the book already
+            // being read, which the state diff cannot tell from staying put.
+            // The reducer's own reading stands only where no event answered.
+            catalog_epoch: catalog_fence.or(catalog_epoch),
+        }),
+        other => other,
+    };
+    // A book change closes out the departing book inside its own open. The
+    // separate progress record that used to follow named the *new* book, so it
+    // wrote that book's position file at the page the open had not resolved
+    // yet, erasing the very place the reader was about to resume from.
+    let open_owns_the_switch = matches!(
+        storage_command,
+        Some(StorageCommand::OpenBook {
+            previous: Some(_),
+            ..
+        })
+    );
+    // The chapter overview can't paint its rows until the on-disk list lands;
+    // hold the current frame and let the Loaded event render once, rather than
+    // flashing a partial first frame and spending an extra panel refresh. Only
+    // when the command is truly in flight -- a queued command relies on the
+    // render's Settled to be drained, so it must still render.
+    let mut awaiting_chapter_list = false;
+    let mut switch_dispatched = false;
+    if let Some(command) = storage_command {
+        match dispatch_storage(parked, command) {
+            StorageDispatch::Rejected => {
+                // Nothing reached the storage task, so nothing is coming back.
+                // Arming the open lock here would wait on a Loaded that cannot
+                // arrive and ignore every button until the battery is pulled;
+                // put the reader back on the book it never actually left
+                // instead. The render below then redraws that book.
+                if open_book_id(command).is_some() {
+                    *state = state.restore_after_failed_open(previous.open_rollback());
+                }
+            }
+            outcome => {
+                // Open/extend commands carry the current type settings, so any
+                // dispatched command syncs the reader store.
+                *reader_relayout_pending = false;
+                commit_reader_request_id(request_id);
+                switch_dispatched = open_owns_the_switch;
+                // What an open in flight leaves the app holding, decided in
+                // `app_core` where a test can walk the whole sequence: the
+                // book being waited on, and where to put the reader back if
+                // the open is refused rather than answered.
+                let hold = app_core::open_hold(&command, previous);
+                if let Some(book_id) = hold.opening_book {
+                    *opening_book = Some(book_id);
+                    *suppress_input_until_open_settled = true;
+                    *open_rollback = hold.rollback;
+                }
+                if outcome == StorageDispatch::Sent
+                    && matches!(command, StorageCommand::LoadChapters { .. })
+                {
+                    awaiting_chapter_list = true;
+                }
+            }
+        }
+    }
+    OpenDispatch {
+        switch_dispatched,
+        awaiting_chapter_list,
+    }
+}
+
 fn log_storage_command(label: &str, command: StorageCommand) {
     match command {
         StorageCommand::OpenBook {
@@ -908,10 +1060,10 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         StorageCommand::ClearBookCache {
             request_id,
             index,
-            catalog_epoch,
+            browse_epoch,
         } => {
             esp_println::println!(
-                "app: storage {label} clear cache request={request_id} index={index} epoch={catalog_epoch}"
+                "app: storage {label} clear cache request={request_id} index={index} browse={browse_epoch}"
             )
         }
         StorageCommand::ReceiveUpload => {
@@ -932,6 +1084,19 @@ fn log_storage_command(label: &str, command: StorageCommand) {
             ..
         } => esp_println::println!(
             "app: storage {label} jump chapter request={request_id} book_id={book_id} index={index} chapter={chapter}"
+        ),
+        StorageCommand::ChooseLibraryRow {
+            request_id,
+            index,
+            browse_epoch,
+        } => esp_println::println!(
+            "app: storage {label} choose row request={request_id} index={index} browse={browse_epoch}"
+        ),
+        StorageCommand::LeaveLibraryFolder {
+            request_id,
+            browse_epoch,
+        } => esp_println::println!(
+            "app: storage {label} leave folder request={request_id} browse={browse_epoch}"
         ),
     }
 }

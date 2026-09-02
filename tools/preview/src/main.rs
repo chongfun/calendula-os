@@ -7,9 +7,10 @@ use display::render::{draw_ascii, fill_rect};
 use display::{Rect, HEIGHT, WIDTH};
 use proto::book::BookId;
 use proto::cache::{
-    cache_key_for, encode_cover_header, CoverCacheHeader, CACHE_COVER_FILE, CACHE_DIR,
-    CACHE_ROOT_DIR, COVER_BYTES, COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH,
+    cache_key_from, encode_cover_header, source_hash_at, CoverCacheHeader, CACHE_COVER_FILE,
+    CACHE_DIR, CACHE_ROOT_DIR, COVER_BYTES, COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH,
 };
+use proto::library_path::BookRoot;
 use proto::epub::{
     decode_html_entity, load_epub_package, parse_css_text_align, strip_fragment,
     xhtml_blocks_to_sink, CssRules, EpubPackage, SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive,
@@ -21,8 +22,8 @@ use std::fs::{create_dir_all, read, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use ui::{
-    render::render_shell, UiBook, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell,
-    UiTocItem, UiView,
+    render::render_shell, UiBook, UiLibraryRow, UiLibraryStatus, UiOrientation, UiRefreshPolicy,
+    UiShell, UiTocItem, UiView,
 };
 
 use display::font::TypeSettings;
@@ -154,7 +155,8 @@ fn preview_epub(
             default_source_path = default_device_source_path(epub_path);
             default_source_path.as_str()
         };
-        let key = cache_key_for(source_path, bytes.len() as u32);
+        let (root_kind, locator) = device_locator(source_path);
+        let key = cache_key_from(source_hash_at(root_kind, locator, bytes.len() as u32));
         let path = sd_root
             .join(CACHE_ROOT_DIR)
             .join(CACHE_DIR)
@@ -220,6 +222,32 @@ fn preview_epub(
         out_dir.display()
     );
     Ok(())
+}
+
+/// Map the `--source-path` spelling onto the device's identity input. The
+/// device hashes a root discriminant and a root-relative locator, so
+/// `/books/<name>` is a Library book and anything else sits at the card
+/// root. This must mirror what the firmware scan derives, or the seeded
+/// cover lands in a directory the device does not look in.
+fn device_locator(source_path: &str) -> (BookRoot, &str) {
+    // The shelf name is matched without case, the way the device discovers
+    // it: a card may legally spell the directory `BOOKS` or `Books`, and a
+    // cover seeded under the wrong root lands where the device does not look.
+    // Compared as bytes: a byte length says nothing about where a character
+    // starts, and slicing a path whose seventh byte sits inside a multi-byte
+    // character would panic. Past the ASCII prefix the boundary is known.
+    if source_path
+        .as_bytes()
+        .get(.."/books/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"/books/"))
+    {
+        (BookRoot::Library, &source_path["/books/".len()..])
+    } else {
+        (
+            BookRoot::CardRoot,
+            source_path.strip_prefix('/').unwrap_or(source_path),
+        )
+    }
 }
 
 fn default_device_source_path(epub_path: &Path) -> String {
@@ -1784,10 +1812,21 @@ fn stroke_rect_direct(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
 
 fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> std::io::Result<()> {
     let mut fb = Framebuffer::new();
+    // Rows rather than paths: the Library lists a folder now, and a row is
+    // a name plus whether entering it goes deeper.
     let entries = [
-        "/books/Flowers for Algernon.epub",
-        "/books/The Time Machine.epub",
-        "/books/Unsong.epub",
+        UiLibraryRow {
+            name: "Flowers for Algernon.epub",
+            is_folder: false,
+        },
+        UiLibraryRow {
+            name: "The Time Machine.epub",
+            is_folder: false,
+        },
+        UiLibraryRow {
+            name: "Unsong.epub",
+            is_folder: false,
+        },
     ];
     let chapters = [
         UiTocItem {
@@ -1845,6 +1884,9 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         },
         library_status: UiLibraryStatus::Ready,
         library_entries: &entries,
+        // The preview shows the library root, which has no folder name.
+        library_folder: "",
+        library_move_pending: false,
         library_window_start: 0,
         library_total: entries.len() as u16,
         chapters: &chapters,
@@ -2207,4 +2249,34 @@ fn spine_item_is_navigation(item: &SpineItem, package: &EpubPackage<'_>) -> bool
         || lower_href.ends_with("toc.html")
         || lower_href.ends_with("nav.xhtml")
         || lower_href.ends_with("nav.html")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A byte length says nothing about where a character starts, so the
+    /// shelf test compares bytes. Slicing this path at seven would land
+    /// inside the multi-byte character and panic before the path could be
+    /// classified at all, and a loose book at the card root is supported.
+    #[test]
+    fn a_root_path_with_a_multibyte_character_classifies_rather_than_panics() {
+        let (root, locator) = device_locator("/abcd\u{65e5}.epub");
+        assert_eq!(root, BookRoot::CardRoot);
+        assert_eq!(locator, "abcd\u{65e5}.epub");
+    }
+
+    /// The device discovers the shelf without case, and a cover seeded under
+    /// the wrong root lands where the device does not look.
+    #[test]
+    fn the_shelf_is_recognised_whatever_its_spelling() {
+        for path in ["/books/Dune.epub", "/BOOKS/Dune.epub", "/Books/Dune.epub"] {
+            let (root, locator) = device_locator(path);
+            assert_eq!(root, BookRoot::Library, "{path}");
+            assert_eq!(locator, "Dune.epub", "{path}");
+        }
+        let (root, locator) = device_locator("/bookshelf/Dune.epub");
+        assert_eq!(root, BookRoot::CardRoot, "a longer name is not the shelf");
+        assert_eq!(locator, "bookshelf/Dune.epub");
+    }
 }
