@@ -412,11 +412,16 @@ impl Emulator {
             self.library_entries
                 .extend((0..count).map(|index| (format!("SD Book {}", index + 1), false)));
         }
-        if matches!(event, LibraryEvent::Loaded { .. }) {
-            self.sd_reader_status = EmulatedReaderStatus::Ready;
-        }
         let before = self.state;
         self.state = self.state.apply_library_event(self.ctx, event);
+        // After the reducer, and only for the book it settled on. A load
+        // answering a book the reader has already left would otherwise show
+        // the emulated reader as ready for the one still loading.
+        if let LibraryEvent::Loaded { book_id, .. } = event {
+            if book_id == self.state.book_id {
+                self.sd_reader_status = EmulatedReaderStatus::Ready;
+            }
+        }
         // Built from what the reducer took, not from what arrived. A listing
         // answering a press the reader has moved past is refused, and reading
         // the event directly would rewrite these rows anyway, leaving the
@@ -732,6 +737,32 @@ impl eframe::App for EmulatorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A load answers one book. One arriving late, for a book the reader
+    /// has already left, would otherwise show the emulated reader as ready
+    /// while the book it is actually on is still loading.
+    #[test]
+    fn a_late_load_for_another_book_leaves_the_reader_loading() {
+        let mut emu = Emulator::boot(None);
+        emu.state.book_id = app_core::ReaderSource::sd(1).book_id();
+        emu.sd_reader_status = EmulatedReaderStatus::Loading;
+
+        emu.library_event(LibraryEvent::Loaded {
+            book_id: app_core::ReaderSource::sd(0).book_id(),
+            pages: 10,
+            chapters: 1,
+            current_chapter: 0,
+            chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+            position: None,
+            text_replaced: false,
+        });
+
+        assert_eq!(
+            emu.sd_reader_status,
+            EmulatedReaderStatus::Loading,
+            "the book being waited on is not the one that answered"
+        );
+    }
 
     #[test]
     fn explicit_png_output_path_is_preserved() {

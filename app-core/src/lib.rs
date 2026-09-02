@@ -953,11 +953,19 @@ pub fn storage_command_for_transition(
     if previous.book_id != next.book_id {
         // The one case that closes out another book. Everything the switch
         // owes rides in this command.
+        //
+        // Leaving Library for a book is the row-open path: storage resolved
+        // the row against a catalog and answered with its number, and a scan
+        // between that answer and this open would leave the number naming
+        // something else. So the open says which catalog it means. Every
+        // other switch resolves its own index against the catalog in hand.
+        let fence = (previous.view == AppView::Library).then_some(next.catalog_epoch);
         return Some(open_book_command(
             next,
             index,
             request_id,
             Some(previous.persisted()),
+            fence,
         ));
     }
 
@@ -984,7 +992,7 @@ pub fn storage_command_for_transition(
         // without loading anything. Entering Reading always requests
         // the section; an already-loaded book answers from RAM without
         // an SD session.
-        return Some(open_book_command(next, index, request_id, None));
+        return Some(open_book_command(next, index, request_id, None, None));
     }
 
     if previous.page != next.page || previous.chapter != next.chapter {
@@ -1067,17 +1075,25 @@ pub fn library_browse_command_for_transition(
 }
 
 /// An open of `state`'s book, closing out `previous` when this changes books.
+///
+/// `catalog_epoch` names the catalog `index` was resolved in, for an open
+/// whose index came from somewhere other than the catalog being opened
+/// against. Storage refuses one whose catalog has since been replaced, since
+/// the number would name a different book. `None` for an open that resolves
+/// its own index against the catalog in hand, which has nothing to be stale
+/// against.
 pub fn open_book_command(
     state: &ReaderState,
     index: u16,
     request_id: u32,
     previous: Option<PersistedAppState>,
+    catalog_epoch: Option<u32>,
 ) -> StorageCommand {
     StorageCommand::OpenBook {
         request_id,
         book_id: state.book_id,
         index,
-        catalog_epoch: None,
+        catalog_epoch,
         chapter: state.chapter,
         target_pages: state.page.min(u16::MAX as u32) as u16,
         type_settings: state.type_settings(),
@@ -4481,7 +4497,7 @@ mod tests {
     /// Every event that releases a lock the app took when it handed work over.
     /// Listed once, so the routing test and the holder tests below cannot
     /// disagree about which events are which.
-    fn settling_events() -> [LibraryEvent; 4] {
+    fn settling_events() -> [LibraryEvent; 8] {
         [
             LibraryEvent::CacheCleared {
                 request_id: 1,
@@ -4509,6 +4525,26 @@ mod tests {
                 font_weight: 0,
                 font_family: 0,
                 front_buttons: 0,
+            },
+            // The browse answers. Each settles a `LibraryBrowse` wait, and a
+            // dropped one leaves the Library rail held on a press nothing
+            // will ever answer.
+            LibraryEvent::FolderListed {
+                request_id: Some(1),
+                browse_epoch: EPOCH,
+                depth: 1,
+                count: 3,
+                books: 2,
+                selection: 0,
+            },
+            LibraryEvent::RowIsBook {
+                request_id: 1,
+                index: 0,
+                catalog_epoch: EPOCH,
+            },
+            LibraryEvent::RowFailed { request_id: 1 },
+            LibraryEvent::LibraryUnreadable {
+                browse_epoch: EPOCH,
             },
         ]
     }
@@ -5255,6 +5291,60 @@ mod tests {
         assert_eq!((listed.library_count, listed.library_books), (4, 3));
         assert_eq!(listed.selection, 0, "a folder is entered at its top");
         assert!(listed.library_browse.is_idle());
+    }
+
+    /// A row number means something only inside the catalog that produced
+    /// it. Storage answers a press with a number, the app opens on it, and a
+    /// scan landing between the two would leave that number naming another
+    /// book. The open says which catalog it means so storage can refuse it.
+    #[test]
+    fn a_row_open_names_the_catalog_the_row_came_from() {
+        let mut state = in_library(1, 3);
+        state.library_browse = LibraryBrowse::Choosing {
+            index: 1,
+            request_id: 4,
+            browse_epoch: EPOCH,
+        };
+        let opened = state.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: 4,
+                index: 2,
+                catalog_epoch: EPOCH,
+            },
+        );
+        assert_eq!(opened.view, AppView::Reading);
+        let command = storage_command_for_transition(&state, &opened, 1);
+        assert!(
+            matches!(
+                command,
+                Some(StorageCommand::OpenBook {
+                    catalog_epoch: Some(EPOCH),
+                    ..
+                })
+            ),
+            "the row open carries its catalog, got {command:?}"
+        );
+
+        // A switch that did not come from a row resolves its own index, so
+        // it has nothing to be stale against, and naming an epoch there
+        // would refuse a good open after any rescan.
+        let mut from_home = in_library(0, 3);
+        from_home.view = AppView::Home;
+        from_home.book_id = ReaderSource::sd(0).book_id();
+        let mut reading = from_home;
+        reading.view = AppView::Reading;
+        reading.book_id = ReaderSource::sd(1).book_id();
+        assert!(
+            matches!(
+                storage_command_for_transition(&from_home, &reading, 1),
+                Some(StorageCommand::OpenBook {
+                    catalog_epoch: None,
+                    ..
+                })
+            ),
+            "a non-row open stays unfenced"
+        );
     }
 
     /// An answer names the press it answers. A row resolved against a
