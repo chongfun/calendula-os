@@ -715,6 +715,14 @@ snapshot immediately. It may show “Library unavailable” before any successfu
 cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
 
+Boot keeps a catalog that still loads, so a card edited on a computer while
+the device was off has a snapshot older than its contents. Browsing walks the
+card and shows the edits; the catalog is what has to catch up. A row the card
+lists and the catalog cannot resolve is taken as proof of exactly that: the
+scan runs, the listing is rebuilt, and the reader picks again from a list
+that now opens. Only a card that changed pays for it, and only once per
+change, which is what keeps an unchanged card on the warm snapshot.
+
 A cache key is derived from where a book is, so tidying one into a folder on
 a computer re-keys it away from its own reading position. Recognising that as
 a move rather than a deletion is a question about *which copy* a file is, and

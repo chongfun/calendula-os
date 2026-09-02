@@ -1009,8 +1009,12 @@ pub(crate) enum RowChoice {
     Entered(Listing),
     /// A book, at this catalog row.
     Book(u16),
-    /// Gone since the listing, unnameable from here, absent from the catalog,
-    /// or a card that would not answer. Nothing moved.
+    /// The row named a book the card holds and the catalog does not, which
+    /// is a catalog written before somebody edited the card on a computer.
+    /// The caller rescans and asks again.
+    Stale,
+    /// Gone since the listing, unnameable from here, or a card that would
+    /// not answer. Nothing moved.
     Failed,
 }
 
@@ -1086,12 +1090,17 @@ pub(crate) fn choose_library_row(
             match find_index_by_locator(epd, sd_cs, at, locator.as_str(), size) {
                 Some(index) => RowChoice::Book(index),
                 None => {
+                    // The card lists this book and the catalog does not, so
+                    // the catalog is older than the card: boot keeps a
+                    // snapshot that still loads, and a computer can add or
+                    // move books while the device is off. Browsing walks the
+                    // card and finds them; only the catalog has to catch up.
                     esp_println::println!(
-                        "library: {} is not in the catalog at {} bytes",
+                        "library: {} at {} bytes is not in the catalog, which is stale",
                         locator.as_str(),
                         size
                     );
-                    RowChoice::Failed
+                    RowChoice::Stale
                 }
             }
         }

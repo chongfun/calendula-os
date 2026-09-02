@@ -1835,6 +1835,27 @@ fn handle_storage_command(
                 crate::library_sd::RowChoice::Failed => {
                     send_required_library_event(&LibraryEvent::RowFailed { request_id });
                 }
+                crate::library_sd::RowChoice::Stale => {
+                    // A book the card holds and the catalog does not, because
+                    // boot keeps a snapshot that still loads and a computer
+                    // can add or move books while the device is off. Rebuild
+                    // rather than tell a reader that a book they can see
+                    // cannot be opened. Only a card edited since the last
+                    // scan pays for this, once, which is what keeps every
+                    // other boot on the warm snapshot.
+                    crate::library_sd::scan_books(epd, sd_cs, sd_library);
+                    restore_saved_state(epd, sd_cs, sd_library, state_restored);
+                    send_library_event(&LibraryEvent::Scanned {
+                        count: sd_library.catalog_count_u16(),
+                        catalog_epoch: sd_library.catalog_epoch(),
+                    });
+                    // The scan takes browsing back to the root, so this
+                    // request's row number no longer names the same child.
+                    // Relist and let the reader pick from what they see; the
+                    // book is in the catalog now, so the next press opens it.
+                    relist_library_folder(epd, sd_cs, sd_library, portrait);
+                    send_required_library_event(&LibraryEvent::RowFailed { request_id });
+                }
             }
         }
         StorageCommand::LeaveLibraryFolder {

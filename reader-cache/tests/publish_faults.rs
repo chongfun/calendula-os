@@ -1638,6 +1638,27 @@ fn a_listing_that_contradicts_itself_stops_the_walk() {
     );
 }
 
+/// A folder with more rows than a cursor can address is refused, not
+/// truncated. Clamping would publish a listing that stops at 65,535 and
+/// leave every child after it unreachable, which is the failure the catalog
+/// refuses an oversized library to avoid. Folders count their
+/// subdirectories as rows, so a card whose catalog is comfortably legal can
+/// still hold a folder past this.
+#[test]
+fn a_folder_past_the_cursor_is_refused_rather_than_shortened() {
+    assert_eq!(reader_cache::browse::addressable_rows(0), Some(0));
+    assert_eq!(
+        reader_cache::browse::addressable_rows(u16::MAX as usize),
+        Some(u16::MAX),
+        "exactly full still lists"
+    );
+    assert_eq!(
+        reader_cache::browse::addressable_rows(u16::MAX as usize + 1),
+        None,
+        "one past it hides a child, so it refuses"
+    );
+}
+
 /// Every cache directory is reached, including the ones past a batch.
 ///
 /// The walk holds a few dozen names at a time and has to restart

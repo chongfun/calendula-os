@@ -22,6 +22,18 @@ use upload_store::library::{count_library_rows, page_library_rows, LibraryRow};
 
 use crate::store::{ReaderStore, LIBRARY_WINDOW};
 
+/// The row count for a folder holding `rows`, or `None` when it holds more
+/// than a cursor can address.
+///
+/// Refused rather than clamped, for the reason the catalog refuses a library
+/// past its own count field: a listing that stops at 65,535 hides the
+/// children after it, and hidden rows are unreachable rather than merely
+/// unlisted. A folder's rows are its files and its subdirectories together,
+/// so this limit is reachable on a card whose catalog is comfortably legal.
+pub fn addressable_rows(rows: usize) -> Option<u16> {
+    u16::try_from(rows).ok()
+}
+
 /// What one listing produced, as the app needs to hear it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Listing {
@@ -146,9 +158,9 @@ where
 {
     let path = store.browse().path().clone();
     let counts = count_library_rows(card_root, &path).ok().flatten()?;
-    let total = counts.total().min(u16::MAX as usize);
+    let total = addressable_rows(counts.total())?;
     store.set_folder_counts(counts);
-    store.browse_mut().set_count(total as u16);
+    store.browse_mut().set_count(total);
     let selection = store.browse().selection();
     store.clear_folder_page();
     if let Some(start) = page_start(store, selection, portrait) {
@@ -158,8 +170,8 @@ where
     }
     Some(Listing {
         depth: path.depth() as u8,
-        count: total as u16,
-        books: counts.books().min(total) as u16,
+        count: total,
+        books: counts.books().min(usize::from(total)) as u16,
         selection,
     })
 }
@@ -285,7 +297,7 @@ where
         store.restore_browse(point);
         return None;
     };
-    let total = counts.total().min(u16::MAX as usize);
+    let total = addressable_rows(counts.total())?;
     store.set_folder_counts(counts);
     // The return finds its folder by name, and the resident page holds only a
     // screenful, so the whole parent is walked past `note_row` first. Into a
@@ -299,7 +311,7 @@ where
     let mut row = 0u16;
     let mut skip = 0usize;
     let mut card_failed = false;
-    while skip < total {
+    while skip < usize::from(total) {
         let filled = match page_library_rows(card_root, &path, counts, skip, &mut window)
             .ok()
             .flatten()
@@ -326,7 +338,7 @@ where
         store.restore_browse(point);
         return None;
     }
-    let walked = skip.min(total);
+    let walked = skip.min(usize::from(total));
     store.browse_mut().set_count(walked as u16);
     let selection = store.browse().selection();
     store.clear_folder_page();
