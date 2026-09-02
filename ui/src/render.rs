@@ -353,18 +353,37 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
     }
 }
 
-/// What Back does from the Library, as a word.
+/// Which Library controls the reducer will honour on the next press.
 ///
-/// Inside a folder Back is a level rather than the way out, except while a
-/// picked action is in flight: that wait swallows every press but Back, and
-/// a folder move is one of the presses it swallows, so Back leaves Library
-/// whatever the depth. The label has to follow, or the rail promises a press
-/// that will not happen.
-fn library_back_label(in_folder: bool, menu: app_core::LibraryMenu) -> &'static str {
-    if in_folder && !matches!(menu, app_core::LibraryMenu::Busy { .. }) {
-        "up"
+/// The rail draws what this says and nothing else, because a label is a
+/// promise: every key it names has to do what it says when pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryRail {
+    /// The actions sheet is up and owns the keys.
+    Sheet,
+    /// Something is outstanding, either a picked action or a move through the
+    /// tree. The reducer swallows every press but Back, and Back leaves
+    /// Library rather than going up a level, so one live key and one word.
+    Held,
+    /// Nothing outstanding. Back is a level inside a folder and the way out
+    /// at the root, and the other three act.
+    Live { back: &'static str },
+}
+
+/// What the rail may offer, given what a press would actually do.
+///
+/// A wait outranks the sheet: while a move or an action is outstanding the
+/// reducer swallows the sheet's keys too, so a rail drawn from the sheet
+/// alone would name three presses that go nowhere.
+fn library_rail(in_folder: bool, menu: app_core::LibraryMenu, move_pending: bool) -> LibraryRail {
+    if move_pending || matches!(menu, app_core::LibraryMenu::Busy { .. }) {
+        LibraryRail::Held
+    } else if matches!(menu, app_core::LibraryMenu::Sheet { .. }) {
+        LibraryRail::Sheet
     } else {
-        "home"
+        LibraryRail::Live {
+            back: if in_folder { "up" } else { "home" },
+        }
     }
 }
 
@@ -372,31 +391,23 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     let layout = shell_layout(shell);
     let in_folder = !shell.library_folder.is_empty();
-    let back_label = library_back_label(in_folder, shell.library_menu);
-    // While the actions sheet is up, the rail answers only it: no label
-    // may promise an action the press will not take.
-    match shell.library_menu {
-        app_core::LibraryMenu::Sheet { .. } => {
+    // No label may promise an action the press will not take.
+    match library_rail(in_folder, shell.library_menu, shell.library_move_pending) {
+        LibraryRail::Sheet => {
             dash_key(fb, layout, 0, "cancel", false);
             dash_key(fb, layout, 1, "select", true);
             dash_key(fb, layout, 2, "previous", false);
             dash_key(fb, layout, 3, "next", false);
         }
-        // A picked action freezes the list until it settles, and the reducer
-        // swallows every press but Back. Three of the four labels would be
-        // promising exactly what will not happen, so only the one that works
-        // is drawn; the rest of the rail stays bare for the moment it takes.
-        //
-        // And Back leaves Library here whatever the depth, because a folder
-        // move is one of the presses being swallowed, so the label says home
-        // even inside a folder.
-        app_core::LibraryMenu::Busy { .. } => {
-            dash_key(fb, layout, 0, back_label, false);
+        // Only the key that works is drawn; the rest of the rail stays bare
+        // for the moment the wait takes.
+        LibraryRail::Held => {
+            dash_key(fb, layout, 0, "home", false);
         }
         // A settled note is dismissed by any press, and that press still
         // acts, so the ordinary rail is honest again.
-        app_core::LibraryMenu::Done { .. } | app_core::LibraryMenu::None => {
-            dash_key(fb, layout, 0, back_label, false);
+        LibraryRail::Live { back } => {
+            dash_key(fb, layout, 0, back, false);
             dash_key(fb, layout, 1, "open", true);
             dash_key(fb, layout, 2, "previous", false);
             dash_key(fb, layout, 3, "next", false);
@@ -1498,27 +1509,51 @@ fn font_family_label(family: display::font::FontFamily, custom_name: &str) -> &s
 mod tests {
     use super::*;
 
-    /// The rail's Back label has to name the press. A picked action holds
-    /// every press but Back, and Back then leaves Library rather than the
-    /// folder, so "up" inside a folder would promise a move that the wait is
-    /// swallowing.
+    const BUSY: app_core::LibraryMenu = app_core::LibraryMenu::Busy {
+        action: app_core::LibraryAction::ClearCache,
+        index: 0,
+        request_id: 1,
+    };
+
+    /// Every label is a promise. Both kinds of wait swallow every press but
+    /// Back, and Back then leaves Library rather than going up a level, so
+    /// the rail offers one key and calls it home.
     #[test]
-    fn a_held_library_offers_home_even_inside_a_folder() {
-        let busy = app_core::LibraryMenu::Busy {
-            action: app_core::LibraryAction::ClearCache,
-            index: 0,
-            request_id: 1,
-        };
-        assert_eq!(library_back_label(true, busy), "home");
-        assert_eq!(library_back_label(false, busy), "home");
+    fn a_wait_leaves_one_live_key_whatever_the_depth() {
+        for in_folder in [true, false] {
+            assert_eq!(
+                library_rail(in_folder, BUSY, false),
+                LibraryRail::Held,
+                "a picked action, in_folder={in_folder}"
+            );
+            assert_eq!(
+                library_rail(in_folder, app_core::LibraryMenu::None, true),
+                LibraryRail::Held,
+                "a move through the tree, in_folder={in_folder}"
+            );
+        }
+    }
+
+    /// A move outstanding swallows the sheet's keys too, so a rail drawn
+    /// from the sheet alone would name three presses that go nowhere.
+    #[test]
+    fn a_move_outranks_the_sheet() {
+        let sheet = app_core::LibraryMenu::Sheet { row: 0 };
+        assert_eq!(library_rail(true, sheet, false), LibraryRail::Sheet);
+        assert_eq!(library_rail(true, sheet, true), LibraryRail::Held);
+    }
+
+    /// With nothing outstanding the whole rail acts, and Back is a level
+    /// inside a folder and the way out at the root.
+    #[test]
+    fn an_idle_library_offers_the_rail_it_can_keep() {
         assert_eq!(
-            library_back_label(true, app_core::LibraryMenu::None),
-            "up",
-            "with nothing in flight a folder is still a level"
+            library_rail(true, app_core::LibraryMenu::None, false),
+            LibraryRail::Live { back: "up" }
         );
         assert_eq!(
-            library_back_label(false, app_core::LibraryMenu::None),
-            "home"
+            library_rail(false, app_core::LibraryMenu::None, false),
+            LibraryRail::Live { back: "home" }
         );
     }
 

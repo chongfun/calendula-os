@@ -1886,6 +1886,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         library_entries: &entries,
         // The preview shows the library root, which has no folder name.
         library_folder: "",
+        library_move_pending: false,
         library_window_start: 0,
         library_total: entries.len() as u16,
         chapters: &chapters,

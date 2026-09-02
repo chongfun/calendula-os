@@ -155,6 +155,10 @@ pub struct UiShell<'a> {
     /// executes on that press, and the waiting and settled states show in
     /// the footer where the position line normally sits.
     pub library_menu: app_core::LibraryMenu,
+    /// Whether a move through the folder tree is outstanding. The list is
+    /// held still while it is, so the rail has to stop offering the presses
+    /// that wait swallows.
+    pub library_move_pending: bool,
 }
 
 #[cfg(test)]
@@ -198,6 +202,7 @@ mod tests {
             sync_status: status,
             wifi_ssid: "",
             library_menu: app_core::LibraryMenu::None,
+            library_move_pending: false,
         };
         for rendered in [format!("{status:?}"), format!("{shell:?}")] {
             assert!(

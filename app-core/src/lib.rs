@@ -315,6 +315,10 @@ pub struct RenderRequest {
     /// The Library per-book actions sheet's progress; renderers draw the
     /// sheet, relabel the key rail, and show the wait or its note.
     pub library_menu: LibraryMenu,
+    /// Whether a move through the folder tree is outstanding. The list is
+    /// held still until the card answers, and the reducer swallows every
+    /// press but Back, so the rail has to stop offering the rest.
+    pub library_move_pending: bool,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -2951,6 +2955,7 @@ impl ReaderState {
             front_buttons: self.front_buttons,
             reading_sheet: self.reading_sheet,
             library_menu: self.library_menu,
+            library_move_pending: !self.library_browse.is_idle(),
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
