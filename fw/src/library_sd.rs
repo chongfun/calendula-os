@@ -54,6 +54,24 @@ enum CatalogFault {
     Reclaimed,
 }
 
+/// What a lookup of one place in the catalog found.
+///
+/// Three-valued because the caller acts on the difference. A catalog that
+/// answered and holds no such place is a catalog older than the card, and
+/// rebuilding it is the repair. A catalog that would not answer says nothing
+/// about the card, and rebuilding on it would retire a usable snapshot
+/// because one read failed.
+pub(crate) enum CatalogRow {
+    /// The catalog holds this place, at this row.
+    Found(u16),
+    /// The catalog was read through and holds no such place. Also a catalog
+    /// that is absent, or written by another version, or damaged: each of
+    /// those is a snapshot that has to be rebuilt before it can answer.
+    Rebuild,
+    /// The card refused a read. Not evidence about what the catalog holds.
+    Unreadable,
+}
+
 /// A failed open is only a missing catalog when the card said so.
 fn open_fault<E: core::error::Error>(error: embedded_sdmmc::Error<E>) -> CatalogFault {
     match error {
@@ -846,12 +864,12 @@ fn find_in_catalog_at<
     at: BookRoot,
     locator: &str,
     byte_size: u32,
-) -> Option<u16>
+) -> CatalogRow
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_catalog_file(root, |file, count| {
+    match with_catalog_file(root, |file, count| {
         seek_to_record(file, 0)?;
         let mut scan = proto::catalog::LocatorScan::new(at, locator, byte_size);
         let mut record = [0u8; CATALOG_RECORD_BYTES];
@@ -860,9 +878,15 @@ where
             scan.offer(index, &record);
         }
         Ok(scan.finish())
-    })
-    .ok()
-    .flatten()
+    }) {
+        Ok(Some(index)) => CatalogRow::Found(index),
+        Ok(None) => CatalogRow::Rebuild,
+        // A snapshot that is absent, outdated, damaged, or invalidated by
+        // recovery cannot answer until it is rebuilt, which is the same
+        // repair a stale one needs. Only a refused read is unknown.
+        Err(CatalogFault::Device) => CatalogRow::Unreadable,
+        Err(_) => CatalogRow::Rebuild,
+    }
 }
 
 /// Find the catalog index of the book a pre-v8 `(path-hash, byte-size)`
@@ -1088,8 +1112,19 @@ pub(crate) fn choose_library_row(
         }
         Ok(reader_cache::browse::RowChoice::Book { at, locator, size }) => {
             match find_index_by_locator(epd, sd_cs, at, locator.as_str(), size) {
-                Some(index) => RowChoice::Book(index),
-                None => {
+                CatalogRow::Found(index) => RowChoice::Book(index),
+                CatalogRow::Unreadable => {
+                    // The card would not answer about the catalog. That is
+                    // not evidence the catalog is behind the card, and
+                    // rebuilding on it would retire a usable snapshot
+                    // because one read failed.
+                    esp_println::println!(
+                        "library: catalog would not answer for {}",
+                        locator.as_str()
+                    );
+                    RowChoice::Failed
+                }
+                CatalogRow::Rebuild => {
                     // The card lists this book and the catalog does not, so
                     // the catalog is older than the card: boot keeps a
                     // snapshot that still loads, and a computer can add or
@@ -1334,12 +1369,13 @@ pub(crate) fn find_index_by_locator(
     at: BookRoot,
     locator: &str,
     byte_size: u32,
-) -> Option<u16> {
+) -> CatalogRow {
+    // A session that would not open is a card that did not answer, which is
+    // the same unknown as a refused read.
     sd_session::with_root(epd, sd_cs, |root| {
         find_in_catalog_at(root, at, locator, byte_size)
     })
-    .ok()
-    .flatten()
+    .unwrap_or(CatalogRow::Unreadable)
 }
 
 /// Empty every book cache under CACHE2 whose book is no longer in the freshly

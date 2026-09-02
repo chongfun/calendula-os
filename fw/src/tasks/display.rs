@@ -1762,8 +1762,14 @@ fn handle_storage_command(
                             locator.as_str(),
                             size,
                         ) {
-                            Some(row) => book_build::clear_book_cache(epd, sd_cs, sd_library, row),
-                            None => false,
+                            crate::library_sd::CatalogRow::Found(row) => {
+                                book_build::clear_book_cache(epd, sd_cs, sd_library, row)
+                            }
+                            // Clearing a cache is not worth a rebuild, and a
+                            // catalog that would not answer is not worth
+                            // anything. Both report nothing cleared.
+                            crate::library_sd::CatalogRow::Rebuild
+                            | crate::library_sd::CatalogRow::Unreadable => false,
                         }
                     }
                     // A folder, or a row the resident page does not cover.

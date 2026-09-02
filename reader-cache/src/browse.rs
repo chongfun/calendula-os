@@ -291,12 +291,35 @@ where
     if !store.browse_mut().leave() {
         return None;
     }
+    // Every way of failing after the move has to put the move back, or the
+    // app and this state describe different folders. One rollback here, so a
+    // path added later cannot forget it: the walk below returns `None` and
+    // says nothing about restoring.
+    match leave_into_parent(store, card_root, portrait) {
+        Some(listing) => Some(listing),
+        None => {
+            store.restore_browse(point);
+            None
+        }
+    }
+}
+
+/// List the parent that [`leave_folder`] has just moved into, or fail.
+///
+/// Separated so the rollback has one place to live. Nothing here restores;
+/// `None` means the caller must.
+fn leave_into_parent<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+) -> Option<Listing>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     store.clear_folder_page();
     let path = store.browse().path().clone();
-    let Some(counts) = count_library_rows(card_root, &path).ok().flatten() else {
-        store.restore_browse(point);
-        return None;
-    };
+    let counts = count_library_rows(card_root, &path).ok().flatten()?;
     let total = addressable_rows(counts.total())?;
     store.set_folder_counts(counts);
     // The return finds its folder by name, and the resident page holds only a
@@ -335,7 +358,6 @@ where
         skip += filled;
     }
     if card_failed {
-        store.restore_browse(point);
         return None;
     }
     let walked = skip.min(usize::from(total));
@@ -343,10 +365,7 @@ where
     let selection = store.browse().selection();
     store.clear_folder_page();
     if let Some(start) = page_start(store, selection, portrait) {
-        if read_page(store, card_root, start).is_none() {
-            store.restore_browse(point);
-            return None;
-        }
+        read_page(store, card_root, start)?;
     }
     Some(Listing {
         depth: path.depth() as u8,
