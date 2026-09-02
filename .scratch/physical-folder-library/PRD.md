@@ -76,6 +76,26 @@ Users may organize arbitrary subdirectories beneath it:
 
 Firmware-private state remains outside the browsable hierarchy under `/READER`.
 
+### Loose books at the card root
+
+EPUB files sitting directly at the card root are library content too, and
+this is compatibility rather than design. Firmware before this document
+catalogued the card root and `/BOOKS` as two flat book locations, so cards in
+the field hold readable books at the root and a shelf-only library would
+lose them.
+
+The compatibility is deliberately narrow. Only files directly at the card
+root count. Its subdirectories are not walked and are not library content,
+so the rule above still holds: the arbitrary hierarchy a reader may organize
+is the one below `/BOOKS`, and it is the only one.
+
+`/BOOKS` remains the only destination for anything the device writes. Books
+arrive at the card root only because a computer put them there.
+
+A locator therefore carries which root it is relative to, and a book at the
+card root has a single-component locator relative to that root. Each root
+keeps one coordinate system; there is no path that spans both.
+
 ## Requirements
 
 ### R1. Physical directories are the navigation model
@@ -83,6 +103,12 @@ Firmware-private state remains outside the browsable hierarchy under `/READER`.
 The library UI reflects the actual hierarchy below `/BOOKS`.
 
 A directory is not copied into a separate organizational database.
+
+The one exception is the screen the reader lands on. It is a view rather
+than a directory, showing the books in `/BOOKS`, then the loose books at the
+card root, then the folders in `/BOOKS`. Books before folders so a reader
+who made no folders sees the list they always saw. Every level below it is a
+real directory, and going up from the first level returns to this view.
 
 ### R2. Only EPUBs and directories participate
 
@@ -111,6 +137,18 @@ History/Rome/SPQR.epub           the locator, as stored and compared
 Root-relative because `/BOOKS` is a product decision that may move, and a
 locator naming it would have to be rewritten if it did. That locator is passed
 to the library-identity layer.
+
+A locator is stored beside the root it is relative to, which is the shelf or
+the card root:
+
+```text
+Library  + History/Rome/SPQR.epub    a shelved book
+CardRoot + Dune.epub                 a legacy loose book
+```
+
+The root is a separate field rather than a prefix on the locator, so that a
+locator has one meaning and one coordinate system. Two books with the same
+locator under different roots are two different books.
 
 Moving the file later updates the locator without inherently changing `BookId`.
 
@@ -270,11 +308,18 @@ Initial navigation can remain deliberately simple:
 
 ```text
 Library
-  > Fiction/
+  > Dune.epub                shelved books
+    SPQR.epub
+    Book at root.epub        then loose books at the card root
+    Fiction/                 then folders
     History/
     Reference/
-    Book at root.epub
 ```
+
+Books before folders, because opening a book is the common act and a reader
+who has made no folders should see the list they have always seen. Below the
+first level the same order applies to a real directory: its books, then its
+subfolders.
 
 Selecting a directory pushes a new directory view.
 
