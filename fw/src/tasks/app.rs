@@ -38,8 +38,10 @@ pub async fn run() {
     // send an extend even though page and chapter are unchanged.
     let mut reader_relayout_pending = false;
     let mut opening_book: Option<u32> = None;
-    // Where to put the reader back if the inflight open aborts. Set only for
-    // a book change, the one open that has somewhere else to return to.
+    // Where to put the reader back if the inflight open is refused rather
+    // than answered. Set for a book change, which leaves the reader between
+    // two books, and for a catalog-fenced row open, which storage refuses
+    // outright when that catalog has been replaced. See `app_core::open_hold`.
     let mut open_rollback: Option<BookOpenRollback> = None;
     // A Power press arriving while the app still owes the storage task work.
     let mut sleep_gate = SleepGate::new();
@@ -986,17 +988,15 @@ fn dispatch_transition_storage(
                 *reader_relayout_pending = false;
                 commit_reader_request_id(request_id);
                 switch_dispatched = open_owns_the_switch;
-                if let Some(book_id) = open_book_id(command) {
+                // What an open in flight leaves the app holding, decided in
+                // `app_core` where a test can walk the whole sequence: the
+                // book being waited on, and where to put the reader back if
+                // the open is refused rather than answered.
+                let hold = app_core::open_hold(&command, previous);
+                if let Some(book_id) = hold.opening_book {
                     *opening_book = Some(book_id);
                     *suppress_input_until_open_settled = true;
-                    // Anything that can be refused needs a way back, which
-                    // is a switch closing out another book or an open naming
-                    // the catalog its row came from. Asking only about the
-                    // switch left a row open for the book already being read
-                    // refusable with nowhere to land, and the reader stayed
-                    // on the reading screen over a row number that a rebuilt
-                    // catalog had given to a different book.
-                    *open_rollback = command.open_may_refuse().then(|| previous.open_rollback());
+                    *open_rollback = hold.rollback;
                 }
                 if outcome == StorageDispatch::Sent
                     && matches!(command, StorageCommand::LoadChapters { .. })

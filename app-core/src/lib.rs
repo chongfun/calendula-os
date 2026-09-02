@@ -518,6 +518,38 @@ pub enum StorageCommand {
     },
 }
 
+/// What the app holds while a dispatched command is in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenHold {
+    /// The book whose open is outstanding, and whose answer settles it.
+    /// `None` for a command that opens nothing.
+    pub opening_book: Option<u32>,
+    /// Where to put the reader back if that open is refused rather than
+    /// answered. `None` when it cannot be refused.
+    pub rollback: Option<BookOpenRollback>,
+}
+
+/// What to hold while `command` is in flight, dispatched from `previous`.
+///
+/// Both halves live here rather than at the dispatch site because the second
+/// was got wrong there once: rollback was armed for an open that closes out
+/// another book, which stopped covering everything the moment a catalog
+/// fence could refuse an open that closes out nobody. Deciding it beside
+/// [`StorageCommand::open_may_refuse`] keeps the two from parting again, and
+/// lets a test walk the whole sequence.
+pub fn open_hold(command: &StorageCommand, previous: &ReaderState) -> OpenHold {
+    match command {
+        StorageCommand::OpenBook { book_id, .. } => OpenHold {
+            opening_book: Some(*book_id),
+            rollback: command.open_may_refuse().then(|| previous.open_rollback()),
+        },
+        _ => OpenHold {
+            opening_book: None,
+            rollback: None,
+        },
+    }
+}
+
 impl StorageCommand {
     /// Whether this open can end without landing on its book, so its caller
     /// has to keep a way back to where the reader was.
@@ -974,20 +1006,19 @@ pub fn storage_command_for_transition(
         return None;
     }
 
+    // Leaving Library for a book is the row-open path, whether or not the row
+    // names the book already being read: storage resolved it against a
+    // catalog and answered with its number, and a scan between that answer
+    // and this open would leave the number naming something else.
+    //
+    // Read from the diff, which cannot tell a row naming the current book
+    // from staying put. Firmware holds the answering event and stamps the
+    // epoch from it, overriding this; see `dispatch_transition_storage`.
+    let fence = (previous.view == AppView::Library).then_some(next.catalog_epoch);
     if previous.book_id != next.book_id {
         // The one case that closes out another book. Everything the switch
         // owes rides in this command.
         //
-        // Leaving Library for a book is the row-open path: storage resolved
-        // the row against a catalog and answered with its number, and a scan
-        // between that answer and this open would leave the number naming
-        // something else. So the open says which catalog it means. Every
-        // other switch resolves its own index against the catalog in hand.
-        //
-        // Read from the diff, which cannot see a row that named the book
-        // already being read. Firmware holds the answering event and stamps
-        // the epoch from it, overriding this; see `dispatch_transition_storage`.
-        let fence = (previous.view == AppView::Library).then_some(next.catalog_epoch);
         return Some(open_book_command(
             next,
             index,
@@ -1020,7 +1051,7 @@ pub fn storage_command_for_transition(
         // without loading anything. Entering Reading always requests
         // the section; an already-loaded book answers from RAM without
         // an SD session.
-        return Some(open_book_command(next, index, request_id, None, None));
+        return Some(open_book_command(next, index, request_id, None, fence));
     }
 
     if previous.page != next.page || previous.chapter != next.chapter {
@@ -5319,6 +5350,72 @@ mod tests {
         assert_eq!((listed.library_count, listed.library_books), (4, 3));
         assert_eq!(listed.selection, 0, "a folder is entered at its top");
         assert!(listed.library_browse.is_idle());
+    }
+
+    /// The whole sequence, because pinning only the classification let the
+    /// arming be reverted without a test noticing.
+    ///
+    /// A reader on book B enters Library and picks B's own row. Nothing
+    /// closes out, so the open carries no departing book, and it carries the
+    /// catalog the row was resolved in. If that catalog is replaced before
+    /// the open runs, storage refuses it. Without a rollback the reader stays
+    /// in Reading over a row number that now names another book, and the next
+    /// page turn extends by that index off a RAM window that checks the index
+    /// rather than which book the text came from.
+    #[test]
+    fn a_refused_row_open_for_the_current_book_puts_the_reader_back() {
+        let mut library = in_library(2, 3);
+        library.book_id = ReaderSource::sd(2).book_id();
+        library.library_browse = LibraryBrowse::Choosing {
+            index: 2,
+            request_id: 4,
+            browse_epoch: EPOCH,
+        };
+
+        let reading = library.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: 4,
+                index: 2,
+                catalog_epoch: EPOCH,
+            },
+        );
+        assert_eq!(reading.view, AppView::Reading);
+        assert_eq!(
+            reading.book_id, library.book_id,
+            "the same book, by its row"
+        );
+
+        let command = storage_command_for_transition(&library, &reading, 1)
+            .expect("entering Reading owes an open");
+        assert!(
+            matches!(
+                command,
+                StorageCommand::OpenBook {
+                    previous: None,
+                    catalog_epoch: Some(EPOCH),
+                    ..
+                }
+            ),
+            "closes out nobody, and names the catalog it was resolved in: {command:?}"
+        );
+
+        let hold = open_hold(&command, &library);
+        assert_eq!(hold.opening_book, Some(reading.book_id));
+        let rollback = hold
+            .rollback
+            .expect("an open that can be refused keeps a way back");
+
+        // Storage refuses it, the catalog having moved on.
+        let landed = reading.restore_after_failed_open(rollback);
+        assert_eq!(
+            landed.view,
+            AppView::Library,
+            "back where the row was picked"
+        );
+        assert_eq!(landed.book_id, library.book_id);
+        assert_eq!(landed.chapter, library.chapter);
+        assert_eq!(landed.page, library.page);
     }
 
     /// An open that can be refused needs somewhere to land when it is.
