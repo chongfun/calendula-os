@@ -364,7 +364,12 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             browse_epoch: 0,
             depth: step.depth.unwrap_or(0),
             count: step.count.unwrap_or(0),
-            books: step.books.unwrap_or_else(|| step.count.unwrap_or(0)),
+            // A listing cannot hold more books than rows, which is what
+            // `reader_cache::browse::list_here` guarantees on the device.
+            books: step
+                .books
+                .unwrap_or_else(|| step.count.unwrap_or(0))
+                .min(step.count.unwrap_or(0)),
             selection: step.selection.unwrap_or(0),
         }),
         _ => Err(format!("unknown library event: {kind}")),

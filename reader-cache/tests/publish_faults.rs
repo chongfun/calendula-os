@@ -1556,7 +1556,7 @@ fn hashed(bytes: &[u8]) -> proto::source::SourceDigest {
 
 /// A book at `locator`, keyed as the firmware keys it, so the tests move real
 /// keys rather than made-up ones.
-fn moved_owner(locator: &'static str, size: u32) -> (String, proto::library_path::BookRoot) {
+fn moved_owner(locator: &str, size: u32) -> (String, proto::library_path::BookRoot) {
     let hash = proto::cache::source_hash_at(proto::library_path::BookRoot::Library, locator, size);
     (
         proto::cache::cache_key_from(hash).as_str().to_string(),
@@ -1682,7 +1682,7 @@ fn the_walk_reaches_past_its_first_batch() {
     let mut made: Vec<String> = Vec::new();
     for index in 0..wanted {
         let locator = std::format!("Book {index:03}.epub");
-        let (key, book_root) = moved_owner(Box::leak(locator.clone().into_boxed_str()), 4096);
+        let (key, book_root) = moved_owner(&locator, 4096);
         let owner = proto::cache::CacheOwner {
             key: key.as_str(),
             root: book_root,
@@ -1722,7 +1722,7 @@ fn reclaiming_inside_the_walk_does_not_skip_what_moves_up() {
     let wanted = files::CACHE_SWEEP_BATCH + 3;
     for index in 0..wanted {
         let locator = std::format!("Book {index:03}.epub");
-        let (key, book_root) = moved_owner(Box::leak(locator.clone().into_boxed_str()), 4096);
+        let (key, book_root) = moved_owner(&locator, 4096);
         let owner = proto::cache::CacheOwner {
             key: key.as_str(),
             root: book_root,

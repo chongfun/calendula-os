@@ -1204,17 +1204,6 @@ fn a_short_only_name_of_accented_characters_is_listed_and_opens() {
     assert_eq!(read, b"accented".to_vec(), "and the row opens the book");
 }
 
-/// Rewrite a six-character long name the driver created into a
-/// five-character case variant, directly in the image bytes.
-///
-/// The driver refuses to create two names differing only in case, which is
-/// exactly the directory another operating system can leave behind, so the
-/// test forges one. A single LFN entry stores UTF-16 units 0..5 at bytes
-/// 1..11 and units 5..11 at bytes 14..26; a six-unit name is shortened by
-/// writing the NUL terminator over unit 5 and pad over unit 6, and re-cased
-/// by rewriting units 0..5. The 8.3 alias and its checksum are untouched: an
-/// alias unrelated to its long name is legal FAT, and is exactly what any
-/// `~1` alias already looks like.
 /// The byte offset of UTF-16 unit `i` inside a 32-byte LFN entry, whose
 /// thirteen units live in three regions.
 fn lfn_unit_offset(i: usize) -> usize {

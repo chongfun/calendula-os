@@ -2420,7 +2420,12 @@ impl ReaderState {
                 }
             }
             (AppView::Library, Some(Button::Back)) => {
-                if self.library_depth > 0 {
+                // A picked action holds every other press, and Back is the
+                // one way out of that wait. Inside a folder it would
+                // otherwise spend itself on the folder and leave the reader
+                // held with nothing that answers.
+                let held = matches!(self.library_menu, LibraryMenu::Busy { .. });
+                if self.library_depth > 0 && !held {
                     // Back zooms out one level, and below the root a level is
                     // a folder rather than the whole screen.
                     next.library_request_seq = self.library_request_seq.wrapping_add(1);
@@ -3028,14 +3033,6 @@ impl ReaderState {
         self
     }
 
-    /// Settles a picked Library action whose storage command never left the
-    /// app, as the failure it is.
-    ///
-    /// `Busy` waits on an event that only the storage task can send, so a
-    /// command the queue refused would leave the screen saying "clearing…"
-    /// with nothing on its way to answer — until the battery ran out. The
-    /// caller that saw the refusal is the only one who knows, so it says so
-    /// here.
     /// Settles a move through the folder tree whose command never left the
     /// app, as the standstill it is.
     ///
@@ -3052,6 +3049,14 @@ impl ReaderState {
         self
     }
 
+    /// Settles a picked Library action whose storage command never left the
+    /// app, as the failure it is.
+    ///
+    /// `Busy` waits on an event that only the storage task can send, so a
+    /// command the queue refused would leave the screen saying "clearing…"
+    /// with nothing on its way to answer — until the battery ran out. The
+    /// caller that saw the refusal is the only one who knows, so it says so
+    /// here.
     pub fn library_action_rejected(mut self) -> Self {
         if let LibraryMenu::Busy { action, .. } = self.library_menu {
             self.library_menu = LibraryMenu::Done { action, ok: false };
@@ -5239,6 +5244,31 @@ mod tests {
         assert_eq!((listed.library_count, listed.library_books), (4, 3));
         assert_eq!(listed.selection, 0, "a folder is entered at its top");
         assert!(listed.library_browse.is_idle());
+    }
+
+    /// A picked action holds every other press, and Back is documented as
+    /// the deliberate exception. Inside a folder Back was spending itself on
+    /// the folder instead, so a reader waiting on an action that no answer
+    /// was coming for had no press that left.
+    #[test]
+    fn back_leaves_a_held_library_from_inside_a_folder() {
+        let mut state = in_folder(1, 2, 1);
+        state.library_menu = LibraryMenu::Busy {
+            action: CLEAR,
+            index: 1,
+            request_id: 3,
+        };
+        let out = press(state, Button::Back);
+        assert_eq!(out.view, AppView::Home, "one press, and it leaves");
+        assert_eq!(
+            out.library_menu,
+            LibraryMenu::None,
+            "leaving Library drops the claim to the answer"
+        );
+        assert!(
+            out.library_browse.is_idle(),
+            "and asks the card for nothing on the way out"
+        );
     }
 
     /// Back zooms out one level, which below the root is a folder rather

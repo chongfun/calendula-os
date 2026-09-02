@@ -1384,7 +1384,8 @@ pub(crate) fn find_index_by_locator(
 /// not its key name, so a live book's cache is never swept. Reading position is
 /// never swept either: `empty_cache_dir` leaves POS*.BIN and the directory
 /// holding it, so a book that leaves the card and comes back resumes where it
-/// was. Bounded per pass; any excess is handled by the next scan.
+/// was. The walk carries a cursor across batches, so one pass reaches every
+/// cache directory rather than the first few dozen.
 ///
 /// The catalog's identities (8 B each) load into `scratch` once, sorted, so
 /// each cache dir checks membership with an in-RAM binary search --

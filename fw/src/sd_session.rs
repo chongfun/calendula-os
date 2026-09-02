@@ -565,12 +565,18 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
         // make a second shelf beside the real one a moment later.
         // A card that will not answer an open is not one to respond to with a
         // metadata write, so the fault and the absence stay apart here.
-        let opened = upload_store::library::open_library_root(&root).ok();
-        match opened {
-            None => {
-                esp_println::println!("upload: the shelf would not open");
-                refuse_uploads_until_exit().await
+        let opened = match upload_store::library::open_library_root(&root) {
+            Ok(shelf) => Some(shelf),
+            Err(error) => {
+                // Both refuse an upload, and they refuse it for different
+                // reasons: a card that would not answer, against a card
+                // holding more than one plausible shelf.
+                esp_println::println!("upload: the shelf would not open: {error:?}");
+                None
             }
+        };
+        match opened {
+            None => refuse_uploads_until_exit().await,
             Some(existing) => match upload_store::reclaim::recover(&root, existing.as_ref()) {
                 Err(error) => {
                     esp_println::println!(

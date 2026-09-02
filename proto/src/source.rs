@@ -32,9 +32,10 @@ pub struct SourceDigest {
 impl SourceDigest {
     /// Rebuild a digest from parts.
     ///
-    /// Private on purpose: every public way to obtain one reads bytes. Stored
-    /// fields assembled into this type would be evidence wearing the shape of
-    /// a fact.
+    /// Crate-private on purpose: every public way to obtain one reads bytes,
+    /// so stored fields cannot be assembled into a fact from outside. Inside
+    /// the crate a claim's bytes are reassembled here and then wrapped in
+    /// [`CachedSourceDigest`], which is the shape that stays evidence.
     pub(crate) const fn from_parts(byte_len: u64, sha256: [u8; SHA256_BYTES]) -> Self {
         Self { byte_len, sha256 }
     }

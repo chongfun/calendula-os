@@ -56,8 +56,6 @@ pub struct Entry {
 #[derive(Default)]
 struct Selector {
     exact: Option<Entry>,
-    forgiving: Option<Entry>,
-    forgiving_seen: usize,
     /// The case-equivalent directories, counted apart from the files:
     /// only a directory can be the shelf, so the shelf reading consults
     /// these and ignores the rest. See [`Selector::finish_for_shelf`].
@@ -104,16 +102,13 @@ impl Selector {
                 // discovery, so the rule is plain ASCII case, not the
                 // driver's Unicode equivalence: `BOOKS` is ASCII, and a
                 // durable locator never reads from this bucket.
-                if !self.settle_on_exact && long.eq_ignore_ascii_case(component) {
-                    self.forgiving_seen += 1;
-                    if entry.is_dir {
-                        self.forgiving_dirs += 1;
-                        if self.forgiving_dir.is_none() {
-                            self.forgiving_dir = Some(entry.clone());
-                        }
-                    }
-                    if self.forgiving.is_none() {
-                        self.forgiving = Some(entry);
+                if !self.settle_on_exact && long.eq_ignore_ascii_case(component) && entry.is_dir {
+                    // Only a directory can be the shelf, so only directories
+                    // are kept: the readings that consult this bucket are
+                    // about which directory, or how many.
+                    self.forgiving_dirs += 1;
+                    if self.forgiving_dir.is_none() {
+                        self.forgiving_dir = Some(entry);
                     }
                 }
             }

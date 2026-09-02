@@ -46,6 +46,13 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 pub const CATALOG_VERSION: u8 = 9;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 419;
+// The record is encoded into a fixed buffer of that width, and the fields are
+// written at offsets derived from other modules' widths. These say so, rather
+// than letting a widened locator or alias run past the end of the buffer or
+// leave a silent gap in the middle of it.
+const _: () =
+    assert!(CATALOG_RECORD_PATH_OFFSET + CATALOG_PATH_BYTES == CATALOG_RECORD_ALIAS_OFFSET);
+const _: () = assert!(CATALOG_RECORD_ALIAS_OFFSET + CATALOG_ALIAS_BYTES == CATALOG_RECORD_BYTES);
 /// Byte range of the title field inside a record, exposed so the firmware
 /// can rewrite just the title in place when a book open learns the real
 /// EPUB title.

@@ -2387,6 +2387,11 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                     f"result this bench.py does not know ({', '.join(seen)}); "
                     f"known results are {', '.join(sorted(CATALOG_LOAD_RESULTS))}"
                 )
+        elif workflow == "folder-nav":
+            # Entering a folder is the walk this suite times. A capture with
+            # none of them measured nothing it was run for.
+            if "folder_enter" not in event_names:
+                warnings.append(f"{label}: no folder entry telemetry captured")
         elif workflow == "sleep-sync":
             if not any(is_terminal_sleep(event) for event in signal_events):
                 warnings.append(
@@ -2544,6 +2549,16 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
                 f"{run.label}: {paired} of {turns} requested page turns "
                 "captured; the run is short of the sample count it was asked "
                 "for"
+            )
+
+    entries = requested.get("folder_entries")
+    if isinstance(entries, int):
+        entered = sum(1 for event in run.events if event.get("event") == "folder_enter")
+        if entered < entries:
+            warnings.append(
+                f"{run.label}: {entered} of {entries} requested folder "
+                "entries captured; the run is short of the sample count it "
+                "was asked for"
             )
 
     cycles = requested.get("sleep_cycles")

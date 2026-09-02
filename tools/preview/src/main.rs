@@ -22,8 +22,8 @@ use std::fs::{create_dir_all, read, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use ui::{
-    render::render_shell, UiBook, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell,
-    UiTocItem, UiView,
+    render::render_shell, UiBook, UiLibraryRow, UiLibraryStatus, UiOrientation, UiRefreshPolicy,
+    UiShell, UiTocItem, UiView,
 };
 
 use display::font::TypeSettings;
@@ -230,8 +230,13 @@ fn preview_epub(
 /// root. This must mirror what the firmware scan derives, or the seeded
 /// cover lands in a directory the device does not look in.
 fn device_locator(source_path: &str) -> (BookRoot, &str) {
-    if let Some(locator) = source_path.strip_prefix("/books/") {
-        (BookRoot::Library, locator)
+    // The shelf name is matched without case, the way the device discovers
+    // it: a card may legally spell the directory `BOOKS` or `Books`, and a
+    // cover seeded under the wrong root lands where the device does not look.
+    if source_path.len() >= "/books/".len()
+        && source_path[.."/books/".len()].eq_ignore_ascii_case("/books/")
+    {
+        (BookRoot::Library, &source_path["/books/".len()..])
     } else {
         (
             BookRoot::CardRoot,
@@ -1802,10 +1807,21 @@ fn stroke_rect_direct(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
 
 fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> std::io::Result<()> {
     let mut fb = Framebuffer::new();
+    // Rows rather than paths: the Library lists a folder now, and a row is
+    // a name plus whether entering it goes deeper.
     let entries = [
-        "/books/Flowers for Algernon.epub",
-        "/books/The Time Machine.epub",
-        "/books/Unsong.epub",
+        UiLibraryRow {
+            name: "Flowers for Algernon.epub",
+            is_folder: false,
+        },
+        UiLibraryRow {
+            name: "The Time Machine.epub",
+            is_folder: false,
+        },
+        UiLibraryRow {
+            name: "Unsong.epub",
+            is_folder: false,
+        },
     ];
     let chapters = [
         UiTocItem {
@@ -1863,6 +1879,8 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         },
         library_status: UiLibraryStatus::Ready,
         library_entries: &entries,
+        // The preview shows the library root, which has no folder name.
+        library_folder: "",
         library_window_start: 0,
         library_total: entries.len() as u16,
         chapters: &chapters,

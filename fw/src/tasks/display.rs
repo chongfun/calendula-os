@@ -613,10 +613,7 @@ pub async fn run(
                                         &mut last_progress_write,
                                         &mut state_restored,
                                         &mut background_build,
-                                        refresh_planner
-                                            .last_request()
-                                            .map(|last| app_core::is_portrait(last.orientation))
-                                            .unwrap_or(true),
+                                        last_portrait(&refresh_planner),
                                     );
                                     sleep.applied();
                                     may_keep_draining = holder().sleep_may_proceed();
@@ -867,10 +864,7 @@ pub async fn run(
                         &mut last_progress_write,
                         &mut state_restored,
                         &mut background_build,
-                        refresh_planner
-                            .last_request()
-                            .map(|last| app_core::is_portrait(last.orientation))
-                            .unwrap_or(true),
+                        last_portrait(&refresh_planner),
                     );
                 }
             },
@@ -1871,6 +1865,11 @@ fn handle_storage_command(
             let listed = if browse_epoch == sd_library.browse_epoch() {
                 crate::library_sd::leave_library_folder(epd, sd_cs, sd_library, portrait)
             } else {
+                esp_println::println!(
+                    "storage: leave folder stale browse epoch={} now={}",
+                    browse_epoch,
+                    sd_library.browse_epoch()
+                );
                 None
             };
             match listed {
@@ -2258,6 +2257,16 @@ fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
 /// shows wrong until the book reopens. The firmware tracks the true chapter
 /// over the whole book; adopt it for the loaded SD book so saved and restored
 /// state name the chapter right.
+/// The orientation the last render was asked for, which is the one a
+/// storage command should be answered in. True before any request, matching
+/// the boot default.
+fn last_portrait(planner: &RefreshPlanner) -> bool {
+    planner
+        .last_request()
+        .map(|last| app_core::is_portrait(last.orientation))
+        .unwrap_or(true)
+}
+
 fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppStateRecord {
     let (source_hash, source_size) = source_identity(library, state.book_id);
     let chapter = if ReaderSource::from_book_id(state.book_id).is_sd()

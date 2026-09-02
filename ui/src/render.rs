@@ -389,7 +389,7 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         fb,
         layout,
         if in_folder {
-            shell.library_folder
+            fitted_heading(shell.library_folder)
         } else {
             "Library"
         },
@@ -1058,11 +1058,37 @@ pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pa
     dash_key(fb, layout, 3, "next", false);
 }
 
+/// Width of the rule under a heading, and so the width a heading has.
+const HEADING_RULE_W: i16 = 320;
+
 fn heading(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
     let small = literata_small(FontStyle::Regular);
     let width = ls_width(small, text, 5);
     ls_caps(fb, small, text, layout.heading_cx - width / 2, 42, 5);
-    hline(fb, layout.heading_cx - 160, 56, 320);
+    hline(
+        fb,
+        layout.heading_cx - HEADING_RULE_W / 2,
+        56,
+        HEADING_RULE_W,
+    );
+}
+
+/// The longest prefix of `text` that fits under the rule.
+///
+/// Headings are a fixed word until a folder name becomes one, and a name is
+/// whatever a reader called a directory. Measured with the letterspacing the
+/// draw uses, or the fit would be computed for a narrower string than the one
+/// that lands.
+fn fitted_heading(text: &str) -> &str {
+    let small = literata_small(FontStyle::Regular);
+    let mut end = text.len();
+    while end > 0 {
+        if text.is_char_boundary(end) && ls_width(small, &text[..end], 5) <= HEADING_RULE_W {
+            return &text[..end];
+        }
+        end -= 1;
+    }
+    ""
 }
 
 /// Letterspaced all-caps, the small-caps stand-in for this bitmap set.

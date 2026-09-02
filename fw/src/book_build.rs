@@ -1231,18 +1231,20 @@ pub(crate) fn load_chapter_title(
     };
     let source_identity = (entry.source_hash, entry.byte_size);
     let cache_key = proto::cache::cache_key_from(source_identity.0);
-    let located = book_locator(library, index);
-    let found = located.is_some()
-        && sd_session::with_root(epd, sd_cs, |root| {
-            let (at, path) = located.as_ref().expect("checked above");
+    // A book with no locator is not found, the same as one whose title would
+    // not read: either way the fallback below runs.
+    let found = match book_locator(library, index) {
+        Some((at, path)) => sd_session::with_root(epd, sd_cs, |root| {
             let owner = proto::cache::CacheOwner {
                 key: cache_key.as_str(),
-                root: *at,
+                root: at,
                 locator: path.as_str(),
             };
             files::read_v2_toc_chapter_title(root, &owner, source_identity, chapter, library)
         })
-        .unwrap_or(false);
+        .unwrap_or(false),
+        None => false,
+    };
     if !found {
         // Tag the source even on a miss so a stale title from another book is
         // never shown; the colophon falls back to a numeral for this chapter.

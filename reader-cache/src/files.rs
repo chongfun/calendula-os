@@ -573,7 +573,7 @@ pub fn for_each_cache_dir<
     );
 }
 
-/// Whether a book's cache directory is still on the card./// Whether a book's cache directory is still on the card.
+/// Whether a book's cache directory is still on the card.
 ///
 /// For a caller walking `CACHE2` in batches: a pass that reclaims a
 /// directory shortens the listing behind it, and a cursor counting entries

@@ -237,6 +237,10 @@ pub struct Emulator {
     library_entries: Vec<(String, bool)>,
     /// The folder being shown, empty at the library root.
     library_folder: String,
+    /// The listing a folder was entered from, and the row it was entered on,
+    /// so leaving replays the parent rather than describing it with the
+    /// child's rows.
+    library_parent: Vec<(u16, u16, u16)>,
     last_storage: Option<StorageCommand>,
     /// Scenario-driven: leave picked per-book actions unsettled so `Busy`
     /// reaches a frame. Off for interactive use, where a clear that never
@@ -266,6 +270,7 @@ impl Emulator {
             _sd_root: sd_root,
             library_entries: Vec::new(),
             library_folder: String::new(),
+            library_parent: Vec::new(),
             last_storage: None,
             hold_storage: false,
             sd_reader_status: EmulatedReaderStatus::Empty,
@@ -351,14 +356,26 @@ impl Emulator {
             StorageCommand::ChooseLibraryRow {
                 request_id, index, ..
             } => match self.library_entries.get(index as usize) {
-                Some((_, true)) => self.library_event(LibraryEvent::FolderListed {
-                    request_id: Some(request_id),
-                    browse_epoch: self.state.library_browse_epoch,
-                    depth: depth.saturating_add(1),
-                    count: 4,
-                    books: 3,
-                    selection: 0,
-                }),
+                Some((_, true)) => {
+                    // Remember the parent before its rows are replaced, so
+                    // Back can put the reader back where they pressed.
+                    let rows = self.library_entries.len().min(u16::MAX as usize) as u16;
+                    let books = self
+                        .library_entries
+                        .iter()
+                        .filter(|(_, is_folder)| !is_folder)
+                        .count()
+                        .min(u16::MAX as usize) as u16;
+                    self.library_parent.push((rows, books, index));
+                    self.library_event(LibraryEvent::FolderListed {
+                        request_id: Some(request_id),
+                        browse_epoch: self.state.library_browse_epoch,
+                        depth: depth.saturating_add(1),
+                        count: 4,
+                        books: 3,
+                        selection: 0,
+                    })
+                }
                 // Storage answers the row and stops; the open is the app's,
                 // and `library_event` dispatches it off the transition into
                 // Reading, the same way a keypress into Reading does.
@@ -370,13 +387,16 @@ impl Emulator {
                 None => self.library_event(LibraryEvent::RowFailed { request_id }),
             },
             StorageCommand::LeaveLibraryFolder { request_id, .. } => {
+                // The parent as it was, not the child described in its place:
+                // the rows here belong to the folder being left.
+                let (count, books, selection) = self.library_parent.pop().unwrap_or((0, 0, 0));
                 self.library_event(LibraryEvent::FolderListed {
                     request_id: Some(request_id),
                     browse_epoch: self.state.library_browse_epoch,
                     depth: depth.saturating_sub(1),
-                    count: self.library_entries.len().min(u16::MAX as usize) as u16,
-                    books: self.library_entries.len().min(u16::MAX as usize) as u16,
-                    selection: 0,
+                    count,
+                    books,
+                    selection,
                 })
             }
             _ => {}

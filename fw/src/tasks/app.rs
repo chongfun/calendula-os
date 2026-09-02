@@ -904,7 +904,7 @@ struct OpenDispatch {
 /// sent its command from the storage task instead, which committed no reader
 /// request id (so the open read as stale and was skipped), armed no open gate,
 /// and kept no rollback for a refusal.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)] // The parked storage, the state, the transition and the four sinks it needs; fires in every X4 and X3 build
 fn dispatch_transition_storage(
     parked: &mut ParkedStorage,
     state: &mut ReaderState,
