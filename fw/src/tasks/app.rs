@@ -942,6 +942,10 @@ fn dispatch_transition_storage(
             type_settings,
             portrait,
             previous,
+            // The event is the better witness: it carries the epoch the row
+            // was resolved in, including for a row naming the book already
+            // being read, which the state diff cannot tell from staying put.
+            // The reducer's own reading stands only where no event answered.
             catalog_epoch: catalog_fence.or(catalog_epoch),
         }),
         other => other,
@@ -985,9 +989,14 @@ fn dispatch_transition_storage(
                 if let Some(book_id) = open_book_id(command) {
                     *opening_book = Some(book_id);
                     *suppress_input_until_open_settled = true;
-                    // Only a switch can abort, and only a switch has a book to
-                    // go back to.
-                    *open_rollback = open_owns_the_switch.then(|| previous.open_rollback());
+                    // Anything that can be refused needs a way back, which
+                    // is a switch closing out another book or an open naming
+                    // the catalog its row came from. Asking only about the
+                    // switch left a row open for the book already being read
+                    // refusable with nowhere to land, and the reader stayed
+                    // on the reading screen over a row number that a rebuilt
+                    // catalog had given to a different book.
+                    *open_rollback = command.open_may_refuse().then(|| previous.open_rollback());
                 }
                 if outcome == StorageDispatch::Sent
                     && matches!(command, StorageCommand::LoadChapters { .. })

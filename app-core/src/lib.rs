@@ -518,6 +518,30 @@ pub enum StorageCommand {
     },
 }
 
+impl StorageCommand {
+    /// Whether this open can end without landing on its book, so its caller
+    /// has to keep a way back to where the reader was.
+    ///
+    /// Two ways an open ends in nothing. It closes out another book, in
+    /// which case a refusal leaves the reader between two; or it names the
+    /// catalog its row came from, and storage refuses it outright when that
+    /// catalog has since been replaced. The second was added later, and the
+    /// arming that reads this used to ask only about the first, which left a
+    /// row open for the book already being read able to be refused with no
+    /// way back. The reader stayed on the reading screen over a row number
+    /// that now belongs to a different book.
+    pub fn open_may_refuse(&self) -> bool {
+        matches!(
+            self,
+            StorageCommand::OpenBook {
+                previous: closing,
+                catalog_epoch: fence,
+                ..
+            } if closing.is_some() || fence.is_some()
+        )
+    }
+}
+
 /// Slots for storage commands the channel could not take yet.
 ///
 /// Two is what a single input transition can produce: one navigation command
@@ -959,6 +983,10 @@ pub fn storage_command_for_transition(
         // between that answer and this open would leave the number naming
         // something else. So the open says which catalog it means. Every
         // other switch resolves its own index against the catalog in hand.
+        //
+        // Read from the diff, which cannot see a row that named the book
+        // already being read. Firmware holds the answering event and stamps
+        // the epoch from it, overriding this; see `dispatch_transition_storage`.
         let fence = (previous.view == AppView::Library).then_some(next.catalog_epoch);
         return Some(open_book_command(
             next,
@@ -5291,6 +5319,46 @@ mod tests {
         assert_eq!((listed.library_count, listed.library_books), (4, 3));
         assert_eq!(listed.selection, 0, "a folder is entered at its top");
         assert!(listed.library_browse.is_idle());
+    }
+
+    /// An open that can be refused needs somewhere to land when it is.
+    ///
+    /// The row open for a book already being read is the case this exists
+    /// for: it closes out nobody, so the older reading of "can this abort"
+    /// said no, while the catalog fence could refuse it all the same. What
+    /// followed was worse than a bad screen. The reader stayed in Reading
+    /// over a row number a rebuilt catalog had given to another book, and
+    /// the next page turn extends by index without a fence, off a RAM window
+    /// that checks the index and not which book the text came from.
+    #[test]
+    fn an_open_that_can_be_refused_says_so() {
+        let state = in_library(0, 3);
+        let plain = open_book_command(&state, 0, 1, None, None);
+        assert!(
+            !plain.open_may_refuse(),
+            "nothing to close out and no catalog named"
+        );
+        assert!(
+            open_book_command(&state, 0, 1, Some(state.persisted()), None).open_may_refuse(),
+            "a switch leaves the reader between two books"
+        );
+        assert!(
+            open_book_command(&state, 0, 1, None, Some(EPOCH)).open_may_refuse(),
+            "a named catalog can be refused for having been replaced"
+        );
+        assert!(
+            !StorageCommand::ExtendSection {
+                request_id: 1,
+                book_id: state.book_id,
+                index: 0,
+                chapter: 0,
+                target_pages: 0,
+                type_settings: state.type_settings(),
+                portrait: is_portrait(state.orientation),
+            }
+            .open_may_refuse(),
+            "only an open is an open"
+        );
     }
 
     /// A row number means something only inside the catalog that produced
