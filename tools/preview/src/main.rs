@@ -233,8 +233,13 @@ fn device_locator(source_path: &str) -> (BookRoot, &str) {
     // The shelf name is matched without case, the way the device discovers
     // it: a card may legally spell the directory `BOOKS` or `Books`, and a
     // cover seeded under the wrong root lands where the device does not look.
-    if source_path.len() >= "/books/".len()
-        && source_path[.."/books/".len()].eq_ignore_ascii_case("/books/")
+    // Compared as bytes: a byte length says nothing about where a character
+    // starts, and slicing a path whose seventh byte sits inside a multi-byte
+    // character would panic. Past the ASCII prefix the boundary is known.
+    if source_path
+        .as_bytes()
+        .get(.."/books/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"/books/"))
     {
         (BookRoot::Library, &source_path["/books/".len()..])
     } else {
@@ -2243,4 +2248,34 @@ fn spine_item_is_navigation(item: &SpineItem, package: &EpubPackage<'_>) -> bool
         || lower_href.ends_with("toc.html")
         || lower_href.ends_with("nav.xhtml")
         || lower_href.ends_with("nav.html")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A byte length says nothing about where a character starts, so the
+    /// shelf test compares bytes. Slicing this path at seven would land
+    /// inside the multi-byte character and panic before the path could be
+    /// classified at all, and a loose book at the card root is supported.
+    #[test]
+    fn a_root_path_with_a_multibyte_character_classifies_rather_than_panics() {
+        let (root, locator) = device_locator("/abcd\u{65e5}.epub");
+        assert_eq!(root, BookRoot::CardRoot);
+        assert_eq!(locator, "abcd\u{65e5}.epub");
+    }
+
+    /// The device discovers the shelf without case, and a cover seeded under
+    /// the wrong root lands where the device does not look.
+    #[test]
+    fn the_shelf_is_recognised_whatever_its_spelling() {
+        for path in ["/books/Dune.epub", "/BOOKS/Dune.epub", "/Books/Dune.epub"] {
+            let (root, locator) = device_locator(path);
+            assert_eq!(root, BookRoot::Library, "{path}");
+            assert_eq!(locator, "Dune.epub", "{path}");
+        }
+        let (root, locator) = device_locator("/bookshelf/Dune.epub");
+        assert_eq!(root, BookRoot::CardRoot, "a longer name is not the shelf");
+        assert_eq!(locator, "bookshelf/Dune.epub");
+    }
 }

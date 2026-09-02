@@ -624,7 +624,10 @@ at all still lists one. Each row carries the root its locator is relative to,
 because the pair is the address: a locator says which root it belongs to only
 by being paired with one. Nothing nests at the card root, so its books appear
 in the root listing alone. Confirm on a book opens it and Confirm on a folder goes
-in; Back goes up a level, and leaves for Home only at the library root. A card
+in; Back goes up a level, and leaves for Home at the library root. While a
+per-book action is in flight Back leaves Library whatever the depth, since a
+folder move is one of the presses that action is holding, and the rail says
+home rather than up for the moment it takes. A card
 with no folders on it therefore reads exactly as a flat list did. The rows are
 read from the card a page at a time through
 `upload_store::library::page_library_rows`, so what a folder costs in
