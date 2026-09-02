@@ -353,6 +353,35 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
     }
 }
 
+/// Which line the Library footer carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryFooterLine {
+    /// A picked action's wait or its result has something of its own to say.
+    Note,
+    /// Just the position. The teaching line names the sheet key, and that
+    /// press does something else here, or nothing.
+    Position,
+    /// The resting line, which teaches the sheet key.
+    Hint,
+}
+
+/// What the footer may say, given what the sheet key would do.
+///
+/// The teaching line is the only thing here that promises a press, so it
+/// only appears when that press opens the sheet. A move through the tree
+/// swallows it exactly as the sheet being up already redirects it, and
+/// neither wait has a note of its own to show instead.
+fn library_footer_line(menu: app_core::LibraryMenu, move_pending: bool) -> LibraryFooterLine {
+    match menu {
+        app_core::LibraryMenu::Busy { .. } | app_core::LibraryMenu::Done { .. } => {
+            LibraryFooterLine::Note
+        }
+        app_core::LibraryMenu::Sheet { .. } => LibraryFooterLine::Position,
+        app_core::LibraryMenu::None if move_pending => LibraryFooterLine::Position,
+        app_core::LibraryMenu::None => LibraryFooterLine::Hint,
+    }
+}
+
 /// Which Library controls the reducer will honour on the next press.
 ///
 /// The rail draws what this says and nothing else, because a label is a
@@ -510,22 +539,28 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             .unwrap_or("this book");
         render_library_sheet(fb, layout, selected_entry, row);
     }
-    match shell.library_menu {
-        app_core::LibraryMenu::Busy { action, .. } => match action {
-            app_core::LibraryAction::ClearCache => footer_note(fb, layout, "clearing\u{2026}"),
+    match library_footer_line(shell.library_menu, shell.library_move_pending) {
+        LibraryFooterLine::Note => match shell.library_menu {
+            app_core::LibraryMenu::Busy {
+                action: app_core::LibraryAction::ClearCache,
+                ..
+            } => footer_note(fb, layout, "clearing\u{2026}"),
+            app_core::LibraryMenu::Done {
+                action: app_core::LibraryAction::ClearCache,
+                ok,
+            } => footer_note(
+                fb,
+                layout,
+                if ok {
+                    "cache cleared"
+                } else {
+                    "cache not cleared"
+                },
+            ),
+            _ => position_footer(fb, layout, selected_index + 1, total),
         },
-        app_core::LibraryMenu::Done { action, ok } => match (action, ok) {
-            (app_core::LibraryAction::ClearCache, true) => footer_note(fb, layout, "cache cleared"),
-            (app_core::LibraryAction::ClearCache, false) => {
-                footer_note(fb, layout, "cache not cleared")
-            }
-        },
-        // While the sheet is up the page-back key dismisses it, so the
-        // teaching line below would lie; the plain position stands in.
-        app_core::LibraryMenu::Sheet { .. } => {
-            position_footer(fb, layout, selected_index + 1, total)
-        }
-        app_core::LibraryMenu::None => library_footer(fb, layout, selected_index + 1, total),
+        LibraryFooterLine::Position => position_footer(fb, layout, selected_index + 1, total),
+        LibraryFooterLine::Hint => library_footer(fb, layout, selected_index + 1, total),
     }
     finish_working_screen(fb, shell, layout);
 }
@@ -1532,6 +1567,32 @@ mod tests {
                 "a move through the tree, in_folder={in_folder}"
             );
         }
+    }
+
+    /// The teaching line names the sheet key, so it may only show when that
+    /// press opens the sheet. A move through the tree swallows it, and that
+    /// wait has no note of its own, so the plain position stands in exactly
+    /// as it does while the sheet is up.
+    #[test]
+    fn a_pending_move_drops_the_line_that_teaches_a_swallowed_key() {
+        assert_eq!(
+            library_footer_line(app_core::LibraryMenu::None, true),
+            LibraryFooterLine::Position
+        );
+        assert_eq!(
+            library_footer_line(app_core::LibraryMenu::None, false),
+            LibraryFooterLine::Hint,
+            "at rest the key it names works"
+        );
+        assert_eq!(
+            library_footer_line(app_core::LibraryMenu::Sheet { row: 0 }, false),
+            LibraryFooterLine::Position
+        );
+        assert_eq!(
+            library_footer_line(BUSY, false),
+            LibraryFooterLine::Note,
+            "a picked action says what it is doing"
+        );
     }
 
     /// A move outstanding swallows the sheet's keys too, so a rail drawn

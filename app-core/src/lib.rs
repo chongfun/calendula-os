@@ -2785,11 +2785,17 @@ impl ReaderState {
                 // below owes is fenced too, because this event can arrive
                 // before the `Scanned` that would have caught it here.
                 let fresh = catalog_epoch == self.catalog_epoch;
-                if !fresh {
+                // Both readings answer one request, so both check that it is
+                // the one still being waited on. A stale answer to a press
+                // the reader has already moved past would otherwise end a
+                // newer move, and the response to that move arrives to find
+                // nothing waiting for it.
+                let mine = self.library_browse.request_id() == Some(request_id);
+                if !fresh && mine {
                     self.library_browse = LibraryBrowse::Idle;
                     self.dirty = Rect::FULL;
                 }
-                if fresh && self.library_browse.request_id() == Some(request_id) {
+                if fresh && mine {
                     self.library_browse = LibraryBrowse::Idle;
                     // What Confirm used to do the moment it was pressed, now
                     // that the row has a catalog number. The transition into
@@ -5249,6 +5255,37 @@ mod tests {
         assert_eq!((listed.library_count, listed.library_books), (4, 3));
         assert_eq!(listed.selection, 0, "a folder is entered at its top");
         assert!(listed.library_browse.is_idle());
+    }
+
+    /// An answer names the press it answers. A row resolved against a
+    /// catalog the app has since been told was replaced is refused, and the
+    /// refusal has to end that press and no other: a reader who moved on to
+    /// a folder is waiting on a newer command, and ending its wait leaves
+    /// the response to arrive with nothing expecting it.
+    #[test]
+    fn a_stale_row_answer_does_not_end_a_newer_move() {
+        let mut state = in_folder(1, 2, 1);
+        state.library_browse = LibraryBrowse::Leaving {
+            request_id: 9,
+            browse_epoch: EPOCH,
+        };
+        let after = state.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: 4,
+                index: 0,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(
+            after.library_browse,
+            LibraryBrowse::Leaving {
+                request_id: 9,
+                browse_epoch: EPOCH
+            },
+            "the move it did not answer is still being waited on"
+        );
+        assert_eq!(after.view, AppView::Library, "and nothing opened");
     }
 
     /// A picked action holds every other press, and Back is documented as

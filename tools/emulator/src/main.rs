@@ -412,31 +412,29 @@ impl Emulator {
             self.library_entries
                 .extend((0..count).map(|index| (format!("SD Book {}", index + 1), false)));
         }
-        if let LibraryEvent::FolderListed {
-            depth,
-            count,
-            books,
-            ..
-        } = event
-        {
-            self.library_entries.clear();
-            self.library_entries
-                .extend((0..books).map(|index| (format!("SD Book {}", index + 1), false)));
-            self.library_entries.extend(
-                (0..count.saturating_sub(books))
-                    .map(|index| (format!("Folder {}", index + 1), true)),
-            );
-            self.library_folder = if depth > 0 {
-                "Fiction".to_string()
-            } else {
-                String::new()
-            };
-        }
         if matches!(event, LibraryEvent::Loaded { .. }) {
             self.sd_reader_status = EmulatedReaderStatus::Ready;
         }
         let before = self.state;
         self.state = self.state.apply_library_event(self.ctx, event);
+        // Built from what the reducer took, not from what arrived. A listing
+        // answering a press the reader has moved past is refused, and reading
+        // the event directly would rewrite these rows anyway, leaving the
+        // emulated card showing a folder the device would not be in.
+        if matches!(event, LibraryEvent::FolderListed { .. }) && self.state != before {
+            let books = self.state.library_books;
+            let folders = self.state.library_count.saturating_sub(books);
+            self.library_entries.clear();
+            self.library_entries
+                .extend((0..books).map(|index| (format!("SD Book {}", index + 1), false)));
+            self.library_entries
+                .extend((0..folders).map(|index| (format!("Folder {}", index + 1), true)));
+            self.library_folder = if self.state.library_depth > 0 {
+                "Fiction".to_string()
+            } else {
+                String::new()
+            };
+        }
         // A library event can move the reader onto a different book, which
         // owes an open exactly as a keypress into Reading does.
         if let Some(command) = storage_command_for_transition(before, self.state) {
