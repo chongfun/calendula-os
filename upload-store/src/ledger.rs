@@ -8,29 +8,39 @@
 //!
 //! One generation is one whole file: a header, then one fixed-size record
 //! per adopted copy, each carrying its own checksum. A rewrite goes to the
-//! side that is not live, records first and header last, so a power cut
-//! anywhere in it leaves the live side exactly as it was and the other side
-//! holding a header that decodes as nothing. A reader picks the side with
-//! the newer valid header, then checks every record on it before believing
-//! it, and falls back to the older side when one fails. That extra pass is
-//! what keeps a damaged record from being read as a shorter library, and it
-//! is one sequential read of a file the join is about to read anyway.
+//! side that is not live. Records go down first under a placeholder header
+//! and the file is closed, so its directory entry carries the final length;
+//! then the file is opened again and the real header written over the
+//! placeholder. That header is the commit, and it is the last block to land:
+//! a power cut anywhere before it leaves the live side exactly as it was and
+//! the other side holding a header that decodes as nothing, and a cut after
+//! it leaves a generation that is already complete.
+//!
+//! A reader takes the newer committed header and checks the file's length and
+//! every record before believing it. A committed generation that does not
+//! read back whole is not an interrupted write, since the header could not
+//! have landed before the records did. It is damage to durable identity
+//! state, and it is refused rather than fallen back from: the older side is
+//! missing every id the newer one added, so taking it would re-mint those
+//! and orphan whatever comes to hang from them. Nothing here repairs a
+//! damaged generation by guessing; the intact records on both sides are still
+//! there for something explicit to salvage.
 //!
 //! Rewriting the whole file rather than appending is deliberate. An append
 //! that straddles a cluster boundary can leave the FAT chain and the
 //! directory entry disagreeing about where the file ends, and the recovery
 //! model in this crate rests on not having to interpret that state. A
-//! rewrite only happens when a scan found copies the ledger does not name,
-//! which after the first scan is the uploads since the last one, and it
-//! costs about what the catalog rewrite beside it already costs.
+//! rewrite happens when a scan changes what the ledger says: copies to
+//! adopt, copies gone missing, or copies come back. On a card that has not
+//! changed, the scan does not run at all.
 //!
 //! Nothing here reads book bytes. Adoption is by place and size: a fresh
 //! catalog row whose root, locator and size a live record names is that
 //! record's copy, and any other row is a copy this library has not seen,
 //! which is minted a fresh id. A copy that was moved on a computer is a new
-//! book to this milestone, and its old record stays in the ledger as a copy
-//! that is missing. Recognising the move is reconciliation work that needs
-//! the source digest, and it lands on top of this.
+//! book to this milestone, and its old record stays in the ledger as a
+//! missing copy, for a bounded number of scans, so that the reconciliation
+//! that recognises the move by digest has something to match when it lands.
 
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use proto::cache::{source_hash_at, CACHE_ROOT_DIR};
@@ -40,7 +50,7 @@ use proto::catalog::{
 };
 use proto::durable::generation_is_newer;
 use proto::identity::{
-    decode_ledger_header, decode_ledger_record, encode_ledger_header,
+    carry_missing, decode_ledger_header, decode_ledger_record, encode_ledger_header,
     encode_ledger_placeholder_header, encode_ledger_record, ledger_file_len, rows_with_hash,
     sort_row_keys, stage_row_key, BookId, LedgerHeader, LedgerRecord, LEDGER_HEADER_BYTES,
     LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
@@ -49,6 +59,10 @@ use proto::identity::{
 /// The two generations, under the cache root.
 pub const LEDGER_FILES: [&str; 2] = ["LEDGERA.BIN", "LEDGERB.BIN"];
 
+/// The most records one generation can hold, because the header counts them
+/// in two bytes. The same ceiling as the catalog, and for the same reason.
+pub const LEDGER_MAX_RECORDS: usize = u16::MAX as usize;
+
 /// Why the ledger could not do what was asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LedgerFault {
@@ -56,13 +70,23 @@ pub enum LedgerFault {
     /// the file being absent. Not evidence about the ledger: the caller
     /// leaves things as they are and the next mount tries again.
     Device,
-    /// More adopted copies than a header can count.
+    /// The live generation was committed and does not read back whole: a
+    /// record fails its checksum, or the file is not as long as its header
+    /// says. That is durable identity state damaged after it landed, and
+    /// falling back to the older generation would re-mint every id the live
+    /// one added. The ledger is left exactly as it is and the operation is
+    /// refused; a catalog already committed keeps serving, and only rebuilds
+    /// stop, until the intact records are salvaged by something explicit.
+    Damaged,
+    /// More copies than a generation can hold once the live and newly
+    /// adopted ones are counted. Missing records yield first, so this is a
+    /// library past the catalog's own ceiling.
     Full,
     /// A row that cannot be adopted: a root byte this build does not know,
     /// or a locator wider than a record. Neither is reachable from a
     /// catalog this build wrote.
     Record,
-    /// The caller's scratch cannot hold even one row key.
+    /// The caller's scratch cannot hold the join's working set.
     Scratch,
 }
 
@@ -83,11 +107,12 @@ impl Ledger {
 
 /// The live generation, or `None` for a card with no ledger yet.
 ///
-/// Both headers are read and the newer is checked record by record before
-/// it is trusted; a side that fails hands over to the other. A device fault
-/// anywhere is an error rather than a fallback, because taking the older
-/// generation over a side the card would not read could re-mint ids that
-/// side holds.
+/// Both headers are read; the newer committed one is the live generation,
+/// and it is checked whole before it is handed back. A side whose header
+/// does not decode was never committed, which is what an interrupted
+/// rewrite leaves, and is skipped. A side whose header does decode and whose
+/// records or length do not check out is [`LedgerFault::Damaged`], and the
+/// older side is deliberately not consulted in its place.
 pub fn open<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
 ) -> Result<Option<Ledger>, LedgerFault>
@@ -100,29 +125,22 @@ where
         Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
         Err(_) => return Err(LedgerFault::Device),
     };
-    let headers = [
-        read_committed_header(&cache_root, 0)?,
-        read_committed_header(&cache_root, 1)?,
-    ];
-    let order: [Option<usize>; 2] = match (headers[0], headers[1]) {
-        (Some(a), Some(b)) if generation_is_newer(b.generation, a.generation) => [Some(1), Some(0)],
-        (Some(_), Some(_)) | (Some(_), None) => [Some(0), Some(1)],
-        (None, Some(_)) => [Some(1), None],
+    let a = committed_header(&cache_root, 0)?;
+    let b = committed_header(&cache_root, 1)?;
+    let (side, header) = match (a, b) {
+        (Some(a), Some(b)) if generation_is_newer(b.generation, a.generation) => (1, b),
+        (Some(a), Some(_)) | (Some(a), None) => (0, a),
+        (None, Some(b)) => (1, b),
         (None, None) => return Ok(None),
     };
-    for side in order.into_iter().flatten() {
-        let Some(header) = headers[side] else {
-            continue;
-        };
-        if records_check_out(&cache_root, side, header.count)? {
-            return Ok(Some(Ledger {
-                side,
-                generation: header.generation,
-                count: header.count,
-            }));
-        }
+    if !reads_back_whole(&cache_root, side, header)? {
+        return Err(LedgerFault::Damaged);
     }
-    Ok(None)
+    Ok(Some(Ledger {
+        side,
+        generation: header.generation,
+        count: header.count,
+    }))
 }
 
 /// Every record of `ledger`, in order, to `visit`. A record that no longer
@@ -186,8 +204,9 @@ where
     }
 }
 
-/// Write the next generation: every record of `previous`, then whatever
-/// `fill` appends, committed by the header last.
+/// Write the next generation: the records of `previous` that `carry` keeps,
+/// each with the `misses` it returns, then whatever `fill` appends, and then
+/// the header that commits it.
 ///
 /// The target is the side `previous` is not on, so `previous` stands
 /// untouched until the new header has landed and read back. `fill` is
@@ -197,6 +216,7 @@ where
 pub fn write_generation<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     previous: Option<&Ledger>,
+    carry: &mut impl FnMut(u16, &LedgerRecord<'_>) -> Option<u8>,
     fill: impl FnOnce(&mut LedgerWriter<'_, '_, D, T, MD, MF, MV>) -> Result<(), LedgerFault>,
 ) -> Result<Ledger, LedgerFault>
 where
@@ -208,12 +228,15 @@ where
         Some(live) => (1 - live.side, live.generation.wrapping_add(1)),
         None => (0, 1),
     };
-    let count;
-    {
+    let mut header = [0u8; LEDGER_HEADER_BYTES];
+
+    // Records first, under a header that decodes as nothing, closed so the
+    // directory entry holds the final length before anything says the
+    // generation exists.
+    let count = {
         let file = cache_root
             .open_file_in_dir(LEDGER_FILES[target], Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| LedgerFault::Device)?;
-        let mut header = [0u8; LEDGER_HEADER_BYTES];
         encode_ledger_placeholder_header(&mut header);
         file.write(&header).map_err(|_| LedgerFault::Device)?;
         let mut carried: u16 = 0;
@@ -225,15 +248,22 @@ where
                 .seek_from_start(LEDGER_HEADER_BYTES as u32)
                 .map_err(|_| LedgerFault::Device)?;
             let mut bytes = [0u8; LEDGER_RECORD_BYTES];
-            for _ in 0..live.count {
+            for index in 0..live.count {
                 // Carried forward only as read back intact. The side was
                 // checked when it was opened, so anything else here is the
                 // card, and a copy of it would be a copy of the damage.
-                if !read_exact(&source, &mut bytes)? || decode_ledger_record(&bytes).is_none() {
+                if !read_exact(&source, &mut bytes)? {
                     return Err(LedgerFault::Device);
                 }
-                file.write(&bytes).map_err(|_| LedgerFault::Device)?;
-                carried += 1;
+                let record = decode_ledger_record(&bytes).ok_or(LedgerFault::Device)?;
+                let Some(misses) = carry(index, &record) else {
+                    continue;
+                };
+                let kept = LedgerRecord { misses, ..record };
+                let mut out = [0u8; LEDGER_RECORD_BYTES];
+                encode_ledger_record(&kept, &mut out).ok_or(LedgerFault::Record)?;
+                file.write(&out).map_err(|_| LedgerFault::Device)?;
+                carried = carried.checked_add(1).ok_or(LedgerFault::Full)?;
             }
         }
         let mut writer = LedgerWriter {
@@ -241,18 +271,36 @@ where
             count: carried,
         };
         fill(&mut writer)?;
-        count = writer.count;
-        encode_ledger_header(LedgerHeader { generation, count }, &mut header);
+        let count = writer.count;
+        file.close().map_err(|_| LedgerFault::Device)?;
+        count
+    };
+
+    // Then the commit: one header, over the placeholder, in a file whose
+    // length is already final.
+    {
+        let file = cache_root
+            .open_file_in_dir(LEDGER_FILES[target], Mode::ReadWriteAppend)
+            .map_err(|_| LedgerFault::Device)?;
         file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
+        encode_ledger_header(LedgerHeader { generation, count }, &mut header);
         file.write(&header).map_err(|_| LedgerFault::Device)?;
-        file.flush().map_err(|_| LedgerFault::Device)?;
+        file.close().map_err(|_| LedgerFault::Device)?;
     }
-    match read_committed_header(&cache_root, target)? {
-        Some(header) if header.generation == generation && header.count == count => Ok(Ledger {
-            side: target,
-            generation,
-            count,
-        }),
+
+    match committed_header(&cache_root, target)? {
+        Some(committed) if committed.generation == generation && committed.count == count => {
+            let ledger = Ledger {
+                side: target,
+                generation,
+                count,
+            };
+            if reads_back_whole(&cache_root, target, committed)? {
+                Ok(ledger)
+            } else {
+                Err(LedgerFault::Device)
+            }
+        }
         _ => Err(LedgerFault::Device),
     }
 }
@@ -269,22 +317,36 @@ pub struct Assignment {
     /// appends one record per unnamed row, so a duplicate is a ledger
     /// written by something else.
     pub duplicates: u16,
+    /// Records that named no row and were carried into the new generation
+    /// as missing copies, one scan older.
+    pub missing: u16,
+    /// Records that named no row and were left behind: missing for longer
+    /// than the ledger retains, or not fitting beside the live library.
+    pub retired: u16,
 }
 
 /// Give every row of a freshly written catalog its [`BookId`].
 ///
 /// `catalog` is the open `CATALOG.BIN` with `count` records written and its
-/// header still the placeholder; rows carry no id yet. Each row a live
-/// ledger record names by root, locator and size takes that record's id in
-/// place. The rest are minted ids and appended to the ledger in one new
-/// generation, and that generation is committed before this returns, so
-/// the ids the catalog carries are durable by the time its own header is.
+/// header still the placeholder; rows carry no id yet. `ledger` is what
+/// [`open`] returned for this card, opened by the caller so that a ledger
+/// that refuses can refuse before the catalog is touched. Each row a live
+/// record names by root, locator and size takes that record's id in place.
+/// The rest are minted ids and appended in one new generation, which is
+/// committed before this returns, so the ids the catalog carries are
+/// durable by the time its own header is. The same generation carries
+/// forward the records no row named, aged by one scan and dropped once
+/// they pass the retention bound or would not fit beside the live library.
+/// A scan that changes nothing writes nothing.
 ///
 /// A join rather than a lookup per row, because a per-row lookup in a
 /// thousand-book library is a thousand file opens. Row keys are staged in
 /// `scratch` a slice at a time, the ledger is read once per slice, and only
-/// rows whose 32-bit place hash agrees are compared in full. The scratch
-/// bounds nothing but the number of slices.
+/// rows whose 32-bit place hash agrees are compared in full. The head of
+/// `scratch` holds one bit per ledger record, set when the record names a
+/// row, which is what tells a live record from a missing one when the
+/// generation is rewritten. The scratch bounds nothing but the number of
+/// slices.
 ///
 /// On a fault nothing is retracted. Ids written into rows are ids that the
 /// ledger either committed, in which case they are right, or did not, in
@@ -296,6 +358,7 @@ pub fn assign_book_ids<D, T, const MD: usize, const MF: usize, const MV: usize>(
     count: u16,
     scratch: &mut [u8],
     random: &mut impl FnMut() -> u32,
+    ledger: Option<Ledger>,
 ) -> Result<Assignment, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -305,13 +368,22 @@ where
     if count == 0 {
         return Ok(assigned);
     }
-    let per_slice = scratch.len() / ROW_KEY_BYTES;
+    let live = ledger.filter(|live| live.count > 0);
+    let bitmap_bytes = live.map_or(0, |live| (live.count as usize).div_ceil(8));
+    if scratch.len() < bitmap_bytes {
+        return Err(LedgerFault::Scratch);
+    }
+    let (named, keys) = scratch.split_at_mut(bitmap_bytes);
+    named.fill(0);
+    let per_slice = keys.len() / ROW_KEY_BYTES;
     if per_slice == 0 {
         return Err(LedgerFault::Scratch);
     }
-    let ledger = open(root)?;
     let mut record = [0u8; CATALOG_RECORD_BYTES];
-    if let Some(live) = ledger.filter(|live| live.count > 0) {
+    // Live records that had been missing, whose count has to go back to
+    // zero: a change to the ledger even when nothing else moved.
+    let mut returned = 0usize;
+    if let Some(live) = live {
         let mut slice_start = 0usize;
         while slice_start < count as usize {
             let slice_end = (slice_start + per_slice).min(count as usize);
@@ -321,13 +393,14 @@ where
                     return Err(LedgerFault::Device);
                 }
                 let (hash, _) = catalog_record_identity(&record);
-                stage_row_key(scratch, row - slice_start, hash, row as u16);
+                stage_row_key(keys, row - slice_start, hash, row as u16);
             }
             let staged = slice_end - slice_start;
-            sort_row_keys(scratch, staged);
-            for_each_record(root, &live, &mut |_, entry| {
+            sort_row_keys(keys, staged);
+            for_each_record(root, &live, &mut |index, entry| {
                 let hash = source_hash_at(entry.root, entry.locator, entry.byte_size);
-                for row in rows_with_hash(scratch, staged, hash) {
+                let mut names_a_row = false;
+                for row in rows_with_hash(keys, staged, hash) {
                     seek_row(catalog, row as usize)?;
                     if !read_exact(catalog, &mut record)? {
                         return Err(LedgerFault::Device);
@@ -337,6 +410,7 @@ where
                     {
                         continue;
                     }
+                    names_a_row = true;
                     if catalog_record_book_id(&record).is_some() {
                         assigned.duplicates = assigned.duplicates.saturating_add(1);
                         continue;
@@ -344,14 +418,57 @@ where
                     write_row_id(catalog, row as usize, entry.id)?;
                     assigned.matched += 1;
                 }
+                if names_a_row && !bit(named, index) {
+                    set_bit(named, index);
+                    if entry.misses > 0 {
+                        returned += 1;
+                    }
+                }
                 Ok(())
             })?;
             slice_start = slice_end;
         }
     }
-    if (assigned.matched as usize) < count as usize {
-        let minted = &mut assigned.minted;
-        write_generation(root, ledger.as_ref(), |writer| {
+
+    let live_records = named
+        .iter()
+        .map(|byte| byte.count_ones() as usize)
+        .sum::<usize>();
+    let missing_records = live.map_or(0, |live| live.count as usize) - live_records;
+    let new_rows = count as usize - assigned.matched as usize;
+    if new_rows == 0 && missing_records == 0 && returned == 0 {
+        return Ok(assigned);
+    }
+    // Live and new copies are the library; a missing record takes a slot
+    // only if one is left once they are all in.
+    let room = LEDGER_MAX_RECORDS.saturating_sub(live_records + new_rows);
+    let mut carried_missing = 0usize;
+    let Assignment {
+        minted,
+        missing,
+        retired,
+        ..
+    } = &mut assigned;
+    write_generation(
+        root,
+        ledger.as_ref(),
+        &mut |index, entry| {
+            if bit(named, index) {
+                return Some(0);
+            }
+            match carry_missing(entry.misses, room - carried_missing) {
+                Some(misses) => {
+                    carried_missing += 1;
+                    *missing += 1;
+                    Some(misses)
+                }
+                None => {
+                    *retired += 1;
+                    None
+                }
+            }
+        },
+        |writer| {
             seek_row(catalog, 0)?;
             for row in 0..count as usize {
                 if !read_exact(catalog, &mut record)? {
@@ -368,6 +485,7 @@ where
                     root: at,
                     locator,
                     byte_size,
+                    misses: 0,
                 })?;
                 // Leaves the cursor at the next row, where the read above
                 // expects it.
@@ -375,15 +493,25 @@ where
                 *minted += 1;
             }
             Ok(())
-        })?;
-    }
+        },
+    )?;
     Ok(assigned)
 }
 
+fn bit(bits: &[u8], index: u16) -> bool {
+    bits[index as usize / 8] & (1 << (index % 8)) != 0
+}
+
+fn set_bit(bits: &mut [u8], index: u16) {
+    bits[index as usize / 8] |= 1 << (index % 8);
+}
+
 /// The committed header on `side`, or `None` for a side that is absent,
-/// holds the placeholder, does not decode, or is not exactly as long as its
-/// count says. Only a refused open or read is an error.
-fn read_committed_header<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// shorter than a header, or holding bytes that do not decode as one, which
+/// is what the placeholder and a torn commit both look like. Only a refused
+/// open or read is an error. Whether the generation behind a committed
+/// header is whole is [`reads_back_whole`]'s question.
+fn committed_header<D, T, const MD: usize, const MF: usize, const MV: usize>(
     cache_root: &Directory<'_, D, T, MD, MF, MV>,
     side: usize,
 ) -> Result<Option<LedgerHeader>, LedgerFault>
@@ -400,21 +528,16 @@ where
     if !read_exact(&file, &mut bytes)? {
         return Ok(None);
     }
-    let Some(header) = decode_ledger_header(&bytes) else {
-        return Ok(None);
-    };
-    if file.length() as usize != ledger_file_len(header.count) {
-        return Ok(None);
-    }
-    Ok(Some(header))
+    Ok(decode_ledger_header(&bytes))
 }
 
-/// Whether every record on `side` decodes. `Ok(false)` is a damaged side;
-/// `Err` is the card.
-fn records_check_out<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// Whether a committed generation is exactly as long as its header says and
+/// every record on it decodes. `Ok(false)` is a damaged side; `Err` is the
+/// card.
+fn reads_back_whole<D, T, const MD: usize, const MF: usize, const MV: usize>(
     cache_root: &Directory<'_, D, T, MD, MF, MV>,
     side: usize,
-    count: u16,
+    header: LedgerHeader,
 ) -> Result<bool, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -423,10 +546,13 @@ where
     let file = cache_root
         .open_file_in_dir(LEDGER_FILES[side], Mode::ReadOnly)
         .map_err(|_| LedgerFault::Device)?;
+    if file.length() as usize != ledger_file_len(header.count) {
+        return Ok(false);
+    }
     file.seek_from_start(LEDGER_HEADER_BYTES as u32)
         .map_err(|_| LedgerFault::Device)?;
     let mut bytes = [0u8; LEDGER_RECORD_BYTES];
-    for _ in 0..count {
+    for _ in 0..header.count {
         if !read_exact(&file, &mut bytes)? || decode_ledger_record(&bytes).is_none() {
             return Ok(false);
         }

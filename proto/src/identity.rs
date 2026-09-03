@@ -86,7 +86,7 @@ pub const LEDGER_MAGIC: [u8; 4] = *b"X4LG";
 /// is the only acceptable way to change this format.
 pub const LEDGER_VERSION: u8 = 1;
 pub const LEDGER_HEADER_BYTES: usize = 16;
-pub const LEDGER_RECORD_BYTES: usize = 283;
+pub const LEDGER_RECORD_BYTES: usize = 284;
 
 // Header: magic | version | reserved (zero) | count u16 | generation u32 |
 // checksum u32 over everything before it.
@@ -97,18 +97,19 @@ const HEADER_GENERATION: usize = 8;
 const HEADER_CHECKSUM: usize = 12;
 const _: () = assert!(HEADER_CHECKSUM + 4 == LEDGER_HEADER_BYTES);
 
-// Record: id | root | locator length u16 | locator, zero padded | byte size
-// at adoption u32 | checksum u32 over everything before it.
+// Record: id | root | misses | locator length u16 | locator, zero padded |
+// byte size at adoption u32 | checksum u32 over everything before it.
 const RECORD_ID: usize = 0;
 const RECORD_ROOT: usize = BOOK_ID_BYTES;
-const RECORD_LOCATOR_LEN: usize = RECORD_ROOT + 1;
+const RECORD_MISSES: usize = RECORD_ROOT + 1;
+const RECORD_LOCATOR_LEN: usize = RECORD_MISSES + 1;
 const RECORD_LOCATOR: usize = RECORD_LOCATOR_LEN + 2;
 const RECORD_SIZE: usize = RECORD_LOCATOR + MAX_PATH_BYTES;
 const RECORD_CHECKSUM: usize = RECORD_SIZE + 4;
 const _: () = assert!(RECORD_CHECKSUM + 4 == LEDGER_RECORD_BYTES);
 
-/// One adopted copy: which id it carries, and the place and size it had
-/// when the record was written.
+/// One adopted copy: which id it carries, the place and size it had when
+/// the record was written, and how long it has been missing from there.
 ///
 /// The size is the cheap evidence a rebuild has that the file at a known
 /// locator is still the file that was adopted there. It is a filter and
@@ -123,6 +124,40 @@ pub struct LedgerRecord<'a> {
     /// Root-relative, exactly as the catalog stores it.
     pub locator: &'a str,
     pub byte_size: u32,
+    /// Consecutive scans in which no row on the card was this place. Zero
+    /// for a copy that is there. A record is carried while this stays
+    /// within [`MISSING_SCANS_RETAINED`] and left behind once it does not,
+    /// which is what keeps the ledger near the size of the live library
+    /// rather than the size of every book that ever passed through it.
+    pub misses: u8,
+}
+
+/// How many consecutive scans a copy may be missing before its record is
+/// left out of the next generation.
+///
+/// A missing record is what lets a book that was taken off the card and put
+/// back, or moved while the card was in a computer, be recognised as the
+/// copy it was rather than adopted afresh; the reconciliation that does the
+/// recognising is later work, and this keeps its evidence for it. The bound
+/// is what the identity design asks for and leaves to the implementation:
+/// a scan runs once per change to the card, so this is eight card edits
+/// during which the book stayed away. Missing records are also the first to
+/// go when a generation would not fit; see [`carry_missing`].
+pub const MISSING_SCANS_RETAINED: u8 = 8;
+
+/// Whether a record that named no row this scan is carried into the next
+/// generation, and with what `misses`.
+///
+/// `room` is how many more records the generation can hold once every live
+/// copy and every newly adopted one is in it. Live and new copies are what
+/// the library is, so they are counted first and a missing record only
+/// takes a slot that is left. Without that, a card that once held the most
+/// books a header can count and then lost them all would carry every stale
+/// record forever, and the first book added afterwards could not be
+/// adopted at all.
+pub fn carry_missing(misses: u8, room: usize) -> Option<u8> {
+    let aged = misses.saturating_add(1);
+    (aged <= MISSING_SCANS_RETAINED && room > 0).then_some(aged)
 }
 
 /// Encode one record. `None` when the locator does not fit, which a legal
@@ -138,6 +173,7 @@ pub fn encode_ledger_record(
     out.fill(0);
     out[RECORD_ID..RECORD_ROOT].copy_from_slice(&record.id.to_bytes());
     out[RECORD_ROOT] = root_byte(record.root);
+    out[RECORD_MISSES] = record.misses;
     out[RECORD_LOCATOR_LEN..RECORD_LOCATOR].copy_from_slice(&(locator.len() as u16).to_le_bytes());
     out[RECORD_LOCATOR..RECORD_LOCATOR + locator.len()].copy_from_slice(locator);
     out[RECORD_SIZE..RECORD_CHECKSUM].copy_from_slice(&record.byte_size.to_le_bytes());
@@ -169,6 +205,7 @@ pub fn decode_ledger_record(bytes: &[u8; LEDGER_RECORD_BYTES]) -> Option<LedgerR
         root,
         locator,
         byte_size,
+        misses: bytes[RECORD_MISSES],
     })
 }
 
@@ -396,6 +433,7 @@ mod tests {
             root: BookRoot::Library,
             locator: "History/Rome/SPQR.epub",
             byte_size: 1_234_567,
+            misses: 0,
         }
     }
 
@@ -409,10 +447,23 @@ mod tests {
         let loose = LedgerRecord {
             root: BookRoot::CardRoot,
             locator: "Dune.epub",
+            misses: 3,
             ..record
         };
         encode_ledger_record(&loose, &mut bytes).unwrap();
         assert_eq!(decode_ledger_record(&bytes), Some(loose));
+    }
+
+    #[test]
+    fn a_missing_record_ages_until_the_bound_and_yields_to_a_full_generation() {
+        assert_eq!(carry_missing(0, 1), Some(1));
+        assert_eq!(
+            carry_missing(MISSING_SCANS_RETAINED - 1, 1),
+            Some(MISSING_SCANS_RETAINED)
+        );
+        assert_eq!(carry_missing(MISSING_SCANS_RETAINED, 1), None);
+        assert_eq!(carry_missing(u8::MAX, usize::MAX), None);
+        assert_eq!(carry_missing(0, 0), None, "live and new copies come first");
     }
 
     #[test]
@@ -422,6 +473,7 @@ mod tests {
         for at in [
             0,
             RECORD_ROOT,
+            RECORD_MISSES,
             RECORD_LOCATOR_LEN,
             RECORD_LOCATOR + 3,
             RECORD_SIZE,

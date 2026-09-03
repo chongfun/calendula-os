@@ -130,14 +130,31 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
             esp_println::println!("sd: storage recovery unfinished; not rebuilding the catalog");
             Err(())
         } else {
-            // The 16 KB section text arena doubles as the scan's staging and
-            // identity scratch: a scan runs from the storage dispatcher
-            // (boot or an explicit refresh), never while a page render is
-            // reading the arena, and the section window is invalidated below
-            // so a stale page can't be served from clobbered text
-            // afterwards.
-            library.clear_catalog();
-            write_catalog_streaming(root, library.arena_as_scratch())
+            // The ledger is asked first, before the resident catalog is
+            // cleared or CATALOG.BIN is truncated. A ledger that refuses is
+            // durable identity state this build will not guess about, and
+            // the one safe answer is to change nothing: the committed catalog
+            // keeps serving the shelf as it was, and the next mount asks
+            // again.
+            match upload_store::ledger::open(root) {
+                Err(fault) => {
+                    esp_println::println!(
+                        "sd: library ledger {:?}; keeping the catalog for the next mount",
+                        fault
+                    );
+                    Err(())
+                }
+                Ok(ledger) => {
+                    // The 16 KB section text arena doubles as the scan's
+                    // staging and identity scratch: a scan runs from the
+                    // storage dispatcher (boot or an explicit refresh), never
+                    // while a page render is reading the arena, and the
+                    // section window is invalidated below so a stale page
+                    // can't be served from clobbered text afterwards.
+                    library.clear_catalog();
+                    write_catalog_streaming(root, library.arena_as_scratch(), ledger)
+                }
+            }
         };
         let status = match scanned {
             Ok(0) => LibraryScanStatus::Empty,
@@ -577,6 +594,7 @@ fn write_catalog_streaming<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     scratch: &mut [u8],
+    ledger: Option<upload_store::ledger::Ledger>,
 ) -> Result<u16, ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -703,13 +721,25 @@ where
     // a rescan next mount, the same as any other interrupted scan.
     let identity_start = Instant::now();
     let rng = esp_hal::rng::Rng::new();
-    let assigned =
-        upload_store::ledger::assign_book_ids(root, &file, count, scratch, &mut || rng.random())
-            .map_err(|fault| {
-                esp_println::println!("sd: library ledger refused: {:?}", fault);
-            })?;
+    let assigned = upload_store::ledger::assign_book_ids(
+        root,
+        &file,
+        count,
+        scratch,
+        &mut || rng.random(),
+        ledger,
+    )
+    .map_err(|fault| {
+        esp_println::println!("sd: library ledger refused: {:?}", fault);
+    })?;
     if assigned.minted > 0 {
         esp_println::println!("sd: adopted {} new book(s)", assigned.minted);
+    }
+    if assigned.retired > 0 {
+        esp_println::println!(
+            "sd: let go of {} book(s) long missing from the card",
+            assigned.retired
+        );
     }
     if assigned.duplicates > 0 {
         esp_println::println!(
@@ -718,9 +748,11 @@ where
         );
     }
     bench_log!(
-        "bench: storage_ledger action=assign matched={} minted={} duplicates={} elapsed_ms={} t_ms={}",
+        "bench: storage_ledger action=assign matched={} minted={} missing={} retired={} duplicates={} elapsed_ms={} t_ms={}",
         assigned.matched,
         assigned.minted,
+        assigned.missing,
+        assigned.retired,
         assigned.duplicates,
         identity_start.elapsed().as_millis(),
         Instant::now().as_millis(),

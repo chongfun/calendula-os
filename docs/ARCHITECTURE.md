@@ -768,19 +768,34 @@ committed as a ledger generation before the catalog header lands, so no
 committed row carries an id the ledger could lose. Two byte-identical files
 are two ids with independent state. A copy moved on a computer is a new id
 to this milestone, and the record of the copy that left stays as a missing
-book for the reconciliation that will match it by digest.
+book for the reconciliation that will match it by digest. Each record counts
+the consecutive scans its place has been missing; a missing record is carried
+for eight such scans and then left out, and missing records are the first to
+go when a generation would not fit beside the live library, so the ledger
+stays near the size of the library rather than of every book that ever
+passed through it. A scan that changes nothing writes nothing.
 
 The ledger is durable state where the catalog is a cache, so it is written
-the way positions are: whole, to the side that is not live, records first and
-a checksummed header last, so a power cut anywhere leaves the standing
-generation untouched. A reader takes the newer valid header, checks every
-record on that side, and falls back to the older side if one fails; the next
-rewrite goes over the damaged side. The join stages six-byte `(hash, row)`
-keys in the scan arena and reads the ledger once per 2,730 rows, so a rebuild
-costs one sequential pass over the ledger plus one row read and one 16-byte
-write per matched row, rather than a file open per book. Positions and
-caches still key by place; moving them onto `BookId` is the next milestone,
-together with the position-format migration in the reading-position work.
+the way positions are: whole, to the side that is not live. Records go down
+under a placeholder header and the file is closed at its final length; then
+the real header is written over the placeholder in a second open, so the
+commit is the last block to land and a power cut anywhere before it leaves
+the standing generation untouched and the other side uncommitted. A reader
+takes the newer committed header and checks the file's length and every
+record before believing it. A committed generation that does not read back
+whole is damage to durable identity state rather than an interrupted write,
+and it is refused, not fallen back from: the older side is missing every id
+the newer one added, and taking it would re-mint those and orphan whatever
+comes to hang from them. The scan asks the ledger before it touches the
+catalog, so a refusal leaves the committed catalog serving the shelf as it
+was and stops only rebuilds, until the intact records on both sides are
+salvaged by something explicit. The join stages six-byte `(hash, row)` keys
+in the scan arena behind one bit per ledger record and reads the ledger once
+per 2,730 rows, so a rebuild costs one sequential pass over the ledger plus
+one row read and one 16-byte write per matched row, rather than a file open
+per book. Positions and caches still key by place; moving them onto `BookId`
+is the next milestone, together with the position-format migration in the
+reading-position work.
 
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN
