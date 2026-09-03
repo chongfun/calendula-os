@@ -422,6 +422,8 @@ use core::ops::ControlFlow;
 use crate::{open_or_make_dir, remove_file_reclaiming_clusters, RemoveStatus};
 use embedded_sdmmc::{Directory, Mode, TimeSource};
 use proto::cache::{CACHE_ROOT_DIR, CATALOG_FILE};
+use proto::identity::Landing;
+use proto::library_path::BookRoot;
 use proto::source::{SourceDigest, SourceHasher};
 
 /// Why a step could not be carried out.
@@ -454,6 +456,21 @@ pub enum InstallError {
     /// until it is fixed on a computer. Unlike [`Self::Card`] a retry
     /// without changing the card cannot help.
     Ambiguous,
+    /// The library ledger refused: it is damaged, or of a version this build
+    /// does not read, so the copy being replaced cannot have its identity
+    /// looked up or recorded. The install is not started, or, after the swap,
+    /// the book is on the shelf with its intent standing for the next mount.
+    /// Nothing changes the shelf until the ledger is looked at.
+    Ledger,
+}
+
+/// What a refusal from the library ledger means to an install.
+fn ledger_error(fault: crate::ledger::LedgerFault) -> InstallError {
+    match fault {
+        crate::ledger::LedgerFault::Device => InstallError::Card,
+        crate::ledger::LedgerFault::Busy => InstallError::Busy,
+        _ => InstallError::Ledger,
+    }
 }
 
 /// What a recovery pass did, for the caller that has to decide whether its
@@ -1298,6 +1315,12 @@ where
             IntentState::Absent | IntentState::Truncated => {}
             IntentState::Valid(_) | IntentState::Unrecognized => return Err(InstallError::Busy),
         }
+        // The library's transaction too. A replacement whose landing has not
+        // been settled owns its place until it is, and nothing else may
+        // change the shelf while it stands.
+        if crate::replace::read(root).map_err(ledger_error)?.is_some() {
+            return Err(InstallError::Busy);
+        }
 
         let alias = proto::upload::upload_short_alias(long_name, 0);
         let stage = with_extension(alias.as_str(), ".TMP");
@@ -1352,10 +1375,16 @@ where
     /// are on no shelf. `Err` says why it could not be finished here, which
     /// does not always mean it will not happen: once the intent is durable, an
     /// install interrupted from this point is finished by the next mount.
+    ///
+    /// The library's own intent is published before the filesystem's and
+    /// settled after it, so the copy under this name keeps its `BookId`
+    /// across the swap; see [`crate::replace`]. `random` mints an id for a
+    /// place the ledger has not adopted.
     pub fn install(
         self,
         root: &Directory<'_, D, T, MD, MF, MV>,
         books: &Directory<'_, D, T, MD, MF, MV>,
+        random: &mut impl FnMut() -> u32,
     ) -> Result<Option<Landed>, InstallError> {
         let Self {
             file,
@@ -1437,6 +1466,28 @@ where
             long_name,
             old,
         };
+        // The library's intent first, durable before the filesystem
+        // transaction begins: which copy this is, what stood at its place,
+        // and which bytes are meant to land. Nothing below touches the shelf
+        // until it has returned.
+        let predecessor_size = match &intent.old {
+            Some(located) => Some(
+                books
+                    .find_directory_entry(located.alias.as_str())
+                    .map_err(|_| InstallError::Card)?
+                    .size,
+            ),
+            None => None,
+        };
+        crate::replace::begin(
+            root,
+            BookRoot::Library,
+            intent.long_name.as_str(),
+            source,
+            predecessor_size,
+            random,
+        )
+        .map_err(ledger_error)?;
         write_intent(root, &intent)?;
 
         if !recover_installs(root, books).complete {
@@ -1453,6 +1504,7 @@ where
         // or a card that lost the staged file. It stays because recovery after
         // a reset reaches these states for real.
         if !observe(root, books, &intent)?.dest {
+            crate::replace::settle(root, Landing::Old).map_err(ledger_error)?;
             return Ok(None);
         }
         // The retired book's label and identity now describe a name that is
@@ -1475,6 +1527,12 @@ where
             holder_of_long_name(books, intent.long_name.as_str()).ok_or(InstallError::Card)?;
         match holder {
             Some((alias, chain)) if chain.value() == intent.stage.chain => {
+                // The destination is this upload's chain, which is the file
+                // the digest was taken over, so the landing is known without
+                // reading the book again. A settle that fails leaves the
+                // intent standing for the next mount to resolve by reading
+                // the destination; the book is on the shelf either way.
+                crate::replace::settle(root, Landing::New).map_err(ledger_error)?;
                 Ok(Some(Landed { alias, source }))
             }
             // `observe` proved the destination was on this upload's chain a

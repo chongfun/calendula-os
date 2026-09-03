@@ -26,6 +26,7 @@
 
 use crate::catalog::{book_root, root_byte};
 use crate::library_path::{BookRoot, MAX_PATH_BYTES};
+use crate::source::{CachedSourceDigest, SourceDigest, SHA256_BYTES};
 
 /// Bytes in a [`BookId`].
 pub const BOOK_ID_BYTES: usize = 16;
@@ -86,7 +87,7 @@ pub const LEDGER_MAGIC: [u8; 4] = *b"X4LG";
 /// writes the new one, and a bump alone is not one.
 pub const LEDGER_VERSION: u8 = 1;
 pub const LEDGER_HEADER_BYTES: usize = 16;
-pub const LEDGER_RECORD_BYTES: usize = 284;
+pub const LEDGER_RECORD_BYTES: usize = 325;
 
 // Header: magic | version | reserved (zero) | count u16 | generation u32 |
 // checksum u32 over everything before it.
@@ -98,18 +99,23 @@ const HEADER_CHECKSUM: usize = 12;
 const _: () = assert!(HEADER_CHECKSUM + 4 == LEDGER_HEADER_BYTES);
 
 // Record: id | root | misses | locator length u16 | locator, zero padded |
-// byte size at adoption u32 | checksum u32 over everything before it.
+// byte size at adoption u32 | digest present u8 | digest byte length u64 |
+// sha256 | checksum u32 over everything before it.
 const RECORD_ID: usize = 0;
 const RECORD_ROOT: usize = BOOK_ID_BYTES;
 const RECORD_MISSES: usize = RECORD_ROOT + 1;
 const RECORD_LOCATOR_LEN: usize = RECORD_MISSES + 1;
 const RECORD_LOCATOR: usize = RECORD_LOCATOR_LEN + 2;
 const RECORD_SIZE: usize = RECORD_LOCATOR + MAX_PATH_BYTES;
-const RECORD_CHECKSUM: usize = RECORD_SIZE + 4;
+const RECORD_HAS_SOURCE: usize = RECORD_SIZE + 4;
+const RECORD_SOURCE_LEN: usize = RECORD_HAS_SOURCE + 1;
+const RECORD_SOURCE_SHA: usize = RECORD_SOURCE_LEN + 8;
+const RECORD_CHECKSUM: usize = RECORD_SOURCE_SHA + SHA256_BYTES;
 const _: () = assert!(RECORD_CHECKSUM + 4 == LEDGER_RECORD_BYTES);
 
 /// One adopted copy: which id it carries, the place and size it had when
-/// the record was written, and how long it has been missing from there.
+/// the record was written, how long it has been missing from there, and
+/// which bytes it held when they were last read whole.
 ///
 /// The size is the cheap evidence a rebuild has that the file at a known
 /// locator is still the file that was adopted there. It is a filter and
@@ -130,6 +136,12 @@ pub struct LedgerRecord<'a> {
     /// which is what keeps the ledger near the size of the live library
     /// rather than the size of every book that ever passed through it.
     pub misses: u8,
+    /// The identity of the copy's bytes, when something has read them: an
+    /// upload hashes what it streams, and a managed replacement records what
+    /// landed. `None` for a copy adopted from the card by place alone, whose
+    /// digest is computed only when something needs it. Evidence rather
+    /// than fact once it is on the card, which the type says.
+    pub source: Option<CachedSourceDigest>,
 }
 
 /// How many consecutive scans a copy may be missing before its record is
@@ -176,7 +188,12 @@ pub fn encode_ledger_record(
     out[RECORD_MISSES] = record.misses;
     out[RECORD_LOCATOR_LEN..RECORD_LOCATOR].copy_from_slice(&(locator.len() as u16).to_le_bytes());
     out[RECORD_LOCATOR..RECORD_LOCATOR + locator.len()].copy_from_slice(locator);
-    out[RECORD_SIZE..RECORD_CHECKSUM].copy_from_slice(&record.byte_size.to_le_bytes());
+    out[RECORD_SIZE..RECORD_HAS_SOURCE].copy_from_slice(&record.byte_size.to_le_bytes());
+    if let Some(source) = &record.source {
+        out[RECORD_HAS_SOURCE] = 1;
+        out[RECORD_SOURCE_LEN..RECORD_SOURCE_SHA].copy_from_slice(&source.byte_len().to_le_bytes());
+        out[RECORD_SOURCE_SHA..RECORD_CHECKSUM].copy_from_slice(source.sha256());
+    }
     let sum = fnv1a(&out[..RECORD_CHECKSUM]);
     out[RECORD_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
     Some(())
@@ -199,13 +216,26 @@ pub fn decode_ledger_record(bytes: &[u8; LEDGER_RECORD_BYTES]) -> Option<LedgerR
         return None;
     }
     let locator = core::str::from_utf8(&bytes[RECORD_LOCATOR..RECORD_LOCATOR + len]).ok()?;
-    let byte_size = u32::from_le_bytes(bytes[RECORD_SIZE..RECORD_CHECKSUM].try_into().ok()?);
+    let byte_size = u32::from_le_bytes(bytes[RECORD_SIZE..RECORD_HAS_SOURCE].try_into().ok()?);
+    let source = match bytes[RECORD_HAS_SOURCE] {
+        0 => None,
+        1 => Some(CachedSourceDigest::new(SourceDigest::from_parts(
+            u64::from_le_bytes(
+                bytes[RECORD_SOURCE_LEN..RECORD_SOURCE_SHA]
+                    .try_into()
+                    .ok()?,
+            ),
+            bytes[RECORD_SOURCE_SHA..RECORD_CHECKSUM].try_into().ok()?,
+        ))),
+        _ => return None,
+    };
     Some(LedgerRecord {
         id,
         root,
         locator,
         byte_size,
         misses: bytes[RECORD_MISSES],
+        source,
     })
 }
 
@@ -479,6 +509,263 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Managed replacement: the library intent that spans an install
+// ---------------------------------------------------------------------------
+
+pub const REPLACE_JOURNAL_MAGIC: [u8; 4] = *b"X4RI";
+pub const REPLACE_JOURNAL_VERSION: u8 = 1;
+/// One entry, at the start of its slot.
+pub const REPLACE_JOURNAL_BYTES: usize = 370;
+/// Kept the way the ledger journal is: two sector-sized slots written
+/// alternately with a sequence number, so a torn write leaves the entry
+/// before it.
+pub const REPLACE_JOURNAL_SLOT_BYTES: usize = 512;
+pub const REPLACE_JOURNAL_SLOTS: usize = 2;
+pub const REPLACE_JOURNAL_FILE_BYTES: usize = REPLACE_JOURNAL_SLOT_BYTES * REPLACE_JOURNAL_SLOTS;
+
+// Entry: magic | version | state | root | predecessor | id | locator length
+// u16 | locator, zero padded | old byte length u64 | old sha256 | new byte
+// length u64 | new sha256 | sequence u32 | checksum u32 over everything
+// before it. A cleared entry carries only its sequence.
+const REPLACE_VERSION: usize = 4;
+const REPLACE_STATE: usize = 5;
+const REPLACE_ROOT: usize = 6;
+const REPLACE_PREDECESSOR: usize = 7;
+const REPLACE_ID: usize = 8;
+const REPLACE_LOCATOR_LEN: usize = REPLACE_ID + BOOK_ID_BYTES;
+const REPLACE_LOCATOR: usize = REPLACE_LOCATOR_LEN + 2;
+const REPLACE_OLD_LEN: usize = REPLACE_LOCATOR + MAX_PATH_BYTES;
+const REPLACE_OLD_SHA: usize = REPLACE_OLD_LEN + 8;
+const REPLACE_NEW_LEN: usize = REPLACE_OLD_SHA + SHA256_BYTES;
+const REPLACE_NEW_SHA: usize = REPLACE_NEW_LEN + 8;
+const REPLACE_SEQUENCE: usize = REPLACE_NEW_SHA + SHA256_BYTES;
+const REPLACE_CHECKSUM: usize = REPLACE_SEQUENCE + 4;
+const _: () = assert!(REPLACE_CHECKSUM + 4 == REPLACE_JOURNAL_BYTES);
+const _: () = assert!(REPLACE_JOURNAL_BYTES <= REPLACE_JOURNAL_SLOT_BYTES);
+const REPLACE_CLEARED: u8 = 1;
+const REPLACE_STANDING: u8 = 2;
+const PREDECESSOR_NONE: u8 = 0;
+const PREDECESSOR_UNKNOWN: u8 = 1;
+const PREDECESSOR_KNOWN: u8 = 2;
+
+/// What held the destination when a managed replacement began.
+///
+/// The three cases resolve a landing differently, so the intent has to
+/// record which it was. A predecessor with a digest can be recognised by
+/// it. One without can only be recognised as "not the new bytes", which the
+/// sole-writer contract makes sufficient: nothing else was permitted to
+/// write while the intent stood. No predecessor at all means an install
+/// that rolled back leaves nothing at the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Predecessor {
+    None,
+    Unknown,
+    Known(CachedSourceDigest),
+}
+
+/// A managed replacement in flight: which copy is being replaced, where, by
+/// what bytes, and what was there before.
+///
+/// Written before the install begins, standing after `INSTALL.JNL` clears,
+/// and cleared once the ledger record says what landed. It is what lets a
+/// power cut anywhere in between keep the copy's id: the filesystem
+/// transaction decides which bytes the destination holds, and this decides
+/// what that means for identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplaceIntent<'a> {
+    pub id: BookId,
+    pub root: BookRoot,
+    /// Root-relative, exactly as the catalog stores it.
+    pub locator: &'a str,
+    pub predecessor: Predecessor,
+    /// The bytes that are meant to land, hashed as they were streamed.
+    pub new: CachedSourceDigest,
+}
+
+/// One entry of the replacement journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplaceJournal<'a> {
+    /// No replacement in flight.
+    Cleared,
+    Standing(ReplaceIntent<'a>),
+}
+
+/// Encode one entry with its sequence number. `None` when the locator does
+/// not fit, which a legal [`crate::library_path::LibraryPath`] cannot reach.
+pub fn encode_replace_journal(
+    entry: &ReplaceJournal<'_>,
+    sequence: u32,
+    out: &mut [u8; REPLACE_JOURNAL_BYTES],
+) -> Option<()> {
+    out.fill(0);
+    out[..4].copy_from_slice(&REPLACE_JOURNAL_MAGIC);
+    out[REPLACE_VERSION] = REPLACE_JOURNAL_VERSION;
+    match entry {
+        ReplaceJournal::Cleared => out[REPLACE_STATE] = REPLACE_CLEARED,
+        ReplaceJournal::Standing(intent) => {
+            let locator = intent.locator.as_bytes();
+            if locator.len() > MAX_PATH_BYTES {
+                return None;
+            }
+            out[REPLACE_STATE] = REPLACE_STANDING;
+            out[REPLACE_ROOT] = root_byte(intent.root);
+            out[REPLACE_ID..REPLACE_LOCATOR_LEN].copy_from_slice(&intent.id.to_bytes());
+            out[REPLACE_LOCATOR_LEN..REPLACE_LOCATOR]
+                .copy_from_slice(&(locator.len() as u16).to_le_bytes());
+            out[REPLACE_LOCATOR..REPLACE_LOCATOR + locator.len()].copy_from_slice(locator);
+            out[REPLACE_PREDECESSOR] = match intent.predecessor {
+                Predecessor::None => PREDECESSOR_NONE,
+                Predecessor::Unknown => PREDECESSOR_UNKNOWN,
+                Predecessor::Known(old) => {
+                    out[REPLACE_OLD_LEN..REPLACE_OLD_SHA]
+                        .copy_from_slice(&old.byte_len().to_le_bytes());
+                    out[REPLACE_OLD_SHA..REPLACE_NEW_LEN].copy_from_slice(old.sha256());
+                    PREDECESSOR_KNOWN
+                }
+            };
+            out[REPLACE_NEW_LEN..REPLACE_NEW_SHA]
+                .copy_from_slice(&intent.new.byte_len().to_le_bytes());
+            out[REPLACE_NEW_SHA..REPLACE_SEQUENCE].copy_from_slice(intent.new.sha256());
+        }
+    }
+    out[REPLACE_SEQUENCE..REPLACE_CHECKSUM].copy_from_slice(&sequence.to_le_bytes());
+    let sum = fnv1a(&out[..REPLACE_CHECKSUM]);
+    out[REPLACE_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
+    Some(())
+}
+
+/// What the bytes at the start of one replacement-journal slot say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplaceJournalReading<'a> {
+    /// All zero. Nothing was ever written here.
+    Blank,
+    Entry {
+        entry: ReplaceJournal<'a>,
+        sequence: u32,
+    },
+    /// The journal's magic under a version this build does not read.
+    UnknownVersion(u8),
+    /// None of the above: a write torn by a power cut, an entry damaged
+    /// after it landed, or not a journal.
+    Damaged,
+}
+
+/// Read one slot without guessing, the way [`classify_ledger_journal`] does.
+pub fn classify_replace_journal(bytes: &[u8; REPLACE_JOURNAL_BYTES]) -> ReplaceJournalReading<'_> {
+    if bytes.iter().all(|byte| *byte == 0) {
+        return ReplaceJournalReading::Blank;
+    }
+    if bytes[..4] != REPLACE_JOURNAL_MAGIC {
+        return ReplaceJournalReading::Damaged;
+    }
+    // Version zero is a write torn just past the magic, over zeros.
+    if bytes[REPLACE_VERSION] == 0 {
+        return ReplaceJournalReading::Damaged;
+    }
+    if bytes[REPLACE_VERSION] != REPLACE_JOURNAL_VERSION {
+        return ReplaceJournalReading::UnknownVersion(bytes[REPLACE_VERSION]);
+    }
+    let stored = u32::from_le_bytes([
+        bytes[REPLACE_CHECKSUM],
+        bytes[REPLACE_CHECKSUM + 1],
+        bytes[REPLACE_CHECKSUM + 2],
+        bytes[REPLACE_CHECKSUM + 3],
+    ]);
+    if fnv1a(&bytes[..REPLACE_CHECKSUM]) != stored {
+        return ReplaceJournalReading::Damaged;
+    }
+    let sequence = u32::from_le_bytes([
+        bytes[REPLACE_SEQUENCE],
+        bytes[REPLACE_SEQUENCE + 1],
+        bytes[REPLACE_SEQUENCE + 2],
+        bytes[REPLACE_SEQUENCE + 3],
+    ]);
+    let entry = match bytes[REPLACE_STATE] {
+        REPLACE_CLEARED => ReplaceJournal::Cleared,
+        REPLACE_STANDING => {
+            let Some(id) =
+                BookId::from_bytes(match bytes[REPLACE_ID..REPLACE_LOCATOR_LEN].try_into() {
+                    Ok(id) => id,
+                    Err(_) => return ReplaceJournalReading::Damaged,
+                })
+            else {
+                return ReplaceJournalReading::Damaged;
+            };
+            let Some(root) = book_root(bytes[REPLACE_ROOT]) else {
+                return ReplaceJournalReading::Damaged;
+            };
+            let len =
+                u16::from_le_bytes([bytes[REPLACE_LOCATOR_LEN], bytes[REPLACE_LOCATOR_LEN + 1]])
+                    as usize;
+            if len > MAX_PATH_BYTES {
+                return ReplaceJournalReading::Damaged;
+            }
+            let Ok(locator) = core::str::from_utf8(&bytes[REPLACE_LOCATOR..REPLACE_LOCATOR + len])
+            else {
+                return ReplaceJournalReading::Damaged;
+            };
+            let digest_at = |len_at: usize, sha_at: usize| {
+                let mut len = [0u8; 8];
+                len.copy_from_slice(&bytes[len_at..len_at + 8]);
+                let mut sha = [0u8; SHA256_BYTES];
+                sha.copy_from_slice(&bytes[sha_at..sha_at + SHA256_BYTES]);
+                CachedSourceDigest::new(SourceDigest::from_parts(u64::from_le_bytes(len), sha))
+            };
+            let predecessor = match bytes[REPLACE_PREDECESSOR] {
+                PREDECESSOR_NONE => Predecessor::None,
+                PREDECESSOR_UNKNOWN => Predecessor::Unknown,
+                PREDECESSOR_KNOWN => {
+                    Predecessor::Known(digest_at(REPLACE_OLD_LEN, REPLACE_OLD_SHA))
+                }
+                _ => return ReplaceJournalReading::Damaged,
+            };
+            ReplaceJournal::Standing(ReplaceIntent {
+                id,
+                root,
+                locator,
+                predecessor,
+                new: digest_at(REPLACE_NEW_LEN, REPLACE_NEW_SHA),
+            })
+        }
+        _ => return ReplaceJournalReading::Damaged,
+    };
+    ReplaceJournalReading::Entry { entry, sequence }
+}
+
+/// Which side of a replacement the destination holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landing {
+    /// The new bytes: the copy keeps its id and takes the new digest.
+    New,
+    /// What stood before, or nothing where nothing stood: the record is left
+    /// as it was.
+    Old,
+}
+
+/// Decide a landing from what the destination holds now, or `None` when
+/// neither side can be established and the intent has to stand.
+///
+/// `destination` is the digest of the file at the locator, freshly computed,
+/// or `None` for no file. The rules are the identity design's: the new
+/// digest is decisive; a known predecessor is recognised by its digest; an
+/// unknown one is recognised as any file that is not the new bytes, which
+/// holds only because nothing else may write while the intent stands; and
+/// where nothing stood, nothing standing is the old landing.
+pub fn landing(
+    predecessor: &Predecessor,
+    new: &CachedSourceDigest,
+    destination: Option<&SourceDigest>,
+) -> Option<Landing> {
+    match (destination, predecessor) {
+        (Some(found), _) if new.agrees_with(found) => Some(Landing::New),
+        (Some(found), Predecessor::Known(old)) if old.agrees_with(found) => Some(Landing::Old),
+        (Some(_), Predecessor::Unknown) => Some(Landing::Old),
+        (None, Predecessor::None) => Some(Landing::Old),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Row keys: the in-RAM side of the join between a fresh catalog and the ledger
 // ---------------------------------------------------------------------------
 
@@ -649,7 +936,12 @@ mod tests {
             locator: "History/Rome/SPQR.epub",
             byte_size: 1_234_567,
             misses: 0,
+            source: None,
         }
+    }
+
+    fn digest(seed: u8) -> CachedSourceDigest {
+        CachedSourceDigest::new(SourceDigest::from_parts(1_234_567, [seed; SHA256_BYTES]))
     }
 
     #[test]
@@ -663,10 +955,160 @@ mod tests {
             root: BookRoot::CardRoot,
             locator: "Dune.epub",
             misses: 3,
+            source: Some(digest(0xA5)),
             ..record
         };
         encode_ledger_record(&loose, &mut bytes).unwrap();
         assert_eq!(decode_ledger_record(&bytes), Some(loose));
+        // A present flag past the two values it can take is not a record.
+        bytes[RECORD_HAS_SOURCE] = 2;
+        let sum = fnv1a(&bytes[..RECORD_CHECKSUM]);
+        bytes[RECORD_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
+        assert_eq!(decode_ledger_record(&bytes), None);
+    }
+
+    #[test]
+    fn a_replacement_intent_round_trips_and_reads_without_guessing() {
+        let id = BookId::from_bytes([3u8; BOOK_ID_BYTES]).unwrap();
+        let entries = [
+            ReplaceJournal::Cleared,
+            ReplaceJournal::Standing(ReplaceIntent {
+                id,
+                root: BookRoot::Library,
+                locator: "Fiction/Dune.epub",
+                predecessor: Predecessor::None,
+                new: digest(1),
+            }),
+            ReplaceJournal::Standing(ReplaceIntent {
+                id,
+                root: BookRoot::CardRoot,
+                locator: "Dune.epub",
+                predecessor: Predecessor::Unknown,
+                new: digest(2),
+            }),
+            ReplaceJournal::Standing(ReplaceIntent {
+                id,
+                root: BookRoot::Library,
+                locator: "Dune.epub",
+                predecessor: Predecessor::Known(digest(3)),
+                new: digest(4),
+            }),
+        ];
+        for entry in entries {
+            let mut bytes = [0u8; REPLACE_JOURNAL_BYTES];
+            encode_replace_journal(&entry, 77, &mut bytes).unwrap();
+            assert_eq!(
+                classify_replace_journal(&bytes),
+                ReplaceJournalReading::Entry {
+                    entry,
+                    sequence: 77
+                },
+                "{entry:?}"
+            );
+            for at in [
+                0,
+                REPLACE_STATE,
+                REPLACE_ROOT,
+                REPLACE_PREDECESSOR,
+                REPLACE_ID,
+                REPLACE_LOCATOR_LEN,
+                REPLACE_LOCATOR + 2,
+                REPLACE_OLD_SHA,
+                REPLACE_NEW_LEN,
+                REPLACE_SEQUENCE,
+                REPLACE_CHECKSUM + 3,
+            ] {
+                let mut torn = bytes;
+                torn[at] ^= 0x04;
+                assert_eq!(
+                    classify_replace_journal(&torn),
+                    ReplaceJournalReading::Damaged,
+                    "{entry:?}, flipped byte {at}"
+                );
+            }
+            let mut other = bytes;
+            other[REPLACE_VERSION] = REPLACE_JOURNAL_VERSION + 1;
+            assert_eq!(
+                classify_replace_journal(&other),
+                ReplaceJournalReading::UnknownVersion(REPLACE_JOURNAL_VERSION + 1)
+            );
+            for landed in 1..REPLACE_JOURNAL_BYTES {
+                let mut torn = [0u8; REPLACE_JOURNAL_BYTES];
+                torn[..landed].copy_from_slice(&bytes[..landed]);
+                assert_eq!(
+                    classify_replace_journal(&torn),
+                    ReplaceJournalReading::Damaged,
+                    "{entry:?}, {landed} bytes landed"
+                );
+            }
+        }
+        assert_eq!(
+            classify_replace_journal(&[0u8; REPLACE_JOURNAL_BYTES]),
+            ReplaceJournalReading::Blank
+        );
+        let long = core::str::from_utf8(&[b'a'; MAX_PATH_BYTES + 1]).unwrap();
+        let mut bytes = [0u8; REPLACE_JOURNAL_BYTES];
+        assert_eq!(
+            encode_replace_journal(
+                &ReplaceJournal::Standing(ReplaceIntent {
+                    id,
+                    root: BookRoot::Library,
+                    locator: long,
+                    predecessor: Predecessor::None,
+                    new: digest(1),
+                }),
+                1,
+                &mut bytes
+            ),
+            None
+        );
+    }
+
+    /// The identity design's resolution table, one row at a time.
+    #[test]
+    fn a_landing_is_decided_by_what_the_destination_holds() {
+        let new = digest(1);
+        let old = digest(2);
+        let stranger = SourceDigest::from_parts(1_234_567, [9u8; SHA256_BYTES]);
+        let new_bytes = SourceDigest::from_parts(1_234_567, [1u8; SHA256_BYTES]);
+        let old_bytes = SourceDigest::from_parts(1_234_567, [2u8; SHA256_BYTES]);
+        for predecessor in [
+            Predecessor::None,
+            Predecessor::Unknown,
+            Predecessor::Known(old),
+        ] {
+            assert_eq!(
+                landing(&predecessor, &new, Some(&new_bytes)),
+                Some(Landing::New),
+                "{predecessor:?}: the new bytes are decisive"
+            );
+        }
+        assert_eq!(
+            landing(&Predecessor::Known(old), &new, Some(&old_bytes)),
+            Some(Landing::Old)
+        );
+        assert_eq!(
+            landing(&Predecessor::Known(old), &new, Some(&stranger)),
+            None,
+            "a known predecessor is recognised by its digest and nothing else"
+        );
+        assert_eq!(
+            landing(&Predecessor::Known(old), &new, None),
+            None,
+            "a predecessor that is gone is no landing"
+        );
+        assert_eq!(
+            landing(&Predecessor::Unknown, &new, Some(&stranger)),
+            Some(Landing::Old),
+            "under the sole-writer contract, not the new bytes means the old"
+        );
+        assert_eq!(landing(&Predecessor::Unknown, &new, None), None);
+        assert_eq!(landing(&Predecessor::None, &new, None), Some(Landing::Old));
+        assert_eq!(
+            landing(&Predecessor::None, &new, Some(&stranger)),
+            None,
+            "where nothing stood, a stranger is not a landing"
+        );
     }
 
     #[test]
@@ -692,6 +1134,8 @@ mod tests {
             RECORD_LOCATOR_LEN,
             RECORD_LOCATOR + 3,
             RECORD_SIZE,
+            RECORD_HAS_SOURCE,
+            RECORD_SOURCE_SHA + 5,
             RECORD_CHECKSUM,
         ] {
             let mut torn = bytes;

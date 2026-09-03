@@ -376,11 +376,43 @@ where
             };
         }
     }
-    let outcome = upload_store::install::recover_installs(root, &books);
+    let mut outcome = upload_store::install::recover_installs(root, &books);
     #[cfg(feature = "powercut-selftest")]
     crate::powercut::report_recovery(&outcome);
     if outcome.touched_shelf {
         esp_println::println!("sd: finished an interrupted install");
+    }
+    // The library's own transaction, after the filesystem's and not before.
+    // A replacement whose intent still stands has a destination the
+    // filesystem has now settled, and the ledger has to be told what that
+    // means before any scan reads the place as a stranger and mints for it.
+    if outcome.complete {
+        match upload_store::replace::recover(root) {
+            Ok(upload_store::replace::Recovery::Nothing) => {}
+            Ok(upload_store::replace::Recovery::Settled(landed)) => {
+                esp_println::println!("sd: settled a replacement in flight ({:?})", landed);
+                // The shelf changed under whatever snapshot predates it.
+                outcome.had_intent = true;
+            }
+            Ok(upload_store::replace::Recovery::Refused) => {
+                esp_println::println!(
+                    "sd: a replacement is unresolved; not rebuilding the catalog"
+                );
+                return Reconciled {
+                    outcome,
+                    shelf_readable: true,
+                    may_mutate: false,
+                };
+            }
+            Err(fault) => {
+                esp_println::println!("sd: library ledger {:?}; not rebuilding the catalog", fault);
+                return Reconciled {
+                    outcome,
+                    shelf_readable: true,
+                    may_mutate: false,
+                };
+            }
+        }
     }
     if !outcome.swept {
         // Invisible to the reader either way; the next mount tries again.

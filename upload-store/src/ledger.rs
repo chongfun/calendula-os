@@ -64,6 +64,11 @@
 //! book to this milestone, and its old record stays in the ledger as a
 //! missing copy, for a bounded number of scans, so that the reconciliation
 //! that recognises the move by digest has something to match when it lands.
+//! The one place a copy's bytes change under its id is a managed
+//! replacement, which [`crate::replace`] carries across the install and
+//! publishes here through [`publish_record`].
+
+use core::cell::Cell;
 
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use proto::cache::{source_hash_at, CACHE_ROOT_DIR};
@@ -77,9 +82,11 @@ use proto::identity::{
     encode_ledger_header, encode_ledger_journal, encode_ledger_placeholder_header,
     encode_ledger_record, ledger_file_len, rows_with_hash, sort_row_keys, stage_row_key, BookId,
     LedgerHeader, LedgerHeaderReading, LedgerJournal, LedgerJournalReading, LedgerRecord,
-    LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_JOURNAL_FILE_BYTES, LEDGER_JOURNAL_SLOTS,
-    LEDGER_JOURNAL_SLOT_BYTES, LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
+    LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_JOURNAL_SLOTS, LEDGER_JOURNAL_SLOT_BYTES,
+    LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
 };
+use proto::library_path::BookRoot;
+use proto::source::CachedSourceDigest;
 
 /// The two generations, under the cache root.
 pub const LEDGER_FILES: [&str; 2] = ["LEDGERA.BIN", "LEDGERB.BIN"];
@@ -100,7 +107,7 @@ pub enum LedgerFault {
     /// The ledger is not as its journal says, or something in it does not
     /// read: the live side is missing, empty, or holds a header other than
     /// the one recorded; the live generation's records or length do not
-    /// match its header; a header or the journal is bytes this build did not
+    /// match its header; a header or a journal is bytes this build did not
     /// write; or there are ledger files with no journal to account for
     /// them. That is durable identity state damaged after it landed, and
     /// taking whatever else is on the card in its place would re-mint every
@@ -112,6 +119,9 @@ pub enum LedgerFault {
     /// build does not read, written by another build. Refused for the same
     /// reason as damage: the ids it holds cannot come back from the card.
     Unreadable,
+    /// A managed replacement is in flight. Until it settles nothing may
+    /// begin another, and nothing may adopt at its locator by guessing.
+    Busy,
     /// More copies than a generation can hold once the live and newly
     /// adopted ones are counted. Missing records yield first, so this is a
     /// library past the catalog's own ceiling.
@@ -292,6 +302,54 @@ where
     Ok(())
 }
 
+/// The live record naming a place, if one does: its id and what it says
+/// about the copy's bytes. The first in ledger order, as the scan's join
+/// takes it.
+pub fn find_record<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+    ledger: &Ledger,
+    at: BookRoot,
+    locator: &str,
+    byte_size: u32,
+) -> Result<Option<(BookId, Option<CachedSourceDigest>)>, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut found: Option<(BookId, Option<CachedSourceDigest>)> = None;
+    for_each_record(root, ledger, &mut |_, record| {
+        if found.is_none()
+            && record.root == at
+            && record.locator == locator
+            && record.byte_size == byte_size
+        {
+            found = Some((record.id, record.source));
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+/// What a carried record is written with: everything but its id, root and
+/// locator, which a carry cannot change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub byte_size: u32,
+    pub misses: u8,
+    pub source: Option<CachedSourceDigest>,
+}
+
+impl Kept {
+    /// Carry a record exactly as it is.
+    pub fn of(record: &LedgerRecord<'_>) -> Self {
+        Self {
+            byte_size: record.byte_size,
+            misses: record.misses,
+            source: record.source,
+        }
+    }
+}
+
 /// Appends records to the generation being written. See [`write_generation`].
 pub struct LedgerWriter<'f, 'd, D, T, const MD: usize, const MF: usize, const MV: usize>
 where
@@ -323,9 +381,8 @@ where
 }
 
 /// Write the next generation: the records of `previous` that `carry` keeps,
-/// each with the `misses` it returns, then whatever `fill` appends, and then
-/// the header that commits it, with the journal saying throughout what is
-/// going on.
+/// each as it says, then whatever `fill` appends, and then the header that
+/// commits it, with the journal saying throughout what is going on.
 ///
 /// The target is the side `previous` is not on, so `previous` stands
 /// untouched until the new header has landed and read back. `fill` is
@@ -335,7 +392,7 @@ where
 pub fn write_generation<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     previous: Option<&Ledger>,
-    carry: &mut impl FnMut(u16, &LedgerRecord<'_>) -> Option<u8>,
+    carry: &mut impl FnMut(u16, &LedgerRecord<'_>) -> Option<Kept>,
     fill: impl FnOnce(&mut LedgerWriter<'_, '_, D, T, MD, MF, MV>) -> Result<(), LedgerFault>,
 ) -> Result<Ledger, LedgerFault>
 where
@@ -392,10 +449,15 @@ where
                     return Err(LedgerFault::Device);
                 }
                 let record = decode_ledger_record(&bytes).ok_or(LedgerFault::Device)?;
-                let Some(misses) = carry(index, &record) else {
+                let Some(kept) = carry(index, &record) else {
                     continue;
                 };
-                let kept = LedgerRecord { misses, ..record };
+                let kept = LedgerRecord {
+                    byte_size: kept.byte_size,
+                    misses: kept.misses,
+                    source: kept.source,
+                    ..record
+                };
                 let mut out = [0u8; LEDGER_RECORD_BYTES];
                 encode_ledger_record(&kept, &mut out).ok_or(LedgerFault::Record)?;
                 file.write(&out).map_err(|_| LedgerFault::Device)?;
@@ -455,6 +517,52 @@ where
         generation,
         count,
     })
+}
+
+/// Publish one record: the record with its id, if the ledger holds one, is
+/// rewritten to say what `record` says, and otherwise `record` is appended.
+/// The rest of the generation is carried as it is.
+///
+/// This is how a managed replacement lands in the ledger: the copy keeps
+/// its id and takes the size and digest of the bytes that replaced it. It
+/// is a whole generation rewrite, which is what every change to the ledger
+/// is, and is committed before this returns.
+pub fn publish_record<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+    ledger: Option<Ledger>,
+    record: &LedgerRecord<'_>,
+) -> Result<Ledger, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let replaced = Cell::new(false);
+    let published = Kept {
+        byte_size: record.byte_size,
+        misses: 0,
+        source: record.source,
+    };
+    write_generation(
+        root,
+        ledger.as_ref(),
+        &mut |_, entry| {
+            if entry.id == record.id {
+                replaced.set(true);
+                Some(published)
+            } else {
+                Some(Kept::of(entry))
+            }
+        },
+        |writer| {
+            if !replaced.get() {
+                writer.append(&LedgerRecord {
+                    misses: 0,
+                    ..*record
+                })?;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// What [`assign_book_ids`] did, for the caller that reports it.
@@ -607,13 +715,19 @@ where
         ledger.as_ref(),
         &mut |index, entry| {
             if bit(named, index) {
-                return Some(0);
+                return Some(Kept {
+                    misses: 0,
+                    ..Kept::of(entry)
+                });
             }
             match carry_missing(entry.misses, room.saturating_sub(carried_missing)) {
                 Some(misses) => {
                     carried_missing += 1;
                     *missing += 1;
-                    Some(misses)
+                    Some(Kept {
+                        misses,
+                        ..Kept::of(entry)
+                    })
                 }
                 None => {
                     *retired += 1;
@@ -639,6 +753,7 @@ where
                     locator,
                     byte_size,
                     misses: 0,
+                    source: None,
                 })?;
                 // Leaves the cursor at the next row, where the read above
                 // expects it.
@@ -659,24 +774,50 @@ fn set_bit(bits: &mut [u8], index: u16) {
     bits[index as usize / 8] |= 1 << (index % 8);
 }
 
-/// The journal's newest entry that reads, with the slot it is in and its
-/// sequence number, or `None` for a card that has no journal: no file, or
-/// an empty one, which is what a cut during its first creation leaves
-/// before any side has been touched, or two blank slots.
+// ---------------------------------------------------------------------------
+// Two-slot journals
+// ---------------------------------------------------------------------------
+
+/// What a caller's classifier says about one slot of a two-slot journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotVerdict {
+    /// All zero: nothing was ever written here.
+    Blank,
+    /// An entry, ordered against the other slot's by this sequence number.
+    Entry(u32),
+    /// An entry of a version this build does not read.
+    UnknownVersion,
+    /// A write torn by a power cut, or damage, or not a journal.
+    Damaged,
+}
+
+/// The slot files in this crate are all kept the same way: two sector-sized
+/// slots, an entry at the start of each, written alternately with a
+/// sequence number one past the entry being superseded.
+pub(crate) const SLOT_BYTES: usize = LEDGER_JOURNAL_SLOT_BYTES;
+pub(crate) const SLOT_COUNT: usize = LEDGER_JOURNAL_SLOTS;
+const SLOT_FILE_BYTES: usize = SLOT_BYTES * SLOT_COUNT;
+
+/// The newest slot of `name` that reads: its first `N` bytes, its index and
+/// its sequence. `None` for a journal that has no entry yet: no file, an
+/// empty one, which is what a cut during its first creation leaves, or two
+/// blank slots.
 ///
 /// Of two entries the newer by sequence wins. Beside an entry, a slot that
 /// is blank or does not read is the slot a later write was torn in, and the
 /// entry stands. A journal with no entry that reads, or of a length this
-/// build did not write, is an error, not an absence; so is an entry of a
-/// version this build does not read, in either slot.
-fn journal_slots<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// crate did not write, is [`LedgerFault::Damaged`]; an entry of a version
+/// this build does not read, in either slot, is [`LedgerFault::Unreadable`].
+pub(crate) fn newest_slot<D, T, const MD: usize, const MF: usize, const MV: usize, const N: usize>(
     cache_root: &Directory<'_, D, T, MD, MF, MV>,
-) -> Result<Option<(LedgerJournal, usize, u32)>, LedgerFault>
+    name: &str,
+    classify: impl Fn(&[u8; N]) -> SlotVerdict,
+) -> Result<Option<([u8; N], usize, u32)>, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let file = match cache_root.open_file_in_dir(LEDGER_JOURNAL, Mode::ReadOnly) {
+    let file = match cache_root.open_file_in_dir(name, Mode::ReadOnly) {
         Ok(file) => file,
         Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
         Err(_) => return Err(LedgerFault::Device),
@@ -684,46 +825,41 @@ where
     if file.length() == 0 {
         return Ok(None);
     }
-    if file.length() as usize != LEDGER_JOURNAL_FILE_BYTES {
+    if file.length() as usize != SLOT_FILE_BYTES {
         return Err(LedgerFault::Damaged);
     }
-    let mut readings = [LedgerJournalReading::Blank; LEDGER_JOURNAL_SLOTS];
-    let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
-    for (index, reading) in readings.iter_mut().enumerate() {
-        file.seek_from_start((index * LEDGER_JOURNAL_SLOT_BYTES) as u32)
+    let mut slots = [[0u8; N]; SLOT_COUNT];
+    let mut verdicts = [SlotVerdict::Blank; SLOT_COUNT];
+    for (index, slot) in slots.iter_mut().enumerate() {
+        file.seek_from_start((index * SLOT_BYTES) as u32)
             .map_err(|_| LedgerFault::Device)?;
-        if !read_exact(&file, &mut bytes)? {
+        if !read_exact(&file, slot)? {
             return Err(LedgerFault::Damaged);
         }
-        *reading = classify_ledger_journal(&bytes);
+        verdicts[index] = classify(slot);
     }
-    if readings
-        .iter()
-        .any(|reading| matches!(reading, LedgerJournalReading::UnknownVersion(_)))
-    {
+    if verdicts.contains(&SlotVerdict::UnknownVersion) {
         return Err(LedgerFault::Unreadable);
     }
-    let mut newest: Option<(LedgerJournal, usize, u32)> = None;
-    for (index, reading) in readings.iter().enumerate() {
-        let LedgerJournalReading::Entry { entry, sequence } = *reading else {
+    let mut newest: Option<(usize, u32)> = None;
+    for (index, verdict) in verdicts.iter().enumerate() {
+        let SlotVerdict::Entry(sequence) = *verdict else {
             continue;
         };
         newest = match newest {
-            None => Some((entry, index, sequence)),
-            Some((_, _, held)) if generation_is_newer(sequence, held) => {
-                Some((entry, index, sequence))
-            }
+            None => Some((index, sequence)),
+            Some((_, held)) if generation_is_newer(sequence, held) => Some((index, sequence)),
             // Two entries one sequence apart are the two most recent writes;
             // equal sequence numbers are nothing this writer produces.
-            Some((_, _, held)) if held == sequence => return Err(LedgerFault::Damaged),
+            Some((_, held)) if held == sequence => return Err(LedgerFault::Damaged),
             Some(kept) => Some(kept),
         };
     }
     match newest {
-        Some(found) => Ok(Some(found)),
-        None if readings
+        Some((index, sequence)) => Ok(Some((slots[index], index, sequence))),
+        None if verdicts
             .iter()
-            .all(|reading| *reading == LedgerJournalReading::Blank) =>
+            .all(|verdict| *verdict == SlotVerdict::Blank) =>
         {
             Ok(None)
         }
@@ -731,29 +867,39 @@ where
     }
 }
 
-/// Publish `entry` into the slot the newest entry is not in, one sequence
-/// past it. The file is created whole the first time and never truncated
-/// after, so a torn write damages one slot and the entry before it stands.
-fn write_journal<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// Publish an entry into the slot the newest entry is not in, one sequence
+/// past it. `current` is what [`newest_slot`] found. The file is created
+/// whole the first time and never truncated after, so a torn write damages
+/// one slot and the entry before it stands.
+pub(crate) fn publish_slot<
+    D,
+    T,
+    const MD: usize,
+    const MF: usize,
+    const MV: usize,
+    const N: usize,
+>(
     cache_root: &Directory<'_, D, T, MD, MF, MV>,
-    entry: LedgerJournal,
+    name: &str,
+    current: Option<(usize, u32)>,
+    encode: impl FnOnce(u32, &mut [u8; N]) -> Result<(), LedgerFault>,
 ) -> Result<(), LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let (slot, sequence) = match journal_slots(cache_root)? {
-        Some((_, held, sequence)) => ((held + 1) % LEDGER_JOURNAL_SLOTS, sequence.wrapping_add(1)),
+    let (slot, sequence) = match current {
+        Some((held, sequence)) => ((held + 1) % SLOT_COUNT, sequence.wrapping_add(1)),
         None => (0, 1),
     };
-    let mut block = [0u8; LEDGER_JOURNAL_SLOT_BYTES];
-    let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
-    encode_ledger_journal(entry, sequence, &mut bytes);
-    block[..LEDGER_JOURNAL_BYTES].copy_from_slice(&bytes);
-    let file = match cache_root.open_file_in_dir(LEDGER_JOURNAL, Mode::ReadWriteAppend) {
+    let mut block = [0u8; SLOT_BYTES];
+    let mut entry = [0u8; N];
+    encode(sequence, &mut entry)?;
+    block[..N].copy_from_slice(&entry);
+    let file = match cache_root.open_file_in_dir(name, Mode::ReadWriteAppend) {
         Ok(file) => file,
         Err(embedded_sdmmc::Error::NotFound) => cache_root
-            .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadWriteCreate)
+            .open_file_in_dir(name, Mode::ReadWriteCreate)
             .map_err(|_| LedgerFault::Device)?,
         Err(_) => return Err(LedgerFault::Device),
     };
@@ -762,14 +908,59 @@ where
         // before it closed: both slots, the entry in the first.
         file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
         file.write(&block).map_err(|_| LedgerFault::Device)?;
-        let blank = [0u8; LEDGER_JOURNAL_SLOT_BYTES];
+        let blank = [0u8; SLOT_BYTES];
         file.write(&blank).map_err(|_| LedgerFault::Device)?;
     } else {
-        file.seek_from_start((slot * LEDGER_JOURNAL_SLOT_BYTES) as u32)
+        file.seek_from_start((slot * SLOT_BYTES) as u32)
             .map_err(|_| LedgerFault::Device)?;
         file.write(&block).map_err(|_| LedgerFault::Device)?;
     }
     file.close().map_err(|_| LedgerFault::Device)
+}
+
+fn journal_verdict(bytes: &[u8; LEDGER_JOURNAL_BYTES]) -> SlotVerdict {
+    match classify_ledger_journal(bytes) {
+        LedgerJournalReading::Blank => SlotVerdict::Blank,
+        LedgerJournalReading::Entry { sequence, .. } => SlotVerdict::Entry(sequence),
+        LedgerJournalReading::UnknownVersion(_) => SlotVerdict::UnknownVersion,
+        LedgerJournalReading::Damaged => SlotVerdict::Damaged,
+    }
+}
+
+/// The ledger journal's newest entry that reads, with its slot and
+/// sequence, or `None` for a card that has none.
+fn journal_slots<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    cache_root: &Directory<'_, D, T, MD, MF, MV>,
+) -> Result<Option<(LedgerJournal, usize, u32)>, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some((bytes, slot, sequence)) = newest_slot(cache_root, LEDGER_JOURNAL, journal_verdict)?
+    else {
+        return Ok(None);
+    };
+    match classify_ledger_journal(&bytes) {
+        LedgerJournalReading::Entry { entry, .. } => Ok(Some((entry, slot, sequence))),
+        // `newest_slot` hands back only a slot it classified as an entry.
+        _ => Err(LedgerFault::Damaged),
+    }
+}
+
+fn write_journal<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    cache_root: &Directory<'_, D, T, MD, MF, MV>,
+    entry: LedgerJournal,
+) -> Result<(), LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let current = newest_slot(cache_root, LEDGER_JOURNAL, journal_verdict)?
+        .map(|(_, slot, sequence)| (slot, sequence));
+    publish_slot(cache_root, LEDGER_JOURNAL, current, |sequence, out| {
+        encode_ledger_journal(entry, sequence, out);
+        Ok(())
+    })
 }
 
 /// What the first sixteen bytes of `side` say. Only a refused open or read
@@ -832,7 +1023,7 @@ where
     Ok(true)
 }
 
-fn open_or_make_cache_root<'a, D, T, const MD: usize, const MF: usize, const MV: usize>(
+pub(crate) fn open_or_make_cache_root<'a, D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &'a Directory<'_, D, T, MD, MF, MV>,
 ) -> Result<Directory<'a, D, T, MD, MF, MV>, LedgerFault>
 where
@@ -885,7 +1076,7 @@ where
 /// Fill `out` from `file`. `Ok(false)` is a file that ended first; a refused
 /// read is the card and is an error, since the two mean different things to
 /// every caller here.
-fn read_exact<D, T, const MD: usize, const MF: usize, const MV: usize>(
+pub(crate) fn read_exact<D, T, const MD: usize, const MF: usize, const MV: usize>(
     file: &File<'_, D, T, MD, MF, MV>,
     mut out: &mut [u8],
 ) -> Result<bool, LedgerFault>

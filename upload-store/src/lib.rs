@@ -27,6 +27,7 @@ pub mod install;
 pub mod ledger;
 pub mod library;
 pub mod reclaim;
+pub mod replace;
 
 use embedded_sdmmc::{Directory, Mode, TimeSource};
 use heapless::String;

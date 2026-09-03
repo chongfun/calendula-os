@@ -815,6 +815,29 @@ per book. Positions and caches still key by place; moving them onto `BookId`
 is the next milestone, together with the position-format migration in the
 reading-position work.
 
+A managed replacement, an upload landing under a name the shelf already
+holds, is the one case where a copy's bytes change under its id, and it
+spans two transactions: `INSTALL.JNL` swaps the bytes, and the ledger has to
+be told. `/READER/REPLACE.JNL` bridges them. Before the installer writes
+`INSTALL.JNL` it publishes an intent there naming the copy's id, its place,
+what stood there (nothing, a predecessor of unknown bytes, or one with a
+recorded digest) and the digest of the bytes staged to land; the intent
+stands after `INSTALL.JNL` clears and is cleared only once the ledger record
+has been rewritten under the same id with the new size and digest. Recovery
+resolves it after the filesystem journals have settled, and asks the card
+rather than the record which side won, by hashing the destination: the new
+digest is decisive; a known predecessor is recognised by its digest; an
+unknown one as any file that is not the new bytes, which the sole-writer
+contract makes sufficient; and where nothing stood, nothing standing is the
+old landing. Anything else keeps the intent and refuses, and while it stands
+no scan adopts and no other change to the shelf begins. In the session that
+ran the install the landing is known from the install's own proof that the
+destination is on its chain, so nothing is hashed twice. The file is two
+slots like the ledger journal, so a torn publication is an install that has
+not begun and a torn clear is an intent resolved again. No id or digest
+enters `INSTALL.JNL` or `RECLAIM.JNL`: the filesystem transaction decides what
+the card holds, and this one records what that means for identity.
+
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN
 /READER/CACHE2/E<hash>/TOC.BIN
@@ -828,6 +851,7 @@ reading-position work.
 /READER/LEDGERA.BIN
 /READER/LEDGERB.BIN
 /READER/PROBE.TXT
+/READER/REPLACE.JNL
 /READER/ROLLBACK/<txn>
 /READER/UPLOAD/<txn>
 /READER/STATEA.BIN
