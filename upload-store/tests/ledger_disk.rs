@@ -28,11 +28,12 @@ use proto::catalog::{
     CATALOG_RECORD_BYTES,
 };
 use proto::identity::{
-    BookId, LedgerRecord, LEDGER_HEADER_BYTES, LEDGER_RECORD_BYTES, MISSING_SCANS_RETAINED,
+    classify_ledger_journal, BookId, LedgerJournal, LedgerJournalReading, LedgerRecord,
+    LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_RECORD_BYTES, MISSING_SCANS_RETAINED,
     ROW_KEY_BYTES,
 };
 use proto::library_path::BookRoot;
-use upload_store::ledger::{self, Assignment, LedgerFault, LEDGER_FILES};
+use upload_store::ledger::{self, Assignment, LedgerFault, LEDGER_FILES, LEDGER_JOURNAL};
 
 const BLOCK_BYTES: usize = 512;
 const DISK_BLOCKS: u32 = 32 * 1024;
@@ -299,6 +300,40 @@ fn generation(root: &Dir<'_>) -> Option<(u32, u16, &'static str)> {
         .map(|live| (live.generation, live.count, live.file_name()))
 }
 
+/// What the journal says, or `None` for no journal file.
+fn journal(root: &Dir<'_>) -> Option<LedgerJournalReading> {
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let file = cache_root
+        .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadOnly)
+        .ok()?;
+    let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
+    if !read_exact(&file, &mut bytes) {
+        return Some(LedgerJournalReading::Blank);
+    }
+    Some(classify_ledger_journal(&bytes))
+}
+
+/// Overwrite the journal's bytes in place, as damage would.
+fn overwrite_journal(root: &Dir<'_>, at: usize, bytes: &[u8]) {
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+    let file = cache_root
+        .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadWriteAppend)
+        .unwrap();
+    file.seek_from_start(at as u32).unwrap();
+    file.write(bytes).unwrap();
+    file.close().unwrap();
+}
+
+fn journal_bytes(root: &Dir<'_>) -> Vec<u8> {
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+    let file = cache_root
+        .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadOnly)
+        .unwrap();
+    let mut out = vec![0u8; file.length() as usize];
+    assert!(read_exact(&file, &mut out));
+    out
+}
+
 /// The ids in the committed catalog, or `None` while its header is still the
 /// placeholder.
 fn committed_catalog_ids(root: &Dir<'_>) -> Option<Vec<Option<BookId>>> {
@@ -552,6 +587,12 @@ fn a_power_cut_anywhere_through_the_catalog_commit_leaves_a_legal_state() {
         "a rewrite that takes {uncut} writes proves little"
     );
 
+    // The four states a cut can leave the journal and the target in, each
+    // of which must be seen at least once for the sweep to have covered the
+    // protocol: the rewrite not begun, begun and not committed, committed
+    // and not yet journalled, and journalled.
+    let mut seen = [false; 4];
+
     for cut in 1..=uncut {
         disk.restore(&base);
         let mgr = open_mgr(&disk);
@@ -583,6 +624,32 @@ fn a_power_cut_anywhere_through_the_catalog_commit_leaves_a_legal_state() {
                 );
             }
         }
+        match journal(&root) {
+            Some(LedgerJournalReading::Entry(LedgerJournal::Committed { side: 0, .. })) => {
+                assert_eq!(live, standing, "cut at write {cut}: not begun");
+                seen[0] = true;
+            }
+            Some(LedgerJournalReading::Entry(LedgerJournal::Rewriting {
+                target: 1,
+                standing: Some(_),
+            })) => {
+                if live == standing {
+                    seen[1] = true;
+                } else {
+                    assert_eq!(
+                        live.len(),
+                        7,
+                        "cut at write {cut}: committed, not journalled"
+                    );
+                    seen[2] = true;
+                }
+            }
+            Some(LedgerJournalReading::Entry(LedgerJournal::Committed { side: 1, .. })) => {
+                assert_eq!(live.len(), 7, "cut at write {cut}: journalled");
+                seen[3] = true;
+            }
+            other => panic!("cut at write {cut}: the journal reads {other:?}"),
+        }
         let ledger_ids = ids_of(&live);
         if let Some(committed) = committed_catalog_ids(&root) {
             assert_eq!(committed.len(), 7, "cut at write {cut}");
@@ -608,6 +675,10 @@ fn a_power_cut_anywhere_through_the_catalog_commit_leaves_a_legal_state() {
         }
         assert_eq!(records(&root).len(), 7, "cut at write {cut}");
     }
+    assert_eq!(
+        seen, [true; 4],
+        "not begun, begun, committed, journalled: each must have been cut into"
+    );
 }
 
 /// Damage one byte inside a record of the given side, as bit rot would.
@@ -706,24 +777,24 @@ fn overwrite_header(root: &Dir<'_>, side: usize, at: usize, bytes: &[u8]) {
 }
 
 /// The header is one block earlier than the records, and the same rule
-/// holds there. Only the exact placeholder means a generation was never
-/// committed; any other header that does not read is a header that had
-/// landed and was damaged since, and without two readable headers the sides
-/// cannot even be ordered. So a damaged header on either side refuses, and
-/// nothing is written over either file.
+/// holds there: the journal names the live side and the header it carries,
+/// and a live side whose header reads as anything else is refused, with
+/// nothing written over either file. The side the journal does not name is
+/// not consulted, so damage there costs nothing until the next rewrite goes
+/// over it.
 #[test]
-fn a_damaged_header_on_either_side_is_refused_rather_than_fallen_back_from() {
+fn a_damaged_header_on_the_live_side_is_refused_and_on_the_other_side_ignored() {
     let disk = new_card();
     let mgr = open_mgr(&disk);
     let root = open_root(&mgr);
     let mut random = entropy();
     scan(&root, &SHELF[..3], ARENA, &mut random, || {}).unwrap();
-    scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    let (_, ids) = scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
     assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
     let older = ledger_file_bytes(&root, 0);
     let newer = ledger_file_bytes(&root, 1);
 
-    // The newer side, which is the one whose ids a fallback would re-mint.
+    // The live side, which is the one whose ids a fallback would re-mint.
     for (at, byte) in [(0usize, b'Y'), (5, 1u8), (9, 0xFF), (15, 0x00)] {
         let mut damaged = newer.clone();
         damaged[at] = byte;
@@ -751,40 +822,226 @@ fn a_damaged_header_on_either_side_is_refused_rather_than_fallen_back_from() {
     }
     assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
 
-    // The older side too: with its header unreadable there is no telling
-    // which side was newer.
+    // The other side: not the ledger's problem.
     overwrite_header(&root, 0, 2, b"?");
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+    let mut grown = SHELF.to_vec();
+    grown.push((BookRoot::Library, "Poetry/Odes.epub", 77_000));
+    let (assigned, after) = scan(&root, &grown, ARENA, &mut random, || {}).unwrap();
+    assert_eq!(assigned.matched, 5);
+    assert_eq!(assigned.minted, 1);
+    assert_eq!(&after[..5], &ids[..]);
+    assert_eq!(generation(&root), Some((3, 6, LEDGER_FILES[0])));
+}
+
+/// The live generation losing its header, its length, or its file is the
+/// loss this ledger exists to refuse. Each of those looks exactly like the
+/// side a rewrite was interrupted on, and the journal is what says it was
+/// not one: it names the side as live, so the side had better be.
+#[test]
+fn a_live_generation_that_loses_its_header_or_file_is_refused() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut random = entropy();
+    scan(&root, &SHELF[..3], ARENA, &mut random, || {}).unwrap();
+    scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+    let older = ledger_file_bytes(&root, 0);
+    let newer = ledger_file_bytes(&root, 1);
+    let recorded = journal_bytes(&root);
+
+    // Its header becomes the placeholder.
+    overwrite_header(&root, 1, 0, &[0u8; LEDGER_HEADER_BYTES]);
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
+    assert_eq!(
+        scan(&root, &SHELF[..3], ARENA, &mut random, || {}).err(),
+        Some(LedgerFault::Damaged),
+        "not even for the rows the older generation could answer for"
+    );
+    assert_eq!(ledger_file_bytes(&root, 0), older);
+    assert_eq!(journal_bytes(&root), recorded);
+    overwrite_header(&root, 1, 0, &newer[..LEDGER_HEADER_BYTES]);
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+
+    // Its file becomes empty.
+    {
+        let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        let file = cache_root
+            .open_file_in_dir(LEDGER_FILES[1], Mode::ReadWriteCreateOrTruncate)
+            .unwrap();
+        file.close().unwrap();
+    }
     assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
     assert_eq!(
         scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
         Some(LedgerFault::Damaged)
     );
-    assert_eq!(ledger_file_bytes(&root, 1), newer);
-    overwrite_header(&root, 0, 0, &older[..LEDGER_HEADER_BYTES]);
-    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+    assert_eq!(ledger_file_bytes(&root, 0), older);
+    assert_eq!(journal_bytes(&root), recorded);
+
+    // Its file is gone.
+    {
+        let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        cache_root.delete_entry_in_dir(LEDGER_FILES[1]).unwrap();
+    }
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
+    assert_eq!(
+        scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
+        Some(LedgerFault::Damaged)
+    );
+    assert_eq!(ledger_file_bytes(&root, 0), older);
+    assert_eq!(journal_bytes(&root), recorded);
 }
 
-/// The placeholder is what an interrupted rewrite leaves on the side it was
-/// writing, and it is the one header that hands over: the older generation
-/// answers, and the next rewrite goes over the uncommitted side.
+/// The same placeholder, left by a rewrite the power actually cut, is
+/// explained by the journal, and the generation that stood answers. The next
+/// scan finishes the rewrite over the side the cut left.
 #[test]
-fn an_uncommitted_newer_side_hands_over_to_the_older_one() {
+fn an_interrupted_rewrite_resumes_from_the_generation_that_stood() {
+    let disk = new_card();
+    let mut random = entropy();
+    let (base, three) = {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        let (_, three) = scan(&root, &SHELF[..3], ARENA, &mut random, || {}).unwrap();
+        (disk.image(), three)
+    };
+
+    // The first cut that lands after the journal has said a rewrite began
+    // and before the new header has: the placeholder on the target side.
+    let mut interrupted = None;
+    for cut in 1..64 {
+        disk.restore(&base);
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            let _ = scan(&root, &SHELF, ARENA, &mut random, || {
+                disk.cut_writes_from(Some(cut))
+            });
+            disk.cut_writes_from(None);
+        }
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        if let Some(LedgerJournalReading::Entry(LedgerJournal::Rewriting {
+            target: 1,
+            standing: Some(_),
+        })) = journal(&root)
+        {
+            let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+            let target = cache_root.open_file_in_dir(LEDGER_FILES[1], Mode::ReadOnly);
+            let uncommitted = match target {
+                Ok(file) => {
+                    let mut header = [0u8; LEDGER_HEADER_BYTES];
+                    file.length() == 0
+                        || (read_exact(&file, &mut header) && header == [0u8; LEDGER_HEADER_BYTES])
+                }
+                Err(_) => true,
+            };
+            if uncommitted {
+                interrupted = Some(cut);
+                break;
+            }
+        }
+    }
+    let cut =
+        interrupted.expect("some cut leaves the target uncommitted under a journal that says why");
+
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    assert_eq!(
+        generation(&root),
+        Some((1, 3, LEDGER_FILES[0])),
+        "cut at write {cut}"
+    );
+    assert_eq!(
+        ids_of(&records(&root)),
+        three.iter().map(|id| id.unwrap()).collect::<Vec<_>>()
+    );
+
+    let (assigned, ids) = scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    assert_eq!(assigned.matched, 3, "cut at write {cut}");
+    assert_eq!(assigned.minted, 2, "cut at write {cut}");
+    assert_eq!(&ids[..3], &three[..]);
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+    assert!(matches!(
+        journal(&root),
+        Some(LedgerJournalReading::Entry(LedgerJournal::Committed {
+            side: 1,
+            ..
+        }))
+    ));
+}
+
+/// Ledger files with no journal to account for them, or a journal that does
+/// not read, are refused: the journal is the only thing that says which side
+/// is live, and guessing is what this file exists to avoid.
+#[test]
+fn a_ledger_without_a_readable_journal_is_refused() {
     let disk = new_card();
     let mgr = open_mgr(&disk);
     let root = open_root(&mgr);
     let mut random = entropy();
-    let (_, three) = scan(&root, &SHELF[..3], ARENA, &mut random, || {}).unwrap();
     scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
-    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+    let written = ledger_file_bytes(&root, 0);
+    let recorded = journal_bytes(&root);
+    assert_eq!(recorded.len(), LEDGER_JOURNAL_BYTES);
 
-    overwrite_header(&root, 1, 0, &[0u8; LEDGER_HEADER_BYTES]);
-    assert_eq!(generation(&root), Some((1, 3, LEDGER_FILES[0])));
+    // Damaged: a flipped byte, all zeros, and the wrong length.
+    overwrite_journal(&root, 7, &[recorded[7] ^ 0x01]);
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
+    overwrite_journal(&root, 0, &[0u8; LEDGER_JOURNAL_BYTES]);
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
+    assert_eq!(
+        scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
+        Some(LedgerFault::Damaged)
+    );
+    assert_eq!(ledger_file_bytes(&root, 0), written, "nothing written over");
+    {
+        let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        let file = cache_root
+            .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadWriteCreateOrTruncate)
+            .unwrap();
+        file.write(&recorded[..LEDGER_JOURNAL_BYTES - 1]).unwrap();
+        file.close().unwrap();
+    }
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
 
-    let (assigned, ids) = scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
-    assert_eq!(assigned.matched, 3);
-    assert_eq!(assigned.minted, 2);
-    assert_eq!(&ids[..3], &three[..]);
-    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+    // Another build's journal.
+    {
+        let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        let file = cache_root
+            .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadWriteCreateOrTruncate)
+            .unwrap();
+        let mut other = recorded.clone();
+        other[4] = proto::identity::LEDGER_JOURNAL_VERSION + 1;
+        file.write(&other).unwrap();
+        file.close().unwrap();
+    }
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Unreadable));
+
+    // Gone.
+    {
+        let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        cache_root.delete_entry_in_dir(LEDGER_JOURNAL).unwrap();
+    }
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
+    assert_eq!(
+        scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
+        Some(LedgerFault::Damaged)
+    );
+    assert_eq!(ledger_file_bytes(&root, 0), written);
+
+    // Put back, all is as it was.
+    {
+        let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        let file = cache_root
+            .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadWriteCreate)
+            .unwrap();
+        file.write(&recorded).unwrap();
+        file.close().unwrap();
+    }
+    assert_eq!(generation(&root), Some((1, 5, LEDGER_FILES[0])));
 }
 
 /// A committed header of a version this build does not read is another

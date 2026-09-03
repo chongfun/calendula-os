@@ -300,6 +300,137 @@ pub fn ledger_file_len(count: u16) -> usize {
     LEDGER_HEADER_BYTES + count as usize * LEDGER_RECORD_BYTES
 }
 
+// ---------------------------------------------------------------------------
+// Ledger journal: which side is live, or which side is being written
+// ---------------------------------------------------------------------------
+
+pub const LEDGER_JOURNAL_MAGIC: [u8; 4] = *b"X4LJ";
+pub const LEDGER_JOURNAL_VERSION: u8 = 1;
+pub const LEDGER_JOURNAL_BYTES: usize = 20;
+
+// Journal: magic | version | state | side | has standing | generation u32 |
+// count u16 | reserved (zero) u16 | checksum u32 over everything before it.
+const JOURNAL_VERSION: usize = 4;
+const JOURNAL_STATE: usize = 5;
+const JOURNAL_SIDE: usize = 6;
+const JOURNAL_HAS_STANDING: usize = 7;
+const JOURNAL_GENERATION: usize = 8;
+const JOURNAL_COUNT: usize = 12;
+const JOURNAL_RESERVED: usize = 14;
+const JOURNAL_CHECKSUM: usize = 16;
+const _: () = assert!(JOURNAL_CHECKSUM + 4 == LEDGER_JOURNAL_BYTES);
+const JOURNAL_COMMITTED: u8 = 1;
+const JOURNAL_REWRITING: u8 = 2;
+
+/// What the ledger journal says about the two sides.
+///
+/// Two ledger files alone cannot say which of them is live. A side that
+/// holds the placeholder, or nothing, looks the same whether a rewrite of
+/// it was interrupted, which is harmless, or it was the live generation and
+/// lost its header, which is the loss of every id it added. The journal is
+/// the durable fact that tells them apart: after every commit it names the
+/// live side and its header, and for the length of a rewrite it names the
+/// side being written and what stood on the other side when the rewrite
+/// began. A side is then believed only when the journal accounts for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerJournal {
+    /// `side` holds the live generation, and this is its header.
+    Committed { side: u8, header: LedgerHeader },
+    /// `target` is being rewritten. `standing` is the committed generation
+    /// on the other side when the rewrite began, or `None` when nothing had
+    /// been committed yet.
+    Rewriting {
+        target: u8,
+        standing: Option<LedgerHeader>,
+    },
+}
+
+pub fn encode_ledger_journal(entry: LedgerJournal, out: &mut [u8; LEDGER_JOURNAL_BYTES]) {
+    out.fill(0);
+    out[..4].copy_from_slice(&LEDGER_JOURNAL_MAGIC);
+    out[JOURNAL_VERSION] = LEDGER_JOURNAL_VERSION;
+    let header = match entry {
+        LedgerJournal::Committed { side, header } => {
+            out[JOURNAL_STATE] = JOURNAL_COMMITTED;
+            out[JOURNAL_SIDE] = side;
+            Some(header)
+        }
+        LedgerJournal::Rewriting { target, standing } => {
+            out[JOURNAL_STATE] = JOURNAL_REWRITING;
+            out[JOURNAL_SIDE] = target;
+            out[JOURNAL_HAS_STANDING] = u8::from(standing.is_some());
+            standing
+        }
+    };
+    if let Some(header) = header {
+        out[JOURNAL_GENERATION..JOURNAL_COUNT].copy_from_slice(&header.generation.to_le_bytes());
+        out[JOURNAL_COUNT..JOURNAL_RESERVED].copy_from_slice(&header.count.to_le_bytes());
+    }
+    let sum = fnv1a(&out[..JOURNAL_CHECKSUM]);
+    out[JOURNAL_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
+}
+
+/// What the bytes of a ledger journal say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerJournalReading {
+    /// All zero. Nothing was ever written here.
+    Blank,
+    Entry(LedgerJournal),
+    /// The journal's magic under a version this build does not read.
+    UnknownVersion(u8),
+    /// None of the above: an entry damaged after it landed, or not a journal.
+    Damaged,
+}
+
+/// Read a journal without guessing, the way [`classify_ledger_header`] reads
+/// a header.
+pub fn classify_ledger_journal(bytes: &[u8; LEDGER_JOURNAL_BYTES]) -> LedgerJournalReading {
+    if bytes.iter().all(|byte| *byte == 0) {
+        return LedgerJournalReading::Blank;
+    }
+    if bytes[..4] != LEDGER_JOURNAL_MAGIC {
+        return LedgerJournalReading::Damaged;
+    }
+    if bytes[JOURNAL_VERSION] != LEDGER_JOURNAL_VERSION {
+        return LedgerJournalReading::UnknownVersion(bytes[JOURNAL_VERSION]);
+    }
+    let stored = u32::from_le_bytes([
+        bytes[JOURNAL_CHECKSUM],
+        bytes[JOURNAL_CHECKSUM + 1],
+        bytes[JOURNAL_CHECKSUM + 2],
+        bytes[JOURNAL_CHECKSUM + 3],
+    ]);
+    if fnv1a(&bytes[..JOURNAL_CHECKSUM]) != stored
+        || bytes[JOURNAL_RESERVED] != 0
+        || bytes[JOURNAL_RESERVED + 1] != 0
+        || bytes[JOURNAL_SIDE] > 1
+    {
+        return LedgerJournalReading::Damaged;
+    }
+    let header = LedgerHeader {
+        generation: u32::from_le_bytes([
+            bytes[JOURNAL_GENERATION],
+            bytes[JOURNAL_GENERATION + 1],
+            bytes[JOURNAL_GENERATION + 2],
+            bytes[JOURNAL_GENERATION + 3],
+        ]),
+        count: u16::from_le_bytes([bytes[JOURNAL_COUNT], bytes[JOURNAL_COUNT + 1]]),
+    };
+    match (bytes[JOURNAL_STATE], bytes[JOURNAL_HAS_STANDING]) {
+        (JOURNAL_COMMITTED, 0) => LedgerJournalReading::Entry(LedgerJournal::Committed {
+            side: bytes[JOURNAL_SIDE],
+            header,
+        }),
+        (JOURNAL_REWRITING, has_standing @ (0 | 1)) => {
+            LedgerJournalReading::Entry(LedgerJournal::Rewriting {
+                target: bytes[JOURNAL_SIDE],
+                standing: (has_standing == 1).then_some(header),
+            })
+        }
+        _ => LedgerJournalReading::Damaged,
+    }
+}
+
 fn fnv1a(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0x811c_9dc5u32, |hash, byte| {
         (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
@@ -610,6 +741,71 @@ mod tests {
             ledger_file_len(header.count),
             LEDGER_HEADER_BYTES + 1129 * LEDGER_RECORD_BYTES
         );
+    }
+
+    #[test]
+    fn a_journal_entry_round_trips_and_reads_without_guessing() {
+        let header = LedgerHeader {
+            generation: 9,
+            count: 1129,
+        };
+        let entries = [
+            LedgerJournal::Committed { side: 1, header },
+            LedgerJournal::Rewriting {
+                target: 0,
+                standing: Some(header),
+            },
+            LedgerJournal::Rewriting {
+                target: 0,
+                standing: None,
+            },
+        ];
+        for entry in entries {
+            let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
+            encode_ledger_journal(entry, &mut bytes);
+            assert_eq!(
+                classify_ledger_journal(&bytes),
+                LedgerJournalReading::Entry(entry),
+                "{entry:?}"
+            );
+            for at in 0..LEDGER_JOURNAL_BYTES {
+                let mut torn = bytes;
+                torn[at] ^= 0x01;
+                let expected = if at == JOURNAL_VERSION {
+                    LedgerJournalReading::UnknownVersion(LEDGER_JOURNAL_VERSION ^ 0x01)
+                } else {
+                    LedgerJournalReading::Damaged
+                };
+                assert_eq!(
+                    classify_ledger_journal(&torn),
+                    expected,
+                    "{entry:?}, flipped byte {at}"
+                );
+            }
+        }
+        assert_eq!(
+            classify_ledger_journal(&[0u8; LEDGER_JOURNAL_BYTES]),
+            LedgerJournalReading::Blank
+        );
+        // A side past the two there are, or a state this build does not
+        // write, is not an entry even under a checksum that agrees.
+        let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
+        encode_ledger_journal(entries[0], &mut bytes);
+        for (at, byte) in [
+            (JOURNAL_SIDE, 2u8),
+            (JOURNAL_STATE, 3),
+            (JOURNAL_HAS_STANDING, 1),
+        ] {
+            let mut odd = bytes;
+            odd[at] = byte;
+            let sum = fnv1a(&odd[..JOURNAL_CHECKSUM]);
+            odd[JOURNAL_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
+            assert_eq!(
+                classify_ledger_journal(&odd),
+                LedgerJournalReading::Damaged,
+                "byte {at} = {byte}"
+            );
+        }
     }
 
     #[test]

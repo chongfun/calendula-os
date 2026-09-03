@@ -780,22 +780,25 @@ The ledger is durable state where the catalog is a cache, so it is written
 the way positions are: whole, to the side that is not live. Records go down
 under an all-zero placeholder header and the file is closed at its final
 length; then the real header is written over the placeholder in a second
-open, so the commit is the last block to land and a power cut anywhere
-before it leaves the standing generation untouched and the other side
-holding the placeholder. A reader reads both headers. The placeholder is the
-one header that means a generation was never committed, and it hands over
-to the other side. A header that decodes is a committed generation, and the
-newer of two is checked for length and every record before it is believed.
-Any other header, on either side, is a header that had landed and was
-damaged since, and so is a committed generation that does not read back
-whole: damage to durable identity state rather than an interrupted write,
-refused rather than fallen back from, because the other side is missing
-every id the damaged one added and taking it would re-mint those and orphan
-whatever comes to hang from them. A header of a format version this build
-does not read is refused for the same reason. The scan asks the ledger
-before it touches the catalog, so a refusal leaves the committed catalog
-serving the shelf as it was and stops only rebuilds, until the intact
-records on both sides are salvaged by something explicit. The join stages six-byte `(hash, row)` keys
+open, so a generation with a header is a generation with all of its records.
+Which side is live is kept in a third file, `/READER/LEDGER.JNL`, one block
+written in place: before a rewrite touches a side it says which side is
+being written and what stood on the other, and after the new header has
+landed and read back it says which side is live and what its header is. A
+reader believes only what the journal accounts for. The side it names as
+live must hold the header it recorded; during a rewrite, the target is live
+if its header landed with the generation after the one that stood, and
+otherwise the side that stood is, if it still holds exactly what was
+recorded. The generation chosen is then checked for length and every record.
+Anything else refuses: a live side that is empty, missing, or under another
+header, a header or journal this build did not write, a header or journal
+of a version it does not read, or ledger files with no journal beside them.
+Those states are the loss of durable identity rather than an interrupted
+write, and the side that is not live is missing every id the live one added,
+so taking it would re-mint those and orphan whatever comes to hang from
+them. The scan asks the ledger before it touches the catalog, so a refusal
+leaves the committed catalog serving the shelf as it was and stops only
+rebuilds, until the intact records are salvaged by something explicit. The join stages six-byte `(hash, row)` keys
 in the scan arena behind one bit per ledger record and reads the ledger once
 per 2,730 rows, so a rebuild costs one sequential pass over the ledger plus
 one row read and one 16-byte write per matched row, rather than a file open
