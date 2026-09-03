@@ -24,16 +24,30 @@
 //! consulted, damaged or not. Once the records are down under the
 //! placeholder it records which side is being written and what stood on the
 //! other; after the new header has landed and read back it records which
-//! side is live and what its header says. The journal is one block, written
-//! in place, so a power cut leaves it saying the one thing or the other. A
-//! reader believes a side only when the journal accounts for it: the side
-//! the journal names as live, with the header it recorded; or, during a
-//! rewrite, the target if its header landed and otherwise the side that
-//! stood, exactly as recorded. Anything else, a side the journal does not
-//! explain, a file that is not as the journal says, a header or journal
-//! that does not read, refuses. Nothing here repairs a ledger by guessing
-//! which side to trust; the intact records stay where they are for
-//! something explicit to salvage.
+//! side is live and what its header says.
+//!
+//! The journal has to survive its own interrupted write, so it is two
+//! sector-sized slots written alternately, each entry with a sequence
+//! number, the way `RECLAIM.JNL` is kept. A write torn by a power cut
+//! damages the slot being written, and the entry before it still reads.
+//! Falling back one entry is safe by construction: a generation's ids reach
+//! a committed catalog only after the journal has named that generation
+//! live, so the entry before names either the same live side or a rewrite
+//! whose outcome the target's own header decides. A torn write of that
+//! header, or of the placeholder before it, is read the same way: under a
+//! journal that says a side is being written, a target that does not read
+//! back as the committed, whole generation expected is a target whose commit
+//! did not land, and the side that stood is live.
+//!
+//! A reader believes a side only when the journal accounts for it: the side
+//! the journal names as live, with the header it recorded and every record
+//! intact; or, during a rewrite, the target if it committed whole and
+//! otherwise the side that stood, exactly as recorded. Anything else, a live
+//! side that is not as the journal says, a journal with no entry that reads,
+//! a header or journal of a version this build does not read, or ledger
+//! files with no journal beside them, refuses. Nothing here repairs a ledger
+//! by guessing which side to trust; the intact records stay where they are
+//! for something explicit to salvage.
 //!
 //! Rewriting the whole file rather than appending is deliberate. An append
 //! that straddles a cluster boundary can leave the FAT chain and the
@@ -57,12 +71,14 @@ use proto::catalog::{
     catalog_record_at, catalog_record_book_id, catalog_record_identity, CATALOG_HEADER_BYTES,
     CATALOG_RECORD_BYTES, CATALOG_RECORD_ID_OFFSET,
 };
+use proto::durable::generation_is_newer;
 use proto::identity::{
     carry_missing, classify_ledger_header, classify_ledger_journal, decode_ledger_record,
     encode_ledger_header, encode_ledger_journal, encode_ledger_placeholder_header,
     encode_ledger_record, ledger_file_len, rows_with_hash, sort_row_keys, stage_row_key, BookId,
     LedgerHeader, LedgerHeaderReading, LedgerJournal, LedgerJournalReading, LedgerRecord,
-    LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
+    LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_JOURNAL_FILE_BYTES, LEDGER_JOURNAL_SLOTS,
+    LEDGER_JOURNAL_SLOT_BYTES, LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
 };
 
 /// The two generations, under the cache root.
@@ -83,18 +99,18 @@ pub enum LedgerFault {
     Device,
     /// The ledger is not as its journal says, or something in it does not
     /// read: the live side is missing, empty, or holds a header other than
-    /// the one recorded; a header or the journal is bytes this build did not
-    /// write; the live generation's records or length do not match its
-    /// header; or there are ledger files with no journal to account for
+    /// the one recorded; the live generation's records or length do not
+    /// match its header; a header or the journal is bytes this build did not
+    /// write; or there are ledger files with no journal to account for
     /// them. That is durable identity state damaged after it landed, and
     /// taking whatever else is on the card in its place would re-mint every
     /// id it held. The ledger is left exactly as it is and the operation is
     /// refused; a catalog already committed keeps serving, and only rebuilds
     /// stop, until the intact records are salvaged by something explicit.
     Damaged,
-    /// A committed header, or the journal, of a format version this build
-    /// does not read, written by another build. Refused for the same reason
-    /// as damage: the ids it holds cannot come back from the card.
+    /// A committed header, or a journal entry, of a format version this
+    /// build does not read, written by another build. Refused for the same
+    /// reason as damage: the ids it holds cannot come back from the card.
     Unreadable,
     /// More copies than a generation can hold once the live and newly
     /// adopted ones are counted. Missing records yield first, so this is a
@@ -133,21 +149,27 @@ enum SideState {
     /// here, and a lost one otherwise.
     Uncommitted,
     Committed(LedgerHeader),
+    /// Bytes that are neither the placeholder nor a header: a torn header
+    /// write, if the journal says one was under way here, and damage
+    /// otherwise.
+    Damaged,
+    /// A header of a version this build does not read.
+    Unreadable,
 }
 
 /// The live generation, or `None` for a card with no ledger yet.
 ///
 /// The journal decides. When it names a live side, that side must hold the
-/// header it recorded. When it names a side being rewritten, that side is
-/// live if its header landed with the generation after the one that stood,
-/// and otherwise the side that stood is, if it still holds exactly the
-/// header recorded for it; a target under any other committed header is not
-/// a state a cut leaves, and refuses. A card with no journal has no ledger,
-/// and ledger files beside no journal are [`LedgerFault::Damaged`]. The
-/// generation chosen is then checked whole, length and every record, before
-/// it is handed back. Sides the journal does not point at are not read at
-/// all, so damage to a generation that is no longer live costs nothing until
-/// the next rewrite goes over it.
+/// header it recorded and read back whole. When it names a side being
+/// rewritten, that side is live if its header landed with the generation
+/// after the one that stood and it reads back whole; anything else there,
+/// the placeholder, a torn header, a header of another generation, is a
+/// commit that did not land, and the side that stood is live if it still
+/// holds exactly the header recorded for it. A card with no journal has no
+/// ledger, and ledger files beside no journal are [`LedgerFault::Damaged`].
+/// Sides the journal does not point at are not read at all, so damage to a
+/// generation that is no longer live costs nothing until the next rewrite
+/// goes over it.
 pub fn open<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
 ) -> Result<Option<Ledger>, LedgerFault>
@@ -160,7 +182,7 @@ where
         Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
         Err(_) => return Err(LedgerFault::Device),
     };
-    let (side, header) = match read_journal(&cache_root)? {
+    let (side, header) = match journal_slots(&cache_root)? {
         None => {
             if side_state(&cache_root, 0)? == SideState::Absent
                 && side_state(&cache_root, 1)? == SideState::Absent
@@ -169,49 +191,74 @@ where
             }
             return Err(LedgerFault::Damaged);
         }
-        Some(LedgerJournal::Committed { side, header }) => {
+        Some((LedgerJournal::Committed { side, header }, _, _)) => {
             let side = usize::from(side);
             match side_state(&cache_root, side)? {
-                SideState::Committed(found) if found == header => (side, header),
+                SideState::Committed(found) if found == header => {
+                    if !reads_back_whole(&cache_root, side, header)? {
+                        return Err(LedgerFault::Damaged);
+                    }
+                    (side, header)
+                }
+                SideState::Unreadable => return Err(LedgerFault::Unreadable),
                 _ => return Err(LedgerFault::Damaged),
             }
         }
-        Some(LedgerJournal::Rewriting { target, standing }) => {
+        Some((LedgerJournal::Rewriting { target, standing }, _, _)) => {
             let target = usize::from(target);
             let other = 1 - target;
             let expected = standing.map_or(1, |stood| stood.generation.wrapping_add(1));
-            match side_state(&cache_root, target)? {
-                // The rewrite got as far as its commit and the power went
-                // before the journal could say so. The generation number is
-                // what says this is that commit.
-                SideState::Committed(found) if found.generation == expected => (target, found),
-                // The journal says a side is being written only once that
-                // side holds the placeholder over the new records, so a
-                // target under any other committed header is not a state a
-                // cut leaves.
-                SideState::Committed(_) => return Err(LedgerFault::Damaged),
-                // The header did not land. What stood must still stand,
-                // exactly as recorded, or nothing does.
-                SideState::Absent | SideState::Uncommitted => {
-                    match (standing, side_state(&cache_root, other)?) {
-                        (None, SideState::Absent) => return Ok(None),
-                        (Some(stood), SideState::Committed(found)) if found == stood => {
-                            (other, stood)
-                        }
-                        _ => return Err(LedgerFault::Damaged),
-                    }
+            // The rewrite got as far as its commit and the power went before
+            // the journal could say so. The generation number is what says
+            // this is that commit, and the whole check is what says it
+            // landed rather than tore.
+            if let SideState::Committed(found) = side_state(&cache_root, target)? {
+                if found.generation == expected && reads_back_whole(&cache_root, target, found)? {
+                    return Ok(Some(Ledger {
+                        side: target,
+                        generation: found.generation,
+                        count: found.count,
+                    }));
                 }
+            }
+            // The commit did not land. What stood must still stand, exactly
+            // as recorded, or nothing does.
+            match (standing, side_state(&cache_root, other)?) {
+                (None, SideState::Absent) => return Ok(None),
+                (Some(stood), SideState::Committed(found)) if found == stood => {
+                    if !reads_back_whole(&cache_root, other, stood)? {
+                        return Err(LedgerFault::Damaged);
+                    }
+                    (other, stood)
+                }
+                (Some(_), SideState::Unreadable) => return Err(LedgerFault::Unreadable),
+                _ => return Err(LedgerFault::Damaged),
             }
         }
     };
-    if !reads_back_whole(&cache_root, side, header)? {
-        return Err(LedgerFault::Damaged);
-    }
     Ok(Some(Ledger {
         side,
         generation: header.generation,
         count: header.count,
     }))
+}
+
+/// The journal's newest entry that reads, or `None` for a card with no
+/// journal. For a caller that reports on the ledger; [`open`] is what
+/// decides from it.
+pub fn read_journal<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+) -> Result<Option<LedgerJournal>, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+        Err(_) => return Err(LedgerFault::Device),
+    };
+    Ok(journal_slots(&cache_root)?.map(|(entry, _, _)| entry))
 }
 
 /// Every record of `ledger`, in order, to `visit`. A record that no longer
@@ -368,7 +415,7 @@ where
     // Now the target is known to hold the placeholder over this
     // generation's records and nothing else. Say it is being written: from
     // here until the header lands the side that stood is the one to
-    // believe, and once the header has landed the target is.
+    // believe, and once the header has landed whole the target is.
     if standing.is_some() {
         write_journal(&cache_root, rewriting)?;
     }
@@ -394,8 +441,8 @@ where
     }
 
     // And say so. Until this lands the journal still explains the target as
-    // being written, and a reader finds it committed with the generation it
-    // expects, which is the same answer.
+    // being written, and a reader finds it committed whole with the
+    // generation it expects, which is the same answer.
     write_journal(
         &cache_root,
         LedgerJournal::Committed {
@@ -612,13 +659,19 @@ fn set_bit(bits: &mut [u8], index: u16) {
     bits[index as usize / 8] |= 1 << (index % 8);
 }
 
-/// The journal entry, or `None` for a card that has none: no file, or an
-/// empty one, which is what a cut during its first creation leaves before
-/// any side has been touched. A journal that is present and does not read
-/// is an error, not an absence.
-fn read_journal<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// The journal's newest entry that reads, with the slot it is in and its
+/// sequence number, or `None` for a card that has no journal: no file, or
+/// an empty one, which is what a cut during its first creation leaves
+/// before any side has been touched, or two blank slots.
+///
+/// Of two entries the newer by sequence wins. Beside an entry, a slot that
+/// is blank or does not read is the slot a later write was torn in, and the
+/// entry stands. A journal with no entry that reads, or of a length this
+/// build did not write, is an error, not an absence; so is an entry of a
+/// version this build does not read, in either slot.
+fn journal_slots<D, T, const MD: usize, const MF: usize, const MV: usize>(
     cache_root: &Directory<'_, D, T, MD, MF, MV>,
-) -> Result<Option<LedgerJournal>, LedgerFault>
+) -> Result<Option<(LedgerJournal, usize, u32)>, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -631,23 +684,56 @@ where
     if file.length() == 0 {
         return Ok(None);
     }
-    if file.length() as usize != LEDGER_JOURNAL_BYTES {
+    if file.length() as usize != LEDGER_JOURNAL_FILE_BYTES {
         return Err(LedgerFault::Damaged);
     }
+    let mut readings = [LedgerJournalReading::Blank; LEDGER_JOURNAL_SLOTS];
     let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
-    if !read_exact(&file, &mut bytes)? {
-        return Err(LedgerFault::Damaged);
+    for (index, reading) in readings.iter_mut().enumerate() {
+        file.seek_from_start((index * LEDGER_JOURNAL_SLOT_BYTES) as u32)
+            .map_err(|_| LedgerFault::Device)?;
+        if !read_exact(&file, &mut bytes)? {
+            return Err(LedgerFault::Damaged);
+        }
+        *reading = classify_ledger_journal(&bytes);
     }
-    match classify_ledger_journal(&bytes) {
-        LedgerJournalReading::Blank => Ok(None),
-        LedgerJournalReading::Entry(entry) => Ok(Some(entry)),
-        LedgerJournalReading::UnknownVersion(_) => Err(LedgerFault::Unreadable),
-        LedgerJournalReading::Damaged => Err(LedgerFault::Damaged),
+    if readings
+        .iter()
+        .any(|reading| matches!(reading, LedgerJournalReading::UnknownVersion(_)))
+    {
+        return Err(LedgerFault::Unreadable);
+    }
+    let mut newest: Option<(LedgerJournal, usize, u32)> = None;
+    for (index, reading) in readings.iter().enumerate() {
+        let LedgerJournalReading::Entry { entry, sequence } = *reading else {
+            continue;
+        };
+        newest = match newest {
+            None => Some((entry, index, sequence)),
+            Some((_, _, held)) if generation_is_newer(sequence, held) => {
+                Some((entry, index, sequence))
+            }
+            // Two entries one sequence apart are the two most recent writes;
+            // equal sequence numbers are nothing this writer produces.
+            Some((_, _, held)) if held == sequence => return Err(LedgerFault::Damaged),
+            Some(kept) => Some(kept),
+        };
+    }
+    match newest {
+        Some(found) => Ok(Some(found)),
+        None if readings
+            .iter()
+            .all(|reading| *reading == LedgerJournalReading::Blank) =>
+        {
+            Ok(None)
+        }
+        None => Err(LedgerFault::Damaged),
     }
 }
 
-/// Write the journal in place. Created once, and never truncated after, so
-/// its one block is either what it said before or what it says now.
+/// Publish `entry` into the slot the newest entry is not in, one sequence
+/// past it. The file is created whole the first time and never truncated
+/// after, so a torn write damages one slot and the entry before it stands.
 fn write_journal<D, T, const MD: usize, const MF: usize, const MV: usize>(
     cache_root: &Directory<'_, D, T, MD, MF, MV>,
     entry: LedgerJournal,
@@ -656,8 +742,14 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let (slot, sequence) = match journal_slots(cache_root)? {
+        Some((_, held, sequence)) => ((held + 1) % LEDGER_JOURNAL_SLOTS, sequence.wrapping_add(1)),
+        None => (0, 1),
+    };
+    let mut block = [0u8; LEDGER_JOURNAL_SLOT_BYTES];
     let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
-    encode_ledger_journal(entry, &mut bytes);
+    encode_ledger_journal(entry, sequence, &mut bytes);
+    block[..LEDGER_JOURNAL_BYTES].copy_from_slice(&bytes);
     let file = match cache_root.open_file_in_dir(LEDGER_JOURNAL, Mode::ReadWriteAppend) {
         Ok(file) => file,
         Err(embedded_sdmmc::Error::NotFound) => cache_root
@@ -665,15 +757,24 @@ where
             .map_err(|_| LedgerFault::Device)?,
         Err(_) => return Err(LedgerFault::Device),
     };
-    file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
-    file.write(&bytes).map_err(|_| LedgerFault::Device)?;
+    if file.length() == 0 {
+        // A journal that does not exist yet, or one whose creation was cut
+        // before it closed: both slots, the entry in the first.
+        file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
+        file.write(&block).map_err(|_| LedgerFault::Device)?;
+        let blank = [0u8; LEDGER_JOURNAL_SLOT_BYTES];
+        file.write(&blank).map_err(|_| LedgerFault::Device)?;
+    } else {
+        file.seek_from_start((slot * LEDGER_JOURNAL_SLOT_BYTES) as u32)
+            .map_err(|_| LedgerFault::Device)?;
+        file.write(&block).map_err(|_| LedgerFault::Device)?;
+    }
     file.close().map_err(|_| LedgerFault::Device)
 }
 
-/// What the first sixteen bytes of `side` say. A header of another version
-/// is [`LedgerFault::Unreadable`], and bytes that are neither the placeholder
-/// nor a header are [`LedgerFault::Damaged`]. Whether a committed generation
-/// is whole is [`reads_back_whole`]'s question.
+/// What the first sixteen bytes of `side` say. Only a refused open or read
+/// is an error here; what a damaged or unreadable header means depends on
+/// what the journal says about the side, and that is [`open`]'s call.
 fn side_state<D, T, const MD: usize, const MF: usize, const MV: usize>(
     cache_root: &Directory<'_, D, T, MD, MF, MV>,
     side: usize,
@@ -692,14 +793,14 @@ where
     }
     let mut bytes = [0u8; LEDGER_HEADER_BYTES];
     if !read_exact(&file, &mut bytes)? {
-        return Err(LedgerFault::Damaged);
+        return Ok(SideState::Damaged);
     }
-    match classify_ledger_header(&bytes) {
-        LedgerHeaderReading::Placeholder => Ok(SideState::Uncommitted),
-        LedgerHeaderReading::Committed(header) => Ok(SideState::Committed(header)),
-        LedgerHeaderReading::UnknownVersion(_) => Err(LedgerFault::Unreadable),
-        LedgerHeaderReading::Damaged => Err(LedgerFault::Damaged),
-    }
+    Ok(match classify_ledger_header(&bytes) {
+        LedgerHeaderReading::Placeholder => SideState::Uncommitted,
+        LedgerHeaderReading::Committed(header) => SideState::Committed(header),
+        LedgerHeaderReading::UnknownVersion(_) => SideState::Unreadable,
+        LedgerHeaderReading::Damaged => SideState::Damaged,
+    })
 }
 
 /// Whether a committed generation is exactly as long as its header says and

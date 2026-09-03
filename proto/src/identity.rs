@@ -266,6 +266,12 @@ pub fn classify_ledger_header(bytes: &[u8; LEDGER_HEADER_BYTES]) -> LedgerHeader
     if bytes[..4] != LEDGER_MAGIC {
         return LedgerHeaderReading::Damaged;
     }
+    // No build writes version zero. A write torn between the magic and the
+    // version byte, over the zeros of a placeholder, leaves exactly that,
+    // and it is damage rather than another build's ledger.
+    if bytes[HEADER_VERSION] == 0 {
+        return LedgerHeaderReading::Damaged;
+    }
     if bytes[HEADER_VERSION] != LEDGER_VERSION {
         return LedgerHeaderReading::UnknownVersion(bytes[HEADER_VERSION]);
     }
@@ -300,10 +306,18 @@ pub fn ledger_file_len(count: u16) -> usize {
 
 pub const LEDGER_JOURNAL_MAGIC: [u8; 4] = *b"X4LJ";
 pub const LEDGER_JOURNAL_VERSION: u8 = 1;
-pub const LEDGER_JOURNAL_BYTES: usize = 20;
+/// One entry, at the start of its slot.
+pub const LEDGER_JOURNAL_BYTES: usize = 24;
+/// A slot is one sector, so a write to it lands whole or is torn inside it
+/// and nowhere else. Two of them alternate, so a torn write damages the
+/// slot being written and the entry before it still reads.
+pub const LEDGER_JOURNAL_SLOT_BYTES: usize = 512;
+pub const LEDGER_JOURNAL_SLOTS: usize = 2;
+pub const LEDGER_JOURNAL_FILE_BYTES: usize = LEDGER_JOURNAL_SLOT_BYTES * LEDGER_JOURNAL_SLOTS;
 
-// Journal: magic | version | state | side | has standing | generation u32 |
-// count u16 | reserved (zero) u16 | checksum u32 over everything before it.
+// Journal entry: magic | version | state | side | has standing |
+// generation u32 | count u16 | reserved (zero) u16 | sequence u32 |
+// checksum u32 over everything before it.
 const JOURNAL_VERSION: usize = 4;
 const JOURNAL_STATE: usize = 5;
 const JOURNAL_SIDE: usize = 6;
@@ -311,8 +325,10 @@ const JOURNAL_HAS_STANDING: usize = 7;
 const JOURNAL_GENERATION: usize = 8;
 const JOURNAL_COUNT: usize = 12;
 const JOURNAL_RESERVED: usize = 14;
-const JOURNAL_CHECKSUM: usize = 16;
+const JOURNAL_SEQUENCE: usize = 16;
+const JOURNAL_CHECKSUM: usize = 20;
 const _: () = assert!(JOURNAL_CHECKSUM + 4 == LEDGER_JOURNAL_BYTES);
+const _: () = assert!(LEDGER_JOURNAL_BYTES <= LEDGER_JOURNAL_SLOT_BYTES);
 const JOURNAL_COMMITTED: u8 = 1;
 const JOURNAL_REWRITING: u8 = 2;
 
@@ -326,6 +342,16 @@ const JOURNAL_REWRITING: u8 = 2;
 /// live side and its header, and for the length of a rewrite it names the
 /// side being written and what stood on the other side when the rewrite
 /// began. A side is then believed only when the journal accounts for it.
+///
+/// The journal has to survive its own interrupted write, or it would be the
+/// one durable write in the protocol that does not. So an entry lives in
+/// one of two sector-sized slots, written alternately, each carrying a
+/// sequence number: a torn write damages the slot being written, and the
+/// entry before it, in the other slot, still reads. Falling back one entry
+/// is safe by construction, because a generation's ids reach a committed
+/// catalog only after the journal has named that generation live, so the
+/// entry before names either the same live side or a rewrite whose outcome
+/// the target's own header decides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LedgerJournal {
     /// `side` holds the live generation, and this is its header.
@@ -339,7 +365,13 @@ pub enum LedgerJournal {
     },
 }
 
-pub fn encode_ledger_journal(entry: LedgerJournal, out: &mut [u8; LEDGER_JOURNAL_BYTES]) {
+/// Encode one entry with its sequence number, which the writer takes as one
+/// past the entry it is superseding.
+pub fn encode_ledger_journal(
+    entry: LedgerJournal,
+    sequence: u32,
+    out: &mut [u8; LEDGER_JOURNAL_BYTES],
+) {
     out.fill(0);
     out[..4].copy_from_slice(&LEDGER_JOURNAL_MAGIC);
     out[JOURNAL_VERSION] = LEDGER_JOURNAL_VERSION;
@@ -360,29 +392,39 @@ pub fn encode_ledger_journal(entry: LedgerJournal, out: &mut [u8; LEDGER_JOURNAL
         out[JOURNAL_GENERATION..JOURNAL_COUNT].copy_from_slice(&header.generation.to_le_bytes());
         out[JOURNAL_COUNT..JOURNAL_RESERVED].copy_from_slice(&header.count.to_le_bytes());
     }
+    out[JOURNAL_SEQUENCE..JOURNAL_CHECKSUM].copy_from_slice(&sequence.to_le_bytes());
     let sum = fnv1a(&out[..JOURNAL_CHECKSUM]);
     out[JOURNAL_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
 }
 
-/// What the bytes of a ledger journal say.
+/// What the bytes at the start of one journal slot say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LedgerJournalReading {
     /// All zero. Nothing was ever written here.
     Blank,
-    Entry(LedgerJournal),
+    /// An entry, with the sequence number that orders it against the other
+    /// slot's.
+    Entry { entry: LedgerJournal, sequence: u32 },
     /// The journal's magic under a version this build does not read.
     UnknownVersion(u8),
-    /// None of the above: an entry damaged after it landed, or not a journal.
+    /// None of the above: a write torn by a power cut, an entry damaged
+    /// after it landed, or not a journal. With the other slot intact the
+    /// first of those is the common case, and the reader falls back to it.
     Damaged,
 }
 
-/// Read a journal without guessing, the way [`classify_ledger_header`] reads
+/// Read one slot without guessing, the way [`classify_ledger_header`] reads
 /// a header.
 pub fn classify_ledger_journal(bytes: &[u8; LEDGER_JOURNAL_BYTES]) -> LedgerJournalReading {
     if bytes.iter().all(|byte| *byte == 0) {
         return LedgerJournalReading::Blank;
     }
     if bytes[..4] != LEDGER_JOURNAL_MAGIC {
+        return LedgerJournalReading::Damaged;
+    }
+    // As for a header: a write torn just past the magic, over a blank slot,
+    // leaves version zero, which no build writes.
+    if bytes[JOURNAL_VERSION] == 0 {
         return LedgerJournalReading::Damaged;
     }
     if bytes[JOURNAL_VERSION] != LEDGER_JOURNAL_VERSION {
@@ -410,19 +452,24 @@ pub fn classify_ledger_journal(bytes: &[u8; LEDGER_JOURNAL_BYTES]) -> LedgerJour
         ]),
         count: u16::from_le_bytes([bytes[JOURNAL_COUNT], bytes[JOURNAL_COUNT + 1]]),
     };
-    match (bytes[JOURNAL_STATE], bytes[JOURNAL_HAS_STANDING]) {
-        (JOURNAL_COMMITTED, 0) => LedgerJournalReading::Entry(LedgerJournal::Committed {
+    let sequence = u32::from_le_bytes([
+        bytes[JOURNAL_SEQUENCE],
+        bytes[JOURNAL_SEQUENCE + 1],
+        bytes[JOURNAL_SEQUENCE + 2],
+        bytes[JOURNAL_SEQUENCE + 3],
+    ]);
+    let entry = match (bytes[JOURNAL_STATE], bytes[JOURNAL_HAS_STANDING]) {
+        (JOURNAL_COMMITTED, 0) => LedgerJournal::Committed {
             side: bytes[JOURNAL_SIDE],
             header,
-        }),
-        (JOURNAL_REWRITING, has_standing @ (0 | 1)) => {
-            LedgerJournalReading::Entry(LedgerJournal::Rewriting {
-                target: bytes[JOURNAL_SIDE],
-                standing: (has_standing == 1).then_some(header),
-            })
-        }
-        _ => LedgerJournalReading::Damaged,
-    }
+        },
+        (JOURNAL_REWRITING, has_standing @ (0 | 1)) => LedgerJournal::Rewriting {
+            target: bytes[JOURNAL_SIDE],
+            standing: (has_standing == 1).then_some(header),
+        },
+        _ => return LedgerJournalReading::Damaged,
+    };
+    LedgerJournalReading::Entry { entry, sequence }
 }
 
 fn fnv1a(bytes: &[u8]) -> u32 {
@@ -707,9 +754,9 @@ mod tests {
         // version, which is another build's ledger.
         for at in 0..LEDGER_HEADER_BYTES {
             let mut torn = bytes;
-            torn[at] ^= 0x01;
+            torn[at] ^= 0x02;
             let expected = if at == HEADER_VERSION {
-                LedgerHeaderReading::UnknownVersion(LEDGER_VERSION ^ 0x01)
+                LedgerHeaderReading::UnknownVersion(LEDGER_VERSION ^ 0x02)
             } else {
                 LedgerHeaderReading::Damaged
             };
@@ -721,6 +768,17 @@ mod tests {
             classify_ledger_header(&nearly_blank),
             LedgerHeaderReading::Damaged
         );
+        // A header write torn just past its magic, over the placeholder,
+        // leaves version zero: damage, not another build.
+        for landed in 1..LEDGER_HEADER_BYTES {
+            let mut torn = [0u8; LEDGER_HEADER_BYTES];
+            torn[..landed].copy_from_slice(&bytes[..landed]);
+            assert_eq!(
+                classify_ledger_header(&torn),
+                LedgerHeaderReading::Damaged,
+                "{landed} bytes landed"
+            );
+        }
         // Another build's version is reported whatever its checksum says,
         // since that build may frame its header differently.
         let mut other = bytes;
@@ -756,17 +814,20 @@ mod tests {
         ];
         for entry in entries {
             let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
-            encode_ledger_journal(entry, &mut bytes);
+            encode_ledger_journal(entry, 0xFFFF_FFF0, &mut bytes);
             assert_eq!(
                 classify_ledger_journal(&bytes),
-                LedgerJournalReading::Entry(entry),
+                LedgerJournalReading::Entry {
+                    entry,
+                    sequence: 0xFFFF_FFF0
+                },
                 "{entry:?}"
             );
             for at in 0..LEDGER_JOURNAL_BYTES {
                 let mut torn = bytes;
-                torn[at] ^= 0x01;
+                torn[at] ^= 0x02;
                 let expected = if at == JOURNAL_VERSION {
-                    LedgerJournalReading::UnknownVersion(LEDGER_JOURNAL_VERSION ^ 0x01)
+                    LedgerJournalReading::UnknownVersion(LEDGER_JOURNAL_VERSION ^ 0x02)
                 } else {
                     LedgerJournalReading::Damaged
                 };
@@ -774,6 +835,17 @@ mod tests {
                     classify_ledger_journal(&torn),
                     expected,
                     "{entry:?}, flipped byte {at}"
+                );
+            }
+            // Every prefix a torn write over a blank slot can leave is
+            // damage, not another build, and not blank once one byte is in.
+            for landed in 1..LEDGER_JOURNAL_BYTES {
+                let mut torn = [0u8; LEDGER_JOURNAL_BYTES];
+                torn[..landed].copy_from_slice(&bytes[..landed]);
+                assert_eq!(
+                    classify_ledger_journal(&torn),
+                    LedgerJournalReading::Damaged,
+                    "{entry:?}, {landed} bytes landed"
                 );
             }
         }
@@ -784,7 +856,7 @@ mod tests {
         // A side past the two there are, or a state this build does not
         // write, is not an entry even under a checksum that agrees.
         let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
-        encode_ledger_journal(entries[0], &mut bytes);
+        encode_ledger_journal(entries[0], 1, &mut bytes);
         for (at, byte) in [
             (JOURNAL_SIDE, 2u8),
             (JOURNAL_STATE, 3),

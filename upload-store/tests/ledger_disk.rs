@@ -29,8 +29,8 @@ use proto::catalog::{
 };
 use proto::identity::{
     classify_ledger_journal, BookId, LedgerJournal, LedgerJournalReading, LedgerRecord,
-    LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_RECORD_BYTES, MISSING_SCANS_RETAINED,
-    ROW_KEY_BYTES,
+    LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_JOURNAL_FILE_BYTES, LEDGER_JOURNAL_SLOTS,
+    LEDGER_JOURNAL_SLOT_BYTES, LEDGER_RECORD_BYTES, MISSING_SCANS_RETAINED, ROW_KEY_BYTES,
 };
 use proto::library_path::BookRoot;
 use upload_store::ledger::{self, Assignment, LedgerFault, LEDGER_FILES, LEDGER_JOURNAL};
@@ -44,6 +44,13 @@ struct RamDisk {
     /// Writes from this number onward do nothing and report failure.
     fail_writes_from: RefCell<Option<u32>>,
     writes_seen: RefCell<u32>,
+    /// The `n`th write lands only its first `k` bytes and then the power
+    /// goes: a sector torn in the middle of being written, which is the one
+    /// thing a checksum on a single-sector record exists to catch.
+    tear_write_at: RefCell<Option<(u32, usize)>>,
+    /// The first block of every write since the last arming, in order, so
+    /// a test can find which writes touched a given file.
+    written_blocks: RefCell<Vec<u32>>,
 }
 
 #[derive(Debug)]
@@ -73,10 +80,23 @@ impl SharedDisk {
     fn cut_writes_from(&self, n: Option<u32>) {
         *self.0.writes_seen.borrow_mut() = 0;
         *self.0.fail_writes_from.borrow_mut() = n;
+        *self.0.tear_write_at.borrow_mut() = None;
+        self.0.written_blocks.borrow_mut().clear();
+    }
+
+    /// Tear the `n`th write from now on after `k` bytes of its first block,
+    /// and cut the power there.
+    fn tear_write_at(&self, n: u32, k: usize) {
+        self.cut_writes_from(None);
+        *self.0.tear_write_at.borrow_mut() = Some((n, k));
     }
 
     fn writes_seen(&self) -> u32 {
         *self.0.writes_seen.borrow()
+    }
+
+    fn written_blocks(&self) -> Vec<u32> {
+        self.0.written_blocks.borrow().clone()
     }
 }
 
@@ -93,13 +113,24 @@ impl BlockDevice for SharedDisk {
     }
 
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
-        {
+        let seen = {
             let mut seen = self.0.writes_seen.borrow_mut();
             *seen += 1;
-            if let Some(from) = *self.0.fail_writes_from.borrow() {
-                if *seen >= from {
-                    return Err(DiskError);
-                }
+            *seen
+        };
+        self.0.written_blocks.borrow_mut().push(start.0);
+        if let Some((n, k)) = *self.0.tear_write_at.borrow() {
+            if seen == n {
+                let mut data = self.0.data.borrow_mut();
+                let at = start.0 as usize * BLOCK_BYTES;
+                data[at..at + k].copy_from_slice(&blocks[0][..k]);
+                *self.0.fail_writes_from.borrow_mut() = Some(seen);
+                return Err(DiskError);
+            }
+        }
+        if let Some(from) = *self.0.fail_writes_from.borrow() {
+            if seen >= from {
+                return Err(DiskError);
             }
         }
         let mut data = self.0.data.borrow_mut();
@@ -159,6 +190,8 @@ fn new_card() -> SharedDisk {
         data: RefCell::new(format_disk()),
         fail_writes_from: RefCell::new(None),
         writes_seen: RefCell::new(0),
+        tear_write_at: RefCell::new(None),
+        written_blocks: RefCell::new(Vec::new()),
     }))
 }
 
@@ -300,17 +333,24 @@ fn generation(root: &Dir<'_>) -> Option<(u32, u16, &'static str)> {
         .map(|live| (live.generation, live.count, live.file_name()))
 }
 
-/// What the journal says, or `None` for no journal file.
-fn journal(root: &Dir<'_>) -> Option<LedgerJournalReading> {
-    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let file = cache_root
-        .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadOnly)
-        .ok()?;
-    let mut bytes = [0u8; LEDGER_JOURNAL_BYTES];
-    if !read_exact(&file, &mut bytes) {
-        return Some(LedgerJournalReading::Blank);
+/// What the journal says: the newest entry that reads, or `None` for no
+/// journal.
+fn journal(root: &Dir<'_>) -> Option<LedgerJournal> {
+    ledger::read_journal(root).expect("read journal")
+}
+
+/// What each of the journal's slots says, read raw.
+fn journal_slots(root: &Dir<'_>) -> [LedgerJournalReading; LEDGER_JOURNAL_SLOTS] {
+    let bytes = journal_bytes(root);
+    assert_eq!(bytes.len(), LEDGER_JOURNAL_FILE_BYTES);
+    let mut slots = [LedgerJournalReading::Blank; LEDGER_JOURNAL_SLOTS];
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let at = index * LEDGER_JOURNAL_SLOT_BYTES;
+        let mut entry = [0u8; LEDGER_JOURNAL_BYTES];
+        entry.copy_from_slice(&bytes[at..at + LEDGER_JOURNAL_BYTES]);
+        *slot = classify_ledger_journal(&entry);
     }
-    Some(classify_ledger_journal(&bytes))
+    slots
 }
 
 /// Overwrite the journal's bytes in place, as damage would.
@@ -625,14 +665,14 @@ fn a_power_cut_anywhere_through_the_catalog_commit_leaves_a_legal_state() {
             }
         }
         match journal(&root) {
-            Some(LedgerJournalReading::Entry(LedgerJournal::Committed { side: 0, .. })) => {
+            Some(LedgerJournal::Committed { side: 0, .. }) => {
                 assert_eq!(live, standing, "cut at write {cut}: not begun");
                 seen[0] = true;
             }
-            Some(LedgerJournalReading::Entry(LedgerJournal::Rewriting {
+            Some(LedgerJournal::Rewriting {
                 target: 1,
                 standing: Some(_),
-            })) => {
+            }) => {
                 if live == standing {
                     seen[1] = true;
                 } else {
@@ -644,7 +684,7 @@ fn a_power_cut_anywhere_through_the_catalog_commit_leaves_a_legal_state() {
                     seen[2] = true;
                 }
             }
-            Some(LedgerJournalReading::Entry(LedgerJournal::Committed { side: 1, .. })) => {
+            Some(LedgerJournal::Committed { side: 1, .. }) => {
                 assert_eq!(live.len(), 7, "cut at write {cut}: journalled");
                 seen[3] = true;
             }
@@ -923,10 +963,10 @@ fn an_interrupted_rewrite_resumes_from_the_generation_that_stood() {
         }
         let mgr = open_mgr(&disk);
         let root = open_root(&mgr);
-        if let Some(LedgerJournalReading::Entry(LedgerJournal::Rewriting {
+        if let Some(LedgerJournal::Rewriting {
             target: 1,
             standing: Some(_),
-        })) = journal(&root)
+        }) = journal(&root)
         {
             let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
             let target = cache_root.open_file_in_dir(LEDGER_FILES[1], Mode::ReadOnly);
@@ -966,10 +1006,7 @@ fn an_interrupted_rewrite_resumes_from_the_generation_that_stood() {
     assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
     assert!(matches!(
         journal(&root),
-        Some(LedgerJournalReading::Entry(LedgerJournal::Committed {
-            side: 1,
-            ..
-        }))
+        Some(LedgerJournal::Committed { side: 1, .. })
     ));
 }
 
@@ -1039,6 +1076,155 @@ fn a_damaged_non_live_side_stays_harmless_through_a_cut_rewrite() {
     }
 }
 
+/// The journal's own write is the one durable write the protocol has left,
+/// and a sector can tear inside it. Two slots written alternately keep the
+/// entry before, and falling back one entry is safe by construction. Tear
+/// the write of each transition at every length that leaves a partial
+/// entry, and at lengths past it, and check that the ledger opens, names a
+/// legal generation, and that the next scan finishes with the standing ids.
+#[test]
+fn a_torn_journal_write_leaves_an_entry_that_still_reads() {
+    let disk = new_card();
+    let mut random = entropy();
+    let mut grown = SHELF.to_vec();
+    grown.push((BookRoot::Library, "Poetry/Odes.epub", 77_000));
+
+    let (base, standing) = {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+        (disk.image(), records(&root))
+    };
+
+    // Which writes of an uncut rewrite land on the journal's blocks: the
+    // first publishes Rewriting into the second slot, the second publishes
+    // Committed into the first.
+    let journal_writes: Vec<u32> = {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        scan(&root, &grown, ARENA, &mut random, || {
+            disk.cut_writes_from(None)
+        })
+        .unwrap();
+        let image = disk.image();
+        let journal_blocks: Vec<u32> = (0..DISK_BLOCKS)
+            .filter(|block| {
+                let at = *block as usize * BLOCK_BYTES;
+                image[at..at + 4] == proto::identity::LEDGER_JOURNAL_MAGIC
+            })
+            .collect();
+        assert_eq!(journal_blocks.len(), 2, "both slots hold an entry by now");
+        disk.written_blocks()
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| journal_blocks.contains(block))
+            .map(|(index, _)| index as u32 + 1)
+            .collect()
+    };
+    assert_eq!(journal_writes.len(), 2, "one write per transition");
+
+    let mut saw_torn = [false; 2];
+    for (transition, write) in journal_writes.iter().enumerate() {
+        for landed in (0..=LEDGER_JOURNAL_BYTES).chain([100, LEDGER_JOURNAL_SLOT_BYTES - 1]) {
+            disk.restore(&base);
+            {
+                let mgr = open_mgr(&disk);
+                let root = open_root(&mgr);
+                let _ = scan(&root, &grown, ARENA, &mut random, || {
+                    disk.tear_write_at(*write, landed)
+                });
+                disk.cut_writes_from(None);
+            }
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            // At most the slot being written tore, and the other still
+            // reads. A tear that landed only bytes the old entry already
+            // had leaves that entry intact, which is the write not having
+            // happened.
+            let slots = journal_slots(&root);
+            let torn = slots
+                .iter()
+                .filter(|slot| **slot == LedgerJournalReading::Damaged)
+                .count();
+            let intact = slots
+                .iter()
+                .filter(|slot| matches!(slot, LedgerJournalReading::Entry { .. }))
+                .count();
+            assert!(
+                torn <= 1 && intact >= 1 && torn + intact == 2,
+                "transition {transition}, {landed} bytes landed: {slots:?}"
+            );
+            if torn == 1 {
+                saw_torn[transition] = true;
+            }
+            // `records` opens the ledger and panics on a refusal.
+            let live = records(&root);
+            assert!(
+                live == standing || live.len() == 6,
+                "transition {transition}, {landed} bytes landed: a legal generation"
+            );
+            let (assigned, ids) = scan(&root, &grown, ARENA, &mut random, || {}).unwrap();
+            assert_eq!(
+                assigned.matched + assigned.minted,
+                6,
+                "transition {transition}, {landed} bytes landed"
+            );
+            for (index, (_, _, _, id, _)) in standing.iter().enumerate() {
+                assert_eq!(
+                    ids[index],
+                    Some(*id),
+                    "transition {transition}, {landed} bytes landed: row {index}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        saw_torn, [true; 2],
+        "both transitions were torn in earnest at least once"
+    );
+}
+
+/// The first generation is the one path that announces itself before its
+/// file exists, so it gets a sweep of its own: a cut at every write of a
+/// first scan leaves a card that opens, and the next scan adopts every book.
+#[test]
+fn a_fresh_card_survives_a_cut_anywhere_in_its_first_scan() {
+    let disk = new_card();
+    let mut random = entropy();
+    let base = disk.image();
+    let uncut = {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        scan(&root, &SHELF, ARENA, &mut random, || {
+            disk.cut_writes_from(None)
+        })
+        .unwrap();
+        disk.writes_seen()
+    };
+    for cut in 1..=uncut {
+        disk.restore(&base);
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            let _ = scan(&root, &SHELF, ARENA, &mut random, || {
+                disk.cut_writes_from(Some(cut))
+            });
+            disk.cut_writes_from(None);
+        }
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        let live = records(&root);
+        assert!(
+            live.is_empty() || live.len() == 5,
+            "cut at write {cut}: nothing yet, or everything"
+        );
+        let (assigned, ids) = scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+        assert_eq!(assigned.matched + assigned.minted, 5, "cut at write {cut}");
+        assert!(ids.iter().all(Option::is_some), "cut at write {cut}");
+        assert_eq!(records(&root).len(), 5, "cut at write {cut}");
+    }
+}
+
 /// Ledger files with no journal to account for them, or a journal that does
 /// not read, are refused: the journal is the only thing that says which side
 /// is live, and guessing is what this file exists to avoid.
@@ -1051,12 +1237,39 @@ fn a_ledger_without_a_readable_journal_is_refused() {
     scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
     let written = ledger_file_bytes(&root, 0);
     let recorded = journal_bytes(&root);
-    assert_eq!(recorded.len(), LEDGER_JOURNAL_BYTES);
+    assert_eq!(recorded.len(), LEDGER_JOURNAL_FILE_BYTES);
+    // A first scan announces the generation and then names it live: two
+    // entries, one per slot, the second the newer.
+    assert!(
+        matches!(
+            journal_slots(&root),
+            [
+                LedgerJournalReading::Entry {
+                    entry: LedgerJournal::Rewriting { .. },
+                    sequence: 1
+                },
+                LedgerJournalReading::Entry {
+                    entry: LedgerJournal::Committed { .. },
+                    sequence: 2
+                }
+            ]
+        ),
+        "{:?}",
+        journal_slots(&root)
+    );
 
-    // Damaged: a flipped byte, all zeros, and the wrong length.
+    // One damaged slot is a torn write, and the other entry answers: here
+    // the announcement, whose target committed whole.
+    let newer = LEDGER_JOURNAL_SLOT_BYTES;
+    overwrite_journal(&root, newer + 7, &[recorded[newer + 7] ^ 0x01]);
+    assert_eq!(generation(&root), Some((1, 5, LEDGER_FILES[0])));
+
+    // Both damaged, then both blank, then a file of the wrong length: no
+    // entry reads, and the ledger files beside it are unaccounted for.
     overwrite_journal(&root, 7, &[recorded[7] ^ 0x01]);
     assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
     overwrite_journal(&root, 0, &[0u8; LEDGER_JOURNAL_BYTES]);
+    overwrite_journal(&root, newer, &[0u8; LEDGER_JOURNAL_BYTES]);
     assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
     assert_eq!(
         scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
@@ -1068,7 +1281,8 @@ fn a_ledger_without_a_readable_journal_is_refused() {
         let file = cache_root
             .open_file_in_dir(LEDGER_JOURNAL, Mode::ReadWriteCreateOrTruncate)
             .unwrap();
-        file.write(&recorded[..LEDGER_JOURNAL_BYTES - 1]).unwrap();
+        file.write(&recorded[..LEDGER_JOURNAL_FILE_BYTES - 1])
+            .unwrap();
         file.close().unwrap();
     }
     assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
