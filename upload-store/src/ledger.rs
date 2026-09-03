@@ -19,18 +19,21 @@
 //! rewrite of it was interrupted, which costs nothing, or it was the live
 //! generation and lost its header, which is the loss of every id it added.
 //! So a third file, `/READER/LEDGER.JNL`, keeps the fact that tells them
-//! apart. Before a rewrite touches a side it records which side is being
-//! written and what stood on the other; after the new header has landed and
-//! read back it records which side is live and what its header says. The
-//! journal is one block, written in place, so a power cut leaves it saying
-//! the one thing or the other. A reader believes a side only when the
-//! journal accounts for it: the side the journal names as live, with the
-//! header it recorded; or, during a rewrite, the target if its header
-//! landed and otherwise the side that stood, exactly as recorded. Anything
-//! else, a side the journal does not explain, a file that is not as the
-//! journal says, a header or journal that does not read, refuses. Nothing
-//! here repairs a ledger by guessing which side to trust; the intact records
-//! stay where they are for something explicit to salvage.
+//! apart. While a rewrite lays the target's records down, the journal still
+//! names the side that stands, so whatever the target held before is not
+//! consulted, damaged or not. Once the records are down under the
+//! placeholder it records which side is being written and what stood on the
+//! other; after the new header has landed and read back it records which
+//! side is live and what its header says. The journal is one block, written
+//! in place, so a power cut leaves it saying the one thing or the other. A
+//! reader believes a side only when the journal accounts for it: the side
+//! the journal names as live, with the header it recorded; or, during a
+//! rewrite, the target if its header landed and otherwise the side that
+//! stood, exactly as recorded. Anything else, a side the journal does not
+//! explain, a file that is not as the journal says, a header or journal
+//! that does not read, refuses. Nothing here repairs a ledger by guessing
+//! which side to trust; the intact records stay where they are for
+//! something explicit to salvage.
 //!
 //! Rewriting the whole file rather than appending is deliberate. An append
 //! that straddles a cluster boundary can leave the FAT chain and the
@@ -138,12 +141,13 @@ enum SideState {
 /// header it recorded. When it names a side being rewritten, that side is
 /// live if its header landed with the generation after the one that stood,
 /// and otherwise the side that stood is, if it still holds exactly the
-/// header recorded for it. A card with no journal has no ledger, and ledger
-/// files beside no journal are [`LedgerFault::Damaged`]. The generation
-/// chosen is then checked whole, length and every record, before it is
-/// handed back. Sides the journal does not point at are not read at all, so
-/// damage to a generation that is no longer live costs nothing until the
-/// next rewrite goes over it.
+/// header recorded for it; a target under any other committed header is not
+/// a state a cut leaves, and refuses. A card with no journal has no ledger,
+/// and ledger files beside no journal are [`LedgerFault::Damaged`]. The
+/// generation chosen is then checked whole, length and every record, before
+/// it is handed back. Sides the journal does not point at are not read at
+/// all, so damage to a generation that is no longer live costs nothing until
+/// the next rewrite goes over it.
 pub fn open<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
 ) -> Result<Option<Ledger>, LedgerFault>
@@ -176,26 +180,27 @@ where
             let target = usize::from(target);
             let other = 1 - target;
             let expected = standing.map_or(1, |stood| stood.generation.wrapping_add(1));
-            match (side_state(&cache_root, target)?, standing) {
+            match side_state(&cache_root, target)? {
                 // The rewrite got as far as its commit and the power went
                 // before the journal could say so. The generation number is
-                // what says this is that commit: the target may instead
-                // still hold the older generation a cut before the first
-                // write left there.
-                (SideState::Committed(found), _) if found.generation == expected => (target, found),
-                // Nothing stood, so the target can hold nothing but the
-                // first generation or the placeholder for it.
-                (SideState::Committed(_), None) => return Err(LedgerFault::Damaged),
-                (_, None) => match side_state(&cache_root, other)? {
-                    SideState::Absent => return Ok(None),
-                    _ => return Err(LedgerFault::Damaged),
-                },
-                // The rewrite did not get as far as its commit, and what
-                // stood must still stand, exactly as recorded.
-                (_, Some(stood)) => match side_state(&cache_root, other)? {
-                    SideState::Committed(found) if found == stood => (other, stood),
-                    _ => return Err(LedgerFault::Damaged),
-                },
+                // what says this is that commit.
+                SideState::Committed(found) if found.generation == expected => (target, found),
+                // The journal says a side is being written only once that
+                // side holds the placeholder over the new records, so a
+                // target under any other committed header is not a state a
+                // cut leaves.
+                SideState::Committed(_) => return Err(LedgerFault::Damaged),
+                // The header did not land. What stood must still stand,
+                // exactly as recorded, or nothing does.
+                SideState::Absent | SideState::Uncommitted => {
+                    match (standing, side_state(&cache_root, other)?) {
+                        (None, SideState::Absent) => return Ok(None),
+                        (Some(stood), SideState::Committed(found)) if found == stood => {
+                            (other, stood)
+                        }
+                        _ => return Err(LedgerFault::Damaged),
+                    }
+                }
             }
         }
     };
@@ -296,24 +301,27 @@ where
         None => (0, 1),
     };
     let mut header = [0u8; LEDGER_HEADER_BYTES];
+    let standing = previous.map(|live| LedgerHeader {
+        generation: live.generation,
+        count: live.count,
+    });
+    let rewriting = LedgerJournal::Rewriting {
+        target: target as u8,
+        standing,
+    };
 
-    // Say what is about to happen, before anything does. From here until
-    // the journal says otherwise, the target side is explained by this and
-    // the standing side is the one to believe.
-    write_journal(
-        &cache_root,
-        LedgerJournal::Rewriting {
-            target: target as u8,
-            standing: previous.map(|live| LedgerHeader {
-                generation: live.generation,
-                count: live.count,
-            }),
-        },
-    )?;
+    // With nothing standing there is no journal yet, and a ledger file with
+    // no journal beside it reads as damage, so the first generation is
+    // announced before its file exists.
+    if standing.is_none() {
+        write_journal(&cache_root, rewriting)?;
+    }
 
     // Records first, under a header that decodes as nothing, closed so the
     // directory entry holds the final length before anything says the
-    // generation exists.
+    // generation exists. The journal still names the side that stands, so a
+    // cut anywhere in here leaves the target unread: whatever it held
+    // before, damaged or not, is neither consulted nor a reason to refuse.
     let count = {
         let file = cache_root
             .open_file_in_dir(LEDGER_FILES[target], Mode::ReadWriteCreateOrTruncate)
@@ -356,6 +364,14 @@ where
         file.close().map_err(|_| LedgerFault::Device)?;
         count
     };
+
+    // Now the target is known to hold the placeholder over this
+    // generation's records and nothing else. Say it is being written: from
+    // here until the header lands the side that stood is the one to
+    // believe, and once the header has landed the target is.
+    if standing.is_some() {
+        write_journal(&cache_root, rewriting)?;
+    }
 
     // Then the commit: one header, over the placeholder, in a file whose
     // length is already final.

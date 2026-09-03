@@ -782,10 +782,12 @@ under an all-zero placeholder header and the file is closed at its final
 length; then the real header is written over the placeholder in a second
 open, so a generation with a header is a generation with all of its records.
 Which side is live is kept in a third file, `/READER/LEDGER.JNL`, one block
-written in place: before a rewrite touches a side it says which side is
-being written and what stood on the other, and after the new header has
-landed and read back it says which side is live and what its header is. A
-reader believes only what the journal accounts for. The side it names as
+written in place. While a rewrite lays the target's records down it still
+names the side that stands, so whatever the target held before is not
+consulted; once the records are down it says which side is being written
+and what stood on the other; and after the new header has landed and read
+back it says which side is live and what its header is. A reader believes
+only what the journal accounts for. The side it names as
 live must hold the header it recorded; during a rewrite, the target is live
 if its header landed with the generation after the one that stood, and
 otherwise the side that stood is, if it still holds exactly what was

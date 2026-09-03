@@ -973,6 +973,72 @@ fn an_interrupted_rewrite_resumes_from_the_generation_that_stood() {
     ));
 }
 
+/// Damage on the side that is not live is harmless on its own, and a cut
+/// rewrite is recoverable on its own. Composed, they used to wedge: the
+/// journal announced the rewrite before the damaged side was touched, so a
+/// cut in between left a journal pointing at a target whose header was
+/// garbage, and every mount after refused. The journal now names the
+/// standing side until the target holds the placeholder, so at every cut of
+/// a rewrite over a damaged side the ledger opens, and the next scan
+/// finishes the job.
+#[test]
+fn a_damaged_non_live_side_stays_harmless_through_a_cut_rewrite() {
+    let disk = new_card();
+    let mut random = entropy();
+    let mut grown = SHELF.to_vec();
+    grown.push((BookRoot::Library, "Poetry/Odes.epub", 77_000));
+
+    let (base, standing) = {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        scan(&root, &SHELF[..3], ARENA, &mut random, || {}).unwrap();
+        scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+        assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+        // The obsolete side, the next rewrite's target, rots.
+        overwrite_header(&root, 0, 2, b"?");
+        assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+        (disk.image(), records(&root))
+    };
+
+    let uncut = {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        let (assigned, _) = scan(&root, &grown, ARENA, &mut random, || {
+            disk.cut_writes_from(None)
+        })
+        .unwrap();
+        assert_eq!(assigned.minted, 1);
+        disk.writes_seen()
+    };
+
+    for cut in 1..=uncut {
+        disk.restore(&base);
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            let _ = scan(&root, &grown, ARENA, &mut random, || {
+                disk.cut_writes_from(Some(cut))
+            });
+            disk.cut_writes_from(None);
+        }
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        // `records` opens the ledger and panics on a refusal, which is the
+        // wedge this test exists to rule out.
+        let live = records(&root);
+        assert!(
+            live == standing || live.len() == 6,
+            "cut at write {cut}: one of the two legal generations"
+        );
+        let (assigned, ids) = scan(&root, &grown, ARENA, &mut random, || {}).unwrap();
+        assert_eq!(assigned.matched + assigned.minted, 6, "cut at write {cut}");
+        for (index, (_, _, _, id, _)) in standing.iter().enumerate() {
+            assert_eq!(ids[index], Some(*id), "cut at write {cut}: row {index}");
+        }
+        assert_eq!(generation(&root).map(|(_, count, _)| count), Some(6));
+    }
+}
+
 /// Ledger files with no journal to account for them, or a journal that does
 /// not read, are refused: the journal is the only thing that says which side
 /// is live, and guessing is what this file exists to avoid.
@@ -1046,8 +1112,7 @@ fn a_ledger_without_a_readable_journal_is_refused() {
 
 /// A committed header of a version this build does not read is another
 /// build's ledger, and it is refused the way damage is: the ids in it
-/// cannot come back from the card. That covers the retired pre-merge
-/// layout, which a card written by that one commit still carries.
+/// cannot come back from the card.
 #[test]
 fn a_ledger_of_a_version_this_build_does_not_read_is_refused() {
     let disk = new_card();
@@ -1057,7 +1122,7 @@ fn a_ledger_of_a_version_this_build_does_not_read_is_refused() {
     scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
     let written = ledger_file_bytes(&root, 0);
 
-    for version in [1u8, proto::identity::LEDGER_VERSION + 1] {
+    for version in [proto::identity::LEDGER_VERSION + 1, u8::MAX] {
         overwrite_header(&root, 0, 4, &[version]);
         assert_eq!(
             ledger::open(&root).err(),

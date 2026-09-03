@@ -84,13 +84,7 @@ pub const LEDGER_MAGIC: [u8; 4] = *b"X4LG";
 /// unlike the catalog, its contents cannot come back from the card. So a
 /// change to this format is a migration, a reader for the old layout that
 /// writes the new one, and a bump alone is not one.
-///
-/// Version 1 is the exception, and the only one there will be. It was the
-/// layout of one pre-merge commit, without the `misses` byte, and no build
-/// that wrote it ever hung user state from an id, so it was retired without
-/// a reader. A card written by that build refuses here until its two ledger
-/// files are removed, after which the next scan adopts every book afresh.
-pub const LEDGER_VERSION: u8 = 2;
+pub const LEDGER_VERSION: u8 = 1;
 pub const LEDGER_HEADER_BYTES: usize = 16;
 pub const LEDGER_RECORD_BYTES: usize = 284;
 
@@ -727,15 +721,15 @@ mod tests {
             classify_ledger_header(&nearly_blank),
             LedgerHeaderReading::Damaged
         );
-        // The retired pre-merge layout is a version this build does not
-        // read, whatever its checksum says.
-        let mut retired = bytes;
-        retired[HEADER_VERSION] = 1;
-        let sum = fnv1a(&retired[..HEADER_CHECKSUM]);
-        retired[HEADER_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
+        // Another build's version is reported whatever its checksum says,
+        // since that build may frame its header differently.
+        let mut other = bytes;
+        other[HEADER_VERSION] = LEDGER_VERSION + 6;
+        let sum = fnv1a(&other[..HEADER_CHECKSUM]);
+        other[HEADER_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
         assert_eq!(
-            classify_ledger_header(&retired),
-            LedgerHeaderReading::UnknownVersion(1)
+            classify_ledger_header(&other),
+            LedgerHeaderReading::UnknownVersion(LEDGER_VERSION + 6)
         );
         assert_eq!(
             ledger_file_len(header.count),
