@@ -559,9 +559,10 @@ fn fold_walk_entry(
 ///
 /// Every batch is another complete walk, and every walk re-reads the whole
 /// tree, so the scan costs one counting walk plus one walk per batch. A
-/// record is 419 bytes since it started carrying a locator and a widened
-/// alias, so the idle 16 KB section arena stages 39 of them per pass:
-/// ordinary libraries still take two walks, a 1,000-book one takes 27. That is the price of nesting until a
+/// record is 435 bytes since it started carrying a locator, a widened
+/// alias and a book id, so the idle 16 KB section arena stages 37 of them
+/// per pass: ordinary libraries still take two walks, a 1,000-book one
+/// takes 29. That is the price of nesting until a
 /// derived index earns its place. The walk is depth first over the shelf
 /// now, so each pass descends the tree as well as re-reading it, and
 /// finding each next subfolder re-iterates its parent; a directory with `s`
@@ -694,6 +695,36 @@ where
     if cursor != total {
         return Err(());
     }
+    // Every row is on the card; now say which copy each one is. Rows a
+    // ledger record names by place keep that record's id, the rest are
+    // minted one, and the ledger's new generation is committed before the
+    // catalog's header is, so no committed row carries an id the ledger
+    // could lose. A refusal leaves the placeholder header in place, which is
+    // a rescan next mount, the same as any other interrupted scan.
+    let identity_start = Instant::now();
+    let rng = esp_hal::rng::Rng::new();
+    let assigned =
+        upload_store::ledger::assign_book_ids(root, &file, count, scratch, &mut || rng.random())
+            .map_err(|fault| {
+                esp_println::println!("sd: library ledger refused: {:?}", fault);
+            })?;
+    if assigned.minted > 0 {
+        esp_println::println!("sd: adopted {} new book(s)", assigned.minted);
+    }
+    if assigned.duplicates > 0 {
+        esp_println::println!(
+            "sd: the ledger names {} row(s) more than once",
+            assigned.duplicates
+        );
+    }
+    bench_log!(
+        "bench: storage_ledger action=assign matched={} minted={} duplicates={} elapsed_ms={} t_ms={}",
+        assigned.matched,
+        assigned.minted,
+        assigned.duplicates,
+        identity_start.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
     encode_catalog_header(count, &mut header);
     file.seek_from_start(0).map_err(|_| ())?;
     file.write(&header).map_err(|_| ())?;

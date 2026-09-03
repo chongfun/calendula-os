@@ -686,10 +686,10 @@ that did not come from resolving a row carry no fence, since their index comes
 from the app's own active book and refusing those would refuse a boot restore
 whose scan the app has not folded yet.
 
-Behind that list, `/READER/CATALOG.BIN` (v9: `X4CT` magic, u16 book count,
-419-byte records) is the whole book set, and stays the source of identity, the
-orphan sweep's ledger, the wifi shelf listing, and what a chosen locator
-resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
+Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
+435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
+book set, and stays what the orphan sweep judges against, the wifi shelf
+listing, and what a chosen locator resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
 instead of holding the whole list in RAM, so library size is bounded by the
 card. That count field is also the library's
 ceiling: 65,535 books. A card holding more fails the scan rather than
@@ -755,6 +755,33 @@ against that arrival: the candidate search, the verdict rule that refuses
 every inference available today, `carry_position`, and the version 2 claim
 that has somewhere to put evidence. None of them runs on the card.
 
+That record now exists, though nothing hangs from it yet. The library ledger,
+`/READER/LEDGERA.BIN` and `LEDGERB.BIN`, adopts every physical EPUB the scan
+catalogues under a `BookId`: sixteen random bytes from the hardware RNG,
+minted once, derived from nothing on the card, and bound by the ledger to the
+root, locator and size the copy had when it was adopted (`proto::identity`,
+`upload_store::ledger`). Every catalog row caches its id, so the reading path
+does not open the ledger. A catalog rebuild joins its fresh rows to the
+ledger by place: a row a live record names by root, locator and size keeps
+that record's id, every other row is minted one, and the new records are
+committed as a ledger generation before the catalog header lands, so no
+committed row carries an id the ledger could lose. Two byte-identical files
+are two ids with independent state. A copy moved on a computer is a new id
+to this milestone, and the record of the copy that left stays as a missing
+book for the reconciliation that will match it by digest.
+
+The ledger is durable state where the catalog is a cache, so it is written
+the way positions are: whole, to the side that is not live, records first and
+a checksummed header last, so a power cut anywhere leaves the standing
+generation untouched. A reader takes the newer valid header, checks every
+record on that side, and falls back to the older side if one fails; the next
+rewrite goes over the damaged side. The join stages six-byte `(hash, row)`
+keys in the scan arena and reads the ledger once per 2,730 rows, so a rebuild
+costs one sequential pass over the ledger plus one row read and one 16-byte
+write per matched row, rather than a file open per book. Positions and
+caches still key by place; moving them onto `BookId` is the next milestone,
+together with the position-format migration in the reading-position work.
+
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN
 /READER/CACHE2/E<hash>/TOC.BIN
@@ -765,6 +792,8 @@ that has somewhere to put evidence. None of them runs on the card.
 /READER/CATALOG.BIN
 /READER/INSTALL.JNL
 /READER/LABELS/<stem>.TXT
+/READER/LEDGERA.BIN
+/READER/LEDGERB.BIN
 /READER/PROBE.TXT
 /READER/ROLLBACK/<txn>
 /READER/UPLOAD/<txn>

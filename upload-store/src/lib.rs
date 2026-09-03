@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod install;
+pub mod ledger;
 pub mod library;
 pub mod reclaim;
 
