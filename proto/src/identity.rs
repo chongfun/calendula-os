@@ -80,11 +80,17 @@ impl BookId {
 // ---------------------------------------------------------------------------
 
 pub const LEDGER_MAGIC: [u8; 4] = *b"X4LG";
-/// Bumping this retires every ledger on every card, and with it every id.
-/// Unlike the catalog, that is a loss and not a migration: once positions
-/// hang from ids, a rewrite that reads the old layout and writes the new one
-/// is the only acceptable way to change this format.
-pub const LEDGER_VERSION: u8 = 1;
+/// A ledger of a version this build does not read is refused, not rebuilt:
+/// unlike the catalog, its contents cannot come back from the card. So a
+/// change to this format is a migration, a reader for the old layout that
+/// writes the new one, and a bump alone is not one.
+///
+/// Version 1 is the exception, and the only one there will be. It was the
+/// layout of one pre-merge commit, without the `misses` byte, and no build
+/// that wrote it ever hung user state from an id, so it was retired without
+/// a reader. A card written by that build refuses here until its two ledger
+/// files are removed, after which the next scan adopts every book afresh.
+pub const LEDGER_VERSION: u8 = 2;
 pub const LEDGER_HEADER_BYTES: usize = 16;
 pub const LEDGER_RECORD_BYTES: usize = 284;
 
@@ -228,26 +234,63 @@ pub fn encode_ledger_header(header: LedgerHeader, out: &mut [u8; LEDGER_HEADER_B
     out[HEADER_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
 }
 
-/// The header a writer puts down first and replaces last. It decodes as
-/// nothing, so a generation whose records were interrupted is a file that
-/// does not exist rather than a shorter library.
+/// The header a writer puts down first and replaces last: all zero, so that a
+/// generation whose write was interrupted reads as one that was never
+/// committed rather than as a shorter library.
+///
+/// It is the only header that means that. A header block is written whole,
+/// so a torn commit leaves this placeholder and a landed commit leaves a
+/// header that decodes; bytes that are neither are a header that landed and
+/// was damaged since.
 pub fn encode_ledger_placeholder_header(out: &mut [u8; LEDGER_HEADER_BYTES]) {
     out.fill(0);
 }
 
-pub fn decode_ledger_header(bytes: &[u8; LEDGER_HEADER_BYTES]) -> Option<LedgerHeader> {
-    if bytes[..4] != LEDGER_MAGIC
-        || bytes[HEADER_VERSION] != LEDGER_VERSION
-        || bytes[HEADER_RESERVED] != 0
-    {
-        return None;
+/// What the sixteen bytes at the start of a ledger file say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerHeaderReading {
+    /// The all-zero placeholder: a generation that was never committed.
+    Placeholder,
+    /// A committed generation this build reads.
+    Committed(LedgerHeader),
+    /// The ledger's magic under a version this build does not read: another
+    /// build's generation, whose ids cannot be rebuilt from the card.
+    UnknownVersion(u8),
+    /// None of the above: a committed header damaged after it landed, or a
+    /// file that was never a ledger. Either way not a reason to trust the
+    /// other side instead.
+    Damaged,
+}
+
+/// Read a header without guessing. A version this build does not read is
+/// reported before the checksum is consulted, since another version may
+/// frame its header differently.
+pub fn classify_ledger_header(bytes: &[u8; LEDGER_HEADER_BYTES]) -> LedgerHeaderReading {
+    if bytes.iter().all(|byte| *byte == 0) {
+        return LedgerHeaderReading::Placeholder;
     }
-    let stored = u32::from_le_bytes(bytes[HEADER_CHECKSUM..].try_into().ok()?);
-    if fnv1a(&bytes[..HEADER_CHECKSUM]) != stored {
-        return None;
+    if bytes[..4] != LEDGER_MAGIC {
+        return LedgerHeaderReading::Damaged;
     }
-    Some(LedgerHeader {
-        generation: u32::from_le_bytes(bytes[HEADER_GENERATION..HEADER_CHECKSUM].try_into().ok()?),
+    if bytes[HEADER_VERSION] != LEDGER_VERSION {
+        return LedgerHeaderReading::UnknownVersion(bytes[HEADER_VERSION]);
+    }
+    let stored = u32::from_le_bytes([
+        bytes[HEADER_CHECKSUM],
+        bytes[HEADER_CHECKSUM + 1],
+        bytes[HEADER_CHECKSUM + 2],
+        bytes[HEADER_CHECKSUM + 3],
+    ]);
+    if bytes[HEADER_RESERVED] != 0 || fnv1a(&bytes[..HEADER_CHECKSUM]) != stored {
+        return LedgerHeaderReading::Damaged;
+    }
+    LedgerHeaderReading::Committed(LedgerHeader {
+        generation: u32::from_le_bytes([
+            bytes[HEADER_GENERATION],
+            bytes[HEADER_GENERATION + 1],
+            bytes[HEADER_GENERATION + 2],
+            bytes[HEADER_GENERATION + 3],
+        ]),
         count: u16::from_le_bytes([bytes[HEADER_COUNT], bytes[HEADER_COUNT + 1]]),
     })
 }
@@ -517,22 +560,52 @@ mod tests {
     }
 
     #[test]
-    fn a_header_round_trips_and_the_placeholder_is_not_one() {
+    fn a_header_reads_as_committed_placeholder_unknown_or_damaged() {
         let header = LedgerHeader {
             generation: 0xFFFF_FFFE,
             count: 1129,
         };
         let mut bytes = [0u8; LEDGER_HEADER_BYTES];
         encode_ledger_header(header, &mut bytes);
-        assert_eq!(decode_ledger_header(&bytes), Some(header));
+        assert_eq!(
+            classify_ledger_header(&bytes),
+            LedgerHeaderReading::Committed(header)
+        );
         let mut placeholder = [0xAAu8; LEDGER_HEADER_BYTES];
         encode_ledger_placeholder_header(&mut placeholder);
-        assert_eq!(decode_ledger_header(&placeholder), None);
+        assert_eq!(
+            classify_ledger_header(&placeholder),
+            LedgerHeaderReading::Placeholder
+        );
+        // Only the exact placeholder means "never committed". Every other
+        // byte flip is damage to a header that had landed, except the
+        // version, which is another build's ledger.
         for at in 0..LEDGER_HEADER_BYTES {
             let mut torn = bytes;
             torn[at] ^= 0x01;
-            assert_eq!(decode_ledger_header(&torn), None, "flipped byte {at}");
+            let expected = if at == HEADER_VERSION {
+                LedgerHeaderReading::UnknownVersion(LEDGER_VERSION ^ 0x01)
+            } else {
+                LedgerHeaderReading::Damaged
+            };
+            assert_eq!(classify_ledger_header(&torn), expected, "flipped byte {at}");
         }
+        let mut nearly_blank = placeholder;
+        nearly_blank[LEDGER_HEADER_BYTES - 1] = 1;
+        assert_eq!(
+            classify_ledger_header(&nearly_blank),
+            LedgerHeaderReading::Damaged
+        );
+        // The retired pre-merge layout is a version this build does not
+        // read, whatever its checksum says.
+        let mut retired = bytes;
+        retired[HEADER_VERSION] = 1;
+        let sum = fnv1a(&retired[..HEADER_CHECKSUM]);
+        retired[HEADER_CHECKSUM..].copy_from_slice(&sum.to_le_bytes());
+        assert_eq!(
+            classify_ledger_header(&retired),
+            LedgerHeaderReading::UnknownVersion(1)
+        );
         assert_eq!(
             ledger_file_len(header.count),
             LEDGER_HEADER_BYTES + 1129 * LEDGER_RECORD_BYTES

@@ -773,23 +773,29 @@ the consecutive scans its place has been missing; a missing record is carried
 for eight such scans and then left out, and missing records are the first to
 go when a generation would not fit beside the live library, so the ledger
 stays near the size of the library rather than of every book that ever
-passed through it. A scan that changes nothing writes nothing.
+passed through it. A card emptied of books is a scan with no rows, and it
+ages every record the same way. A scan that changes nothing writes nothing.
 
 The ledger is durable state where the catalog is a cache, so it is written
 the way positions are: whole, to the side that is not live. Records go down
-under a placeholder header and the file is closed at its final length; then
-the real header is written over the placeholder in a second open, so the
-commit is the last block to land and a power cut anywhere before it leaves
-the standing generation untouched and the other side uncommitted. A reader
-takes the newer committed header and checks the file's length and every
-record before believing it. A committed generation that does not read back
-whole is damage to durable identity state rather than an interrupted write,
-and it is refused, not fallen back from: the older side is missing every id
-the newer one added, and taking it would re-mint those and orphan whatever
-comes to hang from them. The scan asks the ledger before it touches the
-catalog, so a refusal leaves the committed catalog serving the shelf as it
-was and stops only rebuilds, until the intact records on both sides are
-salvaged by something explicit. The join stages six-byte `(hash, row)` keys
+under an all-zero placeholder header and the file is closed at its final
+length; then the real header is written over the placeholder in a second
+open, so the commit is the last block to land and a power cut anywhere
+before it leaves the standing generation untouched and the other side
+holding the placeholder. A reader reads both headers. The placeholder is the
+one header that means a generation was never committed, and it hands over
+to the other side. A header that decodes is a committed generation, and the
+newer of two is checked for length and every record before it is believed.
+Any other header, on either side, is a header that had landed and was
+damaged since, and so is a committed generation that does not read back
+whole: damage to durable identity state rather than an interrupted write,
+refused rather than fallen back from, because the other side is missing
+every id the damaged one added and taking it would re-mint those and orphan
+whatever comes to hang from them. A header of a format version this build
+does not read is refused for the same reason. The scan asks the ledger
+before it touches the catalog, so a refusal leaves the committed catalog
+serving the shelf as it was and stops only rebuilds, until the intact
+records on both sides are salvaged by something explicit. The join stages six-byte `(hash, row)` keys
 in the scan arena behind one bit per ledger record and reads the ledger once
 per 2,730 rows, so a rebuild costs one sequential pass over the ledger plus
 one row read and one 16-byte write per matched row, rather than a file open

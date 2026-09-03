@@ -50,10 +50,10 @@ use proto::catalog::{
 };
 use proto::durable::generation_is_newer;
 use proto::identity::{
-    carry_missing, decode_ledger_header, decode_ledger_record, encode_ledger_header,
+    carry_missing, classify_ledger_header, decode_ledger_record, encode_ledger_header,
     encode_ledger_placeholder_header, encode_ledger_record, ledger_file_len, rows_with_hash,
-    sort_row_keys, stage_row_key, BookId, LedgerHeader, LedgerRecord, LEDGER_HEADER_BYTES,
-    LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
+    sort_row_keys, stage_row_key, BookId, LedgerHeader, LedgerHeaderReading, LedgerRecord,
+    LEDGER_HEADER_BYTES, LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
 };
 
 /// The two generations, under the cache root.
@@ -70,14 +70,20 @@ pub enum LedgerFault {
     /// the file being absent. Not evidence about the ledger: the caller
     /// leaves things as they are and the next mount tries again.
     Device,
-    /// The live generation was committed and does not read back whole: a
-    /// record fails its checksum, or the file is not as long as its header
-    /// says. That is durable identity state damaged after it landed, and
-    /// falling back to the older generation would re-mint every id the live
-    /// one added. The ledger is left exactly as it is and the operation is
-    /// refused; a catalog already committed keeps serving, and only rebuilds
-    /// stop, until the intact records are salvaged by something explicit.
+    /// A generation that had landed does not read back: a header that is
+    /// neither the placeholder nor one this build wrote, on either side, or
+    /// a live generation whose records or length do not match its header.
+    /// That is durable identity state damaged after it landed, and falling
+    /// back to whatever the other side holds would re-mint every id the
+    /// damaged one added. The ledger is left exactly as it is and the
+    /// operation is refused; a catalog already committed keeps serving, and
+    /// only rebuilds stop, until the intact records are salvaged by
+    /// something explicit.
     Damaged,
+    /// A committed header of a format version this build does not read,
+    /// written by another build. Refused for the same reason as damage: the
+    /// ids it holds cannot come back from the card.
+    Unreadable,
     /// More copies than a generation can hold once the live and newly
     /// adopted ones are counted. Missing records yield first, so this is a
     /// library past the catalog's own ceiling.
@@ -337,6 +343,7 @@ pub struct Assignment {
 /// durable by the time its own header is. The same generation carries
 /// forward the records no row named, aged by one scan and dropped once
 /// they pass the retention bound or would not fit beside the live library.
+/// That includes a catalog with no rows at all, which ages every record.
 /// A scan that changes nothing writes nothing.
 ///
 /// A join rather than a lookup per row, because a per-row lookup in a
@@ -365,10 +372,10 @@ where
     T: TimeSource,
 {
     let mut assigned = Assignment::default();
-    if count == 0 {
+    let live = ledger.filter(|live| live.count > 0);
+    if count == 0 && live.is_none() {
         return Ok(assigned);
     }
-    let live = ledger.filter(|live| live.count > 0);
     let bitmap_bytes = live.map_or(0, |live| (live.count as usize).div_ceil(8));
     if scratch.len() < bitmap_bytes {
         return Err(LedgerFault::Scratch);
@@ -376,7 +383,7 @@ where
     let (named, keys) = scratch.split_at_mut(bitmap_bytes);
     named.fill(0);
     let per_slice = keys.len() / ROW_KEY_BYTES;
-    if per_slice == 0 {
+    if count > 0 && per_slice == 0 {
         return Err(LedgerFault::Scratch);
     }
     let mut record = [0u8; CATALOG_RECORD_BYTES];
@@ -506,11 +513,17 @@ fn set_bit(bits: &mut [u8], index: u16) {
     bits[index as usize / 8] |= 1 << (index % 8);
 }
 
-/// The committed header on `side`, or `None` for a side that is absent,
-/// shorter than a header, or holding bytes that do not decode as one, which
-/// is what the placeholder and a torn commit both look like. Only a refused
-/// open or read is an error. Whether the generation behind a committed
-/// header is whole is [`reads_back_whole`]'s question.
+/// The committed header on `side`, or `None` for a side that was never
+/// committed: a file that is absent or empty, which is what a rewrite that
+/// was cut at its first write leaves, or one holding the placeholder.
+///
+/// Anything else that is not a header this build reads is an error rather
+/// than an absence. A file shorter than a header, or a header that is
+/// neither the placeholder nor decodable, is one that landed and was damaged
+/// since, and a header of another version is another build's ledger. In
+/// either case the other side must not be taken in its place. Whether the
+/// generation behind a committed header is whole is [`reads_back_whole`]'s
+/// question.
 fn committed_header<D, T, const MD: usize, const MF: usize, const MV: usize>(
     cache_root: &Directory<'_, D, T, MD, MF, MV>,
     side: usize,
@@ -524,11 +537,19 @@ where
         Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
         Err(_) => return Err(LedgerFault::Device),
     };
-    let mut bytes = [0u8; LEDGER_HEADER_BYTES];
-    if !read_exact(&file, &mut bytes)? {
+    if file.length() == 0 {
         return Ok(None);
     }
-    Ok(decode_ledger_header(&bytes))
+    let mut bytes = [0u8; LEDGER_HEADER_BYTES];
+    if !read_exact(&file, &mut bytes)? {
+        return Err(LedgerFault::Damaged);
+    }
+    match classify_ledger_header(&bytes) {
+        LedgerHeaderReading::Placeholder => Ok(None),
+        LedgerHeaderReading::Committed(header) => Ok(Some(header)),
+        LedgerHeaderReading::UnknownVersion(_) => Err(LedgerFault::Unreadable),
+        LedgerHeaderReading::Damaged => Err(LedgerFault::Damaged),
+    }
 }
 
 /// Whether a committed generation is exactly as long as its header says and

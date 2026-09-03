@@ -694,6 +694,185 @@ fn a_committed_generation_of_the_wrong_length_is_refused() {
     );
 }
 
+/// Overwrite bytes of one side's header, as bit rot or another build would.
+fn overwrite_header(root: &Dir<'_>, side: usize, at: usize, bytes: &[u8]) {
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+    let file = cache_root
+        .open_file_in_dir(LEDGER_FILES[side], Mode::ReadWriteAppend)
+        .unwrap();
+    file.seek_from_start(at as u32).unwrap();
+    file.write(bytes).unwrap();
+    file.close().unwrap();
+}
+
+/// The header is one block earlier than the records, and the same rule
+/// holds there. Only the exact placeholder means a generation was never
+/// committed; any other header that does not read is a header that had
+/// landed and was damaged since, and without two readable headers the sides
+/// cannot even be ordered. So a damaged header on either side refuses, and
+/// nothing is written over either file.
+#[test]
+fn a_damaged_header_on_either_side_is_refused_rather_than_fallen_back_from() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut random = entropy();
+    scan(&root, &SHELF[..3], ARENA, &mut random, || {}).unwrap();
+    scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+    let older = ledger_file_bytes(&root, 0);
+    let newer = ledger_file_bytes(&root, 1);
+
+    // The newer side, which is the one whose ids a fallback would re-mint.
+    for (at, byte) in [(0usize, b'Y'), (5, 1u8), (9, 0xFF), (15, 0x00)] {
+        let mut damaged = newer.clone();
+        damaged[at] = byte;
+        if damaged[at] == newer[at] {
+            damaged[at] ^= 0x01;
+        }
+        overwrite_header(&root, 1, 0, &damaged[..LEDGER_HEADER_BYTES]);
+        assert_eq!(
+            ledger::open(&root).err(),
+            Some(LedgerFault::Damaged),
+            "header byte {at}"
+        );
+        assert_eq!(
+            scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
+            Some(LedgerFault::Damaged),
+            "header byte {at}"
+        );
+        assert_eq!(ledger_file_bytes(&root, 0), older, "header byte {at}");
+        assert_eq!(
+            ledger_file_bytes(&root, 1),
+            damaged,
+            "header byte {at}: not written over either"
+        );
+        overwrite_header(&root, 1, 0, &newer[..LEDGER_HEADER_BYTES]);
+    }
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+
+    // The older side too: with its header unreadable there is no telling
+    // which side was newer.
+    overwrite_header(&root, 0, 2, b"?");
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Damaged));
+    assert_eq!(
+        scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
+        Some(LedgerFault::Damaged)
+    );
+    assert_eq!(ledger_file_bytes(&root, 1), newer);
+    overwrite_header(&root, 0, 0, &older[..LEDGER_HEADER_BYTES]);
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+}
+
+/// The placeholder is what an interrupted rewrite leaves on the side it was
+/// writing, and it is the one header that hands over: the older generation
+/// answers, and the next rewrite goes over the uncommitted side.
+#[test]
+fn an_uncommitted_newer_side_hands_over_to_the_older_one() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut random = entropy();
+    let (_, three) = scan(&root, &SHELF[..3], ARENA, &mut random, || {}).unwrap();
+    scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+
+    overwrite_header(&root, 1, 0, &[0u8; LEDGER_HEADER_BYTES]);
+    assert_eq!(generation(&root), Some((1, 3, LEDGER_FILES[0])));
+
+    let (assigned, ids) = scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    assert_eq!(assigned.matched, 3);
+    assert_eq!(assigned.minted, 2);
+    assert_eq!(&ids[..3], &three[..]);
+    assert_eq!(generation(&root), Some((2, 5, LEDGER_FILES[1])));
+}
+
+/// A committed header of a version this build does not read is another
+/// build's ledger, and it is refused the way damage is: the ids in it
+/// cannot come back from the card. That covers the retired pre-merge
+/// layout, which a card written by that one commit still carries.
+#[test]
+fn a_ledger_of_a_version_this_build_does_not_read_is_refused() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut random = entropy();
+    scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    let written = ledger_file_bytes(&root, 0);
+
+    for version in [1u8, proto::identity::LEDGER_VERSION + 1] {
+        overwrite_header(&root, 0, 4, &[version]);
+        assert_eq!(
+            ledger::open(&root).err(),
+            Some(LedgerFault::Unreadable),
+            "version {version}"
+        );
+        assert_eq!(
+            scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
+            Some(LedgerFault::Unreadable),
+            "version {version}"
+        );
+        assert_eq!(
+            ledger_file_bytes(&root, 0)[LEDGER_HEADER_BYTES..],
+            written[LEDGER_HEADER_BYTES..],
+            "version {version}: the records are untouched"
+        );
+    }
+    overwrite_header(&root, 0, 0, &written[..LEDGER_HEADER_BYTES]);
+    assert_eq!(generation(&root), Some((1, 5, LEDGER_FILES[0])));
+}
+
+/// A card with every book taken off it is a scan with no rows, and that
+/// scan still counts against every record, so the ledger does not keep a
+/// removed library forever.
+#[test]
+fn an_empty_scan_still_ages_and_retires_missing_copies() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut random = entropy();
+    scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+
+    for scans_missing in 1..=MISSING_SCANS_RETAINED {
+        let (assigned, ids) = scan(&root, &[], ARENA, &mut random, || {}).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(
+            assigned,
+            Assignment {
+                missing: 5,
+                ..Assignment::default()
+            },
+            "empty scan {scans_missing}"
+        );
+        let live = records(&root);
+        assert_eq!(live.len(), 5, "empty scan {scans_missing}");
+        assert!(
+            live.iter().all(|record| record.4 == scans_missing),
+            "empty scan {scans_missing}: every record one scan older"
+        );
+    }
+    let (assigned, _) = scan(&root, &[], ARENA, &mut random, || {}).unwrap();
+    assert_eq!(
+        assigned,
+        Assignment {
+            retired: 5,
+            ..Assignment::default()
+        }
+    );
+    assert_eq!(records(&root), vec![], "past the bound, all let go");
+    let settled = generation(&root);
+    assert_eq!(settled.map(|(_, count, _)| count), Some(0));
+    scan(&root, &[], ARENA, &mut random, || {}).unwrap();
+    assert_eq!(
+        generation(&root),
+        settled,
+        "an empty ledger has nothing to age"
+    );
+
+    let (assigned, _) = scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    assert_eq!(assigned.minted, 5, "the books come back as new copies");
+}
+
 /// Damage on the side that is not live is not the ledger's problem: the live
 /// generation answers, and the next rewrite goes over the damaged side.
 #[test]
