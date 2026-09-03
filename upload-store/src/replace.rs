@@ -18,20 +18,35 @@
 //! once the ledger record has been rewritten. Recovery runs it after the
 //! filesystem journals have settled, and asks the card rather than the
 //! record which side won: the destination's bytes are hashed and compared
-//! to the intent. The new digest is decisive. A predecessor that had a
-//! digest is recognised by it. One that had none is recognised as any file
-//! that is not the new bytes, which holds only because a live intent is a
-//! storage transaction for the sole-writer contract: nothing else was
-//! permitted to write while it stood. Where nothing stood, nothing standing
-//! is the old landing. Anything else keeps the intent and refuses, and
-//! while it stands no other replacement may begin and no scan may adopt.
+//! to the intent. The new digest is decisive. A predecessor whose digest
+//! was read in the same session is recognised by it. One whose bytes were
+//! not read is recognised as any file that is not the new bytes, which
+//! holds only because a live intent is a storage transaction for the
+//! sole-writer contract: nothing else was permitted to write while it
+//! stood. Where nothing stood, nothing standing is the old landing. Anything
+//! else keeps the intent and refuses, and while it stands no other
+//! replacement may begin and no scan may adopt.
+//!
+//! What the ledger recorded about the predecessor's bytes is not promoted
+//! into the intent. Between transactions a computer may replace a file with
+//! another of the same size, and the ledger cannot tell; carrying its digest
+//! forward as the predecessor's would make that predecessor unrecognisable
+//! at recovery and wedge the intent on a rollback that recovered perfectly.
+//! So the predecessor is "known" only to a caller that hashed it in this
+//! session, and the installer, which does not, says "unknown".
+//!
+//! Names are exact in the ledger and equivalent by FAT's rules on the card,
+//! so a replacement can respell its place: an upload of `dune.epub` replaces
+//! `Dune.epub`, and a rollback puts the predecessor back under the spelling
+//! that was typed. The intent carries both spellings, and settling moves the
+//! id to whichever the file ends up under.
 //!
 //! The intent is kept in `/READER/REPLACE.JNL` the way the ledger journal
-//! is: two sector-sized slots written alternately with a sequence number, so
-//! a torn publication leaves the entry before it. A torn publication is an
-//! install that has not begun, since the installer waits for it; a torn
-//! clear is an intent that still stands, which recovery resolves again, and
-//! resolving is idempotent.
+//! is: two slots written alternately with a sequence number, so a torn
+//! publication leaves the entry before it. A torn publication is an install
+//! that has not begun, since the installer waits for it; a torn clear is an
+//! intent that still stands, which recovery resolves again, and resolving is
+//! idempotent.
 //!
 //! No `BookId` or digest enters `INSTALL.JNL` or `RECLAIM.JNL`. The
 //! filesystem transaction decides what the card holds, and this one only
@@ -50,21 +65,34 @@ use proto::identity::{
 use proto::library_path::{BookRoot, LibraryPath, MAX_PATH_BYTES};
 use proto::source::{CachedSourceDigest, SourceDigest};
 
-use crate::ledger::{self, LedgerFault, SlotVerdict};
+use crate::ledger::{self, LedgerFault, SlotVerdict, LEDGER_MAX_RECORDS};
 
 /// The intent, beside the ledger it will be published to.
 pub const REPLACE_JOURNAL: &str = "REPLACE.JNL";
 
-const _: () = assert!(REPLACE_JOURNAL_SLOT_BYTES == ledger::SLOT_BYTES);
 const _: () = assert!(REPLACE_JOURNAL_SLOTS == ledger::SLOT_COUNT);
+
+/// What the caller saw at the destination before the install: the exact
+/// spelling of the file holding the place, its size, and its digest if the
+/// caller read it in this session. Nothing read is nothing known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PredecessorSeen<'a> {
+    pub locator: &'a str,
+    pub byte_size: u32,
+    pub digest: Option<SourceDigest>,
+}
 
 /// A replacement in flight, as read back off the card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Standing {
     pub id: BookId,
     pub root: BookRoot,
+    /// Where the install lands, spelled as typed.
     pub locator: String<MAX_PATH_BYTES>,
     pub predecessor: Predecessor,
+    /// The exact spelling the predecessor held the place under, when there
+    /// was one.
+    pub predecessor_locator: Option<String<MAX_PATH_BYTES>>,
     pub new: CachedSourceDigest,
 }
 
@@ -74,11 +102,20 @@ impl Standing {
         locator
             .push_str(intent.locator)
             .map_err(|_| LedgerFault::Record)?;
+        let predecessor_locator = match intent.predecessor_locator {
+            Some(spelled) => {
+                let mut owned = String::new();
+                owned.push_str(spelled).map_err(|_| LedgerFault::Record)?;
+                Some(owned)
+            }
+            None => None,
+        };
         Ok(Self {
             id: intent.id,
             root: intent.root,
             locator,
             predecessor: intent.predecessor,
+            predecessor_locator,
             new: intent.new,
         })
     }
@@ -102,23 +139,24 @@ where
 
 /// Publish the intent for an install about to begin.
 ///
-/// `locator` is where the install lands, under `at`; `new` is the identity
-/// of the bytes staged for it; `predecessor_size` is the size of the file
-/// holding that place now, or `None` for no file. The copy keeps the id of
-/// the ledger record naming that place and size, if there is one, along
-/// with whatever that record knew of the predecessor's bytes; a place no
-/// record names is a copy the library has not adopted, and is minted an id
-/// here so that the landing can be published under it.
+/// `locator` is where the install lands, under `at`, spelled as typed;
+/// `predecessor` is what holds that place now, or `None` for no file; `new`
+/// is the identity of the bytes staged for it. The copy keeps the id of the
+/// ledger record naming the predecessor's exact place and size, if there is
+/// one; a place no record names is a copy the library has not adopted, and
+/// is minted an id here so that the landing can be published under it.
 ///
-/// Refuses with [`LedgerFault::Busy`] while another intent stands. The
-/// caller must not touch the destination until this returns: the intent is
-/// durable then, and not before.
+/// Refuses with [`LedgerFault::Busy`] while another intent stands, and with
+/// [`LedgerFault::Full`] when a fresh id would need a record the ledger has
+/// no room for, so that an install that could not be published is not
+/// begun. The caller must not touch the destination until this returns: the
+/// intent is durable then, and not before.
 pub fn begin<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     at: BookRoot,
     locator: &str,
+    predecessor: Option<PredecessorSeen<'_>>,
     new: SourceDigest,
-    predecessor_size: Option<u32>,
     random: &mut impl FnMut() -> u32,
 ) -> Result<Standing, LedgerFault>
 where
@@ -130,25 +168,46 @@ where
         return Err(LedgerFault::Busy);
     }
     let live = ledger::open(root)?;
-    let (id, predecessor) = match predecessor_size {
-        None => (BookId::mint(random), Predecessor::None),
-        Some(size) => {
-            let known = match &live {
-                Some(live) => ledger::find_record(root, live, at, locator, size)?,
-                None => None,
-            };
-            match known {
-                Some((id, Some(old))) => (id, Predecessor::Known(old)),
-                Some((id, None)) => (id, Predecessor::Unknown),
-                None => (BookId::mint(random), Predecessor::Unknown),
-            }
+    let known = match (&live, predecessor) {
+        (Some(live), Some(seen)) => {
+            ledger::find_record(root, live, at, seen.locator, seen.byte_size)?
         }
+        _ => None,
+    };
+    let id = match known {
+        Some((id, _)) => id,
+        None => {
+            // A fresh record will be appended when the landing is published.
+            // Refusing now, before anything is journalled, is the one place
+            // a full ledger can refuse an install cleanly.
+            if let Some(live) = &live {
+                if live.count as usize >= LEDGER_MAX_RECORDS
+                    && !ledger::has_missing_record(root, live)?
+                {
+                    return Err(LedgerFault::Full);
+                }
+            }
+            BookId::mint(random)
+        }
+    };
+    let (kind, predecessor_locator) = match predecessor {
+        None => (Predecessor::None, None),
+        Some(PredecessorSeen {
+            locator,
+            digest: Some(read),
+            ..
+        }) => (
+            Predecessor::Known(CachedSourceDigest::new(read)),
+            Some(locator),
+        ),
+        Some(PredecessorSeen { locator, .. }) => (Predecessor::Unknown, Some(locator)),
     };
     let intent = ReplaceIntent {
         id,
         root: at,
         locator,
-        predecessor,
+        predecessor: kind,
+        predecessor_locator,
         new: CachedSourceDigest::new(new),
     };
     publish(&cache_root, &ReplaceJournal::Standing(intent))?;
@@ -157,8 +216,11 @@ where
 
 /// Settle the intent in flight, the landing being known.
 ///
-/// A new landing rewrites the copy's ledger record with the new size and
-/// digest under the same id; an old landing leaves the ledger as it was.
+/// A new landing rewrites the copy's ledger record under the same id with
+/// the new size and digest, at the spelling the install used. An old
+/// landing leaves the record's size and digest as they were; if the
+/// predecessor has been put back under the spelling the install used rather
+/// than its own, which a rollback does, the record moves to that spelling.
 /// Either way the intent is then cleared. Nothing to settle is not an
 /// error: a clear that was cut leaves an intent recovery resolves again,
 /// and a caller may settle what recovery already did.
@@ -174,21 +236,45 @@ where
     let Some(intent) = standing(&cache_root)? else {
         return Ok(());
     };
-    if landed == Landing::New {
-        let live = ledger::open(root)?;
-        let byte_size = u32::try_from(intent.new.byte_len()).map_err(|_| LedgerFault::Record)?;
-        ledger::publish_record(
-            root,
-            live,
-            &LedgerRecord {
-                id: intent.id,
-                root: intent.root,
-                locator: intent.locator.as_str(),
-                byte_size,
-                misses: 0,
-                source: Some(intent.new),
-            },
-        )?;
+    match landed {
+        Landing::New => {
+            let live = ledger::open(root)?;
+            let byte_size =
+                u32::try_from(intent.new.byte_len()).map_err(|_| LedgerFault::Record)?;
+            ledger::publish_record(
+                root,
+                live,
+                &LedgerRecord {
+                    id: intent.id,
+                    root: intent.root,
+                    locator: intent.locator.as_str(),
+                    byte_size,
+                    misses: 0,
+                    source: Some(intent.new),
+                },
+            )?;
+        }
+        Landing::Old => {
+            let respelled = match &intent.predecessor_locator {
+                Some(spelled) if spelled.as_str() != intent.locator.as_str() => {
+                    holds_a_file(root, intent.root, intent.locator.as_str())?
+                        && !holds_a_file(root, intent.root, spelled.as_str())?
+                }
+                _ => false,
+            };
+            if respelled {
+                let live = ledger::open(root)?;
+                if let Some(live) = live {
+                    ledger::relocate_record(
+                        root,
+                        live,
+                        intent.id,
+                        intent.root,
+                        intent.locator.as_str(),
+                    )?;
+                }
+            }
+        }
     }
     publish(&cache_root, &ReplaceJournal::Cleared)
 }
@@ -213,7 +299,9 @@ pub enum Recovery {
 /// before: the filesystem transaction decides what the card holds, and this
 /// one only records what that means. The destination is hashed whole, since
 /// which side landed is a question about its bytes and a persisted digest
-/// is evidence rather than an answer.
+/// is evidence rather than an answer. It is looked for under the spelling
+/// the install used and then under the predecessor's own, which a directory
+/// can hold only one of.
 pub fn recover<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
 ) -> Result<Recovery, LedgerFault>
@@ -229,21 +317,14 @@ where
     let Some(intent) = standing(&cache_root)? else {
         return Ok(Recovery::Nothing);
     };
-    let path = LibraryPath::parse(intent.locator.as_str()).map_err(|_| LedgerFault::Record)?;
-    let destination = crate::library::with_book_at(root, intent.root, &path, |dir, alias| {
-        let mut name = String::<12>::new();
-        if write!(name, "{}", alias).is_err() {
-            return Err(crate::install::InstallError::Card);
+    let mut destination = digest_at(root, intent.root, intent.locator.as_str())?;
+    if destination.is_none() {
+        if let Some(spelled) = &intent.predecessor_locator {
+            if spelled.as_str() != intent.locator.as_str() {
+                destination = digest_at(root, intent.root, spelled.as_str())?;
+            }
         }
-        crate::digest_of_file(dir, name.as_str())
-    })
-    .map_err(|_| LedgerFault::Device)?;
-    let destination = match destination {
-        // No shelf, or no file at the place.
-        None => None,
-        Some(Ok(found)) => found,
-        Some(Err(_)) => return Err(LedgerFault::Device),
-    };
+    }
     match landing(&intent.predecessor, &intent.new, destination.as_ref()) {
         Some(landed) => {
             settle(root, landed)?;
@@ -251,6 +332,48 @@ where
         }
         None => Ok(Recovery::Refused),
     }
+}
+
+/// The digest of the file at a place, read whole now, or `None` for no file.
+fn digest_at<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+    at: BookRoot,
+    locator: &str,
+) -> Result<Option<SourceDigest>, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let path = LibraryPath::parse(locator).map_err(|_| LedgerFault::Record)?;
+    let found = crate::library::with_book_at(root, at, &path, |dir, alias| {
+        let mut name = String::<12>::new();
+        if write!(name, "{}", alias).is_err() {
+            return Err(crate::install::InstallError::Card);
+        }
+        crate::digest_of_file(dir, name.as_str())
+    })
+    .map_err(|_| LedgerFault::Device)?;
+    match found {
+        None => Ok(None),
+        Some(Ok(digest)) => Ok(digest),
+        Some(Err(_)) => Err(LedgerFault::Device),
+    }
+}
+
+/// Whether a file sits at a place, spelled exactly so.
+fn holds_a_file<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+    at: BookRoot,
+    locator: &str,
+) -> Result<bool, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let path = LibraryPath::parse(locator).map_err(|_| LedgerFault::Record)?;
+    crate::library::with_book_at(root, at, &path, |_, _| ())
+        .map(|found| found.is_some())
+        .map_err(|_| LedgerFault::Device)
 }
 
 fn verdict(bytes: &[u8; REPLACE_JOURNAL_BYTES]) -> SlotVerdict {
@@ -271,7 +394,13 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Some((bytes, _, _)) = ledger::newest_slot(cache_root, REPLACE_JOURNAL, verdict)? else {
+    let Some((bytes, _, _)) =
+        ledger::newest_slot::<_, _, MD, MF, MV, REPLACE_JOURNAL_BYTES, REPLACE_JOURNAL_SLOT_BYTES>(
+            cache_root,
+            REPLACE_JOURNAL,
+            verdict,
+        )?
+    else {
         return Ok(None);
     };
     match classify_replace_journal(&bytes) {
@@ -296,9 +425,17 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let current = ledger::newest_slot(cache_root, REPLACE_JOURNAL, verdict)?
+    let current =
+        ledger::newest_slot::<_, _, MD, MF, MV, REPLACE_JOURNAL_BYTES, REPLACE_JOURNAL_SLOT_BYTES>(
+            cache_root,
+            REPLACE_JOURNAL,
+            verdict,
+        )?
         .map(|(_, slot, sequence)| (slot, sequence));
-    ledger::publish_slot(cache_root, REPLACE_JOURNAL, current, |sequence, out| {
-        encode_replace_journal(entry, sequence, out).ok_or(LedgerFault::Record)
-    })
+    ledger::publish_slot::<_, _, MD, MF, MV, REPLACE_JOURNAL_BYTES, REPLACE_JOURNAL_SLOT_BYTES>(
+        cache_root,
+        REPLACE_JOURNAL,
+        current,
+        |sequence, out| encode_replace_journal(entry, sequence, out).ok_or(LedgerFault::Record),
+    )
 }

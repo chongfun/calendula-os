@@ -1430,17 +1430,35 @@ where
         // The chain is recorded alongside each alias: it is what still
         // identifies these files after their names have been rewritten, freed
         // and handed to something else.
-        let holder = holder_of_long_name(books, long_name.as_str()).ok_or(InstallError::Card)?;
-        let old = match holder.map(|(alias, chain)| Located {
-            alias,
-            chain: chain.value(),
-        }) {
-            Some(holder) => Some(holder),
+        // The exact spelling the holder has is kept beside it: the ledger
+        // names places exactly where the card matches them by FAT's rules, so
+        // an upload spelled another way is a replacement of this copy that
+        // will also respell its place.
+        let mut predecessor_spelling = String::<{ proto::library_path::MAX_PATH_BYTES }>::new();
+        let old = match spelled_holder_of_long_name(books, long_name.as_str())
+            .ok_or(InstallError::Card)?
+        {
+            Some((alias, chain, spelled)) => {
+                predecessor_spelling = spelled;
+                Some(Located {
+                    alias,
+                    chain: chain.value(),
+                })
+            }
             // Nothing on the shelf carries this long name, which for a book
             // stored before long names existed is exactly what it would look
-            // like whether or not it is there.
+            // like whether or not it is there. Such a book has no long name,
+            // so its alias is its spelling.
             None => match &legacy {
-                Some(key) => legacy_holder(root, books, key).ok_or(InstallError::Card)?,
+                Some(key) => {
+                    let found = legacy_holder(root, books, key).ok_or(InstallError::Card)?;
+                    if let Some(found) = &found {
+                        predecessor_spelling
+                            .push_str(found.alias.as_str())
+                            .map_err(|_| InstallError::Card)?;
+                    }
+                    found
+                }
                 None => None,
             },
         };
@@ -1469,22 +1487,26 @@ where
         // The library's intent first, durable before the filesystem
         // transaction begins: which copy this is, what stood at its place,
         // and which bytes are meant to land. Nothing below touches the shelf
-        // until it has returned.
-        let predecessor_size = match &intent.old {
-            Some(located) => Some(
-                books
+        // until it has returned. The predecessor's bytes were not read here,
+        // so it is "unknown" to the intent whatever the ledger recorded of
+        // them; see `crate::replace` for why that is the safe claim.
+        let predecessor = match &intent.old {
+            Some(located) => Some(crate::replace::PredecessorSeen {
+                locator: predecessor_spelling.as_str(),
+                byte_size: books
                     .find_directory_entry(located.alias.as_str())
                     .map_err(|_| InstallError::Card)?
                     .size,
-            ),
+                digest: None,
+            }),
             None => None,
         };
         crate::replace::begin(
             root,
             BookRoot::Library,
             intent.long_name.as_str(),
+            predecessor,
             source,
-            predecessor_size,
             random,
         )
         .map_err(ledger_error)?;
@@ -1607,24 +1629,47 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    spelled_holder_of_long_name(books, long_name)
+        .map(|holder| holder.map(|(alias, chain, _)| (alias, chain)))
+}
+
+/// [`holder_of_long_name`], with the long name exactly as the holder spells
+/// it, which is the locator the ledger knows the copy by. Names match by
+/// FAT's rules, so the spelling found can differ from the one asked for.
+fn spelled_holder_of_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    books: &Directory<'_, D, T, MD, MF, MV>,
+    long_name: &str,
+) -> Option<
+    Option<(
+        ShortName,
+        embedded_sdmmc::ClusterId,
+        String<{ proto::library_path::MAX_PATH_BYTES }>,
+    )>,
+>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     let mut storage = [0u8; crate::LFN_SCAN_BYTES];
     let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
-    let mut holder: Option<(ShortName, embedded_sdmmc::ClusterId)> = None;
+    let mut holder = None;
     let walked = books.iterate_dir_lfn(&mut lfn, |entry, found| {
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
             return ControlFlow::Continue(());
         }
-        if !found.is_some_and(|name| same_long_name(name, long_name)) {
+        let Some(found) = found.filter(|name| same_long_name(name, long_name)) else {
             return ControlFlow::Continue(());
-        }
+        };
         let mut name = ShortName::new();
+        let mut spelled = String::new();
         use core::fmt::Write as _;
         // A name that would not fit is not this entry's alias, and the holder
-        // is handed to steps that delete and move things.
-        if write!(name, "{}", entry.name).is_err() {
+        // is handed to steps that delete and move things. A spelling that
+        // would not fit is a locator the ledger could not hold either.
+        if write!(name, "{}", entry.name).is_err() || spelled.push_str(found).is_err() {
             return ControlFlow::Continue(());
         }
-        holder = Some((name, entry.cluster));
+        holder = Some((name, entry.cluster, spelled));
         // A directory holds at most one entry under a long name, so there is
         // nothing further to find.
         ControlFlow::Break(())

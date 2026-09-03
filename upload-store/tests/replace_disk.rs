@@ -2,12 +2,14 @@
 //!
 //! The rules are unit-tested in `proto::identity`. What is checked here is
 //! the protocol: that an upload landing over an adopted copy leaves the
-//! copy's id in place with the new size and digest, that a power cut at
-//! every write from the intent's publication through the ledger's rewrite
-//! and the intent's clear leaves a card whose recovery, in the order the
-//! identity design fixes, ends with the same id naming whichever bytes the
-//! destination holds, and that a destination holding neither legal landing
-//! is refused rather than guessed at.
+//! copy's id in place with the new size and digest, at whatever spelling the
+//! install used; that a power cut at every write from the intent's
+//! publication through the ledger's rewrite and the intent's clear leaves a
+//! card whose recovery, in the order the identity design fixes, ends with
+//! the same id naming whichever bytes the destination holds, under whichever
+//! spelling; that a predecessor replaced on a computer between transactions
+//! is still recognised; and that a destination holding neither legal
+//! landing is refused rather than guessed at.
 //!
 //! The card model is the one `ledger_disk.rs` uses: a RAM image whose writes
 //! can be cut off from a chosen point onward, or torn inside one sector.
@@ -28,16 +30,18 @@ use proto::identity::{BookId, Landing, LedgerRecord, Predecessor, REPLACE_JOURNA
 use proto::library_path::{BookRoot, LibraryPath};
 use proto::source::{digest_of, CachedSourceDigest, SourceDigest};
 use upload_store::install::{self, InstallError, StagedUpload};
-use upload_store::ledger::{self, Assignment, LedgerFault};
-use upload_store::replace::{self, Recovery};
+use upload_store::ledger::{self, Assignment, Carry, Kept, LedgerFault, LEDGER_MAX_RECORDS};
+use upload_store::replace::{self, PredecessorSeen, Recovery};
 use upload_store::{library, reclaim};
 
 const BLOCK_BYTES: usize = 512;
+/// 16 MiB, the size every other disk test uses.
 const DISK_BLOCKS: u32 = 32 * 1024;
 const PART_START_BLOCK: u32 = 64;
 
 struct RamDisk {
     data: RefCell<Vec<u8>>,
+    blocks: u32,
     fail_writes_from: RefCell<Option<u32>>,
     writes_seen: RefCell<u32>,
     tear_write_at: RefCell<Option<(u32, usize)>>,
@@ -133,7 +137,7 @@ impl BlockDevice for SharedDisk {
     }
 
     fn num_blocks(&self) -> Result<BlockCount, DiskError> {
-        Ok(BlockCount(DISK_BLOCKS))
+        Ok(BlockCount(self.0.blocks))
     }
 }
 
@@ -156,9 +160,9 @@ type Mgr = VolumeManager<SharedDisk, StaticTime, 8, 8, 1>;
 type Dir<'a> = Directory<'a, SharedDisk, StaticTime, 8, 8, 1>;
 type CardFile<'a> = embedded_sdmmc::File<'a, SharedDisk, StaticTime, 8, 8, 1>;
 
-fn format_disk() -> Vec<u8> {
-    let mut disk = vec![0u8; DISK_BLOCKS as usize * BLOCK_BYTES];
-    let part_blocks = DISK_BLOCKS - PART_START_BLOCK;
+fn format_disk(blocks: u32) -> Vec<u8> {
+    let mut disk = vec![0u8; blocks as usize * BLOCK_BYTES];
+    let part_blocks = blocks - PART_START_BLOCK;
     let mut partition = vec![0u8; part_blocks as usize * BLOCK_BYTES];
     fatfs::format_volume(
         std::io::Cursor::new(partition.as_mut_slice()),
@@ -177,8 +181,13 @@ fn format_disk() -> Vec<u8> {
 }
 
 fn new_card() -> SharedDisk {
+    new_card_of(DISK_BLOCKS)
+}
+
+fn new_card_of(blocks: u32) -> SharedDisk {
     SharedDisk(Rc::new(RamDisk {
-        data: RefCell::new(format_disk()),
+        data: RefCell::new(format_disk(blocks)),
+        blocks,
         fail_writes_from: RefCell::new(None),
         writes_seen: RefCell::new(0),
         tear_write_at: RefCell::new(None),
@@ -229,6 +238,8 @@ fn read_exact(file: &CardFile<'_>, mut out: &mut [u8]) -> bool {
 }
 
 const BOOK: &str = "Dune.epub";
+/// The same name as the card matches it, spelled another way.
+const BOOK_RESPELLED: &str = "dune.epub";
 
 /// A body of `len` bytes, distinct per `seed`. Big enough to span clusters.
 fn body(seed: u8, len: usize) -> Vec<u8> {
@@ -245,7 +256,7 @@ fn sideload(books: &Dir<'_>, name: &str, bytes: &[u8]) {
     file.close().expect("close book");
 }
 
-/// What the shelf holds under `name`, or `None` for no such book.
+/// What the shelf holds under `name`, spelled exactly so, or `None`.
 fn shelf_bytes(root: &Dir<'_>, name: &str) -> Option<Vec<u8>> {
     let path = LibraryPath::parse(name).unwrap();
     library::with_book_at(root, BookRoot::Library, &path, |dir, alias| {
@@ -281,12 +292,15 @@ fn overwrite_shelf(root: &Dir<'_>, name: &str, bytes: &[u8]) {
 }
 
 /// One row of the catalog a scan would write.
-type Row = (BookRoot, &'static str, u32);
+type Row<'a> = (BookRoot, &'a str, u32);
 
 /// The production scan, as far as the ledger is concerned: rows into an
 /// uncommitted `CATALOG.BIN`, the ledger opened and joined, the header
 /// committed.
-fn scan(root: &Dir<'_>, rows: &[Row]) -> Result<(Assignment, Vec<Option<BookId>>), LedgerFault> {
+fn scan(
+    root: &Dir<'_>,
+    rows: &[Row<'_>],
+) -> Result<(Assignment, Vec<Option<BookId>>), LedgerFault> {
     if root.open_dir(CACHE_ROOT_DIR).is_err() {
         root.make_dir_in_dir(CACHE_ROOT_DIR).expect("mkdir READER");
     }
@@ -335,8 +349,22 @@ fn scan(root: &Dir<'_>, rows: &[Row]) -> Result<(Assignment, Vec<Option<BookId>>
     Ok((assigned, ids))
 }
 
-/// The ledger record naming `name` on the shelf, whatever its size: id,
-/// size, and what it says about the bytes.
+/// The ledger record with `id`: its exact locator, size, and what it says
+/// about the bytes.
+fn record_by_id(root: &Dir<'_>, id: BookId) -> Option<(String, u32, Option<CachedSourceDigest>)> {
+    let live = ledger::open(root).expect("open ledger")?;
+    let mut found = None;
+    ledger::for_each_record(root, &live, &mut |_, record: &LedgerRecord<'_>| {
+        if record.id == id {
+            found = Some((record.locator.to_owned(), record.byte_size, record.source));
+        }
+        Ok(())
+    })
+    .expect("read ledger");
+    found
+}
+
+/// The ledger record naming `name` on the shelf, spelled exactly so.
 fn record_for(root: &Dir<'_>, name: &str) -> Option<(BookId, u32, Option<CachedSourceDigest>)> {
     let live = ledger::open(root).expect("open ledger")?;
     let mut found = None;
@@ -388,7 +416,7 @@ fn digest_agrees(recorded: Option<CachedSourceDigest>, bytes: &[u8]) -> bool {
 
 /// An upload over an adopted copy is the same copy: its id stays, and its
 /// record takes the size and digest of what landed. A second upload over it
-/// does the same again, from a predecessor whose digest is now known.
+/// does the same again.
 #[test]
 fn a_replacement_keeps_the_id_and_records_what_landed() {
     let disk = new_card();
@@ -424,7 +452,6 @@ fn a_replacement_keeps_the_id_and_records_what_landed() {
     assert_eq!(assigned.minted, 0);
     assert_eq!(ids[0], Some(id));
 
-    // Again, now from a predecessor whose digest the ledger knows.
     let newer = body(3, 2_500);
     upload(&root, &books, BOOK, &newer, || {})
         .unwrap()
@@ -434,6 +461,48 @@ fn a_replacement_keeps_the_id_and_records_what_landed() {
     assert_eq!(size, newer.len() as u32);
     assert!(digest_agrees(source, &newer));
     assert_eq!(record_count(&root), 1);
+}
+
+/// The card matches names by FAT's rules and the ledger exactly. An upload
+/// spelled another way replaces the copy the installer found under the
+/// name, and the copy's record moves to the new spelling with its id.
+#[test]
+fn a_replacement_spelled_another_way_keeps_the_id_and_respells_the_record() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let old = body(1, 3_000);
+    sideload(&books, BOOK, &old);
+    let (_, ids) = scan(&root, &[(BookRoot::Library, BOOK, old.len() as u32)]).unwrap();
+    let id = ids[0].unwrap();
+
+    let new = body(2, 4_100);
+    upload(&root, &books, BOOK_RESPELLED, &new, || {})
+        .unwrap()
+        .expect("lands");
+    assert_eq!(shelf_bytes(&root, BOOK), None, "the old spelling is gone");
+    assert_eq!(
+        shelf_bytes(&root, BOOK_RESPELLED).as_deref(),
+        Some(&new[..]),
+        "the shelf spells it as typed"
+    );
+    let (locator, size, source) = record_by_id(&root, id).expect("the id survives");
+    assert_eq!(locator, BOOK_RESPELLED, "and its record spells it the same");
+    assert_eq!(size, new.len() as u32);
+    assert!(digest_agrees(source, &new));
+    assert_eq!(
+        record_count(&root),
+        1,
+        "one copy, one record, not a stale twin"
+    );
+    let (assigned, ids) = scan(
+        &root,
+        &[(BookRoot::Library, BOOK_RESPELLED, new.len() as u32)],
+    )
+    .unwrap();
+    assert_eq!(assigned.matched, 1);
+    assert_eq!(assigned.minted, 0);
+    assert_eq!(ids[0], Some(id));
 }
 
 /// An upload to a name nothing holds adopts the copy with its digest, so
@@ -458,29 +527,107 @@ fn a_fresh_upload_is_adopted_with_its_digest() {
     assert_eq!(ids[0], Some(id));
 }
 
-/// A power cut at every write from before the intent is published through
-/// the install, the ledger's rewrite and the intent's clear. After each,
-/// recovery in the fixed order settles the intent, the destination holds one
-/// of the two legal bodies, the ledger names it under the original id with a
-/// size and digest that agree with it, and the next scan mints nothing.
-#[test]
-fn a_power_cut_anywhere_in_a_replacement_keeps_the_id_and_a_consistent_record() {
-    let disk = new_card();
-    let old = body(1, 3_000);
-    let new = body(2, 4_100);
+/// What a cut replacement must look like once recovered: the copy's id
+/// names whichever body the destination holds, under whichever spelling it
+/// holds it, with a size that agrees and a digest that agrees or was left
+/// as it was.
+struct Expectation<'a> {
+    id: BookId,
+    old_name: &'a str,
+    old: &'a [u8],
+    /// What the ledger said of the old copy's bytes before the upload.
+    old_source: Option<CachedSourceDigest>,
+    new_name: &'a str,
+    new: &'a [u8],
+}
 
-    let (base, id) = {
+/// Check the card after a recovered cut, and say which body it held.
+fn check_recovered(root: &Dir<'_>, expected: &Expectation<'_>, label: &str) -> bool {
+    assert_eq!(
+        replace::read(root).unwrap(),
+        None,
+        "{label}: the intent is cleared"
+    );
+    assert_eq!(
+        install::read_intent(root).unwrap(),
+        install::IntentState::Absent,
+        "{label}"
+    );
+    let under_new = shelf_bytes(root, expected.new_name);
+    let under_old = if expected.old_name == expected.new_name {
+        None
+    } else {
+        shelf_bytes(root, expected.old_name)
+    };
+    let (spelled, held) = match (under_new, under_old) {
+        (Some(held), None) => (expected.new_name, held),
+        (None, Some(held)) => (expected.old_name, held),
+        (new, old) => panic!("{label}: exactly one spelling holds a file: {new:?} {old:?}"),
+    };
+    let (locator, size, source) =
+        record_by_id(root, expected.id).unwrap_or_else(|| panic!("{label}: the id survives"));
+    assert_eq!(
+        locator, spelled,
+        "{label}: the record spells the place as the card does"
+    );
+    assert_eq!(
+        size,
+        held.len() as u32,
+        "{label}: the record's size is the file's"
+    );
+    assert_eq!(record_count(root), 1, "{label}: one copy, one record");
+    let landed_new = held == expected.new;
+    if landed_new {
+        assert!(
+            digest_agrees(source, expected.new),
+            "{label}: the new digest"
+        );
+    } else {
+        assert_eq!(held, expected.old, "{label}: one of the two bodies");
+        assert_eq!(
+            source, expected.old_source,
+            "{label}: the record's digest as it was"
+        );
+    }
+    let (assigned, ids) = scan(root, &[(BookRoot::Library, spelled, held.len() as u32)]).unwrap();
+    assert_eq!(assigned.matched, 1, "{label}");
+    assert_eq!(assigned.minted, 0, "{label}");
+    assert_eq!(ids[0], Some(expected.id), "{label}");
+    landed_new
+}
+
+/// A power cut at every write from before the intent is published through
+/// the install, the ledger's rewrite and the intent's clear, for a base
+/// prepared by `prepare`, which returns the copy's id and what the ledger
+/// says of its bytes. `old_name` is the spelling on the shelf; the upload is
+/// spelled `new_name`. Both sides of the swap must be reached.
+fn sweep_replacement(
+    prepare: impl Fn(&Dir<'_>, &Dir<'_>) -> (BookId, Option<CachedSourceDigest>),
+    old_name: &str,
+    old: &[u8],
+    new_name: &str,
+    new: &[u8],
+) {
+    let disk = new_card();
+    let (base, id, old_source) = {
         let mgr = open_mgr(&disk);
         let (root, books) = open_dirs(&mgr);
-        sideload(&books, BOOK, &old);
-        let (_, ids) = scan(&root, &[(BookRoot::Library, BOOK, old.len() as u32)]).unwrap();
-        (disk.image(), ids[0].unwrap())
+        let (id, old_source) = prepare(&root, &books);
+        (disk.image(), id, old_source)
+    };
+    let expected = Expectation {
+        id,
+        old_name,
+        old,
+        old_source,
+        new_name,
+        new,
     };
 
     let uncut = {
         let mgr = open_mgr(&disk);
         let (root, books) = open_dirs(&mgr);
-        upload(&root, &books, BOOK, &new, || disk.cut_writes_from(None))
+        upload(&root, &books, new_name, new, || disk.cut_writes_from(None))
             .unwrap()
             .expect("lands");
         disk.writes_seen()
@@ -496,7 +643,7 @@ fn a_power_cut_anywhere_in_a_replacement_keeps_the_id_and_a_consistent_record() 
         {
             let mgr = open_mgr(&disk);
             let (root, books) = open_dirs(&mgr);
-            let _ = upload(&root, &books, BOOK, &new, || {
+            let _ = upload(&root, &books, new_name, new, || {
                 disk.cut_writes_from(Some(cut))
             });
             disk.cut_writes_from(None);
@@ -504,36 +651,85 @@ fn a_power_cut_anywhere_in_a_replacement_keeps_the_id_and_a_consistent_record() 
         // Power is back.
         let mgr = open_mgr(&disk);
         let (root, books) = open_dirs(&mgr);
+        let label = format!("cut at write {cut}");
         let recovered = recover(&root, &books);
-        assert_ne!(recovered, Recovery::Refused, "cut at write {cut}");
-        assert_eq!(
-            replace::read(&root).unwrap(),
-            None,
-            "cut at write {cut}: cleared"
-        );
-
-        let held = shelf_bytes(&root, BOOK)
-            .unwrap_or_else(|| panic!("cut at write {cut}: a book is on the shelf"));
-        let (found, size, source) = record_for(&root, BOOK)
-            .unwrap_or_else(|| panic!("cut at write {cut}: a record names it"));
-        assert_eq!(found, id, "cut at write {cut}: the copy kept its id");
-        assert_eq!(record_count(&root), 1, "cut at write {cut}");
-        if held == new {
-            assert_eq!(size, new.len() as u32, "cut at write {cut}");
-            assert!(digest_agrees(source, &new), "cut at write {cut}");
-            saw[1] = true;
-        } else {
-            assert_eq!(held, old, "cut at write {cut}: one of the two bodies");
-            assert_eq!(size, old.len() as u32, "cut at write {cut}");
-            assert_eq!(source, None, "cut at write {cut}: the old record as it was");
-            saw[0] = true;
-        }
-        let (assigned, ids) = scan(&root, &[(BookRoot::Library, BOOK, held.len() as u32)]).unwrap();
-        assert_eq!(assigned.matched, 1, "cut at write {cut}");
-        assert_eq!(assigned.minted, 0, "cut at write {cut}");
-        assert_eq!(ids[0], Some(id), "cut at write {cut}");
+        assert_ne!(recovered, Recovery::Refused, "{label}");
+        let landed_new = check_recovered(&root, &expected, &label);
+        saw[usize::from(landed_new)] = true;
     }
     assert_eq!(saw, [true; 2], "cuts landed on both sides of the swap");
+}
+
+#[test]
+fn a_power_cut_anywhere_in_a_replacement_keeps_the_id_and_a_consistent_record() {
+    let old = body(1, 3_000);
+    let new = body(2, 4_100);
+    sweep_replacement(
+        |root, books| {
+            sideload(books, BOOK, &old);
+            let (_, ids) = scan(root, &[(BookRoot::Library, BOOK, old.len() as u32)]).unwrap();
+            (ids[0].unwrap(), None)
+        },
+        BOOK,
+        &old,
+        BOOK,
+        &new,
+    );
+}
+
+/// A rollback puts the predecessor back under the spelling that was typed,
+/// so a cut replacement spelled another way can leave the old bytes under
+/// the new name. The record follows the file either way.
+#[test]
+fn a_power_cut_in_a_replacement_spelled_another_way_keeps_the_id_under_either_spelling() {
+    let old = body(1, 3_000);
+    let new = body(2, 4_100);
+    sweep_replacement(
+        |root, books| {
+            sideload(books, BOOK, &old);
+            let (_, ids) = scan(root, &[(BookRoot::Library, BOOK, old.len() as u32)]).unwrap();
+            (ids[0].unwrap(), None)
+        },
+        BOOK,
+        &old,
+        BOOK_RESPELLED,
+        &new,
+    );
+}
+
+/// Between transactions a computer may replace a book with another of the
+/// same size, which the ledger cannot see. The next upload over it must
+/// still recover from any cut: the ledger's digest is evidence about bytes
+/// that are gone, and the intent does not carry it as the predecessor's.
+#[test]
+fn a_predecessor_replaced_on_a_computer_is_still_recognised_after_a_cut() {
+    let uploaded = body(1, 3_000);
+    let swapped_in = body(7, 3_000);
+    let new = body(2, 4_100);
+    assert_eq!(
+        uploaded.len(),
+        swapped_in.len(),
+        "same size, the case the ledger cannot see"
+    );
+    sweep_replacement(
+        |root, books| {
+            upload(root, books, BOOK, &uploaded, || {})
+                .unwrap()
+                .expect("lands");
+            let (id, _, source) = record_for(root, BOOK).unwrap();
+            assert!(
+                digest_agrees(source, &uploaded),
+                "the ledger recorded the upload"
+            );
+            overwrite_shelf(root, BOOK, &swapped_in);
+            // The record stands, describing bytes that are no longer there.
+            (id, source)
+        },
+        BOOK,
+        &swapped_in,
+        BOOK,
+        &new,
+    );
 }
 
 /// The intent's own writes, torn inside the sector, at every length that
@@ -551,9 +747,18 @@ fn a_torn_intent_write_still_resolves() {
         let (_, ids) = scan(&root, &[(BookRoot::Library, BOOK, old.len() as u32)]).unwrap();
         (disk.image(), ids[0].unwrap())
     };
+    let expected = Expectation {
+        id,
+        old_name: BOOK,
+        old: &old,
+        old_source: None,
+        new_name: BOOK,
+        new: &new,
+    };
 
     // Which writes of an uncut replacement land on the intent's blocks: the
-    // journal's creation, the publication and the clear.
+    // journal's creation, the publication and the clear. An entry spans two
+    // sectors, so only the first of each slot carries the magic.
     let intent_writes: Vec<u32> = {
         let mgr = open_mgr(&disk);
         let (root, books) = open_dirs(&mgr);
@@ -581,7 +786,7 @@ fn a_torn_intent_write_still_resolves() {
     );
 
     for (transition, write) in intent_writes.iter().enumerate() {
-        for landed in [1usize, 4, 5, 8, 24, 100, 300, 369] {
+        for landed in [1usize, 4, 5, 8, 24, 100, 300, 511] {
             disk.restore(&base);
             {
                 let mgr = open_mgr(&disk);
@@ -593,30 +798,18 @@ fn a_torn_intent_write_still_resolves() {
             }
             let mgr = open_mgr(&disk);
             let (root, books) = open_dirs(&mgr);
-            let recovered = recover(&root, &books);
-            assert_ne!(
-                recovered,
-                Recovery::Refused,
-                "transition {transition}, {landed} bytes landed"
-            );
-            assert_eq!(replace::read(&root).unwrap(), None);
-            let held = shelf_bytes(&root, BOOK).unwrap();
-            let (found, size, source) = record_for(&root, BOOK).unwrap();
-            assert_eq!(found, id, "transition {transition}, {landed} bytes landed");
-            assert_eq!(size, held.len() as u32);
-            if held == new {
-                assert!(digest_agrees(source, &new));
-            } else {
-                assert_eq!(held, old);
-            }
+            let label = format!("transition {transition}, {landed} bytes landed");
+            assert_ne!(recover(&root, &books), Recovery::Refused, "{label}");
+            check_recovered(&root, &expected, &label);
         }
     }
 }
 
-/// A destination holding neither the bytes that were meant to land nor the
-/// predecessor is nothing this can resolve: the intent stands, the ledger is
-/// left alone, and no other change to the shelf begins until the card is
-/// looked at. Putting the predecessor back is looking at it.
+/// A destination holding neither the bytes that were meant to land nor a
+/// predecessor whose digest was read in this session is nothing this can
+/// resolve: the intent stands, the ledger is left alone, and no other change
+/// to the shelf begins until the card is looked at. Putting the predecessor
+/// back is looking at it.
 #[test]
 fn a_destination_holding_neither_landing_is_refused_until_looked_at() {
     let disk = new_card();
@@ -627,21 +820,22 @@ fn a_destination_holding_neither_landing_is_refused_until_looked_at() {
         .unwrap()
         .expect("lands");
     let (id, _, source) = record_for(&root, BOOK).unwrap();
-    assert!(
-        digest_agrees(source, &old),
-        "the predecessor's digest is known"
-    );
+    assert!(digest_agrees(source, &old));
 
-    // An intent published and never acted on: the install it was for did
-    // not begin. Then a stranger arrives at the place, which the sole-writer
+    // An intent whose caller read the predecessor, published and never acted
+    // on. Then a stranger arrives at the place, which the sole-writer
     // contract forbids and which this therefore does not read as either.
     let new = body(2, 4_100);
     let standing = replace::begin(
         &root,
         BookRoot::Library,
         BOOK,
+        Some(PredecessorSeen {
+            locator: BOOK,
+            byte_size: old.len() as u32,
+            digest: Some(digest_of(&old)),
+        }),
         digest_of(&new),
-        Some(old.len() as u32),
         &mut words(),
     )
     .unwrap();
@@ -667,8 +861,8 @@ fn a_destination_holding_neither_landing_is_refused_until_looked_at() {
             &root,
             BookRoot::Library,
             BOOK,
-            digest_of(&new),
             None,
+            digest_of(&new),
             &mut words()
         )
         .err(),
@@ -684,6 +878,53 @@ fn a_destination_holding_neither_landing_is_refused_until_looked_at() {
         .expect("the shelf takes changes again");
 }
 
+/// The installer does not read the predecessor, so its intent says
+/// "unknown" whatever the ledger recorded of it, and a stranger at the place
+/// under a standing intent is read as the predecessor: the sole-writer
+/// contract is what makes that sound, and the ledger's digest is left as
+/// the evidence it is.
+#[test]
+fn the_installer_does_not_promote_the_ledgers_digest_to_the_predecessors() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let old = body(1, 3_000);
+    upload(&root, &books, BOOK, &old, || {})
+        .unwrap()
+        .expect("lands");
+    let (id, _, source) = record_for(&root, BOOK).unwrap();
+    assert!(digest_agrees(source, &old));
+
+    let new = body(2, 4_100);
+    let standing = replace::begin(
+        &root,
+        BookRoot::Library,
+        BOOK,
+        Some(PredecessorSeen {
+            locator: BOOK,
+            byte_size: old.len() as u32,
+            digest: None,
+        }),
+        digest_of(&new),
+        &mut words(),
+    )
+    .unwrap();
+    assert_eq!(standing.id, id, "the id is the record's");
+    assert_eq!(
+        standing.predecessor,
+        Predecessor::Unknown,
+        "but the digest is not the record's"
+    );
+    overwrite_shelf(&root, BOOK, &body(9, 3_000));
+    assert_eq!(recover(&root, &books), Recovery::Settled(Landing::Old));
+    let (found, size, source) = record_for(&root, BOOK).unwrap();
+    assert_eq!((found, size), (id, old.len() as u32));
+    assert!(
+        digest_agrees(source, &old),
+        "the ledger's evidence is left as it was"
+    );
+}
+
 /// An intent for a place nothing held, whose install rolled back or was cut
 /// before it began, resolves to the old landing on an empty destination and
 /// leaves no record behind.
@@ -697,8 +938,8 @@ fn where_nothing_stood_nothing_standing_is_the_old_landing() {
         &root,
         BookRoot::Library,
         BOOK,
-        digest_of(&new),
         None,
+        digest_of(&new),
         &mut words(),
     )
     .unwrap();
@@ -711,8 +952,8 @@ fn where_nothing_stood_nothing_standing_is_the_old_landing() {
         &root,
         BookRoot::Library,
         BOOK,
-        digest_of(&new),
         None,
+        digest_of(&new),
         &mut words(),
     )
     .unwrap();
@@ -733,15 +974,17 @@ fn the_new_bytes_at_the_destination_are_published_under_the_old_id() {
     let (_, ids) = scan(&root, &[(BookRoot::Library, BOOK, old.len() as u32)]).unwrap();
     let id = ids[0].unwrap();
 
-    // The intent is published, then the bytes arrive at the destination by
-    // some path the journal has already forgotten.
     let new = body(2, 4_100);
     replace::begin(
         &root,
         BookRoot::Library,
         BOOK,
+        Some(PredecessorSeen {
+            locator: BOOK,
+            byte_size: old.len() as u32,
+            digest: None,
+        }),
         digest_of(&new),
-        Some(old.len() as u32),
         &mut words(),
     )
     .unwrap();
@@ -752,8 +995,97 @@ fn the_new_bytes_at_the_destination_are_published_under_the_old_id() {
     assert_eq!(size, new.len() as u32);
     assert!(digest_agrees(source, &new));
     assert_eq!(replace::read(&root).unwrap(), None);
-    // Settling again is nothing.
     assert_eq!(recover(&root, &books), Recovery::Nothing);
+}
+
+/// A ledger with no room for one more record lets a missing copy go to make
+/// it, and refuses cleanly before anything is journalled when there is none
+/// to let go of. A 64 MiB card, since the records alone are 21 MiB.
+#[test]
+fn a_full_ledger_yields_a_missing_copy_or_refuses_before_the_install_begins() {
+    let disk = new_card_of(128 * 1024);
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    // Every record a live copy but one, which the last scan found missing.
+    let ids: Vec<BookId> = (0..LEDGER_MAX_RECORDS)
+        .map(|index| {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            BookId::from_bytes(bytes).unwrap()
+        })
+        .collect();
+    let missing_index = 777usize;
+    ledger::write_generation(
+        &root,
+        None,
+        &mut |_, record| Carry::Keep(Kept::of(record)),
+        |writer| {
+            for (index, id) in ids.iter().enumerate() {
+                let mut locator = heapless::String::<32>::new();
+                use core::fmt::Write as _;
+                write!(locator, "B{index}.epub").unwrap();
+                writer.append(&LedgerRecord {
+                    id: *id,
+                    root: BookRoot::Library,
+                    locator: locator.as_str(),
+                    byte_size: 1_000,
+                    misses: u8::from(index == missing_index),
+                    source: None,
+                })?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(record_count(&root), LEDGER_MAX_RECORDS);
+
+    // A fresh upload lands and is adopted: the missing copy made room.
+    let new = body(2, 2_048);
+    upload(&root, &books, BOOK, &new, || {})
+        .unwrap()
+        .expect("lands");
+    let (fresh, size, source) = record_for(&root, BOOK).expect("adopted");
+    assert_eq!(size, new.len() as u32);
+    assert!(digest_agrees(source, &new));
+    assert!(!ids.contains(&fresh));
+    assert_eq!(record_count(&root), LEDGER_MAX_RECORDS);
+    assert_eq!(
+        record_by_id(&root, ids[missing_index]),
+        None,
+        "the missing copy's record made the room"
+    );
+    assert!(replace::read(&root).unwrap().is_none());
+
+    // With every record a live copy, a second fresh upload is refused before
+    // any journal is written, and the shelf and the ledger are left as they
+    // were.
+    let refused = upload(&root, &books, "Other.epub", &body(3, 1_500), || {});
+    assert!(
+        matches!(refused, Err(InstallError::Ledger)),
+        "refused by the ledger: {refused:?}"
+    );
+    assert_eq!(
+        replace::read(&root).unwrap(),
+        None,
+        "no intent was published"
+    );
+    assert_eq!(
+        install::read_intent(&root).unwrap(),
+        install::IntentState::Absent,
+        "and no install journal"
+    );
+    assert_eq!(shelf_bytes(&root, "Other.epub"), None);
+    assert_eq!(record_count(&root), LEDGER_MAX_RECORDS);
+    // A replacement of an adopted copy still goes through: no record is
+    // added.
+    upload(&root, &books, BOOK, &body(4, 3_000), || {})
+        .unwrap()
+        .expect("a replacement needs no room");
+    assert_eq!(record_count(&root), LEDGER_MAX_RECORDS);
+    assert_eq!(
+        record_by_id(&root, fresh).map(|(_, size, _)| size),
+        Some(3_000)
+    );
 }
 
 /// A digest the install verified travels into the record; a stored digest

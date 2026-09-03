@@ -819,24 +819,36 @@ A managed replacement, an upload landing under a name the shelf already
 holds, is the one case where a copy's bytes change under its id, and it
 spans two transactions: `INSTALL.JNL` swaps the bytes, and the ledger has to
 be told. `/READER/REPLACE.JNL` bridges them. Before the installer writes
-`INSTALL.JNL` it publishes an intent there naming the copy's id, its place,
-what stood there (nothing, a predecessor of unknown bytes, or one with a
-recorded digest) and the digest of the bytes staged to land; the intent
-stands after `INSTALL.JNL` clears and is cleared only once the ledger record
-has been rewritten under the same id with the new size and digest. Recovery
-resolves it after the filesystem journals have settled, and asks the card
-rather than the record which side won, by hashing the destination: the new
-digest is decisive; a known predecessor is recognised by its digest; an
-unknown one as any file that is not the new bytes, which the sole-writer
-contract makes sufficient; and where nothing stood, nothing standing is the
-old landing. Anything else keeps the intent and refuses, and while it stands
-no scan adopts and no other change to the shelf begins. In the session that
-ran the install the landing is known from the install's own proof that the
-destination is on its chain, so nothing is hashed twice. The file is two
-slots like the ledger journal, so a torn publication is an install that has
-not begun and a torn clear is an intent resolved again. No id or digest
-enters `INSTALL.JNL` or `RECLAIM.JNL`: the filesystem transaction decides what
-the card holds, and this one records what that means for identity.
+`INSTALL.JNL` it publishes an intent there naming the copy's id, the place
+the install lands spelled as typed, what stood there (nothing, a predecessor
+whose bytes were not read, or one whose digest was read in this session) and
+the exact spelling it stood under, and the digest of the bytes staged to
+land; the intent stands after `INSTALL.JNL` clears and is cleared only once
+the ledger record has been rewritten under the same id with the new size and
+digest. What the ledger recorded of the predecessor's bytes is not promoted
+into the intent: a computer may have replaced the file with another of the
+same size between transactions, which the ledger cannot see, so the
+installer says "unknown" and only a caller that hashed the predecessor says
+"known". Recovery resolves the intent after the filesystem journals have
+settled, and asks the card rather than the record which side won, by hashing
+the destination: the new digest is decisive; a known predecessor is
+recognised by its digest; an unknown one as any file that is not the new
+bytes, which the sole-writer contract makes sufficient; and where nothing
+stood, nothing standing is the old landing. Anything else keeps the intent
+and refuses, and while it stands no scan adopts and no other change to the
+shelf begins. In the session that ran the install the landing is known from
+the install's own proof that the destination is on its chain, so nothing is
+hashed twice. Names match by FAT's rules on the card and exactly in the
+ledger, so an upload spelled another way replaces the copy the installer
+found and respells its place, and a rollback puts the predecessor back under
+the spelling typed; settling moves the record to whichever spelling the file
+ends up under. A ledger with no room for a fresh copy's record lets a missing
+copy go to make it, and refuses the install before anything is journalled
+when there is none to let go of. The file is two slots like the ledger
+journal, so a torn publication is an install that has not begun and a torn
+clear is an intent resolved again. No id or digest enters `INSTALL.JNL` or
+`RECLAIM.JNL`: the filesystem transaction decides what the card holds, and
+this one records what that means for identity.
 
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN

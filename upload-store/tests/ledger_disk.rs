@@ -33,7 +33,9 @@ use proto::identity::{
     LEDGER_JOURNAL_SLOT_BYTES, LEDGER_RECORD_BYTES, MISSING_SCANS_RETAINED, ROW_KEY_BYTES,
 };
 use proto::library_path::BookRoot;
-use upload_store::ledger::{self, Assignment, Kept, LedgerFault, LEDGER_FILES, LEDGER_JOURNAL};
+use upload_store::ledger::{
+    self, Assignment, Carry, Kept, LedgerFault, LEDGER_FILES, LEDGER_JOURNAL,
+};
 
 const BLOCK_BYTES: usize = 512;
 const DISK_BLOCKS: u32 = 32 * 1024;
@@ -1551,7 +1553,7 @@ fn a_place_named_twice_takes_the_first_record_and_reports_it() {
     ledger::write_generation(
         &root,
         None,
-        &mut |_, record| Some(Kept::of(record)),
+        &mut |_, record| Carry::Keep(Kept::of(record)),
         |writer| {
             for id in [first, second] {
                 writer.append(&LedgerRecord {

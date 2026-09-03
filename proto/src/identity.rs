@@ -515,18 +515,21 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 pub const REPLACE_JOURNAL_MAGIC: [u8; 4] = *b"X4RI";
 pub const REPLACE_JOURNAL_VERSION: u8 = 1;
 /// One entry, at the start of its slot.
-pub const REPLACE_JOURNAL_BYTES: usize = 370;
-/// Kept the way the ledger journal is: two sector-sized slots written
-/// alternately with a sequence number, so a torn write leaves the entry
-/// before it.
-pub const REPLACE_JOURNAL_SLOT_BYTES: usize = 512;
+pub const REPLACE_JOURNAL_BYTES: usize = 628;
+/// Kept the way the ledger journal is: two slots written alternately with a
+/// sequence number, so a torn write leaves the entry before it. Two sectors
+/// each, since an entry carries two locators; the checksum covers the whole
+/// entry, so a write torn in either sector reads as damage and the other
+/// slot answers.
+pub const REPLACE_JOURNAL_SLOT_BYTES: usize = 1024;
 pub const REPLACE_JOURNAL_SLOTS: usize = 2;
 pub const REPLACE_JOURNAL_FILE_BYTES: usize = REPLACE_JOURNAL_SLOT_BYTES * REPLACE_JOURNAL_SLOTS;
 
 // Entry: magic | version | state | root | predecessor | id | locator length
-// u16 | locator, zero padded | old byte length u64 | old sha256 | new byte
-// length u64 | new sha256 | sequence u32 | checksum u32 over everything
-// before it. A cleared entry carries only its sequence.
+// u16 | locator, zero padded | predecessor locator length u16 | predecessor
+// locator, zero padded | old byte length u64 | old sha256 | new byte length
+// u64 | new sha256 | sequence u32 | checksum u32 over everything before it.
+// A cleared entry carries only its sequence.
 const REPLACE_VERSION: usize = 4;
 const REPLACE_STATE: usize = 5;
 const REPLACE_ROOT: usize = 6;
@@ -534,7 +537,9 @@ const REPLACE_PREDECESSOR: usize = 7;
 const REPLACE_ID: usize = 8;
 const REPLACE_LOCATOR_LEN: usize = REPLACE_ID + BOOK_ID_BYTES;
 const REPLACE_LOCATOR: usize = REPLACE_LOCATOR_LEN + 2;
-const REPLACE_OLD_LEN: usize = REPLACE_LOCATOR + MAX_PATH_BYTES;
+const REPLACE_PRED_LOCATOR_LEN: usize = REPLACE_LOCATOR + MAX_PATH_BYTES;
+const REPLACE_PRED_LOCATOR: usize = REPLACE_PRED_LOCATOR_LEN + 2;
+const REPLACE_OLD_LEN: usize = REPLACE_PRED_LOCATOR + MAX_PATH_BYTES;
 const REPLACE_OLD_SHA: usize = REPLACE_OLD_LEN + 8;
 const REPLACE_NEW_LEN: usize = REPLACE_OLD_SHA + SHA256_BYTES;
 const REPLACE_NEW_SHA: usize = REPLACE_NEW_LEN + 8;
@@ -551,11 +556,19 @@ const PREDECESSOR_KNOWN: u8 = 2;
 /// What held the destination when a managed replacement began.
 ///
 /// The three cases resolve a landing differently, so the intent has to
-/// record which it was. A predecessor with a digest can be recognised by
-/// it. One without can only be recognised as "not the new bytes", which the
-/// sole-writer contract makes sufficient: nothing else was permitted to
-/// write while the intent stood. No predecessor at all means an install
-/// that rolled back leaves nothing at the destination.
+/// record which it was. A predecessor whose digest was read in the same
+/// session can be recognised by it. One whose bytes were not read can only
+/// be recognised as "not the new bytes", which the sole-writer contract
+/// makes sufficient: nothing else was permitted to write while the intent
+/// stood. No predecessor at all means an install that rolled back leaves
+/// nothing at the destination.
+///
+/// `Known` is for a digest read in the session that publishes the intent,
+/// and not for one the ledger recorded earlier. Between transactions a
+/// computer may replace a file with another of the same size, which the
+/// ledger cannot see, and an intent that carried the recorded digest as the
+/// predecessor's would then recognise neither side of a rollback that
+/// recovered perfectly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Predecessor {
     None,
@@ -571,13 +584,21 @@ pub enum Predecessor {
 /// power cut anywhere in between keep the copy's id: the filesystem
 /// transaction decides which bytes the destination holds, and this decides
 /// what that means for identity.
+///
+/// Two locators, because the card matches names by FAT's rules and the
+/// ledger exactly: an upload spelled `dune.epub` replaces `Dune.epub`, and
+/// which spelling the file ends up under depends on which side landed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplaceIntent<'a> {
     pub id: BookId,
     pub root: BookRoot,
-    /// Root-relative, exactly as the catalog stores it.
+    /// Where the install lands, spelled as typed. Root-relative, exactly as
+    /// the catalog stores it.
     pub locator: &'a str,
     pub predecessor: Predecessor,
+    /// The exact spelling the predecessor held the place under. `Some` if
+    /// and only if there was a predecessor.
+    pub predecessor_locator: Option<&'a str>,
     /// The bytes that are meant to land, hashed as they were streamed.
     pub new: CachedSourceDigest,
 }
@@ -590,8 +611,10 @@ pub enum ReplaceJournal<'a> {
     Standing(ReplaceIntent<'a>),
 }
 
-/// Encode one entry with its sequence number. `None` when the locator does
-/// not fit, which a legal [`crate::library_path::LibraryPath`] cannot reach.
+/// Encode one entry with its sequence number. `None` when a locator does not
+/// fit, which a legal [`crate::library_path::LibraryPath`] cannot reach, or
+/// when the predecessor's spelling is given for no predecessor or withheld
+/// for one.
 pub fn encode_replace_journal(
     entry: &ReplaceJournal<'_>,
     sequence: u32,
@@ -607,12 +630,27 @@ pub fn encode_replace_journal(
             if locator.len() > MAX_PATH_BYTES {
                 return None;
             }
+            if intent.predecessor_locator.is_some()
+                == matches!(intent.predecessor, Predecessor::None)
+            {
+                return None;
+            }
             out[REPLACE_STATE] = REPLACE_STANDING;
             out[REPLACE_ROOT] = root_byte(intent.root);
             out[REPLACE_ID..REPLACE_LOCATOR_LEN].copy_from_slice(&intent.id.to_bytes());
             out[REPLACE_LOCATOR_LEN..REPLACE_LOCATOR]
                 .copy_from_slice(&(locator.len() as u16).to_le_bytes());
             out[REPLACE_LOCATOR..REPLACE_LOCATOR + locator.len()].copy_from_slice(locator);
+            if let Some(spelled) = intent.predecessor_locator {
+                let spelled = spelled.as_bytes();
+                if spelled.len() > MAX_PATH_BYTES {
+                    return None;
+                }
+                out[REPLACE_PRED_LOCATOR_LEN..REPLACE_PRED_LOCATOR]
+                    .copy_from_slice(&(spelled.len() as u16).to_le_bytes());
+                out[REPLACE_PRED_LOCATOR..REPLACE_PRED_LOCATOR + spelled.len()]
+                    .copy_from_slice(spelled);
+            }
             out[REPLACE_PREDECESSOR] = match intent.predecessor {
                 Predecessor::None => PREDECESSOR_NONE,
                 Predecessor::Unknown => PREDECESSOR_UNKNOWN,
@@ -704,6 +742,26 @@ pub fn classify_replace_journal(bytes: &[u8; REPLACE_JOURNAL_BYTES]) -> ReplaceJ
             else {
                 return ReplaceJournalReading::Damaged;
             };
+            let spelled_len = u16::from_le_bytes([
+                bytes[REPLACE_PRED_LOCATOR_LEN],
+                bytes[REPLACE_PRED_LOCATOR_LEN + 1],
+            ]) as usize;
+            if spelled_len > MAX_PATH_BYTES {
+                return ReplaceJournalReading::Damaged;
+            }
+            let predecessor_locator = if bytes[REPLACE_PREDECESSOR] == PREDECESSOR_NONE {
+                if spelled_len != 0 {
+                    return ReplaceJournalReading::Damaged;
+                }
+                None
+            } else {
+                match core::str::from_utf8(
+                    &bytes[REPLACE_PRED_LOCATOR..REPLACE_PRED_LOCATOR + spelled_len],
+                ) {
+                    Ok(spelled) => Some(spelled),
+                    Err(_) => return ReplaceJournalReading::Damaged,
+                }
+            };
             let digest_at = |len_at: usize, sha_at: usize| {
                 let mut len = [0u8; 8];
                 len.copy_from_slice(&bytes[len_at..len_at + 8]);
@@ -724,6 +782,7 @@ pub fn classify_replace_journal(bytes: &[u8; REPLACE_JOURNAL_BYTES]) -> ReplaceJ
                 root,
                 locator,
                 predecessor,
+                predecessor_locator,
                 new: digest_at(REPLACE_NEW_LEN, REPLACE_NEW_SHA),
             })
         }
@@ -977,13 +1036,15 @@ mod tests {
                 root: BookRoot::Library,
                 locator: "Fiction/Dune.epub",
                 predecessor: Predecessor::None,
+                predecessor_locator: None,
                 new: digest(1),
             }),
             ReplaceJournal::Standing(ReplaceIntent {
                 id,
                 root: BookRoot::CardRoot,
-                locator: "Dune.epub",
+                locator: "dune.epub",
                 predecessor: Predecessor::Unknown,
+                predecessor_locator: Some("Dune.epub"),
                 new: digest(2),
             }),
             ReplaceJournal::Standing(ReplaceIntent {
@@ -991,6 +1052,7 @@ mod tests {
                 root: BookRoot::Library,
                 locator: "Dune.epub",
                 predecessor: Predecessor::Known(digest(3)),
+                predecessor_locator: Some("Dune.epub"),
                 new: digest(4),
             }),
         ];
@@ -1013,6 +1075,8 @@ mod tests {
                 REPLACE_ID,
                 REPLACE_LOCATOR_LEN,
                 REPLACE_LOCATOR + 2,
+                REPLACE_PRED_LOCATOR_LEN,
+                REPLACE_PRED_LOCATOR + 1,
                 REPLACE_OLD_SHA,
                 REPLACE_NEW_LEN,
                 REPLACE_SEQUENCE,
@@ -1055,6 +1119,7 @@ mod tests {
                     root: BookRoot::Library,
                     locator: long,
                     predecessor: Predecessor::None,
+                    predecessor_locator: None,
                     new: digest(1),
                 }),
                 1,
@@ -1062,6 +1127,29 @@ mod tests {
             ),
             None
         );
+        // A predecessor's spelling goes with a predecessor, and only with one.
+        for (predecessor, predecessor_locator) in [
+            (Predecessor::None, Some("Dune.epub")),
+            (Predecessor::Unknown, None),
+            (Predecessor::Known(digest(3)), None),
+        ] {
+            assert_eq!(
+                encode_replace_journal(
+                    &ReplaceJournal::Standing(ReplaceIntent {
+                        id,
+                        root: BookRoot::Library,
+                        locator: "Dune.epub",
+                        predecessor,
+                        predecessor_locator,
+                        new: digest(1),
+                    }),
+                    1,
+                    &mut bytes
+                ),
+                None,
+                "{predecessor:?} with {predecessor_locator:?}"
+            );
+        }
     }
 
     /// The identity design's resolution table, one row at a time.
