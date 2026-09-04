@@ -892,7 +892,11 @@ async fn send_render(kind: RenderKind, state: &ReaderState) {
     // side would still read "library" after the book opened, and press
     // Confirm into a hold that Library keeps while a pick is in flight.
     #[cfg(feature = "bench-selftest")]
-    crate::bench_selftest::publish_view(state.view);
+    crate::bench_selftest::publish_view(
+        state.view,
+        state.orientation,
+        state.front_buttons == app_core::FrontButtons::PagesLeft,
+    );
     let mut request = state.render_request(kind);
     request.requested_at_ms = Instant::now().as_millis();
     DISPLAY_COMMANDS.send(DisplayCommand::Render(request)).await;

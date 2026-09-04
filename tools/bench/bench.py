@@ -52,6 +52,17 @@ STORAGE_OPEN_RE = re.compile(
     r"storage: open complete status=(?P<status>\w+) pages=(?P<pages>\d+) "
     r"chapters=(?P<chapters>\d+)"
 )
+# The last line a bench-selftest scenario prints. Only a firmware built with
+# that feature can emit it, so recognizing it changes nothing about any
+# capture taken before or since from a shipped build. It exists because the
+# firmware and the host count different things: folder-nav's stop event is
+# `folder_enter`, and a selftest that picks twenty rows on a card whose rows
+# are books produces none of them, so a count-only capture would wait for a
+# target the device stopped being able to reach the moment its loop ended.
+SELFTEST_DONE_RE = re.compile(
+    r"bench-selftest: scenario=(?P<scenario>[a-z-]+) result=(?P<result>\S+)"
+)
+
 # Printed once per boot, before esp_rtos::start, so it carries no t_ms; it
 # marks the start of a boot's time base and says how the chip woke.
 DEEP_SLEEP_WAKE_RE = re.compile(
@@ -318,6 +329,11 @@ def process_capture_stream(
                 or expired
             ):
                 break
+        elif any(e.get("event") == "selftest_done" for e in parsed_events):
+            # The device drives itself and has finished. Nothing further is
+            # coming, so waiting out a duration or a count target only delays
+            # the report.
+            break
         elif stop_target and counts.get(stop_target[0], 0) >= stop_target[1]:
             if stop_target[0] == "page_turn":
                 already_prestaged = any(
@@ -470,7 +486,7 @@ def run_capture(args: argparse.Namespace) -> int:
 # Stop conditions that mean the capture collected what it was told to. The
 # rest — an interrupted capture that had one, a stream that simply ended —
 # leave a partial run `--strict` must not certify.
-COMPLETED_STOP_REASONS = {"count", "duration", "operator"}
+COMPLETED_STOP_REASONS = {"count", "duration", "operator", "selftest"}
 
 # Stop events and the request key that names what the operator asked for.
 STOP_EVENT_REQUEST_KEYS = {
@@ -518,6 +534,12 @@ def observed_stop_reason(
     stop_at: float | None,
 ) -> str:
     """Why the capture stream ended, from what it actually reached."""
+    if counts.get("selftest_done", 0) > 0:
+        # A self-driving scenario ran to its own end. That is a stop
+        # condition someone asked for, even when the suite's own count
+        # target went unmet: on a flat card folder-nav produces no
+        # `folder_enter` at all, and the run is complete regardless.
+        return "selftest"
     if stop_target is not None and counts.get(stop_target[0], 0) >= stop_target[1]:
         return "count"
     if stop_at is not None and time.monotonic() >= stop_at:
@@ -715,6 +737,17 @@ def parse_line(line: str, suite: str = "unknown") -> list[dict[str, Any]]:
                 "prestage_ms": int(data["prestage"]),
                 "t_ms": int(data["t"]),
                 "legacy": True,
+            }
+        ]
+
+    match = SELFTEST_DONE_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "selftest_done",
+                "scenario": match.group("scenario"),
+                "result": match.group("result"),
             }
         ]
 

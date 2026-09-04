@@ -23,6 +23,20 @@ pub fn woke_from_deep_sleep_gpio() -> bool {
     matches!(esp_hal::rtc_cntl::wakeup_cause(), SleepSource::Gpio)
 }
 
+/// Whether this boot is the RTC timer wake a bench scenario armed.
+///
+/// The shipped rule stays GPIO-only on purpose, so nothing but a real button
+/// vouches for the panel contents. A bench build arms the timer as well, and
+/// its wake is just as good a witness that the sleep frame is still on the
+/// panel: the chip powered down through the same handshake either way. Left
+/// out, a timer wake reads as a cold boot, the display pays the full
+/// waveform instead of the fast one, and the suite measures a path the
+/// shipped firmware does not take.
+#[cfg(feature = "bench-selftest")]
+pub fn woke_from_deep_sleep_timer() -> bool {
+    matches!(esp_hal::rtc_cntl::wakeup_cause(), SleepSource::Timer)
+}
+
 /// Enters deep sleep with `wake_pin` (the active-low Power button) as the wake
 /// source. The chip draws ~10–15 µA until the button is pressed, then resets
 /// and reboots from `main`. Returns `!` because waking is a fresh boot, not a

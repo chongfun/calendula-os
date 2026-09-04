@@ -3294,6 +3294,42 @@ fn swap_front_pairs(front_buttons: FrontButtons, button: Option<Button>) -> Opti
     })
 }
 
+/// The physical key that reaches `action` under these settings.
+///
+/// `apply_input` runs a raw key through the front-pair swap and then the
+/// orientation before the reducer sees it, so the key a hand presses and the
+/// action it performs are only the same thing on the default settings.
+/// `PagesLeft` turns a raw `Next` into `Confirm`, and `LandscapeButtonsTop`
+/// turns it into `Back`. Anything that synthesises input rather than reading
+/// the ADC has to send the key that produces the action it means, or it does
+/// whatever the reader last saved in Settings.
+///
+/// Brute force over the seven keys rather than a hand-written inverse: both
+/// maps are small, `orient_button`'s is not an involution, and a second table
+/// would drift from the ones it inverts without anything failing loudly.
+///
+/// `None` means no key reaches that action here, which no current mapping
+/// produces (both are permutations) but is the honest answer if one stops
+/// being one.
+pub fn physical_key_for(
+    orientation: DisplayOrientation,
+    front_buttons: FrontButtons,
+    action: Button,
+) -> Option<Button> {
+    const KEYS: [Button; 7] = [
+        Button::Power,
+        Button::Back,
+        Button::Confirm,
+        Button::Previous,
+        Button::Next,
+        Button::PagePrevious,
+        Button::PageNext,
+    ];
+    KEYS.into_iter().find(|&raw| {
+        orient_button(orientation, swap_front_pairs(front_buttons, Some(raw))) == Some(action)
+    })
+}
+
 fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Option<Button> {
     let button = button?;
     Some(match orientation {
@@ -6850,6 +6886,66 @@ mod tests {
         }
         // Uploads only exist while the browser shelf is being served.
         assert!(!session.admits(&StorageCommand::ReceiveUpload));
+    }
+
+    #[test]
+    fn physical_key_reaches_the_action_it_names_under_every_setting() {
+        use DisplayOrientation::*;
+        use FrontButtons::*;
+        let orientations = [
+            LandscapeButtonsBottom,
+            LandscapeButtonsTop,
+            PortraitButtonsLeft,
+            PortraitButtonsRight,
+        ];
+        let actions = [
+            Button::Power,
+            Button::Back,
+            Button::Confirm,
+            Button::Previous,
+            Button::Next,
+            Button::PagePrevious,
+            Button::PageNext,
+        ];
+        for orientation in orientations {
+            for front in [PagesRight, PagesLeft] {
+                for action in actions {
+                    let key = physical_key_for(orientation, front, action).unwrap_or_else(|| {
+                        panic!("no key reaches {action:?} on {orientation:?}/{front:?}")
+                    });
+                    // The point of the inverse: pressing what it returns has
+                    // to arrive as what was asked for.
+                    let arrived = orient_button(orientation, swap_front_pairs(front, Some(key)));
+                    assert_eq!(
+                        arrived,
+                        Some(action),
+                        "{key:?} did not reach {action:?} on {orientation:?}/{front:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swapped_front_pair_moves_a_page_turn_off_the_next_key() {
+        // The concrete case the bench injector kept getting wrong: on
+        // PagesLeft a raw Next arrives as Confirm, so a scenario that sent
+        // Next to turn a page opened the chapter list instead.
+        assert_eq!(
+            orient_button(
+                DisplayOrientation::PortraitButtonsLeft,
+                swap_front_pairs(FrontButtons::PagesLeft, Some(Button::Next))
+            ),
+            Some(Button::Confirm)
+        );
+        assert_eq!(
+            physical_key_for(
+                DisplayOrientation::PortraitButtonsLeft,
+                FrontButtons::PagesLeft,
+                Button::Next
+            ),
+            Some(Button::Confirm)
+        );
     }
 
     #[test]

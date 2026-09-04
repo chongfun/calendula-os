@@ -383,10 +383,26 @@ fn main() -> ! {
     // The marker is consumed unconditionally so it never outlives one boot.
     let woke_by_button = hal_ext::rtc::woke_from_deep_sleep_gpio();
     let sleep_image_settled = sleep_marker::take_sleep_image_settled();
-    let deep_sleep_wake = woke_by_button && sleep_image_settled;
+    // A bench scenario sleeps and wakes itself off the RTC timer, and that
+    // wake is the same handshake a button wake is: the sleep frame settled
+    // before the chip powered down, so the panel still shows it. Counting
+    // only GPIO here made every unattended wake read as a cold boot, which
+    // put the display on the full waveform and had the suite timing a path
+    // the shipped firmware does not take. `sleep_image_settled` still has to
+    // hold, so a crash or a brownout is a cold boot in either build.
+    #[cfg(feature = "bench-selftest")]
+    let woke_from_sleep = woke_by_button || hal_ext::rtc::woke_from_deep_sleep_timer();
+    #[cfg(not(feature = "bench-selftest"))]
+    let woke_from_sleep = woke_by_button;
+    let deep_sleep_wake = woke_from_sleep && sleep_image_settled;
     esp_println::println!(
         "main: deep_sleep_wake={} (gpio={}, sleep_image={})",
         deep_sleep_wake,
+        // Stays the GPIO answer, not the combined one: the harness parses
+        // this field by name and `deep_sleep_wake` already carries the
+        // verdict. Under bench-selftest a timer wake therefore prints
+        // deep_sleep_wake=true with gpio=false, which is exactly what
+        // happened.
         woke_by_button,
         sleep_image_settled
     );

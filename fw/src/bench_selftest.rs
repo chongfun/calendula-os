@@ -37,7 +37,9 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer, WithTimeout};
 use portable_atomic::{AtomicU8, Ordering};
 
-use crate::{AppView, Button, InputEvent, PowerEvent, INPUT_EVENTS, POWER_EVENTS};
+use crate::{
+    AppView, Button, DisplayOrientation, InputEvent, PowerEvent, INPUT_EVENTS, POWER_EVENTS,
+};
 
 /// Signalled by the app task each time a render settles.
 ///
@@ -62,9 +64,48 @@ static VIEW: AtomicU8 = AtomicU8::new(VIEW_UNKNOWN);
 
 const VIEW_UNKNOWN: u8 = u8::MAX;
 
+/// The reader's saved controls, so an injected key can be the one that
+/// reaches the action a scenario means.
+///
+/// `apply_input` maps a raw key through the front-pair swap and the
+/// orientation before the reducer sees it. A scenario sending raw `Next` to
+/// turn a page turns it on the default settings and opens the chapter list
+/// on `PagesLeft`, so a deterministic selftest has to know what the card
+/// last saved.
+static ORIENTATION: AtomicU8 = AtomicU8::new(0);
+static FRONT_BUTTONS: AtomicU8 = AtomicU8::new(0);
+
 /// Called by the app task as each render is frozen and sent.
-pub fn publish_view(view: AppView) {
+pub fn publish_view(view: AppView, orientation: DisplayOrientation, front_pages_left: bool) {
     VIEW.store(view_code(view), Ordering::Relaxed);
+    ORIENTATION.store(orientation_code(orientation), Ordering::Relaxed);
+    FRONT_BUTTONS.store(u8::from(front_pages_left), Ordering::Relaxed);
+}
+
+fn orientation_code(orientation: DisplayOrientation) -> u8 {
+    match orientation {
+        DisplayOrientation::LandscapeButtonsBottom => 0,
+        DisplayOrientation::LandscapeButtonsTop => 1,
+        DisplayOrientation::PortraitButtonsLeft => 2,
+        DisplayOrientation::PortraitButtonsRight => 3,
+    }
+}
+
+fn current_orientation() -> DisplayOrientation {
+    match ORIENTATION.load(Ordering::Relaxed) {
+        1 => DisplayOrientation::LandscapeButtonsTop,
+        2 => DisplayOrientation::PortraitButtonsLeft,
+        3 => DisplayOrientation::PortraitButtonsRight,
+        _ => DisplayOrientation::LandscapeButtonsBottom,
+    }
+}
+
+fn current_front_buttons() -> app_core::FrontButtons {
+    if FRONT_BUTTONS.load(Ordering::Relaxed) == 0 {
+        app_core::FrontButtons::PagesRight
+    } else {
+        app_core::FrontButtons::PagesLeft
+    }
 }
 
 /// Called by the app task when a render settles.
@@ -170,8 +211,24 @@ const STORAGE_CYCLES: u32 = 3;
 /// book, since the extend is half of what this suite exists to time.
 const STORAGE_TURNS_PER_CYCLE: u32 = 12;
 
-/// Rows to enter and leave. Matches the suite's own default of 20 entries.
+/// Folder entries to collect, matching the suite's own default of 20.
+///
+/// A target, not a press count. bench.py stops folder-nav on `folder_enter`
+/// telemetry, and a row that turns out to be a book produces none of it, so
+/// counting picks instead of entries put the two sides of the capture on
+/// different contracts: twenty picks on a card holding one book could not
+/// reach twenty entries, and on a flat card reached none.
 const FOLDER_ENTRIES: u32 = 20;
+
+/// Picks allowed while collecting those entries. Books consume attempts
+/// without producing entries, so this is what stops a mostly-flat card from
+/// walking forever.
+const FOLDER_ATTEMPT_CEILING: u32 = 40;
+
+/// Picks that may come back a book before the scenario calls the card flat
+/// and stops. Opening a book costs seconds, so a card with no folders should
+/// say so early rather than spend the whole capture proving it.
+const FOLDER_FLAT_PROBE: u32 = 5;
 
 /// Cursor steps before each entry, so the walk crosses page boundaries
 /// rather than entering the same row twenty times.
@@ -241,9 +298,18 @@ const PAGE_TURN_BUTTON: Button = Button::Next;
 /// harness pairs a press to a render through that line, so an injected
 /// press that skipped it would leave the capture full of renders and empty
 /// of durations, which is what the first run of this module did.
-async fn press(button: Button) {
-    crate::tasks::input::log_injected_input(button);
-    INPUT_EVENTS.send(InputEvent::button(button)).await;
+async fn press(action: Button) {
+    // `action` is what the scenario means; the key that reaches it depends
+    // on the orientation and front pair the reader last saved. Sending the
+    // action itself made the selftest do whatever those settings said: on
+    // `PagesLeft` a page turn arrives as Confirm and opens the chapter list
+    // instead. Falling back to the action when no key reaches it keeps a
+    // scenario running rather than hanging on a mapping that stopped being a
+    // permutation.
+    let key = app_core::physical_key_for(current_orientation(), current_front_buttons(), action)
+        .unwrap_or(action);
+    crate::tasks::input::log_injected_input(key);
+    INPUT_EVENTS.send(InputEvent::button(key)).await;
 }
 
 /// Press, then wait for the render it caused to settle.
@@ -316,6 +382,29 @@ async fn wait_for_view(target: AppView, timeout_ms: u64) -> bool {
         }
         Timer::after(Duration::from_millis(VIEW_POLL_MS)).await;
     }
+}
+
+/// Press a named key in Reading, allowing for the portrait key sheet.
+///
+/// Portrait reading is full-bleed, so the first Confirm or Back summons the
+/// key sheet and acts on nothing; the second press acts on the label it
+/// revealed. Landscape maps directly and acts on the first press. Page
+/// turns are exempt in both, so `turn_pages` needs none of this.
+///
+/// So this presses, and presses again only if the view has not moved. That
+/// is right in both orientations: in landscape the first press already
+/// left Reading and the second is not sent, and in portrait the first press
+/// only opened the sheet. A scenario that sent one press and waited was
+/// reading a sheet as a refusal, which is what reported `jumped=false` on a
+/// book whose chapter list was fine.
+async fn act_in_reading(button: Button, timeout_ms: u64) -> bool {
+    if !press_and_settle(button, timeout_ms).await {
+        return false;
+    }
+    if current_view() != Some(AppView::Reading) {
+        return true;
+    }
+    press_and_settle(button, timeout_ms).await
 }
 
 /// Pick the selected row and report where it left the app.
@@ -405,7 +494,10 @@ async fn back_to_library() -> bool {
         if wait_for_view(AppView::Library, VIEW_SETTLE_MS).await {
             return true;
         }
-        if !press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+        // Reading owes the portrait two-step; every other view acts on one
+        // press, and act_in_reading sends only one from those because the
+        // view has already moved.
+        if !act_in_reading(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
             return false;
         }
     }
@@ -540,10 +632,12 @@ async fn scenario_folder_nav() {
     }
     let mut entered = 0u32;
     let mut books = 0u32;
-    for entry in 0..FOLDER_ENTRIES {
+    let mut attempts = 0u32;
+    while entered < FOLDER_ENTRIES && attempts < FOLDER_ATTEMPT_CEILING {
+        attempts += 1;
         for _ in 0..FOLDER_SCROLL_STEPS {
             if !press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await {
-                bench_log!("bench-selftest: scroll stalled at entry {}", entry);
+                bench_log!("bench-selftest: scroll stalled at attempt {}", attempts);
                 break;
             }
         }
@@ -552,20 +646,29 @@ async fn scenario_folder_nav() {
             Some(AppView::Library) => entered += 1,
             Some(_) => {}
             None => {
-                bench_log!("bench-selftest: entry {} did not settle", entry);
+                bench_log!("bench-selftest: attempt {} did not settle", attempts);
                 break;
             }
         }
         if !back_to_library().await {
-            bench_log!("bench-selftest: lost the library at entry {}", entry);
+            bench_log!("bench-selftest: lost the library at attempt {}", attempts);
             break;
+        }
+        if entered == 0 && books >= FOLDER_FLAT_PROBE {
+            bench_log!(
+                "bench-selftest: scenario=folder-nav result=no-folders books={} \
+                 (this card has nothing to enter; the suite wants a folder tree)",
+                books
+            );
+            return;
         }
     }
     bench_log!(
-        "bench-selftest: scenario=folder-nav result=done folders={} books={} of {}",
+        "bench-selftest: scenario=folder-nav result=done folders={} of {} books={} attempts={}",
         entered,
+        FOLDER_ENTRIES,
         books,
-        FOLDER_ENTRIES
+        attempts
     );
 }
 
@@ -594,10 +697,9 @@ async fn scenario_reader_soak() {
     // not open. Waiting for quiet clears it.
     let _ = await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await;
     let mut jumped = false;
-    if press_and_settle(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
-        // Poll rather than read once. Every other view check in this module
-        // needed it, and a measured run reported jumped=false with the list
-        // plainly opening.
+    if act_in_reading(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
+        // Poll rather than read once: a press is not always answered by one
+        // render.
         && wait_for_view(AppView::Chapters, VIEW_SETTLE_MS).await
         && press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await
     {
@@ -620,6 +722,14 @@ async fn scenario_reader_soak() {
         jumped,
         returned
     );
+    // A soak that skipped its chapter navigation is not the workflow this
+    // suite advertises, and --strict cannot tell: it asks for input and
+    // render telemetry plus a completed sleep and a later wake, all of which
+    // a jumpless pass still produces. So say so loudly enough that a reader
+    // of the capture cannot miss it.
+    if !jumped {
+        bench_log!("bench-selftest: scenario=reader-soak INVALID: chapter navigation did not run");
+    }
 
     // Last, because it does not return.
     request_sleep().await;
