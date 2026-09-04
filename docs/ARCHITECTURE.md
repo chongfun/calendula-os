@@ -880,8 +880,8 @@ appeared is adopted in its own right. Ambiguity is left alone from either
 side: two missing copies of the same bytes, or one missing copy and two
 files holding them, are copies no file can be told apart by, so their places
 stay as they are. A scan decides a length or leaves it alone. Every
-unclaimed file whose length a missing copy has is read, which is what lets
-one match mean one match, so there is no reading budget to run out of and
+unclaimed file whose length a missing copy has is read, so one match
+means one match. There is no reading budget to run out of and
 nothing carried to another scan. Bounding that reading instead would mean
 deciding on part of the evidence, or keeping a half-finished question
 somewhere, and a question that outlives a scan wants a journal of its own

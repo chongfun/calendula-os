@@ -2433,9 +2433,9 @@ fn a_twin_past_the_end_of_the_table_still_refuses_the_repair() {
 }
 
 /// A copy is found again however many files of its length the card holds:
-/// the search reads every one of them, which is what lets one match mean
-/// one match. There is no reading budget to run out of, and so nothing to
-/// carry to another scan.
+/// the search reads every one of them, so one match means one match. There
+/// is no reading budget to run out of, and so nothing to carry to another
+/// scan.
 #[test]
 fn a_copy_is_found_whatever_else_shares_its_length() {
     let disk = new_card();

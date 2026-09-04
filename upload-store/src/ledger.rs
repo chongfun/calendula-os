@@ -847,8 +847,8 @@ const MOVES_CONSIDERED: usize = 64;
 ///
 /// A scan decides a length or leaves it alone. There is no reading budget
 /// to run out of: every unclaimed file whose length a missing copy has is
-/// read, which is what lets one match mean one match. Bounding that reading
-/// instead would mean deciding on part of the evidence, or carrying the
+/// read, so one match means one match. Bounding that reading instead would
+/// mean deciding on part of the evidence, or carrying the
 /// question to the next scan, and a question carried across scans wants a
 /// journal of its own rather than a state spread through the catalog, the
 /// ledger and the cache.
