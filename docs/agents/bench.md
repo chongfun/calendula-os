@@ -94,9 +94,19 @@ does nothing, rather than quietly running the default under the wrong name.
 
 ### The terminal protocol
 
-A selftest scenario says how it ended, in two channels with one rule each.
+A selftest scenario says which one it is and how it ended, in three records
+with one rule each.
 
-- **One terminal record per scenario run**, written by the driver rather than
+- **It announces itself on every boot**: `bench-selftest: scenario=X
+  view=...`. `--strict` fails if X is not the workflow the capture was taken
+  as, which catches the stale flash. That check matters most for
+  `reader-soak`, whose gate asks for input and render telemetry plus a
+  completed sleep and a later wake: a `sleep-sync` image produces every one
+  of those, and a successful sleeping scenario writes no terminal record, so
+  nothing else would notice. For a `thermal-run`, the comparison is against
+  the workflow it selected rather than `thermal-run` itself.
+
+- **One terminal record per run**, written by the driver rather than
   the scenario, so a second one cannot happen: `bench-selftest: scenario=X
   result=W`. `result=done` means the scenario finished everything it set out
   to do. Any other word names what stopped it (`nav-failed`, `no-folders`,

@@ -72,6 +72,14 @@ SELFTEST_DONE_RE = re.compile(
 SELFTEST_INVALID_RE = re.compile(
     r"bench-selftest: scenario=(?P<scenario>[a-z-]+) invalid=(?P<reason>\S+)"
 )
+# Which scenario the flashed image is actually about to run, printed once per
+# boot before it touches anything. Worth checking against the workflow the
+# operator asked for, because a stale image certifies the wrong suite in
+# silence: a sleep-sync build captured as `reader-soak --strict` produces
+# inputs, renders, completed sleeps and later wakes, which is the whole of
+# what reader-soak's gate asks for, and a successful sleeping scenario writes
+# no terminal record for the result check to catch.
+SELFTEST_START_RE = re.compile(r"bench-selftest: scenario=(?P<scenario>[a-z-]+) view=(?P<view>\S+)")
 
 # Printed once per boot, before esp_rtos::start, so it carries no t_ms; it
 # marks the start of a boot's time base and says how the chip woke.
@@ -747,6 +755,17 @@ def parse_line(line: str, suite: str = "unknown") -> list[dict[str, Any]]:
                 "prestage_ms": int(data["prestage"]),
                 "t_ms": int(data["t"]),
                 "legacy": True,
+            }
+        ]
+
+    match = SELFTEST_START_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "selftest_start",
+                "scenario": match.group("scenario"),
+                "view": match.group("view"),
             }
         ]
 
@@ -2402,6 +2421,20 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
         # open on its second cycle ended the capture on `nav-failed` while its
         # first cycle had already produced the telemetry and budget samples
         # this gate asks for.
+        # A selftest image announces itself on every boot, so a capture can
+        # check that the firmware on the device is the one the command asked
+        # for. Only checked when the marker is present, so a capture from a
+        # shipped build is unaffected. `workflow` and not `suite`, so a
+        # thermal-run comparison uses the workflow it selected.
+        for event in signal_events:
+            if event.get("event") != "selftest_start":
+                continue
+            announced = str(event.get("scenario"))
+            if workflow is not None and announced != workflow:
+                warnings.append(
+                    f"{label}: the device is running the {announced} selftest "
+                    f"scenario, but this capture was taken as {workflow}"
+                )
         terminals = [e for e in signal_events if e.get("event") == "selftest_done"]
         for event in terminals:
             result = str(event.get("result", "unspecified"))

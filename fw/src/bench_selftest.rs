@@ -667,11 +667,18 @@ async fn scenario_folder_nav() -> Result_ {
     let mut entered = 0u32;
     let mut books = 0u32;
     let mut attempts = 0u32;
+    let mut scroll_stalled = false;
     while entered < FOLDER_ENTRIES && attempts < FOLDER_ATTEMPT_CEILING {
         attempts += 1;
         for _ in 0..FOLDER_SCROLL_STEPS {
             if !press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await {
                 bench_log!("bench-selftest: scroll stalled at attempt {}", attempts);
+                // Paging the list is the other half of what this suite
+                // times, so a stalled step is a phase that did not run. The
+                // walk carries on, because the entries it does collect are
+                // still real ones, and the record below stops the capture
+                // from certifying as though it covered the paging.
+                scroll_stalled = true;
                 break;
             }
         }
@@ -704,6 +711,9 @@ async fn scenario_folder_nav() -> Result_ {
         books,
         attempts
     );
+    if scroll_stalled {
+        report_invalid("folder-nav", "scroll-stalled");
+    }
     if entered < FOLDER_ENTRIES {
         return "short-entries";
     }
