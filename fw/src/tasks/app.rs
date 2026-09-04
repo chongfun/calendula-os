@@ -109,6 +109,8 @@ pub async fn run() {
                     // first screen shows the true charge instead of boot()'s
                     // 100% placeholder.
                     state = state.apply_input(ctx, event);
+                    #[cfg(feature = "bench-selftest")]
+                    crate::bench_selftest::publish_view(state.view);
                     continue;
                 }
                 if matches!(
@@ -158,6 +160,8 @@ pub async fn run() {
                 let previous = state;
                 let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
+                #[cfg(feature = "bench-selftest")]
+                crate::bench_selftest::publish_view(state.view);
                 // Activity carries the post-input view so entering a view
                 // immediately gets that view's idle leash (e.g. opening a
                 // book starts the long Reading timeout right away).
@@ -265,6 +269,10 @@ pub async fn run() {
                         state = state.apply_chapter_cursor(cursor);
                     }
                     rendering = false;
+                    // Below the render lock, so a scenario waiting on this
+                    // sees the same instant the app calls the cycle over.
+                    #[cfg(feature = "bench-selftest")]
+                    crate::bench_selftest::note_settled();
                     // The panel took a frame, so a later failure is a fresh one
                     // and gets its own retry.
                     repaint_retry.settled();

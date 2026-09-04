@@ -318,6 +318,25 @@ fn battery_percent(aux_mv: u16) -> u8 {
     (((mv - 3300) as u32 * 100) / 900) as u8
 }
 
+/// Log a press the scenario injected, in the shape a real one takes.
+///
+/// The harness pairs a press to a render through this line, so an injected
+/// press that skips it is invisible to `page turn` and the capture comes
+/// home with renders and no durations. Sharing the one logger is what keeps
+/// the two paths from drifting apart; the raws match
+/// `InputEvent::button`'s, which is what the app will see.
+#[cfg(feature = "bench-selftest")]
+pub(crate) fn log_injected_input(button: Button) {
+    log_input(
+        Some(button),
+        RawSample {
+            aux: 2000,
+            nav: 0,
+            page: 0,
+        },
+    );
+}
+
 fn log_input(button: Option<Button>, sample: RawSample) {
     bench_log!(
         "bench: input button={:?} aux={} nav={} page_raw={} t_ms={}",

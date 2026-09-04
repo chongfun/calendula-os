@@ -20,6 +20,58 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 5
 tools/bench/bench.py storage-cache --port /dev/cu.usbmodem101 --reset-before --seconds 20 --strict
 ```
 
+## Unattended captures: the `bench-selftest` build
+
+`bench.py` listens; it cannot press a key. Every suite below is therefore
+operator-driven, which puts the operator's cadence inside the measurement.
+A firmware built with the `bench-selftest` feature presses the keys itself:
+
+```sh
+tools/cargo.sh build --release -p fw --features device-x3,bench-selftest
+espflash flash --chip esp32c3 --flash-size 16mb --partition-table partitions.csv \
+  --ignore-app-descriptor --port /dev/cu.usbmodemXXXX \
+  target/riscv32imc-unknown-none-elf/release/fw
+tools/bench/bench.py page-turn --port /dev/cu.usbmodemXXXX --reset-before \
+  --turns 50 --seconds 200 --strict
+```
+
+The scenario waits out the boot paint, walks to Reading by watching which
+view each press actually lands on, waits for the device to stop painting on
+its own, then turns pages one settled render at a time. Cadence comes from
+the settle rather than a host timer, so presses cannot land mid-refresh.
+
+Read the numbers with two things in mind.
+
+- **An injected press is a floor, not the operator number.** It enters at
+  `INPUT_EVENTS` and so skips the ADC sample and the debounce a real press
+  clears. Calibrate the offset once against a hand-pressed run on the same
+  book before quoting an injected median beside the operator baselines.
+- **The book and the card still decide the figure.** The scenario opens
+  whatever the first row offers. A capture meant to compare against the
+  11.7 MB baseline book needs that book on the card and reachable, exactly
+  as a hand-driven one does.
+
+A measured example, X3, 50 turns, nobody touching the device:
+
+```
+page turn      median=433ms p95=453ms min=412ms max=472ms
+page inputs:   presses=50 page_turns=50 nav=0 coalesced=0 unmatched=0
+```
+
+Fifty presses, fifty pairings, nothing coalesced, `--strict` clean. The
+pooled operator captures on the same harness report `presses=101
+page_turns=70 nav=28 coalesced=3`, a 28-second maximum, and three runs
+excluded for cadence. The tightness is the point; the median is not
+comparable until the calibration above is done.
+
+**It presses keys on every boot**, so it is a bench build and not a reading
+one. Reflash without the feature to get the device back.
+
+Only `page-turn` has a scenario today. `storage-cache`, `folder-nav` and
+`reader-soak` are the same shape of work. `sleep-sync` additionally needs a
+`TimerWakeupSource` alongside the button source, since a sleeping device
+cannot be told to wake.
+
 - Run longer hardware checks before releases or risky merges:
 
 ```sh

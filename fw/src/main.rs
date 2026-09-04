@@ -130,6 +130,8 @@ use tasks::input::InputPins;
 #[macro_use]
 mod log;
 
+#[cfg(feature = "bench-selftest")]
+pub mod bench_selftest;
 mod board_guard;
 mod book_build;
 pub mod catalog;
@@ -647,5 +649,7 @@ fn main() -> ! {
         spawner.spawn(tasks::wifi::run(spawner, peripherals.WIFI).unwrap());
         #[cfg(feature = "powercut-selftest")]
         spawner.spawn(powercut::autostart().unwrap());
+        #[cfg(feature = "bench-selftest")]
+        spawner.spawn(bench_selftest::page_turn().unwrap());
     })
 }

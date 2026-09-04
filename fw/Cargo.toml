@@ -37,6 +37,15 @@ ota-selftest = []
 # still need the bench rig. Never enabled in a release build.
 # See fw::powercut and tools/powercut_campaign.py.
 powercut-selftest = []
+# Device-driven bench scenarios: presses buttons from a task so a timing
+# capture runs unattended, with cadence taken from the settle rather than a
+# host timer. bench.py only listens, so every suite has been operator-driven
+# and the operator has been inside the measurement. An injected press enters
+# at INPUT_EVENTS and so skips the ADC sample and debounce a real one clears;
+# calibrate that offset against a hand-pressed run before quoting a number
+# from this path. Never enabled in a release build.
+# See fw::bench_selftest and docs/agents/bench.md.
+bench-selftest = []
 # Build for the Xteink X3 (792x528 UC8253 panel, BQ27220 battery gauge).
 # Off = Xteink X4, the default. See docs/plans/2026-07-06-x3-support-plan.md.
 device-x3 = ["display/device-x3", "reader-cache/device-x3"]
