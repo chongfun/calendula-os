@@ -104,6 +104,16 @@ The wake comes from an RTC timer armed beside the button, which
 and it needs to be: a reader that wakes itself would spend the battery this
 firmware is careful with.
 
+**A wake's own boot marker is unobservable, so read the waveform instead.**
+`main: deep_sleep_wake=` prints before `esp_rtos::start`, which is before the
+USB device re-enumerates, so on exactly the boots where it matters the host
+misses the line. bench.py then falls back to "a sleep preceded this, so call
+it a wake", which is a label rather than evidence. To confirm a wake really
+took the fast path, count Full refreshes: a wake with a settled sleep image
+owes none, so three boots with three Fulls means three cold paths whatever
+the labels say. Measured on the X3, that mislabelling was worth about 860 ms
+of wake timing before the timer wake was recognized.
+
 **A sleeping device cannot be reached at all.** Deep sleep powers down the
 USB Serial/JTAG peripheral, so the port disappears from the host and neither
 espflash nor bench.py can do anything until someone presses Power. A plain
