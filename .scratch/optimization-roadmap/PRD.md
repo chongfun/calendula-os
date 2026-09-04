@@ -15,10 +15,19 @@ change, but it moved the `embedded-sdmmc` pin to our own fork and rebased it
 onto upstream v0.10, and that touches this roadmap in two places worth reading
 before picking anything up: **D6 lost its cost side** (it was rated for the
 expense of *creating* a fork we now maintain anyway, so it re-rates L → M), and
-**Tier 3's "none needs a rebase" is no longer true** — `opt/b7-per-config-section-caches`
-conflicts, and the fix is a driver API migration rather than a rebase. WS-D's
-upload baseline predates #75's write path and needs re-taking before it is
-quoted again.
+**Tier 3's "none needs a rebase" is no longer true** (`opt/b7-per-config-section-caches`
+conflicted, and the fix was a driver API migration rather than a rebase; that
+branch is now retired, see Tier 3). WS-D's upload baseline predates #75's
+write path and needs re-taking before it is quoted again.
+
+**B7 retired 2026-09-03**, superseded by the Reading Position and Layout
+Durability PRD. Tier 3 says why; issue 02 keeps the eleven findings the branch
+paid for, because its successor still needs them. Note the wider debt this
+exposes: the document is reconciled to `main` only as of 2026-08-13, which is
+ten merges ago (#79 through #88), and the four library PRDs written alongside
+those merges are not reflected here beyond this paragraph. Nothing in Tier 1
+is affected. Tier 3 and the workstream file lists are the parts that have
+drifted.
 
 This document is kept to three things: **what is left**, **what has been
 done**, and **what not to do**. Round-by-round history has been dropped —
@@ -47,11 +56,12 @@ item:
   order is unconstrained by conflicts. Rank on correctness and residual work,
   not on cost-to-build. Three are much closer to done than their old queue
   positions implied; two have defects that must be fixed first.
-  **Expired 2026-08-13.** Four of the six have since merged; of the two left,
-  `opt/b7-per-config-section-caches` now conflicts with `main` and needs the
-  v0.10 driver migration. The *ranking principle* stands — rank on correctness
-  and residual work — but "landing order is unconstrained by conflicts" no
-  longer describes the tree. See Tier 3.
+  **Expired 2026-08-13.** Of the six, four have merged,
+  `opt/b7-per-config-section-caches` is retired as of 2026-09-03, and
+  `opt/upload-session-token` is the only one still live. The *ranking
+  principle* still holds. Rank on correctness and residual work. But
+  "landing order is unconstrained by conflicts" no longer describes the
+  tree. See Tier 3.
 
 ### Tier 0 — measurement integrity (do first; hours, not days)
 
@@ -138,7 +148,7 @@ or `sd_session.rs` needs that migration, not a rebase.** Verified by
 | ~~`opt/inflate-caller-owned-window`~~ | **MERGED as #63**. | — |
 | ~~`opt/d4-directed-wifi-join`~~ | **MERGED as #73**. | — |
 | ~~`opt/single-repaint-per-page-turn`~~ | **MERGED as #56**, reworked first. The audit found it suppressed the `Loaded` *event* rather than the render, freezing the app's page count during a background build and stranding the reader at the frontier — rule 4 through a door rule 4 does not name. #56 moved the decision into `app_core::loaded_repaints` and kept the event unconditional, and picked up an open-gate latch and a failed-refresh retry on the way. | — |
-| `opt/b7-per-config-section-caches` | **Three defects** (issue 02): `&str` byte-slicing that aborts on SD-derived filenames — reproduced end-to-end, reachable from the orphan sweep on every catalog write; a cross-config cache wipe at three sites, not the one admitted; `BookBuildResume` not keyed by layout config. Still the best-structured large change in the queue. **Now also conflicts with `main` in `reader-cache/src/files.rs`** — #75 migrated that file to the v0.10 driver API. Defect 1 is unaffected and still real: the fork's `ShortFileName: Display` still emits `byte as char` (`filesystem/filename.rs:238`). | The three fixes, the v0.10 migration, plus prune orphaned sections first |
+| ~~`opt/b7-per-config-section-caches`~~ | **RETIRED 2026-09-03.** Superseded by the Reading Position and Layout Durability PRD, whose Milestones 3 and 4 build the same cache from a different key: `(LocalCacheIdentity, LayoutId)` over a ContentAnchor, rather than the layout config over a page index. Two things settled it, neither of them the three known defects. **#88 replaced the cache key the branch names its files from.** Identity now derives from root, full locator and byte size, not from the display label the branch's `S<cfg><nnn>.BIN` scheme was built over, so the port is no longer "three fixes plus a v0.10 migration". And **its position model is the page index Milestone 2 removes**, so landing it would mean migrating reading positions twice. The branch is not rebased and not merged. It stays readable for its tests and its findings, which are carried into that PRD and enumerated in issue 02. | None. Do not rebase it. |
 
 ### Tier 4 — worthwhile, unblocked, smaller
 
@@ -187,7 +197,6 @@ only as the honest home for prestage overlap.
 | B4 — progressive first open | #53 | **Time-to-prologue 45.3 → 32.6 s; page-turn median during a build 1270 → 231 ms.** Reader now runs 15.9 s ahead of the builder |
 | Reader-cache crate extraction | #55 | `reader-cache` host-testable; 7 fault-injection tests on an in-memory FAT16 card |
 | **Single repaint per page turn** | #56 | Storage emits `Loaded` unconditionally; the repaint decision moved into `app_core::loaded_repaints` with a `text_replaced` flag. **~405 ms of panel time off every page turn in every book** — half the panel duty cycle and half the refresh count. Also fixed an open gate that latched forever when an open was served from RAM, and added a retry when a refresh fails |
-| **B7 — per-config section caches** | *branch* `opt/b7-per-config-section-caches` | A book keeps a paginated copy per layout config, so flipping back to a size or orientation already read is a cache hit instead of the 24–27 s replay. +6.7 KB flash, no static RAM |
 | C1+C3+C4+C5 — wake refresh, gauge decimation, idle tiers, boot init | #11, #36 | Wake seeded from the deep-sleep cause; idle tiered 10 min Reading / 3 min menus |
 | D1 — SD SPI tier | #14 | Cold build −5.4%, write_ms −9.5%, progress write −35%. **Not** the hoped 2× |
 | D3 — portal PSK | #19 | Shipped as a per-session runtime PSK, not the build-time one this PRD proposed |
@@ -204,7 +213,8 @@ only as the honest home for prestage overlap.
 | Panel controller detection | #76 | Probe panel controller before driving |
 | **Long-name uploads, journalled install** | #75 | Uploads stage outside `/BOOKS` and install as a same-volume move — two directory writes rather than a copy of the book's length. Not a performance item, but it moved the driver pin to our fork and rewrote the surface three WS-D items are written against. Released as v0.6.0 |
 
-B7 is committed but not merged; everything else above is on `main`.
+Everything above is on `main`. B7 was committed to a branch and retired
+without merging, so it is not listed here; see Tier 3.
 
 ## Current measured baselines
 
@@ -227,7 +237,7 @@ Quote these, not anything older.
 |---|---|
 | Full cold build | 64.0 s portrait (1240 pp / 100 sections), 62.2 s landscape |
 | Settings-change replay via CONT.BIN | 24.7 s (736 pp) — 27.1 s (1240 pp), ~280–300 ms/section |
-| Orientation flip | same replay path — B7 turns the flip *back* into a hit |
+| Orientation flip | same replay path. Turning the flip *back* into a hit is Reading Position and Layout Durability M4, no longer B7 |
 | Progressive first open → prologue | 32.6 s, interactive throughout |
 | Warm reopen (RAM hit) | 13–15 ms |
 

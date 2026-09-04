@@ -1,9 +1,13 @@
 # WS-B: Book pipeline — cold builds, custom fonts, catalog scan, progressive open
 
-Status (2026-07-30): B2+B3, B6, B4, and the reader-cache extraction are on
-`main`. **B7 is done** on `opt/b7-per-config-section-caches`, not yet merged.
-What is left is one non-B item that outranks everything else here, one gap B4
-left behind, and a `proto` stack item.
+Status (2026-07-30; B7 retired 2026-09-03): B2+B3, B6, B4, and the
+reader-cache extraction are on `main`. **B7 is retired unmerged**, superseded
+by Reading Position and Layout Durability M3/M4. Its findings are kept below
+in full, because the successor builds the same cache and inherits every one
+of them.
+
+What is left in this workstream is one non-B item that outranks everything
+else here, one gap B4 left behind, and a `proto` stack item.
 
 Owns: `reader-cache/`, `fw/src/book_build.rs`, `fw/src/custom_font.rs`,
 `fw/src/library_sd.rs`, `ui/src/reading.rs`, `proto/`.
@@ -81,8 +85,10 @@ build or replay. Counts are solid; seconds are not.
 
 ### 5. Prune orphaned section files — DONE (`opt/prune-orphan-sections`)
 
-Implemented 2026-07-30, one commit over `main`, not merged. **Land it before
-B7**, which multiplies the leak by keeping a copy per config.
+Implemented 2026-07-30 and **merged as #59**. It was sequenced ahead of B7
+because B7 multiplied the leak by keeping a copy per config. B7 is retired, but
+its successor keeps a copy per layout and so re-creates the reason this had to
+exist first.
 
 The publish tail prunes after `write_v2_book_index` succeeds, deleting section
 files whose ordinal is past the new count. Two things make it safe, and both
@@ -119,8 +125,9 @@ until the whole cache dir is emptied. On the measured book that is **~360 KB
 of dead space per shrink, per book**, accumulating across every type change
 and orientation flip.
 
-**B7 multiplies this** — it creates more section files under more names, two
-configs at a time — so whatever prunes them should exist first. Fix: after a
+**Multi-layout retention multiplies this.** It creates more section files
+under more names, two layouts at a time, so whatever prunes them has to exist
+first. That held for B7 and holds unchanged for its successor. Fix: after a
 successful publish, delete `S<n>..` up to the previous header's
 `section_count`, or enumerate `SECTIONS/` and drop anything past `n`. It must
 run **after** the new index lands, never before; deleting a section the reader
@@ -260,7 +267,8 @@ than per run. Measure before building either.
   per settings change.** Proven genuine by read volume: 2.8–3.8 MB per rebuild
   against the 11.7 MB source zip a fallback would stream. The remaining 24–27 s
   is downstream of the capture point (wrap + section writes), which no
-  zip/inflate/XML skip can touch — that is what promoted B7.
+  zip/inflate/XML skip can touch. That is what promoted B7, and it transfers
+  to B7's successor unchanged: the replay is the cost that retention removes.
 - **B4 — progressive first open** (#53). The walk stops at the first spine
   boundary past the requested page, publishes a partial BOOK.BIN stamped with
   `resume_spine`, and finishes in slices from a fifth branch of the display
@@ -278,92 +286,119 @@ than per run. Measure before building either.
   same shape — a write fails *after* the store has been updated and the
   cleanup gets it wrong — in code that lived in a `#![no_main]` binary no test
   could reach.
-- **B7 — per-config section caches** (`opt/b7-per-config-section-caches`,
-  committed, not merged). A book keeps a paginated copy per layout config
-  instead of overwriting the one it has, so flipping back to a type size or
-  orientation already read is a cache hit rather than the 24–27 s replay.
-  Sections are `SECTIONS/S<cfg><nnn>.BIN`, the index is `BK<cfg>.BIN`, and
-  `CFG.BIN` lists the resident configs most-recently-used first — driving both
-  eviction (2 slots, LRU) and the readers that need a book's
-  config-*independent* facts (source identity, title, TOC) to know which index
-  exists. Cost: +6,882 B flash, no static RAM, one extra paginated copy on the
-  card.
+- **B7, per-config section caches** (`opt/b7-per-config-section-caches`).
+  **RETIRED 2026-09-03, unmerged.** The feature is now Reading Position and
+  Layout Durability Milestones 3 and 4, which key pagination on
+  `(LocalCacheIdentity, LayoutId)` over a ContentAnchor rather than on the
+  layout config over a page index. Two things retired it, and the three known
+  defects were not among them. **#88 replaced the cache key the branch names
+  its files from**: identity now derives from root, full locator and byte size,
+  not from the display label that `S<cfg><nnn>.BIN` was built over. And
+  **Milestone 2 removes the page-index position the branch stores**, so landing
+  B7 first would mean migrating reading positions twice. Rebasing it would buy
+  a port to the wrong key.
 
-  Two deliberate deviations from the spec below, both worth knowing:
-  - The spec said to **add** a page-box bit to the config key.
-    `READER_LAYOUT_VERSION` v18 already put one in bit 7, so the key only had
-    to include it. The wrap-relevant key is bits 2–7 (size, weight, family,
-    portrait) — six bits, two hex digits.
-  - The spec said to bump `CACHE_V2_VERSION` because the index name changed.
-    **Not done, deliberately:** nothing reads the old names, so a bump would
-    only invalidate CONT.BIN as well and turn the one-time upgrade from a
-    replay into a full EPUB re-parse. The first open that finds an unkeyed
-    `BOOK.BIN` deletes it and the unkeyed section files instead.
+  **What it measured, which the successor inherits.** The replay it removes is
+  24.7 s (736 pp) to 27.1 s (1240 pp) on X3 against a 64.0 s cold build. The
+  cost of keeping a second copy is +6,882 B flash on X4, `data` and `bss`
+  unchanged so no new static RAM, one extra paginated copy per book on the card,
+  and about 400 B of stack in the adoption path, which returns before the EPUB
+  chain's 13,840 B frame rather than nesting inside it. Two slots was the chosen
+  bound: the flip and the flip back is the flow that hurts.
 
-  **Rebase note, 2026-08-13 — this branch no longer merges cleanly.** #75
-  moved the driver pin to our fork and rebased it onto upstream v0.10, and the
-  conflict is in `reader-cache/src/files.rs`. It is an API migration, not a
-  textual one: `delete_file_in_dir` → `delete_entry_in_dir`, `CardType` moved
-  into `embedded-sdmmc-types` (`SDHC` → `SdhcSdxc`), and `iterate_dir`
-  callbacks now return `ControlFlow` instead of `()`. The last one is not
-  mechanical — `main`'s version of this file now uses `ControlFlow::Break` to
-  stop scans early, and a migration that returns `Continue` everywhere will
-  compile while quietly reverting those. Do the migration against `main`'s
-  intent, not against the compiler's complaints.
+  **Eleven findings the successor still needs.** Each was paid for once, several
+  of them in review or on a fault harness. The first two contradict the
+  successor PRD as currently written. Keep this entry after the branch
+  goes.
 
-  **Branch audit, 2026-07-30 — three defects to fix before it merges.** The
-  branch is the best-structured large change in the queue (1,473 of 1,485
-  added lines are in host-testable crates, 11 real tests on the FAT
-  fault-injection harness, and a `read_cache_header` that fails closed with
-  real care). It should not be demoted. It does need another round:
-
-  1. **`&str` byte-index slicing aborts on SD-derived filenames.** Three name
-     recognizers in `proto/src/cache.rs` (~`:692`, `:707`, `:725`) check *one*
-     char boundary and then slice at others. `name.len()` is a **byte** length,
-     and embedded-sdmmc's `ShortFileName: Display` emits `byte as char`, so any
-     FAT entry byte ≥ 0x80 becomes two UTF-8 bytes and shifts the boundaries.
-     Reproduced end-to-end on the branch's own fake-card harness:
-     `read_cache_header` aborts with *"start byte index 4 is not a char
-     boundary; it is inside 'é'"*. Release is `panic = "abort"`, and the entry
-     point includes the orphan sweep that runs on **every catalog write**.
-     Fix is mechanical — compare over `name.as_bytes()`; nothing here needs
-     `str` semantics. `main` has no equivalent exposure; this is new surface.
-     The near-miss test table is all ASCII, which is what let it through.
-     **Still live after #75** — re-checked in the fork, where `ShortFileName:
-     Display` still writes `c as char`
-     (`embedded-sdmmc/src/filesystem/filename.rs:238`). Long-name support does
-     not help here: `DirEntry::name` is still a `ShortFileName`, so every scan
-     in `reader-cache` still sees the 8.3 alias. If anything the exposure is
-     now easier to hit, since aliases are derived by the driver from
-     user-supplied filenames rather than from a hash.
-  2. **The cross-config cache wipe is at three sites, not the one admitted.**
-     Besides `publish.rs`, `fw/src/book_build.rs` calls `empty_cache_dir` on
-     the cold-build `IndexWriteFailed` arm (~`:1962`) and on the **replay**
-     failure path (~`:2163`) — the very flow B7 exists to accelerate, and it
+  1. **Line spacing belongs out of the cache key**, even though it changes page
+     boundaries. A spacing change re-walks heights over the same wrap points, so
+     both spacings share one set of section files exactly as they did before.
+     The PRD's `LayoutId` input list names line spacing. That is correct for
+     "what can change pagination" and wrong for "what names a file on the card",
+     and the two lists are not the same list.
+  2. **The pagination-algorithm version and the panel salt also belong out**,
+     for the opposite reason: a bump has to retire *every* layout. Left out, a
+     bump is rejected by each index's own header check and rebuilds in place.
+     Put in, each bump strands a fresh set of filenames with nobody left to
+     delete the old set. The PRD's input list names both.
+  3. **The registry must not claim an eviction it did not complete.** The
+     branch's first version wrote the promoted registry whether or not the
+     delete succeeded, so a card that refused a delete got a registry saying the
+     eviction happened. That unregisters an intact cache: the files still load,
+     but nothing counts them, the next eviction walks past a full section set no
+     later pass will look at, and the two-slot storage bound is gone. It is
+     worst exactly when the delete was needed for space, because the build that
+     follows can then fail for want of it. The deletion path has to report
+     whether every file of that layout is accounted for, deleted or already
+     absent, and the registry write has to depend on that answer. Failing the
+     open instead was considered and rejected: eviction only runs when the
+     layout is not resident, which is when a build was going to happen anyway.
+  4. **Evict the index before the sections.** An interrupted eviction then
+     leaves stray sections with no index, which is unreadable and rebuildable,
+     rather than an index promising sections that are gone. Same shape as the
+     roadmap's method rule 4.
+  5. **A lost registry must not read as a deletable cache.** `read_cache_header`
+     is what licenses the orphan sweep to delete a cache directory, so its
+     `Absent` has to mean "nothing is there", not "the registry did not decode".
+     The branch worked the registry slots, then fell back to a bounded directory
+     listing, and reported `Unreadable` for a registry that was present and
+     undecodable, or an index that opened and would not parse. Any multi-layout
+     scheme needs that distinction, because the sweep runs on every catalog
+     write. `read_cached_book_title` skipped the listing on purpose: it runs
+     once per book at catalog scan and a miss there costs a label, not a cache.
+  6. **The cross-layout wipe is wider than the branch admitted, and has grown
+     since.** The audit found `empty_cache_dir` on three failure paths. `main`
+     now calls it at six non-test sites: `fw/src/book_build.rs:1092`, `:2131`
+     and `:2332`, `fw/src/library_sd.rs:1485` and `:1512`, and
+     `reader-cache/src/publish.rs:244`. Each is justified by reasoning that was
+     true with one cache per book and is false with two, because the other
+     layout's complete pagination is collateral. On the replay failure path it
      takes `CONT.BIN` with it, downgrading the fallback from a replay to a full
-     EPUB re-parse. The justifying comment ("safe because the book never became
-     readable") was true with one cache per book and is now false: the other
-     config's complete, valid pagination is collateral. Every existing fault
-     test uses a single config, which is why none of them sees this.
-  3. **`BookBuildResume` is not keyed by the layout config.** `belongs_to`
-     compares only catalog row + source identity. Before B7 a fast hit implied
-     the suspended walk's config; now a fast hit under config B can carry a
-     live walk that was building A, and the resumed step's writers derive
-     config B. Memory-safe and self-correcting (the per-file `font_config`
-     check rebuilds), but it silently destroys the second cached copy the
-     feature exists to preserve. Fold the layout key into `belongs_to`.
+     EPUB re-parse, which is the very flow retention exists to accelerate. Every
+     existing fault test uses a single layout, so none of them sees it.
+  7. **`BookBuildResume` must be keyed by the layout.** `belongs_to`
+     (`fw/src/book_build.rs:110`) still compares only catalog row and source
+     identity. With one cache per book a fast hit implied the suspended walk's
+     layout. With two, a fast hit under layout B can carry a live walk that was
+     building A, and the resumed step's writers derive B. Memory-safe and
+     self-correcting through the per-file config check, and it silently destroys
+     the second cached copy the feature exists to preserve.
+  8. **Recognize cache filenames over bytes, not `&str` slices.** The branch's
+     three name recognizers checked one char boundary and sliced at others.
+     `name.len()` is a byte length, and the driver's `ShortFileName: Display`
+     writes `c as char`, so any FAT entry byte >= 0x80 becomes two UTF-8 bytes
+     and shifts every boundary. Reproduced end to end on the branch's own fake
+     card: an abort reading *"start byte index 4 is not a char boundary; it is
+     inside 'é'"*, on a release build that aborts on panic, from an entry point
+     the orphan sweep reaches on every catalog write. **Still live in the
+     current pin** (`c as char`, `src/filesystem/filename.rs:229`), and
+     `DirEntry::name` is still a `ShortFileName`, so long-name support does not
+     remove the exposure. #75 arguably widened it, since aliases are now derived
+     by the driver from user-supplied filenames rather than from a hash. An
+     ASCII-only near-miss table is what let it through.
+  9. **Do not bump the cache version merely to rename an index.** The branch was
+     specified to bump `CACHE_V2_VERSION` because the index filename changed,
+     and deliberately did not: nothing reads the old names, so a bump would
+     invalidate `CONT.BIN` too and turn a one-time transition from a replay into
+     a full EPUB re-parse. Deleting the unkeyed `BOOK.BIN` and `S<spine>.BIN` on
+     first open costs one failed file open per later open instead.
+  10. **The adoption path must not write on every open.** `adopt_layout_config`
+     ran on every `build_or_load_book_cache`, including section-crossing page
+     turns, and unconditionally did a directory walk, a failed `BOOK.BIN` open
+     and a registry **write**, even when the registry was unchanged. An equality
+     guard is one line, and the registry type already derived `PartialEq`.
+  11. **Rollback to older firmware is a one-way door.** Old firmware sees
+     `Absent`, sweeps the directory, and its name-based `empty_cache_dir` has
+     not heard of the new filenames, so the verify fails, `SECTIONS/` survives,
+     and the sweep re-fails on every catalog write. A rebuild rather than
+     corruption, and worth stating in the successor's format notes rather than
+     rediscovering.
 
-  Also unaccounted in the cost section: `adopt_layout_config` runs on every
-  `build_or_load_book_cache` — including section-crossing page turns — and
-  unconditionally does a dir walk, a failed `BOOK.BIN` open and a `CFG.BIN`
-  **write**, even when the registry is unchanged. `LayoutConfigRegistry`
-  already derives `PartialEq`; an equality guard is one line.
-
-  **Rollback is a rebuild, not corruption** — acceptable — but messier than
-  the commit implies: old firmware sees `Absent`, sweeps the directory, and its
-  name-based `empty_cache_dir` has never heard of `CFG.BIN`/`BK*.BIN`, so the
-  verify fails, `SECTIONS/` is never removed, and the sweep re-fails on every
-  catalog write. Worth documenting as a one-way door.
+  The branch also left one **known follow-up** unfixed, which is finding 6 seen
+  from the other side: `publish.rs`'s provisional-publish failure path calls
+  `empty_cache_dir`, so a torn index write for one layout takes the other
+  layout's good cache with it. Scoping that to the failing layout is the fix.
 
 ## Constraints that bind anything here
 

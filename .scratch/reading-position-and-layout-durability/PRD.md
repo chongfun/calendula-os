@@ -118,6 +118,26 @@ Inputs include at least:
 
 `LayoutId` should be derived deterministically from those inputs.
 
+**The cache key is derived from `LayoutId`, and is not this list.** The list
+above answers "what can change page boundaries", which is the correctness
+question. Naming a stored pagination is a different question, and answering it
+with this list verbatim is wrong in two ways that the retired B7 branch found
+and paid for (roadmap issue 02, findings 1 and 2):
+
+- **Line spacing should be excluded from the key.** A spacing change re-walks
+  heights over the same wrap points, so two spacings share one set of section
+  files. Including it doubles the stored copies and buys nothing.
+- **The pagination-algorithm version and any panel salt should be excluded
+  from the key.** A bump has to retire *every* layout, and that is what R17
+  already provides through each stored index's own header check: a bumped
+  index is rejected and rebuilt in place. Folding the version into the
+  filename instead strands a fresh set of names on every bump, with no reader
+  left that recognizes the old set well enough to delete it.
+
+So the key covers the inputs that change wrap points and that a reader flips
+between. Everything else in the list stays a correctness input to the header
+check rather than a component of the name.
+
 ### ContentAnchor
 
 A layout-independent coordinate identifying a logical location within an EPUB.
@@ -300,6 +320,28 @@ not:
 
 At minimum, normal switching among recently used typography configurations should preserve their pagination.
 
+**Eviction has to be honest about itself.** Whatever structure records which
+layouts are resident must not claim an eviction that did not complete. If a
+delete is refused, by an I/O fault or by no space to write the directory entry
+back, and the record is promoted anyway, an intact cache is left on the card
+that nothing counts: its files still load, but the next eviction walks past a
+full section set that no later pass will look at, and the storage bound is
+gone. It is worst exactly when the delete was needed for space. So the deletion
+path must report whether every file of that layout is accounted for, deleted or
+already absent, and the record's update must depend on that answer. Abandoning
+the adoption and leaving the record naming the layout whose files are still
+there is the correct failure: the layout stays counted, and the next open
+retries the delete.
+
+**Evict the index before the sections.** An interrupted eviction then leaves
+stray sections with no index, which is unreadable and rebuildable, rather than
+an index promising sections that are gone.
+
+Refusing the open on a failed eviction is the wrong alternative. Eviction only
+runs when the layout is not resident, which is precisely when a build was going
+to happen anyway, so refusing would mean refusing to open a book because a
+delete failed.
+
 ### R11. Current layout is not part of reading identity
 
 The durable position must remain valid even if the layout used when it was saved is no longer available.
@@ -405,6 +447,32 @@ Do not couple position-format compatibility to pagination-cache compatibility.
 A firmware update may invalidate every pagination cache while retaining every reading position.
 
 That distinction is a core architectural requirement.
+
+### R18. A multi-layout cache stays legible to the orphan sweep
+
+The sweep that deletes stranded cache directories decides on "is anything here
+at all". A multi-layout scheme spreads that answer across a residency record
+and a set of per-layout indexes, so the reader that answers for the sweep must
+distinguish three states, not two:
+
+- **absent**: nothing is there, and the directory may be deleted;
+- **unreadable**: something is there and did not decode, whether that is a
+  residency record present but corrupt or an index that opened and would not
+  parse. This is not absence, and must not license a delete;
+- **present**: a layout was found.
+
+A lost residency record must therefore fall back to a bounded directory
+listing rather than reporting absence, because the sweep runs on every catalog
+write and a wrong answer there deletes a cache that is plainly on the card.
+Readers that only want a cheap label, rather than a delete decision, may skip
+the listing and accept a miss.
+
+**Downgrade is a one-way door, and the format notes should say so.** Firmware
+that predates the multi-layout naming sees absence, sweeps the directory, and
+fails the verify because its name-based cleanup does not recognize the new
+filenames, leaving the section directory behind and re-failing on every catalog
+write. That is a rebuild rather than corruption, and it is worth stating rather
+than rediscovering.
 
 ## Anchor design
 
@@ -732,8 +800,50 @@ intermediate format that carries a page index under a `BookId`.
 ### Milestone 4: Multi-layout cache retention
 
 - Stop deleting prior pagination on settings changes.
-- Add cache reuse and eviction policy.
+- Add cache reuse and eviction policy, per R10's integrity rules.
 - Pin A → B → A behavior.
+
+**Four preconditions, each one a defect the retired B7 branch hit or was
+audited into.** They are cheap before the feature and expensive after, because
+every existing fault test uses a single layout and so sees none of them.
+
+- **Scope the cross-layout wipe.** `empty_cache_dir` is called at six non-test
+  sites on `main` (`fw/src/book_build.rs:1092`, `:2131`, `:2332`,
+  `fw/src/library_sd.rs:1485`, `:1512`, `reader-cache/src/publish.rs:244`).
+  Each is justified by reasoning that holds with one cache per book and fails
+  with two, because the surviving layout's complete pagination becomes
+  collateral. On the replay failure path it also takes the settings-independent
+  content cache with it, downgrading the fallback from a replay to a full EPUB
+  re-parse, which is the flow this milestone exists to accelerate.
+- **Key the build-resume record by layout.** `BookBuildResume::belongs_to`
+  (`fw/src/book_build.rs:110`) compares only catalog row and source identity.
+  With one cache per book a fast hit implied the suspended walk's layout; with
+  two, a hit under layout B can carry a live walk that was building A while the
+  resumed step's writers derive B. It is memory-safe and self-correcting, and
+  it silently destroys the second copy this milestone exists to keep.
+- **Recognize cache filenames over bytes.** Any scheme that parses a name off
+  the card must compare `as_bytes()`, not slice a `&str` at computed offsets.
+  The driver's short-name `Display` writes `c as char`, so a FAT byte at or
+  above 0x80 becomes two UTF-8 bytes and shifts every boundary; the branch
+  reproduced an abort from exactly this, on a release build that aborts on
+  panic, reached from the orphan sweep on every catalog write. An ASCII-only
+  test table will not catch it.
+- **Do not write the residency record on every open.** The adoption path runs
+  on every cache open, including section-crossing page turns. Guard it on
+  equality so an unchanged record costs no directory walk and no write.
+
+**Do not bump the pagination-cache version merely because an index filename
+changed.** Nothing reads the old names, so a bump invalidates the
+settings-independent content cache as well and turns a one-time transition from
+a replay into a full EPUB re-parse. Delete the unkeyed artifacts on first open
+instead. R17 keeps the position format out of this either way.
+
+**Sizing, measured on the retired branch (X3/X4, 2026-07).** The replay this
+removes is 24.7 s at 736 pages and 27.1 s at 1240, against a 64.0 s cold build.
+Two resident layouts cost +6,882 B of flash on X4 with `data` and `bss`
+unchanged, so no new static RAM, plus one extra paginated copy per book on the
+card and about 400 B of stack in the adoption path. Two slots was the chosen
+bound, on the grounds that the flip and the flip back is the flow that hurts.
 
 ### Milestone 5: Source replacement migration
 
