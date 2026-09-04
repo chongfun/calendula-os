@@ -11,6 +11,16 @@ else here, one gap B4 left behind, and a `proto` stack item.
 
 Owns: `reader-cache/`, `fw/src/book_build.rs`, `fw/src/custom_font.rs`,
 `fw/src/library_sd.rs`, `ui/src/reading.rs`, `proto/`.
+**Shared as of 2026-09-03:** the claim on `proto/` and `reader-cache/` is no
+longer exclusive. #87 and #88 added `proto/src/source.rs`,
+`proto/src/library_path.rs` and `reader-cache/src/browse.rs`, and
+`feature/library-identity-m1` adds `proto/src/identity.rs` and changes
+`reader-cache/src/store.rs`, `proto/src/catalog.rs` and `fw/src/library_sd.rs`.
+Those answer to the four library PRDs in `.scratch/`, not to this workstream.
+**And the pipeline numbers below predate folder browsing:** they were taken on
+a flat `/BOOKS` card, while #88 catalogs at whatever depth a book sits, so the
+scan and catalog-write side of them needs re-taking before it is quoted. The
+per-book build path itself did not change.
 Do not touch: `fw/src/sd_session.rs` — SD chunk/clock/multi-block changes
 belong to WS-D, and this workstream benefits automatically.
 

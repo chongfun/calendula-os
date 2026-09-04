@@ -352,7 +352,7 @@ references today.)*
 
 **New 2026-08-13, from crosspoint `70faa29d`.** We set the CPU clock once —
 `esp_hal::Config::default().with_cpu_clock(CpuClock::_160MHz)` at
-`fw/src/main.rs:365` — and never vary it again. Upstream's measurement puts a
+`fw/src/main.rs:367` — and never vary it again. Upstream's measurement puts a
 number on what that costs: eliminating a 3 s post-turn tail at 160 MHz was
 worth 21.2 mA × 3 s per page turn on its own, separately from their light-sleep
 work.

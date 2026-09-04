@@ -19,7 +19,8 @@ everything.
 
 ## Open
 
-Order: F7 → F8 → F9 (all measurement integrity, all cheap) → F10 → F11 → F5.
+Order: F7 → F8 → F9 (all measurement integrity, all cheap) → F10 → F5.
+**F11 is done**, folded into #58; see its entry.
 
 ### F7 (S): `bench.py report --strict` is a silent no-op on Python < 3.11
 
@@ -135,7 +136,10 @@ It is its own cargo workspace, so the root `cargo fmt --all`,
 that builds it is `pages.yml`, which is `on: push: branches: [main]` with no
 `pull_request` trigger. **A PR that breaks the wasm build merges green and
 fails only on the post-merge deploy** — and there is precedent for post-merge
-Pages failures being the first signal.
+Pages failures being the first signal. **Re-verified 2026-09-03:** still true.
+`pages.yml` is `on: push: branches: [main]` plus `workflow_dispatch`, and
+`ci.yml`, which does fire on `pull_request`, does not build the web emulator.
+F11's half of this item has since been closed by #58; this half has not.
 
 Measured cost to close: the two board wasms build in 5.1 s and 2.7 s, against
 a 45 s `golden-frames` job and a 98 s `clippy-firmware` critical path — so
@@ -143,14 +147,19 @@ attaching them adds **zero CI wall clock**. Exactly the trick that closed F2,
 one level up. (Same paragraph, hygiene: `tools/emulator` is never linted or
 fmt-checked either.)
 
-### F11 (S): the bench harness's own 25 tests run nowhere
+### F11 (S): the bench harness's own tests run nowhere. **Done in #58**
 
-`python3 -m unittest discover -s tools/bench -p 'test_*.py'` → **25 tests,
-0.065 s, all pass.** Nothing runs them: the only Python test invocation in the
-repo is `tools/stack_frames.py` in `check.sh`. This is F2's pattern applied to
-the measurement harness — 25 tests guarding the parser, the reporter and
-`split_runs`, gating nothing. Adding them to `golden-frames` costs 0.065 s,
-and running them under the *shipping* interpreter is what surfaces F7.
+The hole was real: 25 tests guarding the parser, the reporter and
+`split_runs`, gating nothing, because the only Python test invocation in the
+repo was `tools/stack_frames.py` in `check.sh`. **#58 closed it.**
+`.github/workflows/ci.yml` now runs a "Test bench harness" step invoking
+`tools/check.sh test-bench`, and `ci.yml` fires on `pull_request`, so the
+harness is gated on every PR. Running them under the shipping interpreter is
+what surfaced F7, exactly as predicted. Nothing is left owed here.
+
+F10 is the remaining CI hole, and it is a different shape: `pages.yml` has the
+right path filters but no `pull_request` trigger, so a broken wasm still
+merges green.
 
 ### F5 (L; only after F1): shared `fonts.bin` across boards — **re-scope, the deferral rationale was wrong**
 

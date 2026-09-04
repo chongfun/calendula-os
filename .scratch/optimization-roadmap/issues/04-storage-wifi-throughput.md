@@ -13,10 +13,25 @@ for what follows: the 19.3 s baseline was measured on the old write path and
 needs re-taking, the FAT-tax calibration below now has non-FAT contributors,
 and **D6 is no longer gated on a decision to fork.**
 
+**#87 then put a hash on the same path (2026-09-03).** `StagedUpload::write`
+feeds every byte through a streaming SHA-256 before handing it to the card
+(`upload-store/src/install.rs:1329`), so upload wall time now carries a
+per-byte CPU cost that no figure in this document includes. It does not
+invalidate the arithmetic below, but it does mean the instrumentation has to
+separate hash time from write time. Reporting them together would credit the
+SD path with work the CPU is doing and bias the answer toward D6.
+
 Owns: `fw/src/sd_session.rs`, `fw/src/tasks/wifi.rs`, `fw/src/upload.rs`,
 `fw/src/sync_mem.rs`, `upload-store/`, `proto/src/upload.rs`, and the
 `embedded-sdmmc` fork (`chongfun/embedded-sdmmc-rs`, branch
 `calendula/long-names-and-error-fidelity`).
+**Shared region as of 2026-09-03.** `upload-store/` is now where the library
+work lives as well. #82 and #87 changed the install and staging paths, and `feature/library-identity-m1` adds `ledger.rs` and
+`replace.rs`, changes `install.rs`, and modifies `fw/src/sd_session.rs` from
+outside this roadmap. Plan any item here against that branch and the four
+library PRDs in `.scratch/`, and check a file's `git log` before assuming this
+workstream is its only writer.
+
 Note: `sd_session.rs` changes speed up WS-B's reader path too. This
 workstream owns the file; WS-B must not modify it.
 Note: the fork is a real dependency of WS-B as well — its v0.10 API is what

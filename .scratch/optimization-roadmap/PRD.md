@@ -20,14 +20,29 @@ conflicted, and the fix was a driver API migration rather than a rebase; that
 branch is now retired, see Tier 3). WS-D's upload baseline predates #75's
 write path and needs re-taking before it is quoted again.
 
-**B7 retired 2026-09-03**, superseded by the Reading Position and Layout
-Durability PRD. Tier 3 says why; issue 02 keeps the eleven findings the branch
-paid for, because its successor still needs them. Note the wider debt this
-exposes: the document is reconciled to `main` only as of 2026-08-13, which is
-ten merges ago (#79 through #88), and the four library PRDs written alongside
-those merges are not reflected here beyond this paragraph. Nothing in Tier 1
-is affected. Tier 3 and the workstream file lists are the parts that have
-drifted.
+**Reconciled again 2026-09-03, against `main` at #88 and against the four
+library PRDs** (`library-identity`, `source-identity`, `physical-folder-library`,
+`reading-position-and-layout-durability`), which were written while this
+document sat still. Ten merges landed in between, #79 through #88. What that
+sweep changed:
+
+- **B7 is retired**, superseded by Reading Position and Layout Durability
+  Milestones 3 and 4. Tier 3 says why; issue 02 keeps the eleven findings the
+  branch paid for, because its successor inherits every one of them.
+- **Tier 1 was re-verified line by line and stands unchanged.** A13's
+  `SETTLE_MS`, A12's unvaried `CDI_INTERVAL`, the absent frame-identity guard
+  behind A14, and C2's untouched sleep path are all still there. WS-A and WS-C
+  saw no substantive commits in the interval, so the top of the queue is the
+  part of this document that has aged best.
+- **Tier 3 lost its second branch and its clean-merge claim.**
+  `opt/upload-session-token` no longer merges.
+- **F11 landed** inside #58 and is struck from item 11. F10 stands.
+- **Two workstreams no longer own their regions alone.** The library work is
+  implemented in WS-B's `proto/` and `reader-cache/` and in WS-D's
+  `upload-store/` and `sd_session.rs`, from a different document. See
+  Workstreams and Coordination hazards.
+- **WS-B's pipeline baselines predate folder browsing** and are marked as
+  such.
 
 This document is kept to three things: **what is left**, **what has been
 done**, and **what not to do**. Round-by-round history has been dropped —
@@ -122,7 +137,7 @@ is the opposite of what was expected when this started.
 
 | # | Item | WS | Why it ranks here | Effort |
 |---|---|---|---|---|
-| 5 | **Upload instrumentation, then D6** | D | The D2 post-mortem has been misread: it tested write *stalls*, never write *bandwidth*. Arithmetic says **~72% of upload wall time is single-block SD writes** and the ceiling is 1.4× above observed. D6's own precondition was met in July and it stayed deferred. ~25 lines of instrumentation resolve it in one capture. **Re-rated 2026-08-13: #75 removed D6's cost side.** It was sized as "L, fork maintenance" and carried a do-not-fork escape hatch; we now own and maintain that fork, so the payoff is unchanged and the cost is sunk. Effort drops L → M. The instrumentation still goes first — the 72% is arithmetic, not a measurement — but its job is now sizing, not deciding whether to fork. Re-take the baseline before quoting it: #75 changed the upload write path. | S–M then M |
+| 5 | **Upload instrumentation, then D6** | D | The D2 post-mortem has been misread: it tested write *stalls*, never write *bandwidth*. Arithmetic says **~72% of upload wall time is single-block SD writes** and the ceiling is 1.4× above observed. D6's own precondition was met in July and it stayed deferred. ~25 lines of instrumentation resolve it in one capture. **Re-rated 2026-08-13: #75 removed D6's cost side.** It was sized as "L, fork maintenance" and carried a do-not-fork escape hatch; we now own and maintain that fork, so the payoff is unchanged and the cost is sunk. Effort drops L → M. The instrumentation still goes first — the 72% is arithmetic, not a measurement — but its job is now sizing, not deciding whether to fork. Re-take the baseline before quoting it: #75 changed the upload write path. **And re-take it again after #87 (2026-09-03):** `StagedUpload::write` now feeds every byte through a streaming SHA-256 (`upload-store/src/install.rs:1329`), so upload wall time carries a hashing cost that was not in the arithmetic behind the 72% figure. The instrumentation has to separate hash from write, or the split it reports credits the SD path with CPU time and overstates D6. | S–M then M |
 | 6 | **Cache write alignment** | B | Nothing arranges block-aligned writes, so CONT.BIN pays **2 writes + 1 read per 512 B**. Modelled at ~1.75× write amplification, cross-checked against the 2026-07-09 537-block measurement. No format change, no version bump. | S–M |
 | 7 | **E5 + E6 — halve the peak stack chain** | E | `CssRules` ~6.9 KB and `parse_opf`'s duplicated manifest+spine 5,896 B, both on the peak reader chain (26,768 B of 42,136). Two mechanical changes take it to ~14.8 KB. | S–M, M |
 
@@ -135,7 +150,9 @@ v0.10, which is a breaking API change for anything touching SD:
 `embedded-sdmmc-types` (`SDHC` → `SdhcSdxc`), and `iterate_dir` callbacks now
 return `ControlFlow`. **Any branch predating #75 that touches `reader-cache/`
 or `sd_session.rs` needs that migration, not a rebase.** Verified by
-`git merge-tree` against `origin/main`, not assumed.
+`git merge-tree` against `origin/main`, not assumed, and re-run 2026-09-03:
+`opt/upload-session-token` has since acquired eight conflicts of its own from
+#79 and #80, which are renames rather than driver API changes.
 
 | Branch | State | Residual |
 |---|---|---|
@@ -144,7 +161,7 @@ or `sd_session.rs` needs that migration, not a rebase.** Verified by
 | ~~`opt/font-aa-low-threshold`~~ | **MERGED as #72**. | — |
 | ~~`opt/prune-orphan-sections`~~ | **MERGED as #59**. | — |
 | ~~`opt/a11-landscape-glyph-batching`~~ | **MERGED as #57**. | — |
-| `opt/upload-session-token` | **Ready**, and still merges clean against #75. But it adds 68 lines to `fw/src/tasks/wifi.rs`, which #75 also changed, and #75 introduced refusal paths the token gate predates — uploads and deletes are refused while an install journal stands. Confirm the gate covers those before the device check rather than after. | Re-verify, then device check |
+| `opt/upload-session-token` | **No longer merges, as of 2026-09-03.** It conflicts with `main` in eight files: `app-core/src/lib.rs`, `ui/src/lib.rs`, `ui/src/app_render.rs`, `ui/src/join_qr.rs`, `fw/src/tasks/wifi.rs`, `tools/emulator/src/scenario.rs`, and both `fixtures/golden/sync-portal-qr*.png`. The cause is #79 and #80, which renamed the card layout and the onboarding hotspot per device and re-took those goldens, so the conflict is a real rename to follow rather than a textual one, and the two golden conflicts resolve by regenerating rather than by picking a side. The original caveat also stands: it adds 68 lines to `fw/src/tasks/wifi.rs`, and #75 introduced refusal paths the token gate predates, since uploads and deletes are refused while an install journal stands. Confirm the gate covers those before the device check rather than after. | Resolve eight conflicts, regenerate two goldens, re-verify the gate, then device check |
 | ~~`opt/inflate-caller-owned-window`~~ | **MERGED as #63**. | — |
 | ~~`opt/d4-directed-wifi-join`~~ | **MERGED as #73**. | — |
 | ~~`opt/single-repaint-per-page-turn`~~ | **MERGED as #56**, reworked first. The audit found it suppressed the `Loaded` *event* rather than the render, freezing the app's page count during a background build and stranding the reader at the frontier — rule 4 through a door rule 4 does not name. #56 moved the decision into `app_core::loaded_repaints` and kept the event unconditional, and picked up an open-gate latch and a failed-refresh retry on the way. | — |
@@ -157,10 +174,10 @@ or `sd_session.rs` needs that migration, not a rebase.** Verified by
 | 8 | **First open on a deep resume** | B | B4 gives nothing near the end of a book; only a progress indicator helps. | M |
 | 9 | **C8 — sleep entry's discarded second pass** | C | ~657 ms of the ~4.1 s sleep entry, thrown away by the next boot's `init_panel`. Refuting check is free (count `bench: refresh` per sleep in an existing capture). Risk gates it. | M + hw |
 | 10 | **C9 — recovery combo on every wake** | C | 28 ms + 48 ADC conversions that cannot succeed on a button wake. One-line gate. | S |
-| 11 | **F10/F11 — close two CI holes** | F | `tools/web-emulator` is built by **no PR gate** (a broken wasm merges green); the bench harness's own 25 tests run nowhere. Both cost ~0 CI wall clock. | S |
+| 11 | **F10, close the last CI hole** | F | `tools/web-emulator` is built by **no PR gate**, so a broken wasm merges green: `pages.yml` has the right path filters but fires only on `push` to `main`, and `ci.yml` does not build it at all. ~0 CI wall clock. **F11 is done.** #58 added a "Test bench harness" step running `tools/check.sh test-bench`, so the harness's own tests are gated on every PR. | S |
 | 12 | **D5** — portal → station handoff | D | ~40–60 s and 3 steps off first-time onboarding. | M |
 | 13 | **E7** — `sort_unstable_by_key` in the wifi scan | E | One stable sort of 20 elements costs a 4,128 B frame and 3.8 KB of flash; stability is irrelevant there. Cheapest item in the roadmap. | S |
-| 13a | **C11 — scale the CPU clock down when nothing needs 160 MHz** | C | **New 2026-08-13 from crosspoint `70faa29d`.** We set 160 MHz once at `fw/src/main.rs:365` and never vary it. Upstream measured a 3 s post-turn 160 MHz tail at 21.2 mA on an X3. Unlike C10 this touches no timer domain and is not blocked. Impact deliberately unestimated — but note our BUSY wait already sits in WFI on a GPIO edge rather than spinning, so the lever is clock-tree only and **upstream's 3.2× is not this item's number**. **Run it on C2's gauge rig, not separately** — same instrument, same untethered requirement. | S–M |
+| 13a | **C11 — scale the CPU clock down when nothing needs 160 MHz** | C | **New 2026-08-13 from crosspoint `70faa29d`.** We set 160 MHz once at `fw/src/main.rs:367` and never vary it. Upstream measured a 3 s post-turn 160 MHz tail at 21.2 mA on an X3. Unlike C10 this touches no timer domain and is not blocked. Impact deliberately unestimated — but note our BUSY wait already sits in WFI on a GPIO edge rather than spinning, so the lever is clock-tree only and **upstream's 3.2× is not this item's number**. **Run it on C2's gauge rig, not separately** — same instrument, same untethered requirement. | S–M |
 | 14 | **F5 re-scoped** | F | Merriweather is **42.9% of the wasm** and is not the default face: −41% on *every* first visit, not just a board switch. The old deferral reasoning was wrong. | L |
 
 ### Unresolved — measure before ranking
@@ -212,6 +229,8 @@ only as the honest home for prestage overlap.
 | Board identity guard | #77 | Refuse to boot on wrong board |
 | Panel controller detection | #76 | Probe panel controller before driving |
 | **Long-name uploads, journalled install** | #75 | Uploads stage outside `/BOOKS` and install as a same-volume move — two directory writes rather than a copy of the book's length. Not a performance item, but it moved the driver pin to our fork and rewrote the surface three WS-D items are written against. Released as v0.6.0 |
+| **Source identity** | #87 | Not a performance item, listed because it changes two of them. `StagedUpload` hashes every byte it writes (`install.rs:1329`), which puts a streaming SHA-256 on the upload path item 5 measures; and it gives content-derived caches an identity, the one the retired B7's successor keys pagination under |
+| **Physical folder paths** | #88 | Not a performance item, listed because it retired one. A book is addressed by a root-relative locator and its cache key derives from root, locator and byte size rather than from a display label, which is what made B7 unportable. Also catalogs at depth, so WS-B's scan baselines predate it |
 
 Everything above is on `main`. B7 was committed to a branch and retired
 without merging, so it is not listed here; see Tier 3.
@@ -232,6 +251,17 @@ Quote these, not anything older.
 | **Page turn, press-to-settled** | **~424 ms** |
 
 **Book pipeline, X3, 11.7 MB baseline book (2026-07-25 / 07-28).**
+**These predate folder browsing.** They were taken against a flat `/BOOKS`
+card, and #88 now catalogs every book at whatever depth it sits, so the scan
+and catalog-write costs behind the build figures are not the costs these
+numbers describe. The per-book build figures themselves should survive, since
+the build path did not change, but do not quote the scan side of them without
+re-taking it. What *is* recorded for the folder path is in
+`docs/ARCHITECTURE.md` (~`:639`): on an X3 at 1,129 books, entering a folder
+costs 41 ms plus 0.356 ms per row and paging inside one is flat at about
+35 ms, so no derived directory index is warranted. A catalog rebuild
+figure at that book count was taken in an August bench session but is not
+recorded anywhere in the tree, so it needs re-taking before it is quoted.
 
 | Metric | Value |
 |---|---|
@@ -336,7 +366,15 @@ One issue file each, owning a distinct set of files.
   2026-07-30** — the panel's own timing is software-set on the X3.
 - **WS-B — Book pipeline** (`issues/02-book-pipeline.md`). `reader-cache/`,
   `fw/src/book_build.rs`, `fw/src/custom_font.rs`, `fw/src/library_sd.rs`,
-  `ui/src/reading.rs`, `proto/`.
+  `ui/src/reading.rs`, `proto/`. **Shared since 2026-09-03.** The blanket
+  claim on `proto/` and `reader-cache/` is no longer exclusive: #87 and #88
+  added `proto/src/source.rs`, `proto/src/library_path.rs` and
+  `reader-cache/src/browse.rs`, and `feature/library-identity-m1` adds
+  `proto/src/identity.rs` and changes `reader-cache/src/store.rs`,
+  `proto/src/catalog.rs` and `fw/src/library_sd.rs`. Those files answer to the
+  library PRDs, not to this document. Treat the directory claim as "the book
+  pipeline inside these crates" and check `git log` on a file before assuming
+  WS-B owns it.
 - **WS-C — Power & boot** (`issues/03-power-boot.md`). `fw/src/tasks/power.rs`,
   `fw/src/tasks/input.rs`, `hal-ext/src/rtc.rs`, `hal-ext/src/bq27220.rs`,
   planner seed in `app-core/src/lib.rs`, boot region of the display task.
@@ -346,7 +384,12 @@ One issue file each, owning a distinct set of files.
   `embedded-sdmmc` fork — which since #75 is **ours to change**, not a pin to
   work around. Its rev and rationale live in `[workspace.dependencies]` in the
   root `Cargo.toml`; its regression tests live in the fork, so re-run them
-  there when bumping.
+  there when bumping. **Shared since 2026-09-03**, and more heavily than WS-B:
+  `upload-store/` is where the library work lives. #82 and #87 changed the
+  install and staging paths, and `feature/library-identity-m1` adds
+  `upload-store/src/ledger.rs` and `upload-store/src/replace.rs` and touches
+  `install.rs` and `fw/src/sd_session.rs`. A WS-D item that assumes it is the
+  only writer in this region will conflict.
 - **WS-E — Flash & RAM budget** (`issues/05-flash-ram-budget.md`).
   `.cargo/config.toml`, `display/src/font.rs` (struct only), generated font
   tables.
@@ -387,24 +430,35 @@ One issue file each, owning a distinct set of files.
    needs only a device and patience (the fuel gauge integrates over a long
    sleep), not an instrument; C6 and A4/A5 still need a meter or a careful
    visual soak, and A5 needs an X4 nobody has.
-5. **`fw/src/sd_session.rs` is WS-D's.** WS-B benefits from its changes but
-   must not modify it.
+5. **`fw/src/sd_session.rs` is no longer WS-D's alone.** The old rule was
+   that WS-B benefits from its changes but must not modify it. That still
+   holds for WS-B, but the library work modifies it from outside this
+   document (`feature/library-identity-m1`), so WS-D is a second writer rather
+   than the owner. Check the file's `git log` before planning a change to it,
+   and expect the same of `upload-store/`.
+
+6. **The four library PRDs are the other half of the tree.** They live beside
+   this one in `.scratch/` and are where reader-cache identity, pagination
+   keying, folder browsing and upload staging are being designed. Any item in
+   this roadmap that touches cache keys, catalog records, upload staging or
+   book identity should be read against them first, because the roadmap's
+   region ranking predates all four.
 
 ## Verification
 
 - Firmware timing: `tools/bench/bench.py` suites (`page-turn`,
   `storage-cache`, `sleep-sync`, `channel-stress --host`, `reader-soak`) per
   `docs/agents/bench.md`. Budgets in `tools/bench/benches.toml`.
-  **Run it under Python ≥ 3.11 until Tier 0a lands** — on 3.9 the `--strict`
-  budget check silently passes everything (`tomllib` is absent, and macOS
-  system `python3` is 3.9.6).
-- **Fold the protocol rules into `docs/agents/bench.md`.** Method rules 3, 7
-  and 8 live only in this scratch document, and `docs/agents/bench.md` — which
-  `AGENTS.md` routes every bench user to — says nothing about cadence,
-  unmatched presses, or the required interpreter. The rule that was learned by
-  losing a round should not be discoverable only by reading the roadmap.
-  Likewise `AGENTS.md`'s verification entry points do not mention
-  `tools/check.sh stack-frames`.
+  **Interpreter: resolved.** Tier 0a landed in #58, so `--strict` refuses to
+  run without a TOML parser rather than passing silently, and the repository
+  now pins Python to the 3.14 series in `.python-version` with `tools/check.sh`
+  preferring `python3.14`. The old "run it under 3.11 or better" caveat is
+  retired; use the pinned interpreter.
+- **Folding the protocol rules into `docs/agents/bench.md`: done.** That file
+  now carries deliberate cadence, the `coalesced`/`unmatched` accounting, the
+  10% suppression rule, and the 354 ms history that produced them. `AGENTS.md`
+  names `tools/check.sh stack-frames` among its Python-requiring targets.
+  Nothing is left owed here.
 - Visual: emulator goldens on both boards per
   `docs/agents/visual-verification.md`.
 - Size/stack: `llvm-size -A`, `llvm-nm` on `_stack_start`/`_stack_end`, the
