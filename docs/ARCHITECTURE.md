@@ -852,11 +852,13 @@ per copy, and recorded in the claim on the cache directory it keeps its
 reading place in. The read rides the same background slices the spine walk
 uses rather than standing between the reader and their first page: a book is
 megabytes and this card gives up around 550 kB a second, so a large one is
-the better part of a minute. It follows the book that is open, by place
-rather than by row number, since a rescan renumbers rows: a reader who moves
-on takes the reading with them, and the copy they left is read again
-whenever it is opened again. Nothing depends on it finishing, and a partial
-read records nothing.
+the better part of a minute. It follows the book that is open, by root,
+locator and length rather than by row number or cache key: a rescan
+renumbers rows, and a cache key is 28 bits of a hash that two books can
+share, either of which would leave a book unread on another book's account.
+A reader who moves on takes the reading with them, and the copy they left is
+read again whenever it is opened again. Nothing depends on it finishing, and
+a partial read records nothing.
 
 That directory is named for the place the record still names, so the search
 asks it for any copy the ledger says nothing about: a book that has been
@@ -874,14 +876,23 @@ holds and reads at most sixteen books. Those bounds limit which copies a
 scan can repair, not what it knows about the ones it does: every missing
 copy's digest is compared against the ones being carried, so a twin past the
 end of the table still refuses the repair, and a file of the right length
-that goes unread leaves every copy it could have been unsettled. Such a file
-is left unadopted, without an id, which is what keeps the question open: a
-scan that adopted it would match it by place ever after and stop looking,
-and the copy waiting on it would age out with nowhere to go. Files that were
-read and proved to be other books are adopted at once, so each scan gets
-further through the same question, and a file whose waiting copy ages out is
-adopted like any other. A reorganisation larger than one scan is repaired as
-far as it goes and looked at again on the next.
+that goes unread leaves every copy it could have been unsettled. Every file
+that could still be such a copy is left unadopted, without an id, so the
+question stays open: a scan that adopted one would match it by place ever
+after and stop looking, and the copy waiting on it would age out with
+nowhere to go.
+That covers the file that went unread and the file that did match, since
+either could be the copy. Files read and proved to be other books are
+adopted at once, so each scan gets further through the same question, and a
+file whose waiting copy ages out is adopted like any other. A row waiting is
+a row costing the ledger nothing, so it cannot crowd out the record it is
+being kept for.
+
+A committed catalog is otherwise the reason no scan runs, so a scan that
+leaves a question open says so in the catalog header, and the next mount
+reads that and scans instead of serving from it. A reorganisation larger
+than one scan is repaired as far as it goes and looked at again on the
+next.
 
 A repaired locator on its own would leave the reader's place behind, since
 a position is filed under the place a book was read from. So the scan

@@ -98,7 +98,7 @@ pub async fn run(
     // card already knew. A place rather than a row number: a rescan
     // renumbers rows, and a row that comes back as another book would
     // otherwise be taken for one already read.
-    let mut evidence_settled: Option<heapless::String<{ proto::cache::CACHE_KEY_BYTES }>> = None;
+    let mut evidence_settled: Option<book_build::EvidencePlace> = None;
     let mut pending_evidence: Option<book_build::SourceEvidenceJob> = None;
     // On a deep-sleep (Power button) wake the panel still shows the sleep
     // screen: deep_sleep_wake is true only when the RTC wake cause is the
@@ -214,7 +214,7 @@ pub async fn run(
                 (background_build.is_some()
                     || pending_evidence.is_some()
                     || book_build::evidence_place(sd_library)
-                        .is_some_and(|place| evidence_settled.as_deref() != Some(place.as_str())))
+                        .is_some_and(|place| evidence_settled.as_ref() != Some(&place)))
                     && !sync_session.active()
                     && holder().storage_may_run()
                     && !sd_library.text_holds_toc(),
@@ -237,13 +237,13 @@ pub async fn run(
                     // it is opened again.
                     if pending_evidence
                         .as_ref()
-                        .is_some_and(|job| open_place.as_deref() != Some(job.place()))
+                        .is_some_and(|job| open_place.as_ref() != Some(job.place()))
                     {
                         pending_evidence = None;
                     }
                     if pending_evidence.is_none() {
                         if let Some(place) = &open_place {
-                            if evidence_settled.as_deref() != Some(place.as_str()) {
+                            if evidence_settled.as_ref() != Some(place) {
                                 pending_evidence = book_build::evidence_job(sd_library);
                                 if pending_evidence.is_none() {
                                     evidence_settled = Some(place.clone());
@@ -252,8 +252,7 @@ pub async fn run(
                         }
                     }
                     if let Some(job) = &mut pending_evidence {
-                        let mut place = heapless::String::new();
-                        let _ = place.push_str(job.place());
+                        let place = job.place().clone();
                         match book_build::continue_source_evidence(&mut epd, &mut sd_cs, job) {
                             book_build::EvidenceStep::Continued => {}
                             // Settled either way: a copy the card would not

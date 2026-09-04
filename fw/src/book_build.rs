@@ -725,13 +725,37 @@ where
 /// opened long enough is one a move cannot find again, which is the state
 /// every book was in before.
 pub(crate) struct SourceEvidenceJob {
-    at: BookRoot,
-    locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
-    key: String<{ proto::cache::CACHE_KEY_BYTES }>,
-    len: u32,
+    place: EvidencePlace,
     offset: u32,
     started: Instant,
     hasher: proto::source::SourceHasher,
+}
+
+/// Which copy a reading is about: the place itself, exactly.
+///
+/// Not the cache directory it is filed under, whose name is 28 bits of a
+/// hash of this and which two books can share. Deciding by that name would
+/// leave a book unread because another one's reading had settled under it,
+/// and would let a reader moving between two such books keep the reading
+/// they moved away from. Not a row number either, which a rescan
+/// renumbers, and not a `BookId`, which a copy the scan has left in
+/// question does not have yet.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct EvidencePlace {
+    at: BookRoot,
+    locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
+    len: u32,
+}
+
+impl EvidencePlace {
+    /// The cache directory this place's claim lives in.
+    fn key(&self) -> String<{ proto::cache::CACHE_KEY_BYTES }> {
+        proto::cache::cache_key_from(proto::cache::source_hash_at(
+            self.at,
+            self.locator.as_str(),
+            self.len,
+        ))
+    }
 }
 
 /// What one slice of that reading did.
@@ -753,10 +777,9 @@ pub(crate) enum EvidenceStep {
 const EVIDENCE_SLICE_BYTES: u32 = 192 * 1024;
 
 impl SourceEvidenceJob {
-    /// The place this is reading, which is what the claim it will write is
-    /// filed under.
-    pub(crate) fn place(&self) -> &str {
-        self.key.as_str()
+    /// The copy this is reading.
+    pub(crate) fn place(&self) -> &EvidencePlace {
+        &self.place
     }
 }
 
@@ -767,18 +790,20 @@ impl SourceEvidenceJob {
 /// has to outlive one, and rather than a [`proto::identity::BookId`], since
 /// a book whose adoption a scan is still deciding has no id yet and its
 /// bytes are worth reading all the same.
-pub(crate) fn evidence_place(
-    library: &ReaderStore,
-) -> Option<String<{ proto::cache::CACHE_KEY_BYTES }>> {
+pub(crate) fn evidence_place(library: &ReaderStore) -> Option<EvidencePlace> {
     let index = library.active_index()?;
     let len = library.catalog_entry(index)?.byte_size;
     if len == 0 {
         return None;
     }
     let (at, locator) = library.book_location(index)?;
-    Some(proto::cache::cache_key_from(proto::cache::source_hash_at(
-        at, locator, len,
-    )))
+    let mut owned = String::new();
+    owned.push_str(locator).ok()?;
+    Some(EvidencePlace {
+        at,
+        locator: owned,
+        len,
+    })
 }
 
 /// The job for the open book, when the store knows where it is.
@@ -786,20 +811,8 @@ pub(crate) fn evidence_place(
 /// No card access: whether the claim already records the bytes is the first
 /// slice's business, so arming costs an open nothing.
 pub(crate) fn evidence_job(library: &ReaderStore) -> Option<SourceEvidenceJob> {
-    let index = library.active_index()?;
-    let (at, locator) = library.book_location(index)?;
-    let len = library.catalog_entry(index)?.byte_size;
-    if len == 0 {
-        return None;
-    }
-    let key = proto::cache::cache_key_from(proto::cache::source_hash_at(at, locator, len));
-    let mut owned = String::new();
-    owned.push_str(locator).ok()?;
     Some(SourceEvidenceJob {
-        at,
-        locator: owned,
-        key,
-        len,
+        place: evidence_place(library)?,
         offset: 0,
         started: Instant::now(),
         hasher: proto::source::SourceHasher::new(),
@@ -814,13 +827,14 @@ pub(crate) fn continue_source_evidence(
     sd_cs: &mut Output<'static>,
     job: &mut SourceEvidenceJob,
 ) -> EvidenceStep {
-    let Ok(path) = LibraryPath::parse(job.locator.as_str()) else {
+    let Ok(path) = LibraryPath::parse(job.place.locator.as_str()) else {
         return EvidenceStep::Abandoned;
     };
+    let key = job.place.key();
     let owner = proto::cache::CacheOwner {
-        key: job.key.as_str(),
-        root: job.at,
-        locator: job.locator.as_str(),
+        key: key.as_str(),
+        root: job.place.at,
+        locator: job.place.locator.as_str(),
     };
     let slice = sd_session::with_root(epd, sd_cs, |root| {
         // Asked once, on the first slice: a book whose bytes are already
@@ -830,19 +844,19 @@ pub(crate) fn continue_source_evidence(
         {
             return EvidenceStep::Finished;
         }
-        let read = upload_store::library::with_book_at(root, job.at, &path, |dir, alias| {
+        let read = upload_store::library::with_book_at(root, job.place.at, &path, |dir, alias| {
             let Ok(file) = dir.open_file_in_dir(alias, Mode::ReadOnly) else {
                 return None;
             };
-            if file.length() != job.len || file.seek_from_start(job.offset).is_err() {
+            if file.length() != job.place.len || file.seek_from_start(job.offset).is_err() {
                 // A file that is not the length the row said is not the
                 // copy this job was armed for.
                 return None;
             }
             let mut buffer = [0u8; 512];
             let mut taken = 0u32;
-            while taken < EVIDENCE_SLICE_BYTES && job.offset + taken < job.len {
-                let want = (job.len - job.offset - taken).min(buffer.len() as u32) as usize;
+            while taken < EVIDENCE_SLICE_BYTES && job.offset + taken < job.place.len {
+                let want = (job.place.len - job.offset - taken).min(buffer.len() as u32) as usize;
                 match file.read(&mut buffer[..want]) {
                     Ok(0) => break,
                     Ok(read) => {
@@ -858,7 +872,7 @@ pub(crate) fn continue_source_evidence(
             return EvidenceStep::Abandoned;
         };
         job.offset += taken;
-        if job.offset < job.len {
+        if job.offset < job.place.len {
             return if taken == 0 {
                 // The card stopped giving the book up before its end, so
                 // what has been read is not the stream and cannot be
@@ -874,7 +888,7 @@ pub(crate) fn continue_source_evidence(
             Ok(()) => {
                 bench_log!(
                     "bench: storage_evidence action=record len={} elapsed_ms={} t_ms={}",
-                    job.len,
+                    job.place.len,
                     job.started.elapsed().as_millis(),
                     Instant::now().as_millis(),
                 );

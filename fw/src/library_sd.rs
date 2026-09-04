@@ -15,9 +15,9 @@ pub(crate) use proto::cache::CACHE_ROOT_DIR as CATALOG_ROOT_DIR;
 use proto::cache::CATALOG_FILE;
 use proto::catalog::{
     catalog_count, catalog_file_len, catalog_identity_staged, catalog_record_identity,
-    decode_catalog_record, encode_catalog_header, encode_catalog_placeholder_header,
-    encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
-    CatalogRecord, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
+    decode_catalog_record, encode_catalog_placeholder_header, encode_catalog_record,
+    encode_catalog_title, sort_catalog_identities, stage_catalog_identity, CatalogRecord,
+    CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
     CATALOG_RECORD_TITLE_OFFSET, CATALOG_TITLE_BYTES,
 };
 use proto::library_path::BookRoot;
@@ -52,6 +52,11 @@ enum CatalogFault {
     /// catalog written before it may name a file that is now gone. The
     /// rescan that follows is the repair, not a symptom.
     Reclaimed,
+    /// Not a fault either: the scan that wrote this catalog left a file
+    /// unadopted for a later pass to read, and a committed catalog is
+    /// otherwise a reason not to scan again. The rescan that follows is
+    /// that pass.
+    Owed,
 }
 
 /// What a lookup of one place in the catalog found.
@@ -89,6 +94,7 @@ impl CatalogFault {
             Self::Invalid => "invalid",
             Self::Device => "error",
             Self::Reclaimed => "reclaimed",
+            Self::Owed => "owed",
         }
     }
 }
@@ -499,6 +505,14 @@ pub(crate) fn load_catalog_cache(
                 library.clear_catalog();
                 return Err(CatalogFault::Reclaimed);
             }
+            // A scan that ran out of reading, or met a file the card would
+            // not give up, leaves that file unadopted and says so here. It
+            // is the one thing a valid catalog can ask for, since serving
+            // from it is otherwise the reason no scan runs.
+            if catalog_owes_a_pass(root) {
+                library.clear_catalog();
+                return Err(CatalogFault::Owed);
+            }
         }
         loaded
     });
@@ -842,7 +856,7 @@ where
         identity_start.elapsed().as_millis(),
         Instant::now().as_millis(),
     );
-    encode_catalog_header(count, &mut header);
+    proto::catalog::encode_catalog_header_owing(count, assigned.unresolved > 0, &mut header);
     file.seek_from_start(0).map_err(|_| ())?;
     file.write(&header).map_err(|_| ())?;
     Ok(count)
@@ -887,6 +901,36 @@ where
         return Err(CatalogFault::Invalid);
     }
     f(&file, count)
+}
+
+/// Whether the committed catalog asks for another reconciliation pass.
+///
+/// Cheap on purpose: the header alone, read on the path that would
+/// otherwise serve the shelf without scanning.
+fn catalog_owes_a_pass<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(cache_root) = root.open_dir(CATALOG_ROOT_DIR) else {
+        return false;
+    };
+    let Ok(file) = cache_root.open_file_in_dir(CATALOG_FILE, Mode::ReadOnly) else {
+        return false;
+    };
+    let mut header = [0u8; CATALOG_HEADER_BYTES];
+    if read_exact_file(&file, &mut header).is_err() {
+        return false;
+    }
+    proto::catalog::catalog_header_owes_reconciliation(&header)
 }
 
 /// Load the list window `[start, start+LIBRARY_WINDOW)` from the card into the

@@ -2409,17 +2409,78 @@ fn a_file_left_unread_leaves_the_copy_it_could_be_unsettled() {
     );
     assert!(assigned.unresolved >= 1, "and the copy waits: {assigned:?}");
     assert_eq!(
-        assigned.minted, 16,
-        "the files that were read are copies in their own right"
+        assigned.minted, 15,
+        "the files proved to be other books are copies in their own right"
     );
     assert_eq!(
         ids[16], None,
-        "and the one that was not waits, unadopted, for a scan that reads it"
+        "the file that was not read waits, unadopted, for a scan that reads it"
+    );
+    assert_eq!(
+        ids[0], None,
+        "and so does the one that did match, since either could be the copy"
     );
     assert!(!ids.contains(&Some(id)));
     let live = ledger::open(&root).unwrap().unwrap();
     let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
     assert_eq!(copy.misses, 1, "still missing, still waiting");
+
+    // The next scan reads both and finds what the first could not: two
+    // files hold the copy's bytes, so neither takes its id and both are
+    // adopted in their own right.
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 0, "still two of them: {assigned:?}");
+    assert!(assigned.ambiguous >= 1);
+    assert_eq!(assigned.minted, 2, "and both are adopted now");
+    assert!(ids[0].is_some());
+    assert!(ids[16].is_some());
+    assert!(!ids.contains(&Some(id)));
+}
+
+/// A file the card would not read comes before the copy's own file in the
+/// listing. The copy is left waiting, and so is every file that could still
+/// be it: adopting the one further down the listing would spend the right
+/// answer on the strength of a read that failed.
+#[test]
+fn a_file_unread_early_does_not_spend_the_copy_further_down() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    // The copy is renamed, and the listing puts a file the card will not
+    // give up ahead of it.
+    rename_on_shelf(&root, BOOK, "Moved.epub");
+    let rows = [
+        (BookRoot::Library, "Unread.epub", size),
+        (BookRoot::Library, "Moved.epub", size),
+    ];
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 0, "one file went unread: {assigned:?}");
+    assert!(assigned.unresolved >= 1);
+    assert_eq!(assigned.minted, 0, "and nothing was adopted on that");
+    assert_eq!(ids, vec![None, None], "both files wait");
+    let _ = found_again();
+
+    // The card gives that file up on the next scan, and it turns out to be
+    // another book, which leaves one file the copy can be.
+    sideload(&books, "Unread.epub", &body(9, size as usize));
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 1, "the copy is found: {assigned:?}");
+    assert_eq!(assigned.minted, 1, "and the stranger is adopted");
+    assert_eq!(ids[1], Some(id), "under the id it always had");
+    assert_ne!(ids[0], Some(id));
+    assert_eq!(
+        found_again(),
+        vec![(id, BOOK.to_owned(), "Moved.epub".to_owned())],
+    );
 }
 
 /// A file the budget could not reach is not adopted, so the next scan can

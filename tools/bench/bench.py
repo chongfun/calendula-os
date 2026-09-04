@@ -1206,12 +1206,13 @@ def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, 
 # `miss` is deliberately the narrowest of the five: the firmware used to
 # reduce the whole read to a bool inside the SD session, so a refused read, a
 # failed seek and a torn file all surfaced as that benign one.
-CATALOG_LOAD_RESULTS = {"hit", "miss", "stale", "invalid", "error", "reclaimed"}
+CATALOG_LOAD_RESULTS = {"hit", "miss", "stale", "invalid", "error", "reclaimed", "owed"}
 
-# The results that mean something went wrong. `miss`, `stale` and `reclaimed`
-# do not: a catalog not built yet, one the firmware has outgrown, and one
-# retired because recovery deleted a file it might name — all three answered
-# by the same scan.
+# The results that mean something went wrong. `miss`, `stale`, `reclaimed`
+# and `owed` do not: a catalog not built yet, one the firmware has outgrown,
+# one retired because recovery deleted a file it might name, and one whose
+# scan left a file for another pass to read — all four answered by the same
+# scan.
 CATALOG_LOAD_FAULTS = {"invalid", "error"}
 
 # How the report names each one, so a miss does not read as a fault.
@@ -1221,6 +1222,7 @@ CATALOG_LOAD_REASONS = {
     "invalid": "found an unusable snapshot",
     "error": "card error",
     "reclaimed": "retired after an interrupted upload was reclaimed (rebuilt by the scan)",
+    "owed": "asked for another reconciliation pass (run by the scan)",
     "not loaded": "did not load (older firmware: reason not recorded)",
 }
 

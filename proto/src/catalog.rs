@@ -154,10 +154,32 @@ pub fn catalog_count(books: usize) -> Option<u16> {
 }
 
 pub fn encode_catalog_header(count: u16, out: &mut [u8; CATALOG_HEADER_BYTES]) {
+    encode_catalog_header_owing(count, false, out);
+}
+
+/// The header, saying whether the scan that wrote it left a question open.
+///
+/// A scan can leave a file unadopted, waiting to be read by a scan with the
+/// budget for it, and a committed catalog is otherwise a reason not to scan
+/// again. So the catalog itself carries the fact that another pass is owed,
+/// in a byte every writer before this one left zero.
+pub fn encode_catalog_header_owing(
+    count: u16,
+    reconciliation_owed: bool,
+    out: &mut [u8; CATALOG_HEADER_BYTES],
+) {
     out.fill(0);
     out[..4].copy_from_slice(CATALOG_MAGIC);
     out[4] = CATALOG_VERSION;
     out[5..7].copy_from_slice(&count.to_le_bytes());
+    out[7] = u8::from(reconciliation_owed);
+}
+
+/// Whether the scan that wrote this header left a file for another pass to
+/// ask about. False for anything that is not a header this build reads,
+/// since the answer then is to scan anyway.
+pub fn catalog_header_owes_reconciliation(header: &[u8; CATALOG_HEADER_BYTES]) -> bool {
+    classify_catalog_header(header).is_ok() && header[7] == 1
 }
 
 /// A deliberately invalid header, written first and left in place while
