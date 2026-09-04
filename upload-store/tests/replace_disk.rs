@@ -1830,3 +1830,63 @@ fn two_identical_copies_are_two_ids_with_state_of_their_own() {
     );
     assert_eq!(record_count(&root), 3);
 }
+
+/// Deleting a book on a computer and uploading it again is an ordinary
+/// thing to do, and it used to leave the ledger with two ids for one file:
+/// the record of the copy that was deleted still named the place, and the
+/// install, finding nothing there to replace, adopted the new copy under a
+/// fresh id at the same place. Both were live, so the scan's join picked
+/// between them by ledger order, and the id the install had published lost
+/// to the one it had never heard of. Publishing a record now takes the
+/// place with it.
+#[test]
+fn a_book_deleted_and_uploaded_again_is_one_copy_under_the_id_the_install_gave_it() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    sideload(&books, BOOK, &bytes);
+    let (_, ids) = scan(&root, &[(BookRoot::Library, BOOK, size)]).unwrap();
+    let adopted = ids[0].unwrap();
+
+    // The book goes away on a computer, and the next scan ages its record.
+    remove_from_shelf(&root, BOOK);
+    let (assigned, _) = scan(&root, &[]).unwrap();
+    assert_eq!(assigned.missing, 1);
+
+    // The reader uploads the same book again, to the same name.
+    let mut later = words();
+    for _ in 0..4 {
+        later();
+    }
+    upload_minting(&root, &books, BOOK, &bytes, &mut later)
+        .unwrap()
+        .expect("lands");
+    let (installed, installed_size, source) = record_for(&root, BOOK).expect("adopted");
+    assert_ne!(installed, adopted, "nothing established continuity");
+    assert_eq!(installed_size, size);
+    assert!(digest_agrees(source, &bytes));
+    assert_eq!(
+        record_count(&root),
+        1,
+        "the deleted copy's claim on the place went with it"
+    );
+    let live = ledger::open(&root).unwrap().unwrap();
+    assert_eq!(
+        ledger::find_by_id(&root, &live, adopted).unwrap(),
+        None,
+        "and its id names nothing rather than the new copy's file"
+    );
+
+    // So the scan reads the file as the copy the install said it was.
+    let (assigned, ids) = scan(&root, &[(BookRoot::Library, BOOK, size)]).unwrap();
+    assert_eq!(
+        assigned,
+        Assignment {
+            matched: 1,
+            ..Assignment::default()
+        }
+    );
+    assert_eq!(ids, vec![Some(installed)]);
+}

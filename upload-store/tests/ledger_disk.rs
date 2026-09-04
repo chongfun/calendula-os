@@ -1539,11 +1539,16 @@ fn a_missing_copy_is_retained_for_a_bounded_number_of_scans() {
     );
 }
 
-/// Two live records naming one place is a ledger this writer did not
-/// produce. The first in ledger order wins, every time, and the caller is
-/// told.
+/// Two live records naming one place is a ledger this writer does not
+/// produce: one file sits at a place, and the copy there has one id. The
+/// first in ledger order takes the row, every time, and the caller is told;
+/// the record that lost is not treated as naming anything, so it ages out
+/// like any other record whose place is not there and the ledger comes back
+/// to one id per copy on its own. Carrying both as live was the earlier
+/// behaviour, and it left two ids answering for one file for ever, which is
+/// two owners for whatever state hangs from an id.
 #[test]
-fn a_place_named_twice_takes_the_first_record_and_reports_it() {
+fn a_place_named_twice_takes_the_first_record_and_ages_out_the_other() {
     let disk = new_card();
     let mgr = open_mgr(&disk);
     let root = open_root(&mgr);
@@ -1570,23 +1575,42 @@ fn a_place_named_twice_takes_the_first_record_and_reports_it() {
     )
     .unwrap();
 
-    let (assigned, ids) = scan(&root, &[row], ARENA, &mut entropy(), || {}).unwrap();
+    let mut random = entropy();
+    let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
     assert_eq!(
         assigned,
         Assignment {
             matched: 1,
             duplicates: 1,
+            missing: 1,
             ..Assignment::default()
         }
     );
     assert_eq!(ids, vec![Some(first)]);
-    // Both records named a live row, so both are carried, and nothing is
-    // written for a card that has not changed.
-    let settled = generation(&root);
-    let (assigned, _) = scan(&root, &[row], ARENA, &mut entropy(), || {}).unwrap();
-    assert_eq!(assigned.duplicates, 1);
-    assert_eq!(generation(&root), settled);
+    assert_eq!(records(&root).len(), 2, "the other is a scan older");
+
+    // Every scan reads it the same way and ages the shadowed record once
+    // more, until the retention window runs out.
+    for _ in 1..MISSING_SCANS_RETAINED {
+        let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
+        assert_eq!(assigned.duplicates, 1);
+        assert_eq!(ids, vec![Some(first)], "the row's id stays where it was");
+    }
     assert_eq!(records(&root).len(), 2);
+
+    let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
+    assert_eq!(assigned.retired, 1, "the last scan it is carried for");
+    assert_eq!(assigned.duplicates, 1, "read once more on its way out");
+    assert_eq!(ids, vec![Some(first)]);
+    assert_eq!(ids_of(&records(&root)), vec![first], "one copy, one id");
+
+    // And the card settles: nothing shadows the row, and nothing is written
+    // for a card that has not changed.
+    let settled = generation(&root);
+    let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
+    assert_eq!(assigned.duplicates, 0);
+    assert_eq!(ids, vec![Some(first)]);
+    assert_eq!(generation(&root), settled);
 }
 
 /// An id is what per-copy state hangs from, so the ledger has to answer the

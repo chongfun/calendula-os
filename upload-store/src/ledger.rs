@@ -601,6 +601,10 @@ where
 /// it. It is a whole generation rewrite, which is what every change to the
 /// ledger is, and is committed before this returns.
 ///
+/// The place published belongs to this record afterwards: any other record
+/// naming it is dropped, since one file sits at a place and the caller has
+/// just proved which copy that is.
+///
 /// A generation with no room for one more record can make it only by letting
 /// `evict` go, a record the caller chose and verified against the card;
 /// nothing here decides which copy is disposable. A full ledger with no
@@ -649,6 +653,16 @@ where
             } else if entry.id == record.id {
                 replaced.set(true);
                 Carry::Replace(published)
+            } else if entry.root == record.root && entry.locator == record.locator {
+                // Another id claiming the place this copy has just been
+                // proved to hold. One file sits at a place, so the claim is
+                // contradicted by the proof: a book deleted on a computer
+                // and uploaded again lands under a fresh id at the name its
+                // predecessor's record still names, and carrying both would
+                // leave two ids answering for one file for ever, with the
+                // scan's join picking between them by ledger order rather
+                // than by evidence.
+                Carry::Drop
             } else {
                 Carry::Keep(Kept::of(entry))
             }
@@ -664,7 +678,8 @@ where
 
 /// Move the record with `id` to another place, keeping its size, digest and
 /// id. For a copy that a managed transaction respelled or moved. A ledger
-/// with no such record is left as it is.
+/// with no such record is left as it is, and any other record naming the
+/// place moved to is dropped, as in [`publish_record`].
 pub fn relocate_record<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     ledger: Ledger,
@@ -695,6 +710,11 @@ where
                     misses: 0,
                     ..*entry
                 })
+            } else if entry.root == at && entry.locator == locator {
+                // The place this copy is moving to, claimed by another id.
+                // One file sits at a place, and the caller has just seen
+                // which copy that is; see [`publish_record`].
+                Carry::Drop
             } else {
                 Carry::Keep(Kept::of(entry))
             }
@@ -809,11 +829,19 @@ where
                     {
                         continue;
                     }
-                    names_a_row = true;
                     if catalog_record_book_id(&record).is_some() {
+                        // Another record has already taken this row: two ids
+                        // for one place, which this writer cannot produce
+                        // and one file cannot answer to. The first in ledger
+                        // order keeps the row, deterministically, and this
+                        // one is not counted as naming anything, so it ages
+                        // out like any other record whose place is not
+                        // there and the ledger comes back to one id per
+                        // copy on its own.
                         assigned.duplicates = assigned.duplicates.saturating_add(1);
                         continue;
                     }
+                    names_a_row = true;
                     write_row_id(catalog, row as usize, entry.id)?;
                     assigned.matched += 1;
                 }

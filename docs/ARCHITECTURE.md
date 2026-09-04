@@ -813,6 +813,17 @@ ledger record and reads the ledger once per 2,730 rows, so a rebuild costs
 one sequential pass over the ledger plus one row read and one 16-byte write
 per matched row, rather than a file open per book.
 
+A place has one file, so the copy at it has one id: publishing a record for
+a place, or moving one to it, drops any other record naming it, since the
+caller has just proved which copy is there. Without that, a book deleted on
+a computer and uploaded again left the deleted copy's record naming the name
+the upload had just taken, and both records stayed live for ever, with the
+scan choosing between them by ledger order rather than by evidence. A ledger
+that arrives with a place named twice anyway, which this writer does not
+produce, gives the row to the first record in ledger order and stops
+treating the other as naming anything, so it ages out on the ordinary
+retention schedule and the ledger comes back to one id per copy on its own.
+
 Positions and caches still key by place, and the mapping they will move onto
 is what exists now: a place resolves to the id that owns it
 (`upload_store::ledger::find_record`), an id resolves to wherever that copy
