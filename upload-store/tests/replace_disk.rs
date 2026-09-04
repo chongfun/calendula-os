@@ -2676,3 +2676,73 @@ fn sweep_claim(root: &Dir<'_>, at: BookRoot, locator: &str, byte_size: u32) {
     book.delete_entry_in_dir(proto::cache::CACHE_CLAIM_FILE)
         .expect("sweep the claim away");
 }
+
+/// What a copy is, for a book the library adopted without reading it, is
+/// the bytes seen at its own place while that place looked unchanged.
+///
+/// A computer can put a different book of exactly the same length at that
+/// name, which the scan's cheap filter cannot see and no later reading can
+/// undo: nothing on the card ever said what the first book's bytes were.
+/// So the copy takes the bytes that were read there, and a move carries its
+/// id and its reading place to wherever those bytes go. The alternative is
+/// reading every book as the scan adopts it, which is hours on a full card
+/// for a move that may never happen.
+///
+/// What this costs is bounded by what the cache already does: a same-sized
+/// replacement at a stable name reopens the old book's cache and resumes
+/// its place today, before any of this. The rule makes that durable across
+/// a later rename rather than inventing it.
+#[test]
+fn a_copy_nobody_read_takes_the_bytes_seen_at_its_own_place() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let first = body(1, 3_000);
+    let size = first.len() as u32;
+    sideload(&books, BOOK, &first);
+    let mut random = words();
+    let (_, ids) = scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+    let id = ids[0].unwrap();
+    assert_eq!(
+        record_for(&root, BOOK).and_then(|(_, _, source)| source),
+        None,
+        "adopted without reading it"
+    );
+
+    // A computer puts another book of the same length at that name. The
+    // scan matches by root, locator and size, so the copy keeps its id.
+    let second = body(2, 3_000);
+    assert_eq!(second.len() as u32, size);
+    overwrite_shelf(&root, BOOK, &second);
+    let (assigned, ids) =
+        scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).expect("scan");
+    assert_eq!(assigned.matched, 1, "the cheap filter cannot see the swap");
+    assert_eq!(ids[0], Some(id));
+
+    // The reader opens what is there, so what is there becomes what this
+    // copy is.
+    note_open(&root, BookRoot::Library, BOOK, &second);
+
+    // And a rename carries the copy, its id and its place, to the bytes it
+    // is now known by.
+    rename_on_shelf(&root, BOOK, "Elsewhere.epub");
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, "Elsewhere.epub", size)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(assigned.repaired, 1, "found again: {assigned:?}");
+    assert_eq!(ids[0], Some(id));
+    let live = ledger::open(&root).unwrap().unwrap();
+    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
+    assert_eq!(copy.locator(), Some("Elsewhere.epub"));
+    assert!(
+        digest_agrees(copy.source, &second),
+        "under the bytes it was read as"
+    );
+    assert_eq!(
+        found_again(),
+        vec![(id, BOOK.to_owned(), "Elsewhere.epub".to_owned())],
+    );
+}

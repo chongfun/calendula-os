@@ -784,7 +784,12 @@ where
             Ok(false) => {}
             // A place that could not be carried is a place lost, not a scan
             // that failed: the copy has its id back either way, and the
-            // book opens at its beginning rather than not at all.
+            // book opens at its beginning rather than not at all. The one
+            // case this bridge does not cover, and deliberately: failing
+            // the scan would let a card that cannot write a cache stop the
+            // library being rebuilt. It goes when positions hang from the
+            // id and a repaired locator keeps the place with nothing to
+            // copy.
             Err(_) => {
                 esp_println::println!("sd: could not carry a reading place to '{}'", found.now.1)
             }

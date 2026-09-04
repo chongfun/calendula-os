@@ -875,6 +875,21 @@ a copy is, an ordinary tidy-up cannot make it forget. Without that, two
 identical copies could lose one of their two claims and leave the other
 looking like the only book those bytes could belong to.
 
+So what a copy *is*, for a book the library adopted without reading, is the
+bytes seen at its own place while that place looked unchanged. A computer
+can put a different book of exactly the same length at that name, which the
+join's cheap filter cannot see and no later reading can undo, since nothing
+on the card ever said what the first book's bytes were. The copy then takes
+the bytes that were read there, and a move carries its id and its reading
+place to wherever those bytes go. That is a deliberate rule rather than an
+oversight: the alternative is reading every book as the scan adopts it,
+which is hours on a full card for a move that may never happen, and the
+cost is bounded by what the caches already do, since a same-sized
+replacement at a stable name reopens the old book's cache and resumes its
+place today. The rule makes that durable across a later rename rather than
+inventing it. A copy that arrived as an upload is not in this position: its
+bytes were read as it landed.
+
 A copy nothing recorded the bytes of is left missing while the file that
 appeared is adopted in its own right. Ambiguity is left alone from either
 side: two missing copies of the same bytes, or one missing copy and two
@@ -905,7 +920,11 @@ firmware carries the position from the old directory to the new one,
 reading the destination once more to say what it is vouching for. Reporting
 before the write costs a reset nothing: the record is still missing and the
 row still unadopted, so the next scan finds the same move and carries the
-same place again.
+same place again. A card that refuses the carry itself is the one case this
+bridge does not cover: the copy keeps its id and loses its place, rather
+than the scan failing over a cache write. The bridge goes when positions
+hang from the id, at which point a repaired locator keeps the place with
+nothing to copy.
 
 Positions and caches still key by place, and the mapping they will move onto
 is what exists now: a place resolves to the id that owns it

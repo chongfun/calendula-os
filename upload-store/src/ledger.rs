@@ -884,6 +884,18 @@ pub struct FoundAgain<'a> {
 ///
 /// Anything unreadable, foreign, or silent is no evidence rather than an
 /// error: the copy simply is not one this scan can match.
+///
+/// What this makes a copy is the bytes seen at its own place while that
+/// place looked unchanged, which is a deliberate rule and not quite the
+/// same as the bytes it was adopted with. A computer can put a different
+/// book of the same length at that name between two scans, which the
+/// join's cheap filter cannot see and no later reading can undo, since
+/// nothing on the card ever said what the first book's bytes were. The
+/// copy then takes what was read there, and moves with it. The alternative
+/// is reading every book as the scan adopts it, hours on a full card for a
+/// move that may never happen, and the caches already resume the old
+/// book's place at a same-sized replacement, so the rule makes that
+/// durable rather than inventing it.
 fn claim_digest<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     at: BookRoot,
