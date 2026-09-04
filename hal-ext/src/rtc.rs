@@ -42,6 +42,31 @@ pub fn enter_deep_sleep_button(rtc: &mut Rtc<'_>, wake_pin: &mut dyn RtcPinWithR
     rtc.sleep_deep(&[&wakeup])
 }
 
+/// Deep sleep that wakes on the button **or** an RTC timer, for the bench
+/// scenarios that have to sleep and come back with nobody present.
+///
+/// A sleeping device cannot be told to wake: the radio is down, the USB
+/// device is gone, and the only host-side control left is a reset, which is
+/// a reboot rather than a wake and so proves nothing about the wake path.
+/// Arming the timer beside the button lets `sleep-sync` and `reader-soak`
+/// run themselves.
+///
+/// Deliberately not on the shipped path, and behind `bench-selftest`
+/// rather than an option: a reader that wakes itself on a timer would spend
+/// the battery this firmware is careful with.
+#[cfg(feature = "bench-selftest")]
+pub fn enter_deep_sleep_button_or_timer(
+    rtc: &mut Rtc<'_>,
+    wake_pin: &mut dyn RtcPinWithResistors,
+    after: Duration,
+) -> ! {
+    let mut wake_pins: [(&mut dyn RtcPinWithResistors, WakeupLevel); 1] =
+        [(wake_pin, WakeupLevel::Low)];
+    let rtcio = RtcioWakeupSource::new(&mut wake_pins);
+    let timer = TimerWakeupSource::new(after);
+    rtc.sleep_deep(&[&rtcio, &timer])
+}
+
 /// Light sleep with a short RTC timer wake. Keeps DRAM context, used during
 /// Wi-Fi sync windows.
 pub fn enter_light_sleep_timer(mut rtc: Rtc, duration: Duration) {

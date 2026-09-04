@@ -145,6 +145,49 @@ const NAV_ATTEMPTS: u32 = 12;
 /// the operator-driven runs have used.
 const TURNS: u32 = 50;
 
+/// Open, read, back out, open again. Two is the smallest number that shows
+/// both a first open and a repeat one in the same capture, which is what
+/// `storage-cache --cold --warm` checks for; three leaves margin if the
+/// first open was already warm from a previous run.
+const STORAGE_CYCLES: u32 = 3;
+
+/// Turns per storage cycle. Enough to cross a section boundary on a normal
+/// book, since the extend is half of what this suite exists to time.
+const STORAGE_TURNS_PER_CYCLE: u32 = 12;
+
+/// Rows to enter and leave. Matches the suite's own default of 20 entries.
+const FOLDER_ENTRIES: u32 = 20;
+
+/// Cursor steps before each entry, so the walk crosses page boundaries
+/// rather than entering the same row twenty times.
+const FOLDER_SCROLL_STEPS: u32 = 3;
+
+/// Turns per soak pass, on each side of the chapter jump.
+const SOAK_TURNS: u32 = 10;
+
+/// Turns before a sleep. The suite's own words are "several fast page
+/// turns", and the sleep is the part under test.
+const SLEEP_TURNS: u32 = 6;
+
+/// How long to give the sleep transition before deciding it was refused.
+/// The panel has a sleep image to draw and progress to write first, and the
+/// whole entry measured about 4.1 s.
+const SLEEP_SETTLE_MS: u64 = 15_000;
+
+/// Sleep requests before giving up. The app refuses one while it is holding
+/// storage work, and says so, so a retry costs a wait and answers it.
+const SLEEP_ATTEMPTS: u32 = 3;
+
+/// How long the RTC timer waits before waking a sleeping device.
+///
+/// Long enough that the sleep is a real one the capture can see, short
+/// enough that a ten-cycle suite finishes. Deep sleep is terminal, so this
+/// is a reboot interval rather than a nap.
+///
+/// `core::time::Duration`, which is what the RTC wake source takes;
+/// everything else in this module is on embassy's clock.
+pub const SLEEP_WAKE_AFTER: core::time::Duration = core::time::Duration::from_secs(20);
+
 /// The key the scenario turns pages with.
 ///
 /// `Next`, not `PageNext`, though the reducer treats them alike in Reading.
@@ -278,37 +321,28 @@ async fn reach_reading() -> bool {
     false
 }
 
-/// The page-turn suite, driven from the device.
+/// Back out to Library, whichever view the scenario is standing in.
 ///
-/// Waits out the boot paint, navigates to Reading, then turns pages one
-/// settled render at a time. Every timing line bench.py reads is emitted by
-/// the paths this drives, so the report, the trust gating and `--strict`
-/// all work on the result unchanged.
-#[embassy_executor::task]
-pub async fn page_turn() {
-    Timer::after(Duration::from_millis(BOOT_QUIET_MS)).await;
-    bench_log!(
-        "bench-selftest: scenario=page-turn turns={} view={}",
-        TURNS,
-        view_name(current_view())
-    );
-
-    if !reach_reading().await {
-        bench_log!("bench-selftest: scenario=page-turn result=nav-failed");
-        return;
+/// Back is the one key every view answers, and Home's Back is Files, so
+/// repeating it reaches the shelf from anywhere. Bounded, because a view
+/// that answers Back with itself would otherwise spin.
+async fn back_to_library() -> bool {
+    for _ in 0..NAV_ATTEMPTS {
+        if current_view() == Some(AppView::Library) {
+            return true;
+        }
+        if !press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+            return false;
+        }
     }
-    // The open that got here may still be building. Let it finish rather
-    // than timing page turns that are queued behind build slices.
-    if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
-        bench_log!(
-            "bench-selftest: still painting after {} ms, turning anyway",
-            QUIET_BUDGET_MS
-        );
-    }
-    bench_log!("bench-selftest: reached reading, turning {} pages", TURNS);
+    false
+}
 
-    let mut turned = 0u32;
-    for turn in 0..TURNS {
+/// Turn `count` pages, one settled render at a time. Returns how many
+/// landed, so a caller can report a short run rather than hide it.
+async fn turn_pages(count: u32) -> u32 {
+    let mut turned = 0;
+    for turn in 0..count {
         // The idle leash is 10 minutes in Reading and every press pushes it
         // out, so a settled cadence cannot sleep the device. This covers the
         // one gap: a single open or turn that runs long enough to matter.
@@ -323,10 +357,248 @@ pub async fn page_turn() {
         }
         turned += 1;
     }
+    turned
+}
 
+/// Open a book and let whatever it started finish.
+async fn open_and_quiesce() -> bool {
+    if !reach_reading().await {
+        return false;
+    }
+    // The open may still be building. B4 publishes at the first page and
+    // finishes in slices, and pressing into that stream collects coalesced
+    // presses the run did not need.
+    if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+        bench_log!(
+            "bench-selftest: still painting after {} ms, continuing anyway",
+            QUIET_BUDGET_MS
+        );
+    }
+    true
+}
+
+/// Ask for sleep, and say whether the app took it.
+///
+/// The app refuses a Power press while it is holding storage work and says
+/// so on the wire; the retry is for that. Waking is a fresh boot, so on
+/// success this call does not come back and the scenario resumes from the
+/// top on the other side.
+async fn request_sleep() -> bool {
+    for attempt in 0..SLEEP_ATTEMPTS {
+        press(Button::Power).await;
+        // Nothing settles for a sleep, so this waits on the transition
+        // rather than a render: the panel has its sleep image to draw and
+        // progress to write before the SoC goes down.
+        Timer::after(Duration::from_millis(SLEEP_SETTLE_MS)).await;
+        bench_log!("bench-selftest: sleep request {} did not take", attempt);
+    }
+    false
+}
+
+/// `page-turn`: the suite the operator cadence has cost the most.
+async fn scenario_page_turn() {
+    if !open_and_quiesce().await {
+        bench_log!("bench-selftest: scenario=page-turn result=nav-failed");
+        return;
+    }
+    bench_log!("bench-selftest: reached reading, turning {} pages", TURNS);
+    let turned = turn_pages(TURNS).await;
     bench_log!(
         "bench-selftest: scenario=page-turn result=done turns={} of {}",
         turned,
         TURNS
     );
+}
+
+/// `storage-cache`: cold and warm opens, section extends, progress writes.
+///
+/// The shape puts both modes in one capture. The first open
+/// is whatever the card offers, cold if its cache has to be built. Backing
+/// out to Library and opening again is served from the built cache or the
+/// RAM window, which is the warm evidence `--warm` checks for. Page turns
+/// in between produce the progress writes and, at a section boundary, the
+/// extends.
+async fn scenario_storage_cache() {
+    let mut opens = 0u32;
+    for cycle in 0..STORAGE_CYCLES {
+        if !open_and_quiesce().await {
+            bench_log!(
+                "bench-selftest: scenario=storage-cache result=nav-failed cycle={}",
+                cycle
+            );
+            break;
+        }
+        opens += 1;
+        let turned = turn_pages(STORAGE_TURNS_PER_CYCLE).await;
+        bench_log!("bench-selftest: storage cycle={} turns={}", cycle, turned);
+        if !back_to_library().await {
+            bench_log!(
+                "bench-selftest: could not reach library after cycle {}",
+                cycle
+            );
+            break;
+        }
+    }
+    bench_log!(
+        "bench-selftest: scenario=storage-cache result=done opens={} of {}",
+        opens,
+        STORAGE_CYCLES
+    );
+}
+
+/// `folder-nav`: entering and leaving rows, and paging the list.
+///
+/// A row is a book or a folder and the scenario cannot tell which before
+/// pressing, so it presses and then reads where it landed: Reading means a
+/// book, and still Library means a folder was entered. Both are backed out
+/// of, so the walk keeps moving instead of settling into one book. The
+/// `Next` presses before each Confirm are what carries the cursor over a
+/// page boundary, which is the other half of what this suite times.
+async fn scenario_folder_nav() {
+    if !back_to_library().await {
+        bench_log!("bench-selftest: scenario=folder-nav result=no-library");
+        return;
+    }
+    let mut entered = 0u32;
+    let mut books = 0u32;
+    for entry in 0..FOLDER_ENTRIES {
+        for _ in 0..FOLDER_SCROLL_STEPS {
+            if !press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await {
+                bench_log!("bench-selftest: scroll stalled at entry {}", entry);
+                break;
+            }
+        }
+        // An open wears the open ceiling: the row may be a book with a cache
+        // to build.
+        if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
+            bench_log!("bench-selftest: entry {} did not settle", entry);
+            break;
+        }
+        match current_view() {
+            Some(AppView::Reading) => books += 1,
+            Some(AppView::Library) => entered += 1,
+            _ => {}
+        }
+        if !back_to_library().await {
+            bench_log!("bench-selftest: lost the library at entry {}", entry);
+            break;
+        }
+    }
+    bench_log!(
+        "bench-selftest: scenario=folder-nav result=done folders={} books={} of {}",
+        entered,
+        books,
+        FOLDER_ENTRIES
+    );
+}
+
+/// `reader-soak`: the whole reading workflow, including a sleep and a wake.
+///
+/// One pass per boot. Deep sleep is terminal, so the wake at the end is a
+/// fresh boot that runs this again, and the capture accumulates cycles
+/// across reboots the way an operator's session does. `--strict` wants a
+/// completed sleep with a wake later in the same run, which is exactly the
+/// shape this produces.
+async fn scenario_reader_soak() {
+    if !open_and_quiesce().await {
+        bench_log!("bench-selftest: scenario=reader-soak result=nav-failed");
+        return;
+    }
+    let turned = turn_pages(SOAK_TURNS).await;
+
+    // Chapter jump: Confirm opens the list, a step moves the cursor off the
+    // current chapter, Confirm takes it. This is the navigation a page-turn
+    // run never exercises.
+    let mut jumped = false;
+    if press_and_settle(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
+        && current_view() == Some(AppView::Chapters)
+        && press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await
+    {
+        jumped = press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await;
+    }
+
+    // Home and Library returns, then back into the book.
+    let returned = back_to_library().await && open_and_quiesce().await;
+    let turned_after = if returned {
+        turn_pages(SOAK_TURNS).await
+    } else {
+        0
+    };
+
+    bench_log!(
+        "bench-selftest: scenario=reader-soak turns={}+{} jumped={} returned={}",
+        turned,
+        turned_after,
+        jumped,
+        returned
+    );
+
+    // Last, because it does not return.
+    request_sleep().await;
+    bench_log!("bench-selftest: scenario=reader-soak result=sleep-refused");
+}
+
+/// `sleep-sync`: fast turns, then sleep, then wake and repeat.
+///
+/// One cycle per boot, for the same reason `reader-soak` is: the timer wake
+/// reboots the chip and this runs again. bench.py counts `sleep_complete`
+/// until it has the cycles it asked for.
+async fn scenario_sleep_sync() {
+    if !open_and_quiesce().await {
+        bench_log!("bench-selftest: scenario=sleep-sync result=nav-failed");
+        return;
+    }
+    let turned = turn_pages(SLEEP_TURNS).await;
+    bench_log!(
+        "bench-selftest: scenario=sleep-sync turns={}, sleeping",
+        turned
+    );
+    request_sleep().await;
+    bench_log!("bench-selftest: scenario=sleep-sync result=sleep-refused");
+}
+
+/// Which scenario this build runs, from `BENCH_SCENARIO` at compile time.
+///
+/// Compile time and not run time because there is nothing to ask: the radio
+/// is off by design (see the module header) and the firmware reads no
+/// serial. Every scenario is compiled into every bench build, so the choice
+/// costs a rebuild and a flash rather than a code path that only some builds
+/// type-check. `fw/build.rs` reruns on the variable, so changing it actually
+/// changes the image.
+fn scenario_name() -> &'static str {
+    option_env!("BENCH_SCENARIO").unwrap_or("page-turn")
+}
+
+/// The scenario driver.
+///
+/// Every timing line bench.py reads is emitted by the paths these drive, so
+/// the report, the trust gating and `--strict` all work on the result
+/// unchanged. Nothing here writes a new event kind.
+#[embassy_executor::task]
+pub async fn run() {
+    Timer::after(Duration::from_millis(BOOT_QUIET_MS)).await;
+    let scenario = scenario_name();
+    bench_log!(
+        "bench-selftest: scenario={} view={}",
+        scenario,
+        view_name(current_view())
+    );
+
+    match scenario {
+        "storage-cache" => scenario_storage_cache().await,
+        "folder-nav" => scenario_folder_nav().await,
+        "reader-soak" => scenario_reader_soak().await,
+        "sleep-sync" => scenario_sleep_sync().await,
+        "page-turn" => scenario_page_turn().await,
+        other => {
+            // Naming a scenario that does not exist should say so rather
+            // than quietly running the default, which would report a
+            // page-turn capture under whatever name was asked for.
+            bench_log!(
+                "bench-selftest: unknown scenario {}, doing nothing. \
+                 Valid: page-turn storage-cache folder-nav reader-soak sleep-sync",
+                other
+            );
+        }
+    }
 }

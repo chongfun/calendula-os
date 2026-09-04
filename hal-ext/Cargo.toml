@@ -6,6 +6,13 @@ edition = "2021"
 [lints]
 workspace = true
 
+[features]
+# Deep sleep that also wakes on an RTC timer, so the bench sleep suites can
+# run with nobody present. Off on every shipped build: a reader that wakes
+# itself would spend the battery this firmware is careful with.
+# See fw::bench_selftest.
+bench-selftest = []
+
 [dependencies]
 # For `display::epd::probe`, the sans-IO half of the panel-controller
 # fingerprint. This crate drives the pins; the decision rules live where the

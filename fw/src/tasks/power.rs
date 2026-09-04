@@ -126,6 +126,16 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
             PowerEvent::DisplayAsleep(acked) if acked == generation => {
                 esp_println::println!("power: deep sleep");
                 let mut button = take_wake_button().await;
+                // A bench scenario has to come back on its own: nothing can
+                // reach a sleeping device but a reset, and a reset is a
+                // reboot rather than a wake.
+                #[cfg(feature = "bench-selftest")]
+                hal_ext::rtc::enter_deep_sleep_button_or_timer(
+                    rtc,
+                    &mut button,
+                    crate::bench_selftest::SLEEP_WAKE_AFTER,
+                );
+                #[cfg(not(feature = "bench-selftest"))]
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
             PowerEvent::Activity(view) => {

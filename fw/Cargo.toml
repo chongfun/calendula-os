@@ -45,7 +45,7 @@ powercut-selftest = []
 # calibrate that offset against a hand-pressed run before quoting a number
 # from this path. Never enabled in a release build.
 # See fw::bench_selftest and docs/agents/bench.md.
-bench-selftest = []
+bench-selftest = ["hal-ext/bench-selftest"]
 # Build for the Xteink X3 (792x528 UC8253 panel, BQ27220 battery gauge).
 # Off = Xteink X4, the default. See docs/plans/2026-07-06-x3-support-plan.md.
 device-x3 = ["display/device-x3", "reader-cache/device-x3"]

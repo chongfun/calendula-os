@@ -650,6 +650,6 @@ fn main() -> ! {
         #[cfg(feature = "powercut-selftest")]
         spawner.spawn(powercut::autostart().unwrap());
         #[cfg(feature = "bench-selftest")]
-        spawner.spawn(bench_selftest::page_turn().unwrap());
+        spawner.spawn(bench_selftest::run().unwrap());
     })
 }

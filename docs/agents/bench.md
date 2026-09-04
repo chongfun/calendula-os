@@ -67,10 +67,49 @@ comparable until the calibration above is done.
 **It presses keys on every boot**, so it is a bench build and not a reading
 one. Reflash without the feature to get the device back.
 
-Only `page-turn` has a scenario today. `storage-cache`, `folder-nav` and
-`reader-soak` are the same shape of work. `sleep-sync` additionally needs a
-`TimerWakeupSource` alongside the button source, since a sleeping device
-cannot be told to wake.
+### Choosing a scenario
+
+`BENCH_SCENARIO` picks one at build time, defaulting to `page-turn`. Every
+scenario is compiled into every bench build, so the variable selects rather
+than gates, and `fw/build.rs` reruns on it so a changed value actually
+changes the image:
+
+```sh
+BENCH_SCENARIO=folder-nav tools/cargo.sh build --release -p fw \
+  --features device-x3,bench-selftest
+```
+
+Compile time and not run time because there is nothing to ask. The radio is
+off by design, and the firmware reads no serial, so a flash is the control
+channel. Naming a scenario that does not exist prints the valid list and
+does nothing, rather than quietly running the default under the wrong name.
+
+| `BENCH_SCENARIO` | What it drives | What the card needs |
+|---|---|---|
+| `page-turn` | Opens a book, turns 50 pages | The book you mean to time, reachable from the first row |
+| `storage-cache` | Three open/read/back cycles, 12 turns each | Enough pages to cross a section boundary |
+| `folder-nav` | 20 row entries, 3 cursor steps apart | **Folders.** On a flat card every row is a book, so the run reports 0 folder entries and `--strict` fails, correctly |
+| `reader-soak` | Turns, a chapter jump, Home and Library returns, then sleep | A book with chapters |
+| `sleep-sync` | Six fast turns, then sleep | Nothing particular |
+
+### The sleep suites reboot
+
+Deep sleep is terminal on this firmware: waking is a fresh boot. So
+`sleep-sync` and `reader-soak` do one cycle per boot, and the scenario runs
+again on the other side. bench.py reconnects across the re-enumeration and
+counts `sleep_complete` until it has the cycles it asked for.
+
+The wake comes from an RTC timer armed beside the button, which
+`bench-selftest` adds to `hal_ext::rtc`. It is off in every shipped build,
+and it needs to be: a reader that wakes itself would spend the battery this
+firmware is careful with.
+
+**A sleeping device cannot be reached at all.** Deep sleep powers down the
+USB Serial/JTAG peripheral, so the port disappears from the host and neither
+espflash nor bench.py can do anything until someone presses Power. A plain
+build left idle will do this on its own after 3 minutes in menus or 10 in
+Reading. Flash the bench build before walking away, or expect to press the
+button once.
 
 - Run longer hardware checks before releases or risky merges:
 

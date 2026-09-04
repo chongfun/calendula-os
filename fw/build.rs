@@ -27,6 +27,12 @@ fn prev_fb_bytes() -> usize {
 const MIN_STACK_BYTES: usize = 27 * 1024;
 
 fn main() {
+    // The bench scenario is chosen at compile time through option_env!, so
+    // cargo has to rebuild when it changes. Without this a second scenario
+    // silently reflashes the first one, which looks like a device that
+    // ignored the request.
+    println!("cargo:rerun-if-env-changed=BENCH_SCENARIO");
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let fb = prev_fb_bytes();
 
