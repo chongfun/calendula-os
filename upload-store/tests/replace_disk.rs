@@ -2435,6 +2435,51 @@ fn a_file_left_unread_leaves_the_copy_it_could_be_unsettled() {
     assert!(ids[0].is_some());
     assert!(ids[16].is_some());
     assert!(!ids.contains(&Some(id)));
+    assert!(
+        found_again().is_empty(),
+        "and no reading place was moved on the way to finding that out"
+    );
+}
+
+/// The file that could not be read turns out to hold the copy's bytes too.
+/// Nothing may have moved on the strength of the first scan's single
+/// match, because there were two all along and the scan simply could not
+/// see the second one yet.
+#[test]
+fn a_match_that_turns_out_to_be_two_moves_nothing_on_the_way() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    rename_on_shelf(&root, BOOK, "Moved.epub");
+    let rows = [
+        (BookRoot::Library, "Unread.epub", size),
+        (BookRoot::Library, "Moved.epub", size),
+    ];
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 0);
+    assert_eq!(ids, vec![None, None]);
+    assert!(found_again().is_empty(), "nothing moved");
+
+    // It holds the same book, so there are two files the copy could be.
+    sideload(&books, "Unread.epub", &bytes);
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 0, "two of them: {assigned:?}");
+    assert!(assigned.ambiguous >= 1);
+    assert_eq!(assigned.minted, 2, "both adopted in their own right");
+    assert!(!ids.contains(&Some(id)));
+    assert!(
+        found_again().is_empty(),
+        "and still nothing moved, which is the point"
+    );
 }
 
 /// A file the card would not read comes before the copy's own file in the
@@ -2467,7 +2512,10 @@ fn a_file_unread_early_does_not_spend_the_copy_further_down() {
     assert!(assigned.unresolved >= 1);
     assert_eq!(assigned.minted, 0, "and nothing was adopted on that");
     assert_eq!(ids, vec![None, None], "both files wait");
-    let _ = found_again();
+    assert!(
+        found_again().is_empty(),
+        "and nothing is told to move a reading place onto a file that may          yet turn out to be one of two"
+    );
 
     // The card gives that file up on the next scan, and it turns out to be
     // another book, which leaves one file the copy can be.
@@ -2648,4 +2696,64 @@ fn a_twin_past_the_end_of_the_table_still_refuses_the_repair() {
     assert_eq!(assigned.minted, 1, "the file is a copy in its own right");
     assert!(!ids_seen.contains(&Some(ids[0])));
     assert!(!ids_seen.contains(&Some(ids[64])));
+}
+
+/// The bytes a sideloaded copy was read under live in the claim beside its
+/// reading place, and that claim describes a place the copy has left. The
+/// sweep that tidies such a directory takes the claim with it when no
+/// reading place is filed there, so the scan that learned the bytes keeps
+/// them in the copy's own record. Otherwise the pass it asked for would
+/// come back to nothing to look with.
+#[test]
+fn what_a_claim_said_about_a_copy_is_kept_when_the_search_cannot_settle() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    sideload(&books, BOOK, &bytes);
+    let mut random = words();
+    let (_, ids) = scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+    let id = ids[0].unwrap();
+    note_open(&root, BookRoot::Library, BOOK, &bytes);
+    assert_eq!(
+        record_for(&root, BOOK).and_then(|(_, _, source)| source),
+        None,
+        "the ledger itself was told nothing"
+    );
+
+    // The copy moves, and the scan cannot settle it this time round.
+    rename_on_shelf(&root, BOOK, "Moved.epub");
+    let rows = [
+        (BookRoot::Library, "Unread.epub", size),
+        (BookRoot::Library, "Moved.epub", size),
+    ];
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 0);
+    assert_eq!(ids, vec![None, None]);
+    let live = ledger::open(&root).unwrap().unwrap();
+    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
+    assert!(
+        digest_agrees(copy.source, &bytes),
+        "the copy's record now says what its bytes were"
+    );
+
+    // So a sweep that empties the directory the claim was in costs the next
+    // scan nothing.
+    let key = cache_key_from(source_hash_at(BookRoot::Library, BOOK, size));
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).expect("open READER");
+    let cache = cache_root
+        .open_dir(proto::cache::CACHE_V2_DIR)
+        .expect("open CACHE2");
+    let book = cache.open_dir(key.as_str()).expect("open book directory");
+    book.delete_entry_in_dir(proto::cache::CACHE_CLAIM_FILE)
+        .expect("sweep the claim away");
+
+    sideload(&books, "Unread.epub", &body(9, size as usize));
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(
+        assigned.repaired, 1,
+        "the copy is still found, on what its record kept: {assigned:?}"
+    );
+    assert_eq!(ids[1], Some(id));
 }

@@ -969,6 +969,11 @@ fn move_slot_of_record(table: &[u8], slots: usize, index: u16) -> Option<usize> 
     })
 }
 
+/// The slot carrying a record, whether or not the search settled it.
+fn move_slot_carrying(table: &[u8], slots: usize, index: u16) -> Option<usize> {
+    (0..slots).find(|slot| move_u16(move_entry(table, *slot), MOVE_INDEX) == index)
+}
+
 /// Whether a slot names the one file it can be: one match, and nothing left
 /// unread that could have been another.
 fn move_settled(entry: &[u8]) -> bool {
@@ -1253,7 +1258,11 @@ where
     // reader's place under another book.
     for slot in 0..slots {
         let entry = move_entry(table, slot);
-        if entry[MOVE_MATCHES] != 1 {
+        // The same test the ledger is written by. A copy with one match and
+        // a file nobody read is not a copy that has been found: telling a
+        // caller otherwise would have it move a reading place onto a file
+        // the next scan may well refuse to give the copy's id to.
+        if !move_settled(entry) {
             continue;
         }
         let row = move_u16(entry, MOVE_ROW) as usize;
@@ -1323,8 +1332,19 @@ where
                 Some(misses) => {
                     carried_missing += 1;
                     *missing += 1;
+                    // What this copy's bytes were, when the search had to
+                    // go to the claim beside its reading place to learn it.
+                    // Kept in the record from here on: the claim describes
+                    // a place the copy has left, and the sweep that tidies
+                    // such a directory would take the only evidence a later
+                    // scan has of what to look for with it.
+                    let source = entry.source.or_else(|| {
+                        let slot = move_slot_carrying(table, slots, index)?;
+                        parse_record(&move_entry(table, slot)[MOVE_DIGEST..MOVE_ROW])
+                    });
                     Carry::Keep(Kept {
                         misses,
+                        source,
                         ..Kept::of(entry)
                     })
                 }

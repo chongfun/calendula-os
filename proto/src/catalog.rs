@@ -106,9 +106,15 @@ pub struct CatalogRecord {
     pub upload_alias: String<{ crate::storage::MAX_ALIAS_UTF8_BYTES }>,
     pub byte_size: u32,
     pub source_hash: u32,
-    /// Which library copy this row is, cached from the ledger. `None` only
-    /// in a row the scan has staged and the identity join has not reached,
-    /// which a committed catalog does not contain.
+    /// Which library copy this row is, cached from the ledger.
+    ///
+    /// `None` in two states. One is a row the scan has staged and the
+    /// identity join has not reached, which a committed catalog does not
+    /// contain. The other it does: a file the join left in question, which
+    /// a copy that went missing could still turn out to be, and which is
+    /// left unadopted rather than settled the wrong way. Such a catalog
+    /// says so in its header ([`encode_catalog_header_owing`]) and asks for
+    /// another pass, which adopts the row or gives it the copy's id.
     pub book_id: Option<BookId>,
 }
 
