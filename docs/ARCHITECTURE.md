@@ -827,13 +827,15 @@ While it lasts, that record has no place to give, and neither has the
 record of a book a computer replaced with one of another size, which is the
 ordinary way to reach the same shape: the row stops matching the old record
 and is minted an id of its own, so the old record is carried as missing at a
-name the new copy holds. Asking where either id is answers with nothing
-rather than with the other copy's file. A place belongs to the record the
-last scan matched to it, which is the record with no misses, and a place
-another id holds is not an empty place a copy can come back to. Resolving
-one copy's state against another copy's book is the merge that costs more
-than the copy. Both records stay in the ledger, to be matched by their
-bytes or aged out with everything else the card stopped holding.
+name the new copy holds. Asking where the displaced id is answers with
+nothing rather than with the other copy's file, while the id that holds the
+place answers with it. A place belongs to the record the last scan matched
+to it, which is the record with no misses, and a place another id holds is
+not an empty place a copy can come back to. Resolving one copy's state
+against another copy's book is the merge that costs more than the copy.
+Both records stay in the ledger, to be matched by their bytes or aged out
+with everything else the card stopped holding. Two records that are both
+missing keep their places, neither being the one a scan chose.
 
 Positions and caches still key by place, and the mapping they will move onto
 is what exists now: a place resolves to the id that owns it
