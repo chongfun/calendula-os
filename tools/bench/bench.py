@@ -62,6 +62,16 @@ STORAGE_OPEN_RE = re.compile(
 SELFTEST_DONE_RE = re.compile(
     r"bench-selftest: scenario=(?P<scenario>[a-z-]+) result=(?P<result>\S+)"
 )
+# A scenario reporting that it could not perform part of the workflow it
+# advertises. Separate from the terminal `result=` record on purpose: the run
+# continues, because the rest of a soak's sleep and wake is still evidence,
+# and only the terminal record stops a capture. `--strict` fails on this, so a
+# soak cannot skip its chapter navigation and still certify, which it could
+# before: every other signal that suite checks for is produced by a jumpless
+# pass.
+SELFTEST_INVALID_RE = re.compile(
+    r"bench-selftest: scenario=(?P<scenario>[a-z-]+) invalid=(?P<reason>\S+)"
+)
 
 # Printed once per boot, before esp_rtos::start, so it carries no t_ms; it
 # marks the start of a boot's time base and says how the chip woke.
@@ -737,6 +747,17 @@ def parse_line(line: str, suite: str = "unknown") -> list[dict[str, Any]]:
                 "prestage_ms": int(data["prestage"]),
                 "t_ms": int(data["t"]),
                 "legacy": True,
+            }
+        ]
+
+    match = SELFTEST_INVALID_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "selftest_invalid",
+                "scenario": match.group("scenario"),
+                "reason": match.group("reason"),
             }
         ]
 
@@ -2367,6 +2388,13 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
         event_names = {str(event.get("event")) for event in signal_events}
         if "warning" in event_names:
             warnings.append(f"{label}: warning events present")
+        for event in signal_events:
+            if event.get("event") == "selftest_invalid":
+                reason = event.get("reason", "unspecified")
+                warnings.append(
+                    f"{label}: the selftest scenario reported it could not run "
+                    f"{reason}, so this capture does not cover the whole workflow"
+                )
         if run.suite == "thermal-run" and "refresh" not in event_names:
             # Ambient investigations live on refresh timing whatever workflow
             # they ran under.

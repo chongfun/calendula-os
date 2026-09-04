@@ -306,8 +306,16 @@ async fn press(action: Button) {
     // instead. Falling back to the action when no key reaches it keeps a
     // scenario running rather than hanging on a mapping that stopped being a
     // permutation.
-    let key = app_core::physical_key_for(current_orientation(), current_front_buttons(), action)
-        .unwrap_or(action);
+    // The view is part of the mapping, not decoration: Home direct-maps the
+    // physical key column and skips the front-pair swap, so inverting both
+    // there asked for Confirm and pressed the key Home reads as Settings.
+    // An unpublished view takes the general mapping, which is right for
+    // every view but Home, and the scenarios only act at Home once they have
+    // seen it.
+    let view = current_view().unwrap_or(AppView::Library);
+    let key =
+        app_core::physical_key_for(view, current_orientation(), current_front_buttons(), action)
+            .unwrap_or(action);
     crate::tasks::input::log_injected_input(key);
     INPUT_EVENTS.send(InputEvent::button(key)).await;
 }
@@ -723,12 +731,14 @@ async fn scenario_reader_soak() {
         returned
     );
     // A soak that skipped its chapter navigation is not the workflow this
-    // suite advertises, and --strict cannot tell: it asks for input and
-    // render telemetry plus a completed sleep and a later wake, all of which
-    // a jumpless pass still produces. So say so loudly enough that a reader
-    // of the capture cannot miss it.
+    // suite advertises, and --strict cannot tell on its own: it asks for
+    // input and render telemetry plus a completed sleep and a later wake,
+    // all of which a jumpless pass still produces. So this is a shape the
+    // harness parses and fails on, not prose. `invalid=` and not `result=`
+    // deliberately: the run carries on into its sleep, because the wake half
+    // is still evidence worth having, and only `result=` ends a capture.
     if !jumped {
-        bench_log!("bench-selftest: scenario=reader-soak INVALID: chapter navigation did not run");
+        bench_log!("bench-selftest: scenario=reader-soak invalid=chapter-navigation");
     }
 
     // Last, because it does not return.
