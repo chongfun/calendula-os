@@ -823,12 +823,17 @@ that arrives with a place named twice anyway, which this writer does not
 produce, gives the row to the first record in ledger order and stops
 treating the other as naming anything, so it ages out on the ordinary
 retention schedule and the ledger comes back to one id per copy on its own.
-While it lasts, that record has no place to give: asking where its id is
-answers with nothing rather than with the file the record ahead of it owns,
-since a place another id holds is not an empty place a copy can come back
-to, and resolving one copy's state against another copy's book is the merge
-that costs more than the copy. The record stays in the ledger, to be
-matched by its bytes or aged out with the rest.
+While it lasts, that record has no place to give, and neither has the
+record of a book a computer replaced with one of another size, which is the
+ordinary way to reach the same shape: the row stops matching the old record
+and is minted an id of its own, so the old record is carried as missing at a
+name the new copy holds. Asking where either id is answers with nothing
+rather than with the other copy's file. A place belongs to the record the
+last scan matched to it, which is the record with no misses, and a place
+another id holds is not an empty place a copy can come back to. Resolving
+one copy's state against another copy's book is the merge that costs more
+than the copy. Both records stay in the ledger, to be matched by their
+bytes or aged out with everything else the card stopped holding.
 
 Positions and caches still key by place, and the mapping they will move onto
 is what exists now: a place resolves to the id that owns it

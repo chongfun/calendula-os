@@ -301,6 +301,16 @@ fn scan(
     root: &Dir<'_>,
     rows: &[Row<'_>],
 ) -> Result<(Assignment, Vec<Option<BookId>>), LedgerFault> {
+    scan_minting(root, rows, &mut words())
+}
+
+/// [`scan`], minting from `random` rather than the fixed word source: two
+/// scans of one card that both mint must not draw the same id twice.
+fn scan_minting(
+    root: &Dir<'_>,
+    rows: &[Row<'_>],
+    random: &mut impl FnMut() -> u32,
+) -> Result<(Assignment, Vec<Option<BookId>>), LedgerFault> {
     if root.open_dir(CACHE_ROOT_DIR).is_err() {
         root.make_dir_in_dir(CACHE_ROOT_DIR).expect("mkdir READER");
     }
@@ -327,14 +337,8 @@ fn scan(
     }
     let live = ledger::open(root)?;
     let mut scratch = vec![0u8; 16 * 1024];
-    let assigned = ledger::assign_book_ids(
-        root,
-        &file,
-        rows.len() as u16,
-        &mut scratch,
-        &mut words(),
-        live,
-    )?;
+    let assigned =
+        ledger::assign_book_ids(root, &file, rows.len() as u16, &mut scratch, random, live)?;
     encode_catalog_header(rows.len() as u16, &mut header);
     file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
     file.write(&header).map_err(|_| LedgerFault::Device)?;
@@ -1889,4 +1893,79 @@ fn a_book_deleted_and_uploaded_again_is_one_copy_under_the_id_the_install_gave_i
         }
     );
     assert_eq!(ids, vec![Some(installed)]);
+}
+
+/// A book replaced on a computer by one of another size is a new copy at an
+/// old name: the row no longer matches the record that named it, so the row
+/// is minted an id of its own and the old record is carried as missing, at
+/// a name the new copy now holds. What the old id must not do is answer
+/// with that name. Nothing established that the two copies are the same
+/// book, and resolving the old id's state against the new copy's file is
+/// the merge the whole model exists to prevent.
+#[test]
+fn a_copy_replaced_on_a_computer_leaves_the_old_id_with_no_place_to_give() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let old = body(1, 3_000);
+    sideload(&books, BOOK, &old);
+    // One word source across both scans, so the two mints are two ids.
+    let mut random = words();
+    let (_, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, BOOK, old.len() as u32)],
+        &mut random,
+    )
+    .unwrap();
+    let first = ids[0].unwrap();
+
+    // The card goes into a computer, which puts another book at that name.
+    let other = body(2, 4_100);
+    overwrite_shelf(&root, BOOK, &other);
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, BOOK, other.len() as u32)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(
+        assigned.minted, 1,
+        "an unexplained replacement is a new copy"
+    );
+    assert_eq!(assigned.missing, 1, "and the old record is carried a while");
+    let second = ids[0].unwrap();
+    assert_ne!(second, first);
+
+    let live = ledger::open(&root).unwrap().unwrap();
+    let new_copy = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
+    assert_eq!(new_copy.locator(), Some(BOOK), "the copy that is there");
+    assert_eq!(new_copy.misses, 0);
+    assert_eq!(new_copy.byte_size, other.len() as u32);
+
+    let old_copy = ledger::find_by_id(&root, &live, first).unwrap().unwrap();
+    assert_eq!(
+        old_copy.place, None,
+        "the name it knew is another copy's now"
+    );
+    assert_eq!(old_copy.misses, 1);
+    assert_eq!(
+        old_copy.byte_size,
+        old.len() as u32,
+        "and the record is still there to be matched by its bytes"
+    );
+
+    // The same holds however far the old record is from the new one in
+    // ledger order, which is what decides nothing here.
+    let third = body(3, 2_048);
+    upload_minting(&root, &books, "Other.epub", &third, &mut random)
+        .unwrap()
+        .expect("lands");
+    let live = ledger::open(&root).unwrap().unwrap();
+    assert_eq!(
+        ledger::find_by_id(&root, &live, first)
+            .unwrap()
+            .unwrap()
+            .place,
+        None
+    );
 }

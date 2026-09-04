@@ -342,12 +342,12 @@ pub struct LibraryCopy {
     ///
     /// `None` is a record with no place to give. Not the same thing as a
     /// place that is empty, which a missing copy has and which the copy can
-    /// come back to: it is a record whose place an earlier record holds, so
-    /// what it says about the card describes another id's file. Handing
-    /// that back is how state belonging to one copy would be resolved
-    /// against another, which is worse than losing the copy. The record
-    /// stays in the ledger to be matched by its bytes or aged out; what it
-    /// says about the card is what stops being evidence.
+    /// come back to: it is a record whose place another id holds, so what
+    /// it says about the card describes another copy's file. Handing that
+    /// back is how state belonging to one copy would be resolved against
+    /// another, which is worse than losing the copy. The record stays in
+    /// the ledger to be matched by its bytes or aged out; what it says
+    /// about the card is what stops being evidence.
     pub place: Option<(BookRoot, heapless::String<MAX_PATH_BYTES>)>,
     pub byte_size: u32,
     /// Consecutive scans that have not found it. Zero is a copy the last
@@ -374,15 +374,25 @@ impl LibraryCopy {
 /// since. A locator answers the other question, which file this is, and the
 /// two meet in the catalog row that caches both.
 ///
-/// A place is handed back only if it is this record's to give. Two records
-/// naming one place is a ledger this crate's writers do not produce, and
-/// the scan gives such a place to the first record in ledger order, so a
-/// later record naming it describes a file that answers to another id. The
-/// check runs only for a record with misses, which is the only kind that
-/// can be in that position: a record the last scan matched took its place,
-/// and publishing or moving a record drops any other naming the place it
-/// lands on, so a record that holds a place has zero misses and one that
-/// lost one cannot get back to zero while the record that took it stands.
+/// A place is handed back only if it is this record's to give. A place
+/// belongs to the record the last scan matched to it, which is the record
+/// with no misses: the scan matches a row by root, locator and size, gives
+/// the row to one record, and ages every record it did not match. So a
+/// record with misses whose place another record holds with none is a
+/// record describing a file that answers to another id, and it is told
+/// nothing rather than told that.
+///
+/// It is a place with different bytes at it that gets there, which an
+/// ordinary card edit reaches: a book replaced on a computer by one of
+/// another size is a row the old record no longer matches, so the row is
+/// minted an id of its own and the old record is carried as missing at the
+/// name the new copy now holds. Two records naming one place with one size,
+/// which this crate's writers do not produce, resolves the same way, the
+/// scan having matched exactly one of them.
+///
+/// A record with no misses is the owner of its place, so the check runs
+/// only for the others, and resolving a live copy still reads the ledger
+/// once.
 pub fn find_by_id<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     ledger: &Ledger,
@@ -392,9 +402,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut found: Option<(u16, BookRoot, heapless::String<MAX_PATH_BYTES>, u32, u8)> = None;
+    let mut found: Option<(BookRoot, heapless::String<MAX_PATH_BYTES>, u32, u8)> = None;
     let mut source = None;
-    for_each_record(root, ledger, &mut |index, record| {
+    for_each_record(root, ledger, &mut |_, record| {
         if found.is_some() || record.id != id {
             return Ok(());
         }
@@ -403,21 +413,22 @@ where
             .push_str(record.locator)
             .map_err(|_| LedgerFault::Record)?;
         source = record.source;
-        found = Some((index, record.root, locator, record.byte_size, record.misses));
+        found = Some((record.root, locator, record.byte_size, record.misses));
         Ok(())
     })?;
-    let Some((index, at, locator, byte_size, misses)) = found else {
+    let Some((at, locator, byte_size, misses)) = found else {
         return Ok(None);
     };
-    let mut shadowed = false;
-    if misses > 0 && index > 0 {
-        for_each_record(root, ledger, &mut |other, record| {
-            shadowed |= other < index && record.root == at && record.locator == locator.as_str();
+    let mut held_by_another = false;
+    if misses > 0 {
+        for_each_record(root, ledger, &mut |_, record| {
+            held_by_another |=
+                record.misses == 0 && record.root == at && record.locator == locator.as_str();
             Ok(())
         })?;
     }
     Ok(Some(LibraryCopy {
-        place: (!shadowed).then_some((at, locator)),
+        place: (!held_by_another).then_some((at, locator)),
         byte_size,
         misses,
         source,
