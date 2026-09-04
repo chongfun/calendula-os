@@ -337,15 +337,32 @@ where
 /// next read fills.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LibraryCopy {
-    pub root: BookRoot,
-    /// Where the copy sits, spelled exactly as the card spells it.
-    pub locator: heapless::String<MAX_PATH_BYTES>,
+    /// Where the copy sits: the root its locator is relative to, and the
+    /// locator spelled exactly as the card spells it.
+    ///
+    /// `None` is a record with no place to give. Not the same thing as a
+    /// place that is empty, which a missing copy has and which the copy can
+    /// come back to: it is a record whose place an earlier record holds, so
+    /// what it says about the card describes another id's file. Handing
+    /// that back is how state belonging to one copy would be resolved
+    /// against another, which is worse than losing the copy. The record
+    /// stays in the ledger to be matched by its bytes or aged out; what it
+    /// says about the card is what stops being evidence.
+    pub place: Option<(BookRoot, heapless::String<MAX_PATH_BYTES>)>,
     pub byte_size: u32,
     /// Consecutive scans that have not found it. Zero is a copy the last
     /// scan saw; anything else is a copy whose card may simply have been
     /// out, which is why a record with misses still answers here.
     pub misses: u8,
     pub source: Option<CachedSourceDigest>,
+}
+
+impl LibraryCopy {
+    /// Where the copy sits, spelled exactly as the card spells it, when the
+    /// ledger has a place to give for it.
+    pub fn locator(&self) -> Option<&str> {
+        self.place.as_ref().map(|(_, locator)| locator.as_str())
+    }
 }
 
 /// Where the copy `id` names is now, or `None` when no record carries that
@@ -356,6 +373,16 @@ pub struct LibraryCopy {
 /// asking which file that id is, wherever it has been moved or renamed to
 /// since. A locator answers the other question, which file this is, and the
 /// two meet in the catalog row that caches both.
+///
+/// A place is handed back only if it is this record's to give. Two records
+/// naming one place is a ledger this crate's writers do not produce, and
+/// the scan gives such a place to the first record in ledger order, so a
+/// later record naming it describes a file that answers to another id. The
+/// check runs only for a record with misses, which is the only kind that
+/// can be in that position: a record the last scan matched took its place,
+/// and publishing or moving a record drops any other naming the place it
+/// lands on, so a record that holds a place has zero misses and one that
+/// lost one cannot get back to zero while the record that took it stands.
 pub fn find_by_id<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     ledger: &Ledger,
@@ -365,8 +392,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut found: Option<LibraryCopy> = None;
-    for_each_record(root, ledger, &mut |_, record| {
+    let mut found: Option<(u16, BookRoot, heapless::String<MAX_PATH_BYTES>, u32, u8)> = None;
+    let mut source = None;
+    for_each_record(root, ledger, &mut |index, record| {
         if found.is_some() || record.id != id {
             return Ok(());
         }
@@ -374,16 +402,26 @@ where
         locator
             .push_str(record.locator)
             .map_err(|_| LedgerFault::Record)?;
-        found = Some(LibraryCopy {
-            root: record.root,
-            locator,
-            byte_size: record.byte_size,
-            misses: record.misses,
-            source: record.source,
-        });
+        source = record.source;
+        found = Some((index, record.root, locator, record.byte_size, record.misses));
         Ok(())
     })?;
-    Ok(found)
+    let Some((index, at, locator, byte_size, misses)) = found else {
+        return Ok(None);
+    };
+    let mut shadowed = false;
+    if misses > 0 && index > 0 {
+        for_each_record(root, ledger, &mut |other, record| {
+            shadowed |= other < index && record.root == at && record.locator == locator.as_str();
+            Ok(())
+        })?;
+    }
+    Ok(Some(LibraryCopy {
+        place: (!shadowed).then_some((at, locator)),
+        byte_size,
+        misses,
+        source,
+    }))
 }
 
 /// What a carried record is written with when it keeps its id, root and

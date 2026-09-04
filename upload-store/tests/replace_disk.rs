@@ -1779,8 +1779,8 @@ fn two_identical_copies_are_two_ids_with_state_of_their_own() {
     let live = ledger::open(&root).unwrap().unwrap();
     let one = ledger::find_by_id(&root, &live, first).unwrap().unwrap();
     let other = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
-    assert_eq!(one.locator.as_str(), BOOK, "each id names its own copy");
-    assert_eq!(other.locator.as_str(), twin);
+    assert_eq!(one.locator(), Some(BOOK), "each id names its own copy");
+    assert_eq!(other.locator(), Some(twin));
     assert_ne!(
         cache_key_from(source_hash_at(BookRoot::Library, BOOK, size)),
         cache_key_from(source_hash_at(BookRoot::Library, twin, size)),
@@ -1800,7 +1800,7 @@ fn two_identical_copies_are_two_ids_with_state_of_their_own() {
     );
     let live = ledger::open(&root).unwrap().unwrap();
     let other = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
-    assert_eq!(other.locator.as_str(), twin);
+    assert_eq!(other.locator(), Some(twin));
     assert_eq!(other.byte_size, size);
     assert_eq!(other.source, None, "nothing was said about the other copy");
     assert_eq!(

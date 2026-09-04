@@ -1589,12 +1589,37 @@ fn a_place_named_twice_takes_the_first_record_and_ages_out_the_other() {
     assert_eq!(ids, vec![Some(first)]);
     assert_eq!(records(&root).len(), 2, "the other is a scan older");
 
+    // And the shadowed record has no place to give while it lasts. Its
+    // locator is the winner's file, so answering with it would resolve one
+    // copy's state against another's book, which is the merge that costs
+    // more than the copy.
+    let live = ledger::open(&root).unwrap().unwrap();
+    let winner = ledger::find_by_id(&root, &live, first).unwrap().unwrap();
+    assert_eq!(winner.locator(), Some(row.1), "the row's id names the file");
+    assert_eq!(winner.misses, 0);
+    let loser = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
+    assert_eq!(loser.place, None, "the place it names is not its own");
+    assert_eq!(
+        loser.byte_size, row.2,
+        "the record is still there to salvage"
+    );
+    assert_eq!(loser.misses, 1);
+
     // Every scan reads it the same way and ages the shadowed record once
     // more, until the retention window runs out.
     for _ in 1..MISSING_SCANS_RETAINED {
         let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
         assert_eq!(assigned.duplicates, 1);
         assert_eq!(ids, vec![Some(first)], "the row's id stays where it was");
+        let live = ledger::open(&root).unwrap().unwrap();
+        assert_eq!(
+            ledger::find_by_id(&root, &live, second)
+                .unwrap()
+                .unwrap()
+                .place,
+            None,
+            "and still has no place to give"
+        );
     }
     assert_eq!(records(&root).len(), 2);
 
@@ -1603,6 +1628,19 @@ fn a_place_named_twice_takes_the_first_record_and_ages_out_the_other() {
     assert_eq!(assigned.duplicates, 1, "read once more on its way out");
     assert_eq!(ids, vec![Some(first)]);
     assert_eq!(ids_of(&records(&root)), vec![first], "one copy, one id");
+    let live = ledger::open(&root).unwrap().unwrap();
+    assert_eq!(
+        ledger::find_by_id(&root, &live, second).unwrap(),
+        None,
+        "the id it carried names nothing at all now"
+    );
+    assert_eq!(
+        ledger::find_by_id(&root, &live, first)
+            .unwrap()
+            .and_then(|copy| copy.locator().map(str::to_owned)),
+        Some(row.1.to_owned()),
+        "and the copy that kept the place still answers with it"
+    );
 
     // And the card settles: nothing shadows the row, and nothing is written
     // for a card that has not changed.
@@ -1634,8 +1672,11 @@ fn an_id_answers_with_the_copy_it_names_wherever_that_copy_has_moved() {
     let copy = ledger::find_by_id(&root, &live, dune)
         .expect("read")
         .expect("the id names a copy");
-    assert_eq!(copy.root, BookRoot::Library);
-    assert_eq!(copy.locator.as_str(), "Dune.epub");
+    assert_eq!(
+        copy.place.as_ref().map(|(at, _)| *at),
+        Some(BookRoot::Library)
+    );
+    assert_eq!(copy.locator(), Some("Dune.epub"));
     assert_eq!(copy.byte_size, 3_000);
     assert_eq!(copy.misses, 0, "the scan just saw it");
     assert_eq!(copy.source, None, "a sideloaded copy's bytes were not read");
@@ -1652,12 +1693,12 @@ fn an_id_answers_with_the_copy_it_names_wherever_that_copy_has_moved() {
     let copy = ledger::find_by_id(&root, &live, dune)
         .expect("read")
         .expect("the same id, the new place");
-    assert_eq!(copy.locator.as_str(), "Fiction/Dune.epub");
+    assert_eq!(copy.locator(), Some("Fiction/Dune.epub"));
     assert_eq!(copy.byte_size, 3_000);
     let other = ledger::find_by_id(&root, &live, emma)
         .expect("read")
         .expect("the other copy is where it was");
-    assert_eq!(other.locator.as_str(), "Emma.epub");
+    assert_eq!(other.locator(), Some("Emma.epub"));
 }
 
 /// A card can be taken out, edited, and put back, so a copy the last scan
@@ -1689,6 +1730,6 @@ fn a_copy_the_scan_missed_still_answers_to_its_id() {
     let copy = ledger::find_by_id(&root, &live, dune)
         .expect("read")
         .expect("a missing copy still answers");
-    assert_eq!(copy.locator.as_str(), "Dune.epub", "where it last was");
+    assert_eq!(copy.locator(), Some("Dune.epub"), "where it last was");
     assert_eq!(copy.misses, 1);
 }
