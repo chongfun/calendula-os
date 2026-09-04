@@ -844,16 +844,17 @@ found and respells its place, and a rollback puts the predecessor back under
 the spelling typed; settling moves the record to whichever spelling the file
 ends up under. A book with no long name is found by its rendered alias, the
 name a listing shows it under and the locator the library adopts it by, so
-it is replaced under that name and keeps its id like any other. A shelf
-already holding two entries that answer to the name where the upload would
-land is refused before anything is journalled or moved, whichever of them
-the upload spells: FAT gives a directory one namespace over long names and
-aliases together, with case ignored, so whichever the install replaced, the
-other would refuse the landing and the rollback alike halfway through. A
-ledger with no room for a fresh copy's record lets a missing copy go to make
-it, chosen when the intent is published from the records the last scan found
-missing and verified absent from the card then, which the sole-writer
-contract keeps true while the intent stands; with none to let go of, the
+it is replaced under that name and keeps its id like any other. Anything
+else answering to the name where the upload would land refuses it before
+anything is journalled or moved: two entries answering alike, whichever of
+them the upload spells, or a folder carrying the name, which unpacking an
+EPUB on a computer leaves behind. FAT gives a directory one namespace over
+long names and aliases together, with case ignored, so the landing would be
+refused by whichever the install had not taken, and the rollback after it,
+halfway through. A ledger with no room for a fresh copy's record lets a
+missing copy go to make it, chosen when the intent is published from the
+records the last scan found missing and verified absent then, which the
+sole-writer contract keeps true while it stands; with none to let go of, the
 install refuses before anything is journalled. The file is two slots like
 the ledger journal, so a torn publication is an install that has not begun
 and a torn clear is an intent resolved again. No id or digest enters

@@ -448,16 +448,16 @@ pub enum InstallError {
     /// alike. No EPUB is zero bytes, and an empty one on the shelf can be
     /// deleted and the upload retried.
     Empty,
-    /// A name resolved to more than one plausible entry: case variants of
-    /// the shelf with no exact spelling, an exact non-directory squatting on
-    /// the name beside a case-variant directory, or two books on the shelf
-    /// answering alike to the name where an upload is to land, by their long
-    /// names or by an alias. A computer can legally leave any of these
-    /// behind. Nothing here can pick a reading without risking the wrong
-    /// library, and a landing beside the other would be refused by the shelf
-    /// halfway through, so the card is refused before anything is written
-    /// until it is fixed on a computer. Unlike [`Self::Card`] a retry
-    /// without changing the card cannot help.
+    /// A name resolved to more than one plausible entry, or to one this
+    /// transaction cannot work with: case variants of the shelf with no
+    /// exact spelling, an exact non-directory squatting on the name beside
+    /// a case-variant directory, or, where an upload is to land, two entries
+    /// answering alike or a folder carrying the name. A computer can legally
+    /// leave any of these behind. Nothing here can pick a reading without
+    /// risking the wrong library, and a landing beside the other would be
+    /// refused by the shelf halfway through, so the card is refused before
+    /// anything is written until it is fixed on a computer. Unlike
+    /// [`Self::Card`] a retry without changing the card cannot help.
     Ambiguous,
     /// The library ledger refused: it is damaged, or of a version this build
     /// does not read, so the copy being replaced cannot have its identity
@@ -1593,7 +1593,7 @@ fn discard_scratch<D, T, const MD: usize, const MF: usize, const MV: usize>(
     }
 }
 
-/// A name in the rollback directory that no file holds.
+/// A name in the rollback directory that nothing holds.
 fn free_rollback_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Dir<'_, D, T, MD, MF, MV>,
     stage: &str,
@@ -1619,9 +1619,14 @@ where
                 .ok()?;
         }
         candidate.push_str(".OLD").ok()?;
-        if holder_of_long_name(&rollback, candidate.as_str())
+        // Anything answering to the name has it, a directory as much as a
+        // book: the predecessor is parked by moving it in under this name,
+        // and FAT counts every entry in one namespace. A blocked name is
+        // the next probe's business rather than a refusal, since this one
+        // is chosen rather than given.
+        if classify_long_name(&rollback, candidate.as_str())
             .ok()?
-            .is_none()
+            .is_free()
         {
             return Some(candidate);
         }
@@ -1634,7 +1639,8 @@ where
 /// `Ok(None)` is a name nobody holds. [`InstallError::Card`] is a shelf that
 /// would not say, which must stop the install: proceeding would put a
 /// second holder of the name on the card. [`InstallError::Ambiguous`] is a
-/// shelf already holding two entries that answer to the name.
+/// name held by something this transaction cannot move aside; see
+/// [`classify_long_name`].
 fn holder_of_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
     books: &Directory<'_, D, T, MD, MF, MV>,
     long_name: &str,
@@ -1647,36 +1653,8 @@ where
         .map(|holder| holder.map(|(alias, chain, _)| (alias, chain)))
 }
 
-/// One entry a long-name lookup found, with the name exactly as it spells
-/// it.
-type SpelledHolder = (
-    ShortName,
-    embedded_sdmmc::ClusterId,
-    String<{ proto::library_path::MAX_PATH_BYTES }>,
-);
-
 /// [`holder_of_long_name`], with the long name exactly as the holder spells
 /// it, which is the locator the ledger knows the copy by.
-///
-/// Names match by FAT's rules, so the spelling found can differ from the one
-/// asked for, and a card written elsewhere can hold two entries that differ
-/// only by case. A shelf holding two is refused rather than searched for
-/// the better one: the directory has one namespace with case ignored, and
-/// the install lands by moving the staged file in under the name, so
-/// whichever twin it replaced, the other would still be there to refuse the
-/// landing, and the rollback after it, halfway through the transaction.
-/// Refusing here is refusing before anything is journalled or moved. Nor
-/// does directory order decide anything: with one holder there is nothing
-/// to order, and with two the answer is the same whichever came first.
-///
-/// An entry with no long name answers to its rendered alias, which is the
-/// name a listing shows for it and the locator the library adopts it under,
-/// so it is compared the same way. That namespace is the one the landing
-/// will meet: a staged file moved in under a name an alias already holds is
-/// refused by the driver, halfway through the transaction, and a book the
-/// installer read as absent is a book the intent says nothing stood on.
-/// Only a name an alias could be is compared against one, which no upload
-/// is: a `.epub` extension is four characters where 8.3 allows three.
 fn spelled_holder_of_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
     books: &Directory<'_, D, T, MD, MF, MV>,
     long_name: &str,
@@ -1685,13 +1663,83 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let held = classify_long_name(books, long_name)?;
+    if held.blocked {
+        return Err(InstallError::Ambiguous);
+    }
+    Ok(held.book)
+}
+
+/// One entry a long-name lookup found, with the name exactly as it spells
+/// it.
+type SpelledHolder = (
+    ShortName,
+    embedded_sdmmc::ClusterId,
+    String<{ proto::library_path::MAX_PATH_BYTES }>,
+);
+
+/// What answers to a name in a directory.
+///
+/// A struct rather than the three-way enum it reads as, because a holder
+/// carries a whole locator and the empty answers would carry that width
+/// with them.
+struct NameHolder {
+    /// The one book holding the name, when a book is all that holds it. An
+    /// upload to that name replaces it.
+    book: Option<SpelledHolder>,
+    /// Something an upload cannot land beside or move aside holds the name.
+    blocked: bool,
+}
+
+impl NameHolder {
+    /// Nothing holds the name, so an upload lands there fresh.
+    fn is_free(&self) -> bool {
+        self.book.is_none() && !self.blocked
+    }
+}
+
+/// What holds `long_name` in `books`, by the rules the landing will meet.
+///
+/// FAT gives a directory one namespace over its entries' long names and
+/// their aliases together, with case ignored, and the install lands by
+/// moving the staged file in under the name. So everything that answers to
+/// the name is counted here, whatever kind of entry it is and however it is
+/// spelled, and anything other than a single book blocks the name:
+///
+/// - Two entries answering alike, which a computer can leave behind as case
+///   variants. Whichever one the install replaced, the other would be there
+///   to refuse the landing, and the rollback after it, halfway through the
+///   transaction.
+/// - A directory. It is not a book to replace, it cannot be parked, and it
+///   would refuse the landing the same way.
+/// - A book whose name will not fit the buffers the steps that move and
+///   delete it use, which is a book this transaction cannot name again.
+///
+/// A blocked name refuses the install before anything is journalled or
+/// moved, which is the whole point of asking here. Directory order decides
+/// nothing: with one book there is nothing to order, and with anything else
+/// the answer is the same whichever came first.
+///
+/// An entry with no long name answers to its rendered alias, which is the
+/// name a listing shows for it and the locator the library adopts it under.
+/// Only a name an alias could be is compared against one, which no upload
+/// is: a `.epub` extension is four characters where 8.3 allows three.
+fn classify_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    books: &Directory<'_, D, T, MD, MF, MV>,
+    long_name: &str,
+) -> Result<NameHolder, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     let mut storage = [0u8; crate::LFN_SCAN_BYTES];
     let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
     let mut holder: Option<SpelledHolder> = None;
-    let mut holders = 0usize;
+    let mut answered = 0usize;
+    let mut blocked = false;
     let alias_shaped = long_name.len() <= proto::storage::MAX_ALIAS_UTF8_BYTES;
     let walked = books.iterate_dir_lfn(&mut lfn, |entry, found| {
-        if entry.attributes.is_directory() || entry.attributes.is_volume() {
+        if entry.attributes.is_volume() {
             return ControlFlow::Continue(());
         }
         use core::fmt::Write as _;
@@ -1708,26 +1756,25 @@ where
         if !same_long_name(held, long_name) {
             return ControlFlow::Continue(());
         }
-        holders += 1;
-        if holders > 1 {
-            // Two is already a refusal; the rest of the walk cannot change it.
-            return ControlFlow::Break(());
-        }
+        answered += 1;
         let mut name = ShortName::new();
         let mut spelled = String::new();
-        // A name that would not fit is not this entry's alias, and the holder
-        // is handed to steps that delete and move things. A spelling that
-        // would not fit is a locator the ledger could not hold either.
-        if write!(name, "{}", entry.name).is_err() || spelled.push_str(held).is_err() {
-            return ControlFlow::Continue(());
+        if entry.attributes.is_directory()
+            || answered > 1
+            || write!(name, "{}", entry.name).is_err()
+            || spelled.push_str(held).is_err()
+        {
+            blocked = true;
+            // Blocked is already the answer; the rest of the walk cannot
+            // change it.
+            return ControlFlow::Break(());
         }
         holder = Some((name, entry.cluster, spelled));
         ControlFlow::Continue(())
     });
     walked.map_err(|_| InstallError::Card)?;
-    match holders {
-        0 => Ok(None),
-        1 => Ok(holder),
-        _ => Err(InstallError::Ambiguous),
-    }
+    Ok(NameHolder {
+        book: if blocked { None } else { holder },
+        blocked,
+    })
 }

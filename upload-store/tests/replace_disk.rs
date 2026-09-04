@@ -1637,3 +1637,109 @@ fn write_legacy_sidecars(root: &Dir<'_>, alias: &str, identity: u64, label: &str
     file.write(label.as_bytes()).expect("write label");
     file.close().expect("close");
 }
+
+/// A folder can carry a book's name: unpacking an EPUB on a computer leaves
+/// one, and a shelf tidied by hand can too. It is not a book to replace and
+/// it cannot be parked, and FAT counts it in the same namespace as the
+/// books, so the landing would be refused by it halfway through a
+/// transaction whose intent had already said nothing stood there. Refused
+/// at the preflight instead, with neither journal written.
+#[test]
+fn a_folder_holding_the_upload_name_is_refused_before_anything_moves() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    books
+        .make_dir_in_dir_lfn(BOOK)
+        .expect("a folder named like a book");
+
+    let refused = upload(&root, &books, BOOK, &body(2, 4_100), || {});
+    assert!(
+        matches!(refused, Err(InstallError::Ambiguous)),
+        "a folder holding the name is a refusal: {refused:?}"
+    );
+    assert_eq!(
+        replace::read(&root).unwrap(),
+        None,
+        "no intent was published"
+    );
+    assert_eq!(
+        install::read_intent(&root).unwrap(),
+        install::IntentState::Absent,
+        "and no install journal"
+    );
+    assert_eq!(record_count(&root), 0, "and no record");
+    // Nothing was begun, so there is nothing owed: the shelf can still be
+    // read and written. A wedge here would report an install it cannot
+    // finish, on this mount and every one after it.
+    let outcome = install::recover_installs(&root, &books);
+    assert!(
+        outcome.complete && !outcome.had_intent,
+        "nothing to recover: {outcome:?}"
+    );
+    let other = body(3, 2_000);
+    upload(&root, &books, "Other.epub", &other, || {})
+        .unwrap()
+        .expect("another book still installs");
+    assert_eq!(
+        shelf_bytes(&root, "Other.epub").as_deref(),
+        Some(&other[..])
+    );
+
+    // The folder is where it was, which is why the same upload is refused
+    // the same way.
+    let refused = upload(&root, &books, BOOK, &body(4, 4_100), || {});
+    assert!(
+        matches!(refused, Err(InstallError::Ambiguous)),
+        "still refused: {refused:?}"
+    );
+}
+
+/// A folder answering to the book's name by FAT's rules blocks the landing
+/// as surely as one spelled exactly, so the book beside it must not be
+/// parked: it would come off the shelf for a landing that cannot happen.
+#[test]
+fn a_folder_answering_like_the_book_is_refused_before_the_book_is_parked() {
+    let disk = new_card();
+    let old = body(1, 3_000);
+    {
+        let mgr = open_mgr(&disk);
+        let (_, books) = open_dirs(&mgr);
+        sideload(&books, BOOK, &old);
+        // Forged, as the twins are: the driver holds one namespace over
+        // books and folders together, so it refuses to make this folder
+        // beside that book. Another operating system need not.
+        books.make_dir_in_dir_lfn("duneQ.epub").expect("mkdir");
+    }
+    {
+        let mut data = disk.0.data.borrow_mut();
+        rewrite_long_name(&mut data, "duneQ.epub", BOOK_RESPELLED);
+    }
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let (_, ids) = scan(&root, &[(BookRoot::Library, BOOK, old.len() as u32)]).unwrap();
+    let id = ids[0].unwrap();
+
+    let refused = upload(&root, &books, BOOK, &body(2, 4_100), || {});
+    assert!(
+        matches!(refused, Err(InstallError::Ambiguous)),
+        "a folder answering alike is a refusal: {refused:?}"
+    );
+    assert_eq!(replace::read(&root).unwrap(), None, "no intent");
+    assert_eq!(
+        install::read_intent(&root).unwrap(),
+        install::IntentState::Absent,
+        "and no install journal"
+    );
+    assert_eq!(
+        shelf_bytes(&root, BOOK).as_deref(),
+        Some(&old[..]),
+        "the book is still on the shelf, not parked"
+    );
+    assert_eq!(
+        record_for(&root, BOOK).map(|(found, size, _)| (found, size)),
+        Some((id, old.len() as u32)),
+        "and its record is as it was"
+    );
+    assert_eq!(record_count(&root), 1);
+}
