@@ -805,6 +805,11 @@ pub struct Assignment {
     /// Left alone, both sides, since a wrong join of one reader's place to
     /// another book costs more than a copy adopted afresh.
     pub ambiguous: u16,
+    /// Copies this scan did not read enough to place: a file that could
+    /// have been one of them went unread, for want of budget or because
+    /// the card would not give it up. They stay missing, on the ordinary
+    /// retention, and the next scan looks again.
+    pub unresolved: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +842,13 @@ const MOVE_HASHES: u16 = 16;
 /// whatever it finds: another missing copy holds the same bytes, so which
 /// of them a file is cannot be told from the file.
 const MOVE_AMBIGUOUS: u8 = u8::MAX;
+/// A match count meaning this scan did not see enough to say: a file it
+/// could have been went unread, for want of budget or because the card
+/// would not give it up. Not the same as knowing there are two, and not
+/// the same as knowing there is one, which is the point: a file nobody
+/// read is a file that could hold these bytes, and a copy is repaired only
+/// once every file that could be it has been ruled in or out.
+const MOVE_UNRESOLVED: u8 = u8::MAX - 1;
 
 /// A copy the scan found again, told to a caller that keeps something
 /// filed under where it used to be.
@@ -916,6 +928,26 @@ fn move_entry(table: &[u8], slot: usize) -> &[u8] {
 
 fn move_u16(entry: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([entry[at], entry[at + 1]])
+}
+
+/// Whether a slot is still waiting on files of `byte_size`: a copy that
+/// size, which the search has not given up on.
+fn move_awaits(table: &[u8], slot: usize, byte_size: u32) -> bool {
+    let entry = move_entry(table, slot);
+    entry[MOVE_MATCHES] < MOVE_UNRESOLVED
+        && u32::from_le_bytes(entry[MOVE_SIZE..MOVE_ID].try_into().expect("four bytes"))
+            == byte_size
+}
+
+/// Give up on every copy a file of `byte_size` could have been, this scan.
+fn move_unresolved(table: &mut [u8], slots: usize, byte_size: u32, unresolved: &mut u16) {
+    for slot in 0..slots {
+        if !move_awaits(table, slot, byte_size) {
+            continue;
+        }
+        table[slot * MOVE_ENTRY_BYTES + MOVE_MATCHES] = MOVE_UNRESOLVED;
+        *unresolved = unresolved.saturating_add(1);
+    }
 }
 
 /// The slot a record index belongs to, when the search means to move it.
@@ -1075,7 +1107,7 @@ where
     if let Some(live) = live {
         if missing_records > 0 && new_rows > 0 && capacity > 0 {
             for_each_record(root, &live, &mut |index, entry| {
-                if slots >= capacity || bit(named, index) {
+                if bit(named, index) {
                     return Ok(());
                 }
                 let Some(digest) = entry
@@ -1084,11 +1116,35 @@ where
                 else {
                     return Ok(());
                 };
+                let recorded = encode_cached_record(&digest);
+                // Another copy of these bytes, whether or not there was
+                // room to carry this one: two copies no file can be told
+                // apart by, so the one being carried is not repaired. Every
+                // eligible record is compared for this reason, since a
+                // table that holds sixty-four of them would otherwise call
+                // the sixty-fifth's twin unique.
+                if let Some(held) = (0..slots)
+                    .find(|slot| move_entry(table, *slot)[MOVE_DIGEST..MOVE_ROW] == recorded)
+                {
+                    let state = &mut table[held * MOVE_ENTRY_BYTES + MOVE_MATCHES];
+                    if *state != MOVE_AMBIGUOUS {
+                        *state = MOVE_AMBIGUOUS;
+                        assigned.ambiguous = assigned.ambiguous.saturating_add(1);
+                    }
+                    // Both copies are set aside, the one being carried and
+                    // the one that turned up holding its bytes, so both are
+                    // counted.
+                    assigned.ambiguous = assigned.ambiguous.saturating_add(1);
+                    return Ok(());
+                }
+                if slots >= capacity {
+                    return Ok(());
+                }
                 let slot = &mut table[slots * MOVE_ENTRY_BYTES..][..MOVE_ENTRY_BYTES];
                 slot[MOVE_INDEX..MOVE_SIZE].copy_from_slice(&index.to_le_bytes());
                 slot[MOVE_SIZE..MOVE_ID].copy_from_slice(&entry.byte_size.to_le_bytes());
                 slot[MOVE_ID..MOVE_DIGEST].copy_from_slice(&entry.id.to_bytes());
-                slot[MOVE_DIGEST..MOVE_ROW].copy_from_slice(&encode_cached_record(&digest));
+                slot[MOVE_DIGEST..MOVE_ROW].copy_from_slice(&recorded);
                 slot[MOVE_ROW..MOVE_MATCHES].copy_from_slice(&u16::MAX.to_le_bytes());
                 slot[MOVE_MATCHES] = 0;
                 slot[MOVE_ROOT] = move_root_byte(entry.root);
@@ -1101,25 +1157,6 @@ where
             })?;
         }
     }
-    // Two missing copies of the same bytes are two copies no file can be
-    // told apart by, so neither is repaired and both wait for a card that
-    // says more. Marked before anything is read, so the reading is not
-    // paid for either.
-    for slot in 0..slots {
-        for other in slot + 1..slots {
-            if move_entry(table, slot)[MOVE_DIGEST..MOVE_ROW]
-                != move_entry(table, other)[MOVE_DIGEST..MOVE_ROW]
-            {
-                continue;
-            }
-            for ambiguous in [slot, other] {
-                if table[ambiguous * MOVE_ENTRY_BYTES + MOVE_MATCHES] != MOVE_AMBIGUOUS {
-                    table[ambiguous * MOVE_ENTRY_BYTES + MOVE_MATCHES] = MOVE_AMBIGUOUS;
-                    assigned.ambiguous = assigned.ambiguous.saturating_add(1);
-                }
-            }
-        }
-    }
     if slots > 0 {
         seek_row(catalog, 0)?;
         for row in 0..count as usize {
@@ -1130,25 +1167,26 @@ where
                 continue;
             }
             let (at, locator, byte_size) = catalog_record_at(&record).ok_or(LedgerFault::Record)?;
-            let wanted = (0..slots).any(|slot| {
-                let entry = move_entry(table, slot);
-                entry[MOVE_MATCHES] < MOVE_AMBIGUOUS
-                    && u32::from_le_bytes(entry[MOVE_SIZE..MOVE_ID].try_into().expect("four bytes"))
-                        == byte_size
-            });
-            if !wanted || assigned.hashed >= MOVE_HASHES {
+            let wanted = (0..slots).any(|slot| move_awaits(table, slot, byte_size));
+            if !wanted {
                 continue;
             }
-            // A file that cannot be read is a file that proves nothing. The
-            // scan has no business failing over it: the row is adopted
-            // afresh, which is what it would have been anyway.
+            // A file of the right length that goes unread could hold any of
+            // those copies' bytes, so leaving it unread leaves them all
+            // unsettled. Whether the budget ran out or the card would not
+            // give the file up, the answer is the same: not this scan.
+            if assigned.hashed >= MOVE_HASHES {
+                move_unresolved(table, slots, byte_size, &mut assigned.unresolved);
+                continue;
+            }
             let Ok(Some(found)) = crate::replace::digest_at(root, at, locator) else {
+                move_unresolved(table, slots, byte_size, &mut assigned.unresolved);
                 continue;
             };
             assigned.hashed = assigned.hashed.saturating_add(1);
             for slot in 0..slots {
                 let entry = move_entry(table, slot);
-                if entry[MOVE_MATCHES] == MOVE_AMBIGUOUS {
+                if entry[MOVE_MATCHES] >= MOVE_UNRESOLVED {
                     continue;
                 }
                 let Some(recorded) = parse_record(&entry[MOVE_DIGEST..MOVE_ROW]) else {

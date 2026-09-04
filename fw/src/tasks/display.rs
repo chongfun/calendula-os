@@ -94,6 +94,12 @@ pub async fn run(
     // what the loop needs to schedule the next step and to tell whether the
     // reader is still on that book.
     let mut background_build: Option<BackgroundBuild> = None;
+    // The book whose bytes this session has already read, or found the
+    // card already knew. One book at a time, and only the one open: what
+    // the reading is for is finding *this* copy again after a move, and a
+    // reader who opens a book is the reader whose place is worth keeping.
+    let mut evidence_settled: Option<usize> = None;
+    let mut pending_evidence: Option<book_build::SourceEvidenceJob> = None;
     // On a deep-sleep (Power button) wake the panel still shows the sleep
     // screen: deep_sleep_wake is true only when the RTC wake cause is the
     // armed GPIO *and* the pre-sleep handshake recorded that the sleep frame
@@ -205,7 +211,11 @@ pub async fn run(
             place_held_library_event(),
             place_held_display_event(),
             background_build_step_due(
-                background_build.is_some()
+                (background_build.is_some()
+                    || pending_evidence.is_some()
+                    || sd_library
+                        .active_index()
+                        .is_some_and(|index| evidence_settled != Some(index)))
                     && !sync_session.active()
                     && holder().storage_may_run()
                     && !sd_library.text_holds_toc(),
@@ -216,6 +226,33 @@ pub async fn run(
         {
             Either5::Fifth(()) => {
                 let Some(pending) = background_build else {
+                    // No walk owed, so the slice goes to reading the open
+                    // book's bytes, which is the other thing this task owes
+                    // itself and the one that has to wait for the reader to
+                    // have a page before it starts.
+                    if pending_evidence.is_none() {
+                        if let Some(index) = sd_library.active_index() {
+                            pending_evidence = book_build::evidence_job(sd_library, index);
+                            if pending_evidence.is_none() {
+                                evidence_settled = Some(index);
+                            }
+                        }
+                    }
+                    if let Some(job) = &mut pending_evidence {
+                        let index = job.index;
+                        match book_build::continue_source_evidence(&mut epd, &mut sd_cs, job) {
+                            book_build::EvidenceStep::Continued => {}
+                            // Settled either way: a copy the card would not
+                            // give up is not asked for again in this
+                            // session, and a book reopened later arms a
+                            // fresh job.
+                            book_build::EvidenceStep::Finished
+                            | book_build::EvidenceStep::Abandoned => {
+                                pending_evidence = None;
+                                evidence_settled = Some(index);
+                            }
+                        }
+                    }
                     continue;
                 };
                 // Deliberately not gated on the latest reader request id.

@@ -709,58 +709,160 @@ where
 /// Only the active book has a resident locator, and every open stages its row
 /// as active first, so `None` means that staging did not happen or the record
 /// held nothing openable.
-/// Read the book once and record what its bytes are, unless the card
-/// already says.
+/// A copy whose bytes the card has not recorded, read a slice at a time.
 ///
-/// The file is the one the open just proved, read from the start and left
-/// where it was found, so the zip stream that follows sees what it would
-/// have seen. A book too large to read here is left unrecorded rather than
-/// half recorded: what goes into a claim has to be the whole stream.
-fn record_source_evidence<D, T, const MD: usize, const MF: usize, const MV: usize>(
-    root: &Directory<'_, D, T, MD, MF, MV>,
-    owner: &proto::cache::CacheOwner<'_>,
-    file: &embedded_sdmmc::File<'_, D, T, MD, MF, MV>,
-    source_len: u32,
-) where
-    D: embedded_sdmmc::BlockDevice,
-    T: embedded_sdmmc::TimeSource,
-{
-    if files::recorded_evidence(root, owner).is_some_and(|held| held.digest.is_some()) {
-        return;
+/// A scan adopts a book without reading it, so for everything a computer
+/// put on the card the claim beside its reading place is the only thing
+/// that will say what its bytes were, and the only thing that lets a later
+/// scan find the book again after a move. The whole stream has to be read
+/// for the claim to say anything, and a book is megabytes: on this card
+/// around 550 kB a second, so a large one is the better part of a minute.
+/// That cannot stand between the reader and their first page, so it rides
+/// the same background slices the spine walk uses.
+///
+/// Nothing depends on it finishing. A book closed halfway through is a book
+/// whose bytes are recorded on some later open, and one that is never
+/// opened long enough is one a move cannot find again, which is the state
+/// every book was in before.
+pub(crate) struct SourceEvidenceJob {
+    /// The catalog row this is reading, so a book that changes under the
+    /// job takes the job with it.
+    pub(crate) index: usize,
+    at: BookRoot,
+    locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
+    key: String<{ proto::cache::CACHE_KEY_BYTES }>,
+    len: u32,
+    offset: u32,
+    started: Instant,
+    hasher: proto::source::SourceHasher,
+}
+
+/// What one slice of that reading did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EvidenceStep {
+    /// More of the book to read; call again.
+    Continued,
+    /// The stream was read whole and the claim now says what it held, or
+    /// the claim already said and nothing needed reading.
+    Finished,
+    /// The card would not give the book up, or gave up less of it than it
+    /// said it held. Nothing is recorded from a partial read, so the job is
+    /// dropped and the next open starts it over.
+    Abandoned,
+}
+
+/// How much of a book one slice reads. Sized against the background build's
+/// own slice, since it is the same reader waiting either way.
+const EVIDENCE_SLICE_BYTES: u32 = 192 * 1024;
+
+/// The job for the book at `index`, when the store knows where it is.
+///
+/// No card access: whether the claim already records the bytes is the first
+/// slice's business, so arming costs an open nothing.
+pub(crate) fn evidence_job(library: &ReaderStore, index: usize) -> Option<SourceEvidenceJob> {
+    let (at, locator) = library.book_location(index)?;
+    let len = library.catalog_entry(index)?.byte_size;
+    if len == 0 {
+        return None;
     }
-    let started = Instant::now();
-    let mut hasher = proto::source::SourceHasher::new();
-    let mut buffer = [0u8; 512];
-    let mut read_total = 0u32;
-    if file.seek_from_start(0).is_err() {
-        return;
-    }
-    while read_total < source_len {
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                hasher.update(&buffer[..read]);
-                read_total += read as u32;
-            }
-            Err(_) => return,
+    let key = proto::cache::cache_key_from(proto::cache::source_hash_at(at, locator, len));
+    let mut owned = String::new();
+    owned.push_str(locator).ok()?;
+    Some(SourceEvidenceJob {
+        index,
+        at,
+        locator: owned,
+        key,
+        len,
+        offset: 0,
+        started: Instant::now(),
+        hasher: proto::source::SourceHasher::new(),
+    })
+}
+
+/// Read the next slice of a book whose bytes are not recorded yet, and
+/// record them once the last slice is in.
+#[inline(never)]
+pub(crate) fn continue_source_evidence(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    job: &mut SourceEvidenceJob,
+) -> EvidenceStep {
+    let Ok(path) = LibraryPath::parse(job.locator.as_str()) else {
+        return EvidenceStep::Abandoned;
+    };
+    let owner = proto::cache::CacheOwner {
+        key: job.key.as_str(),
+        root: job.at,
+        locator: job.locator.as_str(),
+    };
+    let slice = sd_session::with_root(epd, sd_cs, |root| {
+        // Asked once, on the first slice: a book whose bytes are already
+        // recorded is most of a library most of the time.
+        if job.offset == 0
+            && files::recorded_evidence(root, &owner).is_some_and(|held| held.digest.is_some())
+        {
+            return EvidenceStep::Finished;
         }
-    }
-    let rewound = file.seek_from_start(0).is_ok();
-    if read_total != source_len || !rewound {
-        return;
-    }
-    let digest = hasher.finish();
-    match files::record_cache_evidence(root, owner, None, Some(digest)) {
-        Ok(()) => bench_log!(
-            "bench: storage_evidence action=record len={} elapsed_ms={} t_ms={}",
-            source_len,
-            started.elapsed().as_millis(),
-            Instant::now().as_millis(),
-        ),
-        // A claim that would not take it costs a scan the chance to find
-        // this copy again, and costs this open nothing.
-        Err(_) => esp_println::println!("storage: could not record what this copy is"),
-    }
+        let read = upload_store::library::with_book_at(root, job.at, &path, |dir, alias| {
+            let Ok(file) = dir.open_file_in_dir(alias, Mode::ReadOnly) else {
+                return None;
+            };
+            if file.length() != job.len || file.seek_from_start(job.offset).is_err() {
+                // A file that is not the length the row said is not the
+                // copy this job was armed for.
+                return None;
+            }
+            let mut buffer = [0u8; 512];
+            let mut taken = 0u32;
+            while taken < EVIDENCE_SLICE_BYTES && job.offset + taken < job.len {
+                let want = (job.len - job.offset - taken).min(buffer.len() as u32) as usize;
+                match file.read(&mut buffer[..want]) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        job.hasher.update(&buffer[..read]);
+                        taken += read as u32;
+                    }
+                    Err(_) => return None,
+                }
+            }
+            Some(taken)
+        });
+        let Ok(Some(Some(taken))) = read else {
+            return EvidenceStep::Abandoned;
+        };
+        job.offset += taken;
+        if job.offset < job.len {
+            return if taken == 0 {
+                // The card stopped giving the book up before its end, so
+                // what has been read is not the stream and cannot be
+                // recorded as it.
+                EvidenceStep::Abandoned
+            } else {
+                EvidenceStep::Continued
+            };
+        }
+        let digest =
+            core::mem::replace(&mut job.hasher, proto::source::SourceHasher::new()).finish();
+        match files::record_cache_evidence(root, &owner, None, Some(digest)) {
+            Ok(()) => {
+                bench_log!(
+                    "bench: storage_evidence action=record len={} elapsed_ms={} t_ms={}",
+                    job.len,
+                    job.started.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
+                EvidenceStep::Finished
+            }
+            // A claim that would not take it costs a later scan the chance
+            // to find this copy again, and costs this reader nothing.
+            Err(_) => {
+                esp_println::println!("storage: could not record what this copy is");
+                EvidenceStep::Abandoned
+            }
+        }
+    });
+    slice.unwrap_or(EvidenceStep::Abandoned)
 }
 
 fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, LibraryPath)> {
@@ -1608,13 +1710,6 @@ where
     };
 
     esp_println::println!("epub: stage OpenSdFile len={}", source_len);
-    // What this copy is, recorded once beside the place it is read from.
-    // A scan adopts a book without reading it, so for everything that was
-    // not uploaded this is the only thing on the card that says what the
-    // bytes were, and it is what lets the next scan find the book again
-    // after a computer moves it. Paid once per copy, on the open that also
-    // builds its cache, and skipped whenever the claim already says.
-    record_source_evidence(root, &owner, &file, source_len);
     let requested_global_page = target_pages as u32;
 
     esp_println::println!("epub: zip open len={}", source_len);

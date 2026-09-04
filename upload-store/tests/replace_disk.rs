@@ -2364,3 +2364,120 @@ fn a_claim_naming_another_book_is_no_evidence_about_this_one() {
     assert_ne!(ids[0], Some(id));
     assert!(found_again().is_empty());
 }
+
+/// The search reads at most a fixed number of books, and a file it did not
+/// read is a file that could have held the copy's bytes. So a budget that
+/// runs out leaves every copy that file could have been unsettled, rather
+/// than letting an earlier match stand as the only one: the reader would
+/// have had a place carried onto whichever of two identical files the card
+/// happened to list first.
+#[test]
+fn a_file_left_unread_leaves_the_copy_it_could_be_unsettled() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    // The copy is renamed, and sixteen files of its length arrive with it:
+    // fifteen strangers, and one more copy of the same book at the end of
+    // the listing, past what one scan will read.
+    rename_on_shelf(&root, BOOK, "New00.epub");
+    let mut names = std::vec![std::string::String::from("New00.epub")];
+    for stranger in 1..16u8 {
+        let name = std::format!("New{stranger:02}.epub");
+        sideload(&books, &name, &body(stranger + 40, size as usize));
+        names.push(name);
+    }
+    sideload(&books, "New16.epub", &bytes);
+    names.push(std::string::String::from("New16.epub"));
+    let rows: Vec<Row<'_>> = names
+        .iter()
+        .map(|name| (BookRoot::Library, name.as_str(), size))
+        .collect();
+
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(
+        assigned.repaired, 0,
+        "one of two files was read: {assigned:?}"
+    );
+    assert!(assigned.unresolved >= 1, "and the copy waits: {assigned:?}");
+    assert_eq!(assigned.minted, 17, "every file is a copy in its own right");
+    assert!(!ids.contains(&Some(id)));
+    let live = ledger::open(&root).unwrap().unwrap();
+    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
+    assert_eq!(copy.misses, 1, "still missing, still waiting");
+}
+
+/// One scan carries as many missing copies as its arena holds, and the
+/// bound is on which copies it may repair rather than on what it knows: a
+/// second copy of the same bytes past the end of the table still says the
+/// two cannot be told apart.
+#[test]
+fn a_twin_past_the_end_of_the_table_still_refuses_the_repair() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let shared = body(1, 3_000);
+    let size = shared.len() as u32;
+    // Sixty-five missing copies, all of one length so all are candidates,
+    // the first and the last holding the same bytes.
+    let ids: Vec<BookId> = (0..65u32)
+        .map(|index| {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&(index + 1).to_le_bytes());
+            BookId::from_bytes(bytes).unwrap()
+        })
+        .collect();
+    ledger::write_generation(
+        &root,
+        None,
+        &mut |_, record| Carry::Keep(Kept::of(record)),
+        |writer| {
+            for (index, id) in ids.iter().enumerate() {
+                let mut locator = heapless::String::<32>::new();
+                use core::fmt::Write as _;
+                write!(locator, "Gone{index}.epub").unwrap();
+                let bytes = if index == 0 || index == 64 {
+                    shared.clone()
+                } else {
+                    body(index as u8 + 40, size as usize)
+                };
+                writer.append(&LedgerRecord {
+                    id: *id,
+                    root: BookRoot::Library,
+                    locator: locator.as_str(),
+                    byte_size: size,
+                    misses: 1,
+                    source: Some(CachedSourceDigest::new(digest_of(&bytes))),
+                })?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    // The bytes those two copies held turn up under a name nobody knows.
+    sideload(&books, "Found.epub", &shared);
+    let mut random = words();
+    let (assigned, ids_seen) = scan_minting(
+        &root,
+        &[(BookRoot::Library, "Found.epub", size)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(
+        assigned.repaired, 0,
+        "either copy could be this file: {assigned:?}"
+    );
+    assert!(assigned.ambiguous >= 1, "and it is reported: {assigned:?}");
+    assert_eq!(assigned.minted, 1, "the file is a copy in its own right");
+    assert!(!ids_seen.contains(&Some(ids[0])));
+    assert!(!ids_seen.contains(&Some(ids[64])));
+}
