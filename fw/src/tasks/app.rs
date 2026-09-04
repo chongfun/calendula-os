@@ -109,8 +109,6 @@ pub async fn run() {
                     // first screen shows the true charge instead of boot()'s
                     // 100% placeholder.
                     state = state.apply_input(ctx, event);
-                    #[cfg(feature = "bench-selftest")]
-                    crate::bench_selftest::publish_view(state.view);
                     continue;
                 }
                 if matches!(
@@ -160,8 +158,6 @@ pub async fn run() {
                 let previous = state;
                 let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
-                #[cfg(feature = "bench-selftest")]
-                crate::bench_selftest::publish_view(state.view);
                 // Activity carries the post-input view so entering a view
                 // immediately gets that view's idle leash (e.g. opening a
                 // book starts the long Reading timeout right away).
@@ -889,6 +885,14 @@ async fn send_render(kind: RenderKind, state: &ReaderState) {
     // the display task is mid-flush, mid-prestage, or inside a storage or
     // background-build step waits for all of it, and a press arriving during
     // that wait would be credited to a frame frozen before it existed.
+    // Publishing here and not after apply_input is the difference between
+    // seeing the app's state and seeing only the presses. A Library pick is
+    // answered by the card, so the move to Reading arrives as a storage
+    // event and never touches the input arm: a scenario watching the input
+    // side would still read "library" after the book opened, and press
+    // Confirm into a hold that Library keeps while a pick is in flight.
+    #[cfg(feature = "bench-selftest")]
+    crate::bench_selftest::publish_view(state.view);
     let mut request = state.render_request(kind);
     request.requested_at_ms = Instant::now().as_millis();
     DISPLAY_COMMANDS.send(DisplayCommand::Render(request)).await;

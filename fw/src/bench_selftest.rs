@@ -46,8 +46,15 @@ use crate::{AppView, Button, InputEvent, PowerEvent, INPUT_EVENTS, POWER_EVENTS}
 /// press that produces two renders is answered by the first.
 pub static SETTLED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// The app's view as of its last applied input, so a scenario can drive
-/// against what the device actually shows rather than a blind key sequence.
+/// The view the app is about to paint, so a scenario can drive against what
+/// the device actually shows rather than a blind key sequence.
+///
+/// Published from `send_render`, the one place a render leaves the app, and
+/// not from the input arm. A Library pick is answered by the card, so the
+/// move to Reading arrives as a storage event that touches no input: a
+/// scenario reading the input side would still see "library" after the book
+/// opened and press Confirm into the hold Library keeps while a pick is in
+/// flight. That cost a storage-cache run twelve Confirms and one open.
 ///
 /// An atomic rather than a signal: the scenario polls it between presses and
 /// a stale read costs one wasted press, while a missed edge would hang it.
@@ -55,7 +62,7 @@ static VIEW: AtomicU8 = AtomicU8::new(VIEW_UNKNOWN);
 
 const VIEW_UNKNOWN: u8 = u8::MAX;
 
-/// Called by the app task after each applied input.
+/// Called by the app task as each render is frozen and sent.
 pub fn publish_view(view: AppView) {
     VIEW.store(view_code(view), Ordering::Relaxed);
 }
@@ -136,6 +143,14 @@ const QUIET_WINDOW_MS: u64 = 2_500;
 /// beats one that silently declines to run.
 const QUIET_BUDGET_MS: u64 = 120_000;
 
+/// How often to re-read the published view while waiting on one.
+const VIEW_POLL_MS: u64 = 100;
+
+/// How long to wait for a view to arrive before pressing again. Long enough
+/// for the second render an entry can paint, short enough that a wrong guess
+/// costs a press rather than the capture.
+const VIEW_SETTLE_MS: u64 = 3_000;
+
 /// Presses spent trying to reach Reading before the scenario gives up. Each
 /// one is a Confirm, and a card whose first row is a folder costs one per
 /// level, so this bounds folder depth rather than retries.
@@ -187,6 +202,18 @@ const SLEEP_ATTEMPTS: u32 = 3;
 /// `core::time::Duration`, which is what the RTC wake source takes;
 /// everything else in this module is on embassy's clock.
 pub const SLEEP_WAKE_AFTER: core::time::Duration = core::time::Duration::from_secs(20);
+
+/// How long a sleeping scenario waits at boot before it starts.
+///
+/// This is a reflash window, not a measurement. It costs one wait per cycle
+/// and buys back the ability to interrupt a device that is otherwise only
+/// reachable in whatever gap its own wake timer leaves.
+const SLEEP_SCENARIO_HOLD_MS: u64 = 25_000;
+
+/// Whether a scenario ends by sleeping, and so leaves the device cycling.
+fn scenario_sleeps(scenario: &str) -> bool {
+    matches!(scenario, "sleep-sync" | "reader-soak")
+}
 
 /// The key the scenario turns pages with.
 ///
@@ -271,6 +298,51 @@ async fn await_quiet(quiet_ms: u64, budget_ms: u64) -> bool {
     }
 }
 
+/// Wait for the app to be showing `target`, or give up.
+///
+/// A press is not always answered by one render. Entering Library paints the
+/// view and then paints again when the card hands over the rows, and a
+/// scenario that decided after the first render pressed once more into a
+/// view it had already reached. Polling the published view instead of
+/// counting renders makes that harmless.
+async fn wait_for_view(target: AppView, timeout_ms: u64) -> bool {
+    let deadline = embassy_time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if current_view() == Some(target) {
+            return true;
+        }
+        if embassy_time::Instant::now() >= deadline {
+            return false;
+        }
+        Timer::after(Duration::from_millis(VIEW_POLL_MS)).await;
+    }
+}
+
+/// Pick the selected row and report where it left the app.
+///
+/// One helper because getting this wrong is the same mistake three times.
+/// A pick is a storage command the card answers, so two things have to
+/// happen before the answer means anything. The queue has to be free, or
+/// the app refuses the command outright and says "storage rejected choose
+/// row" while staying exactly where it was. And the move to Reading can land
+/// on a later render than the one that answered the press, so a scenario
+/// that reads the view as soon as the press settles sees the shelf it was
+/// already on and calls a book a folder.
+///
+/// Returns the view the pick landed in: `Reading` for a book, `Library` for
+/// a folder now entered, `None` if the press itself did not settle.
+async fn pick_row() -> Option<AppView> {
+    let _ = await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await;
+    if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
+        return None;
+    }
+    if wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await {
+        Some(AppView::Reading)
+    } else {
+        current_view()
+    }
+}
+
 /// Walk from wherever boot left the device to Reading.
 ///
 /// Driven by the published view rather than a fixed key sequence, because
@@ -282,17 +354,19 @@ async fn reach_reading() -> bool {
     for attempt in 0..NAV_ATTEMPTS {
         match current_view() {
             Some(AppView::Reading) => return true,
-            Some(AppView::Library) => {
-                // A row is a book or a folder, and the card decides which.
-                // An open may build a cache, so this wears the open ceiling.
-                if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
+            Some(AppView::Library) => match pick_row().await {
+                Some(AppView::Reading) => return true,
+                // A folder: the walk is one level deeper and the next pick
+                // takes a row inside it.
+                Some(_) => {}
+                None => {
                     bench_log!(
                         "bench-selftest: nav timed out in library attempt={}",
                         attempt
                     );
                     return false;
                 }
-            }
+            },
             Some(AppView::Home) => {
                 if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
                     bench_log!("bench-selftest: nav timed out at home attempt={}", attempt);
@@ -328,7 +402,7 @@ async fn reach_reading() -> bool {
 /// that answers Back with itself would otherwise spin.
 async fn back_to_library() -> bool {
     for _ in 0..NAV_ATTEMPTS {
-        if current_view() == Some(AppView::Library) {
+        if wait_for_view(AppView::Library, VIEW_SETTLE_MS).await {
             return true;
         }
         if !press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
@@ -384,6 +458,11 @@ async fn open_and_quiesce() -> bool {
 /// success this call does not come back and the scenario resumes from the
 /// top on the other side.
 async fn request_sleep() -> bool {
+    // Measured: the first request of every sleep-sync cycle came back
+    // "sleep deferred until book open settles", because a background build
+    // was still holding storage work six page turns after the open. Waiting
+    // for the device to go quiet first turns that into a request that takes.
+    let _ = await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await;
     for attempt in 0..SLEEP_ATTEMPTS {
         press(Button::Power).await;
         // Nothing settles for a sleep, so this waits on the transition
@@ -468,16 +547,14 @@ async fn scenario_folder_nav() {
                 break;
             }
         }
-        // An open wears the open ceiling: the row may be a book with a cache
-        // to build.
-        if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
-            bench_log!("bench-selftest: entry {} did not settle", entry);
-            break;
-        }
-        match current_view() {
+        match pick_row().await {
             Some(AppView::Reading) => books += 1,
             Some(AppView::Library) => entered += 1,
-            _ => {}
+            Some(_) => {}
+            None => {
+                bench_log!("bench-selftest: entry {} did not settle", entry);
+                break;
+            }
         }
         if !back_to_library().await {
             bench_log!("bench-selftest: lost the library at entry {}", entry);
@@ -508,13 +585,24 @@ async fn scenario_reader_soak() {
 
     // Chapter jump: Confirm opens the list, a step moves the cursor off the
     // current chapter, Confirm takes it. This is the navigation a page-turn
-    // run never exercises.
+    // run does not exercise.
+    // Reading suppresses a Confirm for POST_OPEN_CONFIRM_BLOCK_MS after an
+    // open, so a reader's Confirm cannot be eaten by the open that just
+    // landed. Every page turn re-arms it, so a Confirm pressed the instant
+    // the last turn settles is inside the window and comes back as another
+    // Reading render. Measured: the jump reported false and the list did
+    // not open. Waiting for quiet clears it.
+    let _ = await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await;
     let mut jumped = false;
     if press_and_settle(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
-        && current_view() == Some(AppView::Chapters)
+        // Poll rather than read once. Every other view check in this module
+        // needed it, and a measured run reported jumped=false with the list
+        // plainly opening.
+        && wait_for_view(AppView::Chapters, VIEW_SETTLE_MS).await
         && press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await
     {
-        jumped = press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await;
+        jumped = press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await
+            && wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await;
     }
 
     // Home and Library returns, then back into the book.
@@ -583,6 +671,21 @@ pub async fn run() {
         scenario,
         view_name(current_view())
     );
+
+    // A scenario that sleeps leaves the device cycling: it wakes on the RTC
+    // timer, runs again, and sleeps again, forever. Deep sleep takes the USB
+    // Serial/JTAG peripheral down with it, so the only way to reflash is to
+    // catch an awake window, and without this hold those windows are short
+    // enough to need a polling loop. Measured: twelve espflash attempts in a
+    // row missed. So a sleeping scenario sits still first and gives the host
+    // a window it can rely on.
+    if scenario_sleeps(scenario) {
+        bench_log!(
+            "bench-selftest: holding {} ms before a sleeping scenario, reflash now if you meant to",
+            SLEEP_SCENARIO_HOLD_MS
+        );
+        Timer::after(Duration::from_millis(SLEEP_SCENARIO_HOLD_MS)).await;
+    }
 
     match scenario {
         "storage-cache" => scenario_storage_cache().await,
