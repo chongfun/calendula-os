@@ -85,7 +85,7 @@ use proto::identity::{
     LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_JOURNAL_SLOTS, LEDGER_JOURNAL_SLOT_BYTES,
     LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
 };
-use proto::library_path::BookRoot;
+use proto::library_path::{BookRoot, MAX_PATH_BYTES};
 use proto::source::CachedSourceDigest;
 
 /// The two generations, under the cache root.
@@ -325,6 +325,62 @@ where
         {
             found = Some((record.id, record.source));
         }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+/// The copy a [`BookId`] names, as the ledger has it.
+///
+/// Owned rather than borrowed like [`LedgerRecord`]: a caller resolving an
+/// id is between reads, and a borrowed record points into the buffer the
+/// next read fills.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryCopy {
+    pub root: BookRoot,
+    /// Where the copy sits, spelled exactly as the card spells it.
+    pub locator: heapless::String<MAX_PATH_BYTES>,
+    pub byte_size: u32,
+    /// Consecutive scans that have not found it. Zero is a copy the last
+    /// scan saw; anything else is a copy whose card may simply have been
+    /// out, which is why a record with misses still answers here.
+    pub misses: u8,
+    pub source: Option<CachedSourceDigest>,
+}
+
+/// Where the copy `id` names is now, or `None` when no record carries that
+/// id.
+///
+/// The reverse of [`find_record`], and the direction per-copy user state is
+/// addressed by: a reading position hangs from an id, and resuming it means
+/// asking which file that id is, wherever it has been moved or renamed to
+/// since. A locator answers the other question, which file this is, and the
+/// two meet in the catalog row that caches both.
+pub fn find_by_id<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+    ledger: &Ledger,
+    id: BookId,
+) -> Result<Option<LibraryCopy>, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut found: Option<LibraryCopy> = None;
+    for_each_record(root, ledger, &mut |_, record| {
+        if found.is_some() || record.id != id {
+            return Ok(());
+        }
+        let mut locator = heapless::String::new();
+        locator
+            .push_str(record.locator)
+            .map_err(|_| LedgerFault::Record)?;
+        found = Some(LibraryCopy {
+            root: record.root,
+            locator,
+            byte_size: record.byte_size,
+            misses: record.misses,
+            source: record.source,
+        });
         Ok(())
     })?;
     Ok(found)

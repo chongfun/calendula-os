@@ -807,13 +807,24 @@ write, and the side that is not live is missing every id the live one added,
 so taking it would re-mint those and orphan whatever comes to hang from
 them. The scan asks the ledger before it touches the catalog, so a refusal
 leaves the committed catalog serving the shelf as it was and stops only
-rebuilds, until the intact records are salvaged by something explicit. The join stages six-byte `(hash, row)` keys
-in the scan arena behind one bit per ledger record and reads the ledger once
-per 2,730 rows, so a rebuild costs one sequential pass over the ledger plus
-one row read and one 16-byte write per matched row, rather than a file open
-per book. Positions and caches still key by place; moving them onto `BookId`
-is the next milestone, together with the position-format migration in the
-reading-position work.
+rebuilds, until the intact records are salvaged by something explicit. The
+join stages six-byte `(hash, row)` keys in the scan arena behind one bit per
+ledger record and reads the ledger once per 2,730 rows, so a rebuild costs
+one sequential pass over the ledger plus one row read and one 16-byte write
+per matched row, rather than a file open per book.
+
+Positions and caches still key by place, and the mapping they will move onto
+is what exists now: a place resolves to the id that owns it
+(`upload_store::ledger::find_record`), an id resolves to wherever that copy
+has got to (`find_by_id`), and the open book carries its id in RAM beside
+its locator (`ReaderStore::active_copy_id`), so a rename moves the answer
+without changing the question and a copy the last scan missed still answers,
+saying how many scans have missed it. Two byte-identical copies are two ids
+whose records, sizes and digests move independently, and whose positions are
+filed apart because a cache directory is named for a place. The format
+change that files a position under its id belongs to the reading-position
+work, which moves the page index onto a content anchor in the same
+migration: one migration of the position file rather than two.
 
 A managed replacement, an upload landing under a name the shelf already
 holds, is the one case where a copy's bytes change under its id, and it

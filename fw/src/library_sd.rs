@@ -1297,6 +1297,7 @@ pub(crate) fn load_active_entry(
                 record.byte_size,
                 record.source_hash,
                 (!record.title.is_empty()).then_some(record.title.as_str()),
+                record.book_id,
             );
             true
         }

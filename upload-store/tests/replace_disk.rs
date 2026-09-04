@@ -21,7 +21,7 @@ use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Directory, Mode, TimeSource, Timestamp, VolumeIdx,
     VolumeManager,
 };
-use proto::cache::{source_hash_at, CACHE_ROOT_DIR, CATALOG_FILE};
+use proto::cache::{cache_key_from, source_hash_at, CACHE_ROOT_DIR, CATALOG_FILE};
 use proto::catalog::{
     catalog_record_book_id, encode_catalog_header, encode_catalog_placeholder_header,
     encode_catalog_record, CATALOG_HEADER_BYTES, CATALOG_RECORD_BYTES,
@@ -1742,4 +1742,91 @@ fn a_folder_answering_like_the_book_is_refused_before_the_book_is_parked() {
         "and its record is as it was"
     );
     assert_eq!(record_count(&root), 1);
+}
+
+/// A reader may keep two copies of one book on purpose, and the two are
+/// separate books to the library however identical their bytes: one id
+/// each, one record each, and state that stays where it was put. Reading
+/// one does not move the other, which today means their positions are filed
+/// in cache directories of their own.
+#[test]
+fn two_identical_copies_are_two_ids_with_state_of_their_own() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let shared = body(1, 3_000);
+    let size = shared.len() as u32;
+    let twin = "Dune (2).epub";
+    sideload(&books, BOOK, &shared);
+    sideload(&books, twin, &shared);
+    let (assigned, ids) = scan(
+        &root,
+        &[
+            (BookRoot::Library, BOOK, size),
+            (BookRoot::Library, twin, size),
+        ],
+    )
+    .unwrap();
+    assert_eq!(assigned.minted, 2);
+    let (first, second) = (ids[0].unwrap(), ids[1].unwrap());
+    assert_ne!(first, second, "identical bytes, two library entries");
+    assert_eq!(
+        digest_of(&shelf_bytes(&root, BOOK).unwrap()),
+        digest_of(&shelf_bytes(&root, twin).unwrap()),
+        "and one source digest between them"
+    );
+
+    let live = ledger::open(&root).unwrap().unwrap();
+    let one = ledger::find_by_id(&root, &live, first).unwrap().unwrap();
+    let other = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
+    assert_eq!(one.locator.as_str(), BOOK, "each id names its own copy");
+    assert_eq!(other.locator.as_str(), twin);
+    assert_ne!(
+        cache_key_from(source_hash_at(BookRoot::Library, BOOK, size)),
+        cache_key_from(source_hash_at(BookRoot::Library, twin, size)),
+        "and their state is filed apart"
+    );
+
+    // Replacing one is a change to that copy alone: the other keeps its id,
+    // its place, its size and what the ledger says of its bytes.
+    let newer = body(2, 4_100);
+    upload(&root, &books, BOOK, &newer, || {})
+        .unwrap()
+        .expect("lands");
+    assert_eq!(
+        record_for(&root, BOOK).map(|(id, size, _)| (id, size)),
+        Some((first, newer.len() as u32)),
+        "the copy that was replaced kept its id and took the new size"
+    );
+    let live = ledger::open(&root).unwrap().unwrap();
+    let other = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
+    assert_eq!(other.locator.as_str(), twin);
+    assert_eq!(other.byte_size, size);
+    assert_eq!(other.source, None, "nothing was said about the other copy");
+    assert_eq!(
+        shelf_bytes(&root, twin).as_deref(),
+        Some(&shared[..]),
+        "and its bytes are where they were"
+    );
+
+    // A third copy of those same bytes arriving as an upload is a third
+    // entry rather than a match onto either: same digest, same size as the
+    // twin, and an id of its own.
+    // Two mints have already come off the fixture's word source, one per
+    // copy, and an id is four draws.
+    let mut later = words();
+    for _ in 0..8 {
+        later();
+    }
+    upload_minting(&root, &books, "Third.epub", &shared, &mut later)
+        .unwrap()
+        .expect("lands");
+    let (third, third_size, third_source) = record_for(&root, "Third.epub").expect("adopted");
+    assert!(![first, second].contains(&third), "a third id");
+    assert_eq!(third_size, size);
+    assert!(
+        digest_agrees(third_source, &shared),
+        "the bytes the twin holds, recorded under an id of its own"
+    );
+    assert_eq!(record_count(&root), 3);
 }
