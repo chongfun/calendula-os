@@ -451,12 +451,13 @@ pub enum InstallError {
     /// A name resolved to more than one plausible entry: case variants of
     /// the shelf with no exact spelling, an exact non-directory squatting on
     /// the name beside a case-variant directory, or two books on the shelf
-    /// differing only by case where an upload is to land. A computer can
-    /// legally leave any of these behind. Nothing here can pick a reading
-    /// without risking the wrong library, and a landing beside a twin would
-    /// be refused by the shelf halfway through, so the card is refused
-    /// before anything is written until it is fixed on a computer. Unlike
-    /// [`Self::Card`] a retry without changing the card cannot help.
+    /// answering alike to the name where an upload is to land, by their long
+    /// names or by an alias. A computer can legally leave any of these
+    /// behind. Nothing here can pick a reading without risking the wrong
+    /// library, and a landing beside the other would be refused by the shelf
+    /// halfway through, so the card is refused before anything is written
+    /// until it is fixed on a computer. Unlike [`Self::Card`] a retry
+    /// without changing the card cannot help.
     Ambiguous,
     /// The library ledger refused: it is damaged, or of a version this build
     /// does not read, so the copy being replaced cannot have its identity
@@ -1667,6 +1668,15 @@ type SpelledHolder = (
 /// Refusing here is refusing before anything is journalled or moved. Nor
 /// does directory order decide anything: with one holder there is nothing
 /// to order, and with two the answer is the same whichever came first.
+///
+/// An entry with no long name answers to its rendered alias, which is the
+/// name a listing shows for it and the locator the library adopts it under,
+/// so it is compared the same way. That namespace is the one the landing
+/// will meet: a staged file moved in under a name an alias already holds is
+/// refused by the driver, halfway through the transaction, and a book the
+/// installer read as absent is a book the intent says nothing stood on.
+/// Only a name an alias could be is compared against one, which no upload
+/// is: a `.epub` extension is four characters where 8.3 allows three.
 fn spelled_holder_of_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
     books: &Directory<'_, D, T, MD, MF, MV>,
     long_name: &str,
@@ -1679,13 +1689,25 @@ where
     let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
     let mut holder: Option<SpelledHolder> = None;
     let mut holders = 0usize;
+    let alias_shaped = long_name.len() <= proto::storage::MAX_ALIAS_UTF8_BYTES;
     let walked = books.iterate_dir_lfn(&mut lfn, |entry, found| {
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
             return ControlFlow::Continue(());
         }
-        let Some(found) = found.filter(|name| same_long_name(name, long_name)) else {
-            return ControlFlow::Continue(());
+        use core::fmt::Write as _;
+        let mut rendered = String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
+        let held = match found {
+            Some(long) => long,
+            None => {
+                if !alias_shaped || write!(rendered, "{}", entry.name).is_err() {
+                    return ControlFlow::Continue(());
+                }
+                rendered.as_str()
+            }
         };
+        if !same_long_name(held, long_name) {
+            return ControlFlow::Continue(());
+        }
         holders += 1;
         if holders > 1 {
             // Two is already a refusal; the rest of the walk cannot change it.
@@ -1693,11 +1715,10 @@ where
         }
         let mut name = ShortName::new();
         let mut spelled = String::new();
-        use core::fmt::Write as _;
         // A name that would not fit is not this entry's alias, and the holder
         // is handed to steps that delete and move things. A spelling that
         // would not fit is a locator the ledger could not hold either.
-        if write!(name, "{}", entry.name).is_err() || spelled.push_str(found).is_err() {
+        if write!(name, "{}", entry.name).is_err() || spelled.push_str(held).is_err() {
             return ControlFlow::Continue(());
         }
         holder = Some((name, entry.cluster, spelled));

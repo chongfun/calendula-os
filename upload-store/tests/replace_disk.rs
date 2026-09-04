@@ -1425,3 +1425,215 @@ fn upload_minting(
     staged.write(bytes)?;
     staged.install(root, books, random)
 }
+
+/// Put a book on the shelf the way a computer or an old build does: an 8.3
+/// entry with no long name at all, which a listing shows, and a locator
+/// names, by its rendered alias.
+fn sideload_short_only(books: &Dir<'_>, alias: &str, bytes: &[u8]) {
+    let file = books
+        .open_file_in_dir(alias, Mode::ReadWriteCreate)
+        .expect("create short-only book");
+    file.write(bytes).expect("write book");
+    file.close().expect("close book");
+}
+
+/// A book with no long name is a book the library adopts under its rendered
+/// alias, so an upload landing on that name is a managed replacement like
+/// any other and must keep the copy's id. The install would meet that entry
+/// anyway: FAT gives a directory one namespace over long names and aliases
+/// together, so a staged file moved in under a name an alias holds is
+/// refused, halfway through a transaction whose intent said nothing stood
+/// there.
+#[test]
+fn a_book_with_no_long_name_is_replaced_under_its_alias_and_keeps_its_id() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let old = body(1, 3_000);
+    sideload_short_only(&books, "BOOK1234.EPU", &old);
+    let (assigned, ids) = scan(
+        &root,
+        &[(BookRoot::Library, "BOOK1234.EPU", old.len() as u32)],
+    )
+    .unwrap();
+    assert_eq!(assigned.minted, 1);
+    let id = ids[0].unwrap();
+
+    // Minted from further along the word source, so a fresh id would be a
+    // different id and the assertion below means what it says.
+    let mut later = words();
+    for _ in 0..4 {
+        later();
+    }
+    let new = body(2, 4_100);
+    upload_minting(&root, &books, "BOOK1234.EPU", &new, &mut later)
+        .unwrap()
+        .expect("the book lands");
+    assert_eq!(
+        shelf_bytes(&root, "BOOK1234.EPU").as_deref(),
+        Some(&new[..])
+    );
+    let (found, size, source) = record_for(&root, "BOOK1234.EPU").expect("still a record");
+    assert_eq!(found, id, "the copy kept its id");
+    assert_eq!(size, new.len() as u32);
+    assert!(digest_agrees(source, &new), "and took the new digest");
+    assert_eq!(record_count(&root), 1, "one copy, one record");
+    assert_eq!(replace::read(&root).unwrap(), None, "the intent is cleared");
+    assert_eq!(
+        install::read_intent(&root).unwrap(),
+        install::IntentState::Absent
+    );
+    let (assigned, ids) = scan(
+        &root,
+        &[(BookRoot::Library, "BOOK1234.EPU", new.len() as u32)],
+    )
+    .unwrap();
+    assert_eq!(assigned.matched, 1);
+    assert_eq!(assigned.minted, 0);
+    assert_eq!(ids[0], Some(id));
+}
+
+/// A shelf can hold an entry with a long name and another with only an
+/// alias that answer to the same name, which the ledger knows as two
+/// records. Neither can be replaced while the other is there, so the upload
+/// is refused before anything is journalled, as it is for two long names.
+#[test]
+fn an_alias_and_a_long_name_answering_alike_are_refused_before_anything_moves() {
+    let disk = new_card();
+    let alias_side = body(1, 2_000);
+    let long_side = body(2, 2_500);
+    {
+        let mgr = open_mgr(&disk);
+        let (_, books) = open_dirs(&mgr);
+        sideload_short_only(&books, "BOOK1234.EPU", &alias_side);
+        sideload(&books, "bookXXXXX.epu", &long_side);
+    }
+    {
+        let mut data = disk.0.data.borrow_mut();
+        rewrite_long_name(&mut data, "bookXXXXX.epu", "book1234.epu");
+    }
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    assert_eq!(
+        shelf_bytes(&root, "BOOK1234.EPU").as_deref(),
+        Some(&alias_side[..])
+    );
+    assert_eq!(
+        shelf_bytes(&root, "book1234.epu").as_deref(),
+        Some(&long_side[..])
+    );
+
+    let refused = upload(&root, &books, "BOOK1234.EPU", &body(3, 3_000), || {});
+    assert!(
+        matches!(refused, Err(InstallError::Ambiguous)),
+        "an alias and a long name answering alike are a refusal: {refused:?}"
+    );
+    assert_eq!(replace::read(&root).unwrap(), None, "no intent");
+    assert_eq!(
+        install::read_intent(&root).unwrap(),
+        install::IntentState::Absent,
+        "and no install journal"
+    );
+    assert_eq!(
+        shelf_bytes(&root, "BOOK1234.EPU").as_deref(),
+        Some(&alias_side[..]),
+        "the shelf is as it was"
+    );
+    assert_eq!(
+        shelf_bytes(&root, "book1234.epu").as_deref(),
+        Some(&long_side[..])
+    );
+}
+
+/// The books an old build uploaded are an alias with sidecars and no long
+/// name, and a re-upload of one arrives under a long name that matches
+/// nothing on the shelf. The identity sidecar finds it, and the copy keeps
+/// its id as its place is respelled to the long name the shelf now shows.
+#[test]
+fn a_book_from_before_long_names_keeps_its_id_when_re_uploaded() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let client_name = b"Middlemarch.epub";
+    let alias = proto::upload::sanitized_name(client_name);
+    let identity = proto::upload::hash_identity(client_name);
+    let old = body(1, 3_000);
+    sideload_short_only(&books, alias.as_str(), &old);
+    write_legacy_sidecars(&root, alias.as_str(), identity, "Middlemarch");
+    let (assigned, ids) = scan(
+        &root,
+        &[(BookRoot::Library, alias.as_str(), old.len() as u32)],
+    )
+    .unwrap();
+    assert_eq!(assigned.minted, 1);
+    let id = ids[0].unwrap();
+
+    let long_name = proto::upload::wireless_epub_filename(client_name);
+    let mut later = words();
+    for _ in 0..4 {
+        later();
+    }
+    let new = body(2, 4_100);
+    let mut staged = StagedUpload::begin(
+        &root,
+        &books,
+        long_name.as_str(),
+        Some(install::LegacyKey {
+            alias: {
+                let mut owned = heapless::String::<12>::new();
+                owned.push_str(alias.as_str()).unwrap();
+                owned
+            },
+            identity,
+        }),
+    )
+    .expect("stage");
+    staged.write(&new).expect("stream");
+    staged
+        .install(&root, &books, &mut later)
+        .expect("install")
+        .expect("the book lands");
+
+    assert_eq!(
+        shelf_bytes(&root, long_name.as_str()).as_deref(),
+        Some(&new[..]),
+        "the shelf shows the long name now"
+    );
+    assert_eq!(shelf_bytes(&root, alias.as_str()), None);
+    let (locator, size, source) = record_by_id(&root, id).expect("the id survives");
+    assert_eq!(locator, long_name.as_str(), "respelled to the long name");
+    assert_eq!(size, new.len() as u32);
+    assert!(digest_agrees(source, &new));
+    assert_eq!(record_count(&root), 1, "one copy, one record");
+    assert_eq!(replace::read(&root).unwrap(), None);
+}
+
+/// The sidecars an old build wrote beside a book: its identity, and the
+/// display label the alias could not hold.
+fn write_legacy_sidecars(root: &Dir<'_>, alias: &str, identity: u64, label: &str) {
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap_or_else(|_| {
+        root.make_dir_in_dir(CACHE_ROOT_DIR).expect("make READER");
+        root.open_dir(CACHE_ROOT_DIR).expect("open READER")
+    });
+    if cache_root.open_dir("LABELS").is_err() {
+        cache_root.make_dir_in_dir("LABELS").expect("make LABELS");
+    }
+    let labels = cache_root.open_dir("LABELS").expect("labels");
+    let stem = alias.split('.').next().expect("stem");
+
+    let mut id_name = String::from(stem);
+    id_name.push_str(".ID");
+    let file = labels
+        .open_file_in_dir(id_name.as_str(), Mode::ReadWriteCreate)
+        .expect("identity sidecar");
+    file.write(&identity.to_le_bytes()).expect("write identity");
+    file.close().expect("close");
+
+    let mut txt_name = String::from(stem);
+    txt_name.push_str(".TXT");
+    let file = labels
+        .open_file_in_dir(txt_name.as_str(), Mode::ReadWriteCreate)
+        .expect("label sidecar");
+    file.write(label.as_bytes()).expect("write label");
+    file.close().expect("close");
+}
