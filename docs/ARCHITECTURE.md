@@ -477,6 +477,19 @@ page turns differ by controller:
 - **X3 (UC8253)**: Uploads the firmware-defined `HALF` LUT bank in absolute CDI
   mode — a similar short clean without temperature overrides.
 
+The X3's clean plans also owe the panel 200 ms of quiet before its RAM is
+written again. Nothing in the plan follows that interval, so it rides on
+`FlushPlan::settle_after_ms` instead of being the flush's last step, and the
+caller holds it: the display task reports the frame, waits, then prestages,
+which is the write the interval guards. The gap is unchanged, only which side
+of `DisplayEvent::Settled` it falls on, and that takes it off press-to-settled
+on every view change, wake and menu step. A plan is therefore not finished when
+its steps are, and a caller that drops the interval rather than deferring it is
+the one way to get this wrong: the emulator's panel model refuses a RAM write
+while an unheld settle stands, and in firmware the returned `PanelSettle` is a
+bound variable, so deleting the wait fails the build. Neither guard reaches the
+other's call site.
+
 Waking from the sleep screen and view/context changes use `FastClean`
 instead of the full waveform, since the panel's contents are known.
 

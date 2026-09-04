@@ -1,5 +1,6 @@
 use crate::panel_common::{
-    cmd_history_entry, expect_len, ram_history_entry, HISTORY_DEEP_SLEEP, HISTORY_RESET,
+    cmd_history_entry, expect_len, ram_history_entry, FlushOutcome, HISTORY_DEEP_SLEEP,
+    HISTORY_RESET,
 };
 use display::epd::{
     ram_x_counter, ram_x_range, ram_y_counter, ram_y_range, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
@@ -105,7 +106,7 @@ impl PanelModel {
         previous: &Framebuffer,
         mode: RefreshMode,
         previous_staged: bool,
-    ) -> Result<RefreshMode, String> {
+    ) -> Result<FlushOutcome, String> {
         self.write_framebuffer_bw(current)?;
         if mode == RefreshMode::Fast {
             if !previous_staged {
@@ -115,7 +116,23 @@ impl PanelModel {
             self.write_framebuffer_red(current)?;
         }
         self.refresh(mode)?;
-        Ok(mode)
+        // Every sequence here ends on a completed BUSY wait, so nothing is
+        // owed. The UC8253's clean plans are why `FlushOutcome` carries this.
+        Ok(FlushOutcome {
+            effective_mode: mode,
+            settle_ms: 0,
+        })
+    }
+
+    /// Counterpart to the UC8253 model's `settle`, so one caller drives both
+    /// panels. Nothing is ever owed here, so the only check is that the caller
+    /// is not holding an interval it invented.
+    pub fn settle(&mut self, ms: u16) -> Result<(), String> {
+        if ms == 0 {
+            Ok(())
+        } else {
+            Err(format!("settled {ms}ms against an owed 0ms"))
+        }
     }
 
     pub fn prestage_previous(&mut self, fb: &Framebuffer) -> Result<(), String> {

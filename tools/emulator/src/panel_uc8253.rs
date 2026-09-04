@@ -6,7 +6,8 @@
 //! DTM1 data-stop ordering, LUT/CDI readiness, power, refresh, and sleep.
 
 use crate::panel_common::{
-    cmd_history_entry, expect_len, ram_history_entry, HISTORY_DEEP_SLEEP, HISTORY_RESET,
+    cmd_history_entry, expect_len, ram_history_entry, settle_history_entry, FlushOutcome,
+    HISTORY_DEEP_SLEEP, HISTORY_RESET,
 };
 use display::epd::{
     bank_for, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank, RamPlane, RefreshMode,
@@ -39,6 +40,10 @@ pub struct PanelModel {
     ram_write: Option<RamWriteState>,
     plane_complete: [bool; 2],
     old_needs_stop: bool,
+    /// Interval the last flush handed over and the caller has yet to hold.
+    /// Non-zero blocks the next RAM write, which is what makes the handover
+    /// testable rather than decorative.
+    owed_settle_ms: u16,
     commands: Vec<(u8, usize)>,
     history: Vec<String>,
 }
@@ -58,6 +63,7 @@ impl PanelModel {
             ram_write: None,
             plane_complete: [false; 2],
             old_needs_stop: false,
+            owed_settle_ms: 0,
             commands: Vec::new(),
             history: Vec::new(),
         }
@@ -158,7 +164,7 @@ impl PanelModel {
         previous: &Framebuffer,
         requested_mode: RefreshMode,
         previous_staged: bool,
-    ) -> Result<RefreshMode, String> {
+    ) -> Result<FlushOutcome, String> {
         if !self.initialized {
             return Err("flush before init sequence".into());
         }
@@ -173,7 +179,30 @@ impl PanelModel {
         self.last_refresh = Some(plan.effective_mode);
         self.history
             .push(format!("refresh {:?}", plan.effective_mode));
-        Ok(plan.effective_mode)
+        // Handed over, not spent here. `settle` is the caller's side of it,
+        // standing in for the firmware awaiting `PanelSettle`.
+        self.owed_settle_ms = plan.settle_after_ms;
+        Ok(FlushOutcome {
+            effective_mode: plan.effective_mode,
+            settle_ms: plan.settle_after_ms,
+        })
+    }
+
+    /// Hold the interval the last flush handed back, releasing the planes for
+    /// writing. `ms` is what that flush returned, so settling an interval the
+    /// panel did not ask for is reported rather than absorbed.
+    pub fn settle(&mut self, ms: u16) -> Result<(), String> {
+        if ms != self.owed_settle_ms {
+            return Err(format!(
+                "settled {ms}ms against an owed {}ms",
+                self.owed_settle_ms
+            ));
+        }
+        if ms > 0 {
+            self.history.push(settle_history_entry(ms));
+        }
+        self.owed_settle_ms = 0;
+        Ok(())
     }
 
     pub fn prestage_previous(&mut self, fb: &Framebuffer) -> Result<(), String> {
@@ -278,6 +307,12 @@ impl PanelModel {
         if self.old_needs_stop {
             return Err("RAM write before DATA_STOP completed DTM1".into());
         }
+        if self.owed_settle_ms > 0 {
+            return Err(format!(
+                "RAM write inside the plan's {}ms settle",
+                self.owed_settle_ms
+            ));
+        }
         self.plane_complete[plane_index(plane)] = false;
         self.ram_write = Some(RamWriteState { plane, written: 0 });
         Ok(())
@@ -335,6 +370,7 @@ impl PanelModel {
         self.ram_write = None;
         self.plane_complete = [false; 2];
         self.old_needs_stop = false;
+        self.owed_settle_ms = 0;
         self.history.push(HISTORY_RESET.into());
     }
 }
@@ -388,7 +424,7 @@ mod tests {
             .flush(&fb, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
 
-        assert_eq!(effective, RefreshMode::Full);
+        assert_eq!(effective.effective_mode, RefreshMode::Full);
         assert_eq!(panel.last_refresh(), Some(RefreshMode::Full));
         assert_eq!(
             panel.commands[start..]
@@ -409,7 +445,7 @@ mod tests {
         let effective = panel
             .flush(&fb, &Framebuffer::new(), RefreshMode::Fast, false)
             .unwrap();
-        assert_eq!(effective, RefreshMode::FastClean);
+        assert_eq!(effective.effective_mode, RefreshMode::FastClean);
         assert_eq!(panel.cdi, Some([CDI_ABSOLUTE, CDI_INTERVAL]));
     }
 
@@ -440,6 +476,80 @@ mod tests {
         assert!(!panel.commands[start..]
             .iter()
             .any(|(cmd, _)| *cmd == CMD_DTM1));
+    }
+
+    /// A13: the settle is the caller's now, so the caller is the part that has
+    /// to be right. Skipping it must fail here, not pass quietly.
+    #[test]
+    fn a_prestage_that_skips_the_clean_settle_is_rejected() {
+        let mut panel = PanelModel::new();
+        panel.init_sequence().unwrap();
+        let fb = frame(11, 13);
+        let start = panel.history().len();
+        let flushed = panel
+            .flush(&fb, &Framebuffer::new(), RefreshMode::FastClean, false)
+            .unwrap();
+        assert_eq!(flushed.settle_ms, 200, "the interval must not change");
+
+        let skipped = panel.prestage_previous(&fb).unwrap_err();
+        assert!(
+            skipped.contains("settle"),
+            "prestage inside the settle must name it: {skipped}"
+        );
+
+        // Held, and the same plane write goes through.
+        panel.settle(flushed.settle_ms).unwrap();
+        panel.prestage_previous(&fb).unwrap();
+
+        let tail = &panel.history()[start..];
+        let held = tail
+            .iter()
+            .position(|entry| entry == "settle 200ms")
+            .unwrap_or_else(|| panic!("the held interval left no trace: {tail:?}"));
+        assert_eq!(
+            tail[held - 1], "refresh FastClean",
+            "the interval follows the refresh: {tail:?}"
+        );
+        assert!(
+            tail[held + 1].starts_with("ram 0x10"),
+            "and precedes the DTM1 write it guards: {tail:?}"
+        );
+    }
+
+    /// Inventing an interval is as much a modelling error as skipping one.
+    #[test]
+    fn a_settle_the_plan_did_not_ask_for_is_rejected() {
+        let mut panel = PanelModel::new();
+        panel.init_sequence().unwrap();
+        let fb = frame(5, 7);
+        let flushed = panel
+            .flush(&fb, &Framebuffer::new(), RefreshMode::FastClean, false)
+            .unwrap();
+        assert!(panel.settle(0).unwrap_err().contains("owed 200ms"));
+        panel.settle(flushed.settle_ms).unwrap();
+        assert!(panel.settle(200).unwrap_err().contains("owed 0ms"));
+    }
+
+    /// The counterpart: a fast turn runs straight into the prestage, so it
+    /// owes nothing and must not stall the caller.
+    #[test]
+    fn a_fast_flush_owes_no_settle() {
+        let mut panel = PanelModel::new();
+        panel.init_sequence().unwrap();
+        let first = frame(2, 4);
+        let full = panel
+            .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
+            .unwrap();
+        assert_eq!(full.settle_ms, 0);
+        panel.prestage_previous(&first).unwrap();
+
+        let second = frame(8, 16);
+        let fast = panel
+            .flush(&second, &first, RefreshMode::Fast, true)
+            .unwrap();
+        assert_eq!(fast.settle_ms, 0, "a fast turn must not stall the reader");
+        // Nothing held, and the prestage still goes straight through.
+        panel.prestage_previous(&second).unwrap();
     }
 
     #[test]
