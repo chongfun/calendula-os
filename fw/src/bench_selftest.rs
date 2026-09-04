@@ -676,9 +676,21 @@ async fn scenario_folder_nav() -> Result_ {
                 // Paging the list is the other half of what this suite
                 // times, so a stalled step is a phase that did not run. The
                 // walk carries on, because the entries it does collect are
-                // still real ones, and the record below stops the capture
-                // from certifying as though it covered the paging.
-                scroll_stalled = true;
+                // still real ones.
+                //
+                // Reported here rather than after the loop, and this is the
+                // whole point of the placement: the host ends a
+                // `--entries 20` capture the moment it parses the twentieth
+                // `folder_enter`, and the firmware prints that from inside
+                // `pick_row`. Anything written after the loop goes to a host
+                // that has already stopped, so a run that stalled early and
+                // then reached its twenty entries would have certified with
+                // the record it owed still unsent. Once per run, since the
+                // second stall says nothing the first did not.
+                if !scroll_stalled {
+                    report_invalid("folder-nav", "scroll-stalled");
+                    scroll_stalled = true;
+                }
                 break;
             }
         }
@@ -711,9 +723,6 @@ async fn scenario_folder_nav() -> Result_ {
         books,
         attempts
     );
-    if scroll_stalled {
-        report_invalid("folder-nav", "scroll-stalled");
-    }
     if entered < FOLDER_ENTRIES {
         return "short-entries";
     }

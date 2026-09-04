@@ -97,9 +97,14 @@ does nothing, rather than quietly running the default under the wrong name.
 A selftest scenario says which one it is and how it ended, in three records
 with one rule each.
 
-- **It announces itself on every boot**: `bench-selftest: scenario=X
-  view=...`. `--strict` fails if X is not the workflow the capture was taken
-  as, which catches the stale flash. That check matters most for
+- **Every record names its scenario, and all of them are checked.** The
+  announcement is `bench-selftest: scenario=X view=...`, printed once per
+  boot, and `--strict` fails if X is not the workflow the capture was taken
+  as. The same comparison runs on the terminal and invalid records, because
+  the announcement prints four seconds after boot while a finite scenario
+  works for minutes: a capture attached late sees a terminal record and no
+  announcement, and a `page-turn` image captured as `storage-cache` supplies
+  storage telemetry from opening its book. The check matters most for
   `reader-soak`, whose gate asks for input and render telemetry plus a
   completed sleep and a later wake: a `sleep-sync` image produces every one
   of those, and a successful sleeping scenario writes no terminal record, so
@@ -114,7 +119,11 @@ with one rule each.
   on any of them, because the device has stopped talking, and `--strict`
   certifies only `done`.
 - **A phase that did not run** reports `bench-selftest: scenario=X
-  invalid=REASON` and the scenario carries on. `--strict` fails on it too,
+  invalid=REASON` the moment it happens, and the scenario carries on.
+  Reported at the moment and not summarized at the end, because a count
+  target can stop the capture mid-scenario: `folder-nav --entries 20` ends on
+  the twentieth `folder_enter`, so a stall summarized after the walk goes to
+  a host that has stopped listening. `--strict` fails on it too,
   but the rest of the capture survives, which matters for a soak whose sleep
   and wake are still worth having.
 

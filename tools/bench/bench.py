@@ -2421,18 +2421,28 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
         # open on its second cycle ended the capture on `nav-failed` while its
         # first cycle had already produced the telemetry and budget samples
         # this gate asks for.
-        # A selftest image announces itself on every boot, so a capture can
-        # check that the firmware on the device is the one the command asked
-        # for. Only checked when the marker is present, so a capture from a
-        # shipped build is unaffected. `workflow` and not `suite`, so a
-        # thermal-run comparison uses the workflow it selected.
-        for event in signal_events:
-            if event.get("event") != "selftest_start":
-                continue
-            announced = str(event.get("scenario"))
-            if workflow is not None and announced != workflow:
+        # Every selftest record names its scenario, so every one of them can
+        # answer whether the firmware on the device is what the command asked
+        # for. Checked across all three and not only the announcement: that
+        # line prints once, four seconds after boot, while a finite scenario
+        # goes on working for minutes, so a capture attached late sees a
+        # terminal record and no announcement. A page-turn image captured as
+        # `storage-cache --strict` supplies storage telemetry from opening
+        # its book and then reports `scenario=page-turn result=done`, which
+        # the result check has no opinion about.
+        #
+        # Only checked where a record exists, so a capture from a shipped
+        # build is unaffected: it emits none of these. `workflow` and not
+        # `suite`, so a thermal-run comparison uses the workflow it selected.
+        announced = {
+            str(event.get("scenario"))
+            for event in signal_events
+            if str(event.get("event", "")).startswith("selftest_")
+        }
+        for scenario in sorted(announced):
+            if workflow is not None and scenario != workflow:
                 warnings.append(
-                    f"{label}: the device is running the {announced} selftest "
+                    f"{label}: the device is running the {scenario} selftest "
                     f"scenario, but this capture was taken as {workflow}"
                 )
         terminals = [e for e in signal_events if e.get("event") == "selftest_done"]
