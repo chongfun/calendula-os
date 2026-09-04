@@ -2408,11 +2408,118 @@ fn a_file_left_unread_leaves_the_copy_it_could_be_unsettled() {
         "one of two files was read: {assigned:?}"
     );
     assert!(assigned.unresolved >= 1, "and the copy waits: {assigned:?}");
-    assert_eq!(assigned.minted, 17, "every file is a copy in its own right");
+    assert_eq!(
+        assigned.minted, 16,
+        "the files that were read are copies in their own right"
+    );
+    assert_eq!(
+        ids[16], None,
+        "and the one that was not waits, unadopted, for a scan that reads it"
+    );
     assert!(!ids.contains(&Some(id)));
     let live = ledger::open(&root).unwrap().unwrap();
     let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
     assert_eq!(copy.misses, 1, "still missing, still waiting");
+}
+
+/// A file the budget could not reach is not adopted, so the next scan can
+/// still ask about it: the copy waiting on it is found on the scan after
+/// the one that ran out of reading. Files that were read and proved to be
+/// other books are adopted straight away, so each scan gets further
+/// through the same question.
+#[test]
+fn a_copy_the_budget_could_not_reach_is_found_on_the_next_scan() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    // Sixteen strangers of the copy's length arrive ahead of it in the
+    // listing, and the copy itself is renamed at the end.
+    let mut names = Vec::new();
+    for stranger in 0..16u8 {
+        let name = std::format!("Stranger{stranger:02}.epub");
+        sideload(&books, &name, &body(stranger + 40, size as usize));
+        names.push(name);
+    }
+    rename_on_shelf(&root, BOOK, "Moved.epub");
+    names.push(std::string::String::from("Moved.epub"));
+    let rows: Vec<Row<'_>> = names
+        .iter()
+        .map(|name| (BookRoot::Library, name.as_str(), size))
+        .collect();
+
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(
+        assigned.repaired, 0,
+        "the budget ran out first: {assigned:?}"
+    );
+    assert_eq!(assigned.hashed, 16);
+    assert_eq!(assigned.minted, 16, "the strangers are their own copies");
+    assert_eq!(ids[16], None, "and the copy's file waits, unadopted");
+    let _ = found_again();
+
+    // The next scan has one file left to ask about, and the answer settles
+    // it: the copy is where it went, under the id it always had.
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 1, "found on the next scan: {assigned:?}");
+    assert_eq!(assigned.hashed, 1, "one file left to read");
+    assert_eq!(assigned.minted, 0);
+    assert_eq!(ids[16], Some(id));
+    assert_eq!(
+        found_again(),
+        vec![(id, BOOK.to_owned(), "Moved.epub".to_owned())],
+    );
+    let live = ledger::open(&root).unwrap().unwrap();
+    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
+    assert_eq!(copy.locator(), Some("Moved.epub"));
+    assert_eq!(copy.misses, 0);
+}
+
+/// A file the card would not give up is the same case as one the budget
+/// could not reach: it proves nothing, it is not adopted on the strength of
+/// that, and the copy it could be waits for a scan that can read it.
+#[test]
+fn a_file_the_card_would_not_read_is_asked_about_again() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    // The copy is gone from where it was, and the row that would hold it
+    // cannot be read this time round.
+    remove_from_shelf(&root, BOOK);
+    let rows = [(BookRoot::Library, "Moved.epub", size)];
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 0, "nothing was read: {assigned:?}");
+    assert_eq!(assigned.hashed, 0);
+    assert_eq!(assigned.minted, 0, "and nothing was adopted on that");
+    assert_eq!(ids[0], None);
+    assert!(assigned.unresolved >= 1);
+
+    // The card gives it up on the next scan, and the copy is found.
+    sideload(&books, "Moved.epub", &bytes);
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(
+        assigned.repaired, 1,
+        "found once it could be read: {assigned:?}"
+    );
+    assert_eq!(ids[0], Some(id));
+    assert_eq!(record_count(&root), 1, "one copy, one record");
 }
 
 /// One scan carries as many missing copies as its arena holds, and the

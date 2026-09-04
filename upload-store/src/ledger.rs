@@ -808,7 +808,10 @@ pub struct Assignment {
     /// Copies this scan did not read enough to place: a file that could
     /// have been one of them went unread, for want of budget or because
     /// the card would not give it up. They stay missing, on the ordinary
-    /// retention, and the next scan looks again.
+    /// retention, and the file that could be them is left unadopted so the
+    /// next scan can still ask. A file that was read and proved to be
+    /// another book is adopted straight away, so a scan that runs out of
+    /// reading gets through more of the same question each time.
     pub unresolved: u16,
 }
 
@@ -1102,8 +1105,14 @@ where
     // card says what its bytes were, and a name and a length are not a
     // book.
     let mut slots = 0usize;
-    let capacity = (keys.len() / MOVE_ENTRY_BYTES).min(MOVES_CONSIDERED);
-    let table = &mut keys[..capacity * MOVE_ENTRY_BYTES];
+    // A bit per row, set for a row this scan left in question: one it did
+    // not read while a copy it could be was waiting. Those rows are not
+    // adopted, which is what keeps the question open; see the fill below.
+    let deferred_bytes = (count as usize).div_ceil(8).min(keys.len());
+    let (deferred, work) = keys.split_at_mut(deferred_bytes);
+    deferred.fill(0);
+    let capacity = (work.len() / MOVE_ENTRY_BYTES).min(MOVES_CONSIDERED);
+    let table = &mut work[..capacity * MOVE_ENTRY_BYTES];
     if let Some(live) = live {
         if missing_records > 0 && new_rows > 0 && capacity > 0 {
             for_each_record(root, &live, &mut |index, entry| {
@@ -1177,10 +1186,12 @@ where
             // give the file up, the answer is the same: not this scan.
             if assigned.hashed >= MOVE_HASHES {
                 move_unresolved(table, slots, byte_size, &mut assigned.unresolved);
+                set_bit(deferred, row as u16);
                 continue;
             }
             let Ok(Some(found)) = crate::replace::digest_at(root, at, locator) else {
                 move_unresolved(table, slots, byte_size, &mut assigned.unresolved);
+                set_bit(deferred, row as u16);
                 continue;
             };
             assigned.hashed = assigned.hashed.saturating_add(1);
@@ -1209,6 +1220,7 @@ where
         }
     }
     let table = &table[..slots * MOVE_ENTRY_BYTES];
+    let deferred = &deferred[..];
     // Told only now: a match is settled once every row has been read, since
     // a second file holding the same bytes makes one ambiguous, and
     // a caller acting on a move that turns out to be two would file a
@@ -1297,6 +1309,16 @@ where
                     return Err(LedgerFault::Device);
                 }
                 if catalog_record_book_id(&record).is_some() {
+                    continue;
+                }
+                // A row this scan left in question waits, without an id and
+                // without a record. Adopting it would settle the question
+                // the wrong way for good: the next scan would match it by
+                // place, stop looking, and the copy that could have been it
+                // would age out with nowhere to go. A row nobody is waiting
+                // on is adopted below as usual, and a row whose waiting
+                // copy ages out becomes one of those.
+                if bit(deferred, row as u16) {
                     continue;
                 }
                 let (at, locator, byte_size) =

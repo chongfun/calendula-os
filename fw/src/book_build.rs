@@ -725,9 +725,6 @@ where
 /// opened long enough is one a move cannot find again, which is the state
 /// every book was in before.
 pub(crate) struct SourceEvidenceJob {
-    /// The catalog row this is reading, so a book that changes under the
-    /// job takes the job with it.
-    pub(crate) index: usize,
     at: BookRoot,
     locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
     key: String<{ proto::cache::CACHE_KEY_BYTES }>,
@@ -755,11 +752,41 @@ pub(crate) enum EvidenceStep {
 /// own slice, since it is the same reader waiting either way.
 const EVIDENCE_SLICE_BYTES: u32 = 192 * 1024;
 
-/// The job for the book at `index`, when the store knows where it is.
+impl SourceEvidenceJob {
+    /// The place this is reading, which is what the claim it will write is
+    /// filed under.
+    pub(crate) fn place(&self) -> &str {
+        self.key.as_str()
+    }
+}
+
+/// The place the open book occupies, which is where both its reading place
+/// and what it recorded of its bytes are filed.
+///
+/// A place rather than a row number, since a rescan renumbers rows and this
+/// has to outlive one, and rather than a [`proto::identity::BookId`], since
+/// a book whose adoption a scan is still deciding has no id yet and its
+/// bytes are worth reading all the same.
+pub(crate) fn evidence_place(
+    library: &ReaderStore,
+) -> Option<String<{ proto::cache::CACHE_KEY_BYTES }>> {
+    let index = library.active_index()?;
+    let len = library.catalog_entry(index)?.byte_size;
+    if len == 0 {
+        return None;
+    }
+    let (at, locator) = library.book_location(index)?;
+    Some(proto::cache::cache_key_from(proto::cache::source_hash_at(
+        at, locator, len,
+    )))
+}
+
+/// The job for the open book, when the store knows where it is.
 ///
 /// No card access: whether the claim already records the bytes is the first
 /// slice's business, so arming costs an open nothing.
-pub(crate) fn evidence_job(library: &ReaderStore, index: usize) -> Option<SourceEvidenceJob> {
+pub(crate) fn evidence_job(library: &ReaderStore) -> Option<SourceEvidenceJob> {
+    let index = library.active_index()?;
     let (at, locator) = library.book_location(index)?;
     let len = library.catalog_entry(index)?.byte_size;
     if len == 0 {
@@ -769,7 +796,6 @@ pub(crate) fn evidence_job(library: &ReaderStore, index: usize) -> Option<Source
     let mut owned = String::new();
     owned.push_str(locator).ok()?;
     Some(SourceEvidenceJob {
-        index,
         at,
         locator: owned,
         key,

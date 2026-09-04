@@ -852,8 +852,11 @@ per copy, and recorded in the claim on the cache directory it keeps its
 reading place in. The read rides the same background slices the spine walk
 uses rather than standing between the reader and their first page: a book is
 megabytes and this card gives up around 550 kB a second, so a large one is
-the better part of a minute. Nothing depends on it finishing, and a book
-closed halfway through is one whose bytes are read again on a later open.
+the better part of a minute. It follows the book that is open, by place
+rather than by row number, since a rescan renumbers rows: a reader who moves
+on takes the reading with them, and the copy they left is read again
+whenever it is opened again. Nothing depends on it finishing, and a partial
+read records nothing.
 
 That directory is named for the place the record still names, so the search
 asks it for any copy the ledger says nothing about: a book that has been
@@ -871,8 +874,13 @@ holds and reads at most sixteen books. Those bounds limit which copies a
 scan can repair, not what it knows about the ones it does: every missing
 copy's digest is compared against the ones being carried, so a twin past the
 end of the table still refuses the repair, and a file of the right length
-that goes unread leaves every copy it could have been unsettled until a
-later scan reads it. A reorganisation larger than one scan is repaired as
+that goes unread leaves every copy it could have been unsettled. Such a file
+is left unadopted, without an id, which is what keeps the question open: a
+scan that adopted it would match it by place ever after and stop looking,
+and the copy waiting on it would age out with nowhere to go. Files that were
+read and proved to be other books are adopted at once, so each scan gets
+further through the same question, and a file whose waiting copy ages out is
+adopted like any other. A reorganisation larger than one scan is repaired as
 far as it goes and looked at again on the next.
 
 A repaired locator on its own would leave the reader's place behind, since

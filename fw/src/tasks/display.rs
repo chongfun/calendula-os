@@ -94,11 +94,11 @@ pub async fn run(
     // what the loop needs to schedule the next step and to tell whether the
     // reader is still on that book.
     let mut background_build: Option<BackgroundBuild> = None;
-    // The book whose bytes this session has already read, or found the
-    // card already knew. One book at a time, and only the one open: what
-    // the reading is for is finding *this* copy again after a move, and a
-    // reader who opens a book is the reader whose place is worth keeping.
-    let mut evidence_settled: Option<usize> = None;
+    // The place whose bytes this session has already read, or found the
+    // card already knew. A place rather than a row number: a rescan
+    // renumbers rows, and a row that comes back as another book would
+    // otherwise be taken for one already read.
+    let mut evidence_settled: Option<heapless::String<{ proto::cache::CACHE_KEY_BYTES }>> = None;
     let mut pending_evidence: Option<book_build::SourceEvidenceJob> = None;
     // On a deep-sleep (Power button) wake the panel still shows the sleep
     // screen: deep_sleep_wake is true only when the RTC wake cause is the
@@ -213,9 +213,8 @@ pub async fn run(
             background_build_step_due(
                 (background_build.is_some()
                     || pending_evidence.is_some()
-                    || sd_library
-                        .active_index()
-                        .is_some_and(|index| evidence_settled != Some(index)))
+                    || book_build::evidence_place(sd_library)
+                        .is_some_and(|place| evidence_settled.as_deref() != Some(place.as_str())))
                     && !sync_session.active()
                     && holder().storage_may_run()
                     && !sd_library.text_holds_toc(),
@@ -230,26 +229,41 @@ pub async fn run(
                     // book's bytes, which is the other thing this task owes
                     // itself and the one that has to wait for the reader to
                     // have a page before it starts.
+                    let open_place = book_build::evidence_place(sd_library);
+                    // A job follows the book that is open. The reader
+                    // moving on takes this one with them, half read: the
+                    // copy they moved to is the one whose bytes are worth
+                    // having, and the one they left is read again whenever
+                    // it is opened again.
+                    if pending_evidence
+                        .as_ref()
+                        .is_some_and(|job| open_place.as_deref() != Some(job.place()))
+                    {
+                        pending_evidence = None;
+                    }
                     if pending_evidence.is_none() {
-                        if let Some(index) = sd_library.active_index() {
-                            pending_evidence = book_build::evidence_job(sd_library, index);
-                            if pending_evidence.is_none() {
-                                evidence_settled = Some(index);
+                        if let Some(place) = &open_place {
+                            if evidence_settled.as_deref() != Some(place.as_str()) {
+                                pending_evidence = book_build::evidence_job(sd_library);
+                                if pending_evidence.is_none() {
+                                    evidence_settled = Some(place.clone());
+                                }
                             }
                         }
                     }
                     if let Some(job) = &mut pending_evidence {
-                        let index = job.index;
+                        let mut place = heapless::String::new();
+                        let _ = place.push_str(job.place());
                         match book_build::continue_source_evidence(&mut epd, &mut sd_cs, job) {
                             book_build::EvidenceStep::Continued => {}
                             // Settled either way: a copy the card would not
                             // give up is not asked for again in this
-                            // session, and a book reopened later arms a
-                            // fresh job.
+                            // session, and a book reopened after one is
+                            // asked about afresh.
                             book_build::EvidenceStep::Finished
                             | book_build::EvidenceStep::Abandoned => {
                                 pending_evidence = None;
-                                evidence_settled = Some(index);
+                                evidence_settled = Some(place);
                             }
                         }
                     }
