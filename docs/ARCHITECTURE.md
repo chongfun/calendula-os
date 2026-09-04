@@ -867,32 +867,36 @@ the reading place it would carry lives by. A claim naming another book is no
 evidence about this one, since a cache key is 28 bits of a hash and two
 books can land on one and the same directory.
 
+What a claim says is copied into the copy's own record on the scan that
+first misses it, whether or not anything turned up to compare it with. The
+cache is a cache: a departed book's directory is what the sweep tidies away,
+and the ledger is where identity lives, so once the library has learned what
+a copy is, an ordinary tidy-up cannot make it forget. Without that, two
+identical copies could lose one of their two claims and leave the other
+looking like the only book those bytes could belong to.
+
 A copy nothing recorded the bytes of is left missing while the file that
 appeared is adopted in its own right. Ambiguity is left alone from either
 side: two missing copies of the same bytes, or one missing copy and two
 files holding them, are copies no file can be told apart by, so their places
-stay as they are. One scan carries as many missing copies as the scan arena
-holds and reads at most sixteen books. Those bounds limit which copies a
-scan can repair, not what it knows about the ones it does: every missing
-copy's digest is compared against the ones being carried, so a twin past the
-end of the table still refuses the repair, and a file of the right length
-that goes unread leaves every copy it could have been unsettled. Every file
-that could still be such a copy is left unadopted, without an id, so the
-question stays open: a scan that adopted one would match it by place ever
-after and stop looking, and the copy waiting on it would age out with
-nowhere to go.
-That covers the file that went unread and the file that did match, since
-either could be the copy. Files read and proved to be other books are
-adopted at once, so each scan gets further through the same question, and a
-file whose waiting copy ages out is adopted like any other. A row waiting is
-a row costing the ledger nothing, so it cannot crowd out the record it is
-being kept for.
+stay as they are. A scan decides a length or leaves it alone. Every
+unclaimed file whose length a missing copy has is read, which is what lets
+one match mean one match, so there is no reading budget to run out of and
+nothing carried to another scan. Bounding that reading instead would mean
+deciding on part of the evidence, or keeping a half-finished question
+somewhere, and a question that outlives a scan wants a journal of its own
+rather than a state spread through the catalog, the ledger and the cache.
+What a card costs a scan is therefore the reading of every file whose length
+changed hands, which is the size of the reorganisation rather than the size
+of the library. A file the card would not give up costs its whole length:
+what the files of that length hold is not known well enough to say which
+copy any of them is, so those copies are left alone and the files adopted
+in their own right.
 
-A committed catalog is otherwise the reason no scan runs, so a scan that
-leaves a question open says so in the catalog header, and the next mount
-reads that and scans instead of serving from it. A reorganisation larger
-than one scan is repaired as far as it goes and looked at again on the
-next.
+One scan repairs as many copies as the scan arena holds, which bounds the
+memory rather than the evidence: every missing copy's digest is compared
+against the ones being carried, so a twin past the end of the table still
+refuses the repair.
 
 A repaired locator on its own would leave the reader's place behind, since
 a position is filed under the place a book was read from. So the scan

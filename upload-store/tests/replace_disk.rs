@@ -2365,272 +2365,6 @@ fn a_claim_naming_another_book_is_no_evidence_about_this_one() {
     assert!(found_again().is_empty());
 }
 
-/// The search reads at most a fixed number of books, and a file it did not
-/// read is a file that could have held the copy's bytes. So a budget that
-/// runs out leaves every copy that file could have been unsettled, rather
-/// than letting an earlier match stand as the only one: the reader would
-/// have had a place carried onto whichever of two identical files the card
-/// happened to list first.
-#[test]
-fn a_file_left_unread_leaves_the_copy_it_could_be_unsettled() {
-    let disk = new_card();
-    let mgr = open_mgr(&disk);
-    let (root, books) = open_dirs(&mgr);
-    let bytes = body(1, 3_000);
-    let size = bytes.len() as u32;
-    let mut random = words();
-    upload_minting(&root, &books, BOOK, &bytes, &mut random)
-        .unwrap()
-        .expect("lands");
-    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
-    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
-
-    // The copy is renamed, and sixteen files of its length arrive with it:
-    // fifteen strangers, and one more copy of the same book at the end of
-    // the listing, past what one scan will read.
-    rename_on_shelf(&root, BOOK, "New00.epub");
-    let mut names = std::vec![std::string::String::from("New00.epub")];
-    for stranger in 1..16u8 {
-        let name = std::format!("New{stranger:02}.epub");
-        sideload(&books, &name, &body(stranger + 40, size as usize));
-        names.push(name);
-    }
-    sideload(&books, "New16.epub", &bytes);
-    names.push(std::string::String::from("New16.epub"));
-    let rows: Vec<Row<'_>> = names
-        .iter()
-        .map(|name| (BookRoot::Library, name.as_str(), size))
-        .collect();
-
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(
-        assigned.repaired, 0,
-        "one of two files was read: {assigned:?}"
-    );
-    assert!(assigned.unresolved >= 1, "and the copy waits: {assigned:?}");
-    assert_eq!(
-        assigned.minted, 15,
-        "the files proved to be other books are copies in their own right"
-    );
-    assert_eq!(
-        ids[16], None,
-        "the file that was not read waits, unadopted, for a scan that reads it"
-    );
-    assert_eq!(
-        ids[0], None,
-        "and so does the one that did match, since either could be the copy"
-    );
-    assert!(!ids.contains(&Some(id)));
-    let live = ledger::open(&root).unwrap().unwrap();
-    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
-    assert_eq!(copy.misses, 1, "still missing, still waiting");
-
-    // The next scan reads both and finds what the first could not: two
-    // files hold the copy's bytes, so neither takes its id and both are
-    // adopted in their own right.
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(assigned.repaired, 0, "still two of them: {assigned:?}");
-    assert!(assigned.ambiguous >= 1);
-    assert_eq!(assigned.minted, 2, "and both are adopted now");
-    assert!(ids[0].is_some());
-    assert!(ids[16].is_some());
-    assert!(!ids.contains(&Some(id)));
-    assert!(
-        found_again().is_empty(),
-        "and no reading place was moved on the way to finding that out"
-    );
-}
-
-/// The file that could not be read turns out to hold the copy's bytes too.
-/// Nothing may have moved on the strength of the first scan's single
-/// match, because there were two all along and the scan simply could not
-/// see the second one yet.
-#[test]
-fn a_match_that_turns_out_to_be_two_moves_nothing_on_the_way() {
-    let disk = new_card();
-    let mgr = open_mgr(&disk);
-    let (root, books) = open_dirs(&mgr);
-    let bytes = body(1, 3_000);
-    let size = bytes.len() as u32;
-    let mut random = words();
-    upload_minting(&root, &books, BOOK, &bytes, &mut random)
-        .unwrap()
-        .expect("lands");
-    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
-    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
-
-    rename_on_shelf(&root, BOOK, "Moved.epub");
-    let rows = [
-        (BookRoot::Library, "Unread.epub", size),
-        (BookRoot::Library, "Moved.epub", size),
-    ];
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(assigned.repaired, 0);
-    assert_eq!(ids, vec![None, None]);
-    assert!(found_again().is_empty(), "nothing moved");
-
-    // It holds the same book, so there are two files the copy could be.
-    sideload(&books, "Unread.epub", &bytes);
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(assigned.repaired, 0, "two of them: {assigned:?}");
-    assert!(assigned.ambiguous >= 1);
-    assert_eq!(assigned.minted, 2, "both adopted in their own right");
-    assert!(!ids.contains(&Some(id)));
-    assert!(
-        found_again().is_empty(),
-        "and still nothing moved, which is the point"
-    );
-}
-
-/// A file the card would not read comes before the copy's own file in the
-/// listing. The copy is left waiting, and so is every file that could still
-/// be it: adopting the one further down the listing would spend the right
-/// answer on the strength of a read that failed.
-#[test]
-fn a_file_unread_early_does_not_spend_the_copy_further_down() {
-    let disk = new_card();
-    let mgr = open_mgr(&disk);
-    let (root, books) = open_dirs(&mgr);
-    let bytes = body(1, 3_000);
-    let size = bytes.len() as u32;
-    let mut random = words();
-    upload_minting(&root, &books, BOOK, &bytes, &mut random)
-        .unwrap()
-        .expect("lands");
-    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
-    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
-
-    // The copy is renamed, and the listing puts a file the card will not
-    // give up ahead of it.
-    rename_on_shelf(&root, BOOK, "Moved.epub");
-    let rows = [
-        (BookRoot::Library, "Unread.epub", size),
-        (BookRoot::Library, "Moved.epub", size),
-    ];
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(assigned.repaired, 0, "one file went unread: {assigned:?}");
-    assert!(assigned.unresolved >= 1);
-    assert_eq!(assigned.minted, 0, "and nothing was adopted on that");
-    assert_eq!(ids, vec![None, None], "both files wait");
-    assert!(
-        found_again().is_empty(),
-        "and nothing is told to move a reading place onto a file that may          yet turn out to be one of two"
-    );
-
-    // The card gives that file up on the next scan, and it turns out to be
-    // another book, which leaves one file the copy can be.
-    sideload(&books, "Unread.epub", &body(9, size as usize));
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(assigned.repaired, 1, "the copy is found: {assigned:?}");
-    assert_eq!(assigned.minted, 1, "and the stranger is adopted");
-    assert_eq!(ids[1], Some(id), "under the id it always had");
-    assert_ne!(ids[0], Some(id));
-    assert_eq!(
-        found_again(),
-        vec![(id, BOOK.to_owned(), "Moved.epub".to_owned())],
-    );
-}
-
-/// A file the budget could not reach is not adopted, so the next scan can
-/// still ask about it: the copy waiting on it is found on the scan after
-/// the one that ran out of reading. Files that were read and proved to be
-/// other books are adopted straight away, so each scan gets further
-/// through the same question.
-#[test]
-fn a_copy_the_budget_could_not_reach_is_found_on_the_next_scan() {
-    let disk = new_card();
-    let mgr = open_mgr(&disk);
-    let (root, books) = open_dirs(&mgr);
-    let bytes = body(1, 3_000);
-    let size = bytes.len() as u32;
-    let mut random = words();
-    upload_minting(&root, &books, BOOK, &bytes, &mut random)
-        .unwrap()
-        .expect("lands");
-    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
-    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
-
-    // Sixteen strangers of the copy's length arrive ahead of it in the
-    // listing, and the copy itself is renamed at the end.
-    let mut names = Vec::new();
-    for stranger in 0..16u8 {
-        let name = std::format!("Stranger{stranger:02}.epub");
-        sideload(&books, &name, &body(stranger + 40, size as usize));
-        names.push(name);
-    }
-    rename_on_shelf(&root, BOOK, "Moved.epub");
-    names.push(std::string::String::from("Moved.epub"));
-    let rows: Vec<Row<'_>> = names
-        .iter()
-        .map(|name| (BookRoot::Library, name.as_str(), size))
-        .collect();
-
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(
-        assigned.repaired, 0,
-        "the budget ran out first: {assigned:?}"
-    );
-    assert_eq!(assigned.hashed, 16);
-    assert_eq!(assigned.minted, 16, "the strangers are their own copies");
-    assert_eq!(ids[16], None, "and the copy's file waits, unadopted");
-    let _ = found_again();
-
-    // The next scan has one file left to ask about, and the answer settles
-    // it: the copy is where it went, under the id it always had.
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(assigned.repaired, 1, "found on the next scan: {assigned:?}");
-    assert_eq!(assigned.hashed, 1, "one file left to read");
-    assert_eq!(assigned.minted, 0);
-    assert_eq!(ids[16], Some(id));
-    assert_eq!(
-        found_again(),
-        vec![(id, BOOK.to_owned(), "Moved.epub".to_owned())],
-    );
-    let live = ledger::open(&root).unwrap().unwrap();
-    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
-    assert_eq!(copy.locator(), Some("Moved.epub"));
-    assert_eq!(copy.misses, 0);
-}
-
-/// A file the card would not give up is the same case as one the budget
-/// could not reach: it proves nothing, it is not adopted on the strength of
-/// that, and the copy it could be waits for a scan that can read it.
-#[test]
-fn a_file_the_card_would_not_read_is_asked_about_again() {
-    let disk = new_card();
-    let mgr = open_mgr(&disk);
-    let (root, books) = open_dirs(&mgr);
-    let bytes = body(1, 3_000);
-    let size = bytes.len() as u32;
-    let mut random = words();
-    upload_minting(&root, &books, BOOK, &bytes, &mut random)
-        .unwrap()
-        .expect("lands");
-    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
-    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
-
-    // The copy is gone from where it was, and the row that would hold it
-    // cannot be read this time round.
-    remove_from_shelf(&root, BOOK);
-    let rows = [(BookRoot::Library, "Moved.epub", size)];
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(assigned.repaired, 0, "nothing was read: {assigned:?}");
-    assert_eq!(assigned.hashed, 0);
-    assert_eq!(assigned.minted, 0, "and nothing was adopted on that");
-    assert_eq!(ids[0], None);
-    assert!(assigned.unresolved >= 1);
-
-    // The card gives it up on the next scan, and the copy is found.
-    sideload(&books, "Moved.epub", &bytes);
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(
-        assigned.repaired, 1,
-        "found once it could be read: {assigned:?}"
-    );
-    assert_eq!(ids[0], Some(id));
-    assert_eq!(record_count(&root), 1, "one copy, one record");
-}
-
 /// One scan carries as many missing copies as its arena holds, and the
 /// bound is on which copies it may repair rather than on what it knows: a
 /// second copy of the same bytes past the end of the table still says the
@@ -2698,14 +2432,135 @@ fn a_twin_past_the_end_of_the_table_still_refuses_the_repair() {
     assert!(!ids_seen.contains(&Some(ids[64])));
 }
 
-/// The bytes a sideloaded copy was read under live in the claim beside its
-/// reading place, and that claim describes a place the copy has left. The
-/// sweep that tidies such a directory takes the claim with it when no
-/// reading place is filed there, so the scan that learned the bytes keeps
-/// them in the copy's own record. Otherwise the pass it asked for would
-/// come back to nothing to look with.
+/// A copy is found again however many files of its length the card holds:
+/// the search reads every one of them, which is what lets one match mean
+/// one match. There is no reading budget to run out of, and so nothing to
+/// carry to another scan.
 #[test]
-fn what_a_claim_said_about_a_copy_is_kept_when_the_search_cannot_settle() {
+fn a_copy_is_found_whatever_else_shares_its_length() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    // Twenty strangers of the copy's length arrive ahead of it, which under
+    // a sixteen-file budget would have hidden it.
+    let mut names = Vec::new();
+    for stranger in 0..20u8 {
+        let name = std::format!("Stranger{stranger:02}.epub");
+        sideload(&books, &name, &body(stranger + 40, size as usize));
+        names.push(name);
+    }
+    rename_on_shelf(&root, BOOK, "Moved.epub");
+    names.push(std::string::String::from("Moved.epub"));
+    let rows: Vec<Row<'_>> = names
+        .iter()
+        .map(|name| (BookRoot::Library, name.as_str(), size))
+        .collect();
+
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 1, "found in one scan: {assigned:?}");
+    assert_eq!(assigned.hashed, 21, "having read every file of its length");
+    assert_eq!(assigned.minted, 20, "the strangers are their own copies");
+    assert_eq!(ids[20], Some(id));
+    assert_eq!(
+        found_again(),
+        vec![(id, BOOK.to_owned(), "Moved.epub".to_owned())],
+    );
+}
+
+/// Two files holding one copy's bytes are two files no copy can be told
+/// apart by, whatever else the card holds. Both are adopted in their own
+/// right, the copy stays missing, and nothing is reported: a reading place
+/// moved onto either would be moved onto a guess.
+#[test]
+fn two_files_holding_a_copys_bytes_are_both_adopted() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    rename_on_shelf(&root, BOOK, "One.epub");
+    sideload(&books, "Two.epub", &bytes);
+    let rows = [
+        (BookRoot::Library, "One.epub", size),
+        (BookRoot::Library, "Two.epub", size),
+    ];
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 0, "either could be it: {assigned:?}");
+    assert!(assigned.ambiguous >= 1);
+    assert_eq!(assigned.minted, 2);
+    assert!(!ids.contains(&Some(id)));
+    assert!(found_again().is_empty(), "and nothing moved on a guess");
+}
+
+/// A file the card would not give up could hold any copy's bytes, so the
+/// length it claims stops being decidable: every copy that size is left
+/// alone this scan, and the files are adopted in their own right. A card
+/// that refuses a read costs a copy its continuity, as a card that refuses
+/// a read costs anything else that depended on it.
+#[test]
+fn a_file_the_card_would_not_read_leaves_its_length_alone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    // The listing names a file the card cannot produce, of the copy's
+    // length, beside the file the copy actually moved to.
+    rename_on_shelf(&root, BOOK, "Moved.epub");
+    let rows = [
+        (BookRoot::Library, "Unread.epub", size),
+        (BookRoot::Library, "Moved.epub", size),
+    ];
+    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(
+        assigned.repaired, 0,
+        "the length is undecidable: {assigned:?}"
+    );
+    assert_eq!(assigned.unreadable, 1, "and the reason is said plainly");
+    assert!(!ids.contains(&Some(id)));
+    assert!(found_again().is_empty());
+    let live = ledger::open(&root).unwrap().unwrap();
+    assert_eq!(
+        ledger::find_by_id(&root, &live, id)
+            .unwrap()
+            .unwrap()
+            .misses,
+        1,
+        "the copy is missing, as it is"
+    );
+}
+
+/// What a copy's bytes were is learned from the claim beside its reading
+/// place, and the sweep that tidies a departed book's directory takes that
+/// claim away. So the ledger takes it first, on the scan that misses the
+/// copy, whether or not anything turned up to compare it with. Otherwise
+/// the ordinary two-stage card edit, take the book away now and put the
+/// replacement in later, would arrive with nothing to look with.
+#[test]
+fn a_copy_that_goes_missing_keeps_what_its_claim_said() {
     let disk = new_card();
     let mgr = open_mgr(&disk);
     let (root, books) = open_dirs(&mgr);
@@ -2722,25 +2577,97 @@ fn what_a_claim_said_about_a_copy_is_kept_when_the_search_cannot_settle() {
         "the ledger itself was told nothing"
     );
 
-    // The copy moves, and the scan cannot settle it this time round.
-    rename_on_shelf(&root, BOOK, "Moved.epub");
-    let rows = [
-        (BookRoot::Library, "Unread.epub", size),
-        (BookRoot::Library, "Moved.epub", size),
-    ];
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(assigned.repaired, 0);
-    assert_eq!(ids, vec![None, None]);
+    // The book goes away, and the scan that notices has nothing to compare
+    // it with: no file arrived in its place.
+    remove_from_shelf(&root, BOOK);
+    let (assigned, _) = scan_minting(&root, &[], &mut random).unwrap();
+    assert_eq!(assigned.missing, 1);
+    assert_eq!(assigned.hashed, 0, "and nothing was read to learn it");
     let live = ledger::open(&root).unwrap().unwrap();
     let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
     assert!(
         digest_agrees(copy.source, &bytes),
-        "the copy's record now says what its bytes were"
+        "the record says what its bytes were"
     );
 
-    // So a sweep that empties the directory the claim was in costs the next
-    // scan nothing.
-    let key = cache_key_from(source_hash_at(BookRoot::Library, BOOK, size));
+    // So the sweep may take the claim, and the replacement arriving later
+    // is still found.
+    sweep_claim(&root, BookRoot::Library, BOOK, size);
+    sideload(&books, "Elsewhere.epub", &bytes);
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, "Elsewhere.epub", size)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(assigned.repaired, 1, "found again: {assigned:?}");
+    assert_eq!(ids[0], Some(id));
+}
+
+/// The same, for two copies of one book where only one keeps a reading
+/// place. The sweep takes the other's claim, and if the ledger had not
+/// taken what it said first, the copy that kept its claim would look like
+/// the only one those bytes could belong to. It is not, and the file that
+/// comes back is adopted in its own right.
+#[test]
+fn a_twin_whose_cache_was_swept_still_refuses_the_repair() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let shared = body(1, 3_000);
+    let size = shared.len() as u32;
+    let twin = "Dune (2).epub";
+    sideload(&books, BOOK, &shared);
+    sideload(&books, twin, &shared);
+    let mut random = words();
+    let (_, ids) = scan_minting(
+        &root,
+        &[
+            (BookRoot::Library, BOOK, size),
+            (BookRoot::Library, twin, size),
+        ],
+        &mut random,
+    )
+    .unwrap();
+    let (first, second) = (ids[0].unwrap(), ids[1].unwrap());
+    note_open(&root, BookRoot::Library, BOOK, &shared);
+    note_open(&root, BookRoot::Library, twin, &shared);
+
+    // Both go away, and the scan that notices takes what their claims said.
+    remove_from_shelf(&root, BOOK);
+    remove_from_shelf(&root, twin);
+    scan_minting(&root, &[], &mut random).unwrap();
+    let live = ledger::open(&root).unwrap().unwrap();
+    for id in [first, second] {
+        let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
+        assert!(digest_agrees(copy.source, &shared), "both records say");
+    }
+
+    // The sweep takes both claims, and one of the two files comes back.
+    sweep_claim(&root, BookRoot::Library, BOOK, size);
+    sweep_claim(&root, BookRoot::Library, twin, size);
+    sideload(&books, "Returned.epub", &shared);
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, "Returned.epub", size)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(
+        assigned.repaired, 0,
+        "either copy could be this file: {assigned:?}"
+    );
+    assert!(assigned.ambiguous >= 1);
+    assert_eq!(assigned.minted, 1);
+    assert!(!ids.contains(&Some(first)));
+    assert!(!ids.contains(&Some(second)));
+    assert!(found_again().is_empty());
+}
+
+/// Take a claim away, as the cache sweep does once a departed book's
+/// directory has nothing left to keep.
+fn sweep_claim(root: &Dir<'_>, at: BookRoot, locator: &str, byte_size: u32) {
+    let key = cache_key_from(source_hash_at(at, locator, byte_size));
     let cache_root = root.open_dir(CACHE_ROOT_DIR).expect("open READER");
     let cache = cache_root
         .open_dir(proto::cache::CACHE_V2_DIR)
@@ -2748,12 +2675,4 @@ fn what_a_claim_said_about_a_copy_is_kept_when_the_search_cannot_settle() {
     let book = cache.open_dir(key.as_str()).expect("open book directory");
     book.delete_entry_in_dir(proto::cache::CACHE_CLAIM_FILE)
         .expect("sweep the claim away");
-
-    sideload(&books, "Unread.epub", &body(9, size as usize));
-    let (assigned, ids) = scan_minting(&root, &rows, &mut random).unwrap();
-    assert_eq!(
-        assigned.repaired, 1,
-        "the copy is still found, on what its record kept: {assigned:?}"
-    );
-    assert_eq!(ids[1], Some(id));
 }

@@ -805,14 +805,14 @@ pub struct Assignment {
     /// Left alone, both sides, since a wrong join of one reader's place to
     /// another book costs more than a copy adopted afresh.
     pub ambiguous: u16,
-    /// Copies this scan did not read enough to place: a file that could
-    /// have been one of them went unread, for want of budget or because
-    /// the card would not give it up. They stay missing, on the ordinary
-    /// retention, and the file that could be them is left unadopted so the
-    /// next scan can still ask. A file that was read and proved to be
-    /// another book is adopted straight away, so a scan that runs out of
-    /// reading gets through more of the same question each time.
-    pub unresolved: u16,
+    /// Copies left alone because the card would not give up a file they
+    /// could have been. One unread file makes every copy of its length
+    /// undecidable, since it could hold any of their bytes, and a scan
+    /// decides a length only when it has read every file of that length.
+    /// Those copies stay missing on the ordinary retention and the files
+    /// are adopted in their own right, as for any other reason the search
+    /// cannot tell two things apart.
+    pub unreadable: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -838,21 +838,21 @@ const MOVE_ENTRY_BYTES: usize = MOVE_LOCATOR + MAX_PATH_BYTES;
 /// than this repairs what fits and adopts the rest afresh, which is the
 /// same answer the search gives anything it cannot prove.
 const MOVES_CONSIDERED: usize = 64;
-/// Files one scan reads whole to confirm a move. A bound on the time a scan
-/// can spend, where the entry count bounds the memory: a book is megabytes
-/// and this is the only part of a scan that reads one.
-const MOVE_HASHES: u16 = 16;
-/// This copy is not one the search may repair, whatever else it finds:
-/// another missing copy holds the same bytes, or two files do, so which of
-/// them a copy is cannot be told from the bytes. Settled, and settled for
-/// good: the files are adopted in their own right.
+/// This copy is not one the search may repair: another missing copy holds
+/// the same bytes, or two files do, or a file of its length went unread and
+/// could have held them. One outcome for all three, because they are one
+/// answer: the bytes do not say which copy this file is. The copies stay
+/// missing on the ordinary retention and the files are adopted in their own
+/// right.
+///
+/// A scan decides a length or leaves it alone. There is no reading budget
+/// to run out of: every unclaimed file whose length a missing copy has is
+/// read, which is what lets one match mean one match. Bounding that reading
+/// instead would mean deciding on part of the evidence, or carrying the
+/// question to the next scan, and a question carried across scans wants a
+/// journal of its own rather than a state spread through the catalog, the
+/// ledger and the cache.
 const MOVE_AMBIGUOUS: u8 = 1;
-/// This scan did not see enough to say: a file this copy could be went
-/// unread, for want of budget or because the card would not give it up.
-/// Not the same as knowing there are two, and not the same as knowing
-/// there is one, which is the point. Every file that could still be this
-/// copy waits unadopted with it, so the next scan can ask again.
-const MOVE_UNRESOLVED: u8 = 2;
 
 /// A copy the scan found again, told to a caller that keeps something
 /// filed under where it used to be.
@@ -935,11 +935,7 @@ fn move_u16(entry: &[u8], at: usize) -> u16 {
 }
 
 /// Whether files of `byte_size` still say anything about this copy: one
-/// that size which the bytes have not already settled.
-///
-/// A copy waiting on a file nobody read is still asking, so rows of its
-/// length keep being read: a row proved to be some other book is adopted
-/// rather than left waiting with it.
+/// that size the bytes have not already told apart from something else.
 fn move_awaits(table: &[u8], slot: usize, byte_size: u32) -> bool {
     let entry = move_entry(table, slot);
     entry[MOVE_STATE] != MOVE_AMBIGUOUS
@@ -947,17 +943,16 @@ fn move_awaits(table: &[u8], slot: usize, byte_size: u32) -> bool {
             == byte_size
 }
 
-/// Say that a file this copy could have been went unread.
-fn move_unresolved(table: &mut [u8], slots: usize, byte_size: u32, unresolved: &mut u16) {
+/// Leave every copy of `byte_size` alone: a file that length went unread,
+/// so what the files of that length hold is not known well enough to say
+/// which copy any of them is.
+fn move_undecidable(table: &mut [u8], slots: usize, byte_size: u32, unreadable: &mut u16) {
     for slot in 0..slots {
         if !move_awaits(table, slot, byte_size) {
             continue;
         }
-        let state = &mut table[slot * MOVE_ENTRY_BYTES + MOVE_STATE];
-        if *state != MOVE_UNRESOLVED {
-            *state = MOVE_UNRESOLVED;
-            *unresolved = unresolved.saturating_add(1);
-        }
+        table[slot * MOVE_ENTRY_BYTES + MOVE_STATE] = MOVE_AMBIGUOUS;
+        *unreadable = unreadable.saturating_add(1);
     }
 }
 
@@ -974,8 +969,9 @@ fn move_slot_carrying(table: &[u8], slots: usize, index: u16) -> Option<usize> {
     (0..slots).find(|slot| move_u16(move_entry(table, *slot), MOVE_INDEX) == index)
 }
 
-/// Whether a slot names the one file it can be: one match, and nothing left
-/// unread that could have been another.
+/// Whether a slot names the one file it can be, which is the one thing that
+/// leaves this search: the ledger moves an id on it, and so does everything
+/// downstream.
 fn move_settled(entry: &[u8]) -> bool {
     entry[MOVE_MATCHES] == 1 && entry[MOVE_STATE] == 0
 }
@@ -1124,14 +1120,8 @@ where
     // card says what its bytes were, and a name and a length are not a
     // book.
     let mut slots = 0usize;
-    // A bit per row, set for a row this scan left in question: one it did
-    // not read while a copy it could be was waiting. Those rows are not
-    // adopted, which is what keeps the question open; see the fill below.
-    let deferred_bytes = (count as usize).div_ceil(8).min(keys.len());
-    let (deferred, work) = keys.split_at_mut(deferred_bytes);
-    deferred.fill(0);
-    let capacity = (work.len() / MOVE_ENTRY_BYTES).min(MOVES_CONSIDERED);
-    let table = &mut work[..capacity * MOVE_ENTRY_BYTES];
+    let capacity = (keys.len() / MOVE_ENTRY_BYTES).min(MOVES_CONSIDERED);
+    let table = &mut keys[..capacity * MOVE_ENTRY_BYTES];
     if let Some(live) = live {
         if missing_records > 0 && new_rows > 0 && capacity > 0 {
             for_each_record(root, &live, &mut |index, entry| {
@@ -1200,18 +1190,12 @@ where
             if !wanted {
                 continue;
             }
-            // A file of the right length that goes unread could hold any of
-            // those copies' bytes, so leaving it unread leaves them all
-            // unsettled. Whether the budget ran out or the card would not
-            // give the file up, the answer is the same: not this scan.
-            if assigned.hashed >= MOVE_HASHES {
-                move_unresolved(table, slots, byte_size, &mut assigned.unresolved);
-                set_bit(deferred, row as u16);
-                continue;
-            }
+            // A file of that length the card would not give up could hold
+            // any of those copies' bytes, so the length stops being
+            // decidable and every copy of it is left alone. The file is
+            // adopted in its own right, as it would have been.
             let Ok(Some(found)) = crate::replace::digest_at(root, at, locator) else {
-                move_unresolved(table, slots, byte_size, &mut assigned.unresolved);
-                set_bit(deferred, row as u16);
+                move_undecidable(table, slots, byte_size, &mut assigned.unreadable);
                 continue;
             };
             assigned.hashed = assigned.hashed.saturating_add(1);
@@ -1240,18 +1224,7 @@ where
             }
         }
     }
-    // A copy left waiting on a file nobody read keeps the file that did
-    // match it, if one did: either could be the copy, so adopting the one
-    // that was read would spend the answer before the question is asked
-    // again.
-    for slot in 0..slots {
-        let entry = move_entry(table, slot);
-        if entry[MOVE_STATE] == MOVE_UNRESOLVED && entry[MOVE_MATCHES] == 1 {
-            set_bit(deferred, move_u16(entry, MOVE_ROW));
-        }
-    }
     let table = &table[..slots * MOVE_ENTRY_BYTES];
-    let deferred = &deferred[..];
     // Told only now: a match is settled once every row has been read, since
     // a second file holding the same bytes makes one ambiguous, and
     // a caller acting on a move that turns out to be two would file a
@@ -1296,14 +1269,8 @@ where
     }
 
     // Live and new copies are the library; a missing record takes a slot
-    // only if one is left once they are all in. A row left in question
-    // takes none: it is written no record, and counting one against it
-    // could retire the very copy it is being kept for.
-    let waiting = deferred
-        .iter()
-        .map(|byte| byte.count_ones() as usize)
-        .sum::<usize>();
-    let room = LEDGER_MAX_RECORDS.saturating_sub(live_records + new_rows.saturating_sub(waiting));
+    // only if one is left once they are all in.
+    let room = LEDGER_MAX_RECORDS.saturating_sub(live_records + new_rows);
     let mut carried_missing = 0usize;
     let Assignment {
         minted,
@@ -1332,15 +1299,39 @@ where
                 Some(misses) => {
                     carried_missing += 1;
                     *missing += 1;
-                    // What this copy's bytes were, when the search had to
-                    // go to the claim beside its reading place to learn it.
-                    // Kept in the record from here on: the claim describes
-                    // a place the copy has left, and the sweep that tidies
-                    // such a directory would take the only evidence a later
-                    // scan has of what to look for with it.
+                    // What this copy's bytes were, taken into its own
+                    // record on the scan that first misses it.
+                    //
+                    // For a book nobody uploaded, the claim beside its
+                    // reading place is where that was learned, and a
+                    // departed book's directory is exactly what the cache
+                    // sweep tidies away. So the ledger takes it first, on
+                    // every copy that goes missing, whether or not a file
+                    // turned up to compare it with and whether or not it
+                    // was one of the copies this scan carried into the
+                    // search. Once the library has learned what a copy is,
+                    // an ordinary tidy-up cannot make it forget: that is
+                    // what stops one of two identical copies losing its
+                    // evidence and leaving the other looking unique.
                     let source = entry.source.or_else(|| {
-                        let slot = move_slot_carrying(table, slots, index)?;
-                        parse_record(&move_entry(table, slot)[MOVE_DIGEST..MOVE_ROW])
+                        move_slot_carrying(table, slots, index)
+                            .and_then(|slot| {
+                                parse_record(&move_entry(table, slot)[MOVE_DIGEST..MOVE_ROW])
+                            })
+                            .or_else(|| {
+                                // The first miss is the one scan where the
+                                // claim is still there to read.
+                                (entry.misses == 0)
+                                    .then(|| {
+                                        claim_digest(
+                                            root,
+                                            entry.root,
+                                            entry.locator,
+                                            entry.byte_size,
+                                        )
+                                    })
+                                    .flatten()
+                            })
                     });
                     Carry::Keep(Kept {
                         misses,
@@ -1361,16 +1352,6 @@ where
                     return Err(LedgerFault::Device);
                 }
                 if catalog_record_book_id(&record).is_some() {
-                    continue;
-                }
-                // A row this scan left in question waits, without an id and
-                // without a record. Adopting it would settle the question
-                // the wrong way for good: the next scan would match it by
-                // place, stop looking, and the copy that could have been it
-                // would age out with nowhere to go. A row nobody is waiting
-                // on is adopted below as usual, and a row whose waiting
-                // copy ages out becomes one of those.
-                if bit(deferred, row as u16) {
                     continue;
                 }
                 let (at, locator, byte_size) =
