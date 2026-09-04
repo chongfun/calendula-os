@@ -454,7 +454,7 @@ pub async fn run(
                     );
                 }
                 let flush_start = Instant::now();
-                if display_flush::flush(
+                if let Ok(settle) = display_flush::flush(
                     &mut epd,
                     fb,
                     prev_fb,
@@ -463,7 +463,6 @@ pub async fn run(
                     prev_prestaged,
                 )
                 .await
-                .is_ok()
                 {
                     let flush_ms = flush_start.elapsed().as_millis();
                     refresh_planner.record_render(request, mode);
@@ -517,6 +516,12 @@ pub async fn run(
                         dequeued_at_ms,
                         settled_at_ms,
                     );
+                    // The clean plans' settle, deferred out of the flush so it
+                    // falls after `Settled`. It guards the prestage below and
+                    // nothing else, and the chapter read above now sits inside
+                    // it rather than after it, so the gap cannot shrink while
+                    // 200 ms comes off press-to-settled. Zero on other plans.
+                    settle.wait().await;
                     let prestage_start = Instant::now();
                     // Unconditional, deliberately. Skipping this write when another
                     // render is already queued reads like a saving and is the exact
@@ -701,7 +706,7 @@ pub async fn run(
                 } else {
                     crate::views::render_sleep_blank(fb);
                 }
-                let sleep_frame_settled = if display_flush::flush(
+                let sleep_frame_settled = if let Ok(settle) = display_flush::flush(
                     &mut epd,
                     fb,
                     prev_fb,
@@ -710,8 +715,11 @@ pub async fn run(
                     prev_prestaged,
                 )
                 .await
-                .is_ok()
                 {
+                    // Nothing writes panel RAM before the power-down below.
+                    // `Full` owes zero; holding it keeps that the plan's fact
+                    // rather than this call site's assumption.
+                    settle.wait().await;
                     prev_fb.copy_from(fb);
                     bench_log!(
                         "bench: sleep phase=refresh ok=true elapsed_ms={} t_ms={}",
@@ -826,7 +834,7 @@ pub async fn run(
                         ) {
                             crate::views::render(fb, loading_request, sd_library);
                             let mode = refresh_planner.mode_for(loading_request);
-                            if display_flush::flush(
+                            if let Ok(settle) = display_flush::flush(
                                 &mut epd,
                                 fb,
                                 prev_fb,
@@ -835,8 +843,11 @@ pub async fn run(
                                 prev_prestaged,
                             )
                             .await
-                            .is_ok()
                             {
+                                // Held, not deferred like the render path's: no
+                                // prestage follows a plate, so there is no
+                                // nearer owner for the interval than here.
+                                settle.wait().await;
                                 refresh_planner.record_render(loading_request, mode);
                                 prev_fb.copy_from(fb);
                                 prev_prestaged = false;

@@ -1,4 +1,4 @@
-use super::{Epd, PanelError};
+use super::{Epd, PanelError, PanelSettle};
 use display::epd::{
     ram_x_counter, ram_x_range, ram_y_counter, ram_y_range, update_control_1, update_control_2,
     RefreshMode, SpiOp, CMD_DEEP_SLEEP, CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2,
@@ -30,7 +30,7 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
-) -> Result<(), PanelError> {
+) -> Result<PanelSettle, PanelError> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb).await?;
     bench_log!(
@@ -92,7 +92,8 @@ pub(crate) async fn flush(
         epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
         epd.wait_ready().await?;
     }
-    Ok(())
+    // Every plan here ends on a completed BUSY wait, so nothing is owed.
+    Ok(PanelSettle::from_ms(0))
 }
 
 /// Stage `fb` (the frame just shown) into RED RAM while the panel is idle,

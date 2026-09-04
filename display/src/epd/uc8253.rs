@@ -184,9 +184,17 @@ pub struct FlushPlan {
     pub requested_mode: RefreshMode,
     pub effective_mode: RefreshMode,
     pub steps: &'static [FlushStep],
+    /// Quiet the panel wants once `steps` are done, before its RAM is written
+    /// again. Zero for a plan that ends with a write of its own.
+    ///
+    /// Not a trailing `DelayMs`: nothing in the plan follows it, so awaiting
+    /// it inside the flush only delays the caller's report that the frame is
+    /// up, while the write it guards is the caller's next one. A plan is
+    /// therefore not finished when its steps are.
+    pub settle_after_ms: u16,
 }
 
-/// Settle delay after a non-fast refresh, matching the reference's 200 ms.
+/// The reference's 200 ms of quiet after a refresh, before the next RAM write.
 const SETTLE_MS: u16 = 200;
 
 const FULL_STEPS: &[FlushStep] = &[
@@ -284,6 +292,8 @@ const FULL_POWERED_STEPS: &[FlushStep] = &[
     FlushStep::DataStop,
 ];
 
+/// Both clean plans stop at the refresh; their settle rides on
+/// `FlushPlan::settle_after_ms` rather than a trailing `DelayMs`.
 const CLEAN_POWERED_STEPS: &[FlushStep] = &[
     FlushStep::LoadBank(RefreshMode::FastClean),
     FlushStep::WritePlane {
@@ -291,7 +301,6 @@ const CLEAN_POWERED_STEPS: &[FlushStep] = &[
         source: FrameSource::Current,
     },
     FlushStep::DisplayRefresh,
-    FlushStep::DelayMs(SETTLE_MS),
 ];
 
 const CLEAN_POWER_ON_STEPS: &[FlushStep] = &[
@@ -302,7 +311,6 @@ const CLEAN_POWER_ON_STEPS: &[FlushStep] = &[
     },
     FlushStep::PowerOn,
     FlushStep::DisplayRefresh,
-    FlushStep::DelayMs(SETTLE_MS),
 ];
 
 /// Select the exact controller operation stream for one requested refresh.
@@ -324,18 +332,21 @@ pub const fn flush_plan(
     } else {
         requested_mode
     };
-    let steps = match effective_mode {
-        RefreshMode::Full | RefreshMode::PowerDown if screen_powered => FULL_POWERED_STEPS,
-        RefreshMode::Full | RefreshMode::PowerDown => FULL_STEPS,
-        RefreshMode::Fast if previous_staged => FAST_STAGED_STEPS,
-        RefreshMode::Fast => FAST_UNSTAGED_STEPS,
-        RefreshMode::FastClean if screen_powered => CLEAN_POWERED_STEPS,
-        RefreshMode::FastClean => CLEAN_POWER_ON_STEPS,
+    // Paired with the steps, so a new table cannot gain or lose a settle
+    // without saying so here.
+    let (steps, settle_after_ms) = match effective_mode {
+        RefreshMode::Full | RefreshMode::PowerDown if screen_powered => (FULL_POWERED_STEPS, 0),
+        RefreshMode::Full | RefreshMode::PowerDown => (FULL_STEPS, 0),
+        RefreshMode::Fast if previous_staged => (FAST_STAGED_STEPS, 0),
+        RefreshMode::Fast => (FAST_UNSTAGED_STEPS, 0),
+        RefreshMode::FastClean if screen_powered => (CLEAN_POWERED_STEPS, SETTLE_MS),
+        RefreshMode::FastClean => (CLEAN_POWER_ON_STEPS, SETTLE_MS),
     };
     FlushPlan {
         requested_mode,
         effective_mode,
         steps,
+        settle_after_ms,
     }
 }
 
@@ -638,6 +649,77 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// A13: the settle moved off the reader's wait and onto the caller. The
+    /// interval is handed over, not shortened.
+    #[test]
+    fn clean_plans_hand_their_settle_back_instead_of_awaiting_it() {
+        for screen_powered in [false, true] {
+            let plan = flush_plan(RefreshMode::FastClean, screen_powered, true);
+            assert_eq!(plan.settle_after_ms, 200, "the interval must not change");
+            assert_eq!(
+                plan.steps.last(),
+                Some(&FlushStep::DisplayRefresh),
+                "a clean plan ends on the glass, not on a timer"
+            );
+        }
+    }
+
+    /// A plan ending on `DelayMs` has put the wait back inside the flush,
+    /// where the reader pays for it again.
+    #[test]
+    fn no_plan_ends_on_a_delay() {
+        for mode in [
+            RefreshMode::Full,
+            RefreshMode::PowerDown,
+            RefreshMode::Fast,
+            RefreshMode::FastClean,
+        ] {
+            for screen_powered in [false, true] {
+                for previous_staged in [false, true] {
+                    let plan = flush_plan(mode, screen_powered, previous_staged);
+                    assert!(
+                        !matches!(plan.steps.last(), Some(FlushStep::DelayMs(_))),
+                        "{:?} (powered {}, staged {}) awaits a trailing delay \
+                         instead of declaring settle_after_ms",
+                        mode,
+                        screen_powered,
+                        previous_staged
+                    );
+                }
+            }
+        }
+    }
+
+    /// Only a plan that stops at the refresh owes anything: the full plans end
+    /// with their own DTM1 sync, and a fast turn runs straight into prestage.
+    #[test]
+    fn only_the_clean_plans_owe_the_caller_a_settle() {
+        for mode in [
+            RefreshMode::Full,
+            RefreshMode::PowerDown,
+            RefreshMode::Fast,
+            RefreshMode::FastClean,
+        ] {
+            for screen_powered in [false, true] {
+                for previous_staged in [false, true] {
+                    let plan = flush_plan(mode, screen_powered, previous_staged);
+                    // A Fast request on an unpowered panel is promoted, so the
+                    // settle follows the effective plan, not the request.
+                    let expected = if plan.effective_mode == RefreshMode::FastClean {
+                        SETTLE_MS
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        plan.settle_after_ms, expected,
+                        "{:?} -> {:?} (powered {}, staged {}) settles for the wrong reason",
+                        mode, plan.effective_mode, screen_powered, previous_staged
+                    );
+                }
+            }
+        }
     }
 
     #[test]

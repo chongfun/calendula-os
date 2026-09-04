@@ -143,6 +143,34 @@ pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
     }
 }
 
+/// Quiet a finished flush leaves behind: how long the panel wants before its
+/// RAM is written again. `uc8253::FlushPlan::settle_after_ms` has the why.
+///
+/// The caller must [`wait`](Self::wait) before that write, which the display
+/// task can promise because it owns the panel bus throughout. The SSD1677
+/// owes zero.
+#[derive(Clone, Copy, Debug)]
+#[must_use = "a flush's trailing settle must be waited out before the next RAM write"]
+pub(crate) struct PanelSettle {
+    ms: u16,
+}
+
+impl PanelSettle {
+    /// Zero owes nothing. The single constructor on purpose: a `NONE` beside
+    /// it would be dead code on whichever board did not reach for it.
+    pub(crate) const fn from_ms(ms: u16) -> Self {
+        Self { ms }
+    }
+
+    /// Hold the interval. A no-op when nothing is owed, so callers need no
+    /// mode check of their own.
+    pub(crate) async fn wait(self) {
+        if self.ms > 0 {
+            embassy_time::Timer::after_millis(u64::from(self.ms)).await;
+        }
+    }
+}
+
 pub(crate) async fn flush(
     epd: &mut Epd,
     fb: &Framebuffer,
@@ -150,7 +178,7 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
-) -> Result<(), PanelError> {
+) -> Result<PanelSettle, PanelError> {
     match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::flush(epd, fb, prev_fb, screen_on, mode, prev_staged).await

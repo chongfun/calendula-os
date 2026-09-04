@@ -12,7 +12,7 @@
 //! The two-phase BUSY timing, panel orientation, ported waveforms,
 //! and SPI clock are hardware-verified on the X3.
 
-use super::{Epd, PanelError};
+use super::{Epd, PanelError, PanelSettle};
 use display::epd::uc8253::{
     bank_for, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank, RamPlane, SleepStep,
     CDI_INTERVAL, CMD_DATA_STOP, CMD_DEEP_SLEEP, CMD_DISPLAY_REFRESH, CMD_DTM1, CMD_DTM2,
@@ -67,14 +67,17 @@ pub(crate) async fn flush(
     _screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
-) -> Result<(), PanelError> {
+) -> Result<PanelSettle, PanelError> {
     let plan = flush_plan(mode, SCREEN_POWERED.load(Ordering::Relaxed), prev_staged);
     bench_log!(
         "display: x3 flush requested={:?} effective={:?}",
         plan.requested_mode,
         plan.effective_mode
     );
-    execute_steps(epd, fb, prev_fb, plan.effective_mode, plan.steps).await
+    execute_steps(epd, fb, prev_fb, plan.effective_mode, plan.steps).await?;
+    // Handed back rather than slept through here: the write it guards is the
+    // caller's prestage, which already runs after the frame is reported.
+    Ok(PanelSettle::from_ms(plan.settle_after_ms))
 }
 
 /// Stage the just-shown frame into DTM1 ("old" RAM) so the next fast turn's
