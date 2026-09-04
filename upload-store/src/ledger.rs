@@ -57,16 +57,25 @@
 //! adopt, copies gone missing, or copies come back. On a card that has not
 //! changed, the scan does not run at all.
 //!
-//! Nothing here reads book bytes. Adoption is by place and size: a fresh
-//! catalog row whose root, locator and size a live record names is that
-//! record's copy, and any other row is a copy this library has not seen,
-//! which is minted a fresh id. A copy that was moved on a computer is a new
-//! book to this milestone, and its old record stays in the ledger as a
-//! missing copy, for a bounded number of scans, so that the reconciliation
-//! that recognises the move by digest has something to match when it lands.
-//! The one place a copy's bytes or spelling change under its id is a managed
-//! replacement, which [`crate::replace`] carries across the install and
-//! publishes here through [`publish_record`] and [`relocate_record`].
+//! Adoption is by place and size, and costs no reading: a fresh catalog row
+//! whose root, locator and size a live record names is that record's copy.
+//! That is the whole of it for a card that has not been reorganised, which
+//! is the ordinary case, and it is why a scan of a thousand books opens no
+//! book at all.
+//!
+//! What the join cannot match it does not give up on. A record that named
+//! no row and a row no record named can be one copy in a new place, so the
+//! search between those two sets reads the files whose length a missing
+//! copy has and compares them against what that copy's bytes were: a
+//! unique match on both sides moves the record to the row's place, keeping
+//! its id, and anything less than unique leaves both alone and adopts the
+//! row in its own right. A copy nothing recorded the bytes of cannot be
+//! matched at all, since a name and a length are not a book. Records that
+//! match nothing age for a bounded number of scans and are then let go.
+//!
+//! The other place a copy's bytes or spelling change under its id is a
+//! managed replacement, which [`crate::replace`] carries across the install
+//! and publishes here through [`publish_record`] and [`relocate_record`].
 
 use core::cell::Cell;
 

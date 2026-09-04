@@ -766,9 +766,9 @@ ledger by place: a row a live record names by root, locator and size keeps
 that record's id, every other row is minted one, and the new records are
 committed as a ledger generation before the catalog header lands, so no
 committed row carries an id the ledger could lose. Two byte-identical files
-are two ids with independent state. A copy moved on a computer is a new id
-to this milestone, and the record of the copy that left stays as a missing
-book for the reconciliation that will match it by digest. Each record counts
+are two ids with independent state. A copy moved on a computer is matched
+back to its record by the search described below, and the record of a copy
+that has simply gone stays as a missing book meanwhile. Each record counts
 the consecutive scans its place has been missing; a missing record is carried
 for eight such scans and then left out, and missing records are the first to
 go when a generation would not fit beside the live library, so the ledger
