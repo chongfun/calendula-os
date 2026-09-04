@@ -896,6 +896,7 @@ async fn send_render(kind: RenderKind, state: &ReaderState) {
         state.view,
         state.orientation,
         state.front_buttons == app_core::FrontButtons::PagesLeft,
+        state.library_depth,
     );
     let mut request = state.render_request(kind);
     request.requested_at_ms = Instant::now().as_millis();

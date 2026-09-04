@@ -75,11 +75,30 @@ const VIEW_UNKNOWN: u8 = u8::MAX;
 static ORIENTATION: AtomicU8 = AtomicU8::new(0);
 static FRONT_BUTTONS: AtomicU8 = AtomicU8::new(0);
 
+/// How deep in the folder tree the shelf is.
+///
+/// Published because the view cannot answer it. Back inside a folder leaves
+/// one level and stays in `AppView::Library`; only at the root does it leave
+/// the screen. So a scenario watching the view alone reads "still Library"
+/// after entering a folder, concludes it is already where it wanted to be,
+/// and descends instead of measuring the round trip the suite promises.
+static LIBRARY_DEPTH: AtomicU8 = AtomicU8::new(0);
+
 /// Called by the app task as each render is frozen and sent.
-pub fn publish_view(view: AppView, orientation: DisplayOrientation, front_pages_left: bool) {
+pub fn publish_view(
+    view: AppView,
+    orientation: DisplayOrientation,
+    front_pages_left: bool,
+    library_depth: u8,
+) {
     VIEW.store(view_code(view), Ordering::Relaxed);
     ORIENTATION.store(orientation_code(orientation), Ordering::Relaxed);
     FRONT_BUTTONS.store(u8::from(front_pages_left), Ordering::Relaxed);
+    LIBRARY_DEPTH.store(library_depth, Ordering::Relaxed);
+}
+
+fn current_depth() -> u8 {
+    LIBRARY_DEPTH.load(Ordering::Relaxed)
 }
 
 fn orientation_code(orientation: DisplayOrientation) -> u8 {
@@ -415,6 +434,23 @@ async fn act_in_reading(button: Button, timeout_ms: u64) -> bool {
     press_and_settle(button, timeout_ms).await
 }
 
+/// Climb back out to `depth`, one level per Back.
+///
+/// Back inside a folder leaves a level and stays in Library, so the view
+/// cannot report success here and the published depth has to. Bounded by the
+/// nesting the walk could have created.
+async fn leave_to_depth(depth: u8) -> bool {
+    for _ in 0..NAV_ATTEMPTS {
+        if current_depth() <= depth {
+            return true;
+        }
+        if !press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+            return false;
+        }
+    }
+    current_depth() <= depth
+}
+
 /// Pick the selected row and report where it left the app.
 ///
 /// One helper because getting this wrong is the same mistake three times.
@@ -499,7 +535,10 @@ async fn reach_reading() -> bool {
 /// that answers Back with itself would otherwise spin.
 async fn back_to_library() -> bool {
     for _ in 0..NAV_ATTEMPTS {
-        if wait_for_view(AppView::Library, VIEW_SETTLE_MS).await {
+        // The root, not any Library view. Standing inside a folder is
+        // `AppView::Library` too, so returning on the view alone left
+        // callers one or more levels down from where they asked to be.
+        if wait_for_view(AppView::Library, VIEW_SETTLE_MS).await && current_depth() == 0 {
             return true;
         }
         // Reading owes the portrait two-step; every other view acts on one
@@ -694,18 +733,39 @@ async fn scenario_folder_nav() -> Result_ {
                 break;
             }
         }
+        // Recorded before the pick, because a folder entry is only visible
+        // as a change in depth: the view stays Library either way.
+        let depth_before = current_depth();
         match pick_row().await {
-            Some(AppView::Reading) => books += 1,
-            Some(AppView::Library) => entered += 1,
+            Some(AppView::Reading) => {
+                books += 1;
+                if !back_to_library().await {
+                    bench_log!("bench-selftest: lost the library at attempt {}", attempts);
+                    return "lost-library";
+                }
+            }
+            Some(AppView::Library) => {
+                entered += 1;
+                // The half of the round trip the suite name promises, and
+                // the half that was silently skipped: `back_to_library`
+                // returns at once inside a folder, since standing in one is
+                // still `AppView::Library`, so the walk descended instead of
+                // coming back out. Leaving is its own storage operation with
+                // its own telemetry, so skipping it measured half the suite.
+                if !leave_to_depth(depth_before).await {
+                    bench_log!(
+                        "bench-selftest: stuck at depth {} after attempt {}",
+                        current_depth(),
+                        attempts
+                    );
+                    return "leave-failed";
+                }
+            }
             Some(_) => {}
             None => {
                 bench_log!("bench-selftest: attempt {} did not settle", attempts);
                 return "pick-stalled";
             }
-        }
-        if !back_to_library().await {
-            bench_log!("bench-selftest: lost the library at attempt {}", attempts);
-            return "lost-library";
         }
         if entered == 0 && books >= FOLDER_FLAT_PROBE {
             bench_log!(

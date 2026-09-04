@@ -145,7 +145,11 @@ SUITES = {
         # Entries, not renders: what this suite exists to time is the walk a
         # folder costs to enter, and a Library repaint that answered no press
         # is not one of those.
-        stop_event="folder_enter",
+        # The completed round trip, not the entry. "Enter and leave folders"
+        # is the workload, and stopping on the entry ended a capture with its
+        # last leave still in flight, so the operation with its own storage
+        # telemetry went unmeasured on the sample the operator asked for.
+        stop_event="folder_leave",
         stop_count_arg="entries",
         stop_count_default=20,
     ),
@@ -510,7 +514,9 @@ COMPLETED_STOP_REASONS = {"count", "duration", "operator", "selftest"}
 STOP_EVENT_REQUEST_KEYS = {
     "page_turn": "page_turns",
     "sleep_complete": "sleep_cycles",
-    "folder_enter": "folder_entries",
+    # Still `--entries`, since that is what an operator asks for; what it
+    # counts is completed enter-and-leave round trips.
+    "folder_leave": "folder_entries",
 }
 
 
@@ -2516,10 +2522,28 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                     f"known results are {', '.join(sorted(CATALOG_LOAD_RESULTS))}"
                 )
         elif workflow == "folder-nav":
-            # Entering a folder is the walk this suite times. A capture with
-            # none of them measured nothing it was run for.
+            # Entering and leaving are both the walk this suite times, and
+            # they are separate storage operations with separate telemetry. A
+            # capture holding only entries measured half of what it was run
+            # for, which is what a scenario that descended instead of coming
+            # back out produced.
             if "folder_enter" not in event_names:
                 warnings.append(f"{label}: no folder entry telemetry captured")
+            elif "folder_leave" not in event_names:
+                warnings.append(
+                    f"{label}: folder entries captured but no leaves; the walk "
+                    "went down and did not come back"
+                )
+            failed = sum(
+                1
+                for event in signal_events
+                if event.get("event") == "folder_leave" and event.get("ok") is False
+            )
+            if failed:
+                warnings.append(
+                    f"{label}: {failed} folder leave(s) failed; a refused leave "
+                    "is a card fault, not a sample"
+                )
         elif workflow == "sleep-sync":
             if not any(is_terminal_sleep(event) for event in signal_events):
                 warnings.append(
@@ -2681,12 +2705,16 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
 
     entries = requested.get("folder_entries")
     if isinstance(entries, int):
-        entered = sum(1 for event in run.events if event.get("event") == "folder_enter")
-        if entered < entries:
+        round_trips = sum(
+            1
+            for event in run.events
+            if event.get("event") == "folder_leave" and event.get("ok") is not False
+        )
+        if round_trips < entries:
             warnings.append(
-                f"{run.label}: {entered} of {entries} requested folder "
-                "entries captured; the run is short of the sample count it "
-                "was asked for"
+                f"{run.label}: {round_trips} of {entries} requested folder "
+                "round trips captured; the run is short of the sample count "
+                "it was asked for"
             )
 
     cycles = requested.get("sleep_cycles")

@@ -88,7 +88,7 @@ does nothing, rather than quietly running the default under the wrong name.
 |---|---|---|
 | `page-turn` | Opens a book, turns 50 pages | The book you mean to time, reachable from the first row |
 | `storage-cache` | Three open/read/back cycles, 12 turns each | Enough pages to cross a section boundary |
-| `folder-nav` | 20 row entries, 3 cursor steps apart | **Folders.** On a flat card every row is a book, so the run reports 0 folder entries and `--strict` fails, correctly |
+| `folder-nav` | 20 enter-and-leave round trips, 3 cursor steps apart | **Folders.** On a flat card every row is a book, so the run reports 0 folder entries and `--strict` fails, correctly |
 | `reader-soak` | Turns, a chapter jump, Home and Library returns, then sleep | A book with chapters |
 | `sleep-sync` | Six fast turns, then sleep | Nothing particular |
 
@@ -122,8 +122,15 @@ with one rule each.
   invalid=REASON` the moment it happens, and the scenario carries on.
   Reported at the moment and not summarized at the end, because a count
   target can stop the capture mid-scenario: `folder-nav --entries 20` ends on
-  the twentieth `folder_enter`, so a stall summarized after the walk goes to
-  a host that has stopped listening. `--strict` fails on it too,
+  the twentieth completed round trip, so a stall summarized after the walk
+  goes to a host that has stopped listening.
+
+`folder-nav` counts round trips rather than entries, because entering and
+leaving are separate storage operations with separate telemetry and the suite
+promises both. `--entries N` therefore owes N completed leaves, a capture
+holding entries and no leaves fails as a walk that went down and did not come
+back, and a refused leave fails as a card fault rather than counting as a
+sample. `--strict` fails on it too,
   but the rest of the capture survives, which matters for a soak whose sleep
   and wake are still worth having.
 
