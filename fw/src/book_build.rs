@@ -709,6 +709,60 @@ where
 /// Only the active book has a resident locator, and every open stages its row
 /// as active first, so `None` means that staging did not happen or the record
 /// held nothing openable.
+/// Read the book once and record what its bytes are, unless the card
+/// already says.
+///
+/// The file is the one the open just proved, read from the start and left
+/// where it was found, so the zip stream that follows sees what it would
+/// have seen. A book too large to read here is left unrecorded rather than
+/// half recorded: what goes into a claim has to be the whole stream.
+fn record_source_evidence<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+    owner: &proto::cache::CacheOwner<'_>,
+    file: &embedded_sdmmc::File<'_, D, T, MD, MF, MV>,
+    source_len: u32,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: embedded_sdmmc::TimeSource,
+{
+    if files::recorded_evidence(root, owner).is_some_and(|held| held.digest.is_some()) {
+        return;
+    }
+    let started = Instant::now();
+    let mut hasher = proto::source::SourceHasher::new();
+    let mut buffer = [0u8; 512];
+    let mut read_total = 0u32;
+    if file.seek_from_start(0).is_err() {
+        return;
+    }
+    while read_total < source_len {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                read_total += read as u32;
+            }
+            Err(_) => return,
+        }
+    }
+    let rewound = file.seek_from_start(0).is_ok();
+    if read_total != source_len || !rewound {
+        return;
+    }
+    let digest = hasher.finish();
+    match files::record_cache_evidence(root, owner, None, Some(digest)) {
+        Ok(()) => bench_log!(
+            "bench: storage_evidence action=record len={} elapsed_ms={} t_ms={}",
+            source_len,
+            started.elapsed().as_millis(),
+            Instant::now().as_millis(),
+        ),
+        // A claim that would not take it costs a scan the chance to find
+        // this copy again, and costs this open nothing.
+        Err(_) => esp_println::println!("storage: could not record what this copy is"),
+    }
+}
+
 fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, LibraryPath)> {
     let (at, path) = library.book_location(index)?;
     Some((at, LibraryPath::parse(path).ok()?))
@@ -1554,6 +1608,13 @@ where
     };
 
     esp_println::println!("epub: stage OpenSdFile len={}", source_len);
+    // What this copy is, recorded once beside the place it is read from.
+    // A scan adopts a book without reading it, so for everything that was
+    // not uploaded this is the only thing on the card that says what the
+    // bytes were, and it is what lets the next scan find the book again
+    // after a computer moves it. Paid once per copy, on the open that also
+    // builds its cache, and skipped whenever the claim already says.
+    record_source_evidence(root, &owner, &file, source_len);
     let requested_global_page = target_pages as u32;
 
     esp_println::println!("epub: zip open len={}", source_len);

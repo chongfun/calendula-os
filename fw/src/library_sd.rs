@@ -753,6 +753,43 @@ where
     // a rescan next mount, the same as any other interrupted scan.
     let identity_start = Instant::now();
     let rng = esp_hal::rng::Rng::new();
+    // A copy found again in a new place keeps its id, and the place the
+    // reader left it at is filed under where it used to be, so the two are
+    // brought together here. Reported before the ledger is written, so a
+    // reset between the two leaves a card whose next scan reports the same
+    // move and carries the same place again.
+    let mut carry = |found: &upload_store::ledger::FoundAgain<'_>| {
+        let was_key = proto::cache::cache_key_from(proto::cache::source_hash_at(
+            found.was.0,
+            found.was.1,
+            found.was.2,
+        ));
+        let now_key = proto::cache::cache_key_from(proto::cache::source_hash_at(
+            found.now.0,
+            found.now.1,
+            found.now.2,
+        ));
+        let was = proto::cache::CacheOwner {
+            key: was_key.as_str(),
+            root: found.was.0,
+            locator: found.was.1,
+        };
+        let now = proto::cache::CacheOwner {
+            key: now_key.as_str(),
+            root: found.now.0,
+            locator: found.now.1,
+        };
+        match reader_cache::files::carry_position_for_move(root, &was, &now) {
+            Ok(true) => esp_println::println!("sd: carried a reading place to '{}'", found.now.1),
+            Ok(false) => {}
+            // A place that could not be carried is a place lost, not a scan
+            // that failed: the copy has its id back either way, and the
+            // book opens at its beginning rather than not at all.
+            Err(_) => {
+                esp_println::println!("sd: could not carry a reading place to '{}'", found.now.1)
+            }
+        }
+    };
     let assigned = upload_store::ledger::assign_book_ids(
         root,
         &file,
@@ -760,6 +797,7 @@ where
         scratch,
         &mut || rng.random(),
         ledger,
+        &mut carry,
     )
     .map_err(|fault| {
         esp_println::println!("sd: library ledger refused: {:?}", fault);

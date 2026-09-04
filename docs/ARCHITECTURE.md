@@ -843,14 +843,36 @@ which records named no row and which rows no record named, so the search
 runs between those two sets alone: a shelf that did not change reads no
 book, and a stable file is not read again to prove what the join matched by
 place. Size narrows the candidates and the recorded digest decides, since a
-name and a length are not a book. A copy the ledger holds no digest for
-cannot be matched at all, and is left missing while the file that appeared
-is adopted in its own right. Ambiguity is left alone from either side: two
-missing copies of the same bytes, or one missing copy and two files holding
-them, are copies no file can be told apart by, so their places stay as they
-are. One scan carries as many missing copies as the scan arena holds and
-reads at most sixteen books, a reorganisation larger than that being
-repaired as far as it goes and adopted afresh beyond it.
+name and a length are not a book.
+
+Most of a library has no digest in the ledger, since a scan adopts a book
+without reading it and reading a whole card to adopt it would cost hours for
+a move that may never happen. Opening a book records what its bytes are in
+the claim on the cache directory it keeps its reading place in, once per
+copy, on the open that already builds its cache. That directory is named for
+the place the record still names, so the search asks it for any copy the
+ledger says nothing about: a book that has been read can be found again, and
+one that has not cannot, which is the same rule the reading place it would
+carry lives by. A claim naming another book is no evidence about this one,
+since a cache key is 28 bits of a hash and two books can land on one and the
+same directory.
+
+A copy nothing recorded the bytes of is left missing while the file that
+appeared is adopted in its own right. Ambiguity is left alone from either
+side: two missing copies of the same bytes, or one missing copy and two
+files holding them, are copies no file can be told apart by, so their places
+stay as they are. One scan carries as many missing copies as the scan arena
+holds and reads at most sixteen books, a reorganisation larger than that
+being repaired as far as it goes and adopted afresh beyond it.
+
+A repaired locator on its own would leave the reader's place behind, since
+a position is filed under the place a book was read from. So the scan
+reports each copy it finds again, before it writes the ledger, and the
+firmware carries the position from the old directory to the new one,
+reading the destination once more to say what it is vouching for. Reporting
+before the write costs a reset nothing: the record is still missing and the
+row still unadopted, so the next scan finds the same move and carries the
+same place again.
 
 Positions and caches still key by place, and the mapping they will move onto
 is what exists now: a place resolves to the id that owns it

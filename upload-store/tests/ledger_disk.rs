@@ -277,8 +277,15 @@ fn scan(
     arm();
     let ledger = ledger::open(root)?;
     let mut scratch = vec![0u8; scratch_len];
-    let assigned =
-        ledger::assign_book_ids(root, &file, rows.len() as u16, &mut scratch, random, ledger)?;
+    let assigned = ledger::assign_book_ids(
+        root,
+        &file,
+        rows.len() as u16,
+        &mut scratch,
+        random,
+        ledger,
+        &mut |_| {},
+    )?;
     encode_catalog_header(rows.len() as u16, &mut header);
     file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
     file.write(&header).map_err(|_| LedgerFault::Device)?;

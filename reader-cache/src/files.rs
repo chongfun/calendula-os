@@ -405,6 +405,84 @@ where
     Ok(true)
 }
 
+/// What a book's own claim records of its bytes, when it records anything.
+///
+/// For a caller deciding whether reading the book again would tell the card
+/// something it does not already know. `None` covers every reason not to
+/// bother distinguishing: no directory, no claim, another book's claim, or
+/// one written before claims carried evidence.
+pub fn recorded_evidence<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> Option<proto::cache::CacheEvidence>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = cache_root.open_dir(CACHE_V2_DIR).ok()?;
+    let book = cache.open_dir(owner.key).ok()?;
+    match book_dir_claim(&book, owner) {
+        ClaimState::MineActive | ClaimState::MineReleased => match read_stored_claim(&book) {
+            StoredClaim::Present { evidence, .. } => Some(evidence),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Carry a reading position to where a copy has been found again.
+///
+/// The place a reader left is filed under where the copy used to be, so a
+/// repaired locator on its own would leave it behind. The scan proves the
+/// move by the bytes; this reads the destination again rather than taking
+/// that word for it, because what it writes into the claim is a statement
+/// about the bytes at the new place and the only way to make one is to read
+/// them.
+///
+/// `Ok(false)` is a copy that had no place filed under where it was, which
+/// is most of a library.
+pub fn carry_position_for_move<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    was: &proto::cache::CacheOwner<'_>,
+    now: &proto::cache::CacheOwner<'_>,
+) -> Result<bool, ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let path =
+        proto::library_path::LibraryPath::parse(now.locator).map_err(|_| ClaimDenied::Fault)?;
+    let read = upload_store::library::with_book_at(root, now.root, &path, |dir, alias| {
+        let mut name = heapless::String::<12>::new();
+        use core::fmt::Write as _;
+        if write!(name, "{}", alias).is_err() {
+            return None;
+        }
+        upload_store::digest_of_file(dir, name.as_str())
+            .ok()
+            .flatten()
+    })
+    .map_err(|_| ClaimDenied::Fault)?
+    .flatten();
+    let Some(digest) = read else {
+        return Err(ClaimDenied::Fault);
+    };
+    carry_position(root, was, now, digest, None)
+}
+
 /// The position files inside an open book directory.
 fn read_position_in<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,

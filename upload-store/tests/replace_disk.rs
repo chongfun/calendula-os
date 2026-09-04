@@ -291,6 +291,17 @@ fn overwrite_shelf(root: &Dir<'_>, name: &str, bytes: &[u8]) {
     .expect("the book is there to overwrite");
 }
 
+thread_local! {
+    /// What the scan reported finding again, most recent scan last: the id
+    /// that was kept, where it was, and where it is now.
+    static FOUND_AGAIN: RefCell<Vec<(BookId, String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What the scans since the last call reported, and clear it.
+fn found_again() -> Vec<(BookId, String, String)> {
+    FOUND_AGAIN.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
+}
+
 /// One row of the catalog a scan would write.
 type Row<'a> = (BookRoot, &'a str, u32);
 
@@ -337,8 +348,20 @@ fn scan_minting(
     }
     let live = ledger::open(root)?;
     let mut scratch = vec![0u8; 16 * 1024];
-    let assigned =
-        ledger::assign_book_ids(root, &file, rows.len() as u16, &mut scratch, random, live)?;
+    let assigned = ledger::assign_book_ids(
+        root,
+        &file,
+        rows.len() as u16,
+        &mut scratch,
+        random,
+        live,
+        &mut |found| {
+            FOUND_AGAIN.with(|seen| {
+                seen.borrow_mut()
+                    .push((found.id, found.was.1.to_owned(), found.now.1.to_owned()))
+            });
+        },
+    )?;
     encode_catalog_header(rows.len() as u16, &mut header);
     file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
     file.write(&header).map_err(|_| LedgerFault::Device)?;
@@ -2187,4 +2210,157 @@ fn a_copy_with_no_recorded_bytes_is_not_matched() {
     assert_eq!(assigned.minted, 1);
     assert_eq!(assigned.missing, 1);
     assert_ne!(ids[0], Some(id));
+}
+
+/// Record what the reader records when it opens a book: what the bytes it
+/// read were, in the claim on the directory that book's place names.
+fn note_open(root: &Dir<'_>, at: BookRoot, locator: &str, bytes: &[u8]) {
+    if root.open_dir(CACHE_ROOT_DIR).is_err() {
+        root.make_dir_in_dir(CACHE_ROOT_DIR).expect("make READER");
+    }
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).expect("open READER");
+    if cache_root.open_dir(proto::cache::CACHE_V2_DIR).is_err() {
+        cache_root
+            .make_dir_in_dir(proto::cache::CACHE_V2_DIR)
+            .expect("make CACHE2");
+    }
+    let cache = cache_root
+        .open_dir(proto::cache::CACHE_V2_DIR)
+        .expect("open CACHE2");
+    let key = cache_key_from(source_hash_at(at, locator, bytes.len() as u32));
+    if cache.open_dir(key.as_str()).is_err() {
+        cache
+            .make_dir_in_dir(key.as_str())
+            .expect("make book directory");
+    }
+    let book = cache.open_dir(key.as_str()).expect("open book directory");
+    let evidence = proto::cache::CacheEvidence {
+        cluster: None,
+        digest: Some(CachedSourceDigest::new(digest_of(bytes))),
+    };
+    let mut encoded = [0u8; proto::cache::CACHE_CLAIM_MAX_BYTES];
+    let len = proto::cache::encode_cache_claim(at, locator, false, &evidence, &mut encoded)
+        .expect("the claim fits");
+    let file = book
+        .open_file_in_dir(
+            proto::cache::CACHE_CLAIM_FILE,
+            Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("claim file");
+    file.write(&encoded[..len]).expect("write claim");
+    file.close().expect("close claim");
+}
+
+/// A scan adopts a book without reading it, so most of a library has no
+/// digest in the ledger. Opening one records what its bytes were beside the
+/// place it was read from, and that is enough to find it again: the copy
+/// that moved is the one the reader had been reading, which is the copy
+/// whose place is worth keeping.
+#[test]
+fn a_sideloaded_copy_that_was_read_is_found_again_where_it_went() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    sideload(&books, BOOK, &bytes);
+    let mut random = words();
+    let (_, ids) = scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+    let id = ids[0].unwrap();
+    assert_eq!(
+        record_for(&root, BOOK).and_then(|(_, _, source)| source),
+        None,
+        "the ledger was told nothing about the bytes"
+    );
+
+    // The reader opens it, which is what records them.
+    note_open(&root, BookRoot::Library, BOOK, &bytes);
+    let _ = found_again();
+
+    let moved = "Herbert, Frank - Dune.epub";
+    rename_on_shelf(&root, BOOK, moved);
+    let (assigned, ids) =
+        scan_minting(&root, &[(BookRoot::Library, moved, size)], &mut random).unwrap();
+    assert_eq!(assigned.repaired, 1, "found again: {assigned:?}");
+    assert_eq!(assigned.hashed, 1);
+    assert_eq!(assigned.minted, 0);
+    assert_eq!(ids[0], Some(id), "under the id it was adopted with");
+
+    // And the move is reported with both places, so what is filed under the
+    // old one can be carried to the new one.
+    assert_eq!(
+        found_again(),
+        vec![(id, BOOK.to_owned(), moved.to_owned())],
+        "the scan says which copy went where"
+    );
+
+    let live = ledger::open(&root).unwrap().unwrap();
+    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
+    assert_eq!(copy.locator(), Some(moved));
+    assert!(
+        digest_agrees(copy.source, &bytes),
+        "and the record now says what its bytes are, having read them"
+    );
+}
+
+/// A directory another book claims says nothing about this one, however
+/// well its digest fits: cache keys are 28 bits of a hash of the place, so
+/// two books can land on one directory, and the claim is what tells them
+/// apart.
+#[test]
+fn a_claim_naming_another_book_is_no_evidence_about_this_one() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    sideload(&books, BOOK, &bytes);
+    let mut random = words();
+    let (_, ids) = scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+    let id = ids[0].unwrap();
+
+    // The claim on this book's directory names somebody else, so what it
+    // records of its bytes is somebody else's business.
+    note_open(&root, BookRoot::Library, BOOK, &bytes);
+    let key = cache_key_from(source_hash_at(BookRoot::Library, BOOK, size));
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).expect("open READER");
+    let cache = cache_root
+        .open_dir(proto::cache::CACHE_V2_DIR)
+        .expect("open CACHE2");
+    let book = cache.open_dir(key.as_str()).expect("open book directory");
+    let evidence = proto::cache::CacheEvidence {
+        cluster: None,
+        digest: Some(CachedSourceDigest::new(digest_of(&bytes))),
+    };
+    let mut encoded = [0u8; proto::cache::CACHE_CLAIM_MAX_BYTES];
+    let len = proto::cache::encode_cache_claim(
+        BookRoot::Library,
+        "Someone Else.epub",
+        false,
+        &evidence,
+        &mut encoded,
+    )
+    .expect("the claim fits");
+    let file = book
+        .open_file_in_dir(
+            proto::cache::CACHE_CLAIM_FILE,
+            Mode::ReadWriteCreateOrTruncate,
+        )
+        .expect("claim file");
+    file.write(&encoded[..len]).expect("write claim");
+    file.close().expect("close claim");
+    let _ = found_again();
+
+    rename_on_shelf(&root, BOOK, "Elsewhere.epub");
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, "Elsewhere.epub", size)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(assigned.repaired, 0, "no evidence, no repair: {assigned:?}");
+    assert_eq!(assigned.hashed, 0);
+    assert_eq!(assigned.minted, 1);
+    assert_ne!(ids[0], Some(id));
+    assert!(found_again().is_empty());
 }
