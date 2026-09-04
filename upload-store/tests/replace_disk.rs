@@ -1969,3 +1969,222 @@ fn a_copy_replaced_on_a_computer_leaves_the_old_id_with_no_place_to_give() {
         None
     );
 }
+
+/// Rename a book on the shelf, the way a computer does: the bytes stay put
+/// and the name changes, so the scan sees a place it knew go missing and a
+/// place it has not seen appear.
+fn rename_on_shelf(root: &Dir<'_>, from: &str, to: &str) {
+    let path = LibraryPath::parse(from).unwrap();
+    library::with_book_at(root, BookRoot::Library, &path, |dir, alias| {
+        let mut alias_text = heapless::String::<12>::new();
+        use core::fmt::Write as _;
+        write!(alias_text, "{}", alias).unwrap();
+        dir.move_file_in_dir_lfn(alias_text.as_str(), dir, to)
+            .expect("rename book");
+    })
+    .expect("shelf readable")
+    .expect("the book is there to rename");
+}
+
+/// A book renamed on a computer is the same copy in a new place. The scan
+/// finds the record that named the old place with no row, and the row with
+/// no record, reads the file that appeared, and hands the copy its own id
+/// back rather than adopting it as a stranger.
+#[test]
+fn a_renamed_copy_is_found_again_and_keeps_its_id() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    upload(&root, &books, BOOK, &bytes, || {})
+        .unwrap()
+        .expect("lands");
+    let (id, _, source) = record_for(&root, BOOK).expect("adopted at install");
+    assert!(
+        digest_agrees(source, &bytes),
+        "the install recorded its bytes"
+    );
+    let mut random = words();
+    for _ in 0..4 {
+        random();
+    }
+    let (assigned, ids) =
+        scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+    assert_eq!(assigned.matched, 1);
+    assert_eq!(ids[0], Some(id));
+
+    let renamed = "Dune (First Edition).epub";
+    rename_on_shelf(&root, BOOK, renamed);
+    let (assigned, ids) =
+        scan_minting(&root, &[(BookRoot::Library, renamed, size)], &mut random).unwrap();
+    assert_eq!(
+        assigned.repaired, 1,
+        "the copy was found again: {assigned:?}"
+    );
+    assert_eq!(assigned.hashed, 1, "one file read to prove it");
+    assert_eq!(assigned.minted, 0, "and nothing adopted as a stranger");
+    assert_eq!(assigned.missing, 0);
+    assert_eq!(ids[0], Some(id), "the row carries the copy's own id");
+
+    assert_eq!(record_count(&root), 1, "one copy, one record");
+    let live = ledger::open(&root).unwrap().unwrap();
+    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
+    assert_eq!(
+        copy.locator(),
+        Some(renamed),
+        "the record followed the file"
+    );
+    assert_eq!(copy.misses, 0);
+    assert!(
+        digest_agrees(copy.source, &bytes),
+        "and still says what its bytes are"
+    );
+
+    // The next scan has nothing to look for, so it reads no book at all.
+    let (assigned, ids) =
+        scan_minting(&root, &[(BookRoot::Library, renamed, size)], &mut random).unwrap();
+    assert_eq!(
+        assigned.hashed, 0,
+        "a shelf that did not change reads nothing"
+    );
+    assert_eq!(assigned.matched, 1);
+    assert_eq!(ids[0], Some(id));
+}
+
+/// Two copies of one book, both renamed at once, are two copies no file can
+/// tell apart: whichever of them a file holds, its bytes are the same. The
+/// search leaves both alone rather than joining one reader's place to the
+/// other's book, and the files are adopted as new copies.
+#[test]
+fn two_missing_copies_of_one_book_are_left_alone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let shared = body(1, 3_000);
+    let size = shared.len() as u32;
+    let twin = "Dune (2).epub";
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &shared, &mut random)
+        .unwrap()
+        .expect("lands");
+    upload_minting(&root, &books, twin, &shared, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (first, _, _) = record_for(&root, BOOK).expect("adopted");
+    let (second, _, _) = record_for(&root, twin).expect("adopted");
+    assert_ne!(first, second);
+    scan_minting(
+        &root,
+        &[
+            (BookRoot::Library, BOOK, size),
+            (BookRoot::Library, twin, size),
+        ],
+        &mut random,
+    )
+    .unwrap();
+
+    rename_on_shelf(&root, BOOK, "One.epub");
+    rename_on_shelf(&root, twin, "Two.epub");
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[
+            (BookRoot::Library, "One.epub", size),
+            (BookRoot::Library, "Two.epub", size),
+        ],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(assigned.repaired, 0, "neither copy is chosen: {assigned:?}");
+    assert_eq!(assigned.ambiguous, 2, "and both are reported");
+    assert_eq!(assigned.hashed, 0, "nothing is read to learn what is known");
+    assert_eq!(
+        assigned.minted, 2,
+        "the files are copies in their own right"
+    );
+    assert_eq!(assigned.missing, 2, "and the old records wait a while");
+    let fresh: Vec<BookId> = ids.iter().map(|id| id.expect("adopted")).collect();
+    assert!(!fresh.contains(&first));
+    assert!(!fresh.contains(&second));
+    assert_eq!(record_count(&root), 4);
+}
+
+/// One copy that went missing and two files holding its bytes is the same
+/// ambiguity from the other side: which of them is the copy the reader was
+/// in cannot be told from the bytes, so neither takes its id.
+#[test]
+fn a_copy_that_could_be_either_of_two_files_is_left_alone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    let mut random = words();
+    upload_minting(&root, &books, BOOK, &bytes, &mut random)
+        .unwrap()
+        .expect("lands");
+    let (id, _, _) = record_for(&root, BOOK).expect("adopted");
+    scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+
+    // The reader copies the book beside itself on a computer and renames
+    // the original, so two files now hold what one record knows.
+    rename_on_shelf(&root, BOOK, "One.epub");
+    sideload(&books, "Two.epub", &bytes);
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[
+            (BookRoot::Library, "One.epub", size),
+            (BookRoot::Library, "Two.epub", size),
+        ],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(assigned.repaired, 0, "neither file takes it: {assigned:?}");
+    assert_eq!(assigned.ambiguous, 1);
+    assert_eq!(assigned.hashed, 2, "both were read before that was known");
+    assert_eq!(assigned.minted, 2);
+    assert_eq!(assigned.missing, 1, "the copy waits, still missing");
+    assert!(!ids.contains(&Some(id)));
+    let live = ledger::open(&root).unwrap().unwrap();
+    let copy = ledger::find_by_id(&root, &live, id).unwrap().unwrap();
+    assert_eq!(
+        copy.locator(),
+        Some(BOOK),
+        "it still answers with the place it left, which nothing else holds"
+    );
+    assert_eq!(copy.misses, 1);
+}
+
+/// A copy nothing recorded the bytes of cannot be found again: a name and a
+/// length are not a book, and the file that was there is gone. It is left
+/// missing and the file that appeared is adopted in its own right.
+#[test]
+fn a_copy_with_no_recorded_bytes_is_not_matched() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    sideload(&books, BOOK, &bytes);
+    let mut random = words();
+    let (_, ids) = scan_minting(&root, &[(BookRoot::Library, BOOK, size)], &mut random).unwrap();
+    let id = ids[0].unwrap();
+    assert_eq!(
+        record_for(&root, BOOK).and_then(|(_, _, source)| source),
+        None,
+        "a scan adopts a book without reading it"
+    );
+
+    rename_on_shelf(&root, BOOK, "Elsewhere.epub");
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, "Elsewhere.epub", size)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(assigned.repaired, 0);
+    assert_eq!(assigned.hashed, 0, "there was nothing to compare against");
+    assert_eq!(assigned.minted, 1);
+    assert_eq!(assigned.missing, 1);
+    assert_ne!(ids[0], Some(id));
+}

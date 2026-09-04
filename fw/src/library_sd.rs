@@ -779,13 +779,28 @@ where
             assigned.duplicates
         );
     }
+    if assigned.repaired > 0 {
+        esp_println::println!(
+            "sd: found {} book(s) again in a new place",
+            assigned.repaired
+        );
+    }
+    if assigned.ambiguous > 0 {
+        esp_println::println!(
+            "sd: {} book(s) could be more than one copy, so their places were left alone",
+            assigned.ambiguous
+        );
+    }
     bench_log!(
-        "bench: storage_ledger action=assign matched={} minted={} missing={} retired={} duplicates={} elapsed_ms={} t_ms={}",
+        "bench: storage_ledger action=assign matched={} minted={} missing={} retired={} duplicates={} repaired={} hashed={} ambiguous={} elapsed_ms={} t_ms={}",
         assigned.matched,
         assigned.minted,
         assigned.missing,
         assigned.retired,
         assigned.duplicates,
+        assigned.repaired,
+        assigned.hashed,
+        assigned.ambiguous,
         identity_start.elapsed().as_millis(),
         Instant::now().as_millis(),
     );

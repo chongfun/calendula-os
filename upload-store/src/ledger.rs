@@ -82,11 +82,11 @@ use proto::identity::{
     encode_ledger_header, encode_ledger_journal, encode_ledger_placeholder_header,
     encode_ledger_record, ledger_file_len, rows_with_hash, sort_row_keys, stage_row_key, BookId,
     LedgerHeader, LedgerHeaderReading, LedgerJournal, LedgerJournalReading, LedgerRecord,
-    LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_JOURNAL_SLOTS, LEDGER_JOURNAL_SLOT_BYTES,
-    LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
+    BOOK_ID_BYTES, LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_JOURNAL_SLOTS,
+    LEDGER_JOURNAL_SLOT_BYTES, LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
 };
 use proto::library_path::{BookRoot, MAX_PATH_BYTES};
-use proto::source::CachedSourceDigest;
+use proto::source::{encode_cached_record, parse_record, CachedSourceDigest, SOURCE_RECORD_BYTES};
 
 /// The two generations, under the cache root.
 pub const LEDGER_FILES: [&str; 2] = ["LEDGERA.BIN", "LEDGERB.BIN"];
@@ -790,6 +790,70 @@ pub struct Assignment {
     /// Records that named no row and were left behind: missing for longer
     /// than the ledger retains, or not fitting beside the live library.
     pub retired: u16,
+    /// Copies found again somewhere else: a record that named no row and a
+    /// row no record named, proved the same bytes, so the record moved to
+    /// the row's place with its id rather than the row being adopted afresh.
+    pub repaired: u16,
+    /// Files read whole to confirm a move. What the search costs, and the
+    /// number a fingerprint would be there to bring down.
+    pub hashed: u16,
+    /// Moves that could have been more than one thing: two missing copies of
+    /// the same bytes, or one missing copy and two new files holding them.
+    /// Left alone, both sides, since a wrong join of one reader's place to
+    /// another book costs more than a copy adopted afresh.
+    pub ambiguous: u16,
+}
+
+// ---------------------------------------------------------------------------
+// Moves: a copy that went missing and a file that appeared may be one book
+// ---------------------------------------------------------------------------
+
+/// One missing copy the move search carries while it reads the rows: which
+/// record it is, what it was, the id it keeps if it is found again, the
+/// digest that would prove it, and what the search has turned up so far.
+const MOVE_INDEX: usize = 0;
+const MOVE_SIZE: usize = 2;
+const MOVE_ID: usize = 6;
+const MOVE_DIGEST: usize = MOVE_ID + BOOK_ID_BYTES;
+const MOVE_ROW: usize = MOVE_DIGEST + SOURCE_RECORD_BYTES;
+const MOVE_MATCHES: usize = MOVE_ROW + 2;
+const MOVE_ENTRY_BYTES: usize = MOVE_MATCHES + 1;
+
+/// Missing copies one scan carries into the search. A reorganisation larger
+/// than this repairs what fits and adopts the rest afresh, which is the
+/// same answer the search gives anything it cannot prove.
+const MOVES_CONSIDERED: usize = 64;
+/// Files one scan reads whole to confirm a move. A bound on the time a scan
+/// can spend, where the entry count bounds the memory: a book is megabytes
+/// and this is the only part of a scan that reads one.
+const MOVE_HASHES: u16 = 16;
+/// A match count meaning this copy is not one the search may repair,
+/// whatever it finds: another missing copy holds the same bytes, so which
+/// of them a file is cannot be told from the file.
+const MOVE_AMBIGUOUS: u8 = u8::MAX;
+
+fn move_entry(table: &[u8], slot: usize) -> &[u8] {
+    &table[slot * MOVE_ENTRY_BYTES..][..MOVE_ENTRY_BYTES]
+}
+
+fn move_u16(entry: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([entry[at], entry[at + 1]])
+}
+
+/// The slot a record index belongs to, when the search means to move it.
+fn move_slot_of_record(table: &[u8], slots: usize, index: u16) -> Option<usize> {
+    (0..slots).find(|slot| {
+        let entry = move_entry(table, *slot);
+        move_u16(entry, MOVE_INDEX) == index && entry[MOVE_MATCHES] == 1
+    })
+}
+
+/// The slot a row belongs to, when the search means to give it that copy.
+fn move_slot_of_row(table: &[u8], slots: usize, row: u16) -> Option<usize> {
+    (0..slots).find(|slot| {
+        let entry = move_entry(table, *slot);
+        entry[MOVE_MATCHES] == 1 && move_u16(entry, MOVE_ROW) == row
+    })
 }
 
 /// Give every row of a freshly written catalog its [`BookId`].
@@ -915,6 +979,112 @@ where
     if new_rows == 0 && missing_records == 0 && returned == 0 {
         return Ok(assigned);
     }
+    // The move search: a record that named no row may be a copy that was
+    // moved or renamed on a computer, and a row no record named may be
+    // where it went. Only ever between those two sets, so a card whose
+    // shelf did not change pays nothing, and a stable file is not read
+    // again to prove what the join already matched by place.
+    //
+    // Size narrows the candidates and the digest decides, which is the one
+    // thing that can tell a copy from another book of the same length. A
+    // copy with no recorded digest cannot be matched at all: nothing on the
+    // card says what its bytes were, and a name and a length are not a
+    // book.
+    let mut slots = 0usize;
+    let capacity = (keys.len() / MOVE_ENTRY_BYTES).min(MOVES_CONSIDERED);
+    let table = &mut keys[..capacity * MOVE_ENTRY_BYTES];
+    if let Some(live) = live {
+        if missing_records > 0 && new_rows > 0 && capacity > 0 {
+            for_each_record(root, &live, &mut |index, entry| {
+                let Some(digest) = entry.source else {
+                    return Ok(());
+                };
+                if slots >= capacity || bit(named, index) {
+                    return Ok(());
+                }
+                let slot = &mut table[slots * MOVE_ENTRY_BYTES..][..MOVE_ENTRY_BYTES];
+                slot[MOVE_INDEX..MOVE_SIZE].copy_from_slice(&index.to_le_bytes());
+                slot[MOVE_SIZE..MOVE_ID].copy_from_slice(&entry.byte_size.to_le_bytes());
+                slot[MOVE_ID..MOVE_DIGEST].copy_from_slice(&entry.id.to_bytes());
+                slot[MOVE_DIGEST..MOVE_ROW].copy_from_slice(&encode_cached_record(&digest));
+                slot[MOVE_ROW..MOVE_MATCHES].copy_from_slice(&u16::MAX.to_le_bytes());
+                slot[MOVE_MATCHES] = 0;
+                slots += 1;
+                Ok(())
+            })?;
+        }
+    }
+    // Two missing copies of the same bytes are two copies no file can be
+    // told apart by, so neither is repaired and both wait for a card that
+    // says more. Marked before anything is read, so the reading is not
+    // paid for either.
+    for slot in 0..slots {
+        for other in slot + 1..slots {
+            if move_entry(table, slot)[MOVE_DIGEST..MOVE_ROW]
+                != move_entry(table, other)[MOVE_DIGEST..MOVE_ROW]
+            {
+                continue;
+            }
+            for ambiguous in [slot, other] {
+                if table[ambiguous * MOVE_ENTRY_BYTES + MOVE_MATCHES] != MOVE_AMBIGUOUS {
+                    table[ambiguous * MOVE_ENTRY_BYTES + MOVE_MATCHES] = MOVE_AMBIGUOUS;
+                    assigned.ambiguous = assigned.ambiguous.saturating_add(1);
+                }
+            }
+        }
+    }
+    if slots > 0 {
+        seek_row(catalog, 0)?;
+        for row in 0..count as usize {
+            if !read_exact(catalog, &mut record)? {
+                return Err(LedgerFault::Device);
+            }
+            if catalog_record_book_id(&record).is_some() {
+                continue;
+            }
+            let (at, locator, byte_size) = catalog_record_at(&record).ok_or(LedgerFault::Record)?;
+            let wanted = (0..slots).any(|slot| {
+                let entry = move_entry(table, slot);
+                entry[MOVE_MATCHES] < MOVE_AMBIGUOUS
+                    && u32::from_le_bytes(entry[MOVE_SIZE..MOVE_ID].try_into().expect("four bytes"))
+                        == byte_size
+            });
+            if !wanted || assigned.hashed >= MOVE_HASHES {
+                continue;
+            }
+            // A file that cannot be read is a file that proves nothing. The
+            // scan has no business failing over it: the row is adopted
+            // afresh, which is what it would have been anyway.
+            let Ok(Some(found)) = crate::replace::digest_at(root, at, locator) else {
+                continue;
+            };
+            assigned.hashed = assigned.hashed.saturating_add(1);
+            for slot in 0..slots {
+                let entry = move_entry(table, slot);
+                if entry[MOVE_MATCHES] == MOVE_AMBIGUOUS {
+                    continue;
+                }
+                let Some(recorded) = parse_record(&entry[MOVE_DIGEST..MOVE_ROW]) else {
+                    continue;
+                };
+                if !recorded.agrees_with(&found) {
+                    continue;
+                }
+                let entry = &mut table[slot * MOVE_ENTRY_BYTES..][..MOVE_ENTRY_BYTES];
+                // A second file holding one copy's bytes is the same
+                // ambiguity from the other side.
+                if entry[MOVE_MATCHES] == 1 {
+                    entry[MOVE_MATCHES] = 2;
+                    assigned.ambiguous = assigned.ambiguous.saturating_add(1);
+                } else if entry[MOVE_MATCHES] == 0 {
+                    entry[MOVE_MATCHES] = 1;
+                    entry[MOVE_ROW..MOVE_MATCHES].copy_from_slice(&(row as u16).to_le_bytes());
+                }
+            }
+        }
+    }
+    let table = &table[..slots * MOVE_ENTRY_BYTES];
+
     // Live and new copies are the library; a missing record takes a slot
     // only if one is left once they are all in.
     let room = LEDGER_MAX_RECORDS.saturating_sub(live_records + new_rows);
@@ -923,6 +1093,7 @@ where
         minted,
         missing,
         retired,
+        repaired,
         ..
     } = &mut assigned;
     write_generation(
@@ -934,6 +1105,12 @@ where
                     misses: 0,
                     ..Kept::of(entry)
                 });
+            }
+            // A copy the search found again is written where it was found,
+            // by the row that holds it, rather than carried as missing from
+            // a place it has left.
+            if move_slot_of_record(table, slots, index).is_some() {
+                return Carry::Drop;
             }
             match carry_missing(entry.misses, room.saturating_sub(carried_missing)) {
                 Some(misses) => {
@@ -961,19 +1138,40 @@ where
                 }
                 let (at, locator, byte_size) =
                     catalog_record_at(&record).ok_or(LedgerFault::Record)?;
-                let id = BookId::mint(random);
+                let found_again = move_slot_of_row(table, slots, row as u16).map(|slot| {
+                    let entry = move_entry(table, slot);
+                    (
+                        BookId::from_bytes(
+                            entry[MOVE_ID..MOVE_DIGEST]
+                                .try_into()
+                                .expect("sixteen bytes"),
+                        ),
+                        parse_record(&entry[MOVE_DIGEST..MOVE_ROW]),
+                    )
+                });
+                let (id, source) = match found_again {
+                    // The copy keeps its id and what its bytes were, which
+                    // is what was just read off the file at this row.
+                    Some((Some(id), source)) => {
+                        *repaired += 1;
+                        (id, source)
+                    }
+                    _ => {
+                        *minted += 1;
+                        (BookId::mint(random), None)
+                    }
+                };
                 writer.append(&LedgerRecord {
                     id,
                     root: at,
                     locator,
                     byte_size,
                     misses: 0,
-                    source: None,
+                    source,
                 })?;
                 // Leaves the cursor at the next row, where the read above
                 // expects it.
                 write_row_id(catalog, row, id)?;
-                *minted += 1;
             }
             Ok(())
         },

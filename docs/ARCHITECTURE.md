@@ -837,6 +837,21 @@ Both records stay in the ledger, to be matched by their bytes or aged out
 with everything else the card stopped holding. Two records that are both
 missing keep their places, neither being the one a scan chose.
 
+A copy moved or renamed on a computer is found again rather than adopted as
+a stranger, when the card says enough to prove it. The scan already knows
+which records named no row and which rows no record named, so the search
+runs between those two sets alone: a shelf that did not change reads no
+book, and a stable file is not read again to prove what the join matched by
+place. Size narrows the candidates and the recorded digest decides, since a
+name and a length are not a book. A copy the ledger holds no digest for
+cannot be matched at all, and is left missing while the file that appeared
+is adopted in its own right. Ambiguity is left alone from either side: two
+missing copies of the same bytes, or one missing copy and two files holding
+them, are copies no file can be told apart by, so their places stay as they
+are. One scan carries as many missing copies as the scan arena holds and
+reads at most sixteen books, a reorganisation larger than that being
+repaired as far as it goes and adopted afresh beyond it.
+
 Positions and caches still key by place, and the mapping they will move onto
 is what exists now: a place resolves to the id that owns it
 (`upload_store::ledger::find_record`), an id resolves to wherever that copy

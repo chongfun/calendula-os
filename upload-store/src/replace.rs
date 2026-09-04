@@ -397,7 +397,7 @@ where
 }
 
 /// The digest of the file at a place, read whole now, or `None` for no file.
-fn digest_at<D, T, const MD: usize, const MF: usize, const MV: usize>(
+pub(crate) fn digest_at<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     at: BookRoot,
     locator: &str,
