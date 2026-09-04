@@ -130,7 +130,22 @@ leaving are separate storage operations with separate telemetry and the suite
 promises both. `--entries N` therefore owes N completed leaves, a capture
 holding entries and no leaves fails as a walk that went down and did not come
 back, and a refused leave fails as a card fault rather than counting as a
-sample. `--strict` fails on it too,
+sample.
+
+The Nth leave does not end the capture by itself. `folder_leave` is printed
+by the storage call the moment its SD work is done, before the listing has
+reached the app, been folded into state, or been drawn, so stopping there
+would end the run mid-round-trip on the very sample the operator asked for.
+The capture waits for the repaint that completes it, on the same principle as
+the page-turn prestage.
+
+Two boundaries, and telling them apart matters for anything driving the
+device. A press is answered by a render of the state that press produced. A
+storage operation is answered later, by its own event. Back inside a folder
+sets the browse to Leaving and touches the depth not at all, so a leave has
+to be waited for on the depth, not on the settle. Pressing Back again while
+that move is in flight is a deliberate escape hatch in the reducer: it
+abandons the move and leaves for Home. `--strict` fails on it too,
   but the rest of the capture survives, which matters for a soak whose sleep
   and wake are still worth having.
 

@@ -357,7 +357,24 @@ def process_capture_stream(
             # the report.
             break
         elif stop_target and counts.get(stop_target[0], 0) >= stop_target[1]:
-            if stop_target[0] == "page_turn":
+            if stop_target[0] == "folder_leave" and not any(
+                e.get("event") == "render" for e in parsed_events
+            ):
+                # `folder_leave` is printed by the storage call as soon as the
+                # SD work is done, before its listing has reached the app,
+                # been folded into state, or been drawn. Breaking there ends
+                # the capture mid-round-trip on the very sample the operator
+                # asked for, and hides a listing that arrived and then failed
+                # to render. So the target leave waits for the repaint that
+                # completes it, on the same principle as the page-turn
+                # prestage below.
+                pending_prestage = True
+                deadline = time.monotonic() + pending_prestage_timeout_s
+                pending_prestage_deadline = deadline
+                if on_deadline_set is not None:
+                    on_deadline_set(deadline)
+                pending_prestage_lines = 0
+            elif stop_target[0] == "page_turn":
                 already_prestaged = any(
                     e.get("event") == "render" and isinstance(e.get("prestage_ms"), int)
                     for e in parsed_events

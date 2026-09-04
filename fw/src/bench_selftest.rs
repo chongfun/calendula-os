@@ -206,6 +206,14 @@ const QUIET_BUDGET_MS: u64 = 120_000;
 /// How often to re-read the published view while waiting on one.
 const VIEW_POLL_MS: u64 = 100;
 
+/// How long a folder leave has to be answered.
+///
+/// The card walks the parent past the returning name before it commits, and
+/// measured folder entry runs 41 ms plus 0.356 ms per row at 1,129 books, so
+/// this is orders of margin over a healthy answer and only a stuck card
+/// reaches it.
+const LEAVE_ANSWER_MS: u64 = 30_000;
+
 /// How long to wait for a view to arrive before pressing again. Long enough
 /// for the second render an entry can paint, short enough that a wrong guess
 /// costs a press rather than the capture.
@@ -434,17 +442,53 @@ async fn act_in_reading(button: Button, timeout_ms: u64) -> bool {
     press_and_settle(button, timeout_ms).await
 }
 
+/// Wait for the shelf to be shallower than `from`, or give up.
+///
+/// The settle is the wrong boundary for a leave and this is the right one.
+/// The Back press sets `LibraryBrowse::Leaving` and touches the depth not at
+/// all; the depth moves when storage answers `FolderListed`. Every input is
+/// marked dirty, so the app renders the post-press state straight away, and
+/// that render is what a settle wait consumes.
+async fn wait_for_depth_below(from: u8, timeout_ms: u64) -> bool {
+    let deadline = embassy_time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if current_depth() < from {
+            return true;
+        }
+        if embassy_time::Instant::now() >= deadline {
+            return false;
+        }
+        Timer::after(Duration::from_millis(VIEW_POLL_MS)).await;
+    }
+}
+
 /// Climb back out to `depth`, one level per Back.
 ///
 /// Back inside a folder leaves a level and stays in Library, so the view
-/// cannot report success here and the published depth has to. Bounded by the
-/// nesting the walk could have created.
+/// cannot report success here and the published depth has to.
+///
+/// Each Back waits for its own answer before the next one is considered, and
+/// the wait is required rather than tidy. A second Back arriving while the
+/// browse move is still in flight is a deliberate escape hatch in the
+/// reducer: it resets `library_browse` and leaves for Home, abandoning the
+/// very leave this is trying to measure. Synchronising on the settle instead
+/// of the depth would have sent that second press every time, because the
+/// depth cannot have moved yet when the first render lands.
 async fn leave_to_depth(depth: u8) -> bool {
     for _ in 0..NAV_ATTEMPTS {
-        if current_depth() <= depth {
+        let from = current_depth();
+        if from <= depth {
             return true;
         }
         if !press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+            return false;
+        }
+        if !wait_for_depth_below(from, LEAVE_ANSWER_MS).await {
+            bench_log!(
+                "bench-selftest: leave from depth {} was not answered in {} ms",
+                from,
+                LEAVE_ANSWER_MS
+            );
             return false;
         }
     }
@@ -537,9 +581,11 @@ async fn back_to_library() -> bool {
     for _ in 0..NAV_ATTEMPTS {
         // The root, not any Library view. Standing inside a folder is
         // `AppView::Library` too, so returning on the view alone left
-        // callers one or more levels down from where they asked to be.
-        if wait_for_view(AppView::Library, VIEW_SETTLE_MS).await && current_depth() == 0 {
-            return true;
+        // callers one or more levels down from where they asked to be, and
+        // climbing out is `leave_to_depth`'s job because it waits on the
+        // answer rather than on the press.
+        if wait_for_view(AppView::Library, VIEW_SETTLE_MS).await {
+            return leave_to_depth(0).await;
         }
         // Reading owes the portrait two-step; every other view acts on one
         // press, and act_in_reading sends only one from those because the
