@@ -2395,6 +2395,30 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                     f"{label}: the selftest scenario reported it could not run "
                     f"{reason}, so this capture does not cover the whole workflow"
                 )
+        # A self-driving scenario writes exactly one terminal record, and only
+        # `done` means it finished what it set out to do. Stopping the capture
+        # on any of them is right, since the device has stopped talking, but
+        # certifying any of them was not: a storage-cache run that failed to
+        # open on its second cycle ended the capture on `nav-failed` while its
+        # first cycle had already produced the telemetry and budget samples
+        # this gate asks for.
+        terminals = [e for e in signal_events if e.get("event") == "selftest_done"]
+        for event in terminals:
+            result = str(event.get("result", "unspecified"))
+            if result != "done":
+                warnings.append(
+                    f"{label}: the selftest scenario ended on result={result} "
+                    "rather than done, so it did not finish the workflow"
+                )
+        if len(terminals) > 1:
+            # One scenario, one ending. Two means the firmware printed a
+            # terminal record and carried on, which is how the earlier
+            # storage-cache arm produced `nav-failed` and then `done`.
+            reported = ", ".join(str(e.get("result")) for e in terminals)
+            warnings.append(
+                f"{label}: {len(terminals)} selftest terminal records ({reported}); "
+                "a scenario owes exactly one"
+            )
         if run.suite == "thermal-run" and "refresh" not in event_names:
             # Ambient investigations live on refresh timing whatever workflow
             # they ran under.

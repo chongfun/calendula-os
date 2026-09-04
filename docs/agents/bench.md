@@ -92,6 +92,33 @@ does nothing, rather than quietly running the default under the wrong name.
 | `reader-soak` | Turns, a chapter jump, Home and Library returns, then sleep | A book with chapters |
 | `sleep-sync` | Six fast turns, then sleep | Nothing particular |
 
+### The terminal protocol
+
+A selftest scenario says how it ended, in two channels with one rule each.
+
+- **One terminal record per scenario run**, written by the driver rather than
+  the scenario, so a second one cannot happen: `bench-selftest: scenario=X
+  result=W`. `result=done` means the scenario finished everything it set out
+  to do. Any other word names what stopped it (`nav-failed`, `no-folders`,
+  `short-turns`, `lost-library`, `sleep-refused`). The host stops the capture
+  on any of them, because the device has stopped talking, and `--strict`
+  certifies only `done`.
+- **A phase that did not run** reports `bench-selftest: scenario=X
+  invalid=REASON` and the scenario carries on. `--strict` fails on it too,
+  but the rest of the capture survives, which matters for a soak whose sleep
+  and wake are still worth having.
+
+Both matter because a suite's own strict signals are weaker than they look.
+reader-soak asks for input and render telemetry plus a completed sleep and a
+later wake, and a pass that skipped its chapter jump, its Home and Library
+return, or half its page turns produces all of that. So every advertised
+phase reports itself rather than relying on the suite gate to notice.
+
+The two sleep suites reach no terminal record on success, deliberately: the
+sleep does not return, and their capture is meant to continue across the wake
+into the next cycle. A terminal record from one of them means the sleep was
+refused.
+
 ### The sleep suites reboot
 
 Deep sleep is terminal on this firmware: waking is a fresh boot. So

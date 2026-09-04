@@ -574,19 +574,40 @@ async fn request_sleep() -> bool {
     false
 }
 
+/// A scenario's one terminal word.
+///
+/// `DONE` means it finished everything it set out to do; anything else names
+/// what stopped it, and the harness refuses to certify a capture that ends on
+/// one. Returned rather than printed, so `run` is the only place a terminal
+/// record is written and a second one is structurally impossible. The
+/// previous shape trusted each scenario to log once, and storage-cache did
+/// not: its nav-failure arm printed a result, broke, and fell through to
+/// print `done` as well.
+type Result_ = &'static str;
+
+const DONE: Result_ = "done";
+
+/// Report a phase the scenario could not run.
+///
+/// A diagnostic channel rather than a terminal one: the run carries on, so a
+/// soak still delivers its sleep and wake, and the harness fails `--strict`
+/// on the record without losing the rest of the capture.
+fn report_invalid(scenario: &str, reason: &str) {
+    bench_log!("bench-selftest: scenario={} invalid={}", scenario, reason);
+}
+
 /// `page-turn`: the suite the operator cadence has cost the most.
-async fn scenario_page_turn() {
+async fn scenario_page_turn() -> Result_ {
     if !open_and_quiesce().await {
-        bench_log!("bench-selftest: scenario=page-turn result=nav-failed");
-        return;
+        return "nav-failed";
     }
     bench_log!("bench-selftest: reached reading, turning {} pages", TURNS);
     let turned = turn_pages(TURNS).await;
-    bench_log!(
-        "bench-selftest: scenario=page-turn result=done turns={} of {}",
-        turned,
-        TURNS
-    );
+    bench_log!("bench-selftest: page-turn turns={} of {}", turned, TURNS);
+    if turned < TURNS {
+        return "short-turns";
+    }
+    DONE
 }
 
 /// `storage-cache`: cold and warm opens, section extends, progress writes.
@@ -597,32 +618,38 @@ async fn scenario_page_turn() {
 /// RAM window, which is the warm evidence `--warm` checks for. Page turns
 /// in between produce the progress writes and, at a section boundary, the
 /// extends.
-async fn scenario_storage_cache() {
+async fn scenario_storage_cache() -> Result_ {
     let mut opens = 0u32;
+    let mut short = false;
     for cycle in 0..STORAGE_CYCLES {
         if !open_and_quiesce().await {
-            bench_log!(
-                "bench-selftest: scenario=storage-cache result=nav-failed cycle={}",
-                cycle
-            );
-            break;
+            bench_log!("bench-selftest: storage cycle={} could not open", cycle);
+            return "nav-failed";
         }
         opens += 1;
         let turned = turn_pages(STORAGE_TURNS_PER_CYCLE).await;
         bench_log!("bench-selftest: storage cycle={} turns={}", cycle, turned);
+        short |= turned < STORAGE_TURNS_PER_CYCLE;
         if !back_to_library().await {
             bench_log!(
                 "bench-selftest: could not reach library after cycle {}",
                 cycle
             );
-            break;
+            return "lost-library";
         }
     }
     bench_log!(
-        "bench-selftest: scenario=storage-cache result=done opens={} of {}",
+        "bench-selftest: storage opens={} of {}",
         opens,
         STORAGE_CYCLES
     );
+    if short {
+        // The opens are the evidence this suite is for, and they all landed.
+        // A cycle that ran out of pages is worth reporting without throwing
+        // the capture away.
+        report_invalid("storage-cache", "short-turns");
+    }
+    DONE
 }
 
 /// `folder-nav`: entering and leaving rows, and paging the list.
@@ -633,10 +660,9 @@ async fn scenario_storage_cache() {
 /// of, so the walk keeps moving instead of settling into one book. The
 /// `Next` presses before each Confirm are what carries the cursor over a
 /// page boundary, which is the other half of what this suite times.
-async fn scenario_folder_nav() {
+async fn scenario_folder_nav() -> Result_ {
     if !back_to_library().await {
-        bench_log!("bench-selftest: scenario=folder-nav result=no-library");
-        return;
+        return "no-library";
     }
     let mut entered = 0u32;
     let mut books = 0u32;
@@ -655,29 +681,33 @@ async fn scenario_folder_nav() {
             Some(_) => {}
             None => {
                 bench_log!("bench-selftest: attempt {} did not settle", attempts);
-                break;
+                return "pick-stalled";
             }
         }
         if !back_to_library().await {
             bench_log!("bench-selftest: lost the library at attempt {}", attempts);
-            break;
+            return "lost-library";
         }
         if entered == 0 && books >= FOLDER_FLAT_PROBE {
             bench_log!(
-                "bench-selftest: scenario=folder-nav result=no-folders books={} \
-                 (this card has nothing to enter; the suite wants a folder tree)",
+                "bench-selftest: folder-nav found no folders in {} picks; this card \
+                 has nothing to enter and the suite wants a folder tree",
                 books
             );
-            return;
+            return "no-folders";
         }
     }
     bench_log!(
-        "bench-selftest: scenario=folder-nav result=done folders={} of {} books={} attempts={}",
+        "bench-selftest: folder-nav folders={} of {} books={} attempts={}",
         entered,
         FOLDER_ENTRIES,
         books,
         attempts
     );
+    if entered < FOLDER_ENTRIES {
+        return "short-entries";
+    }
+    DONE
 }
 
 /// `reader-soak`: the whole reading workflow, including a sleep and a wake.
@@ -687,16 +717,23 @@ async fn scenario_folder_nav() {
 /// across reboots the way an operator's session does. `--strict` wants a
 /// completed sleep with a wake later in the same run, which is exactly the
 /// shape this produces.
-async fn scenario_reader_soak() {
+///
+/// Every advertised phase reports itself. `--strict` asks this suite only
+/// for input and render telemetry plus a completed sleep and a later wake,
+/// and a pass that skipped its chapter jump, its Home and Library return, or
+/// half its page turns still produces all of that. So each phase that does
+/// not run says so through the invalid channel, and the run continues to its
+/// sleep because the wake half is still worth capturing.
+async fn scenario_reader_soak() -> Result_ {
     if !open_and_quiesce().await {
-        bench_log!("bench-selftest: scenario=reader-soak result=nav-failed");
-        return;
+        return "nav-failed";
     }
     let turned = turn_pages(SOAK_TURNS).await;
 
     // Chapter jump: Confirm opens the list, a step moves the cursor off the
     // current chapter, Confirm takes it. This is the navigation a page-turn
     // run does not exercise.
+    //
     // Reading suppresses a Confirm for POST_OPEN_CONFIRM_BLOCK_MS after an
     // open, so a reader's Confirm cannot be eaten by the open that just
     // landed. Every page turn re-arms it, so a Confirm pressed the instant
@@ -724,26 +761,27 @@ async fn scenario_reader_soak() {
     };
 
     bench_log!(
-        "bench-selftest: scenario=reader-soak turns={}+{} jumped={} returned={}",
+        "bench-selftest: reader-soak turns={}+{} jumped={} returned={}",
         turned,
         turned_after,
         jumped,
         returned
     );
-    // A soak that skipped its chapter navigation is not the workflow this
-    // suite advertises, and --strict cannot tell on its own: it asks for
-    // input and render telemetry plus a completed sleep and a later wake,
-    // all of which a jumpless pass still produces. So this is a shape the
-    // harness parses and fails on, not prose. `invalid=` and not `result=`
-    // deliberately: the run carries on into its sleep, because the wake half
-    // is still evidence worth having, and only `result=` ends a capture.
     if !jumped {
-        bench_log!("bench-selftest: scenario=reader-soak invalid=chapter-navigation");
+        report_invalid("reader-soak", "chapter-navigation");
+    }
+    if !returned {
+        report_invalid("reader-soak", "library-return");
+    }
+    if turned < SOAK_TURNS || (returned && turned_after < SOAK_TURNS) {
+        report_invalid("reader-soak", "short-turns");
     }
 
-    // Last, because it does not return.
+    // Last, because on success it does not return: the wake is a fresh boot
+    // that runs this scenario again, so the terminal record below is only
+    // reached when the sleep was refused.
     request_sleep().await;
-    bench_log!("bench-selftest: scenario=reader-soak result=sleep-refused");
+    "sleep-refused"
 }
 
 /// `sleep-sync`: fast turns, then sleep, then wake and repeat.
@@ -751,18 +789,17 @@ async fn scenario_reader_soak() {
 /// One cycle per boot, for the same reason `reader-soak` is: the timer wake
 /// reboots the chip and this runs again. bench.py counts `sleep_complete`
 /// until it has the cycles it asked for.
-async fn scenario_sleep_sync() {
+async fn scenario_sleep_sync() -> Result_ {
     if !open_and_quiesce().await {
-        bench_log!("bench-selftest: scenario=sleep-sync result=nav-failed");
-        return;
+        return "nav-failed";
     }
     let turned = turn_pages(SLEEP_TURNS).await;
-    bench_log!(
-        "bench-selftest: scenario=sleep-sync turns={}, sleeping",
-        turned
-    );
+    bench_log!("bench-selftest: sleep-sync turns={}, sleeping", turned);
+    if turned < SLEEP_TURNS {
+        report_invalid("sleep-sync", "short-turns");
+    }
     request_sleep().await;
-    bench_log!("bench-selftest: scenario=sleep-sync result=sleep-refused");
+    "sleep-refused"
 }
 
 /// Which scenario this build runs, from `BENCH_SCENARIO` at compile time.
@@ -807,7 +844,7 @@ pub async fn run() {
         Timer::after(Duration::from_millis(SLEEP_SCENARIO_HOLD_MS)).await;
     }
 
-    match scenario {
+    let result = match scenario {
         "storage-cache" => scenario_storage_cache().await,
         "folder-nav" => scenario_folder_nav().await,
         "reader-soak" => scenario_reader_soak().await,
@@ -822,6 +859,13 @@ pub async fn run() {
                  Valid: page-turn storage-cache folder-nav reader-soak sleep-sync",
                 other
             );
+            "unknown-scenario"
         }
-    }
+    };
+
+    // The only terminal record, so a scenario cannot print two. The word is
+    // `done` when everything the scenario meant to do happened, and names
+    // the obstacle otherwise; the harness stops the capture on either and
+    // refuses to certify anything but `done`.
+    bench_log!("bench-selftest: scenario={} result={}", scenario, result);
 }
