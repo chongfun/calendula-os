@@ -1099,3 +1099,329 @@ fn the_recorded_digest_is_evidence_that_agrees_with_the_bytes() {
     assert!(cached.agrees_with(&fresh));
     assert!(!cached.agrees_with(&digest_of(&body(8, 999))));
 }
+
+/// The byte offset of UTF-16 unit `i` inside a 32-byte LFN entry, whose
+/// thirteen units live in three regions.
+fn lfn_unit_offset(i: usize) -> usize {
+    match i {
+        0..=4 => 1 + 2 * i,
+        5..=10 => 14 + 2 * (i - 5),
+        _ => 28 + 2 * (i - 11),
+    }
+}
+
+/// Rewrite a single-entry long name the driver created into another name of
+/// the same or shorter length, directly in the image bytes.
+///
+/// The driver refuses to create two names differing only in case, which is
+/// exactly the directory another operating system can leave behind, so the
+/// tests forge one. The 8.3 alias and its checksum are untouched: an alias
+/// unrelated to its long name is legal FAT, and is what any `~1` alias
+/// already looks like.
+fn rewrite_long_name(data: &mut [u8], created: &str, forged: &str) {
+    let created_units: Vec<u16> = created.encode_utf16().collect();
+    let forged_units: Vec<u16> = forged.encode_utf16().collect();
+    assert!(created_units.len() <= 13, "one LFN entry holds 13 units");
+    assert!(forged_units.len() <= created_units.len());
+    let mut patched = 0;
+    for at in (0..data.len().saturating_sub(31)).step_by(32) {
+        let entry = &data[at..at + 32];
+        // One terminal LFN entry: sequence 1 with the last-in-chain flag.
+        if entry[0] != 0x41 || entry[11] != 0x0F || entry[12] != 0 {
+            continue;
+        }
+        let unit_at = |i: usize| {
+            let offset = lfn_unit_offset(i);
+            u16::from_le_bytes([entry[offset], entry[offset + 1]])
+        };
+        let matches = (0..created_units.len()).all(|i| unit_at(i) == created_units[i])
+            && (created_units.len() == 13 || unit_at(created_units.len()) == 0x0000);
+        if !matches {
+            continue;
+        }
+        for (i, unit) in forged_units.iter().enumerate() {
+            let offset = lfn_unit_offset(i);
+            data[at + offset..at + offset + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        // Terminator where the forged name ends, padding over the rest of
+        // what the created name used.
+        for i in forged_units.len()..=created_units.len().min(12) {
+            let unit: u16 = if i == forged_units.len() {
+                0x0000
+            } else {
+                0xFFFF
+            };
+            let offset = lfn_unit_offset(i);
+            data[at + offset..at + offset + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        patched += 1;
+    }
+    assert_eq!(patched, 1, "exactly one directory entry should match");
+}
+
+/// A computer can leave two entries on the shelf that differ only by case,
+/// which the card matches as one name. An upload to that name cannot land:
+/// the shelf has one namespace with case ignored, so whichever twin the
+/// install replaced, the other would refuse the landing and the rollback
+/// alike, halfway through. It is refused before anything is journalled or
+/// moved, whether the upload spells one twin exactly or neither, and
+/// whichever twin the directory lists first. Once the shelf holds one, the
+/// upload goes through as a respelling of that one.
+#[test]
+fn case_variant_twins_on_the_shelf_are_refused_before_anything_moves() {
+    let disk = new_card();
+    let a = body(1, 2_000);
+    let b = body(2, 2_500);
+    {
+        let mgr = open_mgr(&disk);
+        let (_, books) = open_dirs(&mgr);
+        sideload(&books, "FooA.epub", &a);
+        sideload(&books, "fooB.epub", &b);
+    }
+    {
+        let mut data = disk.0.data.borrow_mut();
+        rewrite_long_name(&mut data, "FooA.epub", "Foo.epub");
+        rewrite_long_name(&mut data, "fooB.epub", "foo.epub");
+    }
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    assert_eq!(shelf_bytes(&root, "Foo.epub").as_deref(), Some(&a[..]));
+    assert_eq!(shelf_bytes(&root, "foo.epub").as_deref(), Some(&b[..]));
+    let (assigned, ids) = scan(
+        &root,
+        &[
+            (BookRoot::Library, "Foo.epub", a.len() as u32),
+            (BookRoot::Library, "foo.epub", b.len() as u32),
+        ],
+    )
+    .unwrap();
+    assert_eq!(assigned.minted, 2);
+    let (first, second) = (ids[0].unwrap(), ids[1].unwrap());
+
+    // The exact spelling of the twin the directory lists second, and a
+    // spelling that is neither.
+    for name in ["foo.epub", "FOO.EPUB"] {
+        let refused = upload(&root, &books, name, &body(3, 3_000), || {});
+        assert!(
+            matches!(refused, Err(InstallError::Ambiguous)),
+            "{name}: two holders of the name are a refusal: {refused:?}"
+        );
+        assert_eq!(
+            replace::read(&root).unwrap(),
+            None,
+            "{name}: no intent was published"
+        );
+        assert_eq!(
+            install::read_intent(&root).unwrap(),
+            install::IntentState::Absent,
+            "{name}: and no install journal"
+        );
+        assert_eq!(
+            shelf_bytes(&root, "Foo.epub").as_deref(),
+            Some(&a[..]),
+            "{name}: the shelf is as it was"
+        );
+        assert_eq!(shelf_bytes(&root, "foo.epub").as_deref(), Some(&b[..]));
+        assert_eq!(
+            record_for(&root, "Foo.epub").map(|(id, size, _)| (id, size)),
+            Some((first, a.len() as u32)),
+            "{name}: and so is the ledger"
+        );
+        assert_eq!(
+            record_for(&root, "foo.epub").map(|(id, size, _)| (id, size)),
+            Some((second, b.len() as u32))
+        );
+        assert_eq!(record_count(&root), 2);
+    }
+
+    // The twin taken away on a computer, the upload is a respelling of the
+    // one left, which keeps its id.
+    remove_from_shelf(&root, "Foo.epub");
+    let c = body(4, 3_000);
+    upload(&root, &books, "FOO.EPUB", &c, || {})
+        .unwrap()
+        .expect("one holder is a replacement");
+    assert_eq!(shelf_bytes(&root, "FOO.EPUB").as_deref(), Some(&c[..]));
+    assert_eq!(shelf_bytes(&root, "foo.epub"), None);
+    let (locator, size, source) = record_by_id(&root, second).expect("the id survives");
+    assert_eq!(locator, "FOO.EPUB");
+    assert_eq!(size, c.len() as u32);
+    assert!(digest_agrees(source, &c));
+    assert_eq!(replace::read(&root).unwrap(), None);
+}
+
+/// A full ledger makes room by letting a missing copy go, but only one
+/// whose place is empty now: a copy the last scan missed can have been put
+/// back since, and its counter alone would evict a book that is on the
+/// shelf. The candidate is chosen and verified in preflight, written into
+/// the intent, and is what the publication evicts; with no such candidate
+/// the install is refused before anything is journalled.
+#[test]
+fn only_a_missing_copy_verified_absent_makes_room_in_a_full_ledger() {
+    let disk = new_card_of(128 * 1024);
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let ids: Vec<BookId> = (0..LEDGER_MAX_RECORDS)
+        .map(|index| {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            BookId::from_bytes(bytes).unwrap()
+        })
+        .collect();
+    // Two records the last scan found missing. The first in ledger order
+    // has been put back on the shelf since; the second is still gone.
+    let back_index = 300usize;
+    let gone_index = 900usize;
+    let back = body(6, 1_000);
+    sideload(&books, "Back.epub", &back);
+    ledger::write_generation(
+        &root,
+        None,
+        &mut |_, record| Carry::Keep(Kept::of(record)),
+        |writer| {
+            for (index, id) in ids.iter().enumerate() {
+                let mut locator = heapless::String::<32>::new();
+                use core::fmt::Write as _;
+                if index == back_index {
+                    locator.push_str("Back.epub").unwrap();
+                } else if index == gone_index {
+                    locator.push_str("Gone.epub").unwrap();
+                } else {
+                    write!(locator, "B{index}.epub").unwrap();
+                }
+                writer.append(&LedgerRecord {
+                    id: *id,
+                    root: BookRoot::Library,
+                    locator: locator.as_str(),
+                    byte_size: 1_000,
+                    misses: match index {
+                        _ if index == back_index => 1,
+                        _ if index == gone_index => 2,
+                        _ => 0,
+                    },
+                    source: None,
+                })?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(record_count(&root), LEDGER_MAX_RECORDS);
+
+    // The copy that is gone makes the room, not the one that came first.
+    let new = body(2, 2_048);
+    upload(&root, &books, BOOK, &new, || {})
+        .unwrap()
+        .expect("lands");
+    assert!(record_for(&root, BOOK).is_some(), "adopted");
+    assert_eq!(record_count(&root), LEDGER_MAX_RECORDS);
+    assert_eq!(
+        record_by_id(&root, ids[gone_index]),
+        None,
+        "the gone copy made the room"
+    );
+    assert_eq!(
+        record_by_id(&root, ids[back_index]).map(|(locator, _, _)| locator),
+        Some("Back.epub".to_owned()),
+        "the copy that came back kept its record"
+    );
+    assert_eq!(shelf_bytes(&root, "Back.epub").as_deref(), Some(&back[..]));
+
+    // With the only missing counter naming a copy that is on the shelf, a
+    // fresh upload is refused before anything is journalled.
+    let refused = replace::begin(
+        &root,
+        BookRoot::Library,
+        "Other.epub",
+        None,
+        digest_of(&body(3, 1_500)),
+        &mut words(),
+    );
+    assert!(
+        matches!(refused, Err(LedgerFault::Full)),
+        "a counter is not absence: {refused:?}"
+    );
+    let refused = upload(&root, &books, "Other.epub", &body(3, 1_500), || {});
+    assert!(
+        matches!(refused, Err(InstallError::Ledger)),
+        "refused by the ledger: {refused:?}"
+    );
+    assert_eq!(replace::read(&root).unwrap(), None);
+    assert_eq!(
+        install::read_intent(&root).unwrap(),
+        install::IntentState::Absent
+    );
+    assert_eq!(shelf_bytes(&root, "Other.epub"), None);
+    assert_eq!(record_count(&root), LEDGER_MAX_RECORDS);
+    assert!(record_by_id(&root, ids[back_index]).is_some());
+
+    // Taken away again on a computer, the same record is the candidate: the
+    // intent names it, and the publication evicts exactly it.
+    remove_from_shelf(&root, "Back.epub");
+    let standing = replace::begin(
+        &root,
+        BookRoot::Library,
+        "Other.epub",
+        None,
+        digest_of(&body(3, 1_500)),
+        &mut words(),
+    )
+    .expect("room now");
+    assert_eq!(standing.evict, Some(ids[back_index]));
+    assert_eq!(
+        replace::read(&root).unwrap().map(|standing| standing.evict),
+        Some(Some(ids[back_index])),
+        "the reservation is in the intent"
+    );
+    // Nothing stood and nothing landed: an old landing clears the intent
+    // without publishing.
+    replace::settle(&root, Landing::Old).unwrap();
+    assert_eq!(replace::read(&root).unwrap(), None);
+    assert!(record_by_id(&root, ids[back_index]).is_some());
+
+    let other = body(3, 1_500);
+    // Minted from further along the word source, so that this fresh copy
+    // does not draw the id the first one did.
+    let mut later = words();
+    for _ in 0..4 {
+        later();
+    }
+    upload_minting(&root, &books, "Other.epub", &other, &mut later)
+        .unwrap()
+        .expect("lands");
+    let (_, size, source) = record_for(&root, "Other.epub").expect("adopted");
+    assert_eq!(size, other.len() as u32);
+    assert!(digest_agrees(source, &other));
+    assert_eq!(record_count(&root), LEDGER_MAX_RECORDS);
+    assert_eq!(record_by_id(&root, ids[back_index]), None);
+    assert_eq!(replace::read(&root).unwrap(), None);
+}
+
+/// Take what the shelf holds under `name`, spelled exactly so, away, as a
+/// computer would.
+fn remove_from_shelf(root: &Dir<'_>, name: &str) {
+    let path = LibraryPath::parse(name).unwrap();
+    library::with_book_at(root, BookRoot::Library, &path, |dir, alias| {
+        let mut alias_text = heapless::String::<12>::new();
+        use core::fmt::Write as _;
+        write!(alias_text, "{}", alias).unwrap();
+        dir.delete_entry_in_dir(alias_text.as_str())
+            .expect("delete book");
+    })
+    .expect("shelf readable")
+    .expect("the book is there to take away");
+}
+
+/// [`upload`], minting from `random` rather than the fixed word source: a
+/// test that adopts two fresh copies must not draw the same id for both.
+fn upload_minting(
+    root: &Dir<'_>,
+    books: &Dir<'_>,
+    name: &str,
+    bytes: &[u8],
+    random: &mut impl FnMut() -> u32,
+) -> Result<Option<install::Landed>, InstallError> {
+    let mut staged = StagedUpload::begin(root, books, name, None)?;
+    staged.write(bytes)?;
+    staged.install(root, books, random)
+}

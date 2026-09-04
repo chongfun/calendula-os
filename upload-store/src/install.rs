@@ -448,13 +448,15 @@ pub enum InstallError {
     /// alike. No EPUB is zero bytes, and an empty one on the shelf can be
     /// deleted and the upload retried.
     Empty,
-    /// A fixed name resolved to more than one plausible entry: case
-    /// variants of the shelf with no exact spelling, or an exact
-    /// non-directory squatting on the name beside a case-variant directory.
-    /// A computer can legally leave either behind. Nothing here can pick a
-    /// reading without risking the wrong library, so the card is refused
-    /// until it is fixed on a computer. Unlike [`Self::Card`] a retry
-    /// without changing the card cannot help.
+    /// A name resolved to more than one plausible entry: case variants of
+    /// the shelf with no exact spelling, an exact non-directory squatting on
+    /// the name beside a case-variant directory, or two books on the shelf
+    /// differing only by case where an upload is to land. A computer can
+    /// legally leave any of these behind. Nothing here can pick a reading
+    /// without risking the wrong library, and a landing beside a twin would
+    /// be refused by the shelf halfway through, so the card is refused
+    /// before anything is written until it is fixed on a computer. Unlike
+    /// [`Self::Card`] a retry without changing the card cannot help.
     Ambiguous,
     /// The library ledger refused: it is damaged, or of a version this build
     /// does not read, so the copy being replaced cannot have its identity
@@ -655,10 +657,9 @@ where
     // carries the scratch file's, the predecessor the parked copy's.
     let staged = entry_cluster(&upload, intent.stage.alias.as_str()).ok_or(InstallError::Card)?;
     // By the name it was parked under: the move gave it a derived alias.
-    let parked = holder_of_long_name(&rollback, intent.rollback.as_str())
-        .ok_or(InstallError::Card)?
-        .map(|(_, cluster)| cluster);
-    let holder = holder_of_long_name(books, intent.long_name.as_str()).ok_or(InstallError::Card)?;
+    let parked =
+        holder_of_long_name(&rollback, intent.rollback.as_str())?.map(|(_, cluster)| cluster);
+    let holder = holder_of_long_name(books, intent.long_name.as_str())?;
 
     // The installed book is the one on the upload's chain, recorded before
     // anything moved. Asking instead whether the scratch file is still there
@@ -720,7 +721,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    holder_of_long_name(rollback, intent.rollback.as_str()).ok_or(InstallError::Card)
+    holder_of_long_name(rollback, intent.rollback.as_str())
 }
 
 /// Carry out one step. `Ok(true)` if `/BOOKS` changed.
@@ -1435,9 +1436,18 @@ where
         // an upload spelled another way is a replacement of this copy that
         // will also respell its place.
         let mut predecessor_spelling = String::<{ proto::library_path::MAX_PATH_BYTES }>::new();
-        let old = match spelled_holder_of_long_name(books, long_name.as_str())
-            .ok_or(InstallError::Card)?
-        {
+        // Two case variants of the name with neither spelled exactly is a
+        // card this transaction must not touch: either could be the copy
+        // meant, and parking one would take a book off the shelf that no
+        // record then explains. Refused here, before anything is journalled.
+        let holder = match spelled_holder_of_long_name(books, long_name.as_str()) {
+            Ok(holder) => holder,
+            Err(error) => {
+                discard_scratch(root, stage.as_str());
+                return Err(error);
+            }
+        };
+        let old = match holder {
             Some((alias, chain, spelled)) => {
                 predecessor_spelling = spelled;
                 Some(Located {
@@ -1545,8 +1555,7 @@ where
         // A failed walk is an error rather than an empty answer: reporting no
         // landing for a book that landed would lose the identity and log a
         // success as a failure.
-        let holder =
-            holder_of_long_name(books, intent.long_name.as_str()).ok_or(InstallError::Card)?;
+        let holder = holder_of_long_name(books, intent.long_name.as_str())?;
         match holder {
             Some((alias, chain)) if chain.value() == intent.stage.chain => {
                 // The destination is this upload's chain, which is the file
@@ -1609,7 +1618,10 @@ where
                 .ok()?;
         }
         candidate.push_str(".OLD").ok()?;
-        if holder_of_long_name(&rollback, candidate.as_str())?.is_none() {
+        if holder_of_long_name(&rollback, candidate.as_str())
+            .ok()?
+            .is_none()
+        {
             return Some(candidate);
         }
     }
@@ -1618,13 +1630,14 @@ where
 
 /// The book currently holding `long_name`, if one does.
 ///
-/// `Some(None)` is a name nobody holds; `None` is a shelf that would not say,
-/// which must stop the install — proceeding would put a second holder of the
-/// name on the card.
+/// `Ok(None)` is a name nobody holds. [`InstallError::Card`] is a shelf that
+/// would not say, which must stop the install: proceeding would put a
+/// second holder of the name on the card. [`InstallError::Ambiguous`] is a
+/// shelf already holding two entries that answer to the name.
 fn holder_of_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
     books: &Directory<'_, D, T, MD, MF, MV>,
     long_name: &str,
-) -> Option<Option<(ShortName, embedded_sdmmc::ClusterId)>>
+) -> Result<Option<(ShortName, embedded_sdmmc::ClusterId)>, InstallError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -1633,26 +1646,39 @@ where
         .map(|holder| holder.map(|(alias, chain, _)| (alias, chain)))
 }
 
+/// One entry a long-name lookup found, with the name exactly as it spells
+/// it.
+type SpelledHolder = (
+    ShortName,
+    embedded_sdmmc::ClusterId,
+    String<{ proto::library_path::MAX_PATH_BYTES }>,
+);
+
 /// [`holder_of_long_name`], with the long name exactly as the holder spells
-/// it, which is the locator the ledger knows the copy by. Names match by
-/// FAT's rules, so the spelling found can differ from the one asked for.
+/// it, which is the locator the ledger knows the copy by.
+///
+/// Names match by FAT's rules, so the spelling found can differ from the one
+/// asked for, and a card written elsewhere can hold two entries that differ
+/// only by case. A shelf holding two is refused rather than searched for
+/// the better one: the directory has one namespace with case ignored, and
+/// the install lands by moving the staged file in under the name, so
+/// whichever twin it replaced, the other would still be there to refuse the
+/// landing, and the rollback after it, halfway through the transaction.
+/// Refusing here is refusing before anything is journalled or moved. Nor
+/// does directory order decide anything: with one holder there is nothing
+/// to order, and with two the answer is the same whichever came first.
 fn spelled_holder_of_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
     books: &Directory<'_, D, T, MD, MF, MV>,
     long_name: &str,
-) -> Option<
-    Option<(
-        ShortName,
-        embedded_sdmmc::ClusterId,
-        String<{ proto::library_path::MAX_PATH_BYTES }>,
-    )>,
->
+) -> Result<Option<SpelledHolder>, InstallError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let mut storage = [0u8; crate::LFN_SCAN_BYTES];
     let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
-    let mut holder = None;
+    let mut holder: Option<SpelledHolder> = None;
+    let mut holders = 0usize;
     let walked = books.iterate_dir_lfn(&mut lfn, |entry, found| {
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
             return ControlFlow::Continue(());
@@ -1660,6 +1686,11 @@ where
         let Some(found) = found.filter(|name| same_long_name(name, long_name)) else {
             return ControlFlow::Continue(());
         };
+        holders += 1;
+        if holders > 1 {
+            // Two is already a refusal; the rest of the walk cannot change it.
+            return ControlFlow::Break(());
+        }
         let mut name = ShortName::new();
         let mut spelled = String::new();
         use core::fmt::Write as _;
@@ -1670,10 +1701,12 @@ where
             return ControlFlow::Continue(());
         }
         holder = Some((name, entry.cluster, spelled));
-        // A directory holds at most one entry under a long name, so there is
-        // nothing further to find.
-        ControlFlow::Break(())
+        ControlFlow::Continue(())
     });
-    walked.ok()?;
-    Some(holder)
+    walked.map_err(|_| InstallError::Card)?;
+    match holders {
+        0 => Ok(None),
+        1 => Ok(holder),
+        _ => Err(InstallError::Ambiguous),
+    }
 }

@@ -330,24 +330,6 @@ where
     Ok(found)
 }
 
-/// Whether any record is a missing copy, which a full generation may let go
-/// of to make room for a live one.
-pub fn has_missing_record<D, T, const MD: usize, const MF: usize, const MV: usize>(
-    root: &Directory<'_, D, T, MD, MF, MV>,
-    ledger: &Ledger,
-) -> Result<bool, LedgerFault>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let mut found = false;
-    for_each_record(root, ledger, &mut |_, record| {
-        found |= record.misses > 0;
-        Ok(())
-    })?;
-    Ok(found)
-}
-
 /// What a carried record is written with when it keeps its id, root and
 /// locator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -563,33 +545,37 @@ where
 /// it. It is a whole generation rewrite, which is what every change to the
 /// ledger is, and is committed before this returns.
 ///
-/// A generation with no room for one more record lets a missing copy go to
-/// make it, the first in ledger order, as the scan's retention would have;
-/// only a ledger full of live copies is [`LedgerFault::Full`], and a caller
-/// that could refuse earlier asks [`has_missing_record`] first.
+/// A generation with no room for one more record can make it only by letting
+/// `evict` go, a record the caller chose and verified against the card;
+/// nothing here decides which copy is disposable. A full ledger with no
+/// record to let go of, or one whose `evict` is not there, is
+/// [`LedgerFault::Full`], and a caller that can refuse before anything is
+/// journalled does.
 pub fn publish_record<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     ledger: Option<Ledger>,
     record: &LedgerRecord<'_>,
+    evict: Option<BookId>,
 ) -> Result<Ledger, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let mut exists = false;
-    let mut first_missing: Option<u16> = None;
+    let mut evict_exists = false;
     if let Some(live) = &ledger {
-        for_each_record(root, live, &mut |index, entry| {
+        for_each_record(root, live, &mut |_, entry| {
             exists |= entry.id == record.id;
-            if first_missing.is_none() && entry.misses > 0 {
-                first_missing = Some(index);
-            }
+            evict_exists |= evict == Some(entry.id);
             Ok(())
         })?;
     }
     let evict = match &ledger {
         Some(live) if !exists && live.count as usize >= LEDGER_MAX_RECORDS => {
-            Some(first_missing.ok_or(LedgerFault::Full)?)
+            if !evict_exists {
+                return Err(LedgerFault::Full);
+            }
+            evict
         }
         _ => None,
     };
@@ -601,8 +587,8 @@ where
     write_generation(
         root,
         ledger.as_ref(),
-        &mut |index, entry| {
-            if evict == Some(index) {
+        &mut |_, entry| {
+            if evict == Some(entry.id) {
                 Carry::Drop
             } else if entry.id == record.id {
                 replaced.set(true);

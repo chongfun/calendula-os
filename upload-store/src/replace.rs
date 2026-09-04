@@ -41,6 +41,15 @@
 //! that was typed. The intent carries both spellings, and settling moves the
 //! id to whichever the file ends up under.
 //!
+//! A copy the ledger has not adopted needs a record, and a ledger with no
+//! room for one makes it by letting a missing copy go, chosen here and
+//! written into the intent: a record the last scan found missing whose place
+//! is verified empty now. A counter alone would not do, since the copy may
+//! have been put back between transactions; the check against the card is
+//! what makes it safe, and the sole-writer contract keeps it true while the
+//! intent stands. With no such record the install is refused before anything
+//! is journalled.
+//!
 //! The intent is kept in `/READER/REPLACE.JNL` the way the ledger journal
 //! is: two slots written alternately with a sequence number, so a torn
 //! publication leaves the entry before it. A torn publication is an install
@@ -93,6 +102,9 @@ pub struct Standing {
     /// The exact spelling the predecessor held the place under, when there
     /// was one.
     pub predecessor_locator: Option<String<MAX_PATH_BYTES>>,
+    /// The missing copy whose record makes room for this one, if the ledger
+    /// had no room.
+    pub evict: Option<BookId>,
     pub new: CachedSourceDigest,
 }
 
@@ -116,6 +128,7 @@ impl Standing {
             locator,
             predecessor: intent.predecessor,
             predecessor_locator,
+            evict: intent.evict,
             new: intent.new,
         })
     }
@@ -148,9 +161,10 @@ where
 ///
 /// Refuses with [`LedgerFault::Busy`] while another intent stands, and with
 /// [`LedgerFault::Full`] when a fresh id would need a record the ledger has
-/// no room for, so that an install that could not be published is not
-/// begun. The caller must not touch the destination until this returns: the
-/// intent is durable then, and not before.
+/// no room for and no missing copy, verified absent from the card now, can
+/// make it. Either refusal comes before anything is journalled. The caller
+/// must not touch the destination until this returns: the intent is durable
+/// then, and not before.
 pub fn begin<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     at: BookRoot,
@@ -174,20 +188,16 @@ where
         }
         _ => None,
     };
-    let id = match known {
-        Some((id, _)) => id,
+    let (id, evict) = match known {
+        Some((id, _)) => (id, None),
         None => {
-            // A fresh record will be appended when the landing is published.
-            // Refusing now, before anything is journalled, is the one place
-            // a full ledger can refuse an install cleanly.
-            if let Some(live) = &live {
-                if live.count as usize >= LEDGER_MAX_RECORDS
-                    && !ledger::has_missing_record(root, live)?
-                {
-                    return Err(LedgerFault::Full);
+            let evict = match &live {
+                Some(live) if live.count as usize >= LEDGER_MAX_RECORDS => {
+                    Some(room_in(root, live)?.ok_or(LedgerFault::Full)?)
                 }
-            }
-            BookId::mint(random)
+                _ => None,
+            };
+            (BookId::mint(random), evict)
         }
     };
     let (kind, predecessor_locator) = match predecessor {
@@ -208,22 +218,74 @@ where
         locator,
         predecessor: kind,
         predecessor_locator,
+        evict,
         new: CachedSourceDigest::new(new),
     };
     publish(&cache_root, &ReplaceJournal::Standing(intent))?;
     Standing::from_intent(&intent)
 }
 
+/// A record a full ledger can let go of: one the last scan found missing
+/// whose place is empty on the card now. The first such in ledger order, or
+/// `None` when every missing copy has come back.
+fn room_in<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+    live: &ledger::Ledger,
+) -> Result<Option<BookId>, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // Reading the ledger holds a directory and a file open, and looking a
+    // place up on the card opens a directory per path component, so
+    // candidates are gathered in batches and resolved between reads rather
+    // than resolved as they are read. A batch is small because each holds a
+    // locator, and a second pass is rare: it takes a whole batch of missing
+    // copies to have been put back since the last scan.
+    const BATCH: usize = 8;
+    let mut candidates: heapless::Vec<(BookId, BookRoot, String<MAX_PATH_BYTES>), BATCH> =
+        heapless::Vec::new();
+    let mut from = 0u32;
+    loop {
+        candidates.clear();
+        let mut next = from;
+        ledger::for_each_record(root, live, &mut |index, record| {
+            if u32::from(index) < from || record.misses == 0 || candidates.is_full() {
+                return Ok(());
+            }
+            let mut locator = String::new();
+            locator
+                .push_str(record.locator)
+                .map_err(|_| LedgerFault::Record)?;
+            candidates
+                .push((record.id, record.root, locator))
+                .map_err(|_| LedgerFault::Record)?;
+            next = u32::from(index) + 1;
+            Ok(())
+        })?;
+        for (id, at, locator) in &candidates {
+            if !holds_a_file(root, *at, locator.as_str())? {
+                return Ok(Some(*id));
+            }
+        }
+        if !candidates.is_full() {
+            return Ok(None);
+        }
+        from = next;
+    }
+}
+
 /// Settle the intent in flight, the landing being known.
 ///
 /// A new landing rewrites the copy's ledger record under the same id with
-/// the new size and digest, at the spelling the install used. An old
-/// landing leaves the record's size and digest as they were; if the
-/// predecessor has been put back under the spelling the install used rather
-/// than its own, which a rollback does, the record moves to that spelling.
-/// Either way the intent is then cleared. Nothing to settle is not an
-/// error: a clear that was cut leaves an intent recovery resolves again,
-/// and a caller may settle what recovery already did.
+/// the new size and digest, at the spelling the install used, letting the
+/// intent's missing copy go if the ledger had no room. An old landing leaves
+/// the record's size and digest as they were; if the predecessor has been
+/// put back under the spelling the install used rather than its own, which
+/// a rollback does, the record moves to that spelling. Either way the intent
+/// is then cleared. Nothing to settle is not an error: a clear that was cut
+/// leaves an intent recovery resolves again, and a caller may settle what
+/// recovery already did.
 pub fn settle<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     landed: Landing,
@@ -252,6 +314,7 @@ where
                     misses: 0,
                     source: Some(intent.new),
                 },
+                intent.evict,
             )?;
         }
         Landing::Old => {
@@ -263,8 +326,7 @@ where
                 _ => false,
             };
             if respelled {
-                let live = ledger::open(root)?;
-                if let Some(live) = live {
+                if let Some(live) = ledger::open(root)? {
                     ledger::relocate_record(
                         root,
                         live,

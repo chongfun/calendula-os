@@ -842,9 +842,16 @@ hashed twice. Names match by FAT's rules on the card and exactly in the
 ledger, so an upload spelled another way replaces the copy the installer
 found and respells its place, and a rollback puts the predecessor back under
 the spelling typed; settling moves the record to whichever spelling the file
-ends up under. A ledger with no room for a fresh copy's record lets a missing
-copy go to make it, and refuses the install before anything is journalled
-when there is none to let go of. The file is two slots like the ledger
+ends up under. A shelf already holding two books that differ only by case
+where the upload would land is refused before anything is journalled or
+moved, whichever of them the upload spells: the shelf has one namespace with
+case ignored, so whichever twin the install replaced, the other would refuse
+the landing and the rollback alike halfway through. A ledger with no room
+for a fresh copy's record lets a missing copy go to make it, chosen when the
+intent is published from the records the last scan found missing and
+verified absent from the card then, which the sole-writer contract keeps
+true while the intent stands; with none to let go of, the install refuses
+before anything is journalled. The file is two slots like the ledger
 journal, so a torn publication is an install that has not begun and a torn
 clear is an intent resolved again. No id or digest enters `INSTALL.JNL` or
 `RECLAIM.JNL`: the filesystem transaction decides what the card holds, and

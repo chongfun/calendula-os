@@ -515,7 +515,7 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 pub const REPLACE_JOURNAL_MAGIC: [u8; 4] = *b"X4RI";
 pub const REPLACE_JOURNAL_VERSION: u8 = 1;
 /// One entry, at the start of its slot.
-pub const REPLACE_JOURNAL_BYTES: usize = 628;
+pub const REPLACE_JOURNAL_BYTES: usize = 645;
 /// Kept the way the ledger journal is: two slots written alternately with a
 /// sequence number, so a torn write leaves the entry before it. Two sectors
 /// each, since an entry carries two locators; the checksum covers the whole
@@ -525,17 +525,19 @@ pub const REPLACE_JOURNAL_SLOT_BYTES: usize = 1024;
 pub const REPLACE_JOURNAL_SLOTS: usize = 2;
 pub const REPLACE_JOURNAL_FILE_BYTES: usize = REPLACE_JOURNAL_SLOT_BYTES * REPLACE_JOURNAL_SLOTS;
 
-// Entry: magic | version | state | root | predecessor | id | locator length
-// u16 | locator, zero padded | predecessor locator length u16 | predecessor
-// locator, zero padded | old byte length u64 | old sha256 | new byte length
-// u64 | new sha256 | sequence u32 | checksum u32 over everything before it.
-// A cleared entry carries only its sequence.
+// Entry: magic | version | state | root | predecessor | id | has evict |
+// evict id | locator length u16 | locator, zero padded | predecessor locator
+// length u16 | predecessor locator, zero padded | old byte length u64 | old
+// sha256 | new byte length u64 | new sha256 | sequence u32 | checksum u32
+// over everything before it. A cleared entry carries only its sequence.
 const REPLACE_VERSION: usize = 4;
 const REPLACE_STATE: usize = 5;
 const REPLACE_ROOT: usize = 6;
 const REPLACE_PREDECESSOR: usize = 7;
 const REPLACE_ID: usize = 8;
-const REPLACE_LOCATOR_LEN: usize = REPLACE_ID + BOOK_ID_BYTES;
+const REPLACE_HAS_EVICT: usize = REPLACE_ID + BOOK_ID_BYTES;
+const REPLACE_EVICT: usize = REPLACE_HAS_EVICT + 1;
+const REPLACE_LOCATOR_LEN: usize = REPLACE_EVICT + BOOK_ID_BYTES;
 const REPLACE_LOCATOR: usize = REPLACE_LOCATOR_LEN + 2;
 const REPLACE_PRED_LOCATOR_LEN: usize = REPLACE_LOCATOR + MAX_PATH_BYTES;
 const REPLACE_PRED_LOCATOR: usize = REPLACE_PRED_LOCATOR_LEN + 2;
@@ -599,6 +601,12 @@ pub struct ReplaceIntent<'a> {
     /// The exact spelling the predecessor held the place under. `Some` if
     /// and only if there was a predecessor.
     pub predecessor_locator: Option<&'a str>,
+    /// The missing copy whose record makes room for this one in a ledger
+    /// that has none: verified absent from the card when the intent was
+    /// published, which the sole-writer contract keeps true while it stands.
+    /// Only for a copy the ledger has not adopted; a replacement of an
+    /// adopted copy needs no room.
+    pub evict: Option<BookId>,
     /// The bytes that are meant to land, hashed as they were streamed.
     pub new: CachedSourceDigest,
 }
@@ -637,7 +645,11 @@ pub fn encode_replace_journal(
             }
             out[REPLACE_STATE] = REPLACE_STANDING;
             out[REPLACE_ROOT] = root_byte(intent.root);
-            out[REPLACE_ID..REPLACE_LOCATOR_LEN].copy_from_slice(&intent.id.to_bytes());
+            out[REPLACE_ID..REPLACE_HAS_EVICT].copy_from_slice(&intent.id.to_bytes());
+            if let Some(evict) = intent.evict {
+                out[REPLACE_HAS_EVICT] = 1;
+                out[REPLACE_EVICT..REPLACE_LOCATOR_LEN].copy_from_slice(&evict.to_bytes());
+            }
             out[REPLACE_LOCATOR_LEN..REPLACE_LOCATOR]
                 .copy_from_slice(&(locator.len() as u16).to_le_bytes());
             out[REPLACE_LOCATOR..REPLACE_LOCATOR + locator.len()].copy_from_slice(locator);
@@ -721,13 +733,21 @@ pub fn classify_replace_journal(bytes: &[u8; REPLACE_JOURNAL_BYTES]) -> ReplaceJ
     let entry = match bytes[REPLACE_STATE] {
         REPLACE_CLEARED => ReplaceJournal::Cleared,
         REPLACE_STANDING => {
-            let Some(id) =
-                BookId::from_bytes(match bytes[REPLACE_ID..REPLACE_LOCATOR_LEN].try_into() {
-                    Ok(id) => id,
-                    Err(_) => return ReplaceJournalReading::Damaged,
-                })
-            else {
+            let id_at = |at: usize| {
+                let mut id = [0u8; BOOK_ID_BYTES];
+                id.copy_from_slice(&bytes[at..at + BOOK_ID_BYTES]);
+                BookId::from_bytes(id)
+            };
+            let Some(id) = id_at(REPLACE_ID) else {
                 return ReplaceJournalReading::Damaged;
+            };
+            let evict = match bytes[REPLACE_HAS_EVICT] {
+                0 => None,
+                1 => match id_at(REPLACE_EVICT) {
+                    Some(evict) => Some(evict),
+                    None => return ReplaceJournalReading::Damaged,
+                },
+                _ => return ReplaceJournalReading::Damaged,
             };
             let Some(root) = book_root(bytes[REPLACE_ROOT]) else {
                 return ReplaceJournalReading::Damaged;
@@ -783,6 +803,7 @@ pub fn classify_replace_journal(bytes: &[u8; REPLACE_JOURNAL_BYTES]) -> ReplaceJ
                 locator,
                 predecessor,
                 predecessor_locator,
+                evict,
                 new: digest_at(REPLACE_NEW_LEN, REPLACE_NEW_SHA),
             })
         }
@@ -1037,6 +1058,7 @@ mod tests {
                 locator: "Fiction/Dune.epub",
                 predecessor: Predecessor::None,
                 predecessor_locator: None,
+                evict: BookId::from_bytes([9u8; BOOK_ID_BYTES]),
                 new: digest(1),
             }),
             ReplaceJournal::Standing(ReplaceIntent {
@@ -1045,6 +1067,7 @@ mod tests {
                 locator: "dune.epub",
                 predecessor: Predecessor::Unknown,
                 predecessor_locator: Some("Dune.epub"),
+                evict: None,
                 new: digest(2),
             }),
             ReplaceJournal::Standing(ReplaceIntent {
@@ -1053,6 +1076,7 @@ mod tests {
                 locator: "Dune.epub",
                 predecessor: Predecessor::Known(digest(3)),
                 predecessor_locator: Some("Dune.epub"),
+                evict: None,
                 new: digest(4),
             }),
         ];
@@ -1073,6 +1097,8 @@ mod tests {
                 REPLACE_ROOT,
                 REPLACE_PREDECESSOR,
                 REPLACE_ID,
+                REPLACE_HAS_EVICT,
+                REPLACE_EVICT + 3,
                 REPLACE_LOCATOR_LEN,
                 REPLACE_LOCATOR + 2,
                 REPLACE_PRED_LOCATOR_LEN,
@@ -1120,6 +1146,7 @@ mod tests {
                     locator: long,
                     predecessor: Predecessor::None,
                     predecessor_locator: None,
+                    evict: None,
                     new: digest(1),
                 }),
                 1,
@@ -1141,6 +1168,7 @@ mod tests {
                         locator: "Dune.epub",
                         predecessor,
                         predecessor_locator,
+                        evict: None,
                         new: digest(1),
                     }),
                     1,
