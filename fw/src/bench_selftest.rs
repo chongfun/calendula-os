@@ -697,8 +697,12 @@ async fn seek_to_chapter(target: u16) -> bool {
     if !act_in_reading(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
         || !wait_for_view(AppView::Chapters, VIEW_SETTLE_MS).await
     {
-        // Never left Reading, so there is nothing to back out of.
-        return false;
+        // Not proof the list stayed shut. `publish_view` runs in
+        // `send_render` before the frame is queued, and the press goes out
+        // before its settle is waited on, so the reducer can be in Chapters
+        // with the panel still catching up. `leave_chapters` reads the view,
+        // so it does nothing when the list really did stay shut.
+        return leave_chapters(false).await;
     }
     let first = current_selection();
     while current_selection() != target {
