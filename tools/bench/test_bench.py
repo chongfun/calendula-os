@@ -1723,18 +1723,15 @@ class PageTurnCounterTests(unittest.TestCase):
             counter.observe(event)
         self.assertEqual(counter.turns, len(bench.page_turn_stats_over_epochs(events).durations))
 
-    def test_the_live_counter_does_not_count_a_skipped_render_either(self) -> None:
-        """A14's guard settles a press without sending a frame, and the two
-        implementations have to agree about that as well. Counting it live
-        would end `--turns N` one real turn short, with the report excluding
-        the same render and printing N-1."""
+    def test_the_live_counter_counts_a_spared_turn_like_the_report_does(self) -> None:
+        """A14 spares the panel a frame the glass already shows. When the
+        page moved that was a turn, and the stop rule has to agree with the
+        figure the report prints or a capture ends on the wrong press."""
         lines = [
             *self.PRESS_AND_TURN * 2,
-            # The end of the book: the press is answered, the frame matches
-            # the glass, and the seam skips the flush.
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
             (
-                "bench: render view=Reading mode=Fast page=302 chapter=13 layout_ms=5 "
+                "bench: render view=Reading mode=Fast page=99 chapter=4 layout_ms=5 "
                 "flush_ms=0 req_ms=9000 deq_ms=9001 t_ms=9012 skipped=true\n"
             ),
         ]
@@ -1743,8 +1740,36 @@ class PageTurnCounterTests(unittest.TestCase):
         for event in events:
             counter.observe(event)
         stats = bench.page_turn_stats_over_epochs(events)
-        self.assertEqual(counter.turns, 2, "the skipped render is not a turn")
-        self.assertEqual(counter.turns, len(stats.durations), "and the two agree")
+        self.assertEqual(stats.spared_turns, 1, "the page moved, so it was a turn")
+        self.assertEqual(counter.turns, 3, "the live count includes it")
+        self.assertEqual(counter.turns, len(stats.durations) + stats.spared_turns)
+
+    def test_the_live_counter_does_not_count_a_skipped_render_either(self) -> None:
+        """A14's guard settles a press without sending a frame, and the two
+        implementations have to agree about that as well. Counting it live
+        would end `--turns N` one real turn short, with the report excluding
+        the same render and printing N-1."""
+        lines = [
+            *self.PRESS_AND_TURN * 2,
+            # The end of the book: the press is answered, the page has not
+            # moved, and the frame matches the glass.
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
+            (
+                "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=5 "
+                "flush_ms=0 req_ms=9000 deq_ms=9001 t_ms=9012 skipped=true\n"
+            ),
+        ]
+        events = [event for line in lines for event in bench.parse_line(line, "page-turn")]
+        counter = bench.PageTurnCounter()
+        for event in events:
+            counter.observe(event)
+        stats = bench.page_turn_stats_over_epochs(events)
+        self.assertEqual(counter.turns, 2, "the no-op is not a turn")
+        self.assertEqual(
+            counter.turns,
+            len(stats.durations) + stats.spared_turns,
+            "and the two agree",
+        )
         self.assertEqual(stats.presses, 3, "the press still happened")
         self.assertEqual(stats.skipped_answered, 1)
         self.assertEqual(stats.unmatched_presses, 0, "and it was answered")

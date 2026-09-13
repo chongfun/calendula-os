@@ -1965,6 +1965,7 @@ class PageTurnCounter:
         self.pending: list[int] = []
         self.turns = 0
         self.last_t: int | None = None
+        self.last_reading_page: int | None = None
 
     def _new_epoch(self) -> None:
         """Drop presses from the boot that just ended.
@@ -1981,6 +1982,9 @@ class PageTurnCounter:
         """
         self.pending.clear()
         self.last_t = None
+        # The page from before the reboot is no baseline for after it, and
+        # the report splits by epoch for the same reason.
+        self.last_reading_page = None
 
     def observe(self, event: dict[str, Any]) -> None:
         name = event.get("event")
@@ -2004,13 +2008,24 @@ class PageTurnCounter:
             while self.pending and self.pending[0] <= begin:
                 self.pending.pop(0)
                 answered += 1
-            # `skipped` excluded for the reason the report excludes it: the
-            # seam sent no frame, so nothing turned. Counting it here would
-            # end a `--turns 50` capture on 49 turns and a no-op at the end
-            # of the book, which is the divergence this class exists to
-            # prevent.
-            if answered and event.get("view") == "Reading" and not event.get("skipped"):
-                self.turns += 1
+            is_reading = event.get("view") == "Reading"
+            seen_page = event.get("page") if is_reading else None
+            page_before = self.last_reading_page
+            if is_reading and isinstance(seen_page, int):
+                self.last_reading_page = seen_page
+            if answered and is_reading:
+                # A skip whose page moved is a turn the panel was spared,
+                # counted by the rule the report uses. One whose page did not
+                # move turned nothing, which is the end of a book, and
+                # counting it would end a `--turns 50` capture on 49 turns
+                # and a no-op.
+                spared = (
+                    isinstance(seen_page, int)
+                    and page_before is not None
+                    and seen_page != page_before
+                )
+                if not event.get("skipped") or spared:
+                    self.turns += 1
 
 
 def page_turn_stats_over_epochs(events: list[dict[str, Any]]) -> PageTurnStats:

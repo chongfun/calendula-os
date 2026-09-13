@@ -762,7 +762,7 @@ async fn leave_chapters(outcome: bool) -> bool {
 /// A suite that cannot be placed still runs from wherever the reader was,
 /// which is worth capturing; the record is there so a short run is read as
 /// the book running out rather than the device being slow.
-async fn place_at_start_chapter() {
+async fn place_at_start_chapter() -> bool {
     if seek_to_chapter(START_CHAPTER).await {
         bench_log!(
             "bench-selftest: {} placed at chapter {} page {}",
@@ -770,9 +770,22 @@ async fn place_at_start_chapter() {
             START_CHAPTER,
             current_page()
         );
-    } else {
-        report_invalid_current("chapter-seek");
+        return true;
     }
+    report_invalid_current("chapter-seek");
+    // A placement that failed is worth capturing from wherever the reader
+    // already was, and only once that is where the device actually is.
+    // `leave_chapters` is best effort, so a panel that stopped answering can
+    // leave the list up, and turning pages into the chapter cursor would
+    // measure the cursor.
+    if wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await {
+        return true;
+    }
+    bench_log!(
+        "bench-selftest: {} could not get back to reading after a failed seek",
+        current_scenario()
+    );
+    false
 }
 
 /// Walk from wherever boot left the device to Reading.
@@ -1012,7 +1025,9 @@ async fn scenario_page_turn() -> Result_ {
     if !open_and_quiesce().await {
         return "nav-failed";
     }
-    place_at_start_chapter().await;
+    if !place_at_start_chapter().await {
+        return "nav-failed";
+    }
     bench_log!("bench-selftest: reached reading, turning {} pages", TURNS);
     let turned = turn_pages(TURNS).await;
     bench_log!("bench-selftest: page-turn turns={} of {}", turned, TURNS);
@@ -1041,8 +1056,8 @@ async fn scenario_storage_cache() -> Result_ {
         opens += 1;
         // Once, before the cycles. Each later cycle reopens wherever the
         // turning left the reader, which is the warm open this suite times.
-        if cycle == 0 {
-            place_at_start_chapter().await;
+        if cycle == 0 && !place_at_start_chapter().await {
+            return "nav-failed";
         }
         let turned = turn_pages(STORAGE_TURNS_PER_CYCLE).await;
         bench_log!("bench-selftest: storage cycle={} turns={}", cycle, turned);
@@ -1187,7 +1202,9 @@ async fn scenario_reader_soak() -> Result_ {
     if !open_and_quiesce().await {
         return "nav-failed";
     }
-    place_at_start_chapter().await;
+    if !place_at_start_chapter().await {
+        return "nav-failed";
+    }
     let turned = turn_pages(SOAK_TURNS).await;
 
     // Chapter jump: Confirm opens the list, a step moves the cursor off the
