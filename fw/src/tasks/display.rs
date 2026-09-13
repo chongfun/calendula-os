@@ -403,7 +403,13 @@ pub async fn run(
                     && !sync_session.active()
                     && holder().storage_may_run()
                     && !sd_library.text_holds_toc(),
-                background_build.map_or(0, |pending| pending.attempts),
+                // A place the card refused backs off on the same curve a
+                // refused build does. Without it the retry runs at the settle
+                // interval, which is 50 ms of cache work against a card that
+                // is saying no.
+                background_build
+                    .map_or(0, |pending| pending.attempts)
+                    .max(pending_place.as_ref().map_or(0, |waiting| waiting.refusals)),
             ),
         )
         .await
@@ -1714,6 +1720,10 @@ fn handle_storage_command(
             // close-out refused never gets that far and must not report an open
             // that did not happen.
             let mut section_loaded = None;
+            // Set by a section load that left nothing readable, and read by
+            // the announcement, which must then say so rather than report the
+            // counts of an empty store.
+            let mut landed_nothing = false;
             // Read at the saved-position step and spent at the section load,
             // which is where a place first has a pagination to resolve in.
             let mut opening_place: Option<book_build::SavedPlace> = None;
@@ -1842,10 +1852,6 @@ fn handle_storage_command(
                         // beyond the frontier needs the walk to come to it,
                         // and the walk runs in slices so page turns keep
                         // working while it does.
-                        // Set when the open has no readable section left,
-                        // which is the one state that must not be announced as
-                        // a place.
-                        let mut landed_nothing = false;
                         if let Some(place) = opening_place.take() {
                             let resolved = book_build::resolve_place(
                                 epd,
@@ -1974,6 +1980,20 @@ fn handle_storage_command(
                         // on the event itself, so withholding it is never a
                         // saved refresh — it decides the repaint for itself in
                         // `loaded_repaints`.
+                        // An open that landed nowhere says so in its own
+                        // event. The counts here come from a store that was
+                        // cleared on the way into the failed load, and an
+                        // empty store reports one page, which the app would
+                        // clamp the reader's place to and then write to the
+                        // card. What it holds is an error for the reader to
+                        // see, and that is all this has to carry.
+                        if landed_nothing {
+                            send_loaded_library_event(&LibraryEvent::BookOpenUnreadable {
+                                book_id,
+                            });
+                            open.announced();
+                            continue;
+                        }
                         let text_replaced = !matches!(section_loaded, Some(true));
                         send_loaded_library_event(&LibraryEvent::Loaded {
                             book_id,

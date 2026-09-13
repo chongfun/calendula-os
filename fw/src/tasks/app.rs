@@ -646,6 +646,9 @@ fn library_event_affects_view(
         }
         // Handled before the reducer; never reaches here.
         crate::LibraryEvent::BookOpenFailed { .. } => true,
+        // The store holds an error where the page was, so the reader is owed
+        // the frame that shows it.
+        crate::LibraryEvent::BookOpenUnreadable { book_id } => state.book_id == book_id,
         crate::LibraryEvent::ChapterPage {
             book_id,
             chapter,

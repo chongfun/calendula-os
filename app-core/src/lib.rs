@@ -1573,6 +1573,21 @@ pub enum LibraryEvent {
     BookOpenFailed {
         book_id: u32,
     },
+    /// An open ran to its end and left no readable section behind it.
+    ///
+    /// Separate from [`Loaded`](Self::Loaded) because that event is
+    /// navigation metadata the app acts on, and a store with nothing in it
+    /// reports one page. Folding that would clamp the reader's page to zero
+    /// and the ordinary post-event comparison would then write it to the card,
+    /// which is the durable position this book still has and the open failed
+    /// to improve on.
+    ///
+    /// So this event carries the book and nothing else. It lifts the open gate
+    /// and repaints, which shows the reader the error the store is holding,
+    /// and it moves no state, so nothing follows it to the card.
+    BookOpenUnreadable {
+        book_id: u32,
+    },
     ChapterPage {
         book_id: u32,
         chapter: u16,
@@ -2804,6 +2819,15 @@ impl ReaderState {
                 // The app task owns the rollback: it is the only place that
                 // still remembers which book the reader was on before the
                 // open, so it applies `restore_after_failed_open` itself.
+            }
+            LibraryEvent::BookOpenUnreadable { book_id } => {
+                // Deliberately no page, no chapter, no counts. The store this
+                // would have taken them from is empty, and the reader's real
+                // place is the one already on the card.
+                if self.book_id == book_id {
+                    self.read_request_pending = false;
+                    self.dirty = Rect::FULL;
+                }
             }
             LibraryEvent::ChapterPage {
                 book_id,
@@ -5592,6 +5616,54 @@ mod tests {
         assert!(
             !resolves_place(&open_book_command(&back, 0, 1, None, None)),
             "so the page counted under that layout is good again"
+        );
+    }
+
+    /// An open that read nothing must not move the reader, because the state
+    /// it would move them to comes from a store that was emptied on the way
+    /// into the failed load. A `Loaded` carrying that store's counts is the
+    /// shape that does the damage, and it is left here beside the fix so the
+    /// difference is visible.
+    #[test]
+    fn an_unreadable_open_moves_nothing_a_save_would_follow() {
+        let at_page = reading(0, 4, 120);
+        let book_id = at_page.book_id;
+        let before = at_page.persisted();
+
+        // What the storage task would have sent before: an empty store reports
+        // one page, and the clamp takes the reader to the top of the book.
+        let as_loaded = at_page.apply_library_event(
+            CTX,
+            LibraryEvent::Loaded {
+                book_id,
+                pages: 1,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: true,
+            },
+        );
+        assert_eq!(as_loaded.page, 0, "the clamp against an empty store");
+        assert_ne!(
+            as_loaded.persisted().screen,
+            before.screen,
+            "which the ordinary post-event save would then write to the card"
+        );
+
+        // What it sends now.
+        let as_unreadable =
+            at_page.apply_library_event(CTX, LibraryEvent::BookOpenUnreadable { book_id });
+        assert_eq!(as_unreadable.page, 120, "the reader's page is untouched");
+        assert_eq!(as_unreadable.chapter, 4, "and so is their chapter");
+        assert_eq!(
+            as_unreadable.persisted(),
+            before,
+            "so nothing follows the failure to the card"
+        );
+        assert!(
+            !as_unreadable.read_request_pending,
+            "and the open gate lifts, or the reader is stuck"
         );
     }
 
