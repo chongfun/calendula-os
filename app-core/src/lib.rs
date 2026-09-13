@@ -1975,8 +1975,11 @@ impl LibraryEvent {
     /// reissues them — the storage task has already done the work and moved
     /// on, so a dropped one leaves the app waiting for the rest of the visit:
     ///
-    /// - `Loaded` and `BookOpenFailed` are the two ways an open ends, and the
-    ///   app suppresses input until one of them arrives.
+    /// - `Loaded`, `BookOpenFailed` and `BookOpenUnreadable` are the three
+    ///   ways an open ends, and the app suppresses input until one of them
+    ///   arrives. The third carries no navigation metadata, which makes it
+    ///   look droppable and makes it exactly as final as the other two:
+    ///   losing it leaves input suppressed and sleep blocked until reboot.
     /// - `CacheCleared` settles a per-book action's `LibraryMenu::Busy`, which
     ///   holds the whole Library list still while it waits.
     /// - `Restored` is what the boot render waits for before drawing.
@@ -1989,6 +1992,7 @@ impl LibraryEvent {
             self,
             Self::Loaded { .. }
                 | Self::BookOpenFailed { .. }
+                | Self::BookOpenUnreadable { .. }
                 | Self::CacheCleared { .. }
                 | Self::Restored { .. }
                 // The three that settle a `LibraryBrowse`. Dropping one
@@ -4696,13 +4700,17 @@ mod tests {
     /// Every event that releases a lock the app took when it handed work over.
     /// Listed once, so the routing test and the holder tests below cannot
     /// disagree about which events are which.
-    fn settling_events() -> [LibraryEvent; 8] {
+    fn settling_events() -> [LibraryEvent; 9] {
         [
             LibraryEvent::CacheCleared {
                 request_id: 1,
                 ok: true,
             },
             LibraryEvent::BookOpenFailed { book_id: 2 },
+            // The third way an open ends, and the one that looks droppable
+            // because it carries nothing. Losing it holds the input gate and
+            // the sleep block until the device reboots.
+            LibraryEvent::BookOpenUnreadable { book_id: 2 },
             LibraryEvent::Loaded {
                 book_id: 2,
                 pages: 1,
@@ -5632,6 +5640,58 @@ mod tests {
         assert!(
             !resolves_place(&open_book_command(&back, 0, 1, None, None)),
             "so the page counted under that layout is good again"
+        );
+    }
+
+    /// The write that follows the failure, which is the one that matters. An
+    /// open that read nothing leaves the card naming the book the reader came
+    /// from, so the app has to name it too: a setting changed a minute later
+    /// goes through the ordinary progress save, and that save writes whichever
+    /// book the app is holding.
+    #[test]
+    fn an_unreadable_open_does_not_make_its_book_the_one_that_gets_saved() {
+        let readable = ReaderSource::sd(1).book_id();
+        let unreadable = ReaderSource::sd(2).book_id();
+
+        // Reading A, then selecting B. The rollback captures A.
+        let on_a = reading(1, 3, 88);
+        assert_eq!(on_a.persisted().book_id, readable);
+        let rollback = on_a.open_rollback();
+        let mut attempting_b = on_a;
+        attempting_b.book_id = unreadable;
+        attempting_b.page = 0;
+        attempting_b.chapter = 0;
+
+        // B reads nothing. The transaction skipped its pointer write, so the
+        // card still names A, and the app follows it back.
+        let settled = attempting_b
+            .apply_library_event(
+                CTX,
+                LibraryEvent::BookOpenUnreadable {
+                    book_id: unreadable,
+                },
+            )
+            .restore_after_failed_open(rollback);
+        assert_eq!(
+            settled.persisted().book_id,
+            readable,
+            "the app names the book the card names"
+        );
+        assert_eq!(settled.page, 88, "at the page it was on");
+
+        // Now the save that used to commit B: any input that moves persisted
+        // state sends one, and it carries the book id along with everything
+        // else.
+        let after_setting = {
+            let mut state = settled;
+            state.view = AppView::Settings;
+            state.selection = 1;
+            apply_setting(state)
+        };
+        assert_eq!(
+            after_setting.persisted().book_id,
+            readable,
+            "so the write it triggers cannot make an unreadable book the reboot target"
         );
     }
 

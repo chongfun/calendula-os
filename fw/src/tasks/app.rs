@@ -501,6 +501,27 @@ fn fold_library_event(
         }
         return true;
     }
+    if let crate::LibraryEvent::BookOpenUnreadable { book_id } = *event {
+        // The open ran to its end and read nothing, so the transaction left
+        // the card pointing at the book the reader came from. The same has to
+        // happen in RAM: leaving the new book named here and uncommitted
+        // there is one identity in two places, and the next setting change
+        // writes whichever one this holds.
+        if *opening_book == Some(book_id) {
+            *opening_book = None;
+        }
+        if let Some(rollback) = open_rollback.take() {
+            esp_println::println!(
+                "app: book open read nothing book_id={book_id}; back to book_id={}",
+                rollback.book_id
+            );
+            *state = state.restore_after_failed_open(rollback);
+            return true;
+        }
+        // No rollback is a reopen of the book already being read, which the
+        // card already names. The reducer clears the open gate and repaints,
+        // and the reader sees the error the store is holding.
+    }
     if let Some(book_id) = loaded_book_id(event) {
         if *opening_book == Some(book_id) {
             *opening_book = None;
