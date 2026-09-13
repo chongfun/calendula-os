@@ -1739,7 +1739,7 @@ fn handle_storage_command(
             // counts of an empty store.
             let mut landed_nothing = false;
             // The row this open is leaving, for the same ending.
-            let mut departing: Option<u16> = None;
+            let mut departing: Option<reader_cache::store::ActiveEntrySnapshot> = None;
             // Read at the saved-position step and spent at the section load,
             // which is where a place first has a pagination to resolve in.
             let mut opening_place: Option<book_build::SavedPlace> = None;
@@ -1747,12 +1747,12 @@ fn handle_storage_command(
                 match open.next() {
                     OpenAction::CloseOutDeparting(previous) => {
                         // The book the store goes back to if this open ends
-                        // with nothing readable. Taken here because this is
-                        // where the departing book is named, and the staging
-                        // that follows overwrites the store's active entry
-                        // with the incoming one.
-                        departing =
-                            app_core::ReaderSource::from_book_id(previous.book_id).sd_index();
+                        // with nothing readable, held whole rather than as a
+                        // row number. Putting it back has to work on a card
+                        // that is refusing reads, because that is the only way
+                        // that ending is reached. Taken here because the
+                        // staging below overwrites the active entry.
+                        departing = sd_library.active_entry_snapshot();
                         let stored = close_out_departing_book(
                             epd,
                             sd_cs,
@@ -2028,17 +2028,8 @@ fn handle_storage_command(
                             // progress save for the old book identity-less,
                             // and makes the close-out of the next open fail
                             // outright, which refuses that open.
-                            if let Some(index) = departing {
-                                if !crate::library_sd::load_active_entry(
-                                    epd,
-                                    sd_cs,
-                                    sd_library,
-                                    index as usize,
-                                ) {
-                                    esp_println::println!(
-                                        "storage: could not restage the book this open left"
-                                    );
-                                }
+                            if let Some(snapshot) = departing.as_ref() {
+                                sd_library.restore_active_entry(snapshot);
                             }
                             send_loaded_library_event(&LibraryEvent::BookOpenUnreadable {
                                 book_id,
