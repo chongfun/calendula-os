@@ -1774,8 +1774,12 @@ class PageTurnStats:
     # cannot be trusted on unmatched count alone.
     coalesced_presses: int
     # Presses answered by a render the flush seam skipped: answered, so not
-    # unmatched, but no frame was sent so they are not turns either.
+    # unmatched, but no frame was sent so they carry no duration.
     skipped_answered: int = 0
+    # The subset of those whose page had moved. A spared turn is a turn the
+    # panel did not have to be sent; a skip at the last page of a book turned
+    # nothing, and the two are the same record apart from the page.
+    spared_turns: int = 0
 
     @property
     def unmatched_presses(self) -> int:
@@ -1874,6 +1878,8 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
     nav_answered = 0
     coalesced_presses = 0
     skipped_answered = 0
+    spared_turns = 0
+    last_reading_page: int | None = None
     for event in sorted(events, key=event_sort_key):
         name = event.get("event")
         if name == "input" and press_action(event) in {"Next", "Previous"}:
@@ -1886,8 +1892,15 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
             if not isinstance(t_ms, int):
                 continue
             is_reading = event.get("view") == "Reading"
+            seen_page = event.get("page") if is_reading else None
+            # The page a skipped render is compared against. Updated for
+            # every Reading render, paired or not: a repaint nobody pressed
+            # for still changes what is on the glass.
+            page_before = last_reading_page
             if is_reading:
                 reading_renders += 1
+                if isinstance(seen_page, int):
+                    last_reading_page = seen_page
             begin = render_begin_ms(event)
             # Events are sorted by t_ms, so pending_inputs is nondecreasing
             # and this pops exactly the presses this render answers.
@@ -1907,6 +1920,12 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
                 # duration is left out.
                 if event.get("skipped"):
                     skipped_answered += 1
+                    if (
+                        isinstance(seen_page, int)
+                        and page_before is not None
+                        and seen_page != page_before
+                    ):
+                        spared_turns += 1
                 else:
                     durations.append(t_ms - newest_answered)
             else:
@@ -1918,6 +1937,7 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
         nav_answered,
         coalesced_presses,
         skipped_answered,
+        spared_turns,
     )
 
 
@@ -2097,7 +2117,7 @@ def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
     pooled figure is exactly its parts and coverage can be judged per part
     without measuring anything twice.
     """
-    merged = PageTurnStats([], 0, 0, 0, 0, 0)
+    merged = PageTurnStats([], 0, 0, 0, 0, 0, 0)
     for stats in parts:
         merged = PageTurnStats(
             merged.durations + stats.durations,
@@ -2106,6 +2126,7 @@ def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
             merged.nav_answered + stats.nav_answered,
             merged.coalesced_presses + stats.coalesced_presses,
             merged.skipped_answered + stats.skipped_answered,
+            merged.spared_turns + stats.spared_turns,
         )
     return merged
 
@@ -3221,16 +3242,15 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
     if isinstance(turns, int):
         window = counted_window(run.events, "page_turn") if self_driven else run.events
         paired = page_turn_stats_over_epochs(window)
-        # A turn whose frame matched the glass is a turn the panel was spared,
-        # so it has no duration and is still telemetry that arrived. Counting
-        # only durations reported a 50-turn run as 49 the first time a page
-        # rendered identically to the one before it. A press that turned
-        # nothing is caught by the checkpoint arm above and by the scenario's
-        # own `invalid=end-of-book`, not here.
+        # A turn the panel was spared has no duration and still happened, so
+        # it counts, but only when its page moved. A skip at the last page of
+        # a book turned nothing, and the page is the difference. Deciding on
+        # that rather than on whether the capture is self-driven holds a
+        # manual run, which has no checkpoint behind it, to the same evidence.
         short(
             "page turns",
             turns,
-            len(paired.durations) + paired.skipped_answered,
+            len(paired.durations) + paired.spared_turns,
             checkpoint_completions(run.events, "page_turn") if self_driven else None,
         )
 

@@ -1774,6 +1774,17 @@ class PageTurnCounterTests(unittest.TestCase):
             "the skipped turn counts toward the request",
         )
 
+        # A skip at the end of a book turned no page, and that must not
+        # satisfy the request. The record is the same apart from the page,
+        # and this capture is manual, so no checkpoint stands behind it.
+        no_op = [dict(e) for e in events]
+        no_op[4]["page"] = 6
+        warnings = bench.evaluate_suite_signals(no_op)
+        self.assertTrue(
+            any("1 of 2 requested page turns" in w for w in warnings),
+            warnings,
+        )
+
         # And a run genuinely one turn short is still reported as short.
         one_short = [e for e in events if e.get("page") != 7 and e.get("t_ms") != 3000]
         self.assertTrue(

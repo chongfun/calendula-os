@@ -681,11 +681,15 @@ const START_CHAPTER: u16 = 3;
 /// Put the book at the start of `target` before a scenario counts anything.
 ///
 /// The chapter list wraps at both ends, so the cursor is walked one step at a
-/// time and watched, and a lap without reaching `target` means the book has
-/// fewer chapters than that.
+/// time and watched. A lap back to where it started means the book has no
+/// such chapter, and a press that moves it nowhere means it has stopped
+/// answering. No press ceiling: a list runs to whatever the book's table of
+/// contents holds, and a ceiling low enough to be a spin guard is low enough
+/// to give up on a long book before the lap is done.
 ///
-/// `false` leaves the reader wherever they were, which is a scenario worth
-/// running and reporting rather than abandoning.
+/// Leaves Reading up either way. A scenario that carries on believing it is
+/// in Reading would send its first page turn to the chapter cursor, move no
+/// page, and report the end of the book.
 async fn seek_to_chapter(target: u16) -> bool {
     if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
         report_invalid_current("not-quiescent");
@@ -693,36 +697,47 @@ async fn seek_to_chapter(target: u16) -> bool {
     if !act_in_reading(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
         || !wait_for_view(AppView::Chapters, VIEW_SETTLE_MS).await
     {
+        // Never left Reading, so there is nothing to back out of.
         return false;
     }
     let first = current_selection();
-    let mut stepped = 0u16;
     while current_selection() != target {
+        let before = current_selection();
         if !press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await {
-            return false;
+            return leave_chapters(false).await;
         }
-        stepped += 1;
-        if stepped > 0 && current_selection() == first {
-            // A full lap: every row was offered and none was `target`.
+        let now = current_selection();
+        if now == before {
             bench_log!(
-                "bench-selftest: {} has no chapter {}; {} in the list",
+                "bench-selftest: {} chapter cursor stuck at {}",
                 current_scenario(),
-                target,
-                stepped
+                now
             );
-            return false;
+            return leave_chapters(false).await;
         }
-        if stepped > CHAPTER_SEEK_LIMIT {
-            return false;
+        if now == first {
+            bench_log!(
+                "bench-selftest: {} has no chapter {}",
+                current_scenario(),
+                target
+            );
+            return leave_chapters(false).await;
         }
     }
     press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await
         && wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await
 }
 
-/// A chapter list longer than this is a book no scenario needs to seek in,
-/// and a cursor that stops moving would otherwise spin here.
-const CHAPTER_SEEK_LIMIT: u16 = 200;
+/// Back out of the chapter list to Reading, and pass `outcome` through.
+///
+/// Best effort: a card or panel that will not answer leaves the scenario
+/// wherever it is, and the caller has already reported the failure.
+async fn leave_chapters(outcome: bool) -> bool {
+    if press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+        let _ = wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await;
+    }
+    outcome
+}
 
 /// Put the reader at [`START_CHAPTER`] before a suite counts anything, and
 /// say so in the log if that could not be done.
