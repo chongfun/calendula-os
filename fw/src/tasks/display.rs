@@ -1738,12 +1738,21 @@ fn handle_storage_command(
             // the announcement, which must then say so rather than report the
             // counts of an empty store.
             let mut landed_nothing = false;
+            // The row this open is leaving, for the same ending.
+            let mut departing: Option<u16> = None;
             // Read at the saved-position step and spent at the section load,
             // which is where a place first has a pagination to resolve in.
             let mut opening_place: Option<book_build::SavedPlace> = None;
             loop {
                 match open.next() {
                     OpenAction::CloseOutDeparting(previous) => {
+                        // The book the store goes back to if this open ends
+                        // with nothing readable. Taken here because this is
+                        // where the departing book is named, and the staging
+                        // that follows overwrites the store's active entry
+                        // with the incoming one.
+                        departing =
+                            app_core::ReaderSource::from_book_id(previous.book_id).sd_index();
                         let stored = close_out_departing_book(
                             epd,
                             sd_cs,
@@ -2011,6 +2020,26 @@ fn handle_storage_command(
                         // card. What it holds is an error for the reader to
                         // see, and that is all this has to carry.
                         if landed_nothing {
+                            // The app rolls back to the book it came from, and
+                            // the store has to go with it. Its active entry is
+                            // still the book that failed, and that entry is
+                            // how a row outside the resident catalog window is
+                            // resolved at all: leaving it wrong makes the next
+                            // progress save for the old book identity-less,
+                            // and makes the close-out of the next open fail
+                            // outright, which refuses that open.
+                            if let Some(index) = departing {
+                                if !crate::library_sd::load_active_entry(
+                                    epd,
+                                    sd_cs,
+                                    sd_library,
+                                    index as usize,
+                                ) {
+                                    esp_println::println!(
+                                        "storage: could not restage the book this open left"
+                                    );
+                                }
+                            }
                             send_loaded_library_event(&LibraryEvent::BookOpenUnreadable {
                                 book_id,
                             });
@@ -2363,6 +2392,22 @@ fn handle_storage_command(
         }
         StorageCommand::StoreProgress(record) => {
             let record = record_for_persisted(sd_library, record);
+            // A record the store could not give an identity to cannot be
+            // written and cannot become writable later: the retry replays the
+            // record as it is rather than resolving it again. Holding it would
+            // owe a write forever, which refuses sleep every time it is asked
+            // and defers the next book switch behind it. The book's durable
+            // record is the one already on the card, written when it was the
+            // book being read.
+            if app_core::ReaderSource::from_book_id(record.book_id).is_sd()
+                && (record.source_hash, record.source_size) == (0, 0)
+            {
+                esp_println::println!(
+                    "storage: dropping a progress record with no source identity book_id={}",
+                    record.book_id
+                );
+                return;
+            }
             // Coalesce same-context page turns; anything beyond the screen
             // number changing (book, chapter, orientation, policy) is rare
             // and worth landing immediately. A pending record for the same
