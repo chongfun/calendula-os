@@ -86,7 +86,7 @@ fn resolve_pending_place(
     sd_library: &mut ReaderStore,
     pending_place: &mut Option<PendingPlace>,
     book_id: u32,
-    reader_page: u32,
+    reader_page: Option<u32>,
     walk_alive: bool,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     font_metrics: &mut crate::custom_font::MetricCache,
@@ -99,6 +99,13 @@ fn resolve_pending_place(
         *pending_place = None;
         return None;
     }
+    // `None` is nobody reading this book, which is not the same as somebody
+    // reading its first page. Collapsing the two lets a place fire into a
+    // book the reader has left, because the provisional landing is page 0.
+    let Some(reader_page) = reader_page else {
+        *pending_place = None;
+        return None;
+    };
     if reader_page != waiting.landed {
         // The reader moved. Whatever they are reading now is a better answer
         // than where they left off last time.
@@ -223,6 +230,19 @@ fn load_target_page(
     );
     apply_build_outcome(background_build, outcome, book_id);
     sd_library.covers_global_page(index as usize, target)
+}
+
+/// The page the reader is on in `book_id`, or `None` when no Reading render
+/// says they are in that book at all.
+///
+/// Kept apart from a page number on purpose. A place waiting on a book the
+/// reader has left must be dropped rather than matched against the page it
+/// happened to land on, and the provisional landing is page 0.
+fn reader_page_of(planner: &RefreshPlanner, book_id: u32) -> Option<u32> {
+    planner
+        .last_request()
+        .filter(|request| request.book_id == book_id && request.view == AppView::Reading)
+        .map(|request| request.page)
 }
 
 /// A stored place the open could not turn into a page yet.
@@ -423,19 +443,13 @@ pub async fn run(
                     // it is a place quietly abandoned.
                     if let Some(waiting) = pending_place.as_ref() {
                         let book_id = waiting.book_id;
-                        let reader_page = refresh_planner
-                            .last_request()
-                            .filter(|request| {
-                                request.book_id == book_id && request.view == AppView::Reading
-                            })
-                            .map_or(0, |request| request.page);
                         let resolved = resolve_pending_place(
                             &mut epd,
                             &mut sd_cs,
                             sd_library,
                             &mut pending_place,
                             book_id,
-                            reader_page,
+                            reader_page_of(&refresh_planner, book_id),
                             false,
                             &mut epub_scratch,
                             font_metrics,
@@ -632,7 +646,7 @@ pub async fn run(
                     sd_library,
                     &mut pending_place,
                     pending.book_id,
-                    reader_page,
+                    reader_page_of(&refresh_planner, pending.book_id),
                     matches!(
                         step,
                         book_build::BackgroundStep::Continued | book_build::BackgroundStep::Retry
@@ -1924,6 +1938,15 @@ fn handle_storage_command(
                                 | book_build::PlaceTarget::Unavailable => Some(()),
                                 book_build::PlaceTarget::Keep => None,
                             };
+                            // An open that read nothing is over, and the app
+                            // rolls back off this book. A place left waiting
+                            // would resolve later and send a `Loaded` for a
+                            // transaction that ended, which the open
+                            // bookkeeping matches by book alone: it would
+                            // answer whichever open of this book is current by
+                            // then and take its rollback with it. The place is
+                            // on the card, so the next open reads it again.
+                            let landed_on = if landed_nothing { None } else { landed_on };
                             *pending_place = landed_on.map(|()| PendingPlace {
                                 book_id,
                                 index,

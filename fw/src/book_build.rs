@@ -1066,6 +1066,23 @@ pub(crate) fn store_app_state(
     library: &ReaderStore,
     record: AppStateRecord,
 ) -> bool {
+    // A record for a book whose identity the store cannot supply is refused
+    // rather than written. Restore finds a book by its source hash and size,
+    // so a zeroed pair matches nothing and the record is a slot spent saying
+    // nothing, over one that was saying where the reader was.
+    //
+    // Reachable through a rollback: an open that read nothing puts the app
+    // back on the book it came from, and that book may be outside the catalog
+    // window while the store's active entry is still the one that failed.
+    if app_core::ReaderSource::from_book_id(record.book_id).is_sd()
+        && (record.source_hash, record.source_size) == (0, 0)
+    {
+        esp_println::println!(
+            "storage: refusing a global record with no source identity book_id={}",
+            record.book_id
+        );
+        return false;
+    }
     // The same session lands the global record and, for SD books, the
     // per-book position beside that book's cache, so switching books does
     // not abandon the previous one's place.
