@@ -79,6 +79,12 @@ impl std::error::Error for DiskError {}
 struct FaultPlan {
     fail_write_in: Cell<Option<u32>>,
     fail_read_in: Cell<Option<u32>>,
+    /// Land this many bytes of the next write's first sector, then fail.
+    ///
+    /// A clean write fault leaves the sector entirely old. An interrupted
+    /// in-place overwrite half-covers the record instead, and this is the
+    /// only way to put that mixture on the card.
+    tear_write_after: Cell<Option<usize>>,
 }
 
 impl FaultPlan {
@@ -135,6 +141,13 @@ impl BlockDevice for SharedDisk {
 
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
         self.writes.set(self.writes.get() + 1);
+        if let Some(bytes) = self.fault.tear_write_after.take() {
+            let mut data = self.data.borrow_mut();
+            let at = start.0 as usize * BLOCK_BYTES;
+            let landed = bytes.min(BLOCK_BYTES);
+            data[at..at + landed].copy_from_slice(&blocks[0][..landed]);
+            return Err(DiskError);
+        }
         if FaultPlan::take_fault(&self.fault.fail_write_in) {
             return Err(DiskError);
         }
@@ -2427,6 +2440,60 @@ fn a_save_that_dies_part_way_still_leaves_a_position_to_return_to() {
         }
     }
     assert!(faulted > 0, "at least one probe has to have failed a write");
+}
+
+/// The mixture an interrupted overwrite leaves, which a clean write fault
+/// cannot produce.
+///
+/// Writing a record over the bytes of the one before it means a dead write
+/// leaves a sector that is part old and part new, and the reader has to
+/// refuse it: the checksum covers the whole body, so a half-covered record
+/// fails it, and the other generation is still whole. Every cut point across
+/// the record is tried, and the answer is read through a freshly mounted
+/// volume so nothing survives in a cache that a power cut would have taken.
+#[test]
+fn a_half_written_record_is_refused_and_the_other_generation_answers() {
+    let record_len = 6 + proto::durable::DURABLE_OVERHEAD;
+    let mut torn = 0usize;
+    for cut in 1..record_len {
+        let disk = new_card();
+        let (key, book_root) = moved_owner("Dune.epub", 4096);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: book_root,
+            locator: "Dune.epub",
+        };
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            // Both generations whole, so the save under test overwrites.
+            files::write_position_file(&root, &owner, 12, 340).expect("seed A");
+            files::write_position_file(&root, &owner, 13, 341).expect("seed B");
+
+            disk.fault.tear_write_after.set(Some(cut));
+            let saved = files::write_position_file(&root, &owner, 99, 900);
+            disk.fault.tear_write_after.set(None);
+            if saved.is_err() {
+                torn += 1;
+            }
+        }
+
+        // A fresh mount, the way a reboot would see the card.
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        match files::read_position_file(&root, &owner) {
+            Some((99, 900)) => {}
+            Some((13, 341)) => {}
+            other => panic!(
+                "cut {cut}: a half-written record left {other:?}, neither the \
+                 place being saved nor the one before it",
+            ),
+        }
+    }
+    assert!(
+        torn > 0,
+        "at least one cut has to have interrupted a record write",
+    );
 }
 
 /// A record whose length changed between firmware versions cannot be written
