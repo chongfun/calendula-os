@@ -740,6 +740,20 @@ impl OpenSequence {
         self.resumed |= self.page > 0 || self.chapter > 0;
     }
 
+    /// The section covering the target page could not be made resident, and
+    /// neither could the one the open was going to land on.
+    ///
+    /// It still announces, because the app clears its open lock on that event
+    /// and the store's own error reaches the reader. It claims no place: the
+    /// pointer keeps naming the book the reader came from, so a reboot goes
+    /// back there rather than to a book with no text, and no position rides
+    /// along, because a page number for a section nobody could read is one the
+    /// app would act on.
+    pub fn section_failed(&mut self) {
+        self.resumed = false;
+        self.phase = OpenPhase::Announce;
+    }
+
     /// The section covering the target page is resident.
     pub fn section_loaded(&mut self) {
         self.phase = if self.previous.is_some() {
@@ -786,6 +800,64 @@ impl OpenSequence {
 
 #[cfg(test)]
 mod tests {
+
+    /// A book switch whose section will not load, in either place: the target
+    /// the saved place named, and the page the open was landing on. The open
+    /// has to finish, because the app is holding a lock on it, and it must
+    /// finish without claiming the reader is somewhere.
+    #[test]
+    fn an_open_with_no_readable_section_points_at_nothing() {
+        let previous = persisted(ReaderSource::sd(1).book_id(), 2, 40);
+        let command = open(ReaderSource::sd(2).book_id(), 0, 0, Some(previous));
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+
+        assert!(matches!(open.next(), OpenAction::CloseOutDeparting(_)));
+        open.departing_stored(true);
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        open.saved_position(Some((4, 300)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+
+        // Neither the place's page nor the landing page could be read.
+        open.section_failed();
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position, None,
+                "an open with nothing resident claims no page"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+        open.announced();
+        assert!(matches!(open.next(), OpenAction::Done));
+    }
+
+    /// The same open when the section does load: the pointer is written and
+    /// the resolved page rides out with the announcement.
+    #[test]
+    fn an_open_that_loaded_points_at_the_page_it_landed_on() {
+        let previous = persisted(ReaderSource::sd(1).book_id(), 2, 40);
+        let command = open(ReaderSource::sd(2).book_id(), 0, 0, Some(previous));
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+        assert!(matches!(open.next(), OpenAction::CloseOutDeparting(_)));
+        open.departing_stored(true);
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        open.saved_position(Some((4, 300)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+        open.section_loaded();
+        assert!(
+            matches!(open.next(), OpenAction::StorePointer(_)),
+            "a switch that landed writes the pointer"
+        );
+        open.pointer_stored(true);
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(position, Some(300)),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
+
     use super::*;
     use crate::{book_open_outcome, BookOpenOutcome, ReaderSource};
     use display::font::{FontFamily, FontSize, FontWeight, LineSpacing};

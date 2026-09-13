@@ -144,6 +144,20 @@ fn resolve_pending_place(
                         "restore: and the page the reader was on would not come back"
                     );
                 }
+                // Counted with the refused reads, and for the same reason. A
+                // target that resolves and will not load is a card saying no
+                // to a particular section, and retrying it forever means a
+                // cache build every settle interval for as long as the book
+                // stays open.
+                if let Some(waiting) = pending_place.as_mut() {
+                    waiting.refusals = waiting.refusals.saturating_add(1);
+                    if waiting.refusals >= PLACE_READ_REFUSALS {
+                        esp_println::println!(
+                            "restore: the place's section kept refusing; leaving the reader put"
+                        );
+                        *pending_place = None;
+                    }
+                }
                 return None;
             }
             *pending_place = None;
@@ -1828,6 +1842,10 @@ fn handle_storage_command(
                         // beyond the frontier needs the walk to come to it,
                         // and the walk runs in slices so page turns keep
                         // working while it does.
+                        // Set when the open has no readable section left,
+                        // which is the one state that must not be announced as
+                        // a place.
+                        let mut landed_nothing = false;
                         if let Some(place) = opening_place.take() {
                             let resolved = book_build::resolve_place(
                                 epd,
@@ -1870,7 +1888,7 @@ fn handle_storage_command(
                                             "restore: the place resolved and its section \
                                              would not load"
                                         );
-                                        if !load_target_page(
+                                        let recovered = load_target_page(
                                             epd,
                                             sd_cs,
                                             sd_library,
@@ -1880,13 +1898,15 @@ fn handle_storage_command(
                                             epub_scratch,
                                             font_metrics,
                                             background_build,
-                                        ) {
+                                        );
+                                        section_loaded = Some(false);
+                                        if !recovered {
                                             esp_println::println!(
                                                 "restore: and the page it was landing on \
                                                  would not come back"
                                             );
                                         }
-                                        section_loaded = Some(false);
+                                        landed_nothing = !recovered;
                                         Some(())
                                     }
                                 }
@@ -1906,7 +1926,11 @@ fn handle_storage_command(
                                 refusals: 0,
                             });
                         }
-                        open.section_loaded();
+                        if landed_nothing {
+                            open.section_failed();
+                        } else {
+                            open.section_loaded();
+                        }
                     }
                     OpenAction::StorePointer(state) => {
                         let record = record_for_persisted(sd_library, state);
