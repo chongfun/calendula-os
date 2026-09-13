@@ -79,6 +79,12 @@ impl std::error::Error for DiskError {}
 struct FaultPlan {
     fail_write_in: Cell<Option<u32>>,
     fail_read_in: Cell<Option<u32>>,
+    /// Land this many bytes of the next write's first sector, then fail.
+    ///
+    /// A clean write fault leaves the sector entirely old. An interrupted
+    /// in-place overwrite half-covers the record instead, and this is the
+    /// only way to put that mixture on the card.
+    tear_write_after: Cell<Option<usize>>,
 }
 
 impl FaultPlan {
@@ -135,6 +141,13 @@ impl BlockDevice for SharedDisk {
 
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
         self.writes.set(self.writes.get() + 1);
+        if let Some(bytes) = self.fault.tear_write_after.take() {
+            let mut data = self.data.borrow_mut();
+            let at = start.0 as usize * BLOCK_BYTES;
+            let landed = bytes.min(BLOCK_BYTES);
+            data[at..at + landed].copy_from_slice(&blocks[0][..landed]);
+            return Err(DiskError);
+        }
         if FaultPlan::take_fault(&self.fault.fail_write_in) {
             return Err(DiskError);
         }
@@ -2350,6 +2363,181 @@ fn a_generation_that_reads_but_does_not_decode_is_no_place() {
         files::book_dir_position_presence(&root, key.as_str()),
         files::PositionPresence::Absent,
         "whole, and not a record anyone can return to",
+    );
+}
+
+/// The two-generation writer overwrites its record in place once the file is
+/// the right length, so the A/B alternation has to keep working over a file
+/// whose clusters are no longer freed and reallocated between writes.
+///
+/// Ten saves, each read back: any generation the alternation got wrong, or
+/// any stale byte an in-place write failed to cover, shows up as an older
+/// position surviving a newer one.
+#[test]
+fn saving_a_position_over_and_over_keeps_returning_the_newest() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let (key, book_root) = moved_owner("Dune.epub", 4096);
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: book_root,
+        locator: "Dune.epub",
+    };
+
+    for step in 0..10u32 {
+        let chapter = (step + 1) as u16;
+        let page = 100 + step;
+        files::write_position_file(&root, &owner, chapter, page).expect("save");
+        assert_eq!(
+            files::read_position_file(&root, &owner),
+            Some((chapter, page)),
+            "save {step} must be the one that reads back",
+        );
+    }
+}
+
+/// The A/B pair exists so a write that dies part way leaves the reader's
+/// place somewhere. Overwriting in place changes what a dead write leaves
+/// behind, from a truncated file to a mix of old and new bytes, so the
+/// guarantee has to be re-proved against that shape: every write in the save
+/// is failed in turn, and the answer must be a position, the old one or the
+/// new one, and not an absence.
+#[test]
+fn a_save_that_dies_part_way_still_leaves_a_position_to_return_to() {
+    let mut faulted = 0usize;
+    for probe in 0..24 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+
+        let (key, book_root) = moved_owner("Dune.epub", 4096);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: book_root,
+            locator: "Dune.epub",
+        };
+        // Two saves first, so both generations hold a record and the next
+        // one takes the in-place path rather than creating a file.
+        files::write_position_file(&root, &owner, 12, 340).expect("seed A");
+        files::write_position_file(&root, &owner, 13, 341).expect("seed B");
+
+        disk.fault.fail_write_in.set(Some(probe));
+        let saved = files::write_position_file(&root, &owner, 99, 900);
+        disk.fault.fail_write_in.set(None);
+        if saved.is_err() {
+            faulted += 1;
+        }
+
+        match files::read_position_file(&root, &owner) {
+            Some((99, 900)) => {}
+            Some((13, 341)) => {}
+            other => panic!(
+                "probe {probe}: a save that died left {other:?}, \
+                 neither the place it was saving nor the one before it",
+            ),
+        }
+    }
+    assert!(faulted > 0, "at least one probe has to have failed a write");
+}
+
+/// The mixture an interrupted overwrite leaves, which a clean write fault
+/// cannot produce.
+///
+/// Writing a record over the bytes of the one before it means a dead write
+/// leaves a sector that is part old and part new, and the reader has to
+/// refuse it: the checksum covers the whole body, so a half-covered record
+/// fails it, and the other generation is still whole. Every cut point across
+/// the record is tried, and the answer is read through a freshly mounted
+/// volume so nothing survives in a cache that a power cut would have taken.
+#[test]
+fn a_half_written_record_is_refused_and_the_other_generation_answers() {
+    let record_len = 6 + proto::durable::DURABLE_OVERHEAD;
+    let mut torn = 0usize;
+    for cut in 1..record_len {
+        let disk = new_card();
+        let (key, book_root) = moved_owner("Dune.epub", 4096);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: book_root,
+            locator: "Dune.epub",
+        };
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            // Both generations whole, so the save under test overwrites.
+            files::write_position_file(&root, &owner, 12, 340).expect("seed A");
+            files::write_position_file(&root, &owner, 13, 341).expect("seed B");
+
+            disk.fault.tear_write_after.set(Some(cut));
+            let saved = files::write_position_file(&root, &owner, 99, 900);
+            disk.fault.tear_write_after.set(None);
+            if saved.is_err() {
+                torn += 1;
+            }
+        }
+
+        // A fresh mount, the way a reboot would see the card.
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        match files::read_position_file(&root, &owner) {
+            Some((99, 900)) => {}
+            Some((13, 341)) => {}
+            other => panic!(
+                "cut {cut}: a half-written record left {other:?}, neither the \
+                 place being saved nor the one before it",
+            ),
+        }
+    }
+    assert!(
+        torn > 0,
+        "at least one cut has to have interrupted a record write",
+    );
+}
+
+/// A record whose length changed between firmware versions cannot be written
+/// over in place: the shorter record would leave the old tail behind and the
+/// reader requires an exact length. The writer truncates in that case, and
+/// the proof is that the file reads back as the position just written.
+#[test]
+fn a_file_left_at_the_wrong_length_is_rewritten_rather_than_overwritten() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let (key, book_root) = moved_owner("Dune.epub", 4096);
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: book_root,
+        locator: "Dune.epub",
+    };
+    files::write_position_file(&root, &owner, 12, 340).expect("a place to keep");
+
+    // Leave both generations longer than a record, the shape a payload that
+    // grew would leave behind.
+    {
+        let mut book = root.open_dir("READER").expect("reader dir");
+        book.change_dir("CACHE2").expect("cache dir");
+        book.change_dir(key.as_str()).expect("book dir");
+        for name in ["POSA.BIN", "POSB.BIN"] {
+            let file = book
+                .open_file_in_dir(name, embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+                .expect("rewrite it");
+            file.write(&[0x5A; 96]).expect("a longer file");
+        }
+    }
+    assert_eq!(
+        files::read_position_file(&root, &owner),
+        None,
+        "neither generation is a record the reader accepts",
+    );
+
+    files::write_position_file(&root, &owner, 21, 9).expect("save over the wrong length");
+    assert_eq!(
+        files::read_position_file(&root, &owner),
+        Some((21, 9)),
+        "the writer truncated rather than leaving a tail behind",
     );
 }
 
