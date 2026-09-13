@@ -1749,6 +1749,39 @@ class PageTurnCounterTests(unittest.TestCase):
         self.assertEqual(stats.skipped_answered, 1)
         self.assertEqual(stats.unmatched_presses, 0, "and it was answered")
 
+    def test_a_turn_the_panel_was_spared_still_counts_toward_the_request(self) -> None:
+        """A14 skips a frame the glass already shows, so that turn has no
+        duration to report. It happened, so a run that was asked for two
+        turns and delivered one timed and one skipped is not short."""
+        events: list[dict] = [
+            {"event": "run_start", "suite": "page-turn", "requested": {"page_turns": 2}},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1354, "req_ms": 1000, "page": 6},
+            {"event": "input", "button": "Next", "t_ms": 3000},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 3012,
+                "req_ms": 3000,
+                "page": 7,
+                "skipped": True,
+            },
+            {"event": "run_end", "elapsed_s": 9.0, "stop_reason": "count", "completed": True},
+        ]
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(events) if "page turns" in w],
+            [],
+            "the skipped turn counts toward the request",
+        )
+
+        # And a run genuinely one turn short is still reported as short.
+        one_short = [e for e in events if e.get("page") != 7 and e.get("t_ms") != 3000]
+        self.assertTrue(
+            any(
+                "1 of 2 requested page turns" in w for w in bench.evaluate_suite_signals(one_short)
+            ),
+        )
+
     def test_a_short_capture_is_reported_against_what_was_asked_for(self) -> None:
         events = [
             {"event": "run_start", "suite": "page-turn", "requested_page_turns": 50},

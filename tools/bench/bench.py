@@ -3220,10 +3220,17 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
     turns = requested.get("page_turns")
     if isinstance(turns, int):
         window = counted_window(run.events, "page_turn") if self_driven else run.events
+        paired = page_turn_stats_over_epochs(window)
+        # A turn whose frame matched the glass is a turn the panel was spared,
+        # so it has no duration and is still telemetry that arrived. Counting
+        # only durations reported a 50-turn run as 49 the first time a page
+        # rendered identically to the one before it. A press that turned
+        # nothing is caught by the checkpoint arm above and by the scenario's
+        # own `invalid=end-of-book`, not here.
         short(
             "page turns",
             turns,
-            len(page_turn_stats_over_epochs(window).durations),
+            len(paired.durations) + paired.skipped_answered,
             checkpoint_completions(run.events, "page_turn") if self_driven else None,
         )
 
