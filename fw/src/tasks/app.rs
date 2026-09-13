@@ -856,11 +856,15 @@ fn open_book_id(command: StorageCommand) -> Option<u32> {
     }
 }
 
+/// The book an open transaction has finished with, whatever it finished as.
+///
+/// The rule lives in `app_core::open_answered_for`, where it can be tested:
+/// an ending missing from it holds `opening_book`, and with it the input gate
+/// and the sleep block, until the device reboots. `BookOpenFailed` is handled
+/// by the branch above before this is reached, and answering for it here as
+/// well costs nothing and keeps the rule one rule.
 fn loaded_book_id(event: &crate::LibraryEvent) -> Option<u32> {
-    match *event {
-        crate::LibraryEvent::Loaded { book_id, .. } => Some(book_id),
-        _ => None,
-    }
+    app_core::open_answered_for(event)
 }
 
 fn should_block_post_open_confirm(event: InputEvent, block_until: &mut Option<Instant>) -> bool {

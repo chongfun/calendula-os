@@ -859,6 +859,22 @@ pub const fn loaded_repaints(reading: bool, text_replaced: bool, page_moved: boo
 /// nobody owes stays shut for good — every press ignored, sleep deferred, until
 /// the battery goes. So the test is whether a frame is *in flight*, which an
 /// event arriving between cycles can answer as well as a cycle ending can.
+/// The book an open transaction has finished with, whatever it finished as.
+///
+/// Every ending belongs here. A caller holds the open's bookkeeping, the input
+/// gate and the sleep block on the answer to this, so an ending it does not
+/// recognize holds all three until the device reboots. The ending that carries
+/// no navigation metadata is the one to watch: it reads like an event about
+/// nothing and is exactly as final as the others.
+pub const fn open_answered_for(event: &LibraryEvent) -> Option<u32> {
+    match *event {
+        LibraryEvent::Loaded { book_id, .. }
+        | LibraryEvent::BookOpenUnreadable { book_id }
+        | LibraryEvent::BookOpenFailed { book_id } => Some(book_id),
+        _ => None,
+    }
+}
+
 pub const fn open_gate_may_lift(gated: bool, open_unresolved: bool, frame_in_flight: bool) -> bool {
     gated && !open_unresolved && !frame_in_flight
 }
@@ -5617,6 +5633,61 @@ mod tests {
             !resolves_place(&open_book_command(&back, 0, 1, None, None)),
             "so the page counted under that layout is good again"
         );
+    }
+
+    /// Every way an open can end has to answer it. The caller hangs the open's
+    /// bookkeeping, the input gate and the sleep block on this, so an ending
+    /// missing from it leaves the reader unable to press anything or go to
+    /// sleep until the device reboots.
+    #[test]
+    fn every_ending_of_an_open_answers_for_it() {
+        let book_id = ReaderSource::sd(3).book_id();
+
+        // It landed.
+        assert_eq!(
+            open_answered_for(&LibraryEvent::Loaded {
+                book_id,
+                pages: 40,
+                chapters: 2,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: Some(9),
+                text_replaced: true,
+            }),
+            Some(book_id)
+        );
+        // It refused before it began.
+        assert_eq!(
+            open_answered_for(&LibraryEvent::BookOpenFailed { book_id }),
+            Some(book_id)
+        );
+        // It ran to its end and read nothing. The one that carries no
+        // navigation metadata, and just as final as the other two.
+        assert_eq!(
+            open_answered_for(&LibraryEvent::BookOpenUnreadable { book_id }),
+            Some(book_id)
+        );
+        // And events that are not an open ending answer for nothing.
+        assert_eq!(
+            open_answered_for(&LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: 1,
+            }),
+            None
+        );
+        assert_eq!(
+            open_answered_for(&LibraryEvent::CustomFont { available: true }),
+            None
+        );
+    }
+
+    /// And the gate the answer feeds: while an open is unresolved it stays
+    /// shut, whatever else is true.
+    #[test]
+    fn the_open_gate_waits_for_that_answer() {
+        assert!(!open_gate_may_lift(true, true, false), "open unresolved");
+        assert!(!open_gate_may_lift(true, false, true), "a frame in flight");
+        assert!(open_gate_may_lift(true, false, false), "answered and idle");
     }
 
     /// An open that read nothing must not move the reader, because the state
