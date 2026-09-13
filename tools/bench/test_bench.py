@@ -1771,7 +1771,7 @@ class PageTurnCounterTests(unittest.TestCase):
             "and the two agree",
         )
         self.assertEqual(stats.presses, 3, "the press still happened")
-        self.assertEqual(stats.skipped_answered, 1)
+        self.assertEqual(stats.unmoved_answered, 1, "the no-op has its own bucket")
         self.assertEqual(stats.unmatched_presses, 0, "and it was answered")
 
     def test_a_turn_the_panel_was_spared_still_counts_toward_the_request(self) -> None:
@@ -3144,7 +3144,7 @@ class StorageOpenPopulationTests(unittest.TestCase):
             if index != 0:
                 events.extend(
                     bench.parse_line(
-                        "bench: render view=Reading mode=Fast page=1 chapter=0 layout_ms=5 "
+                        f"bench: render view=Reading mode=Fast page={index + 1} chapter=0 layout_ms=5 "
                         f"flush_ms=405 req_ms={press} deq_ms={press + 1} t_ms={press + 470}",
                         "page-turn",
                     )
@@ -3648,12 +3648,19 @@ class CountAndDurationContractTests(unittest.TestCase):
         return events
 
     def test_a_skipped_render_is_answered_but_is_not_a_turn(self) -> None:
-        """A14's frame-identity guard settles a press without sending a
-        frame. The press is answered, so it is not unmatched, but nothing
-        turned and its ~12 ms must stay out of the turn population."""
+        """A press at the last page of a book is answered by a redraw of the
+        page already shown. It is answered, so it is not unmatched, and it
+        turned nothing, so its ~12 ms stays out of the turn population."""
         events = [
             {"event": "input", "button": "Next", "t_ms": 1000},
-            {"event": "render", "view": "Reading", "t_ms": 1350, "req_ms": 1000, "deq_ms": 1001},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 1350,
+                "req_ms": 1000,
+                "deq_ms": 1001,
+                "page": 5,
+            },
             {"event": "input", "button": "Next", "t_ms": 2000},
             {
                 "event": "render",
@@ -3661,19 +3668,25 @@ class CountAndDurationContractTests(unittest.TestCase):
                 "t_ms": 2012,
                 "req_ms": 2000,
                 "deq_ms": 2001,
+                "page": 5,
                 "skipped": True,
             },
         ]
         stats = bench.page_turn_stats_over_epochs(events)
-        self.assertEqual(stats.durations, [350], "the skipped render is not a turn")
+        self.assertEqual(stats.durations, [350], "the page did not move, so it is no turn")
         self.assertEqual(stats.presses, 2, "both presses still count")
-        self.assertEqual(stats.skipped_answered, 1, "the skipped press has its own bucket")
+        self.assertEqual(stats.unmoved_answered, 1, "the no-op has its own bucket")
         self.assertEqual(stats.unmatched_presses, 0, "and both presses were answered")
         self.assertEqual(stats.untrusted_fraction, 0.0, "a skip is not a trust problem")
 
-        # A capture from a build without the field reads as it always did.
+        # The same record without the field reads the same way. Whether the
+        # seam sent the frame or found it already on the glass says nothing
+        # about whether the page moved, and a clean refresh at the end of a
+        # book produces exactly this: a no-op that was flushed.
         older = [{k: v for k, v in e.items() if k != "skipped"} for e in events]
-        self.assertEqual(bench.page_turn_stats_over_epochs(older).durations, [350, 12])
+        older_stats = bench.page_turn_stats_over_epochs(older)
+        self.assertEqual(older_stats.durations, [350])
+        self.assertEqual(older_stats.unmoved_answered, 1)
 
     def test_the_count_landing_first_is_a_clean_pass(self) -> None:
         """`--turns 3 --seconds 600`, done in twelve seconds."""

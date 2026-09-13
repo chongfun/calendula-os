@@ -779,6 +779,12 @@ async fn place_at_start_chapter() -> bool {
     // leave the list up, and turning pages into the chapter cursor would
     // measure the cursor.
     if wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await {
+        // The view is published from `send_render`, a flush before the frame
+        // settles, so Reading here can still be painting. The first measured
+        // press would land in that frame and be timed against it.
+        if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+            report_invalid_current("not-quiescent");
+        }
         return true;
     }
     bench_log!(

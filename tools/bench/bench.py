@@ -1278,7 +1278,8 @@ def summarize_paths(
             f"page_turns={len(turn_stats.durations)} "
             f"nav={turn_stats.nav_answered} "
             f"coalesced={turn_stats.coalesced_presses} "
-            f"skipped={turn_stats.skipped_answered} "
+            f"spared={turn_stats.spared_turns} "
+            f"unmoved={turn_stats.unmoved_answered} "
             f"unmatched={turn_stats.unmatched_presses} "
             f"reading_renders={turn_stats.reading_renders}"
         )
@@ -1773,13 +1774,14 @@ class PageTurnStats:
     # constant above — these are the burst signal, and the reason the median
     # cannot be trusted on unmatched count alone.
     coalesced_presses: int
-    # Presses answered by a render the flush seam skipped: answered, so not
-    # unmatched, but no frame was sent so they carry no duration.
-    skipped_answered: int = 0
-    # The subset of those whose page had moved. A spared turn is a turn the
-    # panel did not have to be sent; a skip at the last page of a book turned
-    # nothing, and the two are the same record apart from the page.
+    # Turns whose frame the panel was spared: the page moved and the flush
+    # seam found the frame already on the glass, so there is nothing to time.
     spared_turns: int = 0
+    # Presses answered by a Reading render that turned no page. The reducer
+    # clamps at the last page while input still marks the view dirty, so the
+    # end of a book answers every press with a redraw of the page shown.
+    # Answered, so not unmatched, and not a turn either.
+    unmoved_answered: int = 0
 
     @property
     def unmatched_presses(self) -> int:
@@ -1788,7 +1790,8 @@ class PageTurnStats:
             - len(self.durations)
             - self.nav_answered
             - self.coalesced_presses
-            - self.skipped_answered
+            - self.spared_turns
+            - self.unmoved_answered
         )
 
     @property
@@ -1877,8 +1880,8 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
     reading_renders = 0
     nav_answered = 0
     coalesced_presses = 0
-    skipped_answered = 0
     spared_turns = 0
+    unmoved_answered = 0
     last_reading_page: int | None = None
     for event in sorted(events, key=event_sort_key):
         name = event.get("event")
@@ -1918,14 +1921,22 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
                 # catches presses paired against renders already in flight.
                 # The press still counts and is still answered; only the
                 # duration is left out.
-                if event.get("skipped"):
-                    skipped_answered += 1
-                    if (
-                        isinstance(seen_page, int)
-                        and page_before is not None
-                        and seen_page != page_before
-                    ):
-                        spared_turns += 1
+                # A turn is a page that moved. A redraw of the page already
+                # shown is the end of the book, and whether the seam sent the
+                # frame or found it already on the glass says nothing about
+                # that. Only a page known to have stayed put is refused: a
+                # reader reaches the last page by turning to it, so the case
+                # this catches always has a previous page behind it, and
+                # demanding one of the first render would drop a real turn
+                # from any capture that opens straight into Reading.
+                if (
+                    isinstance(seen_page, int)
+                    and page_before is not None
+                    and seen_page == page_before
+                ):
+                    unmoved_answered += 1
+                elif event.get("skipped"):
+                    spared_turns += 1
                 else:
                     durations.append(t_ms - newest_answered)
             else:
@@ -1936,8 +1947,8 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
         reading_renders,
         nav_answered,
         coalesced_presses,
-        skipped_answered,
         spared_turns,
+        unmoved_answered,
     )
 
 
@@ -2013,19 +2024,15 @@ class PageTurnCounter:
             page_before = self.last_reading_page
             if is_reading and isinstance(seen_page, int):
                 self.last_reading_page = seen_page
-            if answered and is_reading:
-                # A skip whose page moved is a turn the panel was spared,
-                # counted by the rule the report uses. One whose page did not
-                # move turned nothing, which is the end of a book, and
-                # counting it would end a `--turns 50` capture on 49 turns
-                # and a no-op.
-                spared = (
-                    isinstance(seen_page, int)
-                    and page_before is not None
-                    and seen_page != page_before
-                )
-                if not event.get("skipped") or spared:
-                    self.turns += 1
+            # The report's rule: a turn is a page that moved, whether or not
+            # the seam had to send the frame. A redraw of the page already
+            # shown is the end of the book, and counting it would end a
+            # `--turns 50` capture on 49 turns and a no-op.
+            unmoved = (
+                isinstance(seen_page, int) and page_before is not None and seen_page == page_before
+            )
+            if answered and is_reading and not unmoved:
+                self.turns += 1
 
 
 def page_turn_stats_over_epochs(events: list[dict[str, Any]]) -> PageTurnStats:
@@ -2140,8 +2147,8 @@ def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
             merged.reading_renders + stats.reading_renders,
             merged.nav_answered + stats.nav_answered,
             merged.coalesced_presses + stats.coalesced_presses,
-            merged.skipped_answered + stats.skipped_answered,
             merged.spared_turns + stats.spared_turns,
+            merged.unmoved_answered + stats.unmoved_answered,
         )
     return merged
 
