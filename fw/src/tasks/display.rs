@@ -69,6 +69,96 @@ static EPUB_DECOMPRESSOR: static_cell::StaticCell<proto::epub::DecompressorOxide
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
+/// Try a waiting place against the pagination the last slice left behind.
+///
+/// `Some(page)` once the place resolves and the reader is still standing
+/// where the open put them: they asked to resume, so moving them to the place
+/// they asked for is finishing that, and a reader who has turned a page has
+/// chosen somewhere else.
+///
+/// Liveness comes from the walk's own step rather than from the page count: a
+/// spine item that renders nothing advances the cursor and adds no pages, so
+/// counting pages would drop the place one empty item short of its target.
+#[expect(clippy::too_many_arguments)] // The slice's whole world: the card, the store, the place, and the walk it waits on
+fn resolve_pending_place(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &mut ReaderStore,
+    pending_place: &mut Option<PendingPlace>,
+    book_id: u32,
+    reader_page: u32,
+    step: book_build::BackgroundStep,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    font_metrics: &mut crate::custom_font::MetricCache,
+    background_build: &mut Option<BackgroundBuild>,
+) -> Option<u32> {
+    let waiting = pending_place.as_ref()?;
+    if waiting.book_id != book_id {
+        return None;
+    }
+    if reader_page != waiting.landed {
+        // The reader moved. Whatever they are reading now is a better answer
+        // than where they left off last time.
+        *pending_place = None;
+        return None;
+    }
+    let index = waiting.index;
+    let place = waiting.place;
+    let target = match book_build::resolve_place(epd, sd_cs, sd_library, index as usize, place) {
+        book_build::PlaceTarget::Page(target) => {
+            *pending_place = None;
+            if !sd_library.covers_global_page(index as usize, target) {
+                let scratch = ensure_epub_scratch(epub_scratch);
+                let outcome = book_build::build_or_load_book_cache(
+                    epd,
+                    sd_cs,
+                    sd_library,
+                    index as usize,
+                    0,
+                    target as usize,
+                    scratch,
+                    font_metrics,
+                );
+                apply_build_outcome(background_build, outcome, book_id);
+            }
+            Some(target)
+        }
+        // Still short of it. Worth waiting only while a walk is coming: once
+        // it has finished or stopped, no later slice will reach the place.
+        book_build::PlaceTarget::Extend(_)
+            if matches!(
+                step,
+                book_build::BackgroundStep::Continued | book_build::BackgroundStep::Retry
+            ) =>
+        {
+            None
+        }
+        _ => {
+            *pending_place = None;
+            None
+        }
+    };
+    target
+}
+
+/// A stored place the open could not turn into a page yet.
+///
+/// The page a place names lives in pagination that a progressive build has
+/// yet to reach, and reaching it is the background walk's job, one sliced
+/// step at a time. So the open finishes where it can and the place waits here
+/// for the walk to come far enough, rather than a second pagination driver
+/// running inside the open and holding the executor through a minute of
+/// building.
+struct PendingPlace {
+    book_id: u32,
+    index: u16,
+    place: book_build::SavedPlace,
+    /// The page the open landed on. The reader is moved off it only while
+    /// they are still standing on it: once they turn a page, the place they
+    /// asked to resume at has been overtaken by the one they chose.
+    landed: u32,
+}
+
 #[embassy_executor::task]
 pub async fn run(
     mut epd: Epd,
@@ -94,6 +184,7 @@ pub async fn run(
     // what the loop needs to schedule the next step and to tell whether the
     // reader is still on that book.
     let mut background_build: Option<BackgroundBuild> = None;
+    let mut pending_place: Option<PendingPlace> = None;
     // The place whose bytes this session has already read, or found the
     // card already knew. A place rather than a row number: a rescan
     // renumbers rows, and a row that comes back as another book would
@@ -387,6 +478,38 @@ pub async fn run(
                         )
                     }
                 };
+                // The walk just came further, which is the only thing that
+                // can make a waiting place resolvable. Asked here rather than
+                // inside the open, because the walk advances one sliced step
+                // at a time and the open cannot hold the executor for it.
+                let resolved_place = resolve_pending_place(
+                    &mut epd,
+                    &mut sd_cs,
+                    sd_library,
+                    &mut pending_place,
+                    pending.book_id,
+                    reader_page,
+                    step,
+                    &mut epub_scratch,
+                    font_metrics,
+                    &mut background_build,
+                );
+                if let Some(target) = resolved_place {
+                    esp_println::println!(
+                        "restore: the place resolved once the book reached it, page {}",
+                        target
+                    );
+                    send_loaded_library_event(&LibraryEvent::Loaded {
+                        book_id: pending.book_id,
+                        pages: sd_library.advertised_page_count(),
+                        chapters: sd_library.chapter_count_for_ui(),
+                        current_chapter: sd_library.current_chapter(),
+                        chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                        position: Some(target),
+                        text_replaced: true,
+                    });
+                    continue;
+                }
                 if announce {
                     // `position: None` — the book grew, the reader did not
                     // move, and adopting a page here would yank them.
@@ -668,6 +791,7 @@ pub async fn run(
                                         &mut last_progress_write,
                                         &mut state_restored,
                                         &mut background_build,
+                                        &mut pending_place,
                                         last_portrait(&refresh_planner),
                                     );
                                     sleep.applied();
@@ -925,6 +1049,7 @@ pub async fn run(
                         &mut last_progress_write,
                         &mut state_restored,
                         &mut background_build,
+                        &mut pending_place,
                         last_portrait(&refresh_planner),
                     );
                 }
@@ -1294,6 +1419,7 @@ fn handle_storage_command(
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
     background_build: &mut Option<BackgroundBuild>,
+    pending_place: &mut Option<PendingPlace>,
     portrait: bool,
 ) {
     // The session decides what may run: progress writes stay alive during a
@@ -1449,7 +1575,7 @@ fn handle_storage_command(
             let mut section_loaded = None;
             // Read at the saved-position step and spent at the section load,
             // which is where a place first has a pagination to resolve in.
-            let mut pending_place: Option<book_build::SavedPlace> = None;
+            let mut opening_place: Option<book_build::SavedPlace> = None;
             loop {
                 match open.next() {
                     OpenAction::CloseOutDeparting(previous) => {
@@ -1507,9 +1633,9 @@ fn handle_storage_command(
                         // it names content, and which page that content falls
                         // on is decided by the pagination this open is about
                         // to build.
-                        pending_place =
+                        opening_place =
                             book_build::load_place(epd, sd_cs, sd_library, index as usize);
-                        open.saved_position(pending_place.map(book_build::SavedPlace::provisional));
+                        open.saved_position(opening_place.map(book_build::SavedPlace::provisional));
                         if open.resumed() {
                             esp_println::println!(
                                 "storage: resume book {} at chapter {} screen {}",
@@ -1566,59 +1692,48 @@ fn handle_storage_command(
                         }
                         // The index now describes this book under this
                         // layout, which is the first moment a stored place
-                        // can be turned into a page.
-                        //
-                        // A progressive build stops once it covers the page
-                        // it was asked for, and the page a place names is not
-                        // known until the pagination holding it exists, so
-                        // the two take turns: resolve, build further, resolve
-                        // again. The loop ends when the place resolves or
-                        // when a step adds no pages, which is the index
-                        // saying it has nothing left to give. Counting steps
-                        // instead would abandon a real place in a long book,
-                        // since a continuation is a time slice and carries no
-                        // promise about how far it gets.
-                        if let Some(place) = pending_place.take() {
-                            loop {
-                                let target = book_build::resolve_place(
-                                    epd,
-                                    sd_cs,
-                                    sd_library,
-                                    index as usize,
-                                    place,
-                                );
-                                let (want, again) = match target {
-                                    book_build::PlaceTarget::Keep => break,
-                                    book_build::PlaceTarget::Page(page) => (page, false),
-                                    book_build::PlaceTarget::Extend(page) => (page, true),
-                                };
-                                let before = sd_library.advertised_page_count();
-                                if !sd_library.covers_global_page(index as usize, want) {
-                                    let scratch = ensure_epub_scratch(epub_scratch);
-                                    let outcome = book_build::build_or_load_book_cache(
-                                        epd,
-                                        sd_cs,
-                                        sd_library,
-                                        index as usize,
-                                        chapter,
-                                        want as usize,
-                                        scratch,
-                                        font_metrics,
-                                    );
-                                    apply_build_outcome(background_build, outcome, book_id);
-                                    section_loaded = Some(false);
+                        // can be turned into a page. Once, here: a place
+                        // beyond the frontier needs the walk to come to it,
+                        // and the walk runs in slices so page turns keep
+                        // working while it does.
+                        if let Some(place) = opening_place.take() {
+                            match book_build::resolve_place(
+                                epd,
+                                sd_cs,
+                                sd_library,
+                                index as usize,
+                                place,
+                            ) {
+                                book_build::PlaceTarget::Page(target) => {
+                                    if !sd_library.covers_global_page(index as usize, target) {
+                                        let scratch = ensure_epub_scratch(epub_scratch);
+                                        let outcome = book_build::build_or_load_book_cache(
+                                            epd,
+                                            sd_cs,
+                                            sd_library,
+                                            index as usize,
+                                            chapter,
+                                            target as usize,
+                                            scratch,
+                                            font_metrics,
+                                        );
+                                        apply_build_outcome(background_build, outcome, book_id);
+                                        section_loaded = Some(false);
+                                    }
+                                    open.resolve_place(target);
                                 }
-                                if !again {
-                                    open.resolve_place(want);
-                                    break;
+                                // The pagination holding it does not exist
+                                // yet. The reader gets the book now, and the
+                                // place waits for the walk.
+                                book_build::PlaceTarget::Extend(_) => {
+                                    *pending_place = Some(PendingPlace {
+                                        book_id,
+                                        index,
+                                        place,
+                                        landed: u32::from(open.target_page()),
+                                    });
                                 }
-                                if sd_library.advertised_page_count() <= before {
-                                    // The book grew no further, so asking
-                                    // again would ask the same question of
-                                    // the same index. The reader stays where
-                                    // the open put them.
-                                    break;
-                                }
+                                book_build::PlaceTarget::Keep => {}
                             }
                         }
                         open.section_loaded();
