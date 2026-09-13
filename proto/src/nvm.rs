@@ -406,34 +406,26 @@ impl PositionRecord {
 /// nothing about what it holds, and the anchor is the thing that is supposed
 /// to survive a move, so anything path-derived here would throw away exactly
 /// the case the record exists for.
+///
+/// The length is the whole witness, and its limit is the one the library
+/// identity PRD's R4 already accepts: a replacement of the same length at the
+/// same place reads as the same source. A recorded hash cannot close that
+/// today. The hash a copy carries is written once by the background read and
+/// stands until the cache directory goes, so a place and the claim it would
+/// be compared against hold the same value whatever the file now says.
+/// Closing it needs a witness of the bytes as they are now, which the device
+/// has only while a managed replacement is in flight.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlaceSource {
-    /// The file's length. Move-invariant and cheap, and a replacement of a
-    /// different length is caught by it alone.
+    /// The file's length. Move-invariant, free to read, and a replacement of
+    /// a different length is caught by it alone.
     pub byte_size: u32,
-    /// The hash recorded for this copy, when one has been read. Absent for a
-    /// copy nobody has read yet, which the library identity PRD's R4 accepts:
-    /// a same-sized replacement of a copy with no recorded bytes cannot be
-    /// told from the original by anything the device holds.
-    pub digest: Option<[u8; 32]>,
 }
 
 impl PlaceSource {
     /// Whether a place written against `self` still describes `now`.
-    ///
-    /// Length first, since it settles most replacements and costs nothing.
-    /// Then the recorded hashes, which settle the same-length replacement
-    /// when both sides have been read. Two absent hashes read as the same
-    /// source, by the same rule that lets a copy be adopted without reading
-    /// it.
     pub fn describes(&self, now: &Self) -> bool {
-        if self.byte_size != now.byte_size {
-            return false;
-        }
-        match (self.digest, now.digest) {
-            (Some(was), Some(is)) => was == is,
-            _ => true,
-        }
+        self.byte_size == now.byte_size
     }
 }
 
@@ -468,10 +460,10 @@ pub struct PlaceRecord {
 }
 
 impl PlaceRecord {
-    pub const ENCODED_LEN: usize = 75;
+    pub const ENCODED_LEN: usize = 41;
     const MAGIC: &'static [u8; 4] = b"X4PL";
     const VERSION: u8 = 1;
-    const CHECKSUM_AT: usize = 71;
+    const CHECKSUM_AT: usize = 37;
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
@@ -483,13 +475,9 @@ impl PlaceRecord {
         self.anchor.encode(&mut anchor);
         out[22..28].copy_from_slice(&anchor);
         out[28..32].copy_from_slice(&self.source.byte_size.to_le_bytes());
-        if let Some(digest) = self.source.digest {
-            out[32] = 1;
-            out[33..65].copy_from_slice(&digest);
-        }
         if let Some(progression) = self.progression {
-            out[65] = 1;
-            out[66..68].copy_from_slice(&progression.to_le_bytes());
+            out[32] = 1;
+            out[33..35].copy_from_slice(&progression.to_le_bytes());
         }
         let sum = checksum(&out[..Self::CHECKSUM_AT]);
         out[Self::CHECKSUM_AT..].copy_from_slice(&sum.to_le_bytes());
@@ -523,19 +511,13 @@ impl PlaceRecord {
         id.copy_from_slice(&bytes[6..22]);
         let mut anchor = [0u8; crate::anchor::CONTENT_ANCHOR_BYTES];
         anchor.copy_from_slice(&bytes[22..28]);
-        let digest = (bytes[32] == 1).then(|| {
-            let mut sha = [0u8; 32];
-            sha.copy_from_slice(&bytes[33..65]);
-            sha
-        });
         Some(Self {
             id: crate::identity::BookId::from_bytes(id)?,
             anchor: crate::anchor::ContentAnchor::decode(&anchor),
             source: PlaceSource {
                 byte_size: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
-                digest,
             },
-            progression: (bytes[65] == 1).then(|| u16::from_le_bytes([bytes[66], bytes[67]])),
+            progression: (bytes[32] == 1).then(|| u16::from_le_bytes([bytes[33], bytes[34]])),
         })
     }
 }

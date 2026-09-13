@@ -1218,6 +1218,15 @@ impl ReaderStore {
         self.page_anchor(usize::try_from(within).ok()?)
     }
 
+    /// Where a spine item starts, as a global page, when the index reaches
+    /// it. `None` for an item a partial index has yet to walk.
+    pub fn first_page_of_spine(&self, spine: u16) -> Option<u32> {
+        (0..self.book_section_count)
+            .map(|index| self.book_sections[index])
+            .find(|record| record.spine == spine)
+            .map(|record| record.start_page)
+    }
+
     /// How many sections the resident index describes.
     pub fn book_section_count(&self) -> usize {
         self.book_section_count

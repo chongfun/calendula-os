@@ -966,7 +966,6 @@ fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, Librar
 /// a layout change and a move and the page-keyed file beside it is not.
 fn store_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    owner: &proto::cache::CacheOwner<'_>,
     library: &ReaderStore,
     index: usize,
     screen: u32,
@@ -984,7 +983,7 @@ where
     let Some(entry) = library.catalog_entry(index) else {
         return Ok(());
     };
-    let source = files::place_source_for(root, owner, entry.byte_size);
+    let source = files::place_source_for(entry.byte_size);
     // The anchor is written whatever the pagination is doing. Only the
     // fraction beside it waits for a book with a known length: a page total
     // from a half-built index is a floor, so dividing by it would call page
@@ -1093,7 +1092,7 @@ pub(crate) fn store_app_state(
                     // a place across a settings change or a move, so treating
                     // a refused place as success would retire a retry the
                     // reader needs.
-                    let place = store_place(root, &owner, library, index, record.screen);
+                    let place = store_place(root, library, index, record.screen);
                     let position = match files::write_position_file(
                         root,
                         &owner,
@@ -1171,7 +1170,7 @@ pub(crate) fn store_book_position(
             root: at,
             locator: path.as_str(),
         };
-        let place = store_place(root, &owner, library, index as usize, record.screen);
+        let place = store_place(root, library, index as usize, record.screen);
         let position = match files::write_position_file(root, &owner, record.chapter, record.screen)
         {
             Ok(()) => Ok(()),
@@ -1278,7 +1277,7 @@ pub(crate) fn load_place(
                 // Against the copy's content, so a book that moved keeps its
                 // exact place: a move changes the locator and nothing else,
                 // and the anchor exists to survive exactly that.
-                let now = files::place_source_for(root, &owner, entry.byte_size);
+                let now = files::place_source_for(entry.byte_size);
                 return Some(SavedPlace::Place {
                     anchor: place.anchor,
                     exact: place.describes(&now),
@@ -1303,9 +1302,7 @@ pub(crate) enum PlaceTarget {
     /// for, and the page a place names is not known until the pagination
     /// holding it exists.
     Extend(u32),
-    /// Nothing better than where the open already is. An inexact place with
-    /// no whole-book length to read its fraction against lands at the spine
-    /// item it names, which is publication order and survives an edit.
+    /// Nothing better than where the open already is.
     Keep,
 }
 
@@ -1335,26 +1332,37 @@ pub(crate) fn resolve_place(
     };
     let partial = library.book_index_is_partial();
     if !exact {
-        // The content changed under the copy, so the anchor is a guess and
-        // the progression carries what an edit leaves. It is a fraction of
-        // the whole book, so it needs the whole book's length: against a
-        // half-built index it would put the reader at page 5 of 10 when it
-        // meant page 100 of 200.
-        let (Some(progression), false) = (progression, partial) else {
+        // The content changed under the copy, so the anchor is a guess. A
+        // progression is a fraction of the whole book and needs the whole
+        // book's length: against a half-built index it would put the reader
+        // at page 5 of 10 when it meant page 100 of 200.
+        if let (Some(progression), false) = (progression, partial) {
+            let total = library.advertised_page_count();
+            let page = ((u64::from(progression) * u64::from(total)) / u64::from(u16::MAX)) as u32;
             esp_println::println!(
-                "restore: the source changed and no whole-book length is known; \
-                 resuming at the item the place names"
+                "restore: the source changed; resuming near {}/{}",
+                page,
+                total
             );
-            return PlaceTarget::Keep;
+            return PlaceTarget::Page(page.min(total.saturating_sub(1)));
+        }
+        // Publication order carries the rest, and the reading-position PRD's
+        // M5 names it as the fallback. The spine item the place was in
+        // survives an edit better than an offset into it does, so the reader
+        // opens at the top of it rather than at the top of the book.
+        return match library.first_page_of_spine(anchor.spine) {
+            Some(page) => {
+                esp_println::println!(
+                    "restore: the source changed and no whole-book length is known; \
+                     resuming at spine {}",
+                    anchor.spine
+                );
+                PlaceTarget::Page(page)
+            }
+            // That item is past what this index reaches, so build toward it.
+            None if partial => PlaceTarget::Extend(library.advertised_page_count()),
+            None => PlaceTarget::Keep,
         };
-        let total = library.advertised_page_count();
-        let page = ((u64::from(progression) * u64::from(total)) / u64::from(u16::MAX)) as u32;
-        esp_println::println!(
-            "restore: the source changed; resuming near {}/{}",
-            page,
-            total
-        );
-        return PlaceTarget::Page(page.min(total.saturating_sub(1)));
     }
     let Some(entry) = library.catalog_entry(index) else {
         return PlaceTarget::Keep;

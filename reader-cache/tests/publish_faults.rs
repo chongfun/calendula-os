@@ -1090,7 +1090,6 @@ fn evicting_pagination_leaves_the_place_alone() {
 fn source() -> proto::nvm::PlaceSource {
     proto::nvm::PlaceSource {
         byte_size: IDENTITY.1,
-        digest: None,
     }
 }
 
@@ -1114,40 +1113,25 @@ fn book_id(seed: u8) -> proto::identity::BookId {
 fn a_move_leaves_a_place_exact() {
     let was = proto::nvm::PlaceSource {
         byte_size: 8_123_456,
-        digest: Some([7u8; 32]),
     };
     // Same bytes, somewhere else on the card. Nothing about content moved.
-    let moved = was;
-    assert!(was.describes(&moved), "a move is not a source change");
+    assert!(was.describes(&was), "a move is not a source change");
 
-    // A different edition of the same length, read, so both sides have a
-    // hash to compare.
+    // A replacement announces itself by length, which is the whole witness
+    // the device has without reading the file.
     let replaced = proto::nvm::PlaceSource {
-        byte_size: 8_123_456,
-        digest: Some([9u8; 32]),
+        byte_size: 8_127_552,
     };
-    assert!(
-        !was.describes(&replaced),
-        "a same-length replacement is caught by the recorded bytes"
-    );
+    assert!(!was.describes(&replaced), "a different length settles it");
 
-    // Neither side read: the library identity PRD's R4 accepts this, because
-    // nothing on the device can tell the two apart.
-    let unread = proto::nvm::PlaceSource {
+    // And the limit, stated rather than papered over: a replacement of the
+    // same length at the same place reads as the same source. That is the
+    // library identity PRD's R4 rule, and closing it needs a witness of the
+    // bytes as they are now, which nothing here holds.
+    let same_length = proto::nvm::PlaceSource {
         byte_size: 8_123_456,
-        digest: None,
     };
-    assert!(unread.describes(&proto::nvm::PlaceSource {
-        byte_size: 8_123_456,
-        digest: None,
-    }));
-    assert!(
-        !unread.describes(&proto::nvm::PlaceSource {
-            byte_size: 9_000_000,
-            digest: None,
-        }),
-        "and a different length settles it without any hash"
-    );
+    assert!(was.describes(&same_length));
 }
 
 /// A place with no trustworthy fraction is still a place. The anchor is the
@@ -1194,7 +1178,6 @@ fn a_place_survives_a_replacement_without_claiming_to_be_exact() {
     // up in the length whatever else it changes.
     let replaced = proto::nvm::PlaceSource {
         byte_size: IDENTITY.1 + 4_096,
-        digest: None,
     };
     assert!(
         !place.describes(&replaced),

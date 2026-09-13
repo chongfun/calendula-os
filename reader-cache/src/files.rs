@@ -273,31 +273,11 @@ pub enum PlaceDenied {
 
 /// What a place should record as the source it was resolved against.
 ///
-/// The copy's length, plus the hash recorded for it if the background read
-/// has reached it. Both are content: a move changes where the file sits and
-/// changes neither of these, which is the whole point of storing them rather
-/// than the locator-derived cache identity.
-pub fn place_source_for<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    owner: &proto::cache::CacheOwner<'_>,
-    byte_size: u32,
-) -> proto::nvm::PlaceSource
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    proto::nvm::PlaceSource {
-        byte_size,
-        digest: recorded_evidence(root, owner)
-            .and_then(|evidence| evidence.digest)
-            .map(|digest| *digest.sha256()),
-    }
+/// The copy's length, which is content rather than location: a move changes
+/// where the file sits and leaves this alone, which is the whole point of
+/// storing it instead of the locator-derived cache identity.
+pub const fn place_source_for(byte_size: u32) -> proto::nvm::PlaceSource {
+    proto::nvm::PlaceSource { byte_size }
 }
 
 /// Store where a reader left off in one copy.

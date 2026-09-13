@@ -69,11 +69,6 @@ static EPUB_DECOMPRESSOR: static_cell::StaticCell<proto::epub::DecompressorOxide
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
-/// How many times an open will build further to pin down a stored place.
-/// Each step covers at least one more section, and the bound stops a book
-/// whose index refuses to grow from holding the open open.
-const PLACE_RESOLVE_STEPS: usize = 8;
-
 #[embassy_executor::task]
 pub async fn run(
     mut epd: Epd,
@@ -1577,10 +1572,14 @@ fn handle_storage_command(
                         // it was asked for, and the page a place names is not
                         // known until the pagination holding it exists, so
                         // the two take turns: resolve, build further, resolve
-                        // again. Bounded, because a book whose index refuses
-                        // to grow must not hold the open open.
+                        // again. The loop ends when the place resolves or
+                        // when a step adds no pages, which is the index
+                        // saying it has nothing left to give. Counting steps
+                        // instead would abandon a real place in a long book,
+                        // since a continuation is a time slice and carries no
+                        // promise about how far it gets.
                         if let Some(place) = pending_place.take() {
-                            for _ in 0..PLACE_RESOLVE_STEPS {
+                            loop {
                                 let target = book_build::resolve_place(
                                     epd,
                                     sd_cs,
@@ -1588,12 +1587,13 @@ fn handle_storage_command(
                                     index as usize,
                                     place,
                                 );
-                                let (page, again) = match target {
+                                let (want, again) = match target {
                                     book_build::PlaceTarget::Keep => break,
                                     book_build::PlaceTarget::Page(page) => (page, false),
                                     book_build::PlaceTarget::Extend(page) => (page, true),
                                 };
-                                if !sd_library.covers_global_page(index as usize, page) {
+                                let before = sd_library.advertised_page_count();
+                                if !sd_library.covers_global_page(index as usize, want) {
                                     let scratch = ensure_epub_scratch(epub_scratch);
                                     let outcome = book_build::build_or_load_book_cache(
                                         epd,
@@ -1601,7 +1601,7 @@ fn handle_storage_command(
                                         sd_library,
                                         index as usize,
                                         chapter,
-                                        page as usize,
+                                        want as usize,
                                         scratch,
                                         font_metrics,
                                     );
@@ -1609,12 +1609,14 @@ fn handle_storage_command(
                                     section_loaded = Some(false);
                                 }
                                 if !again {
-                                    open.resolve_place(page);
+                                    open.resolve_place(want);
                                     break;
                                 }
-                                // Nothing new was built, so asking again
-                                // would ask the same question forever.
-                                if sd_library.advertised_page_count() <= page {
+                                if sd_library.advertised_page_count() <= before {
+                                    // The book grew no further, so asking
+                                    // again would ask the same question of
+                                    // the same index. The reader stays where
+                                    // the open put them.
                                     break;
                                 }
                             }
