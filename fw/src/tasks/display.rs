@@ -94,6 +94,9 @@ fn resolve_pending_place(
 ) -> Option<u32> {
     let waiting = pending_place.as_ref()?;
     if waiting.book_id != book_id {
+        // A place left over from a book the reader has moved on from. Its
+        // walk belongs to that open, and this one will not carry it.
+        *pending_place = None;
         return None;
     }
     if reader_page != waiting.landed {
@@ -104,23 +107,26 @@ fn resolve_pending_place(
     }
     let index = waiting.index;
     let place = waiting.place;
-    let target = match book_build::resolve_place(epd, sd_cs, sd_library, index as usize, place) {
+    match book_build::resolve_place(epd, sd_cs, sd_library, index as usize, place) {
         book_build::PlaceTarget::Page(target) => {
-            *pending_place = None;
-            if !sd_library.covers_global_page(index as usize, target) {
-                let scratch = ensure_epub_scratch(epub_scratch);
-                let outcome = book_build::build_or_load_book_cache(
-                    epd,
-                    sd_cs,
-                    sd_library,
-                    index as usize,
-                    0,
-                    target as usize,
-                    scratch,
-                    font_metrics,
-                );
-                apply_build_outcome(background_build, outcome, book_id);
+            if !load_target_page(
+                epd,
+                sd_cs,
+                sd_library,
+                index,
+                target,
+                book_id,
+                epub_scratch,
+                font_metrics,
+                background_build,
+            ) {
+                // The page resolved and its text would not come off the card.
+                // Announcing it would move the reader onto a page nothing has
+                // loaded, so the place stays and the next slice tries again.
+                esp_println::println!("restore: the place resolved and its section would not load");
+                return None;
             }
+            *pending_place = None;
             Some(target)
         }
         // Still short of it. Worth waiting only while a walk is coming: once
@@ -133,12 +139,49 @@ fn resolve_pending_place(
         {
             None
         }
+        // The card refused a read, which says nothing about the place. Kept
+        // whatever the walk is doing, because the remedy is to ask again.
+        book_build::PlaceTarget::Unavailable => None,
         _ => {
             *pending_place = None;
             None
         }
-    };
-    target
+    }
+}
+
+/// Bring a resolved page's text into the store, and say whether it arrived.
+///
+/// The answer is the store's own, not the build's: a build can report it did
+/// what it could and leave the page short of resident, and the only thing
+/// worth acting on is whether the page can be drawn now.
+#[expect(clippy::too_many_arguments)] // The load's whole world: the card, the store, the page, and the walk it may start
+fn load_target_page(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &mut ReaderStore,
+    index: u16,
+    target: u32,
+    book_id: u32,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    font_metrics: &mut crate::custom_font::MetricCache,
+    background_build: &mut Option<BackgroundBuild>,
+) -> bool {
+    if sd_library.covers_global_page(index as usize, target) {
+        return true;
+    }
+    let scratch = ensure_epub_scratch(epub_scratch);
+    let outcome = book_build::build_or_load_book_cache(
+        epd,
+        sd_cs,
+        sd_library,
+        index as usize,
+        0,
+        target as usize,
+        scratch,
+        font_metrics,
+    );
+    apply_build_outcome(background_build, outcome, book_id);
+    sd_library.covers_global_page(index as usize, target)
 }
 
 /// A stored place the open could not turn into a page yet.
@@ -1610,6 +1653,11 @@ fn handle_storage_command(
                         type_settings,
                         portrait,
                     } => {
+                        // A place belongs to the open that read it. Whatever
+                        // an earlier open left waiting is that open's, and it
+                        // ends here rather than outliving it and landing on
+                        // whoever comes next.
+                        *pending_place = None;
                         // Read this book's catalog record into the active-entry
                         // slot so the reader pipeline (load_position,
                         // build_or_load) resolves it from the card rather than
@@ -1697,44 +1745,58 @@ fn handle_storage_command(
                         // and the walk runs in slices so page turns keep
                         // working while it does.
                         if let Some(place) = opening_place.take() {
-                            match book_build::resolve_place(
+                            let resolved = book_build::resolve_place(
                                 epd,
                                 sd_cs,
                                 sd_library,
                                 index as usize,
                                 place,
-                            ) {
+                            );
+                            let landed_on = match resolved {
                                 book_build::PlaceTarget::Page(target) => {
-                                    if !sd_library.covers_global_page(index as usize, target) {
-                                        let scratch = ensure_epub_scratch(epub_scratch);
-                                        let outcome = book_build::build_or_load_book_cache(
-                                            epd,
-                                            sd_cs,
-                                            sd_library,
-                                            index as usize,
-                                            chapter,
-                                            target as usize,
-                                            scratch,
-                                            font_metrics,
-                                        );
-                                        apply_build_outcome(background_build, outcome, book_id);
+                                    let loaded = load_target_page(
+                                        epd,
+                                        sd_cs,
+                                        sd_library,
+                                        index,
+                                        target,
+                                        book_id,
+                                        epub_scratch,
+                                        font_metrics,
+                                        background_build,
+                                    );
+                                    if loaded {
                                         section_loaded = Some(false);
+                                        open.resolve_place(target);
+                                        None
+                                    } else {
+                                        // The page is the reader's and its
+                                        // text would not come off the card.
+                                        // Telling the app they are there
+                                        // would put them on a page nothing
+                                        // has loaded, so the open lands where
+                                        // it is and the place waits.
+                                        esp_println::println!(
+                                            "restore: the place resolved and its section \
+                                             would not load"
+                                        );
+                                        Some(())
                                     }
-                                    open.resolve_place(target);
                                 }
                                 // The pagination holding it does not exist
-                                // yet. The reader gets the book now, and the
-                                // place waits for the walk.
-                                book_build::PlaceTarget::Extend(_) => {
-                                    *pending_place = Some(PendingPlace {
-                                        book_id,
-                                        index,
-                                        place,
-                                        landed: u32::from(open.target_page()),
-                                    });
-                                }
-                                book_build::PlaceTarget::Keep => {}
-                            }
+                                // yet, or the card refused to say. Either
+                                // way the reader gets the book now and the
+                                // place waits for a later slice.
+                                book_build::PlaceTarget::Extend(_)
+                                | book_build::PlaceTarget::Unavailable => Some(()),
+                                book_build::PlaceTarget::Keep => None,
+                            };
+                            *pending_place = landed_on.map(|()| PendingPlace {
+                                book_id,
+                                index,
+                                place,
+                                landed: u32::from(open.target_page()),
+                            });
                         }
                         open.section_loaded();
                     }

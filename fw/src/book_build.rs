@@ -1302,8 +1302,13 @@ pub(crate) enum PlaceTarget {
     /// for, and the page a place names is not known until the pagination
     /// holding it exists.
     Extend(u32),
-    /// Nothing better than where the open already is.
+    /// Nothing better than where the open already is, and looking again will
+    /// not change that.
     Keep,
+    /// The card would not answer. Says nothing about the place, so the place
+    /// keeps waiting: a refused read is the one case where trying later is
+    /// the whole remedy.
+    Unavailable,
 }
 
 /// The page a stored place opens at, once the book is paginated for the
@@ -1364,15 +1369,18 @@ pub(crate) fn resolve_place(
             None => PlaceTarget::Keep,
         };
     }
+    // None of these three looked at the book. A row that is not staged yet
+    // and an index with no sections in it are states that pass, so they are
+    // unavailable rather than answers about the place.
     let Some(entry) = library.catalog_entry(index) else {
-        return PlaceTarget::Keep;
+        return PlaceTarget::Unavailable;
     };
     let identity = (entry.source_hash, entry.byte_size);
     let Some(section) = library.section_for_anchor(anchor) else {
-        return PlaceTarget::Keep;
+        return PlaceTarget::Unavailable;
     };
     let Some(record) = library.book_section(section) else {
-        return PlaceTarget::Keep;
+        return PlaceTarget::Unavailable;
     };
     // A partial index can stop inside the item the anchor names, and its last
     // section is the one every anchor past it resolves to. Nothing bounds the
@@ -1405,7 +1413,10 @@ pub(crate) fn resolve_place(
     .flatten();
     match resolved {
         Some(page) => PlaceTarget::Page(page),
-        None => PlaceTarget::Keep,
+        // The index put the place in a section and the section would not give
+        // up its anchors. Nothing was learned about the place, so it is not
+        // spent.
+        None => PlaceTarget::Unavailable,
     }
 }
 
