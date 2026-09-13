@@ -724,16 +724,29 @@ async fn seek_to_chapter(target: u16) -> bool {
             return leave_chapters(false).await;
         }
     }
-    press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await
-        && wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await
+    if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
+        return leave_chapters(false).await;
+    }
+    if !wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await {
+        return leave_chapters(false).await;
+    }
+    true
 }
 
-/// Back out of the chapter list to Reading, and pass `outcome` through.
+/// Put Reading back up if the chapter list is still there, and pass
+/// `outcome` through.
 ///
-/// Best effort: a card or panel that will not answer leaves the scenario
-/// wherever it is, and the caller has already reported the failure.
+/// Reads the view rather than pressing Back on faith. The press that opens a
+/// chapter is sent before its render is waited on, so a Confirm that timed
+/// out may have landed: Back from Reading goes to Home, which would take the
+/// scenario out of the book it was placing.
+///
+/// Best effort. A panel that will not answer leaves the scenario where it
+/// is, and the caller has already reported the failure.
 async fn leave_chapters(outcome: bool) -> bool {
-    if press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+    if current_view() == Some(AppView::Chapters)
+        && press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await
+    {
         let _ = wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await;
     }
     outcome
