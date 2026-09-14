@@ -959,6 +959,11 @@ pub struct BookOpenRollback {
     pub book_id: u32,
     pub chapter: u16,
     pub page: u32,
+    /// The layout `page` was counted under. Restored with the page it
+    /// describes: a page carrying the wrong stamp reads as current, and the
+    /// next open of this book resumes at a number that means something else
+    /// rather than resolving the stored place.
+    pub page_layout: u16,
     pub view: AppView,
     pub selection: u16,
     pub sd_page_count: u32,
@@ -3215,6 +3220,7 @@ impl ReaderState {
             book_id: self.book_id,
             chapter: self.chapter,
             page: self.page,
+            page_layout: self.page_layout,
             view: self.view,
             selection: self.selection,
             sd_page_count: self.sd_page_count,
@@ -3233,6 +3239,7 @@ impl ReaderState {
         self.book_id = rollback.book_id;
         self.chapter = rollback.chapter;
         self.page = rollback.page;
+        self.page_layout = rollback.page_layout;
         self.view = rollback.view;
         self.selection = rollback.selection;
         self.sd_page_count = rollback.sd_page_count;
@@ -4169,6 +4176,44 @@ mod tests {
         assert_eq!(recovered.chapter, 4);
         assert_eq!(recovered.page, 120);
         assert_eq!(recovered.view, AppView::Reading);
+    }
+
+    /// Selecting a book stamps the current layout on a page of zero, so a
+    /// refused open has to put the old stamp back with the old page. Leaving
+    /// the new one makes a stale page read as current, and the next open of
+    /// that book skips resolving its stored place and resumes at a number
+    /// counted under a pagination that is gone.
+    #[test]
+    fn an_aborted_open_puts_back_the_layout_the_page_was_counted_under() {
+        // Book A, read at page 120 under settings the reader has since left.
+        let mut before = reading(0, 4, 120);
+        before.stamp_page_layout();
+        before.font_size = FontSize::Large;
+        assert_ne!(
+            before.page_layout,
+            before.layout_stamp(),
+            "the fixture needs a page the current layout did not count"
+        );
+        let rollback = before.open_rollback();
+
+        // Book B is selected, which stamps page zero with the layout in hand,
+        // and the storage task refuses the switch.
+        let mut committed = reading(1, 0, 0);
+        committed.font_size = FontSize::Large;
+        committed.stamp_page_layout();
+        let recovered = committed.restore_after_failed_open(rollback);
+
+        assert_eq!(recovered.page, 120);
+        assert_eq!(
+            recovered.page_layout, before.page_layout,
+            "the page came back, so the layout that counted it has to as well"
+        );
+        assert_ne!(
+            recovered.page_layout,
+            recovered.layout_stamp(),
+            "and the next open of this book resolves the place rather than \
+             trusting the number"
+        );
     }
 
     #[test]

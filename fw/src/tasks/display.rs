@@ -2064,6 +2064,39 @@ fn handle_storage_command(
                                 font_metrics,
                             );
                             apply_build_outcome(background_build, outcome, book_id);
+                            // The store's own answer, not the build's: a build
+                            // can report it did what it could and leave the
+                            // page short of resident, and a failed one leaves
+                            // the store cleared. The announcement reads a
+                            // cleared store as a one-page book and clamps the
+                            // reader into it, so weaken the position the way a
+                            // place does. The build has had its turn at this
+                            // page, so the ladder starts below it.
+                            if !sd_library.covers_global_page(index as usize, page as u32) {
+                                let fell_back = page != 0
+                                    && load_target_page(
+                                        epd,
+                                        sd_cs,
+                                        sd_library,
+                                        index,
+                                        0,
+                                        book_id,
+                                        epub_scratch,
+                                        font_metrics,
+                                        background_build,
+                                    );
+                                if fell_back {
+                                    esp_println::println!(
+                                        "open: page {} would not load; falling back to the \
+                                         start of the book",
+                                        page
+                                    );
+                                    open.resolve_place(0);
+                                } else {
+                                    esp_println::println!("open: no page of this book would load");
+                                    landed_nothing = true;
+                                }
+                            }
                         }
                         // The index now describes this book under this
                         // layout, which is the first moment a stored place
