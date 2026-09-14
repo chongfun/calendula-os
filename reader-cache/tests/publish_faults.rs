@@ -1070,6 +1070,34 @@ fn a_third_layout_evicts_one_and_only_then() {
     assert!(!left.contains(&third), "the arriving layout writes its own");
 }
 
+/// A card that refuses a read on the way down to the sections has deleted
+/// nothing, and the caller has to hear that. Reporting success drops the
+/// layout from the resident list, and R10 is the reason it matters: once a
+/// layout is counted as gone while its files are still there, nothing looks
+/// again and the storage bound is lost rather than delayed.
+#[test]
+fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let victim = write_section_under(&root, &mut store, false, 0);
+    assert_eq!(files::resident_layouts(&root, &OWNER).len(), 1);
+
+    disk.fault.fail_read_in.set(Some(0));
+    assert!(
+        !files::evict_layout_sections(&root, KEY, victim),
+        "a refused read is the card saying no, not a cache that is already gone"
+    );
+    assert_eq!(
+        files::resident_layouts(&root, &OWNER),
+        heapless::Vec::<u8, 16>::from_slice(&[victim]).expect("one layout"),
+        "and the sections are still there to be counted next time"
+    );
+}
+
 /// R11: pagination is derived and a place is not. Evicting every layout of a
 /// book leaves the reader's place where it was.
 #[test]

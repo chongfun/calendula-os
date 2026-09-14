@@ -1963,14 +1963,26 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
-        return true;
+    // Every step down to the sections answers the same way. A directory that
+    // is not there is nothing to delete, so this layout is gone and the bound
+    // holds. Any other error is the card refusing, and the files are still
+    // there and still counted, so the caller has to hear no and try again on
+    // the next open. Reporting success would drop the layout from the
+    // caller's list and lose the bound for good.
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
     };
-    let Ok(cache) = cache_root.open_dir(CACHE_V2_DIR) else {
-        return true;
+    let cache = match cache_root.open_dir(CACHE_V2_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
     };
-    let Ok(book) = cache.open_dir(key) else {
-        return true;
+    let book = match cache.open_dir(key) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
     };
     match book.open_dir(CACHE_SECTIONS_DIR) {
         Ok(sections) => delete_layout_sections(&sections, layout),
