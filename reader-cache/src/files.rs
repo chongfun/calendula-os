@@ -4226,7 +4226,8 @@ pub fn page_of_anchor_in_section<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
-    layout_key: u8,
+    library: &ReaderStore,
+    source_identity: (u32, u32),
     section: u16,
     anchor: proto::anchor::ContentAnchor,
 ) -> Option<u16>
@@ -4234,40 +4235,60 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_section_file(root, owner, layout_key, section, Mode::ReadOnly, |file| {
-        let mut header = [0u8; SECTION_V2_HEADER_BYTES];
-        if read_exact_file(file, &mut header).is_err() {
-            return None;
-        }
-        let header = decode_section_v2_header(&header).ok()?;
-        if header.spine != anchor.spine {
-            return None;
-        }
-        let page_count = header.page_count as usize;
-        if page_count == 0 {
-            return None;
-        }
-        let skip = (page_count * PAGE_RECORD_BYTES) as u32;
-        file.seek_from_current(skip as i32).ok()?;
-        let mut found = 0u16;
-        let mut bytes = [0u8; PAGE_ANCHOR_BYTES];
-        for index in 0..page_count {
-            // A refused read is the card saying no, not an answer about the
-            // place. Stopping here and reporting the last page it managed to
-            // see would hand the open a page the anchor does not name, which
-            // loads and settles as though the place had resolved there.
-            if read_exact_file(file, &mut bytes).is_err() {
+    let want_config = layout::reader_layout_config(library.type_settings(), library.portrait());
+    let want_font = library.custom_font_identity();
+    with_v2_section_file(
+        root,
+        owner,
+        library.layout_key(),
+        section,
+        Mode::ReadOnly,
+        |file| {
+            let mut header = [0u8; SECTION_V2_HEADER_BYTES];
+            if read_exact_file(file, &mut header).is_err() {
                 return None;
             }
-            let offset = u32::from_le_bytes(bytes);
-            if proto::anchor::ContentAnchor::at(header.spine, offset) <= anchor {
-                found = index as u16;
-            } else {
-                break;
+            let header = decode_section_v2_header(&header).ok()?;
+            // Everything the anchors depend on, asked here rather than assumed
+            // from the index that named this file. The file's name carries only
+            // the layout key, which is six bits of the config: line spacing and
+            // the wrap-rule version are not in it, and both move the page breaks
+            // these anchors describe. A section from either would answer with a
+            // page that means something else.
+            if header.spine != anchor.spine
+                || header.source_hash != source_identity.0
+                || header.source_size != source_identity.1
+                || header.font_config != want_config
+                || header.custom_font_identity != want_font
+            {
+                return None;
             }
-        }
-        Some(found)
-    })
+            let page_count = header.page_count as usize;
+            if page_count == 0 {
+                return None;
+            }
+            let skip = (page_count * PAGE_RECORD_BYTES) as u32;
+            file.seek_from_current(skip as i32).ok()?;
+            let mut found = 0u16;
+            let mut bytes = [0u8; PAGE_ANCHOR_BYTES];
+            for index in 0..page_count {
+                // A refused read is the card saying no, not an answer about the
+                // place. Stopping here and reporting the last page it managed to
+                // see would hand the open a page the anchor does not name, which
+                // loads and settles as though the place had resolved there.
+                if read_exact_file(file, &mut bytes).is_err() {
+                    return None;
+                }
+                let offset = u32::from_le_bytes(bytes);
+                if proto::anchor::ContentAnchor::at(header.spine, offset) <= anchor {
+                    found = index as u16;
+                } else {
+                    break;
+                }
+            }
+            Some(found)
+        },
+    )
     .flatten()
 }
 

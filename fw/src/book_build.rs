@@ -1486,12 +1486,13 @@ pub(crate) fn resolve_place(
             locator: path.as_str(),
         };
         // By section, not by spine. One spine item can hold several sections,
-        // and the file is named for the section; the header's spine check
-        // then confirms the file is the item the anchor names.
+        // and the file is named for the section; the header checks then
+        // confirm the file is this item of this copy under this layout.
         let within = files::page_of_anchor_in_section(
             root,
             &owner,
-            library.layout_key(),
+            library,
+            identity,
             record.section,
             anchor,
         )?;
@@ -1500,7 +1501,22 @@ pub(crate) fn resolve_place(
     .ok()
     .flatten();
     match resolved {
-        Some(page) => PlaceTarget::Page(page),
+        Some(page) => {
+            // The one line a resolution that works prints. Every other
+            // message on this path reports a failure or a deferral, so a
+            // place doing its job was visible only as a second open at a
+            // page nobody asked for.
+            bench_log!(
+                "bench: storage_place index={} spine={} offset={} section={} page={} t_ms={}",
+                index,
+                anchor.spine,
+                anchor.offset,
+                record.section,
+                page,
+                Instant::now().as_millis(),
+            );
+            PlaceTarget::Page(page)
+        }
         // The index put the place in a section and the section would not give
         // up its anchors. Nothing was learned about the place, so it is not
         // spent.

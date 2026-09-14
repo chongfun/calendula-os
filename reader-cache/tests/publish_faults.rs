@@ -21,7 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use display::font::{FontSize, FontStyle, TypeSettings};
+use display::font::{FontSize, FontStyle, LineSpacing, TypeSettings};
 use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Directory, Mode, TimeSource, Timestamp, VolumeIdx,
     VolumeManager,
@@ -1441,7 +1441,7 @@ fn an_anchor_table_that_stops_short_is_not_the_page_it_got_to() {
         .expect("the last page has an anchor");
     let layout = store.layout_key();
     assert_eq!(
-        files::page_of_anchor_in_section(&root, &OWNER, layout, 0, last),
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
         Some(pages as u16 - 1),
         "the place is on the last page while the whole table is there"
     );
@@ -1472,7 +1472,7 @@ fn an_anchor_table_that_stops_short_is_not_the_page_it_got_to() {
     assert!(rewritten, "the fixture cuts the anchor table short");
 
     assert_eq!(
-        files::page_of_anchor_in_section(&root, &OWNER, layout, 0, last),
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
         None,
         "a table that stops short is no answer, not the page the walk reached"
     );
@@ -1617,6 +1617,76 @@ fn a_place_write_that_reports_success_is_the_one_that_reads_back() {
     assert!(
         reported_ok > 0,
         "the sweep has to get at least one write through"
+    );
+}
+
+/// A section file's name carries the layout key, which is six bits of the
+/// config: line spacing and the wrap-rule version are outside it, so a section
+/// paginated under either shares the name. The per-page anchors inside
+/// describe breaks that move with both, so resolving a place against the wrong
+/// one answers with a page that means something else, and the save that
+/// follows writes that page's anchor back. The resolver asks the header rather
+/// than trusting whatever named the file.
+#[test]
+fn a_section_from_another_layout_says_nothing_about_a_place() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    fill_section(&mut store, 0, 60);
+    let pages = store.page_count();
+    assert!(pages > 1, "the fixture needs more than one page of anchors");
+    store.set_cached_spine(0);
+    let wrote = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, 0, &store)
+    });
+    assert!(wrote, "the section writes");
+
+    let last = store
+        .page_anchor(pages - 1)
+        .expect("the last page has an anchor");
+    let settings = store.type_settings();
+    let key = store.layout_key();
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
+        Some(pages as u16 - 1),
+        "its own layout resolves the place"
+    );
+
+    // Same file, different line spacing.
+    store.set_layout(
+        TypeSettings {
+            spacing: LineSpacing::Relaxed,
+            ..settings
+        },
+        false,
+    );
+    assert_eq!(
+        store.layout_key(),
+        key,
+        "the fixture depends on spacing staying out of the name"
+    );
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
+        None,
+        "another spacing paginates elsewhere, so its anchors are not these"
+    );
+
+    // And a section belonging to another copy under the same key.
+    store.set_layout(settings, false);
+    assert_eq!(
+        files::page_of_anchor_in_section(
+            &root,
+            &OWNER,
+            &store,
+            (IDENTITY.0, IDENTITY.1 + 1),
+            0,
+            last
+        ),
+        None,
+        "and a section written for another copy is not this copy's pagination"
     );
 }
 
