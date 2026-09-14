@@ -1784,10 +1784,12 @@ class PageTurnStats:
     # Answered, so not unmatched, and not a turn either.
     unmoved_answered: int = 0
     # Answers with no page before them to compare against, which is the
-    # first Reading render a capture sees. Counted as turns and counted
-    # here too, so the coverage check can refuse to certify a request that
-    # leaned on one: the same record is a no-op on a device already sitting
-    # at the last page. A `--reset-before` capture has none of these.
+    # first Reading render a capture sees. They count toward what a capture
+    # collected, since that is usually what they are, and are kept out of
+    # `durations`: the same record is a no-op on a device already at the
+    # last page, and the median is an enforced budget. The coverage check
+    # refuses a request that leaned on one. A `--reset-before` capture has
+    # none of these.
     unknown_answered: int = 0
 
     @property
@@ -1937,10 +1939,16 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
                 # this catches always has a previous page behind it, and
                 # demanding one of the first render would drop a real turn
                 # from any capture that opens straight into Reading.
-                known = isinstance(seen_page, int) and page_before is not None
-                if not known:
+                # A render carrying no page at all is a capture older than
+                # the field, and its pairing reads as it always did. One that
+                # carries a page with nothing before it is the hazard: the
+                # first answer of a capture that attached to a device already
+                # sitting on its last page. That one is counted and kept out
+                # of the timings, since a redraw settles in a fraction of a
+                # turn and the median it would join is an enforced budget.
+                if isinstance(seen_page, int) and page_before is None:
                     unknown_answered += 1
-                if known and seen_page == page_before:
+                elif isinstance(seen_page, int) and seen_page == page_before:
                     unmoved_answered += 1
                 elif event.get("skipped"):
                     spared_turns += 1
@@ -3282,7 +3290,9 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
         # a book turned nothing, and the page is the difference. Deciding on
         # that rather than on whether the capture is self-driven holds a
         # manual run, which has no checkpoint behind it, to the same evidence.
-        measured = len(paired.durations) + paired.spared_turns
+        # What the capture collected, timed or not. The unknown ones are
+        # counted here and refused below when the request turns on them.
+        measured = len(paired.durations) + paired.spared_turns + paired.unknown_answered
         short(
             "page turns",
             turns,
