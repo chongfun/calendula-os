@@ -23,7 +23,7 @@ use std::rc::Rc;
 
 use display::font::{FontSize, FontStyle, TypeSettings};
 use embedded_sdmmc::{
-    Block, BlockCount, BlockDevice, BlockIdx, Directory, TimeSource, Timestamp, VolumeIdx,
+    Block, BlockCount, BlockDevice, BlockIdx, Directory, Mode, TimeSource, Timestamp, VolumeIdx,
     VolumeManager,
 };
 use proto::cache::{
@@ -1248,6 +1248,70 @@ fn a_walk_that_suspended_between_spine_items_does_not_reindex_as_a_whole_book() 
             .expect("a set that reaches the end of the book");
     assert_eq!(count, 5, "every spine item of the book");
     assert!(total_pages > 0);
+}
+
+/// A section's header goes down before the body it describes, `ends_spine`
+/// with it. A write that tears partway through therefore leaves a file
+/// claiming to finish a chapter whose text is not there, and the scan reads
+/// only the header and one anchor, so it would take that claim at face value.
+#[test]
+fn a_section_torn_partway_through_does_not_certify_a_layout() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    capture_through_spine(&root, 1);
+    write_section_at(&root, &mut store, 0, 0, true);
+    write_section_at(&root, &mut store, 1, 1, true);
+
+    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_some(),
+        "the whole set reindexes before the tear"
+    );
+
+    // Keep the header, the page records and the first page anchor, which is
+    // everything the scan reads, and drop the rest as a failed write would.
+    let mut name = heapless::String::<16>::new();
+    proto::cache::section_file_name(store.layout_key(), 1, &mut name);
+    let mut prefix = [0u8; 512];
+    let kept = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadOnly)
+            .expect("the section opens");
+        let mut header_bytes = [0u8; proto::cache::SECTION_V2_HEADER_BYTES];
+        files::read_exact_file(&file, &mut header_bytes).expect("the header reads");
+        let header =
+            proto::cache::decode_section_v2_header(&header_bytes).expect("the header decodes");
+        let keep = proto::cache::SECTION_V2_HEADER_BYTES
+            + header.page_count as usize * proto::cache::PAGE_RECORD_BYTES
+            + proto::cache::PAGE_ANCHOR_BYTES;
+        assert!(
+            keep < file.length() as usize && keep <= prefix.len(),
+            "the tear has to drop something"
+        );
+        file.seek_from_start(0).expect("rewind");
+        files::read_exact_file(&file, &mut prefix[..keep]).expect("the prefix reads");
+        keep
+    });
+
+    let rewritten = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
+            .expect("the section reopens");
+        file.write(&prefix[..kept]).is_ok()
+    });
+    assert!(rewritten, "the fixture tears the section");
+
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_none(),
+        "a section that is shorter than its own header says is not a whole one"
+    );
 }
 
 /// Reaching the book's last spine item is not reaching the end of it. A long

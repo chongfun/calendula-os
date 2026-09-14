@@ -2188,9 +2188,9 @@ where
 ///
 /// A section prefix is not a book, and an abandoned walk leaves one that
 /// looks finished: pagination suspends at spine boundaries, so its last
-/// section is clean. Answers only for a set that carries the spine item a
-/// finished capture ended on through to its end, with no section files past
-/// where the scan stopped.
+/// section is clean. Answers only for a set of whole sections that carries
+/// the spine item a finished capture ended on through to its end, with no
+/// section files past where the scan stopped.
 pub fn reindex_layout_from_sections<
     D,
     T,
@@ -2233,6 +2233,13 @@ where
                 || header.custom_font_identity != want_font
                 || header.page_count == 0
             {
+                return None;
+            }
+            // The header goes down before the body it describes, `ends_spine`
+            // with it, so a write that tore partway through leaves a section
+            // claiming to finish a chapter it no longer holds. The header says
+            // exactly how long the file should be.
+            if file.length() as usize != proto::cache::section_v2_cache_size(header) {
                 return None;
             }
             // Where the section opens in its item's content, which the
