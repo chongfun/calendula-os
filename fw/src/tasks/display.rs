@@ -165,9 +165,19 @@ fn resolve_pending_place(
             }
             match settled {
                 // Back where the reader already was, so there is nothing to
-                // tell the app.
+                // tell the app, and the place keeps its turn: the target it
+                // wants may load on a later slice.
                 Some(page) if page == landed => PlaceOutcome::Waiting,
-                Some(page) => PlaceOutcome::Moved(page),
+                // The ladder went past the reader's own page to the start of
+                // the book, which is the last rung and a decision rather than
+                // a wait. Leaving the place armed lets it reach for the same
+                // target again and move a reader who has already been moved,
+                // the moment a retry beats the page-zero render back to the
+                // planner.
+                Some(page) => {
+                    *pending_place = None;
+                    PlaceOutcome::Moved(page)
+                }
                 None => {
                     *pending_place = None;
                     PlaceOutcome::Unreadable
