@@ -2256,6 +2256,13 @@ pub struct ReaderState {
     /// round trip back to where it started keeps its page: the stamp matches
     /// again.
     pub page_layout: u16,
+    /// A book that was selected and could not be read.
+    ///
+    /// The reader chose it, so it stays chosen and shows its error. What it
+    /// does not get is the durable record, which is where a reboot comes back
+    /// to: that keeps naming the last book that had a page until this one
+    /// produces one.
+    pub unreadable_book: Option<u32>,
     pub selection: u16,
     pub chapter: u16,
     pub book_id: u32,
@@ -2336,11 +2343,21 @@ impl ReaderState {
         self.page_layout = self.layout_stamp();
     }
 
+    /// Whether the book on screen is one that could not be read.
+    ///
+    /// Its page is whatever the app last held and names nothing loaded, so a
+    /// save carrying it would make an unreadable book the place a reboot
+    /// returns to. Cleared by the book changing or by a load that works.
+    pub fn book_unreadable(&self) -> bool {
+        self.unreadable_book == Some(self.book_id)
+    }
+
     pub const fn boot() -> Self {
         Self {
             view: AppView::Home,
             page: 0,
             page_layout: 0,
+            unreadable_book: None,
             selection: 0,
             chapter: 0,
             book_id: 1,
@@ -2815,6 +2832,9 @@ impl ReaderState {
                 text_replaced: _,
             } => {
                 if self.book_id == book_id {
+                    // Whatever this book could not do before, it has a page
+                    // now, so it may hold the durable record again.
+                    self.unreadable_book = None;
                     self.sd_page_count = pages.max(1);
                     self.sd_chapter_count = chapters.max(1);
                     self.sd_chapter_pages = chapter_pages;
@@ -2842,9 +2862,15 @@ impl ReaderState {
             }
             LibraryEvent::BookOpenUnreadable { book_id } => {
                 // Deliberately no page, no chapter, no counts. The store this
-                // would have taken them from is empty, and the reader's real
-                // place is the one already on the card.
+                // would have taken them from is empty.
+                //
+                // The book stays selected. The reader asked for it and the
+                // honest answer is this book with an error on it, rather than
+                // the device quietly going back to the last one that worked.
+                // What waits is the durable record, which is crash recovery
+                // rather than what is on screen.
                 if self.book_id == book_id {
+                    self.unreadable_book = Some(book_id);
                     self.read_request_pending = false;
                     self.dirty = Rect::FULL;
                 }
@@ -5643,55 +5669,84 @@ mod tests {
         );
     }
 
-    /// The write that follows the failure, which is the one that matters. An
-    /// open that read nothing leaves the card naming the book the reader came
-    /// from, so the app has to name it too: a setting changed a minute later
-    /// goes through the ordinary progress save, and that save writes whichever
-    /// book the app is holding.
+    /// The book the reader chose stays chosen, and the write that follows
+    /// the failure is the one that matters. A book that would not open holds
+    /// no page worth keeping, so it stays off the durable record until it
+    /// produces one, and the record goes on naming the last book that had a
+    /// page. That is crash recovery, not what is on screen.
     #[test]
-    fn an_unreadable_open_does_not_make_its_book_the_one_that_gets_saved() {
+    fn a_book_that_would_not_open_stays_selected_and_off_the_card() {
+        let unreadable = ReaderSource::sd(2).book_id();
+        let attempting = reading(2, 0, 0);
+        assert_eq!(attempting.book_id, unreadable);
+
+        let settled = attempting.apply_library_event(
+            CTX,
+            LibraryEvent::BookOpenUnreadable {
+                book_id: unreadable,
+            },
+        );
+        assert_eq!(
+            settled.book_id, unreadable,
+            "the reader asked for this book, so it is still the book"
+        );
+        assert!(
+            settled.book_unreadable(),
+            "and it is the one that could not be read"
+        );
+        assert!(
+            !settled.read_request_pending,
+            "with the open gate lifted, or the reader is stuck"
+        );
+
+        // A load that works settles it, and the book may hold the record
+        // again.
+        let readable = settled.apply_library_event(
+            CTX,
+            LibraryEvent::Loaded {
+                book_id: unreadable,
+                pages: 40,
+                chapters: 2,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: Some(3),
+                text_replaced: true,
+            },
+        );
+        assert!(
+            !readable.book_unreadable(),
+            "a page arrived, so the book is readable after all"
+        );
+        assert_eq!(readable.page, 3);
+    }
+
+    /// And the book the reader left keeps the durable record meanwhile, where
+    /// a reboot comes back to.
+    #[test]
+    fn a_book_that_would_not_open_leaves_the_durable_record_alone() {
         let readable = ReaderSource::sd(1).book_id();
         let unreadable = ReaderSource::sd(2).book_id();
-
-        // Reading A, then selecting B. The rollback captures A.
         let on_a = reading(1, 3, 88);
         assert_eq!(on_a.persisted().book_id, readable);
-        let rollback = on_a.open_rollback();
+
         let mut attempting_b = on_a;
         attempting_b.book_id = unreadable;
         attempting_b.page = 0;
         attempting_b.chapter = 0;
-
-        // B reads nothing. The transaction skipped its pointer write, so the
-        // card still names A, and the app follows it back.
-        let settled = attempting_b
-            .apply_library_event(
-                CTX,
-                LibraryEvent::BookOpenUnreadable {
-                    book_id: unreadable,
-                },
-            )
-            .restore_after_failed_open(rollback);
-        assert_eq!(
-            settled.persisted().book_id,
-            readable,
-            "the app names the book the card names"
+        let settled = attempting_b.apply_library_event(
+            CTX,
+            LibraryEvent::BookOpenUnreadable {
+                book_id: unreadable,
+            },
         );
-        assert_eq!(settled.page, 88, "at the page it was on");
 
-        // Now the save that used to commit B: any input that moves persisted
-        // state sends one, and it carries the book id along with everything
-        // else.
-        let after_setting = {
-            let mut state = settled;
-            state.view = AppView::Settings;
-            state.selection = 1;
-            apply_setting(state)
-        };
-        assert_eq!(
-            after_setting.persisted().book_id,
-            readable,
-            "so the write it triggers cannot make an unreadable book the reboot target"
+        // The app names B, the book the reader chose. The write that would
+        // carry B is the one held back: `book_unreadable` is the
+        // gate the task checks before sending a progress record.
+        assert_eq!(settled.book_id, unreadable);
+        assert!(
+            settled.book_unreadable(),
+            "so no progress write leaves for it, and the card keeps naming A"
         );
     }
 

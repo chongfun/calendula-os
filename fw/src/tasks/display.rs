@@ -232,6 +232,50 @@ fn load_target_page(
     sd_library.covers_global_page(index as usize, target)
 }
 
+/// Put some page of this book under the reader, weakening the position until
+/// one lands.
+///
+/// A saved place that cannot be restored is a worse position, not a different
+/// book. The reader chose this one, so the ladder stays inside it: the page
+/// the open was landing on, then the start of the book. `false` is a book
+/// that would give up no page at all, which is the only thing that makes an
+/// open unreadable.
+#[expect(clippy::too_many_arguments)] // The open's whole world: the card, the store, the transaction, and the page it is trying to reach
+fn settle_on_a_readable_page(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &mut ReaderStore,
+    open: &mut app_core::storage_loop::OpenSequence,
+    index: u16,
+    landing: u32,
+    book_id: u32,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    font_metrics: &mut crate::custom_font::MetricCache,
+    background_build: &mut Option<BackgroundBuild>,
+) -> bool {
+    for page in [landing, 0] {
+        if load_target_page(
+            epd,
+            sd_cs,
+            sd_library,
+            index,
+            page,
+            book_id,
+            epub_scratch,
+            font_metrics,
+            background_build,
+        ) {
+            if page != landing {
+                esp_println::println!("restore: falling back to the start of the book");
+            }
+            open.resolve_place(page);
+            return true;
+        }
+    }
+    esp_println::println!("restore: no page of this book would load");
+    false
+}
+
 /// The page the reader is on in `book_id`, or `None` when no Reading render
 /// says they are in that book at all.
 ///
@@ -1738,21 +1782,12 @@ fn handle_storage_command(
             // the announcement, which must then say so rather than report the
             // counts of an empty store.
             let mut landed_nothing = false;
-            // The row this open is leaving, for the same ending.
-            let mut departing: Option<reader_cache::store::ActiveEntrySnapshot> = None;
             // Read at the saved-position step and spent at the section load,
             // which is where a place first has a pagination to resolve in.
             let mut opening_place: Option<book_build::SavedPlace> = None;
             loop {
                 match open.next() {
                     OpenAction::CloseOutDeparting(previous) => {
-                        // The book the store goes back to if this open ends
-                        // with nothing readable, held whole rather than as a
-                        // row number. Putting it back has to work on a card
-                        // that is refusing reads, because that is the only way
-                        // that ending is reached. Taken here because the
-                        // staging below overwrites the active entry.
-                        departing = sd_library.active_entry_snapshot();
                         let stored = close_out_departing_book(
                             epd,
                             sd_cs,
@@ -1917,10 +1952,17 @@ fn handle_storage_command(
                                             "restore: the place resolved and its section \
                                              would not load"
                                         );
-                                        let recovered = load_target_page(
+                                        section_loaded = Some(false);
+                                        // A place that cannot be restored is a
+                                        // worse position, not a different
+                                        // book. The reader asked for this one,
+                                        // so the position weakens and the book
+                                        // stays.
+                                        landed_nothing = !settle_on_a_readable_page(
                                             epd,
                                             sd_cs,
                                             sd_library,
+                                            &mut open,
                                             index,
                                             landing,
                                             book_id,
@@ -1928,14 +1970,6 @@ fn handle_storage_command(
                                             font_metrics,
                                             background_build,
                                         );
-                                        section_loaded = Some(false);
-                                        if !recovered {
-                                            esp_println::println!(
-                                                "restore: and the page it was landing on \
-                                                 would not come back"
-                                            );
-                                        }
-                                        landed_nothing = !recovered;
                                         Some(())
                                     }
                                 }
@@ -2020,17 +2054,6 @@ fn handle_storage_command(
                         // card. What it holds is an error for the reader to
                         // see, and that is all this has to carry.
                         if landed_nothing {
-                            // The app rolls back to the book it came from, and
-                            // the store has to go with it. Its active entry is
-                            // still the book that failed, and that entry is
-                            // how a row outside the resident catalog window is
-                            // resolved at all: leaving it wrong makes the next
-                            // progress save for the old book identity-less,
-                            // and makes the close-out of the next open fail
-                            // outright, which refuses that open.
-                            if let Some(snapshot) = departing.as_ref() {
-                                sd_library.restore_active_entry(snapshot);
-                            }
                             send_loaded_library_event(&LibraryEvent::BookOpenUnreadable {
                                 book_id,
                             });

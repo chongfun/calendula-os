@@ -209,25 +209,6 @@ pub struct TrimmedTail {
     text_len: usize,
 }
 
-/// The active book's identity, kept so a transaction that replaces it can put
-/// it back.
-///
-/// Everything [`ReaderStore::set_active_entry`] was given, held in RAM, so
-/// restoring costs no card read. The caller is a book open that failed on a
-/// refused read, and a rollback that asks the card again fails exactly when it
-/// is needed.
-#[derive(Clone)]
-pub struct ActiveEntrySnapshot {
-    index: usize,
-    display_name: String<64>,
-    display_label: String<64>,
-    root: Option<proto::library_path::BookRoot>,
-    path: String<{ proto::library_path::MAX_PATH_BYTES }>,
-    byte_size: u32,
-    source_hash: u32,
-    copy_id: Option<proto::identity::BookId>,
-}
-
 pub struct ReaderStore {
     pub status: LibraryScanStatus,
     /// Full book count across CATALOG.BIN (the source of truth), independent of
@@ -789,34 +770,6 @@ impl ReaderStore {
     pub fn clear_folder_page(&mut self) {
         self.folder_start = 0;
         self.folder_len = 0;
-    }
-
-    /// The active book's identity, for a caller about to replace it.
-    pub fn active_entry_snapshot(&self) -> Option<ActiveEntrySnapshot> {
-        let index = self.active_index?;
-        Some(ActiveEntrySnapshot {
-            index,
-            display_name: self.active_entry.display_name.clone(),
-            display_label: self.active_entry.display_label.clone(),
-            root: self.active_root,
-            path: self.active_path.clone(),
-            byte_size: self.active_entry.byte_size,
-            source_hash: self.active_entry.source_hash,
-            copy_id: self.active_copy_id,
-        })
-    }
-
-    /// Put a snapshot back. No card read, so a rollback cannot fail for the
-    /// reason it is rolling back from.
-    pub fn restore_active_entry(&mut self, snapshot: &ActiveEntrySnapshot) {
-        self.active_entry.display_name = snapshot.display_name.clone();
-        self.active_entry.display_label = snapshot.display_label.clone();
-        self.active_entry.byte_size = snapshot.byte_size;
-        self.active_entry.source_hash = snapshot.source_hash;
-        self.active_root = snapshot.root;
-        self.active_path = snapshot.path.clone();
-        self.active_copy_id = snapshot.copy_id;
-        self.active_index = Some(snapshot.index);
     }
 
     /// Adopt `index` as the active book whose entry the reading path reads
@@ -1989,57 +1942,6 @@ mod tests {
     extern crate std;
     use super::*;
     use std::boxed::Box;
-
-    /// The rollback an open that read nothing depends on. It runs because the
-    /// card refused reads, so it has to work without asking the card: the
-    /// departing book's identity is taken before the incoming one replaces it
-    /// and put back from RAM.
-    #[test]
-    fn a_departing_book_can_be_put_back_without_the_card() {
-        let mut store = Box::new(ReaderStore::new());
-        let departing_id = proto::identity::BookId::from_bytes([5u8; 16]).expect("an id");
-        store.set_active_entry(
-            9,
-            "/books/A.epub",
-            Some(proto::library_path::BookRoot::Library),
-            "A.epub",
-            4_096,
-            0x1111_2222,
-            Some("A"),
-            Some(departing_id),
-        );
-        let snapshot = store
-            .active_entry_snapshot()
-            .expect("a book is active to snapshot");
-
-        // The open stages the incoming book over it.
-        let incoming_id = proto::identity::BookId::from_bytes([6u8; 16]).expect("an id");
-        store.set_active_entry(
-            40,
-            "/books/B.epub",
-            Some(proto::library_path::BookRoot::Library),
-            "B.epub",
-            8_192,
-            0x3333_4444,
-            Some("B"),
-            Some(incoming_id),
-        );
-        let staged = store.catalog_entry(40).expect("the staged book resolves");
-        assert_eq!((staged.source_hash, staged.byte_size), (0x3333_4444, 8_192));
-
-        // B reads nothing, so the store goes back to A.
-        store.restore_active_entry(&snapshot);
-        assert_eq!(store.active_index(), Some(9));
-        assert_eq!(store.active_copy_id(), Some(departing_id));
-        let back = store
-            .catalog_entry(9)
-            .expect("A resolves again, which a progress save and the next close-out both need");
-        assert_eq!((back.source_hash, back.byte_size), (0x1111_2222, 4_096));
-        assert_eq!(
-            store.book_location(9),
-            Some((proto::library_path::BookRoot::Library, "A.epub"))
-        );
-    }
 
     /// The open book's copy id is what per-copy state is addressed by, so it
     /// has to be resident for as long as the place beside it: a rescan
