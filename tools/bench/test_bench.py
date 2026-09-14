@@ -1780,6 +1780,7 @@ class PageTurnCounterTests(unittest.TestCase):
         turns and delivered one timed and one skipped is not short."""
         events: list[dict] = [
             {"event": "run_start", "suite": "page-turn", "requested": {"page_turns": 2}},
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 5},
             {"event": "input", "button": "Next", "t_ms": 1000},
             {"event": "render", "view": "Reading", "t_ms": 1354, "req_ms": 1000, "page": 6},
             {"event": "input", "button": "Next", "t_ms": 3000},
@@ -1803,7 +1804,10 @@ class PageTurnCounterTests(unittest.TestCase):
         # satisfy the request. The record is the same apart from the page,
         # and this capture is manual, so no checkpoint stands behind it.
         no_op = [dict(e) for e in events]
-        no_op[4]["page"] = 6
+        # The same record with the page standing still, found rather than
+        # indexed so a fixture change cannot quietly stop mutating it.
+        skipped = next(e for e in no_op if e.get("skipped"))
+        skipped["page"] = 6
         warnings = bench.evaluate_suite_signals(no_op)
         self.assertTrue(
             any("1 of 2 requested page turns" in w for w in warnings),
@@ -1818,6 +1822,55 @@ class PageTurnCounterTests(unittest.TestCase):
             ),
         )
 
+    def test_a_capture_that_attached_mid_session_cannot_certify_its_first_turn(
+        self,
+    ) -> None:
+        """A capture can open on a device already at the last page.
+
+        The first answer then has no page before it, so a turn and an
+        end-of-book no-op record the same thing and the telemetry cannot say
+        which. Certifying on it would let a book that cannot turn satisfy
+        `--turns 1`, so the count is refused when it leaned on that answer.
+        """
+        events: list[dict] = [
+            {"event": "run_start", "suite": "page-turn", "requested": {"page_turns": 1}},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1354, "req_ms": 1000, "page": 303},
+            {"event": "run_end", "elapsed_s": 5.0, "stop_reason": "count", "completed": True},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("no page before them" in w for w in warnings),
+            warnings,
+        )
+
+        # The boot paint a --reset-before capture opens with settles it, and
+        # the same run then certifies.
+        with_boot = [
+            events[0],
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 302},
+            *events[1:],
+        ]
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(with_boot) if "page turns" in w],
+            [],
+        )
+
+        # And a run with a turn to spare owes nothing here, since the count
+        # did not depend on the answer it cannot check.
+        spare = [
+            {"event": "run_start", "suite": "page-turn", "requested": {"page_turns": 1}},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1354, "req_ms": 1000, "page": 303},
+            {"event": "input", "button": "Next", "t_ms": 3000},
+            {"event": "render", "view": "Reading", "t_ms": 3354, "req_ms": 3000, "page": 304},
+            {"event": "run_end", "elapsed_s": 9.0, "stop_reason": "count", "completed": True},
+        ]
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(spare) if "page turns" in w],
+            [],
+        )
+
     def test_a_short_capture_is_reported_against_what_was_asked_for(self) -> None:
         events = [
             {"event": "run_start", "suite": "page-turn", "requested_page_turns": 50},
@@ -1830,6 +1883,9 @@ class PageTurnCounterTests(unittest.TestCase):
     def test_a_complete_capture_is_not_faulted(self) -> None:
         events: list[dict] = [
             {"event": "run_start", "suite": "page-turn", "requested_page_turns": 2},
+            # The boot paint a --reset-before capture opens with, which is
+            # the page the first turn moves from.
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 0},
         ]
         for turn in range(2):
             press = 1000 + turn * 5000
@@ -1840,6 +1896,7 @@ class PageTurnCounterTests(unittest.TestCase):
                     "view": "Reading",
                     "t_ms": press + 430,
                     "req_ms": press,
+                    "page": turn + 1,
                 }
             )
         self.assertEqual(bench.evaluate_suite_signals(events), [])
@@ -1995,6 +2052,8 @@ class BenchCaptureLoopTests(unittest.TestCase):
     def test_capture_waits_for_paired_prestage_across_intervening_log(self) -> None:
         """Capture continues past unrelated logs until event=='prestage' arrives."""
         lines = [
+            # The boot paint: the page every later turn is measured against.
+            "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n",
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
             "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n",
             "[LOG_INF] Unrelated firmware message\n",
@@ -2015,9 +2074,12 @@ class BenchCaptureLoopTests(unittest.TestCase):
         )
 
         self.assertEqual(counts.get("page_turn"), 1)
-        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("reading_render"), 2, "the boot paint and the turn")
         self.assertEqual(counts.get("prestage"), 1)
-        self.assertEqual([event["event"] for event in written], ["input", "render", "prestage"])
+        self.assertEqual(
+            [event["event"] for event in written],
+            ["render", "input", "render", "prestage"],
+        )
 
     def test_a_skipped_render_does_not_satisfy_the_turns_target(self) -> None:
         """`--turns 2` must not be ended by a no-op at the end of the book.
@@ -2065,6 +2127,7 @@ class BenchCaptureLoopTests(unittest.TestCase):
     def test_capture_stops_immediately_for_structured_combined_render(self) -> None:
         """Structured combined render with prestage_ms stops without waiting for standalone prestage."""
         lines = [
+            "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n",
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
             "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 prestage_ms=15 req_ms=50 t_ms=500\n",
             "bench: prestage staged=true elapsed_ms=24 t_ms=124\n",
@@ -2083,13 +2146,14 @@ class BenchCaptureLoopTests(unittest.TestCase):
         )
 
         self.assertEqual(counts.get("page_turn"), 1)
-        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("reading_render"), 2, "the boot paint and the turn")
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual([event["event"] for event in written], ["input", "render"])
+        self.assertEqual([event["event"] for event in written], ["render", "input", "render"])
 
     def test_capture_bounded_fallback_when_prestage_missing(self) -> None:
         """Capture stops boundedly if prestage telemetry never arrives."""
         lines = [
+            "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n",
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
             "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n",
         ] + [f"[LOG_INF] Intervening log {i}\n" for i in range(10)]
@@ -2107,9 +2171,9 @@ class BenchCaptureLoopTests(unittest.TestCase):
         )
 
         self.assertEqual(counts.get("page_turn"), 1)
-        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("reading_render"), 2, "the boot paint and the turn")
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual([event["event"] for event in written], ["input", "render"])
+        self.assertEqual([event["event"] for event in written], ["render", "input", "render"])
 
     def test_capture_silent_device_fallback_when_prestage_missing(self) -> None:
         """Capture stops when deadline expires even if serial stream is completely silent (no newlines)."""
@@ -2118,6 +2182,7 @@ class BenchCaptureLoopTests(unittest.TestCase):
         deadline_val: list[float] = []
 
         def silent_lines():
+            yield "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n"
             yield "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n"
             yield "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n"
             while True:
@@ -2143,9 +2208,9 @@ class BenchCaptureLoopTests(unittest.TestCase):
         elapsed = time.monotonic() - started
 
         self.assertEqual(counts.get("page_turn"), 1)
-        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("reading_render"), 2, "the boot paint and the turn")
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual([event["event"] for event in written], ["input", "render"])
+        self.assertEqual([event["event"] for event in written], ["render", "input", "render"])
         self.assertLess(elapsed, 1.0)
 
 
@@ -3624,7 +3689,10 @@ class CountAndDurationContractTests(unittest.TestCase):
                 "workflow": "page-turn",
                 "host_time": 1.0,
                 "requested": {"page_turns": requested},
-            }
+            },
+            # The boot paint a --reset-before capture opens with, which is
+            # the page the first turn moves from.
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 0},
         ]
         for index in range(turns):
             press = 1000 + index * 3000
@@ -3635,6 +3703,7 @@ class CountAndDurationContractTests(unittest.TestCase):
                     "view": "Reading",
                     "t_ms": press + 470,
                     "req_ms": press,
+                    "page": index + 1,
                 }
             )
         events.append(
@@ -4341,6 +4410,12 @@ class BoardBudgetTests(unittest.TestCase):
             def fake_capture_lines(*_args: Any, **_kwargs: Any) -> Any:
                 return iter(
                     [
+                        # The boot paint a capture opens with, so the turn
+                        # below has a page to move from.
+                        (
+                            "bench: render view=Reading mode=Fast page=0 ch=0 "
+                            "layout_ms=15 flush_ms=307 prestage_ms=24 t_ms=10"
+                        ),
                         "input: Some(Next) gpio0=1 gpio1=1 gpio2=0 t=1000",
                         "bench: refresh mode=Fast busy_ms=307 t_ms=1307",
                         (
