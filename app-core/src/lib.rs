@@ -2352,7 +2352,12 @@ impl ReaderState {
             | ((self.font_size as u16) << 3)
             | ((self.font_weight as u16) << 6)
             | ((self.line_spacing as u16) << 8)
-            | ((self.orientation as u16) << 11)
+            // The page box, not which way up the device is. Both
+            // landscapes share one box and both portraits the other, so
+            // turning it around moves no page boundary and leaves the page in
+            // hand describing the pagination it was counted under. The same
+            // predicate the open sends as its `portrait` field.
+            | ((is_portrait(self.orientation) as u16) << 11)
     }
 
     /// Record that `page` was counted under the settings in hand.
@@ -3309,7 +3314,7 @@ impl ReaderState {
 /// Whether an orientation stands the panel's long axis upright. The two
 /// portrait variants share one page geometry, so reading layout keys off
 /// this rather than the exact variant.
-pub fn is_portrait(orientation: DisplayOrientation) -> bool {
+pub const fn is_portrait(orientation: DisplayOrientation) -> bool {
     matches!(
         orientation,
         DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight
@@ -4176,6 +4181,61 @@ mod tests {
         assert_eq!(recovered.chapter, 4);
         assert_eq!(recovered.page, 120);
         assert_eq!(recovered.view, AppView::Reading);
+    }
+
+    /// The stamp says whether the page in hand still describes a pagination
+    /// that exists, so it tracks what pagination depends on: the page box.
+    /// Both landscapes share one box and both portraits the other. A stamp
+    /// that moved when the device was turned around would send the next open
+    /// to the stored place instead, which is the last place saved rather than
+    /// the page the reader is on, so a turn inside the save interval would
+    /// cost them the pages since.
+    #[test]
+    fn turning_the_device_around_keeps_the_page_it_was_counted_under() {
+        let mut state = reading(2, 0, 40);
+
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+        state.stamp_page_layout();
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+        assert_eq!(
+            state.page_layout,
+            state.layout_stamp(),
+            "both portraits paginate into the same box"
+        );
+
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.stamp_page_layout();
+        state.orientation = DisplayOrientation::LandscapeButtonsTop;
+        assert_eq!(
+            state.page_layout,
+            state.layout_stamp(),
+            "and so do both landscapes"
+        );
+
+        // The box itself changing is the thing the stamp is for.
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+        assert_ne!(
+            state.page_layout,
+            state.layout_stamp(),
+            "landscape to portrait moves every page boundary"
+        );
+
+        // And the stamp agrees with what the open tells storage.
+        for orientation in [
+            DisplayOrientation::PortraitButtonsLeft,
+            DisplayOrientation::PortraitButtonsRight,
+            DisplayOrientation::LandscapeButtonsBottom,
+            DisplayOrientation::LandscapeButtonsTop,
+        ] {
+            state.orientation = orientation;
+            state.stamp_page_layout();
+            let portrait_bit = (state.page_layout >> 11) & 1 == 1;
+            assert_eq!(
+                portrait_bit,
+                is_portrait(orientation),
+                "the stamp and the open's portrait field are one answer"
+            );
+        }
     }
 
     /// Selecting a book stamps the current layout on a page of zero, so a
