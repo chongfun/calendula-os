@@ -4290,6 +4290,39 @@ mod tests {
         }
     }
 
+    /// What the transition machinery makes of a rollback, and why the app task
+    /// does not ask it. The two states differ by book, so this reads a
+    /// rollback as an ordinary switch and closes out the failed book, writing
+    /// the page the app briefly held for it over the real one on the card.
+    /// Only the caller knows which way the state moved, and
+    /// `fw::tasks::app::handle_library_event` skips this call when it applied
+    /// a rollback.
+    #[test]
+    fn a_rollback_read_as_a_switch_would_close_out_the_book_that_failed() {
+        // Selecting book 2 put the app on it at page zero; the open was
+        // refused and the rollback puts book 1 back at page 88.
+        let failed = reading(2, 0, 0);
+        let restored = reading(1, 3, 88);
+
+        match storage_command_for_transition(&failed, &restored, 1) {
+            Some(StorageCommand::OpenBook {
+                book_id, previous, ..
+            }) => {
+                assert_eq!(
+                    book_id, restored.book_id,
+                    "an open for the book coming back"
+                );
+                let departing = previous.expect("and a close-out for the one it left");
+                assert_eq!(departing.book_id, failed.book_id);
+                assert_eq!(
+                    departing.screen, 0,
+                    "at a page nothing ever loaded, over whatever that book really had"
+                );
+            }
+            other => panic!("expected an open, got {other:?}"),
+        }
+    }
+
     /// Selecting a book stamps the current layout on a page of zero, so a
     /// refused open has to put the old stamp back with the old page. Leaving
     /// the new one makes a stale page read as current, and the next open of

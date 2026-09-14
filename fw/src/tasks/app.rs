@@ -580,7 +580,18 @@ async fn handle_library_event(
         return false;
     }
     let request_id = peek_reader_request_id();
-    let command = storage_command_for_transition(&before, state, request_id);
+    // A rollback walks the state backwards, and the transition machinery reads
+    // any book change as a switch whichever way it points. It would close out
+    // the book that failed to open, writing the page the app was holding for
+    // it over the real one that book has on the card, and dispatch an open for
+    // a book the store is already holding. The open that failed touched
+    // nothing, so the reader is back where they started and nothing is owed.
+    let rolled_back = matches!(event, crate::LibraryEvent::BookOpenFailed { .. });
+    let command = if rolled_back {
+        None
+    } else {
+        storage_command_for_transition(&before, state, request_id)
+    };
     let previous_persisted = before.persisted();
     // The one event whose index came from a row the storage task just looked
     // up. The open it owes is fenced to the catalog that lookup ran against.
