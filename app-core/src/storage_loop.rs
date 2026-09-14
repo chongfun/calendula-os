@@ -509,6 +509,10 @@ pub struct OpenSequence {
     /// book's own saved position. Extends never resume.
     resumable: bool,
     resumed: bool,
+    /// Whether this transaction is an extend of the book already open rather
+    /// than an open of one. An extend inherits the open's work instead of
+    /// replacing it, so whatever that open left outstanding is still owed.
+    extend: bool,
 }
 
 impl OpenSequence {
@@ -615,7 +619,16 @@ impl OpenSequence {
             previous,
             resumable,
             resumed: false,
+            extend: matches!(command, StorageCommand::ExtendSection { .. }),
         })
+    }
+
+    /// Whether this transaction extends the book already open rather than
+    /// opening one. An open supersedes what an earlier one left outstanding;
+    /// an extend is that same open asking for more of its book, and inherits
+    /// it.
+    pub const fn is_extend(&self) -> bool {
+        self.extend
     }
 
     pub const fn next(&self) -> OpenAction {
@@ -804,6 +817,31 @@ impl OpenSequence {
 
 #[cfg(test)]
 mod tests {
+
+    /// The firmware keeps a waiting place across an extend and ends it on an
+    /// open, so the staging step has to tell them apart. A restore settling
+    /// the reader on a page raises an extend, and reading that as an open has
+    /// the restore's own result cancel the restore.
+    #[test]
+    fn an_extend_is_not_an_open_of_the_book_it_extends() {
+        let book_id = ReaderSource::sd(2).book_id();
+
+        let extending = OpenSequence::begin(&extend(book_id, 0, 40), 7, 0).expect("an extend");
+        assert!(matches!(extending.next(), OpenAction::StageBook { .. }));
+        assert!(extending.is_extend());
+
+        // The same book, opened rather than extended. An open reads the
+        // stored place again, so whatever an earlier one left waiting is over.
+        let reopening = OpenSequence::begin(&open(book_id, 0, 40, None), 7, 0).expect("an open");
+        assert!(matches!(reopening.next(), OpenAction::StageBook { .. }));
+        assert!(!reopening.is_extend());
+
+        // And a switch from another book, which stages after its close-out.
+        let previous = persisted(ReaderSource::sd(1).book_id(), 2, 40);
+        let switching =
+            OpenSequence::begin(&open(book_id, 0, 0, Some(previous)), 7, 0).expect("an open");
+        assert!(!switching.is_extend());
+    }
 
     /// A place that resolves to the start of the book has to travel like any
     /// other. The open carries the page the app had, counted under the layout

@@ -345,10 +345,10 @@ struct PendingPlace {
     landed: u32,
     /// How many times the card has refused a read of this place.
     refusals: u8,
-    /// Set when the refusals ran out. The place stops being asked for, and
-    /// stays here so a progress save still cannot write the provisional
-    /// landing over the stored place: giving up costs this session's resume,
-    /// which it only does while the place on the card is left alone.
+    /// Set when the asking is over: the refusals ran out, or the restore
+    /// settled the reader on a page nobody chose. The place stays here so a
+    /// progress save still cannot write that page over the stored one, and
+    /// the settle slices stop being scheduled for it.
     stopped: bool,
 }
 
@@ -517,7 +517,9 @@ pub async fn run(
             place_held_display_event(),
             background_build_step_due(
                 (background_build.is_some()
-                    || pending_place.is_some()
+                    || pending_place
+                        .as_ref()
+                        .is_some_and(|waiting| !waiting.stopped)
                     || pending_evidence.is_some()
                     || book_build::evidence_place(sd_library)
                         .is_some_and(|place| evidence_settled.as_ref() != Some(&place)))
@@ -528,9 +530,12 @@ pub async fn run(
                 // refused build does. Without it the retry runs at the settle
                 // interval, which is 50 ms of cache work against a card that
                 // is saying no.
-                background_build
-                    .map_or(0, |pending| pending.attempts)
-                    .max(pending_place.as_ref().map_or(0, |waiting| waiting.refusals)),
+                background_build.map_or(0, |pending| pending.attempts).max(
+                    pending_place
+                        .as_ref()
+                        .filter(|waiting| !waiting.stopped)
+                        .map_or(0, |waiting| waiting.refusals),
+                ),
             ),
         )
         .await
@@ -1907,7 +1912,20 @@ fn handle_storage_command(
                         // an earlier open left waiting is that open's, and it
                         // ends here rather than outliving it and landing on
                         // whoever comes next.
-                        *pending_place = None;
+                        //
+                        // An extend is that same open asking for more of its
+                        // book, so it inherits the place rather than ending
+                        // it. The restore raises one of these itself: settling
+                        // on a page moves the app, and a page move inside a
+                        // book is an extend. Clearing here would let the
+                        // restore's own result cancel the hold it just took
+                        // out over the stored place. A place that has been
+                        // overtaken is retired where that can be told apart,
+                        // in `resolve_pending_place`, by the reader standing
+                        // somewhere other than where they were put.
+                        if !open.is_extend() {
+                            *pending_place = None;
+                        }
                         // Read this book's catalog record into the active-entry
                         // slot so the reader pipeline (load_position,
                         // build_or_load) resolves it from the card rather than
