@@ -58,6 +58,11 @@ pub(crate) fn reader_page_at(sd_library: &ReaderStore, page_index: usize) -> Pag
 /// records overflowed their capacity, so a builder can adopt them and keep
 /// appending incrementally (the carry path does exactly that).
 pub fn rebuild_page_index(library: &mut ReaderStore) -> (PageIndexCursor, bool) {
+    // Block zero's offset, which is page zero's wherever this is called from:
+    // a carried page that is about to become one, or a section just loaded
+    // with the offsets it was written with. The walk below moves the pages
+    // around, so it re-derives the rest from here.
+    let section_offset = library.page_offset[0];
     library.page_count = 0;
     let mut cursor = PageIndexCursor::start(library.page_box());
     let mut overflowed = false;
@@ -74,7 +79,26 @@ pub fn rebuild_page_index(library: &mut ReaderStore) -> (PageIndexCursor, bool) 
             &mut overflowed,
         );
     }
+    rebuild_page_offsets(library, section_offset);
     (cursor, overflowed)
+}
+
+/// Re-derive where each page opens in the content stream, by walking the
+/// blocks forward from `section_offset`. Offsets loaded or built alongside an
+/// older set of page breaks describe pages this walk has just moved.
+pub(crate) fn rebuild_page_offsets(library: &mut ReaderStore, section_offset: u32) {
+    let mut offset = section_offset;
+    let mut block = 0usize;
+    for page in 0..library.page_count {
+        let first = (library.pages[page].first_block as usize).min(library.block_count);
+        while block < first {
+            offset = offset.saturating_add(proto::anchor::block_stream_len(
+                library.blocks[block].text_len as usize,
+            ));
+            block += 1;
+        }
+        library.page_offset[page] = offset;
+    }
 }
 
 pub fn rebuild_toc_page_targets(library: &mut ReaderStore) {

@@ -926,6 +926,13 @@ impl ReaderStore {
         if first_block == 0 || first_block >= self.block_count {
             return;
         }
+        // Where the carried page opens in the content stream. It becomes page
+        // zero of the next section, and the rebuild that follows derives every
+        // other page's offset by walking forward from it, so losing it here
+        // would put the next section's whole index at offset zero.
+        let carried_offset = (0..self.page_count)
+            .find(|page| self.pages[*page].first_block as usize == first_block)
+            .map_or(0, |page| self.page_offset[page]);
         let text_start = self.blocks[first_block].text_offset as usize;
         let carried_blocks = self.block_count - first_block;
         let carried_text = self.text_len.saturating_sub(text_start);
@@ -957,6 +964,7 @@ impl ReaderStore {
             self.page_spine[index] = 0;
             self.page_offset[index] = 0;
         }
+        self.page_offset[0] = carried_offset;
     }
 
     pub fn clear_book_index(&mut self) {
@@ -2108,6 +2116,130 @@ mod tests {
             (store.block_count, store.page_count, store.text_len),
             (40, 5, 900),
             "all three counters describe one arena and must come back together"
+        );
+    }
+
+    /// A long chapter flushes on a page boundary and carries its unfinished
+    /// last page into the next section, where it becomes page zero. That page
+    /// keeps its place in the content stream: the section record written for
+    /// the next section is taken from it, and a saved place resolves through
+    /// those records to find which section holds it.
+    #[test]
+    fn a_carried_page_keeps_where_it_opens() {
+        let mut store = Box::new(ReaderStore::new());
+        // Four lines of eight bytes each, so each occupies nine of the stream,
+        // and two pages: blocks 0-1, then blocks 2-3 opening at 18.
+        for index in 0..4usize {
+            assert!(store.set_cached_block(
+                index,
+                BlockRecord {
+                    text_offset: (index * 8) as u32,
+                    text_len: 8,
+                    line_count: 1,
+                    role: TextRole::Body,
+                    style: proto::text::FontStyle::Regular,
+                    align: TextAlign::Left,
+                },
+                FontStyle::Regular,
+                5,
+            ));
+        }
+        store.block_count = 4;
+        store.text_len = 32;
+        assert!(store.set_cached_page(
+            0,
+            PageRecord {
+                first_block: 0,
+                block_count: 2
+            },
+            5,
+        ));
+        assert!(store.set_cached_page_offset(0, 100));
+        assert!(store.set_cached_page(
+            1,
+            PageRecord {
+                first_block: 2,
+                block_count: 2
+            },
+            5,
+        ));
+        assert!(store.set_cached_page_offset(1, 118));
+        store.page_count = 2;
+
+        store.carry_last_page(2);
+        assert_eq!(
+            store.page_offset[0], 118,
+            "the carried page opens where it opened before it moved"
+        );
+
+        let (_, _) = crate::layout::rebuild_page_index(&mut store);
+        assert_eq!(
+            store.page_anchor(0),
+            Some(ContentAnchor::at(5, 118)),
+            "and the rebuild that follows keeps it"
+        );
+    }
+
+    /// A spacing change re-walks heights over the same wrap points, so the
+    /// pages move while the lines stay put. Offsets that came in with the old
+    /// breaks describe pages that are gone.
+    #[test]
+    fn a_repagination_moves_the_offsets_with_the_pages() {
+        let mut store = Box::new(ReaderStore::new());
+        for index in 0..4usize {
+            assert!(store.set_cached_block(
+                index,
+                BlockRecord {
+                    text_offset: (index * 8) as u32,
+                    text_len: 8,
+                    line_count: 1,
+                    role: TextRole::Body,
+                    style: proto::text::FontStyle::Regular,
+                    align: TextAlign::Left,
+                },
+                FontStyle::Regular,
+                2,
+            ));
+        }
+        store.block_count = 4;
+        store.text_len = 32;
+
+        // As loaded: two pages of two lines, opening at 40 and 58.
+        lay_out(&mut store, 2, &[40, 58]);
+        assert!(store.set_cached_page(
+            0,
+            PageRecord {
+                first_block: 0,
+                block_count: 2
+            },
+            2,
+        ));
+        assert!(store.set_cached_page(
+            1,
+            PageRecord {
+                first_block: 2,
+                block_count: 2
+            },
+            2,
+        ));
+        store.page_count = 2;
+
+        // The breaks move: every line opens a page now. Driven through the
+        // real walk rather than by writing page records, so the call that
+        // re-derives the offsets is on the path this covers.
+        for index in 1..4usize {
+            store.block_page_break_before[index] = true;
+        }
+        crate::layout::rebuild_page_index(&mut store);
+        assert_eq!(store.page_count, 4, "one line per page now");
+
+        assert_eq!(
+            (0..4)
+                .map(|page| store.page_anchor(page).map(|anchor| anchor.offset))
+                .collect::<heapless::Vec<_, 4>>()
+                .as_slice(),
+            &[Some(40), Some(49), Some(58), Some(67)],
+            "each page opens one stream position past the lines before it"
         );
     }
 
