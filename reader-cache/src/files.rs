@@ -171,11 +171,23 @@ where
     T: TimeSource,
 {
     let mut scratch = [0u8; DURABLE_MAX_BYTES];
-    // A side that would not read is treated as the older one, so the write
-    // lands there and the side that did read survives it.
-    let a = read_generation_file(directory, names[0], magic, &mut scratch[..payload.len()]).valid();
-    let b = read_generation_file(directory, names[1], magic, &mut scratch[..payload.len()]).valid();
-    let (target, generation) = match (a, b) {
+    let a = read_generation_file(directory, names[0], magic, &mut scratch[..payload.len()]);
+    let b = read_generation_file(directory, names[1], magic, &mut scratch[..payload.len()]);
+    // Whatever this write lands has to beat what the other side holds, and
+    // only a side that read cleanly says what that is. One readable side sets
+    // the number and the write goes to the other, overwriting it. With
+    // neither readable and one of them refused, a refusal could be hiding a
+    // generation higher than anything this write could claim: the write would
+    // land, verify against its own target, and lose to the other side on the
+    // next read, having reported success. Two absent sides are a fresh pair
+    // and safe to number from one.
+    if a.valid().is_none()
+        && b.valid().is_none()
+        && (a == GenerationRead::Fault || b == GenerationRead::Fault)
+    {
+        return Err(());
+    }
+    let (target, generation) = match (a.valid(), b.valid()) {
         (Some(a), Some(b)) if generation_is_newer(b, a) => (0, b.wrapping_add(1)),
         (Some(a), Some(_)) => (1, a.wrapping_add(1)),
         (Some(a), None) => (1, a.wrapping_add(1)),

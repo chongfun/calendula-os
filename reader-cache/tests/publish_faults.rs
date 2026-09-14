@@ -79,6 +79,10 @@ impl std::error::Error for DiskError {}
 struct FaultPlan {
     fail_write_in: Cell<Option<u32>>,
     fail_read_in: Cell<Option<u32>>,
+    /// Reads to fail after the armed one, so a test can ask what an operation
+    /// does when the card answers none of the reads it makes rather than one
+    /// of them. Zero by default, which is the exactly-once model above.
+    extra_read_faults: Cell<u32>,
 }
 
 impl FaultPlan {
@@ -123,6 +127,11 @@ impl BlockDevice for SharedDisk {
     fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), DiskError> {
         self.reads.set(self.reads.get() + 1);
         if FaultPlan::take_fault(&self.fault.fail_read_in) {
+            let extra = self.fault.extra_read_faults.get();
+            if extra > 0 {
+                self.fault.extra_read_faults.set(extra - 1);
+                self.fault.fail_read_in.set(Some(0));
+            }
             return Err(DiskError);
         }
         let data = self.data.borrow();
@@ -1539,6 +1548,62 @@ fn a_place_write_refuses_while_ownership_is_unreadable() {
     assert!(
         refused > 0,
         "a write whose ownership check could not read has to refuse"
+    );
+}
+
+/// The durable pair's contract, as one property: a write that reports success
+/// is the write a healthy read returns. The pair numbers its generations from
+/// what it can read of the two sides, and with both refused it has no basis
+/// for a number, so one it picks can lose to whatever the refused side holds
+/// while verifying against its own target and reporting success.
+#[test]
+fn a_place_write_that_reports_success_is_the_one_that_reads_back() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = book_id(41);
+    let first = proto::anchor::ContentAnchor::at(0, 10);
+    let second = proto::anchor::ContentAnchor::at(0, 20);
+    // Two writes, so the pair holds a generation on each side.
+    files::write_place(&root, id, first, source(), None).expect("the first place stores");
+    files::write_place(&root, id, second, source(), None).expect("the second place stores");
+
+    let wanted = proto::anchor::ContentAnchor::at(7, 4_096);
+    let before = disk.reads.get();
+    let _ = files::read_place(&root, id);
+    let reads = disk.reads.get() - before;
+    assert!(reads > 0, "the lookup reads the card");
+
+    // Fault a run of reads from each starting point, so the sweep covers the
+    // pair's two generation probes failing together as well as singly.
+    let mut reported_ok = 0;
+    for extra in 0..2u32 {
+        for nth in 0..reads + 2 {
+            // Put the pair back the way it started before each attempt.
+            files::write_place(&root, id, first, source(), None).expect("the reset stores");
+            files::write_place(&root, id, second, source(), None).expect("the reset stores");
+
+            disk.fault.extra_read_faults.set(extra);
+            disk.fault.fail_read_in.set(Some(nth));
+            let wrote = files::write_place(&root, id, wanted, source(), None);
+            disk.fault.fail_read_in.set(None);
+            disk.fault.extra_read_faults.set(0);
+
+            if wrote.is_ok() {
+                reported_ok += 1;
+                assert_eq!(
+                    place_anchor(&root, id),
+                    Some(wanted),
+                    "{} refused reads from read {nth} reported a write the card does not serve",
+                    extra + 1
+                );
+            }
+        }
+    }
+    assert!(
+        reported_ok > 0,
+        "the sweep has to get at least one write through"
     );
 }
 

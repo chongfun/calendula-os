@@ -986,11 +986,21 @@ fn store_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VO
     library: &ReaderStore,
     index: usize,
     screen: u32,
+    may_replace: bool,
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if !may_replace {
+        // A restore for this book is still owed and the reader is standing
+        // where the open put them, not where they left off. This page's
+        // anchor is the provisional landing, and the stored place is the
+        // position the restore is reaching for: the only copy of it that
+        // survives a reboot. The page file beside it still records where the
+        // reader is.
+        return Ok(());
+    }
     let Some(id) = record_copy_id(root, library, index) else {
         return Ok(());
     };
@@ -1092,6 +1102,7 @@ pub(crate) fn store_app_state(
     sd_cs: &mut Output<'static>,
     library: &ReaderStore,
     record: AppStateRecord,
+    may_replace_place: bool,
 ) -> bool {
     // A record for a book whose identity the store cannot supply is refused
     // rather than written. Restore finds a book by its source hash and size,
@@ -1136,7 +1147,7 @@ pub(crate) fn store_app_state(
                     // a place across a settings change or a move, so treating
                     // a refused place as success would retire a retry the
                     // reader needs.
-                    let place = store_place(root, library, index, record.screen);
+                    let place = store_place(root, library, index, record.screen, may_replace_place);
                     let position = match files::write_position_file(
                         root,
                         &owner,
@@ -1193,6 +1204,7 @@ pub(crate) fn store_book_position(
     sd_cs: &mut Output<'static>,
     library: &ReaderStore,
     record: AppStateRecord,
+    may_replace_place: bool,
 ) -> bool {
     let Some(index) = app_core::ReaderSource::from_book_id(record.book_id).sd_index() else {
         return true;
@@ -1214,7 +1226,13 @@ pub(crate) fn store_book_position(
             root: at,
             locator: path.as_str(),
         };
-        let place = store_place(root, library, index as usize, record.screen);
+        let place = store_place(
+            root,
+            library,
+            index as usize,
+            record.screen,
+            may_replace_place,
+        );
         let position = match files::write_position_file(root, &owner, record.chapter, record.screen)
         {
             Ok(()) => Ok(()),

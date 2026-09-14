@@ -114,6 +114,11 @@ fn resolve_pending_place(
         *pending_place = None;
         return PlaceOutcome::Waiting;
     }
+    if waiting.stopped {
+        // Done asking. Still held, so the save cannot overwrite the place
+        // this open failed to reach.
+        return PlaceOutcome::Waiting;
+    }
     let index = waiting.index;
     let landed = waiting.landed;
     let place = waiting.place;
@@ -160,7 +165,7 @@ fn resolve_pending_place(
                     esp_println::println!(
                         "restore: the place's section kept refusing; leaving the reader put"
                     );
-                    *pending_place = None;
+                    waiting.stopped = true;
                 }
             }
             match settled {
@@ -170,12 +175,17 @@ fn resolve_pending_place(
                 Some(page) if page == landed => PlaceOutcome::Waiting,
                 // The ladder went past the reader's own page to the start of
                 // the book, which is the last rung and a decision rather than
-                // a wait. Leaving the place armed lets it reach for the same
-                // target again and move a reader who has already been moved,
-                // the moment a retry beats the page-zero render back to the
-                // planner.
+                // a wait. Done asking, so a retry cannot reach for the same
+                // target again and move a reader who has already been moved.
+                // Held rather than dropped, and standing on the page it just
+                // put them on: a page nobody chose is no reason to overwrite
+                // the place on the card, and the reader turning away from it
+                // is.
                 Some(page) => {
-                    *pending_place = None;
+                    if let Some(waiting) = pending_place.as_mut() {
+                        waiting.landed = page;
+                        waiting.stopped = true;
+                    }
                     PlaceOutcome::Moved(page)
                 }
                 None => {
@@ -199,7 +209,7 @@ fn resolve_pending_place(
                     esp_println::println!(
                         "restore: the card kept refusing the place; leaving the reader put"
                     );
-                    *pending_place = None;
+                    waiting.stopped = true;
                 }
             }
             PlaceOutcome::Waiting
@@ -335,6 +345,25 @@ struct PendingPlace {
     landed: u32,
     /// How many times the card has refused a read of this place.
     refusals: u8,
+    /// Set when the refusals ran out. The place stops being asked for, and
+    /// stays here so a progress save still cannot write the provisional
+    /// landing over the stored place: giving up costs this session's resume,
+    /// which it only does while the place on the card is left alone.
+    stopped: bool,
+}
+
+/// Whether a progress record may replace its book's stored place.
+///
+/// A restore still owed holds the reader on a provisional landing: the start
+/// of the book, or as far as the pagination had reached when the open needed
+/// an answer. Writing that page's anchor over the stored one discards the
+/// position the restore exists to reach. The reader turning a page supersedes
+/// the restore and is worth storing, which is the same rule
+/// [`resolve_pending_place`] retires a place by.
+fn place_may_be_replaced(pending_place: &Option<PendingPlace>, record: &AppStateRecord) -> bool {
+    pending_place
+        .as_ref()
+        .is_none_or(|waiting| waiting.book_id != record.book_id || record.screen != waiting.landed)
 }
 
 /// How many refused reads a waiting place takes before it is let go.
@@ -1077,6 +1106,7 @@ pub async fn run(
                                 sd_library,
                                 &mut pending_progress,
                                 &mut last_progress_write,
+                                &pending_place,
                             );
                             sleep.flushed(stored);
                         }
@@ -1704,6 +1734,7 @@ fn handle_storage_command(
                 sd_library,
                 pending_progress,
                 last_progress_write,
+                pending_place,
             ) {
                 // The wifi task is blocked on this answer; a silent return
                 // would strand it (and the Wireless screen) forever. Refuse
@@ -1846,6 +1877,7 @@ fn handle_storage_command(
                             sd_library,
                             pending_progress,
                             last_progress_write,
+                            pending_place,
                             previous,
                         );
                         if !stored {
@@ -2050,6 +2082,7 @@ fn handle_storage_command(
                                 place,
                                 landed: landing,
                                 refusals: 0,
+                                stopped: false,
                             });
                         }
                         if landed_nothing {
@@ -2501,6 +2534,7 @@ fn handle_storage_command(
                     sd_library,
                     pending_progress,
                     last_progress_write,
+                    pending_place,
                 )
             {
                 // The other book's position couldn't land; overwriting the
@@ -2512,7 +2546,13 @@ fn handle_storage_command(
             }
             if context_changed || due {
                 let progress_start = Instant::now();
-                let stored = book_build::store_app_state(epd, sd_cs, sd_library, record);
+                let stored = book_build::store_app_state(
+                    epd,
+                    sd_cs,
+                    sd_library,
+                    record,
+                    place_may_be_replaced(pending_place, &record),
+                );
                 if stored {
                     *pending_progress = None;
                     *last_progress_write = Some(Instant::now());
@@ -2761,6 +2801,7 @@ fn close_out_departing_book(
     sd_library: &ReaderStore,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
+    pending_place: &Option<PendingPlace>,
     previous: PersistedAppState,
 ) -> bool {
     // A coalesced record for another book still has to land: it names that
@@ -2773,13 +2814,23 @@ fn close_out_departing_book(
             sd_library,
             pending_progress,
             last_progress_write,
+            pending_place,
         )
     {
         return false;
     }
     let record = record_for_persisted(sd_library, previous);
     let start = Instant::now();
-    let stored = book_build::store_book_position(epd, sd_cs, sd_library, record);
+    // The departing book's own restore may still be owed: switching away
+    // from a book the reader saw only a provisional page of leaves its
+    // stored place the better answer for when they come back.
+    let stored = book_build::store_book_position(
+        epd,
+        sd_cs,
+        sd_library,
+        record,
+        place_may_be_replaced(pending_place, &record),
+    );
     bench_log!(
         "bench: store_book_position ok={} book_id={} page={} elapsed_ms={} t_ms={}",
         stored,
@@ -3064,10 +3115,12 @@ fn flush_pending_progress(
     sd_library: &ReaderStore,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
+    pending_place: &Option<PendingPlace>,
 ) -> bool {
     if let Some(record) = *pending_progress {
         let start = Instant::now();
-        let stored = book_build::store_app_state(epd, sd_cs, sd_library, record);
+        let may_replace = place_may_be_replaced(pending_place, &record);
+        let stored = book_build::store_app_state(epd, sd_cs, sd_library, record, may_replace);
         if stored {
             *pending_progress = None;
             *last_progress_write = Some(Instant::now());
