@@ -3321,6 +3321,25 @@ impl ReaderState {
 /// Whether an orientation stands the panel's long axis upright. The two
 /// portrait variants share one page geometry, so reading layout keys off
 /// this rather than the exact variant.
+/// Whether a state change owes storage a progress record of its own.
+///
+/// Only a change inside one book does. A book change is owned by the open it
+/// dispatches, which closes out the book being left and writes the arriving
+/// book's pointer once it knows where the reader landed; a record beside it
+/// would name the arriving book at the page the open has yet to resolve and
+/// erase the place it was about to resume from. A book change backwards is a
+/// rollback, where nothing was touched and nothing is owed. And a book that
+/// could not be read holds no page worth keeping.
+///
+/// Asked of the two states rather than of what the open dispatched, because
+/// an open carries no departing state when the book it leaves is unreadable,
+/// so whether one went out says nothing about whether a record is owed.
+pub fn progress_owed(previous: &ReaderState, next: &ReaderState) -> bool {
+    previous.book_id == next.book_id
+        && previous.persisted() != next.persisted()
+        && !next.book_unreadable()
+}
+
 pub const fn is_portrait(orientation: DisplayOrientation) -> bool {
     matches!(
         orientation,
@@ -4288,6 +4307,60 @@ mod tests {
                 "the stamp and the open's portrait field are one answer"
             );
         }
+    }
+
+    /// Who owes a progress record, which has been got wrong twice by asking
+    /// the wrong question. Asking whether the open carried a departing book
+    /// breaks the moment an open legitimately carries none.
+    #[test]
+    fn only_a_move_inside_one_book_owes_a_progress_record() {
+        let reading_a = reading(1, 3, 88);
+
+        // The ordinary case: same book, the reader turned a page.
+        let turned = reading(1, 3, 89);
+        assert!(progress_owed(&reading_a, &turned));
+
+        // Nothing moved.
+        assert!(!progress_owed(&reading_a, &reading_a));
+
+        // A switch. The open closes out the book being left and writes the
+        // arriving book's pointer once it knows where the reader landed; a
+        // record beside it names the arriving book at the page the open has
+        // yet to resolve.
+        let arriving = reading(2, 0, 0);
+        assert!(
+            !progress_owed(&reading_a, &arriving),
+            "the open owns a book change"
+        );
+
+        // Still a switch when the book being left could not be read, which
+        // sends no departing state and so dispatches no close-out. Asking
+        // about the departing state would call this one owed.
+        let unreadable = reading_a.apply_library_event(
+            CTX,
+            LibraryEvent::BookOpenUnreadable {
+                book_id: reading_a.book_id,
+            },
+        );
+        assert!(unreadable.book_unreadable());
+        assert!(
+            !progress_owed(&unreadable, &arriving),
+            "an open with nothing to close out still owns its switch"
+        );
+
+        // A rollback, which is a switch pointing backwards. The open that
+        // failed touched nothing.
+        assert!(
+            !progress_owed(&arriving, &reading_a),
+            "a rollback owes nothing either"
+        );
+
+        // And the book that could not be read holds no page worth keeping.
+        let deeper = ReaderState {
+            page: 99,
+            ..unreadable
+        };
+        assert!(!progress_owed(&unreadable, &deeper));
     }
 
     /// What the transition machinery makes of a rollback, and why the app task
