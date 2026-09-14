@@ -1278,7 +1278,9 @@ def summarize_paths(
             f"page_turns={len(turn_stats.durations)} "
             f"nav={turn_stats.nav_answered} "
             f"coalesced={turn_stats.coalesced_presses} "
-            f"skipped={turn_stats.skipped_answered} "
+            f"spared={turn_stats.spared_turns} "
+            f"unmoved={turn_stats.unmoved_answered} "
+            f"unknown={turn_stats.unknown_answered} "
             f"unmatched={turn_stats.unmatched_presses} "
             f"reading_renders={turn_stats.reading_renders}"
         )
@@ -1773,9 +1775,25 @@ class PageTurnStats:
     # constant above — these are the burst signal, and the reason the median
     # cannot be trusted on unmatched count alone.
     coalesced_presses: int
-    # Presses answered by a render the flush seam skipped: answered, so not
-    # unmatched, but no frame was sent so they are not turns either.
-    skipped_answered: int = 0
+    # Turns whose frame the panel was spared: the page moved and the flush
+    # seam found the frame already on the glass, so there is nothing to time.
+    spared_turns: int = 0
+    # Presses answered by a Reading render that turned no page. The reducer
+    # clamps at the last page while input still marks the view dirty, so the
+    # end of a book answers every press with a redraw of the page shown.
+    # Answered, so not unmatched, and not a turn either.
+    unmoved_answered: int = 0
+    # Answers with no page before them to compare against, which is the
+    # first Reading render a capture sees. Subtracted from the unmatched
+    # count like every other answered bucket: uncertain as a turn is not the
+    # same as unanswered as a press, and counting it as the latter would
+    # spend the trust budget that exists for operator cadence. They count toward what a capture
+    # collected, since that is usually what they are, and are kept out of
+    # `durations`: the same record is a no-op on a device already at the
+    # last page, and the median is an enforced budget. The coverage check
+    # refuses a request that leaned on one. A `--reset-before` capture has
+    # none of these.
+    unknown_answered: int = 0
 
     @property
     def unmatched_presses(self) -> int:
@@ -1784,7 +1802,9 @@ class PageTurnStats:
             - len(self.durations)
             - self.nav_answered
             - self.coalesced_presses
-            - self.skipped_answered
+            - self.spared_turns
+            - self.unmoved_answered
+            - self.unknown_answered
         )
 
     @property
@@ -1873,7 +1893,10 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
     reading_renders = 0
     nav_answered = 0
     coalesced_presses = 0
-    skipped_answered = 0
+    spared_turns = 0
+    unmoved_answered = 0
+    unknown_answered = 0
+    last_reading_page: int | None = None
     for event in sorted(events, key=event_sort_key):
         name = event.get("event")
         if name == "input" and press_action(event) in {"Next", "Previous"}:
@@ -1886,8 +1909,15 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
             if not isinstance(t_ms, int):
                 continue
             is_reading = event.get("view") == "Reading"
+            seen_page = event.get("page") if is_reading else None
+            # The page a skipped render is compared against. Updated for
+            # every Reading render, paired or not: a repaint nobody pressed
+            # for still changes what is on the glass.
+            page_before = last_reading_page
             if is_reading:
                 reading_renders += 1
+                if isinstance(seen_page, int):
+                    last_reading_page = seen_page
             begin = render_begin_ms(event)
             # Events are sorted by t_ms, so pending_inputs is nondecreasing
             # and this pops exactly the presses this render answers.
@@ -1905,8 +1935,27 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
                 # catches presses paired against renders already in flight.
                 # The press still counts and is still answered; only the
                 # duration is left out.
-                if event.get("skipped"):
-                    skipped_answered += 1
+                # A turn is a page that moved. A redraw of the page already
+                # shown is the end of the book, and whether the seam sent the
+                # frame or found it already on the glass says nothing about
+                # that. Only a page known to have stayed put is refused: a
+                # reader reaches the last page by turning to it, so the case
+                # this catches always has a previous page behind it, and
+                # demanding one of the first render would drop a real turn
+                # from any capture that opens straight into Reading.
+                # A render carrying no page at all is a capture older than
+                # the field, and its pairing reads as it always did. One that
+                # carries a page with nothing before it is the hazard: the
+                # first answer of a capture that attached to a device already
+                # sitting on its last page. That one is counted and kept out
+                # of the timings, since a redraw settles in a fraction of a
+                # turn and the median it would join is an enforced budget.
+                if isinstance(seen_page, int) and page_before is None:
+                    unknown_answered += 1
+                elif isinstance(seen_page, int) and seen_page == page_before:
+                    unmoved_answered += 1
+                elif event.get("skipped"):
+                    spared_turns += 1
                 else:
                     durations.append(t_ms - newest_answered)
             else:
@@ -1917,7 +1966,9 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
         reading_renders,
         nav_answered,
         coalesced_presses,
-        skipped_answered,
+        spared_turns,
+        unmoved_answered,
+        unknown_answered,
     )
 
 
@@ -1945,6 +1996,7 @@ class PageTurnCounter:
         self.pending: list[int] = []
         self.turns = 0
         self.last_t: int | None = None
+        self.last_reading_page: int | None = None
 
     def _new_epoch(self) -> None:
         """Drop presses from the boot that just ended.
@@ -1961,6 +2013,9 @@ class PageTurnCounter:
         """
         self.pending.clear()
         self.last_t = None
+        # The page from before the reboot is no baseline for after it, and
+        # the report splits by epoch for the same reason.
+        self.last_reading_page = None
 
     def observe(self, event: dict[str, Any]) -> None:
         name = event.get("event")
@@ -1984,12 +2039,23 @@ class PageTurnCounter:
             while self.pending and self.pending[0] <= begin:
                 self.pending.pop(0)
                 answered += 1
-            # `skipped` excluded for the reason the report excludes it: the
-            # seam sent no frame, so nothing turned. Counting it here would
-            # end a `--turns 50` capture on 49 turns and a no-op at the end
-            # of the book, which is the divergence this class exists to
-            # prevent.
-            if answered and event.get("view") == "Reading" and not event.get("skipped"):
+            is_reading = event.get("view") == "Reading"
+            seen_page = event.get("page") if is_reading else None
+            page_before = self.last_reading_page
+            if is_reading and isinstance(seen_page, int):
+                self.last_reading_page = seen_page
+            # The report's rule: a turn is a page that moved, whether or not
+            # the seam had to send the frame. A redraw of the page already
+            # shown is the end of the book, and counting it would end a
+            # `--turns 50` capture on 49 turns and a no-op.
+            # The report's rule: a turn is a page that moved. Only a page
+            # known to have stayed put is refused, so the first answer of a
+            # capture counts here as it does there, and the coverage check is
+            # where an unverifiable one is held against the request.
+            unmoved = (
+                isinstance(seen_page, int) and page_before is not None and seen_page == page_before
+            )
+            if answered and is_reading and not unmoved:
                 self.turns += 1
 
 
@@ -2097,7 +2163,7 @@ def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
     pooled figure is exactly its parts and coverage can be judged per part
     without measuring anything twice.
     """
-    merged = PageTurnStats([], 0, 0, 0, 0, 0)
+    merged = PageTurnStats([], 0, 0, 0, 0, 0, 0, 0)
     for stats in parts:
         merged = PageTurnStats(
             merged.durations + stats.durations,
@@ -2105,7 +2171,9 @@ def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
             merged.reading_renders + stats.reading_renders,
             merged.nav_answered + stats.nav_answered,
             merged.coalesced_presses + stats.coalesced_presses,
-            merged.skipped_answered + stats.skipped_answered,
+            merged.spared_turns + stats.spared_turns,
+            merged.unmoved_answered + stats.unmoved_answered,
+            merged.unknown_answered + stats.unknown_answered,
         )
     return merged
 
@@ -3220,12 +3288,39 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
     turns = requested.get("page_turns")
     if isinstance(turns, int):
         window = counted_window(run.events, "page_turn") if self_driven else run.events
+        paired = page_turn_stats_over_epochs(window)
+        # A turn the panel was spared has no duration and still happened, so
+        # it counts, but only when its page moved. A skip at the last page of
+        # a book turned nothing, and the page is the difference. Deciding on
+        # that rather than on whether the capture is self-driven holds a
+        # manual run, which has no checkpoint behind it, to the same evidence.
+        # What the capture collected, timed or not. The unknown ones are
+        # counted here and refused below when the request turns on them.
+        measured = len(paired.durations) + paired.spared_turns + paired.unknown_answered
         short(
             "page turns",
             turns,
-            len(page_turn_stats_over_epochs(window).durations),
+            measured,
             checkpoint_completions(run.events, "page_turn") if self_driven else None,
         )
+        # A capture that attached with the device already in Reading has no
+        # page behind its first answer, so that answer is a turn or a no-op
+        # at the last page and the telemetry cannot say which. Certifying on
+        # it would let a book that cannot turn satisfy the request. Only when
+        # the count leaned on it: a run with turns to spare, or a self-driven
+        # one whose checkpoints prove the pages moved, owes nothing here.
+        if (
+            not self_driven
+            and paired.unknown_answered
+            and measured >= turns > measured - paired.unknown_answered
+        ):
+            warnings.append(
+                f"{run.label}: {turns} page turns were requested and "
+                f"{paired.unknown_answered} of the answers counted had no page "
+                "before them to compare against, so the count cannot be "
+                "certified; capture with --reset-before, whose boot paint "
+                "gives the first turn something to move from"
+            )
 
     entries = requested.get("folder_entries")
     if isinstance(entries, int):

@@ -1603,13 +1603,24 @@ class PageTurnCounterTests(unittest.TestCase):
     properly and simply reported what it found.
     """
 
-    PRESS_AND_TURN: ClassVar[list[str]] = [
-        "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=1000\n",
-        (
-            "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 "
-            "flush_ms=400 req_ms=1000 prestage_ms=15 t_ms=1430\n"
-        ),
-    ]
+    @staticmethod
+    def turns(count: int, *, first_page: int = 2, start_ms: int = 1000) -> list[str]:
+        """`count` presses, each answered by the next page.
+
+        A turn is a page that moved. A fixture repeating one page was
+        modelling a reader pressing Next at the end of a book.
+        """
+        lines: list[str] = []
+        for index in range(count):
+            press = start_ms + index * 2000
+            lines.append(f"bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms={press}\n")
+            lines.append(
+                f"bench: render view=Reading mode=Fast page={first_page + index} "
+                f"chapter=1 layout_ms=10 flush_ms=400 req_ms={press} "
+                f"prestage_ms=15 t_ms={press + 430}\n"
+            )
+        return lines
+
     # No press before it: the paint a boot or a storage re-render produces.
     UNPROMPTED_RENDER = (
         "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 "
@@ -1625,14 +1636,19 @@ class PageTurnCounterTests(unittest.TestCase):
         )
 
     def test_an_unprompted_render_does_not_consume_a_requested_turn(self) -> None:
-        lines = [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN * 2
+        lines = [self.UNPROMPTED_RENDER] + self.turns(2)
         counts = self._counts(lines, 2)
         self.assertEqual(counts.get("page_turn"), 2)
         self.assertEqual(counts.get("reading_render"), 3)
 
     def test_the_capture_runs_until_the_turns_are_paired(self) -> None:
         """Two turns requested, one repaint in the middle: still two turns."""
-        lines = self.PRESS_AND_TURN + [self.UNPROMPTED_RENDER] + self.PRESS_AND_TURN
+        lines = (
+            [self.UNPROMPTED_RENDER]
+            + self.turns(1)
+            + [self.UNPROMPTED_RENDER]
+            + self.turns(1, first_page=3, start_ms=5000)
+        )
         counts = self._counts(lines, 2)
         self.assertEqual(counts.get("page_turn"), 2)
 
@@ -1707,7 +1723,7 @@ class PageTurnCounterTests(unittest.TestCase):
         """The stop rule and the reported figure must not drift apart."""
         lines = (
             [self.UNPROMPTED_RENDER]
-            + self.PRESS_AND_TURN * 3
+            + self.turns(3)
             + [
                 # A press answered by a Home render is navigation, not a turn.
                 "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
@@ -1723,18 +1739,16 @@ class PageTurnCounterTests(unittest.TestCase):
             counter.observe(event)
         self.assertEqual(counter.turns, len(bench.page_turn_stats_over_epochs(events).durations))
 
-    def test_the_live_counter_does_not_count_a_skipped_render_either(self) -> None:
-        """A14's guard settles a press without sending a frame, and the two
-        implementations have to agree about that as well. Counting it live
-        would end `--turns N` one real turn short, with the report excluding
-        the same render and printing N-1."""
+    def test_the_live_counter_counts_a_spared_turn_like_the_report_does(self) -> None:
+        """A14 spares the panel a frame the glass already shows. When the
+        page moved that was a turn, and the stop rule has to agree with the
+        figure the report prints or a capture ends on the wrong press."""
         lines = [
-            *self.PRESS_AND_TURN * 2,
-            # The end of the book: the press is answered, the frame matches
-            # the glass, and the seam skips the flush.
+            self.UNPROMPTED_RENDER,
+            *self.turns(2),
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
             (
-                "bench: render view=Reading mode=Fast page=302 chapter=13 layout_ms=5 "
+                "bench: render view=Reading mode=Fast page=99 chapter=4 layout_ms=5 "
                 "flush_ms=0 req_ms=9000 deq_ms=9001 t_ms=9012 skipped=true\n"
             ),
         ]
@@ -1743,11 +1757,156 @@ class PageTurnCounterTests(unittest.TestCase):
         for event in events:
             counter.observe(event)
         stats = bench.page_turn_stats_over_epochs(events)
-        self.assertEqual(counter.turns, 2, "the skipped render is not a turn")
-        self.assertEqual(counter.turns, len(stats.durations), "and the two agree")
+        self.assertEqual(stats.spared_turns, 1, "the page moved, so it was a turn")
+        self.assertEqual(counter.turns, 3, "the live count includes it")
+        self.assertEqual(counter.turns, len(stats.durations) + stats.spared_turns)
+
+    def test_the_live_counter_does_not_count_a_skipped_render_either(self) -> None:
+        """A14's guard settles a press without sending a frame, and the two
+        implementations have to agree about that as well. Counting it live
+        would end `--turns N` one real turn short, with the report excluding
+        the same render and printing N-1."""
+        lines = [
+            self.UNPROMPTED_RENDER,
+            *self.turns(2),
+            # The end of the book: the press is answered, the page has not
+            # moved, and the frame matches the glass.
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=9000\n",
+            (
+                "bench: render view=Reading mode=Fast page=3 chapter=1 layout_ms=5 "
+                "flush_ms=0 req_ms=9000 deq_ms=9001 t_ms=9012 skipped=true\n"
+            ),
+        ]
+        events = [event for line in lines for event in bench.parse_line(line, "page-turn")]
+        counter = bench.PageTurnCounter()
+        for event in events:
+            counter.observe(event)
+        stats = bench.page_turn_stats_over_epochs(events)
+        self.assertEqual(counter.turns, 2, "the no-op is not a turn")
+        self.assertEqual(
+            counter.turns,
+            len(stats.durations) + stats.spared_turns,
+            "and the two agree",
+        )
         self.assertEqual(stats.presses, 3, "the press still happened")
-        self.assertEqual(stats.skipped_answered, 1)
+        self.assertEqual(stats.unmoved_answered, 1, "the no-op has its own bucket")
         self.assertEqual(stats.unmatched_presses, 0, "and it was answered")
+
+    def test_a_turn_the_panel_was_spared_still_counts_toward_the_request(self) -> None:
+        """A14 skips a frame the glass already shows, so that turn has no
+        duration to report. It happened, so a run that was asked for two
+        turns and delivered one timed and one skipped is not short."""
+        events: list[dict] = [
+            {"event": "run_start", "suite": "page-turn", "requested": {"page_turns": 2}},
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 5},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1354, "req_ms": 1000, "page": 6},
+            {"event": "input", "button": "Next", "t_ms": 3000},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 3012,
+                "req_ms": 3000,
+                "page": 7,
+                "skipped": True,
+            },
+            {"event": "run_end", "elapsed_s": 9.0, "stop_reason": "count", "completed": True},
+        ]
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(events) if "page turns" in w],
+            [],
+            "the skipped turn counts toward the request",
+        )
+
+        # A skip at the end of a book turned no page, and that must not
+        # satisfy the request. The record is the same apart from the page,
+        # and this capture is manual, so no checkpoint stands behind it.
+        no_op = [dict(e) for e in events]
+        # The same record with the page standing still, found rather than
+        # indexed so a fixture change cannot quietly stop mutating it.
+        skipped = next(e for e in no_op if e.get("skipped"))
+        skipped["page"] = 6
+        warnings = bench.evaluate_suite_signals(no_op)
+        self.assertTrue(
+            any("1 of 2 requested page turns" in w for w in warnings),
+            warnings,
+        )
+
+        # And a run genuinely one turn short is still reported as short.
+        one_short = [e for e in events if e.get("page") != 7 and e.get("t_ms") != 3000]
+        self.assertTrue(
+            any(
+                "1 of 2 requested page turns" in w for w in bench.evaluate_suite_signals(one_short)
+            ),
+        )
+
+    def test_a_capture_that_attached_mid_session_cannot_certify_its_first_turn(
+        self,
+    ) -> None:
+        """A capture can open on a device already at the last page.
+
+        The first answer then has no page before it, so a turn and an
+        end-of-book no-op record the same thing and the telemetry cannot say
+        which. Certifying on it would let a book that cannot turn satisfy
+        `--turns 1`, so the count is refused when it leaned on that answer.
+        """
+        events: list[dict] = [
+            {"event": "run_start", "suite": "page-turn", "requested": {"page_turns": 1}},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1354, "req_ms": 1000, "page": 303},
+            {"event": "run_end", "elapsed_s": 5.0, "stop_reason": "count", "completed": True},
+        ]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertTrue(
+            any("no page before them" in w for w in warnings),
+            warnings,
+        )
+
+        # The boot paint a --reset-before capture opens with settles it, and
+        # the same run then certifies.
+        with_boot = [
+            events[0],
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 302},
+            *events[1:],
+        ]
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(with_boot) if "page turns" in w],
+            [],
+        )
+
+        # The unverifiable answer is out of the timing population as well as
+        # flagged in the count. A redraw of the last page settles in a
+        # fraction of a turn, and the median it would join is an enforced
+        # budget, so a latency nothing proved was a turn must not reach it.
+        stats = bench.page_turn_stats_over_epochs(events)
+        self.assertEqual(stats.durations, [], "nothing verified, so nothing timed")
+        self.assertEqual(stats.unknown_answered, 1)
+
+        # And a run with a turn to spare owes nothing here, since the count
+        # did not depend on the answer it cannot check.
+        spare = [
+            {"event": "run_start", "suite": "page-turn", "requested": {"page_turns": 1}},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "render", "view": "Reading", "t_ms": 1354, "req_ms": 1000, "page": 303},
+            {"event": "input", "button": "Next", "t_ms": 3000},
+            {"event": "render", "view": "Reading", "t_ms": 3354, "req_ms": 3000, "page": 304},
+            {"event": "run_end", "elapsed_s": 9.0, "stop_reason": "count", "completed": True},
+        ]
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(spare) if "page turns" in w],
+            [],
+        )
+        # Only the turn that was proved is timed, so the median cannot be
+        # dragged by the answer the capture could not check.
+        spare_stats = bench.page_turn_stats_over_epochs(spare)
+        self.assertEqual(spare_stats.durations, [354], "the proved turn alone")
+        self.assertEqual(spare_stats.unknown_answered, 1)
+        # Uncertain as a turn, and answered as a press. Counting it as a
+        # dropped input would spend the trust budget that exists for operator
+        # cadence and throw the one verified timing away with it.
+        self.assertEqual(spare_stats.unmatched_presses, 0, "both presses were answered")
+        self.assertEqual(spare_stats.untrusted_fraction, 0.0)
+        self.assertTrue(spare_stats.median_trusted, "the verified timing still counts")
 
     def test_a_short_capture_is_reported_against_what_was_asked_for(self) -> None:
         events = [
@@ -1761,6 +1920,9 @@ class PageTurnCounterTests(unittest.TestCase):
     def test_a_complete_capture_is_not_faulted(self) -> None:
         events: list[dict] = [
             {"event": "run_start", "suite": "page-turn", "requested_page_turns": 2},
+            # The boot paint a --reset-before capture opens with, which is
+            # the page the first turn moves from.
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 0},
         ]
         for turn in range(2):
             press = 1000 + turn * 5000
@@ -1771,6 +1933,7 @@ class PageTurnCounterTests(unittest.TestCase):
                     "view": "Reading",
                     "t_ms": press + 430,
                     "req_ms": press,
+                    "page": turn + 1,
                 }
             )
         self.assertEqual(bench.evaluate_suite_signals(events), [])
@@ -1926,6 +2089,8 @@ class BenchCaptureLoopTests(unittest.TestCase):
     def test_capture_waits_for_paired_prestage_across_intervening_log(self) -> None:
         """Capture continues past unrelated logs until event=='prestage' arrives."""
         lines = [
+            # The boot paint: the page every later turn is measured against.
+            "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n",
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
             "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n",
             "[LOG_INF] Unrelated firmware message\n",
@@ -1946,9 +2111,12 @@ class BenchCaptureLoopTests(unittest.TestCase):
         )
 
         self.assertEqual(counts.get("page_turn"), 1)
-        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("reading_render"), 2, "the boot paint and the turn")
         self.assertEqual(counts.get("prestage"), 1)
-        self.assertEqual([event["event"] for event in written], ["input", "render", "prestage"])
+        self.assertEqual(
+            [event["event"] for event in written],
+            ["render", "input", "render", "prestage"],
+        )
 
     def test_a_skipped_render_does_not_satisfy_the_turns_target(self) -> None:
         """`--turns 2` must not be ended by a no-op at the end of the book.
@@ -1958,6 +2126,12 @@ class BenchCaptureLoopTests(unittest.TestCase):
         and report one against the two asked for.
         """
         lines = [
+            # The paint a capture opens with, so the first turn has a page to
+            # move from.
+            (
+                "bench: render view=Reading mode=Fast page=0 chapter=0 layout_ms=10 "
+                "flush_ms=400 t_ms=10\n"
+            ),
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=1000\n",
             (
                 "bench: render view=Reading mode=Fast page=1 chapter=0 layout_ms=10 "
@@ -1991,11 +2165,12 @@ class BenchCaptureLoopTests(unittest.TestCase):
             "and the report agrees with the count that stopped the capture",
         )
         pages = [e.get("page") for e in written if e.get("event") == "render"]
-        self.assertEqual(pages, [1, 1, 2], "the capture ran through the skip to the real turn")
+        self.assertEqual(pages, [0, 1, 1, 2], "the capture ran through the skip to the real turn")
 
     def test_capture_stops_immediately_for_structured_combined_render(self) -> None:
         """Structured combined render with prestage_ms stops without waiting for standalone prestage."""
         lines = [
+            "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n",
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
             "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 prestage_ms=15 req_ms=50 t_ms=500\n",
             "bench: prestage staged=true elapsed_ms=24 t_ms=124\n",
@@ -2014,13 +2189,14 @@ class BenchCaptureLoopTests(unittest.TestCase):
         )
 
         self.assertEqual(counts.get("page_turn"), 1)
-        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("reading_render"), 2, "the boot paint and the turn")
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual([event["event"] for event in written], ["input", "render"])
+        self.assertEqual([event["event"] for event in written], ["render", "input", "render"])
 
     def test_capture_bounded_fallback_when_prestage_missing(self) -> None:
         """Capture stops boundedly if prestage telemetry never arrives."""
         lines = [
+            "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n",
             "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
             "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n",
         ] + [f"[LOG_INF] Intervening log {i}\n" for i in range(10)]
@@ -2038,9 +2214,9 @@ class BenchCaptureLoopTests(unittest.TestCase):
         )
 
         self.assertEqual(counts.get("page_turn"), 1)
-        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("reading_render"), 2, "the boot paint and the turn")
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual([event["event"] for event in written], ["input", "render"])
+        self.assertEqual([event["event"] for event in written], ["render", "input", "render"])
 
     def test_capture_silent_device_fallback_when_prestage_missing(self) -> None:
         """Capture stops when deadline expires even if serial stream is completely silent (no newlines)."""
@@ -2049,6 +2225,7 @@ class BenchCaptureLoopTests(unittest.TestCase):
         deadline_val: list[float] = []
 
         def silent_lines():
+            yield "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n"
             yield "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n"
             yield "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n"
             while True:
@@ -2074,9 +2251,9 @@ class BenchCaptureLoopTests(unittest.TestCase):
         elapsed = time.monotonic() - started
 
         self.assertEqual(counts.get("page_turn"), 1)
-        self.assertEqual(counts.get("reading_render"), 1)
+        self.assertEqual(counts.get("reading_render"), 2, "the boot paint and the turn")
         self.assertEqual(counts.get("prestage", 0), 0)
-        self.assertEqual([event["event"] for event in written], ["input", "render"])
+        self.assertEqual([event["event"] for event in written], ["render", "input", "render"])
         self.assertLess(elapsed, 1.0)
 
 
@@ -3075,7 +3252,7 @@ class StorageOpenPopulationTests(unittest.TestCase):
             if index != 0:
                 events.extend(
                     bench.parse_line(
-                        "bench: render view=Reading mode=Fast page=1 chapter=0 layout_ms=5 "
+                        f"bench: render view=Reading mode=Fast page={index + 1} chapter=0 layout_ms=5 "
                         f"flush_ms=405 req_ms={press} deq_ms={press + 1} t_ms={press + 470}",
                         "page-turn",
                     )
@@ -3555,7 +3732,10 @@ class CountAndDurationContractTests(unittest.TestCase):
                 "workflow": "page-turn",
                 "host_time": 1.0,
                 "requested": {"page_turns": requested},
-            }
+            },
+            # The boot paint a --reset-before capture opens with, which is
+            # the page the first turn moves from.
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 0},
         ]
         for index in range(turns):
             press = 1000 + index * 3000
@@ -3566,6 +3746,7 @@ class CountAndDurationContractTests(unittest.TestCase):
                     "view": "Reading",
                     "t_ms": press + 470,
                     "req_ms": press,
+                    "page": index + 1,
                 }
             )
         events.append(
@@ -3579,12 +3760,22 @@ class CountAndDurationContractTests(unittest.TestCase):
         return events
 
     def test_a_skipped_render_is_answered_but_is_not_a_turn(self) -> None:
-        """A14's frame-identity guard settles a press without sending a
-        frame. The press is answered, so it is not unmatched, but nothing
-        turned and its ~12 ms must stay out of the turn population."""
+        """A press at the last page of a book is answered by a redraw of the
+        page already shown. It is answered, so it is not unmatched, and it
+        turned nothing, so its ~12 ms stays out of the turn population."""
         events = [
+            # The paint a capture opens with, so the first press has a page
+            # to be measured against.
+            {"event": "render", "view": "Reading", "t_ms": 10, "page": 4},
             {"event": "input", "button": "Next", "t_ms": 1000},
-            {"event": "render", "view": "Reading", "t_ms": 1350, "req_ms": 1000, "deq_ms": 1001},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 1350,
+                "req_ms": 1000,
+                "deq_ms": 1001,
+                "page": 5,
+            },
             {"event": "input", "button": "Next", "t_ms": 2000},
             {
                 "event": "render",
@@ -3592,19 +3783,25 @@ class CountAndDurationContractTests(unittest.TestCase):
                 "t_ms": 2012,
                 "req_ms": 2000,
                 "deq_ms": 2001,
+                "page": 5,
                 "skipped": True,
             },
         ]
         stats = bench.page_turn_stats_over_epochs(events)
-        self.assertEqual(stats.durations, [350], "the skipped render is not a turn")
+        self.assertEqual(stats.durations, [350], "the page did not move, so it is no turn")
         self.assertEqual(stats.presses, 2, "both presses still count")
-        self.assertEqual(stats.skipped_answered, 1, "the skipped press has its own bucket")
+        self.assertEqual(stats.unmoved_answered, 1, "the no-op has its own bucket")
         self.assertEqual(stats.unmatched_presses, 0, "and both presses were answered")
         self.assertEqual(stats.untrusted_fraction, 0.0, "a skip is not a trust problem")
 
-        # A capture from a build without the field reads as it always did.
+        # The same record without the field reads the same way. Whether the
+        # seam sent the frame or found it already on the glass says nothing
+        # about whether the page moved, and a clean refresh at the end of a
+        # book produces exactly this: a no-op that was flushed.
         older = [{k: v for k, v in e.items() if k != "skipped"} for e in events]
-        self.assertEqual(bench.page_turn_stats_over_epochs(older).durations, [350, 12])
+        older_stats = bench.page_turn_stats_over_epochs(older)
+        self.assertEqual(older_stats.durations, [350])
+        self.assertEqual(older_stats.unmoved_answered, 1)
 
     def test_the_count_landing_first_is_a_clean_pass(self) -> None:
         """`--turns 3 --seconds 600`, done in twelve seconds."""
@@ -4259,6 +4456,12 @@ class BoardBudgetTests(unittest.TestCase):
             def fake_capture_lines(*_args: Any, **_kwargs: Any) -> Any:
                 return iter(
                     [
+                        # The boot paint a capture opens with, so the turn
+                        # below has a page to move from.
+                        (
+                            "bench: render view=Reading mode=Fast page=0 ch=0 "
+                            "layout_ms=15 flush_ms=307 prestage_ms=24 t_ms=10"
+                        ),
                         "input: Some(Next) gpio0=1 gpio1=1 gpio2=0 t=1000",
                         "bench: refresh mode=Fast busy_ms=307 t_ms=1307",
                         (

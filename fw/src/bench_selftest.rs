@@ -35,7 +35,7 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer, WithTimeout};
-use portable_atomic::{AtomicU8, Ordering};
+use portable_atomic::{AtomicU16, AtomicU8, Ordering};
 
 use crate::{
     AppView, Button, DisplayOrientation, InputEvent, PowerEvent, INPUT_EVENTS, POWER_EVENTS,
@@ -94,6 +94,13 @@ static LIBRARY_DEPTH: AtomicU8 = AtomicU8::new(0);
 /// twelve on the case its comment names. The turn is real only if this moved.
 static PAGE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(u32::MAX);
 
+/// The chapter list cursor, published while Chapters is up.
+///
+/// The list wraps at both ends, so no number of presses reaches a known row
+/// by saturating against an edge. A scenario that wants a particular chapter
+/// has to watch the cursor move.
+static SELECTION: AtomicU16 = AtomicU16::new(u16::MAX);
+
 /// Which scenario is running, so a helper deep in the walk can write an
 /// `invalid=` record naming it without threading the name through every call.
 static SCENARIO: AtomicU8 = AtomicU8::new(u8::MAX);
@@ -132,7 +139,9 @@ pub fn publish_view(
     front_pages_left: bool,
     library_depth: u8,
     page: u32,
+    selection: u16,
 ) {
+    SELECTION.store(selection, Ordering::Relaxed);
     PAGE.store(page, Ordering::Relaxed);
     VIEW.store(view_code(view), Ordering::Relaxed);
     ORIENTATION.store(orientation_code(orientation), Ordering::Relaxed);
@@ -142,6 +151,10 @@ pub fn publish_view(
 
 fn current_depth() -> u8 {
     LIBRARY_DEPTH.load(Ordering::Relaxed)
+}
+
+fn current_selection() -> u16 {
+    SELECTION.load(Ordering::Relaxed)
 }
 
 fn orientation_code(orientation: DisplayOrientation) -> u8 {
@@ -658,6 +671,129 @@ async fn pick_row() -> Option<AppView> {
     Some(landed)
 }
 
+/// The chapter a page-turning scenario starts from.
+///
+/// Not the first: a book's opening items are usually a cover and a table of
+/// contents, a page or two each. Not the reader's own place either, which is
+/// wherever the last run left it and has repeatedly been the end of the book.
+const START_CHAPTER: u16 = 3;
+
+/// Put the book at the start of `target` before a scenario counts anything.
+///
+/// The chapter list wraps at both ends, so the cursor is walked one step at a
+/// time and watched. A lap back to where it started means the book has no
+/// such chapter, and a press that moves it nowhere means it has stopped
+/// answering. No press ceiling: a list runs to whatever the book's table of
+/// contents holds, and a ceiling low enough to be a spin guard is low enough
+/// to give up on a long book before the lap is done.
+///
+/// Leaves Reading up either way. A scenario that carries on believing it is
+/// in Reading would send its first page turn to the chapter cursor, move no
+/// page, and report the end of the book.
+async fn seek_to_chapter(target: u16) -> bool {
+    if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+        report_invalid_current("not-quiescent");
+    }
+    if !act_in_reading(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
+        || !wait_for_view(AppView::Chapters, VIEW_SETTLE_MS).await
+    {
+        // Not proof the list stayed shut. `publish_view` runs in
+        // `send_render` before the frame is queued, and the press goes out
+        // before its settle is waited on, so the reducer can be in Chapters
+        // with the panel still catching up. `leave_chapters` reads the view,
+        // so it does nothing when the list really did stay shut.
+        return leave_chapters(false).await;
+    }
+    let first = current_selection();
+    while current_selection() != target {
+        let before = current_selection();
+        if !press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await {
+            return leave_chapters(false).await;
+        }
+        let now = current_selection();
+        if now == before {
+            bench_log!(
+                "bench-selftest: {} chapter cursor stuck at {}",
+                current_scenario(),
+                now
+            );
+            return leave_chapters(false).await;
+        }
+        if now == first {
+            bench_log!(
+                "bench-selftest: {} has no chapter {}",
+                current_scenario(),
+                target
+            );
+            return leave_chapters(false).await;
+        }
+    }
+    if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
+        return leave_chapters(false).await;
+    }
+    if !wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await {
+        return leave_chapters(false).await;
+    }
+    true
+}
+
+/// Put Reading back up if the chapter list is still there, and pass
+/// `outcome` through.
+///
+/// Reads the view rather than pressing Back on faith. The press that opens a
+/// chapter is sent before its render is waited on, so a Confirm that timed
+/// out may have landed: Back from Reading goes to Home, which would take the
+/// scenario out of the book it was placing.
+///
+/// Best effort. A panel that will not answer leaves the scenario where it
+/// is, and the caller has already reported the failure.
+async fn leave_chapters(outcome: bool) -> bool {
+    if current_view() == Some(AppView::Chapters)
+        && press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await
+    {
+        let _ = wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await;
+    }
+    outcome
+}
+
+/// Put the reader at [`START_CHAPTER`] before a suite counts anything, and
+/// say so in the log if that could not be done.
+///
+/// A suite that cannot be placed still runs from wherever the reader was,
+/// which is worth capturing; the record is there so a short run is read as
+/// the book running out rather than the device being slow.
+async fn place_at_start_chapter() -> bool {
+    if seek_to_chapter(START_CHAPTER).await {
+        bench_log!(
+            "bench-selftest: {} placed at chapter {} page {}",
+            current_scenario(),
+            START_CHAPTER,
+            current_page()
+        );
+        return true;
+    }
+    report_invalid_current("chapter-seek");
+    // A placement that failed is worth capturing from wherever the reader
+    // already was, and only once that is where the device actually is.
+    // `leave_chapters` is best effort, so a panel that stopped answering can
+    // leave the list up, and turning pages into the chapter cursor would
+    // measure the cursor.
+    if wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await {
+        // The view is published from `send_render`, a flush before the frame
+        // settles, so Reading here can still be painting. The first measured
+        // press would land in that frame and be timed against it.
+        if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+            report_invalid_current("not-quiescent");
+        }
+        return true;
+    }
+    bench_log!(
+        "bench-selftest: {} could not get back to reading after a failed seek",
+        current_scenario()
+    );
+    false
+}
+
 /// Walk from wherever boot left the device to Reading.
 ///
 /// Driven by the published view rather than a fixed key sequence, because
@@ -895,6 +1031,9 @@ async fn scenario_page_turn() -> Result_ {
     if !open_and_quiesce().await {
         return "nav-failed";
     }
+    if !place_at_start_chapter().await {
+        return "nav-failed";
+    }
     bench_log!("bench-selftest: reached reading, turning {} pages", TURNS);
     let turned = turn_pages(TURNS).await;
     bench_log!("bench-selftest: page-turn turns={} of {}", turned, TURNS);
@@ -921,6 +1060,11 @@ async fn scenario_storage_cache() -> Result_ {
             return "nav-failed";
         }
         opens += 1;
+        // Once, before the cycles. Each later cycle reopens wherever the
+        // turning left the reader, which is the warm open this suite times.
+        if cycle == 0 && !place_at_start_chapter().await {
+            return "nav-failed";
+        }
         let turned = turn_pages(STORAGE_TURNS_PER_CYCLE).await;
         bench_log!("bench-selftest: storage cycle={} turns={}", cycle, turned);
         short |= turned < STORAGE_TURNS_PER_CYCLE;
@@ -1062,6 +1206,9 @@ async fn scenario_folder_nav() -> Result_ {
 /// sleep because the wake half is still worth capturing.
 async fn scenario_reader_soak() -> Result_ {
     if !open_and_quiesce().await {
+        return "nav-failed";
+    }
+    if !place_at_start_chapter().await {
         return "nav-failed";
     }
     let turned = turn_pages(SOAK_TURNS).await;
