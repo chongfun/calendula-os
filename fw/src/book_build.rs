@@ -2778,7 +2778,7 @@ where
     if !files::load_v2_book_labels_and_toc(root, owner, source_identity, library) {
         return false;
     }
-    let Some((count, total_pages)) = files::reindex_layout_from_sections(
+    let Some((count, total_pages, ends_partial)) = files::reindex_layout_from_sections(
         root,
         owner,
         source_identity,
@@ -2787,6 +2787,17 @@ where
     ) else {
         return false;
     };
+    if ends_partial {
+        // What is on the card for this layout is where a build stopped, not
+        // the book. Publishing it would fence the reader at that page behind
+        // an index claiming to be complete, so nothing would ever raise it.
+        // The replay below rebuilds the whole book from CONT.BIN instead,
+        // which the flip away from this layout left behind.
+        esp_println::println!(
+            "epub: reindex found where a build stopped, not a book; falling back"
+        );
+        return false;
+    }
     let sections = &scratch.book_sections[..count];
     let published = publish::publish_book_cache(
         root,
@@ -2796,7 +2807,11 @@ where
         library,
         sections,
         total_pages,
+        // Proven, not assumed: a set ending on a partial section turned back
+        // above, so what is left covers every section it names.
         false,
+        // Nothing is coming back for more. A reindex reads what is already
+        // written rather than walking, the same as the replay.
         0,
     );
     if published.outcome != publish::BookPublishOutcome::Ready {

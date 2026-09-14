@@ -1525,8 +1525,15 @@ where
             return false;
         }
         library.toc_text_len = text_len;
-        library.toc_count = header.toc_count as usize;
     }
+    // Outside the text: the records above carry the spine target, which is
+    // what the TOC navigates by, and a book whose headings are all empty has
+    // records and no text at all. Adopting the records and leaving the count
+    // at zero threw those targets away, and on a reindex wrote the loss back
+    // to the card. Every record here already passed its bounds check against
+    // `toc_text_bytes`, so a title in a book with no text reads as empty
+    // rather than out of range.
+    library.toc_count = header.toc_count as usize;
     true
 }
 
@@ -2086,6 +2093,10 @@ where
 /// Each section is checked against the layout and the source it claims, so a
 /// stale or foreign file stops the reindex. `None` leaves the caller to build
 /// from the EPUB.
+///
+/// The third value is whether the set ends on a section a build stopped
+/// inside, which makes it a frontier rather than a book. The caller decides
+/// what to do about that; what it must not do is publish it as complete.
 pub fn reindex_layout_from_sections<
     D,
     T,
@@ -2098,7 +2109,7 @@ pub fn reindex_layout_from_sections<
     source_identity: (u32, u32),
     library: &mut ReaderStore,
     sections: &mut [proto::cache::BookV2SectionRecord],
-) -> Option<(usize, u32)>
+) -> Option<(usize, u32, bool)>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -2108,6 +2119,7 @@ where
     let want_font = library.custom_font_identity();
     let mut count = 0usize;
     let mut total_pages = 0u32;
+    let mut ends_partial = false;
     while count < sections.len() {
         let ordinal = count as u16;
         let read = with_v2_section_file(root, owner, layout, ordinal, Mode::ReadOnly, |file| {
@@ -2154,10 +2166,11 @@ where
         // follows it, and claiming otherwise would fence the reader in behind
         // a page count nothing will raise.
         if header.partial {
+            ends_partial = true;
             break;
         }
     }
-    (count > 0 && total_pages > 0).then_some((count, total_pages))
+    (count > 0 && total_pages > 0).then_some((count, total_pages, ends_partial))
 }
 
 pub fn empty_layout_cache<

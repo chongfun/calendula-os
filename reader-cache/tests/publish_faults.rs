@@ -1120,6 +1120,50 @@ fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
     );
 }
 
+/// A TOC carries its navigation in the records, not the text: each one holds
+/// the spine item it targets, and the text is only the label. A book whose
+/// headings are all empty therefore has a TOC worth keeping and no text at
+/// all, and reading it back used to drop every entry because the count was
+/// adopted inside the guard that read the title bytes.
+#[test]
+fn a_toc_with_no_title_text_still_comes_back() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let book = build_book(&root, &mut store, 2);
+    assert!(store.push_toc_record("", 0, 0), "first chapter");
+    assert!(store.push_toc_record("", 0, 1), "second chapter");
+    assert_eq!(store.toc_count(), 2);
+
+    assert!(
+        files::write_v2_book_index(
+            &root,
+            &OWNER,
+            IDENTITY,
+            total_pages(&book),
+            &book,
+            &store,
+            false,
+            0,
+        ),
+        "the index writes"
+    );
+
+    // A fresh open of the same book, as a flip back does before it reindexes.
+    store.begin_book_load();
+    assert_eq!(store.toc_count(), 0, "the open starts from nothing");
+    assert!(files::load_v2_book_labels_and_toc(
+        &root, &OWNER, IDENTITY, &mut store
+    ));
+    assert_eq!(
+        store.toc_count(),
+        2,
+        "both chapters come back, labels or no labels"
+    );
+}
+
 /// R10, the whole operation. Two layouts are resident, a third arrives, and
 /// the card will not free a slot. The reader still gets the book, and the
 /// bound is not quietly abandoned. The layout is left without an index, so
