@@ -2279,6 +2279,32 @@ mod tests {
         );
     }
 
+    /// A trailing paragraph mark grows the block that was already placed, and
+    /// a block that no longer fits moves to a page of its own. That page is
+    /// opened after the walk that fills offsets in has gone past, so it used
+    /// to open at offset zero, which resolves to the start of the spine item
+    /// rather than the line the reader is on.
+    #[test]
+    fn a_block_moved_by_its_paragraph_gap_takes_its_offset_along() {
+        let mut store = Box::new(ReaderStore::new());
+        push_line(&mut store, 4, "the first line", 500);
+        push_line(&mut store, 4, "the second line", 515);
+
+        let (mut cursor, _) = crate::layout::rebuild_page_index(&mut store);
+        assert_eq!(store.page_count, 1, "both lines start on one page");
+
+        // The gap pushes the last block off the page it had joined.
+        store.block_page_break_before[1] = true;
+        crate::layout::replace_last_block(&mut store, &mut cursor, 1);
+
+        assert_eq!(store.page_count, 2, "the block moved to a page of its own");
+        assert_eq!(
+            store.page_anchor(1),
+            Some(ContentAnchor::at(4, 515)),
+            "and the page opens where that line opens"
+        );
+    }
+
     /// Lay a book out as pages, the way a build does: each entry is one
     /// page's first line and where that line begins in the spine item's
     /// content. Two layouts of one book differ only in where the breaks

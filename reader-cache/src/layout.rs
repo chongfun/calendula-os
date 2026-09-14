@@ -155,6 +155,7 @@ pub fn replace_last_block(
     }
     let spine = library.block_spine.get(index).copied().unwrap_or(0);
     let mut overflowed = false;
+    let before = library.page_count;
     ui::reading::apply_last_block_move(
         index,
         spine,
@@ -163,5 +164,12 @@ pub fn replace_last_block(
         &mut library.page_count,
         &mut overflowed,
     );
+    // The move can open a page, and the moved block is the only thing on it,
+    // so that is where the page opens. The walk that sets offsets as pages
+    // open has already been past this one.
+    if library.page_count > before {
+        let page = library.page_count - 1;
+        library.page_offset[page] = library.block_offset.get(index).copied().unwrap_or(0);
+    }
     overflowed
 }
