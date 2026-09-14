@@ -1858,8 +1858,13 @@ where
     cleared
 }
 
-/// Clear one layout's pagination and the index that named it, leaving every
-/// other layout, the content cache, the TOC, the cover and the claim alone.
+/// Clear one layout's pagination and the book index, leaving every other
+/// layout's sections, the content cache, the TOC, the cover and the claim
+/// alone.
+///
+/// For the failure paths, where the index may be half written. Eviction wants
+/// [`evict_layout_sections`] instead: the index is one file for the book, so
+/// taking it there would strand the layout that is staying.
 ///
 /// The narrow form of [`empty_cache_dir`], for the failure paths that have to
 /// throw away a half-written index. Emptying the whole directory there was
@@ -1936,6 +1941,44 @@ where
 /// tries again. The caller goes on to build either way: eviction only runs
 /// when a build was going to happen, so refusing the open over a failed delete
 /// would refuse a book because the card would not free a file.
+/// Delete one layout's section files and nothing else.
+///
+/// The book index stays. It is one file for the book rather than one per
+/// layout, and the layout that is staying needs it: its labels and TOC are in
+/// there, and `try_reindex_layout` reads them to rebuild an index from the
+/// sections it still has. An index describing the evicted layout is a header
+/// mismatch, which is the ordinary rebuild path.
+pub fn evict_layout_sections<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    layout: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
+        return true;
+    };
+    let Ok(cache) = cache_root.open_dir(CACHE_V2_DIR) else {
+        return true;
+    };
+    let Ok(book) = cache.open_dir(key) else {
+        return true;
+    };
+    match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => delete_layout_sections(&sections, layout),
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    }
+}
+
 pub fn evict_layouts_for<
     D,
     T,
@@ -1964,7 +2007,7 @@ where
         let Some(victim) = resident.iter().copied().find(|layout| *layout != keep) else {
             break;
         };
-        if !empty_layout_cache(root, owner.key, victim) {
+        if !evict_layout_sections(root, owner.key, victim) {
             complete = false;
             break;
         }

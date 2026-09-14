@@ -62,7 +62,9 @@ const BACKGROUND_SLICE_MS: u64 = 400;
 /// — see the fast-path split in `build_or_load_book_cache_from_root`, which is
 /// also the only route that leaves an existing walk standing.
 ///
-/// RAM: 24 bytes inside the `EPUB_SCRATCH` static (`.bss`), not on any stack.
+/// RAM: 28 bytes inside the `EPUB_SCRATCH` static (`.bss`), not on any stack.
+/// Four more than before the layout field, which tells a walk which stored
+/// pagination it is building.
 ///
 /// `PartialEq` is load-bearing, not derived for convenience: comparing the
 /// value before and after an open is how [`build_or_load_book_cache`] tells a
@@ -98,6 +100,11 @@ pub(crate) struct BookBuildResume {
     /// second copy would be overwritten a section at a time by the first.
     layout: u8,
 }
+
+// The size the doc above quotes, checked rather than remembered: this rides in
+// a static beside the EPUB scratch, and the budget there is the reason the
+// number is written down at all.
+const _: () = assert!(core::mem::size_of::<BookBuildResume>() == 28);
 
 impl BookBuildResume {
     /// Whether this suspended walk is the one building the book that is *now*
@@ -3832,7 +3839,6 @@ fn push_styled_preview_fragment<
         let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
         let _ = measure.push_str(&sink.line[kept_len..]);
         sink.push_line_ink_str(measure.as_str());
-        sink.note_word_placed(word.len(), line_was_empty);
 
         // The line in progress opens a paragraph while no line of it has
         // flushed yet: the previous block still closes a paragraph. Once the
@@ -3854,12 +3860,18 @@ fn push_styled_preview_fragment<
             let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
             let _ = measure.push_str(sink.line.as_str());
             sink.push_line_ink_str(measure.as_str());
+            // Counted here and not before the wrap, because the wrap decides
+            // which line the word joined. Counting it on the way in and again
+            // on the way out advanced the block twice for one word, and set
+            // the new line's offset past the word that opens it, so a place
+            // saved on that line named content after itself.
             sink.note_word_placed(word.len(), true);
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;
             sink.pending_space = false;
         } else {
+            sink.note_word_placed(word.len(), line_was_empty);
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;

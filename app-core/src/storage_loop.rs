@@ -737,7 +737,11 @@ impl OpenSequence {
     /// this open builds.
     pub fn resolve_place(&mut self, page: u32) {
         self.page = page.min(u16::MAX as u32) as u16;
-        self.resumed |= self.page > 0 || self.chapter > 0;
+        // Page zero counts. A place that resolves to the start of the book is
+        // an answer, and leaving `resumed` false there sends no position, so
+        // the app keeps the page it came in with: the number counted under the
+        // layout this open just replaced.
+        self.resumed = true;
     }
 
     /// The section covering the target page could not be made resident, and
@@ -800,6 +804,42 @@ impl OpenSequence {
 
 #[cfg(test)]
 mod tests {
+
+    /// A place that resolves to the start of the book has to travel like any
+    /// other. The open carries the page the app had, counted under the layout
+    /// this open is replacing, so saying nothing leaves the reader on a number
+    /// that means nothing here.
+    #[test]
+    fn a_place_that_resolves_to_the_first_page_still_says_so() {
+        let book_id = ReaderSource::sd(2).book_id();
+        let mut command = open(book_id, 4, 120, None);
+        if let StorageCommand::OpenBook {
+            ref mut resolve_place,
+            ..
+        } = command
+        {
+            *resolve_place = true;
+        }
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(
+            matches!(open.next(), OpenAction::LoadSavedPosition { .. }),
+            "a layout change resolves the place even holding a page"
+        );
+        open.saved_position(Some((0, 0)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+        open.resolve_place(0);
+        open.section_loaded();
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position,
+                Some(0),
+                "the start of the book is a place, not the absence of one"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
 
     /// A book switch whose section will not load, in either place: the target
     /// the saved place named, and the page the open was landing on. The open

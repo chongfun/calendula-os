@@ -1050,8 +1050,17 @@ fn a_third_layout_evicts_one_and_only_then() {
     );
 
     // A third makes room, and the one that goes is not the one arriving.
+    // The book index is one file for the book, so the eviction leaves it for
+    // the layout that stays: without it a reindex has no labels or TOC to
+    // rebuild from and the open falls back to re-parsing the EPUB.
+    let index_before = files::read_cache_header(&root, KEY);
     let third = first.wrapping_add(64).max(1);
     assert!(files::evict_layouts_for(&root, &OWNER, third));
+    assert_eq!(
+        files::read_cache_header(&root, KEY),
+        index_before,
+        "the book index survives a layout eviction"
+    );
     let left = files::resident_layouts(&root, &OWNER);
     assert_eq!(left.len(), 1, "one of the two was evicted");
     assert!(

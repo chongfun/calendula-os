@@ -1002,12 +1002,7 @@ pub fn layout_of_section_file(name: &str) -> Option<u8> {
 /// 0x80 becomes two UTF-8 bytes and shifts every character boundary past it.
 /// Slicing at computed offsets then reads the wrong field, or panics.
 pub fn section_file_is_layout(name: &str, layout: u8) -> bool {
-    let bytes = name.as_bytes();
-    let mut expect = String::<4>::new();
-    let _ = expect.push('S');
-    push_hex(&mut expect, u32::from(layout), 2);
-    let expect = expect.as_bytes();
-    bytes.len() > expect.len() && bytes[..expect.len()].eq_ignore_ascii_case(expect)
+    layout_of_section_file(name) == Some(layout)
 }
 
 pub fn encode_book_header(header: BookCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {
