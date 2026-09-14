@@ -2082,6 +2082,98 @@ where
     resident.len() <= budget
 }
 
+/// The spine item a finished content capture ended on.
+///
+/// Once another layout has rewritten the shared book index, this is the only
+/// thing left on the card that knows how far the book goes. A capture's
+/// header stays incomplete until its walk reaches the end, and the last
+/// record that walk writes is its final spine-end marker.
+///
+/// `None` for no capture, one written for another file under the same key, or
+/// one whose walk did not finish.
+pub fn captured_final_spine<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    source_identity: (u32, u32),
+) -> Option<u16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_content_file(root, owner, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; CONTENT_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return None;
+        }
+        let header = proto::cache::decode_content_header(&header_bytes).ok()?;
+        if !header.complete
+            || header.source_hash != source_identity.0
+            || header.source_size != source_identity.1
+        {
+            return None;
+        }
+        // The final record is a bare spine-end marker, so it sits exactly one
+        // record header back from the end.
+        let at = (header.content_len as usize).checked_sub(CONTENT_RECORD_HEADER_BYTES)?;
+        if at < CONTENT_HEADER_BYTES || file.seek_from_start(at as u32).is_err() {
+            return None;
+        }
+        let mut record_bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
+        if read_exact_file(file, &mut record_bytes).is_err() {
+            return None;
+        }
+        let record = proto::cache::decode_content_record_header(&record_bytes).ok()?;
+        record.spine_end.then_some(record.spine_index)
+    })
+    .flatten()
+}
+
+/// How many section files one layout has on the card.
+///
+/// `None` when the card would not say. Counted rather than inferred from the
+/// ordinals a scan reached: a scan stops at the first ordinal it cannot open,
+/// and a set with a hole in it stops early while more files sit past the gap.
+fn layout_section_file_count<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    layout: u8,
+) -> Option<usize>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    with_v2_sections_dir(root, owner, |sections| {
+        let sections = sections?;
+        let mut found = 0usize;
+        let listed = sections.iterate_dir(|entry| {
+            if entry.attributes.is_directory() {
+                return ControlFlow::Continue(());
+            }
+            let mut name = String::<SHORT_NAME_BYTES>::new();
+            if write!(name, "{}", entry.name).is_ok()
+                && proto::cache::layout_of_section_file(name.as_str()) == Some(layout)
+            {
+                found += 1;
+            }
+            ControlFlow::Continue(())
+        });
+        listed.ok().map(|()| found)
+    })
+}
+
 /// Rebuild a book index from the section files already on the card for one
 /// layout.
 ///
@@ -2094,9 +2186,11 @@ where
 /// stale or foreign file stops the reindex. `None` leaves the caller to build
 /// from the EPUB.
 ///
-/// The third value is whether the set ends on a section a build stopped
-/// inside, which makes it a frontier rather than a book. The caller decides
-/// what to do about that; what it must not do is publish it as complete.
+/// A section prefix is not a book, and an abandoned walk leaves one that
+/// looks finished: pagination suspends at spine boundaries, so its last
+/// section is clean. Answers only for a set that reaches the spine item a
+/// finished capture ended on, with no section files past where the scan
+/// stopped.
 pub fn reindex_layout_from_sections<
     D,
     T,
@@ -2109,7 +2203,7 @@ pub fn reindex_layout_from_sections<
     source_identity: (u32, u32),
     library: &mut ReaderStore,
     sections: &mut [proto::cache::BookV2SectionRecord],
-) -> Option<(usize, u32, bool)>
+) -> Option<(usize, u32)>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -2117,6 +2211,10 @@ where
     let layout = library.layout_key();
     let want_config = layout::reader_layout_config(library.type_settings(), library.portrait());
     let want_font = library.custom_font_identity();
+    let Some(final_spine) = captured_final_spine(root, owner, source_identity) else {
+        cache_log!("cache: no finished capture, so nothing vouches for this layout's sections");
+        return None;
+    };
     let mut count = 0usize;
     let mut total_pages = 0u32;
     let mut ends_partial = false;
@@ -2170,7 +2268,25 @@ where
             break;
         }
     }
-    (count > 0 && total_pages > 0).then_some((count, total_pages, ends_partial))
+    if count == 0 || total_pages == 0 {
+        return None;
+    }
+    if ends_partial {
+        cache_log!("cache: this layout's sections end where a build stopped inside one");
+        return None;
+    }
+    if sections[count - 1].spine != final_spine {
+        cache_log!("cache: this layout's sections stop short of the spine the book ends on");
+        return None;
+    }
+    // The scan stops at the first ordinal it cannot open, which a hole looks
+    // exactly like. Anything past the gap is still on the card and still part
+    // of the book.
+    if layout_section_file_count(root, owner, layout) != Some(count) {
+        cache_log!("cache: this layout has section files the scan did not reach");
+        return None;
+    }
+    Some((count, total_pages))
 }
 
 pub fn empty_layout_cache<

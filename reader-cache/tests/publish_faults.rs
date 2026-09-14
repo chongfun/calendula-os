@@ -35,7 +35,7 @@ use proto::text::{TextAlign, TextRole};
 use reader_cache::files::{self, CacheLoadResult};
 use reader_cache::layout;
 use reader_cache::publish::{self, BookPublishOutcome, PublishError};
-use reader_cache::store::{BookLoadStatus, ReaderStore};
+use reader_cache::store::{BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD};
 
 const BLOCK_BYTES: usize = 512;
 /// 16 MiB card: big enough that fatfs picks FAT16 and small enough to stay fast.
@@ -1120,6 +1120,44 @@ fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
     );
 }
 
+/// Write a CONT.BIN for this book covering spine items `0..=last`, marked
+/// complete, exactly as a walk that reached the end of the book leaves one.
+fn capture_through_spine(root: &Dir<'_>, last: u16) {
+    files::ensure_v2_cache_dirs(root, &OWNER).expect("cache dirs");
+    let dir = files::open_v2_book_dir(root, &OWNER).expect("book dir");
+    let mut stage = [0u8; 512];
+    let mut capture = files::ContentCapture::begin(Some(&dir), IDENTITY, &mut stage);
+    for spine in 0..=last {
+        capture.push_block_record(
+            spine,
+            "body text",
+            TextRole::Body,
+            proto::text::FontStyle::Regular,
+            TextAlign::Left,
+            true,
+            0,
+        );
+        capture.spine_end(spine);
+    }
+    assert!(capture.finish(Some(&dir), true), "the capture completes");
+}
+
+/// One section per spine item, for the layout the store is in.
+fn write_section_for_spine(root: &Dir<'_>, store: &mut ReaderStore, spine: u16) {
+    write_section(root, store, spine, 0);
+}
+
+/// A section at a chosen ordinal holding a chosen spine item, so a fixture can
+/// give one item several sections the way a long chapter does.
+fn write_section_at(root: &Dir<'_>, store: &mut ReaderStore, section: u16, spine: u16) {
+    fill_section(store, section, 6);
+    store.set_cached_spine(spine);
+    let wrote = files::with_v2_sections_dir(root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, section, store)
+    });
+    assert!(wrote, "section {section} should write");
+}
+
 /// A TOC carries its navigation in the records, not the text: each one holds
 /// the spine item it targets, and the text is only the label. A book whose
 /// headings are all empty therefore has a TOC worth keeping and no text at
@@ -1161,6 +1199,84 @@ fn a_toc_with_no_title_text_still_comes_back() {
         store.toc_count(),
         2,
         "both chapters come back, labels or no labels"
+    );
+}
+
+/// R10 and the flip back: a walk that suspends between spine items leaves a
+/// clean final section, so nothing in the section files says more was coming.
+/// The index that knew is gone, overwritten when the other layout published.
+/// Reindexing that prefix would fence the reader at the page the walk happened
+/// to reach, behind an index claiming the book ends there.
+#[test]
+fn a_walk_that_suspended_between_spine_items_does_not_reindex_as_a_whole_book() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // The book runs to spine 4, and the capture that finished says so.
+    capture_through_spine(&root, 4);
+
+    // This layout's walk got through spine 2 and suspended before 3. Its last
+    // section is an ordinary finished one.
+    for spine in 0..=2u16 {
+        write_section_for_spine(&root, &mut store, spine);
+    }
+
+    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_none(),
+        "a prefix of the spine is where a build stopped, not a book"
+    );
+
+    // The rest of the walk lands, and the same set now reindexes.
+    for spine in 3..=4u16 {
+        write_section_for_spine(&root, &mut store, spine);
+    }
+    let (count, total_pages) =
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .expect("a set that reaches the end of the book");
+    assert_eq!(count, 5, "every spine item of the book");
+    assert!(total_pages > 0);
+}
+
+/// The scan stops at the first ordinal it cannot open, and a hole looks the
+/// same from the inside. A section that failed to write mid-build leaves one,
+/// with the rest of the book still on the card behind it.
+#[test]
+fn a_hole_in_the_section_files_is_not_the_end_of_the_book() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // A book of three spine items whose last one is long enough to need three
+    // sections, so a hole can sit inside it without shortening the spine the
+    // set reaches.
+    capture_through_spine(&root, 2);
+    write_section_at(&root, &mut store, 0, 0);
+    write_section_at(&root, &mut store, 1, 1);
+    write_section_at(&root, &mut store, 2, 2);
+    write_section_at(&root, &mut store, 3, 2);
+    write_section_at(&root, &mut store, 4, 2);
+
+    // Section 3 never made it to the card, and 4 is sitting behind the gap.
+    let mut name = heapless::String::<16>::new();
+    proto::cache::section_file_name(store.layout_key(), 3, &mut name);
+    let removed = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        sections
+            .expect("sections dir")
+            .delete_entry_in_dir(name.as_str())
+            .is_ok()
+    });
+    assert!(removed, "the fixture removes one section file");
+
+    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_none(),
+        "the scan stopped at the hole, and the book continues past it"
     );
 }
 
