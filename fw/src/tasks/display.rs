@@ -368,14 +368,23 @@ fn place_may_be_replaced(
     pending_place: &mut Option<PendingPlace>,
     record: &AppStateRecord,
 ) -> bool {
-    let Some(waiting) = pending_place.as_ref() else {
-        return true;
-    };
-    if waiting.hold.superseded_by(record.book_id, record.screen) {
+    retire_superseded_place(pending_place, record);
+    pending_place.is_none()
+}
+
+/// Drop a restore's claim once a record proves the reader has gone somewhere
+/// they chose.
+///
+/// Called on arrival as well as at the write, because the two are different
+/// moments: a record can be coalesced away or refused by the card, and the
+/// reader moved either way.
+fn retire_superseded_place(pending_place: &mut Option<PendingPlace>, record: &AppStateRecord) {
+    if pending_place
+        .as_ref()
+        .is_some_and(|waiting| waiting.hold.superseded_by(record.book_id, record.screen))
+    {
         *pending_place = None;
-        return true;
     }
-    false
 }
 
 /// How many refused reads a waiting place takes before it is let go.
@@ -2571,6 +2580,14 @@ fn handle_storage_command(
         }
         StorageCommand::StoreProgress(record) => {
             let record = record_for_persisted(sd_library, record);
+            // The move is the event that ends a restore's claim, not the write
+            // that follows it. Turns inside the write interval coalesce to the
+            // latest one, so a turn away and back leaves no record of the turn
+            // away: the claim would still be standing on the page the reader
+            // came back to, forbidding a save that is now their own. Ahead of
+            // the identity check too, since a record that cannot be written
+            // still says where they went.
+            retire_superseded_place(pending_place, &record);
             // A record the store could not give an identity to cannot be
             // written and cannot become writable later: the retry replays the
             // record as it is rather than resolving it again. Holding it would

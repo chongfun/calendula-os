@@ -901,6 +901,18 @@ mod tests {
             held.is_none_or(|hold| hold.superseded_by(book, 0)),
             "so page 0 is the reader's own page now, and storable"
         );
+
+        // The first move frees it, not the last one seen. A caller that keeps
+        // only the latest of several moves, which the firmware's write
+        // coalescer does inside its write interval, hands over a turn away
+        // and back as a single record for the page the claim stands on: asked
+        // then and only then, the claim survives both turns and forbids the
+        // page the reader is on. So every arrival asks, whether or not it is
+        // the one that gets written.
+        assert!(
+            !PlaceHold::new(book, 0).superseded_by(book, 0),
+            "asked only about where the turns ended, the claim outlives them"
+        );
     }
 
     /// A restore that settles the reader somewhere carries the hold to that
