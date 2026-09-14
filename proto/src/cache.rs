@@ -30,8 +30,8 @@ pub const CACHE_VERSION: u16 = 2;
 // cache on every card to add a value they already carry correctly. Only do the
 // same for a field whose old bytes are a *provably* fixed constant, and pin it
 // with a test the way `book_v2_header` does.
-pub const CACHE_V2_VERSION: u16 = 26;
-const CACHE_V2_COMPAT_VERSION: u16 = 26;
+pub const CACHE_V2_VERSION: u16 = 27;
+const CACHE_V2_COMPAT_VERSION: u16 = 27;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
@@ -64,6 +64,11 @@ pub const PAGE_RECORD_BYTES: usize = 4;
 /// re-derive by walking; where the page sits in the book's content cannot be
 /// re-derived from anything the layout keeps, so it is written down.
 pub const PAGE_ANCHOR_BYTES: usize = 4;
+/// One block's offset in the logical content stream, stored alongside the
+/// block records. Where a page opens is where its first block opens, and a
+/// block's offset is the only thing that survives a repagination moving the
+/// page breaks around.
+pub const BLOCK_ANCHOR_BYTES: usize = 4;
 pub const LINE_RECORD_BYTES: usize = 12;
 pub const WORD_RECORD_BYTES: usize = 12;
 pub const BLOCK_RECORD_BYTES: usize = 12;
@@ -610,6 +615,7 @@ pub fn section_v2_cache_size(header: SectionV2Header) -> usize {
         + header.page_count as usize * PAGE_RECORD_BYTES
         + header.page_count as usize * PAGE_ANCHOR_BYTES
         + header.block_count as usize * BLOCK_RECORD_BYTES
+        + header.block_count as usize * BLOCK_ANCHOR_BYTES
         + header.block_count as usize
         + header.text_bytes as usize
 }
@@ -2089,6 +2095,7 @@ mod tests {
                 + PAGE_RECORD_BYTES * 2
                 + PAGE_ANCHOR_BYTES * 2
                 + BLOCK_RECORD_BYTES * 3
+                + BLOCK_ANCHOR_BYTES * 3
                 + 3
                 + 19
         );

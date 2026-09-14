@@ -13,12 +13,12 @@ use proto::cache::{
     encode_book_v2_header, encode_book_v2_section, encode_content_header,
     encode_content_record_header, encode_page, encode_section_v2_header, encode_toc,
     encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord, ContentHeader,
-    ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
-    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE, CACHE_COVER_FILE,
-    CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE,
-    CACHE_V2_DIR, CONTENT_HEADER_BYTES, CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES,
-    PAGE_ANCHOR_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES,
-    TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
+    ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_ANCHOR_BYTES, BLOCK_RECORD_BYTES,
+    BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE,
+    CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES,
+    CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR, CONTENT_HEADER_BYTES,
+    CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES, PAGE_ANCHOR_BYTES, PAGE_RECORD_BYTES,
+    SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -4440,6 +4440,14 @@ where
     }) {
         return false;
     }
+    if !read_records_batched(file, BLOCK_ANCHOR_BYTES, block_count, |index, bytes| {
+        library.set_cached_block_offset(
+            index,
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        )
+    }) {
+        return false;
+    }
     if !read_records_batched(file, 1, block_count, |index, bytes| {
         library.set_cached_paragraph_end(index, bytes[0] & 0b01 != 0)
             && library.set_cached_paragraph_start(index, bytes[0] & 0b10 != 0)
@@ -4538,6 +4546,12 @@ where
             || stage.push(&record[..BLOCK_RECORD_BYTES]).is_err()
         {
             cache_log!("cache: write block record failed");
+            return false;
+        }
+    }
+    for offset in library.block_offset.iter().take(library.block_count) {
+        if stage.push(&offset.to_le_bytes()).is_err() {
+            cache_log!("cache: write block anchor failed");
             return false;
         }
     }

@@ -3999,7 +3999,7 @@ fn flush_styled_preview_line<
         role,
         align,
         paragraph_end,
-        sink.spine_index,
+        proto::anchor::ContentAnchor::at(sink.spine_index, sink.line_offset),
     ) {
         // The section arena (text bytes or the block table) just filled.
         // Flush what we have to a section file and retry the line into a
@@ -4015,7 +4015,7 @@ fn flush_styled_preview_line<
             role,
             align,
             paragraph_end,
-            sink.spine_index,
+            proto::anchor::ContentAnchor::at(sink.spine_index, sink.line_offset),
         );
     }
     if sink.library.block_count() > appended_from {

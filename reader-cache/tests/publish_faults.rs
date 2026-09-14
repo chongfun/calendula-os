@@ -238,6 +238,7 @@ fn new_store() -> Box<ReaderStore> {
 /// paginate it, leaving the store exactly as a finished spine item leaves it.
 fn fill_section(store: &mut ReaderStore, spine: u16, lines: usize) {
     store.clear_lines();
+    let mut offset = 0u32;
     for n in 0..lines {
         let line = format!("section {spine} line {n} with enough words to occupy a row");
         assert!(
@@ -247,10 +248,13 @@ fn fill_section(store: &mut ReaderStore, spine: u16, lines: usize) {
                 TextRole::Body,
                 TextAlign::Left,
                 true,
-                spine,
+                proto::anchor::ContentAnchor::at(spine, offset),
             ),
             "line buffer should hold the fixture text"
         );
+        // Plain fixture text, so the stream advances by the line plus its
+        // separator. Real lines carry style markers the stream does not.
+        offset += line.len() as u32 + 1;
     }
     layout::rebuild_page_index(store);
     assert!(
