@@ -484,6 +484,51 @@ enum OpenPhase {
     Done,
 }
 
+/// A restore's claim on a book's stored place.
+///
+/// A restore that could not reach the saved position leaves the reader on a
+/// page the open picked rather than one they chose. Saving that page over the
+/// stored place discards the position the restore exists to reach, and the
+/// stored place is the only copy that survives a reboot. The reader going
+/// anywhere else ends the claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaceHold {
+    book_id: u32,
+    landed: u32,
+}
+
+impl PlaceHold {
+    pub const fn new(book_id: u32, landed: u32) -> Self {
+        Self { book_id, landed }
+    }
+
+    pub const fn book_id(self) -> u32 {
+        self.book_id
+    }
+
+    /// The page the hold stands on.
+    pub const fn landed(self) -> u32 {
+        self.landed
+    }
+
+    /// Carry the hold to the page a restore settled the reader on. Still a
+    /// page the reader did not choose, so the claim moves with them.
+    pub fn settled_on(&mut self, page: u32) {
+        self.landed = page;
+    }
+
+    /// Whether a save of `page` in `book_id` is the reader somewhere they
+    /// chose, which both frees the place write and ends this hold.
+    ///
+    /// Both halves matter. Answering without ending it leaves a hold standing
+    /// on a page the reader has left, and it forbids that page the next time
+    /// they come back to it, holding the card at wherever they went in
+    /// between.
+    pub const fn superseded_by(self, book_id: u32, page: u32) -> bool {
+        self.book_id != book_id || page != self.landed
+    }
+}
+
 /// A book-open (or section-extend) transaction, as the ordered card work it
 /// owes.
 ///
@@ -817,6 +862,65 @@ impl OpenSequence {
 
 #[cfg(test)]
 mod tests {
+
+    /// The whole life of a restore's hold, which is where the save rule keeps
+    /// going wrong. It stands on the page the open put the reader on and
+    /// forbids that page being written over the stored place, frees anywhere
+    /// else, and has to end at the move that freed it. A hold that outlives
+    /// its own supersession is the failure: the reader comes back to the page
+    /// it stands on, the save is forbidden again, and the card keeps pointing
+    /// at wherever they went in between.
+    #[test]
+    fn a_hold_ends_at_the_move_that_frees_it() {
+        let book = ReaderSource::sd(2).book_id();
+        let other = ReaderSource::sd(3).book_id();
+        let hold = PlaceHold::new(book, 0);
+
+        assert!(
+            !hold.superseded_by(book, 0),
+            "the page the reader was put on is the one the hold is for"
+        );
+        assert!(
+            hold.superseded_by(book, 1),
+            "anywhere else in the book is the reader choosing"
+        );
+        assert!(
+            hold.superseded_by(other, 0),
+            "and so is the same page number in another book"
+        );
+
+        // The reader turns to page 1, which frees the save. Whoever holds
+        // this has to drop it here: asking again once they turn back to page
+        // 0 would forbid the page they are actually on.
+        let mut held = Some(hold);
+        if held.is_some_and(|hold| hold.superseded_by(book, 1)) {
+            held = None;
+        }
+        assert!(held.is_none(), "the move that frees the save ends the hold");
+        assert!(
+            held.is_none_or(|hold| hold.superseded_by(book, 0)),
+            "so page 0 is the reader's own page now, and storable"
+        );
+    }
+
+    /// A restore that settles the reader somewhere carries the hold to that
+    /// page rather than ending it: it is still a page the open picked.
+    #[test]
+    fn a_settled_restore_carries_its_hold_to_where_it_landed() {
+        let book = ReaderSource::sd(2).book_id();
+        let mut hold = PlaceHold::new(book, 40);
+        hold.settled_on(0);
+
+        assert_eq!(hold.landed(), 0);
+        assert!(
+            !hold.superseded_by(book, 0),
+            "the page the fallback chose is not a page the reader chose"
+        );
+        assert!(
+            hold.superseded_by(book, 40),
+            "and the page it left is somewhere they would have to go back to"
+        );
+    }
 
     /// The firmware keeps a waiting place across an extend and ends it on an
     /// open, so the staging step has to tell them apart. A restore settling

@@ -95,7 +95,7 @@ fn resolve_pending_place(
     let Some(waiting) = pending_place.as_ref() else {
         return PlaceOutcome::Waiting;
     };
-    if waiting.book_id != book_id {
+    if waiting.hold.book_id() != book_id {
         // A place left over from a book the reader has moved on from. Its
         // walk belongs to that open, and this one will not carry it.
         *pending_place = None;
@@ -108,7 +108,7 @@ fn resolve_pending_place(
         *pending_place = None;
         return PlaceOutcome::Waiting;
     };
-    if reader_page != waiting.landed {
+    if reader_page != waiting.hold.landed() {
         // The reader moved. Whatever they are reading now is a better answer
         // than where they left off last time.
         *pending_place = None;
@@ -120,7 +120,7 @@ fn resolve_pending_place(
         return PlaceOutcome::Waiting;
     }
     let index = waiting.index;
-    let landed = waiting.landed;
+    let landed = waiting.hold.landed();
     let place = waiting.place;
     match book_build::resolve_place(epd, sd_cs, sd_library, index as usize, place) {
         book_build::PlaceTarget::Page(target) => {
@@ -183,7 +183,7 @@ fn resolve_pending_place(
                 // is.
                 Some(page) => {
                     if let Some(waiting) = pending_place.as_mut() {
-                        waiting.landed = page;
+                        waiting.hold.settled_on(page);
                         waiting.stopped = true;
                     }
                     PlaceOutcome::Moved(page)
@@ -336,13 +336,10 @@ enum PlaceOutcome {
 /// running inside the open and holding the executor through a minute of
 /// building.
 struct PendingPlace {
-    book_id: u32,
+    /// The book and page this place is holding the card's copy against.
+    hold: app_core::storage_loop::PlaceHold,
     index: u16,
     place: book_build::SavedPlace,
-    /// The page the open landed on. The reader is moved off it only while
-    /// they are still standing on it: once they turn a page, the place they
-    /// asked to resume at has been overtaken by the one they chose.
-    landed: u32,
     /// How many times the card has refused a read of this place.
     refusals: u8,
     /// Set when the asking is over: the refusals ran out, or the restore
@@ -360,10 +357,25 @@ struct PendingPlace {
 /// position the restore exists to reach. The reader turning a page supersedes
 /// the restore and is worth storing, which is the same rule
 /// [`resolve_pending_place`] retires a place by.
-fn place_may_be_replaced(pending_place: &Option<PendingPlace>, record: &AppStateRecord) -> bool {
-    pending_place
-        .as_ref()
-        .is_none_or(|waiting| waiting.book_id != record.book_id || record.screen != waiting.landed)
+///
+/// Ends the hold when it answers yes, rather than leaving that to the settle
+/// slices: a stopped hold schedules none of those, and one that outlives the
+/// move it was superseded by forbids the very page it stands on the next time
+/// the reader comes back to it. Ended before the write is attempted, because
+/// the reader chose this page whether or not the card takes it, and the
+/// coalescer keeps a refused record for the retry.
+fn place_may_be_replaced(
+    pending_place: &mut Option<PendingPlace>,
+    record: &AppStateRecord,
+) -> bool {
+    let Some(waiting) = pending_place.as_ref() else {
+        return true;
+    };
+    if waiting.hold.superseded_by(record.book_id, record.screen) {
+        *pending_place = None;
+        return true;
+    }
+    false
 }
 
 /// How many refused reads a waiting place takes before it is let go.
@@ -548,7 +560,7 @@ pub async fn run(
                     // building, and a place kept with nothing coming back for
                     // it is a place quietly abandoned.
                     if let Some(waiting) = pending_place.as_ref() {
-                        let book_id = waiting.book_id;
+                        let book_id = waiting.hold.book_id();
                         let resolved = resolve_pending_place(
                             &mut epd,
                             &mut sd_cs,
@@ -1144,7 +1156,7 @@ pub async fn run(
                                 sd_library,
                                 &mut pending_progress,
                                 &mut last_progress_write,
-                                &pending_place,
+                                &mut pending_place,
                             );
                             sleep.flushed(stored);
                         }
@@ -2144,10 +2156,9 @@ fn handle_storage_command(
                             // on the card, so the next open reads it again.
                             let landed_on = if landed_nothing { None } else { landed_on };
                             *pending_place = landed_on.map(|()| PendingPlace {
-                                book_id,
+                                hold: app_core::storage_loop::PlaceHold::new(book_id, landing),
                                 index,
                                 place,
-                                landed: landing,
                                 refusals: 0,
                                 stopped: false,
                             });
@@ -2868,7 +2879,7 @@ fn close_out_departing_book(
     sd_library: &ReaderStore,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
-    pending_place: &Option<PendingPlace>,
+    pending_place: &mut Option<PendingPlace>,
     previous: PersistedAppState,
 ) -> bool {
     // A coalesced record for another book still has to land: it names that
@@ -3182,7 +3193,7 @@ fn flush_pending_progress(
     sd_library: &ReaderStore,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
-    pending_place: &Option<PendingPlace>,
+    pending_place: &mut Option<PendingPlace>,
 ) -> bool {
     if let Some(record) = *pending_progress {
         let start = Instant::now();
