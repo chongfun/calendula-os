@@ -967,15 +967,6 @@ pub fn section_file_name<const N: usize>(layout: u8, spine: u16, out: &mut Strin
     let _ = out.push_str(".BIN");
 }
 
-/// The book index for one layout. Paginated alongside the sections and just
-/// as layout-bound: it holds the page totals and where each section starts.
-pub fn book_file_name<const N: usize>(layout: u8, out: &mut String<N>) {
-    out.clear();
-    let _ = out.push('B');
-    push_hex(out, u32::from(layout), 2);
-    let _ = out.push_str(".BIN");
-}
-
 /// The layout a section file's name says made it, or `None` for a name that is
 /// not one of ours. Over bytes, for the reason below.
 pub fn layout_of_section_file(name: &str) -> Option<u8> {

@@ -1237,18 +1237,6 @@ impl ReaderStore {
         (index < self.book_section_count).then(|| self.book_sections[index])
     }
 
-    /// The page a stored place opens at, as a global page index.
-    ///
-    /// Two steps because the two live in different files: the book index says
-    /// which section, and only that section's own pages say which page. The
-    /// caller loads the section named by [`section_for_anchor`] before asking.
-    pub fn page_for_anchor(&self, anchor: ContentAnchor) -> Option<u32> {
-        let section = self.section_for_anchor(anchor)?;
-        let record = self.book_sections[section];
-        let within = self.resident_page_containing(anchor)?;
-        Some(record.start_page.saturating_add(within as u32))
-    }
-
     /// Record where a page just opened by the build starts. The build appends
     /// pages in order, so this always names the last one.
     pub fn set_last_page_offset(&mut self, offset: u32) {
