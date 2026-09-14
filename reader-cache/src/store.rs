@@ -293,6 +293,7 @@ pub struct ReaderStore {
     pub(crate) cover_bits: [u8; COVER_BYTES],
     pub(crate) cached_spine: u16,
     pub(crate) section_partial: bool,
+    pub(crate) section_ends_spine: bool,
     pub(crate) book_total_pages: u32,
     pub current_section_start_page: u32,
     pub current_section_page_count: u16,
@@ -423,6 +424,7 @@ impl ReaderStore {
             cover_bits: [0; COVER_BYTES],
             cached_spine: 0,
             section_partial: false,
+            section_ends_spine: false,
             book_total_pages: 0,
             current_section_start_page: 0,
             current_section_page_count: 0,
@@ -898,6 +900,7 @@ impl ReaderStore {
         self.block_count = 0;
         self.page_count = 0;
         self.section_partial = false;
+        self.section_ends_spine = false;
         for (index, block) in self.blocks.iter_mut().enumerate() {
             *block = EMPTY_BLOCK_RECORD;
             self.block_styles[index] = FontStyle::Regular;
@@ -1292,12 +1295,14 @@ impl ReaderStore {
         block_count: usize,
         text_len: usize,
         partial: bool,
+        ends_spine: bool,
     ) {
         self.page_count = page_count;
         self.block_count = block_count;
         self.text_len = text_len;
         self.cached_spine = spine;
         self.section_partial = partial;
+        self.section_ends_spine = ends_spine;
         // A real section now occupies the text buffer, replacing any TOC the
         // overview had loaded there.
         self.text_holds_toc = false;
@@ -1306,6 +1311,12 @@ impl ReaderStore {
 
     pub fn set_section_partial(&mut self, partial: bool) {
         self.section_partial = partial;
+    }
+
+    /// Whether the section now in hand carries its spine item to the end.
+    /// The build knows; a reindex has no other way to ask.
+    pub fn set_section_ends_spine(&mut self, ends_spine: bool) {
+        self.section_ends_spine = ends_spine;
     }
 
     pub fn set_cached_spine(&mut self, spine: u16) {

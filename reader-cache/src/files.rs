@@ -2188,9 +2188,9 @@ where
 ///
 /// A section prefix is not a book, and an abandoned walk leaves one that
 /// looks finished: pagination suspends at spine boundaries, so its last
-/// section is clean. Answers only for a set that reaches the spine item a
-/// finished capture ended on, with no section files past where the scan
-/// stopped.
+/// section is clean. Answers only for a set that carries the spine item a
+/// finished capture ended on through to its end, with no section files past
+/// where the scan stopped.
 pub fn reindex_layout_from_sections<
     D,
     T,
@@ -2218,6 +2218,7 @@ where
     let mut count = 0usize;
     let mut total_pages = 0u32;
     let mut ends_partial = false;
+    let mut ends_spine = false;
     while count < sections.len() {
         let ordinal = count as u16;
         let read = with_v2_section_file(root, owner, layout, ordinal, Mode::ReadOnly, |file| {
@@ -2259,6 +2260,7 @@ where
             logical_offset,
         };
         total_pages = total_pages.saturating_add(u32::from(header.page_count));
+        ends_spine = header.ends_spine;
         count += 1;
         // A partial section is the tail of a build that stopped. Nothing
         // follows it, and claiming otherwise would fence the reader in behind
@@ -2277,6 +2279,13 @@ where
     }
     if sections[count - 1].spine != final_spine {
         cache_log!("cache: this layout's sections stop short of the spine the book ends on");
+        return None;
+    }
+    // Reaching the book's last spine item is not reaching the end of it. A
+    // long item spans several sections, and the write of its last one can
+    // fail with nothing behind the gap to give it away.
+    if !ends_spine {
+        cache_log!("cache: this layout's sections stop inside the spine the book ends on");
         return None;
     }
     // The scan stops at the first ordinal it cannot open, which a hole looks
@@ -4442,6 +4451,7 @@ where
         block_count,
         text_bytes,
         header.partial,
+        header.ends_spine,
     );
     true
 }
@@ -4476,6 +4486,7 @@ where
         bytes_consumed: 0,
         total_bytes: 0,
         partial: library.section_partial,
+        ends_spine: library.section_ends_spine,
     };
     let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
     if encode_section_v2_header(header, &mut bytes).is_err() || file.write(&bytes).is_err() {

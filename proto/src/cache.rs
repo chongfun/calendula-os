@@ -474,6 +474,12 @@ pub struct SectionV2Header {
     pub bytes_consumed: u32,
     pub total_bytes: u32,
     pub partial: bool,
+    /// Whether this section carries its spine item to the end.
+    ///
+    /// False for the intermediate flushes of a long item, and for every
+    /// section written before this flag existed, which reads as no proof and
+    /// sends a reindex to the replay rather than to a truncated book.
+    pub ends_spine: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1129,7 +1135,7 @@ pub fn encode_section_v2_header(
     write_u16(out, 8, header.page_count);
     write_u16(out, 10, header.block_count);
     out[12] = header.partial as u8;
-    out[13] = 0;
+    out[13] = header.ends_spine as u8;
     write_u16(out, 14, 0);
     write_u32(out, 16, header.text_bytes);
     write_u16(out, 20, header.viewport_width);
@@ -1158,6 +1164,7 @@ pub fn decode_section_v2_header(input: &[u8]) -> Result<SectionV2Header, CacheEr
         page_count: read_u16(input, 8)?,
         block_count: read_u16(input, 10)?,
         partial: input[12] != 0,
+        ends_spine: input[13] != 0,
         text_bytes: read_u32(input, 16)?,
         viewport_width: read_u16(input, 20)?,
         viewport_height: read_u16(input, 22)?,
@@ -2058,11 +2065,24 @@ mod tests {
             bytes_consumed: 8192,
             total_bytes: 12_000,
             partial: true,
+            ends_spine: false,
         };
         let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
         encode_section_v2_header(header, &mut bytes).expect("section v2 header encodes");
 
         assert_eq!(decode_section_v2_header(&bytes).unwrap(), header);
+
+        // The two flags sit in adjacent bytes and mean opposite things, so
+        // they are worth proving apart rather than together.
+        let swapped = SectionV2Header {
+            partial: false,
+            ends_spine: true,
+            ..header
+        };
+        let mut swapped_bytes = [0u8; SECTION_V2_HEADER_BYTES];
+        encode_section_v2_header(swapped, &mut swapped_bytes).expect("section v2 header encodes");
+        assert_eq!(decode_section_v2_header(&swapped_bytes).unwrap(), swapped);
+        assert_ne!(bytes[12..14], swapped_bytes[12..14]);
         assert_eq!(
             section_v2_cache_size(header),
             SECTION_V2_HEADER_BYTES

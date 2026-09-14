@@ -273,6 +273,7 @@ fn write_section(
     // silently fails for every other — a fixture flaw a mutation check caught
     // only once a test reached past the first section.
     store.set_cached_spine(section);
+    store.set_section_ends_spine(true);
     let page_count = store.page_count().min(u16::MAX as usize) as u16;
     let wrote = files::with_v2_sections_dir(root, &OWNER, |sections| {
         let sections = sections.expect("sections dir should exist");
@@ -1148,10 +1149,18 @@ fn write_section_for_spine(root: &Dir<'_>, store: &mut ReaderStore, spine: u16) 
 }
 
 /// A section at a chosen ordinal holding a chosen spine item, so a fixture can
-/// give one item several sections the way a long chapter does.
-fn write_section_at(root: &Dir<'_>, store: &mut ReaderStore, section: u16, spine: u16) {
+/// give one item several sections the way a long chapter does. The build
+/// stamps `ends_spine` on the flush that finishes an item.
+fn write_section_at(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    section: u16,
+    spine: u16,
+    ends_spine: bool,
+) {
     fill_section(store, section, 6);
     store.set_cached_spine(spine);
+    store.set_section_ends_spine(ends_spine);
     let wrote = files::with_v2_sections_dir(root, &OWNER, |sections| {
         files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, section, store)
     });
@@ -1241,6 +1250,39 @@ fn a_walk_that_suspended_between_spine_items_does_not_reindex_as_a_whole_book() 
     assert!(total_pages > 0);
 }
 
+/// Reaching the book's last spine item is not reaching the end of it. A long
+/// chapter spans several sections, and the write of its final one can fail
+/// with nothing behind the gap to give it away: the scan stops where the files
+/// stop, the spine matches, and the file count agrees. Only the flag the build
+/// stamps on the flush that finishes an item tells the two apart.
+#[test]
+fn a_set_that_stops_inside_the_last_chapter_is_not_a_whole_book() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // Two spine items; the second needs two sections.
+    capture_through_spine(&root, 1);
+    write_section_at(&root, &mut store, 0, 0, true);
+    write_section_at(&root, &mut store, 1, 1, false);
+
+    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_none(),
+        "the last chapter is only half here"
+    );
+
+    // The section that finishes the chapter lands, and the set is a book.
+    write_section_at(&root, &mut store, 2, 1, true);
+    let (count, total_pages) =
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .expect("a set that carries the last chapter to its end");
+    assert_eq!(count, 3);
+    assert!(total_pages > 0);
+}
+
 /// The scan stops at the first ordinal it cannot open, and a hole looks the
 /// same from the inside. A section that failed to write mid-build leaves one,
 /// with the rest of the book still on the card behind it.
@@ -1255,11 +1297,11 @@ fn a_hole_in_the_section_files_is_not_the_end_of_the_book() {
     // sections, so a hole can sit inside it without shortening the spine the
     // set reaches.
     capture_through_spine(&root, 2);
-    write_section_at(&root, &mut store, 0, 0);
-    write_section_at(&root, &mut store, 1, 1);
-    write_section_at(&root, &mut store, 2, 2);
-    write_section_at(&root, &mut store, 3, 2);
-    write_section_at(&root, &mut store, 4, 2);
+    write_section_at(&root, &mut store, 0, 0, true);
+    write_section_at(&root, &mut store, 1, 1, true);
+    write_section_at(&root, &mut store, 2, 2, false);
+    write_section_at(&root, &mut store, 3, 2, false);
+    write_section_at(&root, &mut store, 4, 2, true);
 
     // Section 3 never made it to the card, and 4 is sitting behind the gap.
     let mut name = heapless::String::<16>::new();

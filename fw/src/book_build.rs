@@ -3632,6 +3632,9 @@ where
 
         self.library.set_cached_spine(self.spine_index);
         self.library.set_section_partial(partial);
+        // The flush that ends a spine item is the one `finish_spine` makes;
+        // the carry flushes of a long item are mid-item by construction.
+        self.library.set_section_ends_spine(!carry_incomplete);
         let section_id = (*self.section_count).min(u16::MAX as usize) as u16;
         let write_started = Instant::now();
         let wrote = match self.sections_dir {
