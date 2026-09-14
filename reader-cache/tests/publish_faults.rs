@@ -1456,6 +1456,92 @@ fn an_anchor_table_that_stops_short_is_not_the_page_it_got_to() {
     );
 }
 
+/// A refused read of a stored place is not the absence of one. Collapsing the
+/// two hands the open a page-keyed fallback, or nothing, over an exact place
+/// the card is holding and would give up on the next look, and the retry path
+/// is reached only through the difference.
+#[test]
+fn a_refused_place_read_is_not_an_absent_place() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = book_id(21);
+    let anchor = proto::anchor::ContentAnchor::at(3, 640);
+    files::write_place(&root, id, anchor, source(), Some(900)).expect("the place stores");
+
+    assert!(
+        matches!(files::read_place(&root, id), files::PlaceRead::Found(place) if place.anchor == anchor),
+        "the place reads back while the card answers"
+    );
+
+    // A book with no place of its own, which is the durable absence.
+    assert!(
+        matches!(
+            files::read_place(&root, book_id(22)),
+            files::PlaceRead::Absent
+        ),
+        "nothing stored reads as absent"
+    );
+
+    // Sweep the fault across the reads the lookup makes. Every answer has to
+    // be the real place or a fault, and the sweep has to feel at least one.
+    let before = disk.reads.get();
+    let _ = files::read_place(&root, id);
+    let reads = disk.reads.get() - before;
+    assert!(reads > 0, "the lookup reads the card");
+    let mut faulted = 0;
+    for nth in 0..reads {
+        disk.fault.fail_read_in.set(Some(nth));
+        match files::read_place(&root, id) {
+            files::PlaceRead::Found(place) => assert_eq!(
+                place.anchor, anchor,
+                "a fault at read {nth} produced a place the card did not hold"
+            ),
+            files::PlaceRead::Fault => faulted += 1,
+            files::PlaceRead::Absent => {
+                panic!("a fault at read {nth} read as no place stored")
+            }
+        }
+        disk.fault.fail_read_in.set(None);
+    }
+    assert!(faulted > 0, "the sweep has to reach the lookup's own reads");
+}
+
+/// And a write cannot step over the ownership question while the card is
+/// declining to answer it: the directory is shared by hash, and a refused
+/// read says nothing about who holds it.
+#[test]
+fn a_place_write_refuses_while_ownership_is_unreadable() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = book_id(31);
+    let anchor = proto::anchor::ContentAnchor::at(1, 64);
+    files::write_place(&root, id, anchor, source(), None).expect("the place stores");
+
+    let later = proto::anchor::ContentAnchor::at(1, 128);
+    let before = disk.reads.get();
+    let _ = files::read_place(&root, id);
+    let reads = disk.reads.get() - before;
+    let mut refused = 0;
+    for nth in 0..reads {
+        disk.fault.fail_read_in.set(Some(nth));
+        if matches!(
+            files::write_place(&root, id, later, source(), None),
+            Err(files::PlaceDenied::Fault)
+        ) {
+            refused += 1;
+        }
+        disk.fault.fail_read_in.set(None);
+    }
+    assert!(
+        refused > 0,
+        "a write whose ownership check could not read has to refuse"
+    );
+}
+
 /// R10, the whole operation. Two layouts are resident, a third arrives, and
 /// the card will not free a slot. The reader still gets the book, and the
 /// bound is not quietly abandoned. The layout is left without an index, so
@@ -1597,7 +1683,9 @@ fn place_anchor(
     root: &Dir<'_>,
     id: proto::identity::BookId,
 ) -> Option<proto::anchor::ContentAnchor> {
-    files::read_place(root, id).map(|place| place.anchor)
+    files::read_place(root, id)
+        .found()
+        .map(|place| place.anchor)
 }
 
 fn book_id(seed: u8) -> proto::identity::BookId {
@@ -1646,7 +1734,7 @@ fn a_place_stores_its_anchor_before_it_knows_the_books_length() {
     let anchor = proto::anchor::ContentAnchor::at(6, 1_200);
 
     files::write_place(&root, id, anchor, source(), None).expect("the place stores");
-    let place = files::read_place(&root, id).expect("it reads back");
+    let place = files::read_place(&root, id).found().expect("it reads back");
     assert_eq!(place.anchor, anchor, "the anchor is there");
     assert_eq!(
         place.progression, None,
@@ -1667,7 +1755,7 @@ fn a_place_survives_a_replacement_without_claiming_to_be_exact() {
     let progression = (u16::MAX / 3) * 2;
 
     files::write_place(&root, id, anchor, source(), Some(progression)).expect("the place stores");
-    let place = files::read_place(&root, id).expect("it reads back");
+    let place = files::read_place(&root, id).found().expect("it reads back");
     assert!(
         place.describes(&source()),
         "against the bytes it was written for"

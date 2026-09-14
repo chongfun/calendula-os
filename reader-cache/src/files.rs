@@ -30,9 +30,31 @@ use proto::durable::{
     DURABLE_OVERHEAD,
 };
 
+/// What one generation file had to say.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenerationRead {
+    /// A record, and the generation it carries.
+    Valid(u32),
+    /// Missing, short, oversized, or corrupt. A durable answer: reading it
+    /// again gets the same one.
+    Absent,
+    /// The card would not answer. Not evidence about the record.
+    Fault,
+}
+
+impl GenerationRead {
+    /// The generation when one was readable, for callers with nothing to do
+    /// about a fault.
+    fn valid(self) -> Option<u32> {
+        match self {
+            Self::Valid(generation) => Some(generation),
+            Self::Absent | Self::Fault => None,
+        }
+    }
+}
+
 /// Read and validate one durable generation file; `payload` receives the
-/// record body and the valid record's generation is returned. Any missing,
-/// short, oversized, or corrupt file reads as `None`.
+/// record body.
 fn read_generation_file<
     D,
     T,
@@ -44,26 +66,54 @@ fn read_generation_file<
     name: &str,
     magic: [u8; 4],
     payload: &mut [u8],
-) -> Option<u32>
+) -> GenerationRead
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let total = payload.len().checked_add(DURABLE_OVERHEAD)?;
+    let Some(total) = payload.len().checked_add(DURABLE_OVERHEAD) else {
+        return GenerationRead::Absent;
+    };
     if total > DURABLE_MAX_BYTES {
-        return None;
+        return GenerationRead::Absent;
     }
-    let file = directory.open_file_in_dir(name, Mode::ReadOnly).ok()?;
+    let file = match directory.open_file_in_dir(name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return GenerationRead::Absent,
+        Err(_) => return GenerationRead::Fault,
+    };
     if file.length() as usize != total {
-        return None;
+        return GenerationRead::Absent;
     }
     let mut bytes = [0u8; DURABLE_MAX_BYTES];
-    read_exact_file(&file, &mut bytes[..total]).ok()?;
-    decode_durable_record(magic, &bytes[..total], payload)
+    if read_exact_file(&file, &mut bytes[..total]).is_err() {
+        return GenerationRead::Fault;
+    }
+    match decode_durable_record(magic, &bytes[..total], payload) {
+        Some(generation) => GenerationRead::Valid(generation),
+        None => GenerationRead::Absent,
+    }
+}
+
+/// What an A/B pair had to say, with the newest valid record in `payload`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TwoGenerationRead {
+    Found,
+    /// Neither side holds a record.
+    Absent,
+    /// One side would not read. Reported even when the other side held a
+    /// record, because which of them is newer is exactly what the refused
+    /// side would have said.
+    Fault,
+}
+
+impl TwoGenerationRead {
+    fn found(self) -> bool {
+        self == Self::Found
+    }
 }
 
 /// Read the newest valid generation out of an A/B file pair into `payload`.
-/// False means neither side holds a valid record.
 fn read_two_generation<
     D,
     T,
@@ -75,7 +125,7 @@ fn read_two_generation<
     names: [&str; 2],
     magic: [u8; 4],
     payload: &mut [u8],
-) -> bool
+) -> TwoGenerationRead
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -83,18 +133,21 @@ where
     let mut other = [0u8; DURABLE_MAX_BYTES];
     let a = read_generation_file(directory, names[0], magic, payload);
     let b = read_generation_file(directory, names[1], magic, &mut other[..payload.len()]);
-    match (a, b) {
-        (None, None) => false,
-        (Some(_), None) => true,
+    if a == GenerationRead::Fault || b == GenerationRead::Fault {
+        return TwoGenerationRead::Fault;
+    }
+    match (a.valid(), b.valid()) {
+        (None, None) => TwoGenerationRead::Absent,
+        (Some(_), None) => TwoGenerationRead::Found,
         (None, Some(_)) => {
             payload.copy_from_slice(&other[..payload.len()]);
-            true
+            TwoGenerationRead::Found
         }
         (Some(a), Some(b)) if generation_is_newer(b, a) => {
             payload.copy_from_slice(&other[..payload.len()]);
-            true
+            TwoGenerationRead::Found
         }
-        (Some(_), Some(_)) => true,
+        (Some(_), Some(_)) => TwoGenerationRead::Found,
     }
 }
 
@@ -118,8 +171,10 @@ where
     T: TimeSource,
 {
     let mut scratch = [0u8; DURABLE_MAX_BYTES];
-    let a = read_generation_file(directory, names[0], magic, &mut scratch[..payload.len()]);
-    let b = read_generation_file(directory, names[1], magic, &mut scratch[..payload.len()]);
+    // A side that would not read is treated as the older one, so the write
+    // lands there and the side that did read survives it.
+    let a = read_generation_file(directory, names[0], magic, &mut scratch[..payload.len()]).valid();
+    let b = read_generation_file(directory, names[1], magic, &mut scratch[..payload.len()]).valid();
     let (target, generation) = match (a, b) {
         (Some(a), Some(b)) if generation_is_newer(b, a) => (0, b.wrapping_add(1)),
         (Some(a), Some(_)) => (1, a.wrapping_add(1)),
@@ -142,7 +197,7 @@ where
         magic,
         &mut verify[..payload.len()],
     );
-    if verified == Some(generation) && &verify[..payload.len()] == payload {
+    if verified.valid() == Some(generation) && &verify[..payload.len()] == payload {
         Ok(())
     } else {
         Err(())
@@ -306,7 +361,10 @@ where
     let name = place_dir_name(id);
     let copy = open_or_make_dir(&places, name.as_str()).map_err(|_| PlaceDenied::Fault)?;
     match read_place_in(&copy) {
-        Some(record) if record.id != id => return Err(PlaceDenied::Taken),
+        PlaceRead::Found(record) if record.id != id => return Err(PlaceDenied::Taken),
+        // Whether another copy holds this directory is exactly what the card
+        // declined to say, so publishing into it would be a guess.
+        PlaceRead::Fault => return Err(PlaceDenied::Fault),
         _ => {}
     }
     write_two_generation(
@@ -324,39 +382,80 @@ where
     .map_err(|_| PlaceDenied::Fault)
 }
 
-/// Where the reader left off in this copy, or `None` when nothing legible is
-/// stored for it. A directory holding another copy's id reads as `None` for
-/// the same reason it refuses a write.
+/// What the card says about where the reader left off in this copy.
+///
+/// Three answers, not two. A card that refuses a read has said nothing about
+/// the place, and treating that as "no place stored" turns an exact position
+/// into a page fallback or into nothing, with no later look to correct it.
+/// The same reasoning the cache claim is built on: failure to read ownership
+/// is not evidence that there is no owner.
 ///
 /// The whole record comes back. Whether the anchor can be believed depends on
 /// the source stored beside it, which is the caller's question to ask.
+pub enum PlaceRead {
+    /// A record this copy owns.
+    Found(proto::nvm::PlaceRecord),
+    /// Nothing legible stored for it, or a directory another copy's id holds,
+    /// which reads as absent for the same reason a write is refused. Durable
+    /// either way: the next look gets the same answer.
+    Absent,
+    /// The card would not say.
+    Fault,
+}
+
+impl PlaceRead {
+    /// The record when there was one. For callers asking whether a place
+    /// exists rather than what the card could tell them.
+    pub fn found(self) -> Option<proto::nvm::PlaceRecord> {
+        match self {
+            Self::Found(record) => Some(record),
+            Self::Absent | Self::Fault => None,
+        }
+    }
+}
+
 pub fn read_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     id: proto::identity::BookId,
-) -> Option<proto::nvm::PlaceRecord>
+) -> PlaceRead
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let places = cache_root.open_dir(PLACES_DIR).ok()?;
-    let copy = places.open_dir(place_dir_name(id).as_str()).ok()?;
-    let record = read_place_in(&copy)?;
-    (record.id == id).then_some(record)
+    let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return PlaceRead::Absent,
+        Err(_) => return PlaceRead::Fault,
+    };
+    for step in [PLACES_DIR, place_dir_name(id).as_str()] {
+        match dir.change_dir(step) {
+            Ok(()) => {}
+            Err(embedded_sdmmc::Error::NotFound) => return PlaceRead::Absent,
+            Err(_) => return PlaceRead::Fault,
+        }
+    }
+    match read_place_in(&dir) {
+        PlaceRead::Found(record) if record.id != id => PlaceRead::Absent,
+        answer => answer,
+    }
 }
 
 fn read_place_in<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     copy: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-) -> Option<proto::nvm::PlaceRecord>
+) -> PlaceRead
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let mut bytes = [0u8; proto::nvm::PlaceRecord::ENCODED_LEN];
-    if !read_two_generation(copy, PLACE_GENERATIONS, PLACE_DURABLE_MAGIC, &mut bytes) {
-        return None;
+    match read_two_generation(copy, PLACE_GENERATIONS, PLACE_DURABLE_MAGIC, &mut bytes) {
+        TwoGenerationRead::Fault => PlaceRead::Fault,
+        TwoGenerationRead::Absent => PlaceRead::Absent,
+        TwoGenerationRead::Found => match proto::nvm::PlaceRecord::decode(&bytes) {
+            Some(record) => PlaceRead::Found(record),
+            None => PlaceRead::Absent,
+        },
     }
-    proto::nvm::PlaceRecord::decode(&bytes)
 }
 
 /// Per-book reading position beside the book's cache records, so
@@ -638,7 +737,9 @@ where
         POSITION_GENERATIONS,
         POSITION_DURABLE_MAGIC,
         &mut bytes,
-    ) {
+    )
+    .found()
+    {
         return decode_position(&bytes);
     }
     // Legacy single-file fallback, kept readable so an upgrade resumes at
@@ -1173,7 +1274,9 @@ where
         STATE_GENERATIONS,
         STATE_DURABLE_MAGIC,
         &mut bytes,
-    ) {
+    )
+    .found()
+    {
         return proto::nvm::AppStateRecord::decode(&bytes);
     }
     let file = cache_root
@@ -1359,6 +1462,7 @@ where
         WIFI_HINT_DURABLE_MAGIC,
         &mut bytes,
     )
+    .found()
     .then(|| proto::nvm::WifiApHintRecord::decode(&bytes))
     .flatten()
 }
@@ -1385,7 +1489,9 @@ where
         WIFI_GENERATIONS,
         WIFI_DURABLE_MAGIC,
         &mut bytes,
-    ) {
+    )
+    .found()
+    {
         return proto::nvm::WifiCredentialsRecord::decode(&bytes);
     }
     let file = cache_root

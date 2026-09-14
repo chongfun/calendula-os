@@ -1007,7 +1007,17 @@ where
     // 10 of an eventual 200 the halfway mark. A place whose progression is
     // stale or absent is still a place; one with no anchor is nothing.
     let progression = if library.book_index_is_partial() {
-        files::read_place(root, id).and_then(|place| place.progression)
+        match files::read_place(root, id) {
+            files::PlaceRead::Found(place) => place.progression,
+            files::PlaceRead::Absent => None,
+            // Writing now would publish this anchor with the fraction beside
+            // it dropped, on no evidence that there was one to keep. The save
+            // repeats, so owing it costs a settle interval.
+            files::PlaceRead::Fault => {
+                esp_println::println!("storage: the place read failed; leaving the save owed");
+                return Err(());
+            }
+        }
     } else {
         let total = library.advertised_page_count().max(1);
         Some(((u64::from(screen) * u64::from(u16::MAX)) / u64::from(total)) as u16)
@@ -1267,6 +1277,11 @@ pub(crate) enum SavedPlace {
         chapter: u16,
         page: u32,
     },
+    /// The card would not say what is stored. Not a place, and not the
+    /// absence of one: the open takes its provisional page and the settle
+    /// slices read again, under the same refusal budget as any other place
+    /// the card refuses.
+    Unreadable,
 }
 
 impl SavedPlace {
@@ -1279,6 +1294,10 @@ impl SavedPlace {
         match self {
             Self::Place { anchor, .. } => (anchor.spine, 0),
             Self::Page { chapter, page } => (chapter, page),
+            // Nothing is known about where the reader was, so the open takes
+            // the start of the book and the retry moves them if the card
+            // comes back with an answer.
+            Self::Unreadable => (0, 0),
         }
     }
 }
@@ -1307,23 +1326,31 @@ pub(crate) fn load_place(
             locator: path.as_str(),
         };
         if let Some(id) = record_copy_id(root, library, index) {
-            if let Some(place) = files::read_place(root, id) {
-                // Against the copy's content, so a book that moved keeps its
-                // exact place: a move changes the locator and nothing else,
-                // and the anchor exists to survive exactly that.
-                let now = files::place_source_for(entry.byte_size);
-                return Some(SavedPlace::Place {
-                    anchor: place.anchor,
-                    exact: place.describes(&now),
-                    progression: place.progression,
-                });
+            match files::read_place(root, id) {
+                files::PlaceRead::Found(place) => {
+                    // Against the copy's content, so a book that moved keeps
+                    // its exact place: a move changes the locator and nothing
+                    // else, and the anchor exists to survive exactly that.
+                    let now = files::place_source_for(entry.byte_size);
+                    return Some(SavedPlace::Place {
+                        anchor: place.anchor,
+                        exact: place.describes(&now),
+                        progression: place.progression,
+                    });
+                }
+                // Falling through to the page-keyed position here would take
+                // a layout-specific page, or nothing, over an exact place the
+                // card is holding and would hand over on the next look.
+                files::PlaceRead::Fault => return Some(SavedPlace::Unreadable),
+                files::PlaceRead::Absent => {}
             }
         }
         files::read_position_file_or_legacy(root, &owner, display_name.as_str(), entry.byte_size)
             .map(|(chapter, page)| SavedPlace::Page { chapter, page })
     })
-    .ok()
-    .flatten()
+    // A session that would not open is the same answer as a place that would
+    // not read, and the same remedy: look again on a later slice.
+    .unwrap_or(Some(SavedPlace::Unreadable))
 }
 
 /// What a stored place asks the open to do next.
@@ -1361,6 +1388,15 @@ pub(crate) fn resolve_place(
     index: usize,
     place: SavedPlace,
 ) -> PlaceTarget {
+    // The one place that reads the card again rather than resolving what it
+    // was handed. The refusal budget above this bounds the asking.
+    let place = match place {
+        SavedPlace::Unreadable => match load_place(epd, sd_cs, library, index) {
+            Some(SavedPlace::Unreadable) | None => return PlaceTarget::Unavailable,
+            Some(read) => read,
+        },
+        read => read,
+    };
     let SavedPlace::Place {
         anchor,
         exact,
