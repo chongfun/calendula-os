@@ -484,6 +484,18 @@ enum OpenPhase {
     Done,
 }
 
+/// What a saved record says about a [`PlaceHold`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldVerdict {
+    /// Another book's record. It says nothing about this hold either way.
+    Unrelated,
+    /// The page the hold stands on, so the stored place keeps it.
+    Held,
+    /// The reader chose somewhere else in this book. The write goes, and the
+    /// hold is over.
+    Superseded,
+}
+
 /// A restore's claim on a book's stored place.
 ///
 /// A restore that could not reach the saved position leaves the reader on a
@@ -517,15 +529,21 @@ impl PlaceHold {
         self.landed = page;
     }
 
-    /// Whether a save of `page` in `book_id` is the reader somewhere they
-    /// chose, which both frees the place write and ends this hold.
+    /// What a save of `page` in `book_id` says about this hold.
     ///
-    /// Both halves matter. Answering without ending it leaves a hold standing
-    /// on a page the reader has left, and it forbids that page the next time
-    /// they come back to it, holding the card at wherever they went in
-    /// between.
-    pub const fn superseded_by(self, book_id: u32, page: u32) -> bool {
-        self.book_id != book_id || page != self.landed
+    /// Three answers, not two. Another book's save is not the reader moving
+    /// within this one, and reading it as one spends a restore that book is
+    /// still owed. Within this book, answering without ending the hold leaves
+    /// it standing on a page the reader has left, forbidding that page the
+    /// next time they come back to it.
+    pub const fn verdict(self, book_id: u32, page: u32) -> HoldVerdict {
+        if self.book_id != book_id {
+            HoldVerdict::Unrelated
+        } else if page == self.landed {
+            HoldVerdict::Held
+        } else {
+            HoldVerdict::Superseded
+        }
     }
 }
 
@@ -866,41 +884,31 @@ mod tests {
     /// The whole life of a restore's hold, which is where the save rule keeps
     /// going wrong. It stands on the page the open put the reader on and
     /// forbids that page being written over the stored place, frees anywhere
-    /// else, and has to end at the move that freed it. A hold that outlives
-    /// its own supersession is the failure: the reader comes back to the page
-    /// it stands on, the save is forbidden again, and the card keeps pointing
-    /// at wherever they went in between.
+    /// else in the same book, and has to end at the move that freed it.
     #[test]
     fn a_hold_ends_at_the_move_that_frees_it() {
         let book = ReaderSource::sd(2).book_id();
-        let other = ReaderSource::sd(3).book_id();
         let hold = PlaceHold::new(book, 0);
 
-        assert!(
-            !hold.superseded_by(book, 0),
+        assert_eq!(
+            hold.verdict(book, 0),
+            HoldVerdict::Held,
             "the page the reader was put on is the one the hold is for"
         );
-        assert!(
-            hold.superseded_by(book, 1),
+        assert_eq!(
+            hold.verdict(book, 1),
+            HoldVerdict::Superseded,
             "anywhere else in the book is the reader choosing"
-        );
-        assert!(
-            hold.superseded_by(other, 0),
-            "and so is the same page number in another book"
         );
 
         // The reader turns to page 1, which frees the save. Whoever holds
         // this has to drop it here: asking again once they turn back to page
         // 0 would forbid the page they are actually on.
         let mut held = Some(hold);
-        if held.is_some_and(|hold| hold.superseded_by(book, 1)) {
+        if held.is_some_and(|hold| hold.verdict(book, 1) == HoldVerdict::Superseded) {
             held = None;
         }
         assert!(held.is_none(), "the move that frees the save ends the hold");
-        assert!(
-            held.is_none_or(|hold| hold.superseded_by(book, 0)),
-            "so page 0 is the reader's own page now, and storable"
-        );
 
         // The first move frees it, not the last one seen. A caller that keeps
         // only the latest of several moves, which the firmware's write
@@ -909,9 +917,45 @@ mod tests {
         // then and only then, the claim survives both turns and forbids the
         // page the reader is on. So every arrival asks, whether or not it is
         // the one that gets written.
-        assert!(
-            !PlaceHold::new(book, 0).superseded_by(book, 0),
+        assert_eq!(
+            PlaceHold::new(book, 0).verdict(book, 0),
+            HoldVerdict::Held,
             "asked only about where the turns ended, the claim outlives them"
+        );
+    }
+
+    /// A hold speaks for its own book. Another book's save is not the reader
+    /// moving within this one, and spending the hold on it leaves the book
+    /// still owed a restore with its stored place open to the next write.
+    /// Reachable through the write coalescer, which holds one book's record
+    /// while the reader opens another and flushes it afterwards.
+    #[test]
+    fn another_books_save_says_nothing_about_this_hold() {
+        let book = ReaderSource::sd(2).book_id();
+        let other = ReaderSource::sd(3).book_id();
+        let hold = PlaceHold::new(book, 0);
+
+        assert_eq!(
+            hold.verdict(other, 0),
+            HoldVerdict::Unrelated,
+            "the same page number in another book is another book"
+        );
+        assert_eq!(
+            hold.verdict(other, 7),
+            HoldVerdict::Unrelated,
+            "and so is any other page of it"
+        );
+
+        // So it neither ends the hold nor waits on it.
+        let mut held = Some(hold);
+        if held.is_some_and(|hold| hold.verdict(other, 7) == HoldVerdict::Superseded) {
+            held = None;
+        }
+        assert!(held.is_some(), "the hold outlives another book's save");
+        assert_ne!(
+            hold.verdict(other, 7),
+            HoldVerdict::Held,
+            "and that save is not held back by it either"
         );
     }
 
@@ -924,12 +968,14 @@ mod tests {
         hold.settled_on(0);
 
         assert_eq!(hold.landed(), 0);
-        assert!(
-            !hold.superseded_by(book, 0),
+        assert_eq!(
+            hold.verdict(book, 0),
+            HoldVerdict::Held,
             "the page the fallback chose is not a page the reader chose"
         );
-        assert!(
-            hold.superseded_by(book, 40),
+        assert_eq!(
+            hold.verdict(book, 40),
+            HoldVerdict::Superseded,
             "and the page it left is somewhere they would have to go back to"
         );
     }

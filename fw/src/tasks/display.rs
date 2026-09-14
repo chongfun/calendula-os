@@ -365,7 +365,12 @@ fn place_may_be_replaced(
     record: &AppStateRecord,
 ) -> bool {
     retire_superseded_place(pending_place, record);
-    pending_place.is_none()
+    !matches!(
+        pending_place
+            .as_ref()
+            .map(|waiting| waiting.hold.verdict(record.book_id, record.screen)),
+        Some(app_core::storage_loop::HoldVerdict::Held)
+    )
 }
 
 /// Drop a restore's claim once a record proves the reader has gone somewhere
@@ -375,10 +380,11 @@ fn place_may_be_replaced(
 /// moments: a record can be coalesced away or refused by the card, and the
 /// reader moved either way.
 fn retire_superseded_place(pending_place: &mut Option<PendingPlace>, record: &AppStateRecord) {
-    if pending_place
-        .as_ref()
-        .is_some_and(|waiting| waiting.hold.superseded_by(record.book_id, record.screen))
-    {
+    let superseded = pending_place.as_ref().is_some_and(|waiting| {
+        waiting.hold.verdict(record.book_id, record.screen)
+            == app_core::storage_loop::HoldVerdict::Superseded
+    });
+    if superseded {
         *pending_place = None;
     }
 }

@@ -2881,11 +2881,6 @@ where
         esp_println::println!("epub: reindex publish failed, falling back");
         return false;
     }
-    library.finish_book_load(
-        published.cover.map_or(0, |_| 0),
-        0,
-        reader_cache::store::BookLoadStatus::Ready,
-    );
     esp_println::println!(
         "epub: reindexed {} section(s) for this layout in {} ms",
         count,

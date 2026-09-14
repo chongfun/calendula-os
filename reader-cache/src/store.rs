@@ -1144,8 +1144,8 @@ impl ReaderStore {
         true
     }
 
-    /// Where a page read back from a section file starts in its item's
-    /// content. Separate from [`set_cached_page`](Self::set_cached_page)
+    /// Where a block read back from a section file starts in its item's
+    /// content. Separate from [`set_cached_block`](Self::set_cached_block)
     /// because the two come off the card in separate passes.
     pub(crate) fn set_cached_block_offset(&mut self, index: usize, offset: u32) -> bool {
         if index >= self.block_offset.len() {
