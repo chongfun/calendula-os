@@ -2080,6 +2080,13 @@ fn handle_storage_command(
                                 place,
                             );
                             let landing = u32::from(open.target_page());
+                            // Where the open actually leaves the reader. The
+                            // ladder below can settle somewhere other than the
+                            // landing, and the hold has to stand on the page
+                            // they are on: one standing anywhere else reads as
+                            // the reader having moved, which retires the place
+                            // and frees the save it exists to hold back.
+                            let mut settled = landing;
                             let landed_on = match resolved {
                                 book_build::PlaceTarget::Page(target) => {
                                     let loaded = load_target_page(
@@ -2130,7 +2137,10 @@ fn handle_storage_command(
                                             font_metrics,
                                             background_build,
                                         ) {
-                                            Some(page) => open.resolve_place(page),
+                                            Some(page) => {
+                                                settled = page;
+                                                open.resolve_place(page);
+                                            }
                                             None => landed_nothing = true,
                                         }
                                         Some(())
@@ -2154,7 +2164,7 @@ fn handle_storage_command(
                             // on the card, so the next open reads it again.
                             let landed_on = if landed_nothing { None } else { landed_on };
                             *pending_place = landed_on.map(|()| PendingPlace {
-                                hold: app_core::storage_loop::PlaceHold::new(book_id, landing),
+                                hold: app_core::storage_loop::PlaceHold::new(book_id, settled),
                                 index,
                                 place,
                                 refusals: 0,
