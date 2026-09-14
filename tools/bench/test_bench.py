@@ -1901,6 +1901,12 @@ class PageTurnCounterTests(unittest.TestCase):
         spare_stats = bench.page_turn_stats_over_epochs(spare)
         self.assertEqual(spare_stats.durations, [354], "the proved turn alone")
         self.assertEqual(spare_stats.unknown_answered, 1)
+        # Uncertain as a turn, and answered as a press. Counting it as a
+        # dropped input would spend the trust budget that exists for operator
+        # cadence and throw the one verified timing away with it.
+        self.assertEqual(spare_stats.unmatched_presses, 0, "both presses were answered")
+        self.assertEqual(spare_stats.untrusted_fraction, 0.0)
+        self.assertTrue(spare_stats.median_trusted, "the verified timing still counts")
 
     def test_a_short_capture_is_reported_against_what_was_asked_for(self) -> None:
         events = [

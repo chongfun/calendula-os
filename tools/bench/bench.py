@@ -1784,7 +1784,10 @@ class PageTurnStats:
     # Answered, so not unmatched, and not a turn either.
     unmoved_answered: int = 0
     # Answers with no page before them to compare against, which is the
-    # first Reading render a capture sees. They count toward what a capture
+    # first Reading render a capture sees. Subtracted from the unmatched
+    # count like every other answered bucket: uncertain as a turn is not the
+    # same as unanswered as a press, and counting it as the latter would
+    # spend the trust budget that exists for operator cadence. They count toward what a capture
     # collected, since that is usually what they are, and are kept out of
     # `durations`: the same record is a no-op on a device already at the
     # last page, and the median is an enforced budget. The coverage check
@@ -1801,6 +1804,7 @@ class PageTurnStats:
             - self.coalesced_presses
             - self.spared_turns
             - self.unmoved_answered
+            - self.unknown_answered
         )
 
     @property
