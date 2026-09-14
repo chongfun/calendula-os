@@ -151,9 +151,6 @@ where
     }
 }
 
-/// Write `payload` as the next generation of an A/B file pair, overwriting
-/// the *older* side so the newest survivor is never the one mid-write, then
-/// prove the write by re-reading it through the validating read path.
 /// Write one whole record over a file that is already exactly that long.
 ///
 /// Truncating first frees the cluster chain and allocates it again for the
@@ -191,6 +188,9 @@ where
     file.write(record).map_err(|_| ())
 }
 
+/// Write `payload` as the next generation of an A/B file pair, overwriting
+/// the *older* side so the newest survivor is never the one mid-write, then
+/// prove the write by re-reading it through the validating read path.
 fn write_two_generation<
     D,
     T,
