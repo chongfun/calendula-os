@@ -589,20 +589,6 @@ impl CoverCacheHeader {
     }
 }
 
-pub fn book_cache_size(header: BookCacheHeader) -> usize {
-    BOOK_HEADER_BYTES
-        + header.spine_count as usize * SPINE_RECORD_BYTES
-        + header.toc_count as usize * TOC_RECORD_BYTES
-        + header.string_bytes as usize
-}
-
-pub fn page_cache_size(header: PageCacheHeader) -> usize {
-    PAGE_HEADER_BYTES
-        + header.page_count as usize * PAGE_RECORD_BYTES
-        + header.block_count as usize * BLOCK_RECORD_BYTES
-        + header.text_bytes as usize
-}
-
 pub fn section_cache_size(header: SectionHeader) -> usize {
     SECTION_HEADER_BYTES
         + header.page_count as usize * PAGE_RECORD_BYTES

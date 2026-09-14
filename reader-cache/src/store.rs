@@ -611,18 +611,6 @@ impl ReaderStore {
         &self.window[..self.window_len]
     }
 
-    pub fn catalog_window_start(&self) -> usize {
-        self.window_start
-    }
-
-    /// True when the loaded window already covers `[start, start+len)`, so the
-    /// firmware can skip a re-read while scrolling inside it.
-    pub fn window_covers(&self, start: usize, len: usize) -> bool {
-        self.window_len > 0
-            && start >= self.window_start
-            && start + len <= self.window_start + self.window_len
-    }
-
     /// Begin filling a fresh window at `start`; `push_window_entry` appends.
     pub fn begin_window(&mut self, start: usize) {
         self.window_start = start;

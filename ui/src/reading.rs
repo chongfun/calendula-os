@@ -519,10 +519,6 @@ pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
-/// Footer band top: 14 rows up from the panel's bottom edge. Panel-relative
-/// so the X3's taller page pushes the footer to its own bottom edge; on the
-/// X4 this is the historical 466.
-pub const READER_FOOTER_TOP: i16 = display::HEIGHT as i16 - 14;
 /// Page-counter text baseline: as low as it goes without clipping (the
 /// slash inks 2 rows below its baseline). Used by `fw::views` so the
 /// footer's exact panel-relative position lives in one place instead of
