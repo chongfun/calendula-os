@@ -963,7 +963,7 @@ pub struct BookOpenRollback {
     /// describes: a page carrying the wrong stamp reads as current, and the
     /// next open of this book resumes at a number that means something else
     /// rather than resolving the stored place.
-    pub page_layout: u16,
+    pub page_layout: Option<u16>,
     pub view: AppView,
     pub selection: u16,
     pub sd_page_count: u32,
@@ -1202,7 +1202,7 @@ pub fn open_book_command(
         // The page in hand was counted under another layout, so it names
         // nothing in the one this open adopts. The stored place is the only
         // thing that still means where the reader was.
-        resolve_place: state.page_layout != state.layout_stamp(),
+        resolve_place: state.page_layout != Some(state.layout_stamp()),
     }
 }
 
@@ -2268,11 +2268,18 @@ impl ReducerContext {
 pub struct ReaderState {
     pub view: AppView,
     pub page: u32,
-    /// The layout `page` was counted under, so an open can tell whether the
-    /// number in hand still describes a pagination that exists. A settings
-    /// round trip back to where it started keeps its page: the stamp matches
-    /// again.
-    pub page_layout: u16,
+    /// The layout `page` was counted under, or `None` for a page this app did
+    /// not count.
+    ///
+    /// An open compares it against the layout in hand to tell whether the
+    /// number still describes a pagination that exists. A settings round trip
+    /// back to where it started keeps its page: the stamp matches again.
+    ///
+    /// `None` rather than a reserved number: the stamp packs settings into
+    /// bits and a real one can be zero. The boot restore takes its page off
+    /// the card, so it starts here and the first open resolves the stored
+    /// place rather than trusting the number.
+    pub page_layout: Option<u16>,
     /// A book that was selected and could not be read.
     ///
     /// The reader chose it, so it stays chosen and shows its error. What it
@@ -2362,7 +2369,7 @@ impl ReaderState {
 
     /// Record that `page` was counted under the settings in hand.
     pub const fn stamp_page_layout(&mut self) {
-        self.page_layout = self.layout_stamp();
+        self.page_layout = Some(self.layout_stamp());
     }
 
     /// Whether the book on screen is one that could not be read.
@@ -2378,7 +2385,7 @@ impl ReaderState {
         Self {
             view: AppView::Home,
             page: 0,
-            page_layout: 0,
+            page_layout: None,
             unreadable_book: None,
             selection: 0,
             chapter: 0,
@@ -4183,6 +4190,51 @@ mod tests {
         assert_eq!(recovered.view, AppView::Reading);
     }
 
+    /// Boot takes its page off the card, so the first open resolves the stored
+    /// place rather than trusting the number. The lowest of every setting
+    /// packs to a stamp of zero, so a zero meaning "unstamped" would read as
+    /// counted under exactly those settings, and a reader on them would reboot
+    /// to the page mirror instead of where they were.
+    #[test]
+    fn a_boot_resolves_its_place_even_on_the_settings_that_pack_to_zero() {
+        let state = ReaderState::boot();
+        assert_eq!(state.page_layout, None, "boot counted no page");
+
+        let restored = state.apply_library_event(
+            CTX,
+            LibraryEvent::Restored {
+                book_id: ReaderSource::sd(2).book_id(),
+                chapter: 13,
+                page: 302,
+                page_count: 400,
+                reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
+                refresh_policy: RefreshPolicy::FullOnWake as u8,
+                font_size: FontSize::Small as u8,
+                line_spacing: LineSpacing::Compact as u8,
+                font_weight: FontWeight::Normal as u8,
+                font_family: FontFamily::Literata as u8,
+                front_buttons: FrontButtons::PagesRight as u8,
+            },
+        );
+        assert_eq!(
+            restored.layout_stamp(),
+            0,
+            "the fixture needs the settings whose stamp is zero"
+        );
+        assert_eq!(
+            restored.page_layout, None,
+            "and the restore adopts a page it did not count"
+        );
+
+        match open_book_command(&restored, 2, 1, None, None) {
+            StorageCommand::OpenBook { resolve_place, .. } => assert!(
+                resolve_place,
+                "the page came off the card, so the place decides where to open"
+            ),
+            other => panic!("expected an open, got {other:?}"),
+        }
+    }
+
     /// The stamp says whether the page in hand still describes a pagination
     /// that exists, so it tracks what pagination depends on: the page box.
     /// Both landscapes share one box and both portraits the other. A stamp
@@ -4199,7 +4251,7 @@ mod tests {
         state.orientation = DisplayOrientation::PortraitButtonsRight;
         assert_eq!(
             state.page_layout,
-            state.layout_stamp(),
+            Some(state.layout_stamp()),
             "both portraits paginate into the same box"
         );
 
@@ -4208,7 +4260,7 @@ mod tests {
         state.orientation = DisplayOrientation::LandscapeButtonsTop;
         assert_eq!(
             state.page_layout,
-            state.layout_stamp(),
+            Some(state.layout_stamp()),
             "and so do both landscapes"
         );
 
@@ -4216,7 +4268,7 @@ mod tests {
         state.orientation = DisplayOrientation::PortraitButtonsLeft;
         assert_ne!(
             state.page_layout,
-            state.layout_stamp(),
+            Some(state.layout_stamp()),
             "landscape to portrait moves every page boundary"
         );
 
@@ -4229,7 +4281,7 @@ mod tests {
         ] {
             state.orientation = orientation;
             state.stamp_page_layout();
-            let portrait_bit = (state.page_layout >> 11) & 1 == 1;
+            let portrait_bit = (state.page_layout.expect("just stamped") >> 11) & 1 == 1;
             assert_eq!(
                 portrait_bit,
                 is_portrait(orientation),
@@ -4251,7 +4303,7 @@ mod tests {
         before.font_size = FontSize::Large;
         assert_ne!(
             before.page_layout,
-            before.layout_stamp(),
+            Some(before.layout_stamp()),
             "the fixture needs a page the current layout did not count"
         );
         let rollback = before.open_rollback();
@@ -4270,7 +4322,7 @@ mod tests {
         );
         assert_ne!(
             recovered.page_layout,
-            recovered.layout_stamp(),
+            Some(recovered.layout_stamp()),
             "and the next open of this book resolves the place rather than \
              trusting the number"
         );
