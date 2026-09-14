@@ -1880,6 +1880,12 @@ where
 /// configuration the reader has left.
 pub const MAX_RESIDENT_LAYOUTS: usize = 2;
 
+/// Room for every layout key there is. `ui::reading::layout_key` masks to six
+/// bits, so 64 holds the whole space and a listing cannot come back short. A
+/// smaller buffer would drop names once a card went over the bound, which is
+/// the one situation the listing exists to notice.
+const LAYOUT_KEY_COUNT: usize = 64;
+
 /// The layouts this book has section files for, read off the card.
 ///
 /// Listed rather than recorded. A record of what is resident can drift from
@@ -1901,13 +1907,13 @@ pub fn resident_layouts<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
-) -> Option<heapless::Vec<u8, 16>>
+) -> Option<heapless::Vec<u8, LAYOUT_KEY_COUNT>>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     use core::fmt::Write;
-    let empty: heapless::Vec<u8, 16> = heapless::Vec::new();
+    let empty: heapless::Vec<u8, LAYOUT_KEY_COUNT> = heapless::Vec::new();
     // One handle down the chain, as the build does, so this costs one
     // directory slot rather than four.
     let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
@@ -1936,7 +1942,7 @@ where
         Err(embedded_sdmmc::Error::NotFound) => return Some(empty),
         Err(_) => return None,
     }
-    let mut found: heapless::Vec<u8, 16> = heapless::Vec::new();
+    let mut found: heapless::Vec<u8, LAYOUT_KEY_COUNT> = heapless::Vec::new();
     let listed = dir.iterate_dir(|entry| {
         if entry.attributes.is_directory() || found.is_full() {
             return ControlFlow::Continue(());

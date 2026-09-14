@@ -2770,6 +2770,11 @@ where
     T: TimeSource,
 {
     let started = Instant::now();
+    // Before the labels, not after: `begin_book_load` clears the title,
+    // author and TOC, and the index this rebuilds is written out of the
+    // store. Clearing after the load published a book with none of them and
+    // put that on the card as the authoritative index.
+    library.begin_book_load();
     if !files::load_v2_book_labels_and_toc(root, owner, source_identity, library) {
         return false;
     }
@@ -2783,7 +2788,6 @@ where
         return false;
     };
     let sections = &scratch.book_sections[..count];
-    library.begin_book_load();
     let published = publish::publish_book_cache(
         root,
         owner,

@@ -1115,7 +1115,7 @@ fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
     );
     assert_eq!(
         files::resident_layouts(&root, &OWNER).expect("the card answers"),
-        heapless::Vec::<u8, 16>::from_slice(&[victim]).expect("one layout"),
+        heapless::Vec::<u8, 64>::from_slice(&[victim]).expect("one layout"),
         "and the sections are still there to be counted next time"
     );
 }
