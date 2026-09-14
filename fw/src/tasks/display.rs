@@ -91,33 +91,35 @@ fn resolve_pending_place(
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     font_metrics: &mut crate::custom_font::MetricCache,
     background_build: &mut Option<BackgroundBuild>,
-) -> Option<u32> {
-    let waiting = pending_place.as_ref()?;
+) -> PlaceOutcome {
+    let Some(waiting) = pending_place.as_ref() else {
+        return PlaceOutcome::Waiting;
+    };
     if waiting.book_id != book_id {
         // A place left over from a book the reader has moved on from. Its
         // walk belongs to that open, and this one will not carry it.
         *pending_place = None;
-        return None;
+        return PlaceOutcome::Waiting;
     }
     // `None` is nobody reading this book, which is not the same as somebody
     // reading its first page. Collapsing the two lets a place fire into a
     // book the reader has left, because the provisional landing is page 0.
     let Some(reader_page) = reader_page else {
         *pending_place = None;
-        return None;
+        return PlaceOutcome::Waiting;
     };
     if reader_page != waiting.landed {
         // The reader moved. Whatever they are reading now is a better answer
         // than where they left off last time.
         *pending_place = None;
-        return None;
+        return PlaceOutcome::Waiting;
     }
     let index = waiting.index;
+    let landed = waiting.landed;
     let place = waiting.place;
     match book_build::resolve_place(epd, sd_cs, sd_library, index as usize, place) {
         book_build::PlaceTarget::Page(target) => {
-            let landed = waiting.landed;
-            if !load_target_page(
+            if load_target_page(
                 epd,
                 sd_cs,
                 sd_library,
@@ -128,51 +130,53 @@ fn resolve_pending_place(
                 font_metrics,
                 background_build,
             ) {
-                // The page resolved and its text would not come off the card.
-                // Announcing it would move the reader onto a page nothing has
-                // loaded, so the place stays and a later slice tries again.
-                //
-                // The attempt cleared the store on its way in, so the page the
-                // reader is actually on has to be fetched back before this
-                // returns. Nothing else will: the open that loaded it is over.
-                esp_println::println!("restore: the place resolved and its section would not load");
-                if !load_target_page(
-                    epd,
-                    sd_cs,
-                    sd_library,
-                    index,
-                    landed,
-                    book_id,
-                    epub_scratch,
-                    font_metrics,
-                    background_build,
-                ) {
-                    esp_println::println!(
-                        "restore: and the page the reader was on would not come back"
-                    );
-                }
-                // Counted with the refused reads, and for the same reason. A
-                // target that resolves and will not load is a card saying no
-                // to a particular section, and retrying it forever means a
-                // cache build every settle interval for as long as the book
-                // stays open.
-                if let Some(waiting) = pending_place.as_mut() {
-                    waiting.refusals = waiting.refusals.saturating_add(1);
-                    if waiting.refusals >= PLACE_READ_REFUSALS {
-                        esp_println::println!(
-                            "restore: the place's section kept refusing; leaving the reader put"
-                        );
-                        *pending_place = None;
-                    }
-                }
-                return None;
+                *pending_place = None;
+                return PlaceOutcome::Moved(target);
             }
-            *pending_place = None;
-            Some(target)
+            // The place resolved and its text would not come off the card,
+            // which is a worse position rather than a different book. The
+            // same ladder the open walks: back to where the reader is, then
+            // the start of the book. The attempt cleared the store on its way
+            // in, so something has to be put back either way.
+            esp_println::println!("restore: the place resolved and its section would not load");
+            let settled = settle_on_a_readable_page(
+                epd,
+                sd_cs,
+                sd_library,
+                index,
+                landed,
+                book_id,
+                epub_scratch,
+                font_metrics,
+                background_build,
+            );
+            // Counted with the refused reads, and for the same reason: a
+            // target that resolves and will not load is a card saying no to a
+            // particular section, and retrying it forever means a cache build
+            // every settle interval for as long as the book stays open.
+            if let Some(waiting) = pending_place.as_mut() {
+                waiting.refusals = waiting.refusals.saturating_add(1);
+                if waiting.refusals >= PLACE_READ_REFUSALS {
+                    esp_println::println!(
+                        "restore: the place's section kept refusing; leaving the reader put"
+                    );
+                    *pending_place = None;
+                }
+            }
+            match settled {
+                // Back where the reader already was, so there is nothing to
+                // tell the app.
+                Some(page) if page == landed => PlaceOutcome::Waiting,
+                Some(page) => PlaceOutcome::Moved(page),
+                None => {
+                    *pending_place = None;
+                    PlaceOutcome::Unreadable
+                }
+            }
         }
         // Still short of it. Worth waiting only while a walk is coming: once
         // it has finished or stopped, no later slice will reach the place.
-        book_build::PlaceTarget::Extend(_) if walk_alive => None,
+        book_build::PlaceTarget::Extend(_) if walk_alive => PlaceOutcome::Waiting,
         // The card refused a read, which says nothing about the place, so the
         // remedy is to ask again. Counted, because a card that keeps refusing
         // would otherwise be asked forever; giving up costs this session's
@@ -188,11 +192,11 @@ fn resolve_pending_place(
                     *pending_place = None;
                 }
             }
-            None
+            PlaceOutcome::Waiting
         }
         _ => {
             *pending_place = None;
-            None
+            PlaceOutcome::Waiting
         }
     }
 }
@@ -237,22 +241,24 @@ fn load_target_page(
 ///
 /// A saved place that cannot be restored is a worse position, not a different
 /// book. The reader chose this one, so the ladder stays inside it: the page
-/// the open was landing on, then the start of the book. `false` is a book
-/// that would give up no page at all, which is the only thing that makes an
-/// open unreadable.
+/// the open was landing on, then the start of the book. `None` is a book that
+/// would give up no page at all, the one thing that makes an open unreadable.
+///
+/// Answers with the page rather than acting on it, because the two callers do
+/// different things with it and must not drift apart about how they got there:
+/// an open resolves its transaction, a background slice tells the app.
 #[expect(clippy::too_many_arguments)] // The open's whole world: the card, the store, the transaction, and the page it is trying to reach
 fn settle_on_a_readable_page(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     sd_library: &mut ReaderStore,
-    open: &mut app_core::storage_loop::OpenSequence,
     index: u16,
     landing: u32,
     book_id: u32,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     font_metrics: &mut crate::custom_font::MetricCache,
     background_build: &mut Option<BackgroundBuild>,
-) -> bool {
+) -> Option<u32> {
     for page in [landing, 0] {
         if load_target_page(
             epd,
@@ -268,12 +274,11 @@ fn settle_on_a_readable_page(
             if page != landing {
                 esp_println::println!("restore: falling back to the start of the book");
             }
-            open.resolve_place(page);
-            return true;
+            return Some(page);
         }
     }
     esp_println::println!("restore: no page of this book would load");
-    false
+    None
 }
 
 /// The page the reader is on in `book_id`, or `None` when no Reading render
@@ -287,6 +292,19 @@ fn reader_page_of(planner: &RefreshPlanner, book_id: u32) -> Option<u32> {
         .last_request()
         .filter(|request| request.book_id == book_id && request.view == AppView::Reading)
         .map(|request| request.page)
+}
+
+/// What a slice's look at a waiting place came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaceOutcome {
+    /// The reader belongs on this page now.
+    Moved(u32),
+    /// Nothing to tell the app: the place is still waiting, or it is gone, or
+    /// the reader is already where it settled.
+    Waiting,
+    /// The book gave up no page at all. Not a position any more: the text the
+    /// reader is looking at is gone with it.
+    Unreadable,
 }
 
 /// A stored place the open could not turn into a page yet.
@@ -499,23 +517,35 @@ pub async fn run(
                             font_metrics,
                             &mut background_build,
                         );
-                        if let Some(target) = resolved {
-                            esp_println::println!(
-                                "restore: the place resolved on a later look, page {}",
-                                target
-                            );
-                            send_loaded_library_event(&LibraryEvent::Loaded {
-                                book_id,
-                                pages: sd_library.advertised_page_count(),
-                                chapters: sd_library.chapter_count_for_ui(),
-                                current_chapter: sd_library.current_chapter(),
-                                chapter_pages: reader_cache::store::chapter_pages_for_event(
-                                    sd_library,
-                                ),
-                                position: Some(target),
-                                text_replaced: true,
-                            });
-                            continue;
+                        match resolved {
+                            PlaceOutcome::Moved(target) => {
+                                esp_println::println!(
+                                    "restore: the place resolved on a later look, page {}",
+                                    target
+                                );
+                                send_loaded_library_event(&LibraryEvent::Loaded {
+                                    book_id,
+                                    pages: sd_library.advertised_page_count(),
+                                    chapters: sd_library.chapter_count_for_ui(),
+                                    current_chapter: sd_library.current_chapter(),
+                                    chapter_pages: reader_cache::store::chapter_pages_for_event(
+                                        sd_library,
+                                    ),
+                                    position: Some(target),
+                                    text_replaced: true,
+                                });
+                                continue;
+                            }
+                            // The book took its own text with it and gave
+                            // nothing back. A `Loaded` here would say it has a
+                            // page, which is the one thing it does not have.
+                            PlaceOutcome::Unreadable => {
+                                send_loaded_library_event(&LibraryEvent::BookOpenUnreadable {
+                                    book_id,
+                                });
+                                continue;
+                            }
+                            PlaceOutcome::Waiting => {}
                         }
                     }
                     // No walk owed, so the slice goes to reading the open
@@ -699,21 +729,33 @@ pub async fn run(
                     font_metrics,
                     &mut background_build,
                 );
-                if let Some(target) = resolved_place {
-                    esp_println::println!(
-                        "restore: the place resolved once the book reached it, page {}",
-                        target
-                    );
-                    send_loaded_library_event(&LibraryEvent::Loaded {
-                        book_id: pending.book_id,
-                        pages: sd_library.advertised_page_count(),
-                        chapters: sd_library.chapter_count_for_ui(),
-                        current_chapter: sd_library.current_chapter(),
-                        chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
-                        position: Some(target),
-                        text_replaced: true,
-                    });
-                    continue;
+                match resolved_place {
+                    PlaceOutcome::Moved(target) => {
+                        esp_println::println!(
+                            "restore: the place resolved once the book reached it, page {}",
+                            target
+                        );
+                        send_loaded_library_event(&LibraryEvent::Loaded {
+                            book_id: pending.book_id,
+                            pages: sd_library.advertised_page_count(),
+                            chapters: sd_library.chapter_count_for_ui(),
+                            current_chapter: sd_library.current_chapter(),
+                            chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                            position: Some(target),
+                            text_replaced: true,
+                        });
+                        continue;
+                    }
+                    // Nothing of this book is resident any more, so the
+                    // announcement the walk was about to make would report an
+                    // empty store as a book with a page in it.
+                    PlaceOutcome::Unreadable => {
+                        send_loaded_library_event(&LibraryEvent::BookOpenUnreadable {
+                            book_id: pending.book_id,
+                        });
+                        continue;
+                    }
+                    PlaceOutcome::Waiting => {}
                 }
                 if announce {
                     // `position: None` — the book grew, the reader did not
@@ -1958,18 +2000,20 @@ fn handle_storage_command(
                                         // book. The reader asked for this one,
                                         // so the position weakens and the book
                                         // stays.
-                                        landed_nothing = !settle_on_a_readable_page(
+                                        match settle_on_a_readable_page(
                                             epd,
                                             sd_cs,
                                             sd_library,
-                                            &mut open,
                                             index,
                                             landing,
                                             book_id,
                                             epub_scratch,
                                             font_metrics,
                                             background_build,
-                                        );
+                                        ) {
+                                            Some(page) => open.resolve_place(page),
+                                            None => landed_nothing = true,
+                                        }
                                         Some(())
                                     }
                                 }

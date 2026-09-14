@@ -1043,13 +1043,13 @@ pub fn storage_command_for_transition(
         // The one case that closes out another book. Everything the switch
         // owes rides in this command.
         //
-        return Some(open_book_command(
-            next,
-            index,
-            request_id,
-            Some(previous.persisted()),
-            fence,
-        ));
+        // Unless the book being left could not be read. Its page is whatever
+        // the app was holding when the open failed, which names nothing that
+        // loaded, and writing it would put a speculative page over the real
+        // one that book already has on the card. It was closed out before the
+        // failed open, and it has owed nothing since.
+        let departing = (!previous.book_unreadable()).then(|| previous.persisted());
+        return Some(open_book_command(next, index, request_id, departing, fence));
     }
 
     if previous.view != AppView::Reading {
@@ -5667,6 +5667,53 @@ mod tests {
             !resolves_place(&open_book_command(&back, 0, 1, None, None)),
             "so the page counted under that layout is good again"
         );
+    }
+
+    /// Leaving a book that would not open owes it nothing. Its page is
+    /// whatever the app held when the open failed, so closing it out would
+    /// write a speculative page over the real one already on the card, and a
+    /// refused write would hold the reader on a book they cannot read.
+    #[test]
+    fn leaving_an_unreadable_book_closes_nothing_out() {
+        let unreadable = ReaderSource::sd(2).book_id();
+        let next_book = ReaderSource::sd(3).book_id();
+
+        // The reader is on a book that would not open.
+        let mut stuck = reading(2, 0, 0);
+        stuck = stuck.apply_library_event(
+            CTX,
+            LibraryEvent::BookOpenUnreadable {
+                book_id: unreadable,
+            },
+        );
+        assert!(stuck.book_unreadable());
+
+        // They pick another one.
+        let mut moving_on = stuck;
+        moving_on.book_id = next_book;
+        moving_on.page = 0;
+        moving_on.chapter = 0;
+        match storage_command_for_transition(&stuck, &moving_on, 1) {
+            Some(StorageCommand::OpenBook { previous, .. }) => assert!(
+                previous.is_none(),
+                "the book that would not open has no position to close out"
+            ),
+            other => panic!("expected an open, got {other:?}"),
+        }
+
+        // A book that did open still closes out, which is the ordinary case.
+        let reading_fine = reading(2, 1, 44);
+        let mut switching = reading_fine;
+        switching.book_id = next_book;
+        switching.page = 0;
+        switching.chapter = 0;
+        match storage_command_for_transition(&reading_fine, &switching, 1) {
+            Some(StorageCommand::OpenBook { previous, .. }) => {
+                let departing = previous.expect("a readable book carries its place");
+                assert_eq!(departing.screen, 44);
+            }
+            other => panic!("expected an open, got {other:?}"),
+        }
     }
 
     /// The book the reader chose stays chosen, and the write that follows
