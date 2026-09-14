@@ -298,6 +298,7 @@ pub struct ReaderStore {
     pub current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
+    pub(crate) layout_bound_unmet: bool,
     pub(crate) book_section_count: usize,
     pub(crate) book_sections: [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
@@ -427,6 +428,7 @@ impl ReaderStore {
             current_section_page_count: 0,
             book_cache_ready: false,
             book_cache_partial: false,
+            layout_bound_unmet: false,
             book_section_count: 0,
             book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
@@ -1447,6 +1449,18 @@ impl ReaderStore {
     /// the book.
     pub fn book_index_is_partial(&self) -> bool {
         self.book_cache_partial
+    }
+
+    /// `true` when the card holds more layouts of this book than R10 allows
+    /// and would not free one. Publishers leave the book index unwritten
+    /// while it is set, so the next open cannot fast-hit and has to run the
+    /// eviction again. Set once per open, and not by `clear_book_index`.
+    pub fn layout_bound_unmet(&self) -> bool {
+        self.layout_bound_unmet
+    }
+
+    pub fn set_layout_bound_unmet(&mut self, unmet: bool) {
+        self.layout_bound_unmet = unmet;
     }
 
     pub fn advertised_page_count(&self) -> u32 {

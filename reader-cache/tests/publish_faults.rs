@@ -21,7 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use display::font::FontStyle;
+use display::font::{FontSize, FontStyle, TypeSettings};
 use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Directory, TimeSource, Timestamp, VolumeIdx,
     VolumeManager,
@@ -987,6 +987,28 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
 /// Write one section file under a layout that is not the store's, by moving
 /// the store to those settings for the write and back afterwards. Stands in
 /// for the reader having used that configuration earlier.
+/// How many layouts the card says this book has. Panics when the card would
+/// not say, which no test here arranges except on purpose.
+fn resident_count(root: &Dir<'_>) -> usize {
+    files::resident_layouts(root, &OWNER)
+        .expect("the card answers")
+        .len()
+}
+
+/// Leave the store in a layout that is neither of the two `write_section_under`
+/// reaches, so a test can be about a third one arriving. Portrait and
+/// landscape are the only two that flag reaches; the type size is the next
+/// thing the key is made of.
+fn set_third_layout(store: &mut ReaderStore) -> u8 {
+    let base = store.type_settings();
+    let size = match base.size {
+        FontSize::Large => FontSize::Small,
+        _ => FontSize::Large,
+    };
+    store.set_layout(TypeSettings { size, ..base }, false);
+    store.layout_key()
+}
+
 fn write_section_under(
     root: &Dir<'_>,
     store: &mut ReaderStore,
@@ -1016,7 +1038,7 @@ fn a_second_layout_does_not_take_the_first_ones_pagination() {
     let portrait = write_section_under(&root, &mut store, true, 0);
     assert_ne!(landscape, portrait, "the page box names a layout apart");
 
-    let mut resident = files::resident_layouts(&root, &OWNER);
+    let mut resident = files::resident_layouts(&root, &OWNER).expect("the card answers");
     resident.sort_unstable();
     let mut expected = [landscape, portrait];
     expected.sort_unstable();
@@ -1039,12 +1061,12 @@ fn a_third_layout_evicts_one_and_only_then() {
 
     let first = write_section_under(&root, &mut store, false, 0);
     let second = write_section_under(&root, &mut store, true, 0);
-    assert_eq!(files::resident_layouts(&root, &OWNER).len(), 2);
+    assert_eq!(resident_count(&root), 2);
 
     // Re-opening one of the two evicts nothing: it is already resident.
     assert!(files::evict_layouts_for(&root, &OWNER, first));
     assert_eq!(
-        files::resident_layouts(&root, &OWNER).len(),
+        resident_count(&root),
         2,
         "a layout already on the card costs nothing to open"
     );
@@ -1061,7 +1083,7 @@ fn a_third_layout_evicts_one_and_only_then() {
         index_before,
         "the book index survives a layout eviction"
     );
-    let left = files::resident_layouts(&root, &OWNER);
+    let left = files::resident_layouts(&root, &OWNER).expect("the card answers");
     assert_eq!(left.len(), 1, "one of the two was evicted");
     assert!(
         left.contains(&first) || left.contains(&second),
@@ -1084,7 +1106,7 @@ fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
     files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
 
     let victim = write_section_under(&root, &mut store, false, 0);
-    assert_eq!(files::resident_layouts(&root, &OWNER).len(), 1);
+    assert_eq!(resident_count(&root), 1);
 
     disk.fault.fail_read_in.set(Some(0));
     assert!(
@@ -1092,10 +1114,115 @@ fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
         "a refused read is the card saying no, not a cache that is already gone"
     );
     assert_eq!(
-        files::resident_layouts(&root, &OWNER),
+        files::resident_layouts(&root, &OWNER).expect("the card answers"),
         heapless::Vec::<u8, 16>::from_slice(&[victim]).expect("one layout"),
         "and the sections are still there to be counted next time"
     );
+}
+
+/// R10, the whole operation. Two layouts are resident, a third arrives, and
+/// the card will not free a slot. The reader still gets the book, and the
+/// bound is not quietly abandoned. The layout is left without an index, so
+/// the next open has to ask the card again rather than fast-hitting past the
+/// question.
+#[test]
+fn a_third_layout_the_card_would_not_make_room_for_stays_off_the_fast_path() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let first = write_section_under(&root, &mut store, false, 0);
+    let second = write_section_under(&root, &mut store, true, 0);
+    assert_eq!(resident_count(&root), 2);
+
+    // A third layout arrives. The delete is refused, so the eviction reports
+    // that the bound is not met.
+    let third = set_third_layout(&mut store);
+    assert!(
+        third != first && third != second,
+        "the fixture has to reach a layout the first two do not: {first} {second} {third}"
+    );
+    disk.fault.fail_write_in.set(Some(0));
+    let within_bound = files::evict_layouts_for(&root, &OWNER, third);
+    assert!(
+        !within_bound,
+        "a refused delete leaves the layout counted, and the caller has to know"
+    );
+
+    // What the firmware does with that answer: open the book anyway, and
+    // publish without an index.
+    store.set_layout_bound_unmet(!within_bound);
+    let book = build_book(&root, &mut store, 3);
+    store.begin_book_load();
+    let outcome = publish::publish_book_cache(
+        &root,
+        &OWNER,
+        IDENTITY,
+        0,
+        &mut store,
+        &book,
+        total_pages(&book),
+        false,
+        0,
+    );
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert_eq!(
+        outcome.outcome,
+        BookPublishOutcome::Ready,
+        "the reader asked for this book and gets it"
+    );
+    assert!(
+        matches!(
+            files::read_cache_header(&root, KEY),
+            files::CacheHeader::Absent
+        ),
+        "and it is left off the fast path, so the next open cannot skip the eviction"
+    );
+
+    // The next open. Nothing to fast-hit, so the eviction runs again, and
+    // this time the card cooperates.
+    assert_eq!(resident_count(&root), 3, "three until the retry lands");
+    assert!(files::evict_layouts_for(&root, &OWNER, store.layout_key()));
+    let left = files::resident_layouts(&root, &OWNER).expect("the card answers");
+    assert_eq!(left.len(), 2, "the retry brought it back under the bound");
+    assert!(
+        left.contains(&store.layout_key()),
+        "and the layout the reader is on is one of the two"
+    );
+}
+
+/// The other way the bound goes: a card that will not say what is stored. An
+/// empty answer and a refused one look the same to a caller that cannot tell
+/// them apart, and it writes one more layout on top of however many are
+/// really there.
+#[test]
+fn a_card_that_will_not_say_what_is_stored_is_not_an_empty_cache() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let first = write_section_under(&root, &mut store, false, 0);
+    write_section_under(&root, &mut store, true, 0);
+    assert_eq!(resident_count(&root), 2);
+
+    disk.fault.fail_read_in.set(Some(0));
+    assert!(
+        files::resident_layouts(&root, &OWNER).is_none(),
+        "a refused read is not a list of no layouts"
+    );
+
+    disk.fault.fail_read_in.set(Some(0));
+    let third = set_third_layout(&mut store);
+    assert!(third != first);
+    assert!(
+        !files::evict_layouts_for(&root, &OWNER, third),
+        "and an eviction that cannot see the card refuses rather than waving a third layout through"
+    );
+    assert_eq!(resident_count(&root), 2, "nothing was deleted on a guess");
 }
 
 /// R11: pagination is derived and a place is not. Evicting every layout of a
@@ -1114,7 +1241,7 @@ fn evicting_pagination_leaves_the_place_alone() {
 
     let layout = write_section_under(&root, &mut store, false, 0);
     assert!(files::empty_layout_cache(&root, KEY, layout));
-    assert!(files::resident_layouts(&root, &OWNER).is_empty());
+    assert_eq!(resident_count(&root), 0);
     assert_eq!(
         place_anchor(&root, id),
         Some(anchor),

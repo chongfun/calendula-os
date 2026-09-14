@@ -1887,6 +1887,11 @@ pub const MAX_RESIDENT_LAYOUTS: usize = 2;
 /// did not happen loses the storage bound entirely: the files still load,
 /// nothing counts them, and no later pass looks. The directory cannot lie
 /// about itself.
+///
+/// `None` is the card declining to answer, which is not the empty list. A
+/// refused read that reads as "nothing here" is the same lost bound by a
+/// different route: the caller decides no eviction is needed and writes one
+/// more layout on top of however many are really there.
 pub fn resident_layouts<
     D,
     T,
@@ -1896,34 +1901,60 @@ pub fn resident_layouts<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
-) -> heapless::Vec<u8, 16>
+) -> Option<heapless::Vec<u8, 16>>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     use core::fmt::Write;
+    let empty: heapless::Vec<u8, 16> = heapless::Vec::new();
+    // One handle down the chain, as the build does, so this costs one
+    // directory slot rather than four.
+    let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return Some(empty),
+        Err(_) => return None,
+    };
+    for step in [CACHE_V2_DIR, owner.key] {
+        match dir.change_dir(step) {
+            Ok(()) => {}
+            Err(embedded_sdmmc::Error::NotFound) => return Some(empty),
+            Err(_) => return None,
+        }
+    }
+    match book_dir_claim(&dir, owner) {
+        ClaimState::MineActive => {}
+        // The claim is unreadable, so whether anything here is ours is
+        // exactly what cannot be established.
+        ClaimState::Fault => return None,
+        // Someone else's directory, or one nothing vouches for. This book
+        // keeps nothing in it and evicts nothing from it.
+        _ => return Some(empty),
+    }
+    match dir.change_dir(CACHE_SECTIONS_DIR) {
+        Ok(()) => {}
+        Err(embedded_sdmmc::Error::NotFound) => return Some(empty),
+        Err(_) => return None,
+    }
     let mut found: heapless::Vec<u8, 16> = heapless::Vec::new();
-    with_v2_sections_dir(root, owner, |sections| {
-        let Some(sections) = sections else {
-            return;
-        };
-        let _ = sections.iterate_dir(|entry| {
-            if entry.attributes.is_directory() || found.is_full() {
-                return ControlFlow::Continue(());
+    let listed = dir.iterate_dir(|entry| {
+        if entry.attributes.is_directory() || found.is_full() {
+            return ControlFlow::Continue(());
+        }
+        let mut name = String::<SHORT_NAME_BYTES>::new();
+        if write!(name, "{}", entry.name).is_err() {
+            return ControlFlow::Continue(());
+        }
+        if let Some(layout) = proto::cache::layout_of_section_file(name.as_str()) {
+            if !found.contains(&layout) {
+                let _ = found.push(layout);
             }
-            let mut name = String::<SHORT_NAME_BYTES>::new();
-            if write!(name, "{}", entry.name).is_err() {
-                return ControlFlow::Continue(());
-            }
-            if let Some(layout) = proto::cache::layout_of_section_file(name.as_str()) {
-                if !found.contains(&layout) {
-                    let _ = found.push(layout);
-                }
-            }
-            ControlFlow::Continue(())
-        });
+        }
+        ControlFlow::Continue(())
     });
-    found
+    // A listing that stopped partway has seen some of the names, and the ones
+    // it did not see are the ones that matter.
+    listed.ok().map(|()| found)
 }
 
 /// Make room for `keep` among this book's stored layouts.
@@ -2006,26 +2037,36 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut resident = resident_layouts(root, owner);
-    if resident.contains(&keep) || resident.len() < MAX_RESIDENT_LAYOUTS {
+    let Some(mut resident) = resident_layouts(root, owner) else {
+        // Deciding what to evict from a list that might be short is the same
+        // lost bound as evicting nothing, so the answer is no.
+        return false;
+    };
+    // What the bound governs is how many layouts the book holds when this
+    // open is done. One already on the card is one of them; one that is
+    // arriving needs a slot left free for it.
+    let budget = if resident.contains(&keep) {
+        MAX_RESIDENT_LAYOUTS
+    } else {
+        MAX_RESIDENT_LAYOUTS - 1
+    };
+    if resident.len() <= budget {
         return true;
     }
     // Nothing on the card says which layout the reader used last, and a record
     // that did would be the drift R10 warns about. The lowest key that is not
     // the one arriving is the deterministic choice.
     resident.sort_unstable();
-    let mut complete = true;
-    while resident.len() >= MAX_RESIDENT_LAYOUTS {
+    while resident.len() > budget {
         let Some(victim) = resident.iter().copied().find(|layout| *layout != keep) else {
             break;
         };
         if !evict_layout_sections(root, owner.key, victim) {
-            complete = false;
-            break;
+            return false;
         }
         resident.retain(|layout| *layout != victim);
     }
-    complete
+    resident.len() <= budget
 }
 
 /// Rebuild a book index from the section files already on the card for one

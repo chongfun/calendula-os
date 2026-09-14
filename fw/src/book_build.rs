@@ -616,6 +616,9 @@ where
     );
     let cache_key = proto::cache::cache_key_from(source_identity.0);
     library.set_cache_key(cache_key.as_str());
+    // Nothing is owed until this open's eviction says so, and what the book
+    // before this one owed says nothing about this one.
+    library.set_layout_bound_unmet(false);
     // The cache is reachable only with a provable owner: the key and every
     // artifact identity are 32-bit hashes a twin can share, so a row whose
     // locator is not resident gets no cache access, only the build path.
@@ -665,8 +668,15 @@ where
     // now, before the writers run.
     if !fast_hit {
         if let Some(owner) = owner.as_ref() {
-            if !files::evict_layouts_for(root, owner, library.layout_key()) {
-                esp_println::println!("epub: a stored layout would not delete; it stays counted");
+            let within_bound = files::evict_layouts_for(root, owner, library.layout_key());
+            // A refused delete, or a card that would not say what is here.
+            // The open carries on and gives up the fast path instead: with
+            // no index written, the next open cannot skip this question.
+            library.set_layout_bound_unmet(!within_bound);
+            if !within_bound {
+                esp_println::println!(
+                    "epub: over the layout bound and the card would not free one; no index this open"
+                );
             }
         }
     }
