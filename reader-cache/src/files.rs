@@ -4102,8 +4102,12 @@ where
         let mut found = 0u16;
         let mut bytes = [0u8; PAGE_ANCHOR_BYTES];
         for index in 0..page_count {
+            // A refused read is the card saying no, not an answer about the
+            // place. Stopping here and reporting the last page it managed to
+            // see would hand the open a page the anchor does not name, which
+            // loads and settles as though the place had resolved there.
             if read_exact_file(file, &mut bytes).is_err() {
-                break;
+                return None;
             }
             let offset = u32::from_le_bytes(bytes);
             if proto::anchor::ContentAnchor::at(header.spine, offset) <= anchor {

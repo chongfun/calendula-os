@@ -1390,6 +1390,72 @@ fn a_hole_in_the_section_files_is_not_the_end_of_the_book() {
     );
 }
 
+/// Resolving a place walks a section's page anchors looking for the last one
+/// at or before it. A read that stops partway has seen some of them, and the
+/// page it had reached is not an answer about the place: it is an earlier page
+/// that would load, and the open would settle there as though the anchor had
+/// resolved. Saying so sends the open down the retry path instead.
+#[test]
+fn an_anchor_table_that_stops_short_is_not_the_page_it_got_to() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    fill_section(&mut store, 0, 60);
+    let pages = store.page_count();
+    assert!(pages > 2, "the walk needs several anchors to get through");
+    store.set_cached_spine(0);
+    let wrote = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, 0, &store)
+    });
+    assert!(wrote, "the section writes");
+
+    // The place is on the last page, so a walk that stops early is left
+    // holding an earlier page it could report instead.
+    let last = store
+        .page_anchor(pages - 1)
+        .expect("the last page has an anchor");
+    let layout = store.layout_key();
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, layout, 0, last),
+        Some(pages as u16 - 1),
+        "the place is on the last page while the whole table is there"
+    );
+
+    // Cut the file after the first two anchors, as a torn write leaves it.
+    let mut name = heapless::String::<16>::new();
+    proto::cache::section_file_name(layout, 0, &mut name);
+    let mut prefix = [0u8; 2048];
+    let kept = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadOnly)
+            .expect("the section opens");
+        let keep = proto::cache::SECTION_V2_HEADER_BYTES
+            + pages * proto::cache::PAGE_RECORD_BYTES
+            + 2 * proto::cache::PAGE_ANCHOR_BYTES;
+        assert!(keep <= prefix.len(), "the fixture buffer has to hold it");
+        files::read_exact_file(&file, &mut prefix[..keep]).expect("the prefix reads");
+        keep
+    });
+    let rewritten = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
+            .expect("the section reopens");
+        file.write(&prefix[..kept]).is_ok()
+    });
+    assert!(rewritten, "the fixture cuts the anchor table short");
+
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, layout, 0, last),
+        None,
+        "a table that stops short is no answer, not the page the walk reached"
+    );
+}
+
 /// R10, the whole operation. Two layouts are resident, a third arrives, and
 /// the card will not free a slot. The reader still gets the book, and the
 /// bound is not quietly abandoned. The layout is left without an index, so
