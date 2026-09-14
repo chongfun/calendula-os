@@ -119,6 +119,16 @@ fn resolve_pending_place(
         // this open failed to reach.
         return PlaceOutcome::Waiting;
     }
+    // The row is about to be dereferenced, so it has to still be the book this
+    // place was read from.
+    let row_holds_it = sd_library
+        .catalog_entry(waiting.index as usize)
+        .is_some_and(|entry| (entry.source_hash, entry.byte_size) == waiting.source_identity);
+    if !row_holds_it {
+        esp_println::println!("restore: the row this place was waiting on holds another book");
+        *pending_place = None;
+        return PlaceOutcome::Waiting;
+    }
     let index = waiting.index;
     let landed = waiting.hold.landed();
     let place = waiting.place;
@@ -339,6 +349,13 @@ struct PendingPlace {
     /// The book and page this place is holding the card's copy against.
     hold: app_core::storage_loop::PlaceHold,
     index: u16,
+    /// What the row held when this was armed, checked again before the row is
+    /// dereferenced. A rescan reorders rows, and `book_id` is the row number,
+    /// so neither it nor the hold moves when another copy takes the index.
+    /// Resolving then reads this anchor against that copy's pagination. Same
+    /// fence `BookBuildResume::belongs_to` puts on a suspended walk, for the
+    /// same reason.
+    source_identity: (u32, u32),
     place: book_build::SavedPlace,
     /// How many times the card has refused a read of this place.
     refusals: u8,
@@ -2205,6 +2222,7 @@ fn handle_storage_command(
                             *pending_place = landed_on.map(|()| PendingPlace {
                                 hold: app_core::storage_loop::PlaceHold::new(book_id, settled),
                                 index,
+                                source_identity: source_identity(sd_library, book_id),
                                 place,
                                 refusals: 0,
                                 stopped: false,
