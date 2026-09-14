@@ -349,21 +349,17 @@ struct PendingPlace {
     stopped: bool,
 }
 
-/// Whether a progress record may replace its book's stored place.
+/// Whether a progress record may replace its book's stored place, ending the
+/// hold when it may.
 ///
-/// A restore still owed holds the reader on a provisional landing: the start
-/// of the book, or as far as the pagination had reached when the open needed
-/// an answer. Writing that page's anchor over the stored one discards the
-/// position the restore exists to reach. The reader turning a page supersedes
-/// the restore and is worth storing, which is the same rule
-/// [`resolve_pending_place`] retires a place by.
+/// A restore still owed holds the reader on a page the open picked, so writing
+/// that page's anchor over the stored one discards the position the restore
+/// exists to reach. The reader turning a page supersedes the restore and is
+/// worth storing.
 ///
-/// Ends the hold when it answers yes, rather than leaving that to the settle
-/// slices: a stopped hold schedules none of those, and one that outlives the
-/// move it was superseded by forbids the very page it stands on the next time
-/// the reader comes back to it. Ended before the write is attempted, because
-/// the reader chose this page whether or not the card takes it, and the
-/// coalescer keeps a refused record for the retry.
+/// Ends the hold here rather than in the settle slices, which a stopped hold
+/// does not schedule, and before the write is attempted, since the reader
+/// chose the page whether or not the card takes it.
 fn place_may_be_replaced(
     pending_place: &mut Option<PendingPlace>,
     record: &AppStateRecord,
@@ -1978,21 +1974,14 @@ fn handle_storage_command(
                         type_settings,
                         portrait,
                     } => {
-                        // A place belongs to the open that read it. Whatever
-                        // an earlier open left waiting is that open's, and it
-                        // ends here rather than outliving it and landing on
-                        // whoever comes next.
-                        //
-                        // An extend is that same open asking for more of its
-                        // book, so it inherits the place rather than ending
-                        // it. The restore raises one of these itself: settling
-                        // on a page moves the app, and a page move inside a
-                        // book is an extend. Clearing here would let the
-                        // restore's own result cancel the hold it just took
-                        // out over the stored place. A place that has been
-                        // overtaken is retired where that can be told apart,
-                        // in `resolve_pending_place`, by the reader standing
-                        // somewhere other than where they were put.
+                        // A place belongs to the open that read it, so an
+                        // open ends whatever an earlier one left waiting. An
+                        // extend is that same open asking for more of its
+                        // book and inherits it instead: a restore settling on
+                        // a page raises one, and ending the place here would
+                        // have the restore cancel itself. An overtaken place
+                        // is retired in `resolve_pending_place`, where the
+                        // reader's own move can be told apart.
                         if !open.is_extend() {
                             *pending_place = None;
                         }

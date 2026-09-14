@@ -967,14 +967,6 @@ fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, Librar
     Some((at, LibraryPath::parse(path).ok()?))
 }
 
-#[inline(never)]
-/// Row `index`'s location as its catalog record states it, verified against
-/// the expected identity: the root, the locator, and the display name the
-/// legacy position fallback derives from. Read from the card because the
-/// resident window keeps only labels and identity; one record read on paths
-/// that already run whole SD sessions. `None` when the record is unreadable,
-/// names a root this build does not know, or no longer carries this
-/// identity, in which case no keyed cache access can prove ownership.
 /// Store where the reader is, under the copy's id.
 ///
 /// `Ok(())` also covers the cases with nothing to store: a copy with no id
@@ -1070,6 +1062,15 @@ where
     crate::library_sd::read_catalog_record_at(root, index)?.book_id
 }
 
+/// Row `index`'s location as its catalog record states it, checked against the
+/// expected identity: the root, the locator, and the display name the legacy
+/// position fallback derives from.
+///
+/// Read from the card because the resident window keeps only labels and
+/// identity, and only on paths already running a whole SD session. `None` when
+/// the record is unreadable, names a root this build does not know, or no
+/// longer carries this identity, so no keyed cache access can prove ownership.
+#[inline(never)]
 fn record_location<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     index: usize,
@@ -1287,7 +1288,7 @@ pub(crate) enum SavedPlace {
         anchor: proto::anchor::ContentAnchor,
         /// Whether the content the anchor was resolved against is still the
         /// content of this copy. False demotes the anchor to a guess and
-        /// leaves the progression, per the reading-position PRD's R13.
+        /// leaves the progression to answer instead.
         exact: bool,
         progression: Option<u16>,
     },
@@ -1439,8 +1440,7 @@ pub(crate) fn resolve_place(
             );
             return PlaceTarget::Page(page.min(total.saturating_sub(1)));
         }
-        // Publication order carries the rest, and the reading-position PRD's
-        // M5 names it as the fallback. The spine item the place was in
+        // Publication order carries the rest. The spine item the place was in
         // survives an edit better than an offset into it does, so the reader
         // opens at the top of it rather than at the top of the book.
         return match library.first_page_of_spine(anchor.spine) {

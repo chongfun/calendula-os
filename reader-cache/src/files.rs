@@ -2015,21 +2015,6 @@ where
     cleared
 }
 
-/// Clear one layout's pagination and the book index, leaving every other
-/// layout's sections, the content cache, the TOC, the cover and the claim
-/// alone.
-///
-/// For the failure paths, where the index may be half written. Eviction wants
-/// [`evict_layout_sections`] instead: the index is one file for the book, so
-/// taking it there would strand the layout that is staying.
-///
-/// The narrow form of [`empty_cache_dir`], for the failure paths that have to
-/// throw away a half-written index. Emptying the whole directory there was
-/// right while a book had one cache; with two it takes the other layout's
-/// finished work as collateral, and it takes `CONT.BIN` with it, which turns
-/// the next open from a replay into a full re-parse of the EPUB.
-///
-/// Reports whether everything it meant to remove is gone.
 /// How many layouts of one book keep their pagination.
 ///
 /// Two, because the flow that hurts is the flip and the flip back. A third
@@ -2045,11 +2030,9 @@ const LAYOUT_KEY_COUNT: usize = 64;
 
 /// The layouts this book has section files for, read off the card.
 ///
-/// Listed rather than recorded. A record of what is resident can drift from
-/// what is there, and R10 is explicit that a record claiming an eviction that
-/// did not happen loses the storage bound entirely: the files still load,
-/// nothing counts them, and no later pass looks. The directory cannot lie
-/// about itself.
+/// Listed rather than recorded. A record claiming an eviction that did not
+/// happen loses the bound for good: the files still load, nothing counts them,
+/// and no later pass looks. The directory cannot lie about itself.
 ///
 /// `None` is the card declining to answer, which is not the empty list. A
 /// refused read that reads as "nothing here" is the same lost bound by a
@@ -2120,28 +2103,11 @@ where
     listed.ok().map(|()| found)
 }
 
-/// Make room for `keep` among this book's stored layouts.
-///
-/// Runs before a layout's first index is written, which is the only moment a
-/// book gains one, and only then: eviction that fired on every open would be
-/// "this layout is not the current layout", the rule R10 forbids.
-///
-/// The index goes before the sections. An interrupted eviction then leaves
-/// sections with no index, which reads as nothing and rebuilds, rather than an
-/// index promising sections that are gone.
-///
-/// Reports whether the card is now within the bound. `false` means a delete
-/// was refused and the layout it named is still counted, so the next open
-/// tries again. The caller goes on to build either way: eviction only runs
-/// when a build was going to happen, so refusing the open over a failed delete
-/// would refuse a book because the card would not free a file.
 /// Delete one layout's section files and nothing else.
 ///
 /// The book index stays. It is one file for the book rather than one per
-/// layout, and the layout that is staying needs it: its labels and TOC are in
-/// there, and `try_reindex_layout` reads them to rebuild an index from the
-/// sections it still has. An index describing the evicted layout is a header
-/// mismatch, which is the ordinary rebuild path.
+/// layout, and the surviving layout needs its labels and TOC to rebuild an
+/// index from the sections it still has.
 pub fn evict_layout_sections<
     D,
     T,
@@ -2185,6 +2151,16 @@ where
     }
 }
 
+/// Make room for `keep` among this book's stored layouts.
+///
+/// Runs only before a layout's first index is written, the one moment a book
+/// gains one. Evicting on every open would mean evicting whatever the reader
+/// is not using at this instant, which keeps no pagination at all.
+///
+/// `false` means a delete was refused and the layout it named is still
+/// counted, so the next open tries again. The caller builds either way:
+/// eviction only runs when a build was going to happen, so refusing over a
+/// failed delete would refuse a book because the card would not free a file.
 pub fn evict_layouts_for<
     D,
     T,
@@ -2217,8 +2193,8 @@ where
         return true;
     }
     // Nothing on the card says which layout the reader used last, and a record
-    // that did would be the drift R10 warns about. The lowest key that is not
-    // the one arriving is the deterministic choice.
+    // that did could drift from the files. The lowest key that is not the one
+    // arriving is the deterministic choice.
     resident.sort_unstable();
     while resident.len() > budget {
         let Some(victim) = resident.iter().copied().find(|layout| *layout != keep) else {
@@ -2332,15 +2308,12 @@ where
 /// back still has their old pagination and has lost only the index naming it.
 /// Rebuilding reads one header per section instead of re-parsing the EPUB.
 ///
-/// Each section is checked against the layout and the source it claims, so a
-/// stale or foreign file stops the reindex. `None` leaves the caller to build
-/// from the EPUB.
-///
-/// A section prefix is not a book, and an abandoned walk leaves one that
-/// looks finished: pagination suspends at spine boundaries, so its last
-/// section is clean. Answers only for a set of whole sections that carries
-/// the spine item a finished capture ended on through to its end, with no
-/// section files past where the scan stopped.
+/// A section prefix is not a book, and an abandoned walk leaves one that looks
+/// finished: pagination suspends at spine boundaries, so its last section is
+/// clean. Answers only for a set of whole sections, each matching this layout
+/// and source, carrying the spine item a finished capture ended on through to
+/// its end, with no section files past where the scan stopped. `None` leaves
+/// the caller to build from the EPUB.
 pub fn reindex_layout_from_sections<
     D,
     T,
@@ -2455,6 +2428,17 @@ where
     Some((count, total_pages))
 }
 
+/// Clear one layout's pagination and the book index, leaving every other
+/// layout's sections, the content cache, the TOC, the cover and the claim
+/// alone. Reports whether everything it meant to remove is gone.
+///
+/// The narrow form of [`empty_cache_dir`], for the failure paths that have to
+/// throw away a half-written index. Emptying the whole directory takes the
+/// other layout's finished work as collateral, and takes `CONT.BIN` with it,
+/// which turns the next open from a replay into a full re-parse of the EPUB.
+///
+/// Eviction wants [`evict_layout_sections`] instead: the index is one file for
+/// the book, so taking it there would strand the layout that is staying.
 pub fn empty_layout_cache<
     D,
     T,

@@ -402,19 +402,17 @@ impl PositionRecord {
 /// What a place was written against, for deciding whether its anchor still
 /// describes the book.
 ///
-/// Content, not location. A move changes where a copy sits and changes
-/// nothing about what it holds, and the anchor is the thing that is supposed
-/// to survive a move, so anything path-derived here would throw away exactly
-/// the case the record exists for.
+/// Content, not location: a move changes where a copy sits and nothing about
+/// what it holds, and the anchor exists to survive exactly that, so anything
+/// path-derived would throw away the case the record is for.
 ///
-/// The length is the whole witness, and its limit is the one the library
-/// identity PRD's R4 already accepts: a replacement of the same length at the
-/// same place reads as the same source. A recorded hash cannot close that
-/// today. The hash a copy carries is written once by the background read and
-/// stands until the cache directory goes, so a place and the claim it would
-/// be compared against hold the same value whatever the file now says.
-/// Closing it needs a witness of the bytes as they are now, which the device
-/// has only while a managed replacement is in flight.
+/// Length is the whole witness, with the limit the identity rule already
+/// accepts: a replacement of the same length at the same place reads as the
+/// same source. A recorded hash cannot close that, since the hash a copy
+/// carries is written once and stands until the cache directory goes, so both
+/// sides of the comparison hold the same stale value. Closing it needs a
+/// witness of the bytes as they stand, which the device has only while a
+/// managed replacement is in flight.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlaceSource {
     /// The file's length. Move-invariant, free to read, and a replacement of

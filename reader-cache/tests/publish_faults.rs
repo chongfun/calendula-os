@@ -1051,7 +1051,7 @@ fn write_section_under(
     key
 }
 
-/// R9, the flow the milestone exists for: A, then B, then back to A, with A's
+/// The flow the milestone exists for: A, then B, then back to A, with A's
 /// pagination still on the card.
 #[test]
 fn a_second_layout_does_not_take_the_first_ones_pagination() {
@@ -1076,7 +1076,7 @@ fn a_second_layout_does_not_take_the_first_ones_pagination() {
     );
 }
 
-/// R10: the bound is on stored layouts, and a third arriving evicts one.
+/// The bound is on stored layouts, and a third arriving evicts one.
 /// Nothing evicts merely because a layout stopped being current.
 #[test]
 fn a_third_layout_evicts_one_and_only_then() {
@@ -1121,9 +1121,9 @@ fn a_third_layout_evicts_one_and_only_then() {
 
 /// A card that refuses a read on the way down to the sections has deleted
 /// nothing, and the caller has to hear that. Reporting success drops the
-/// layout from the resident list, and R10 is the reason it matters: once a
-/// layout is counted as gone while its files are still there, nothing looks
-/// again and the storage bound is lost rather than delayed.
+/// layout from the resident list. Once a layout is counted as gone while its
+/// files are still there, nothing looks again and the bound is lost rather
+/// than delayed.
 #[test]
 fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
     let disk = new_card();
@@ -1196,8 +1196,7 @@ fn write_section_at(
 /// A TOC carries its navigation in the records, not the text: each one holds
 /// the spine item it targets, and the text is only the label. A book whose
 /// headings are all empty therefore has a TOC worth keeping and no text at
-/// all, and reading it back used to drop every entry because the count was
-/// adopted inside the guard that read the title bytes.
+/// all, and every entry has to survive the read back.
 #[test]
 fn a_toc_with_no_title_text_still_comes_back() {
     let disk = new_card();
@@ -1237,7 +1236,7 @@ fn a_toc_with_no_title_text_still_comes_back() {
     );
 }
 
-/// R10 and the flip back: a walk that suspends between spine items leaves a
+/// The flip back: a walk that suspends between spine items leaves a
 /// clean final section, so nothing in the section files says more was coming.
 /// The index that knew is gone, overwritten when the other layout published.
 /// Reindexing that prefix would fence the reader at the page the walk happened
@@ -1690,7 +1689,7 @@ fn a_section_from_another_layout_says_nothing_about_a_place() {
     );
 }
 
-/// R10, the whole operation. Two layouts are resident, a third arrives, and
+/// The whole operation. Two layouts are resident, a third arrives, and
 /// the card will not free a slot. The reader still gets the book, and the
 /// bound is not quietly abandoned. The layout is left without an index, so
 /// the next open has to ask the card again rather than fast-hitting past the
@@ -1795,7 +1794,7 @@ fn a_card_that_will_not_say_what_is_stored_is_not_an_empty_cache() {
     assert_eq!(resident_count(&root), 2, "nothing was deleted on a guess");
 }
 
-/// R11: pagination is derived and a place is not. Evicting every layout of a
+/// Pagination is derived and a place is not. Evicting every layout of a
 /// book leaves the reader's place where it was.
 #[test]
 fn evicting_pagination_leaves_the_place_alone() {
@@ -1862,7 +1861,7 @@ fn a_move_leaves_a_place_exact() {
 
     // And the limit, stated rather than papered over: a replacement of the
     // same length at the same place reads as the same source. That is the
-    // library identity PRD's R4 rule, and closing it needs a witness of the
+    // identity rule, and closing it needs a witness of the
     // bytes as they are now, which nothing here holds.
     let same_length = proto::nvm::PlaceSource {
         byte_size: 8_123_456,
@@ -1890,7 +1889,7 @@ fn a_place_stores_its_anchor_before_it_knows_the_books_length() {
     );
 }
 
-/// R13 and R15: a place written against other bytes keeps its progression,
+/// A place written against other bytes keeps its progression,
 /// and says plainly that the anchor is no longer evidence.
 #[test]
 fn a_place_survives_a_replacement_without_claiming_to_be_exact() {

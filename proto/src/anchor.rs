@@ -1,40 +1,32 @@
-//! The coordinate a reading position is stored as.
+//! The coordinate a reading position is stored as: a spine item, and how far
+//! into that item's logical content stream the position sits.
 //!
 //! A page number means something only to the layout that produced it, so it
-//! cannot be durable state. What is durable is a place in the book's content,
-//! and this is the coordinate for one: a spine item, and how far into that
-//! item's logical content stream the place sits.
+//! cannot be durable state. This survives every layout change.
 //!
 //! # The logical content stream
 //!
-//! The stream is a coordinate space, not a buffer. Nothing materializes it and
-//! no file holds it. It is defined by what the XHTML block parser emits for
-//! one spine item:
+//! A coordinate space, not a buffer: nothing materializes it and no file holds
+//! it. The XHTML block parser defines it for one spine item.
 //!
-//! - blocks count in the order the parser emits them, which is document order;
-//! - a block occupies `text.len() + 1` bytes of the space, the extra byte
-//!   standing for the boundary after it;
+//! - blocks count in the order the parser emits them, document order;
+//! - a block occupies `text.len() + 1` bytes, the extra byte standing for the
+//!   boundary after it;
 //! - a block's offset is the sum of the sizes of every block before it in the
-//!   same spine item, so the first block of an item sits at 0.
+//!   same item, so an item's first block sits at 0.
 //!
-//! The extra byte per block is what lets content with no text hold a place of
-//! its own. An image block emits no characters, and without it two images in a
-//! row would share one offset and a reader could not be returned to the
-//! second.
+//! The extra byte lets content with no text hold a place. An image emits no
+//! characters, and without it two images in a row would share one offset.
 //!
-//! # What the stream does not depend on
-//!
-//! The parser takes XHTML and CSS and nothing else. No font, no viewport, no
-//! margin and no line spacing reaches it, so the same bytes always produce the
-//! same stream. That is the point: a place in it survives every layout change,
-//! which a page number does not.
+//! The parser takes XHTML and CSS and nothing else. No font, viewport, margin
+//! or line spacing reaches it, so the same bytes always produce the same
+//! stream.
 //!
 //! # Versioning
 //!
-//! The rules above are persistence ABI, so [`CONTENT_STREAM_VERSION`] covers
-//! them. Change what the parser emits, how it normalizes text, or how a
-//! block's size is counted, and every stored anchor moves. The version is what
-//! a reader checks before believing one.
+//! These rules are persistence ABI, covered by [`CONTENT_STREAM_VERSION`].
+//! Change what the parser emits, how it normalizes text, or how a block's size
+//! is counted, and every stored anchor moves.
 
 /// The rules that define the logical content stream an offset indexes.
 ///

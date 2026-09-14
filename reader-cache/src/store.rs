@@ -1482,8 +1482,8 @@ impl ReaderStore {
         self.book_cache_partial
     }
 
-    /// `true` when the card holds more layouts of this book than R10 allows
-    /// and would not free one. Publishers leave the book index unwritten
+    /// `true` when the card holds more layouts of this book than the bound
+    /// allows and would not free one. Publishers leave the book index unwritten
     /// while it is set, so the next open cannot fast-hit and has to run the
     /// eviction again. Set once per open, and not by `clear_book_index`.
     pub fn layout_bound_unmet(&self) -> bool {
