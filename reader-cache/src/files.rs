@@ -102,13 +102,10 @@ enum TwoGenerationRead {
     /// could be read.
     ///
     /// `saw_both` is false when the other side refused, so a newer record may
-    /// be sitting behind that refusal. What to do about that is the caller's,
-    /// and the two kinds of caller want opposite things. A record with a
-    /// legacy file behind it takes what it can get: missing here sends it to
-    /// the older file or to nothing. A reading place refuses: it has a
-    /// bounded retry that recovers the newer one, and accepting the older
-    /// puts the reader behind where they were and lets the next save write
-    /// that backwards step to the card.
+    /// sit behind that refusal, and the two kinds of caller want opposite
+    /// things about it. A record with a legacy file behind it takes what it
+    /// can get. A reading place refuses, having a bounded retry that recovers
+    /// the newer one.
     Found { saw_both: bool },
     /// Neither side holds a record.
     Absent,

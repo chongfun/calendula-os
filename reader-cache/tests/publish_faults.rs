@@ -1925,8 +1925,6 @@ fn book_id(seed: u8) -> proto::identity::BookId {
     proto::identity::BookId::from_bytes([seed; 16]).expect("a non-zero id")
 }
 
-/// The whole point of the format: a place belongs to the copy, so it is
-/// legible after anything that used to lose it.
 /// The case the anchor exists for, and the one a locator-derived source
 /// identity would have thrown away: a proven move keeps the copy's id and
 /// changes nothing about its content, so the place stays exact.

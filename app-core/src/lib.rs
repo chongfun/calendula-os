@@ -3318,25 +3318,17 @@ impl ReaderState {
     }
 }
 
-/// Whether an orientation stands the panel's long axis upright. The two
-/// portrait variants share one page geometry, so reading layout keys off
-/// this rather than the exact variant.
 /// Whether a state change owes storage a progress record of its own.
 ///
-/// The question is who decides where the reader lands. An open or a chapter
-/// jump hands that to storage, which resolves it against a pagination the app
-/// cannot see and reports it back; the app's own page is provisional until
-/// then, and a record carrying it would write that provisional page over the
-/// position the open is resuming from. Those owe nothing, whether or not the
-/// book changed: selecting the book already being read is still an open.
+/// The question is who decided where the reader lands. An open or a chapter
+/// jump hands that to storage and owes nothing, whether or not the book
+/// changed: the app's page stays provisional until storage answers, and a
+/// record carrying it would overwrite the position being resumed. Selecting
+/// the book already open is still an open.
 ///
-/// Nothing dispatched and the book changed is a rollback, or a command the
-/// queue refused. Nothing was touched.
-///
-/// What is left is the app moving inside a book it already holds: a page
-/// turn, a settings change, an extend. Those it decided itself and owes.
-/// Except for a book that could not be read, which holds no page worth
-/// keeping.
+/// Nothing dispatched with the book changed is a rollback or a refusal, which
+/// touched nothing. What is left the app decided itself, unless the book
+/// could not be read and holds no page worth keeping.
 pub fn progress_owed(
     previous: &ReaderState,
     next: &ReaderState,
@@ -3349,6 +3341,9 @@ pub fn progress_owed(
     }
 }
 
+/// Whether an orientation stands the panel's long axis upright. The two
+/// portrait variants share one page geometry, so layout keys read off this
+/// rather than off the exact variant.
 pub const fn is_portrait(orientation: DisplayOrientation) -> bool {
     matches!(
         orientation,
@@ -4318,10 +4313,10 @@ mod tests {
         }
     }
 
-    /// Who owes a progress record. Got wrong three times now, each by asking
-    /// something adjacent to the real question: whether an open carried a
-    /// departing book, then whether the book changed. The question is who
-    /// decides where the reader lands.
+    /// Who owes a progress record: whoever decided where the reader lands.
+    /// Asking instead whether the open carried a departing book, or whether
+    /// the book changed, answers a neighboring question and gets the cases
+    /// below wrong.
     #[test]
     fn only_a_move_the_app_decided_owes_a_progress_record() {
         let reading_a = reading(1, 3, 88);

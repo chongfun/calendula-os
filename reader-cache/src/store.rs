@@ -359,10 +359,9 @@ pub struct ReaderStore {
     ///
     /// 1536 B of static RAM, the largest single cost of keeping positions as
     /// content anchors; `page_offset` below adds 384. The store is a static,
-    /// so both come off the stack region: adding this one moved
-    /// `_stack_start - _stack_end` down by exactly its own size on both
-    /// boards. `tools/stack_frames.py` prints that region on every firmware
-    /// gate, beside the 24576 B ceiling on any one frame.
+    /// so both come off the stack region rather than any frame, and
+    /// `tools/stack_frames.py` prints that region beside the per-frame ceiling
+    /// on every firmware gate.
     pub(crate) block_offset: [u32; MAX_READER_BLOCKS],
     pub block_paragraph_end: [bool; MAX_READER_BLOCKS],
     /// True for a block that opens a paragraph (its opening line takes the
