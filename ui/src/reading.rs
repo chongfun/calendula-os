@@ -519,10 +519,6 @@ pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
-/// Footer band top: 14 rows up from the panel's bottom edge. Panel-relative
-/// so the X3's taller page pushes the footer to its own bottom edge; on the
-/// X4 this is the historical 466.
-pub const READER_FOOTER_TOP: i16 = display::HEIGHT as i16 - 14;
 /// Page-counter text baseline: as low as it goes without clipping (the
 /// slash inks 2 rows below its baseline). Used by `fw::views` so the
 /// footer's exact panel-relative position lives in one place instead of
@@ -606,6 +602,40 @@ const _: () = assert!(READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 256);
 /// in bits 5-6, portrait in bit 7, version above. Size, weight, family,
 /// and the page box all change wrap points, so a change in any forces a
 /// full rebuild.
+/// The fields below have fixed widths, and a variant added past one would
+/// overlap the field packed above it. Two layouts would then share a config,
+/// which the section header stores and the index compares, so a book
+/// paginated under one would be served under the other. The matches are
+/// exhaustive so that fails to compile here first.
+const _: () = {
+    const fn families() -> u16 {
+        match display::font::FontFamily::Literata {
+            display::font::FontFamily::Literata
+            | display::font::FontFamily::Merriweather
+            | display::font::FontFamily::Custom => 3,
+        }
+    }
+    const fn weights() -> u16 {
+        match display::font::FontWeight::Normal {
+            display::font::FontWeight::Normal | display::font::FontWeight::Heavy => 2,
+        }
+    }
+    const fn sizes() -> u16 {
+        match FontSize::Small {
+            FontSize::Small | FontSize::Medium | FontSize::Large => 3,
+        }
+    }
+    const fn spacings() -> u16 {
+        match LineSpacing::Compact {
+            LineSpacing::Compact | LineSpacing::Normal | LineSpacing::Relaxed => 3,
+        }
+    }
+    assert!(spacings() <= 4, "line spacing has bits 0 and 1");
+    assert!(sizes() <= 4, "font size has bits 2 and 3");
+    assert!(weights() <= 2, "font weight has bit 4 alone");
+    assert!(families() <= 4, "font family has bits 5 and 6");
+};
+
 pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
     ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
         | ((portrait as u16) << 7)
@@ -613,6 +643,22 @@ pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
         | ((settings.weight as u16) << 4)
         | ((settings.size as u16) << 2)
         | settings.spacing as u16
+}
+
+/// The part of the layout that names a stored pagination.
+///
+/// The wrap-point inputs only: size, weight, family, and the page box. Two
+/// layouts differing in any of those break pages in different places, so the
+/// cache names them apart and keeps both.
+///
+/// Line spacing stays out. A spacing change re-walks heights over the same
+/// wrap points, so both spacings share one stored set and the header check
+/// sorts them out. The wrap-rule version and panel salt stay out because a
+/// bump must retire every layout, which each index's own header does by
+/// rejecting itself; in the name it would strand a fresh set of files with no
+/// reader left to delete the old one.
+pub fn layout_key(settings: TypeSettings, portrait: bool) -> u8 {
+    ((reader_layout_config(settings, portrait) >> 2) & 0x3F) as u8
 }
 
 /// The reading body face for the given settings and style run.

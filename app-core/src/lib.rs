@@ -427,6 +427,14 @@ pub enum StorageCommand {
         /// The departing book's final position, when this open changes books.
         /// `None` re-opens the book already active, which owes nothing.
         previous: Option<PersistedAppState>,
+        /// Resolve the copy's stored place rather than opening at the page
+        /// this command carries.
+        ///
+        /// Set when the app's page was counted under another layout, which a
+        /// typography change leaves behind: the number still reads like a
+        /// page and names content that moved. The place is content, so it
+        /// answers where the reader was in the pagination this open builds.
+        resolve_place: bool,
     },
     ExtendSection {
         request_id: u32,
@@ -844,6 +852,22 @@ pub const fn loaded_repaints(reading: bool, text_replaced: bool, page_moved: boo
     !reading || text_replaced || page_moved
 }
 
+/// The book an open transaction has finished with, whatever it finished as.
+///
+/// Every ending belongs here. A caller holds the open's bookkeeping, the input
+/// gate and the sleep block on this answer, so an ending it does not recognize
+/// holds all three until the device reboots. Watch the ending that carries no
+/// navigation metadata: it reads like an event about nothing and is exactly as
+/// final as the others.
+pub const fn open_answered_for(event: &LibraryEvent) -> Option<u32> {
+    match *event {
+        LibraryEvent::Loaded { book_id, .. }
+        | LibraryEvent::BookOpenUnreadable { book_id }
+        | LibraryEvent::BookOpenFailed { book_id } => Some(book_id),
+        _ => None,
+    }
+}
+
 /// Whether the input gate an open took may be lifted now.
 ///
 /// A dispatched `OpenBook` shuts input off until the open has both *answered*
@@ -935,6 +959,11 @@ pub struct BookOpenRollback {
     pub book_id: u32,
     pub chapter: u16,
     pub page: u32,
+    /// The layout `page` was counted under. Restored with the page it
+    /// describes: a page carrying the wrong stamp reads as current, and the
+    /// next open of this book resumes at a number that means something else
+    /// rather than resolving the stored place.
+    pub page_layout: Option<u16>,
     pub view: AppView,
     pub selection: u16,
     pub sd_page_count: u32,
@@ -1031,13 +1060,13 @@ pub fn storage_command_for_transition(
         // The one case that closes out another book. Everything the switch
         // owes rides in this command.
         //
-        return Some(open_book_command(
-            next,
-            index,
-            request_id,
-            Some(previous.persisted()),
-            fence,
-        ));
+        // Unless the book being left could not be read. Its page is whatever
+        // the app was holding when the open failed, which names nothing that
+        // loaded, and writing it would put a speculative page over the real
+        // one that book already has on the card. It was closed out before the
+        // failed open, and it has owed nothing since.
+        let departing = (!previous.book_unreadable()).then(|| previous.persisted());
+        return Some(open_book_command(next, index, request_id, departing, fence));
     }
 
     if previous.view != AppView::Reading {
@@ -1170,6 +1199,10 @@ pub fn open_book_command(
         type_settings: state.type_settings(),
         portrait: is_portrait(state.orientation),
         previous,
+        // The page in hand was counted under another layout, so it names
+        // nothing in the one this open adopts. The stored place is the only
+        // thing that still means where the reader was.
+        resolve_place: state.page_layout != Some(state.layout_stamp()),
     }
 }
 
@@ -1573,6 +1606,21 @@ pub enum LibraryEvent {
     BookOpenFailed {
         book_id: u32,
     },
+    /// An open ran to its end and left no readable section behind it.
+    ///
+    /// Separate from [`Loaded`](Self::Loaded) because that event is
+    /// navigation metadata the app acts on, and a store with nothing in it
+    /// reports one page. Folding that would clamp the reader's page to zero
+    /// and the ordinary post-event comparison would then write it to the card,
+    /// which is the durable position this book still has and the open failed
+    /// to improve on.
+    ///
+    /// So this event carries the book and nothing else. It lifts the open gate
+    /// and repaints, which shows the reader the error the store is holding,
+    /// and it moves no state, so nothing follows it to the card.
+    BookOpenUnreadable {
+        book_id: u32,
+    },
     ChapterPage {
         book_id: u32,
         chapter: u16,
@@ -1944,8 +1992,11 @@ impl LibraryEvent {
     /// reissues them — the storage task has already done the work and moved
     /// on, so a dropped one leaves the app waiting for the rest of the visit:
     ///
-    /// - `Loaded` and `BookOpenFailed` are the two ways an open ends, and the
-    ///   app suppresses input until one of them arrives.
+    /// - `Loaded`, `BookOpenFailed` and `BookOpenUnreadable` are the three
+    ///   ways an open ends, and the app suppresses input until one of them
+    ///   arrives. The third carries no navigation metadata, which makes it
+    ///   look droppable and makes it exactly as final as the other two:
+    ///   losing it leaves input suppressed and sleep blocked until reboot.
     /// - `CacheCleared` settles a per-book action's `LibraryMenu::Busy`, which
     ///   holds the whole Library list still while it waits.
     /// - `Restored` is what the boot render waits for before drawing.
@@ -1958,6 +2009,7 @@ impl LibraryEvent {
             self,
             Self::Loaded { .. }
                 | Self::BookOpenFailed { .. }
+                | Self::BookOpenUnreadable { .. }
                 | Self::CacheCleared { .. }
                 | Self::Restored { .. }
                 // The three that settle a `LibraryBrowse`. Dropping one
@@ -2216,6 +2268,25 @@ impl ReducerContext {
 pub struct ReaderState {
     pub view: AppView,
     pub page: u32,
+    /// The layout `page` was counted under, or `None` for a page this app did
+    /// not count.
+    ///
+    /// An open compares it against the layout in hand to tell whether the
+    /// number still describes a pagination that exists. A settings round trip
+    /// back to where it started keeps its page: the stamp matches again.
+    ///
+    /// `None` rather than a reserved number: the stamp packs settings into
+    /// bits and a real one can be zero. The boot restore takes its page off
+    /// the card, so it starts here and the first open resolves the stored
+    /// place rather than trusting the number.
+    pub page_layout: Option<u16>,
+    /// A book that was selected and could not be read.
+    ///
+    /// The reader chose it, so it stays chosen and shows its error. What it
+    /// does not get is the durable record, which is where a reboot comes back
+    /// to: that keeps naming the last book that had a page until this one
+    /// produces one.
+    pub unreadable_book: Option<u32>,
     pub selection: u16,
     pub chapter: u16,
     pub book_id: u32,
@@ -2278,10 +2349,44 @@ pub struct ReaderState {
 }
 
 impl ReaderState {
+    /// Everything that moves a page boundary, packed into one number.
+    ///
+    /// Line spacing is in, unlike the pagination cache's own layout key: a
+    /// spacing change re-walks the same wrap points, which leaves the stored
+    /// pagination valid and still moves which page a given place falls on.
+    pub const fn layout_stamp(&self) -> u16 {
+        (self.font_family as u16)
+            | ((self.font_size as u16) << 3)
+            | ((self.font_weight as u16) << 6)
+            | ((self.line_spacing as u16) << 8)
+            // The page box, not which way up the device is. Both
+            // landscapes share one box and both portraits the other, so
+            // turning it around moves no page boundary and leaves the page in
+            // hand describing the pagination it was counted under. The same
+            // predicate the open sends as its `portrait` field.
+            | ((is_portrait(self.orientation) as u16) << 11)
+    }
+
+    /// Record that `page` was counted under the settings in hand.
+    pub const fn stamp_page_layout(&mut self) {
+        self.page_layout = Some(self.layout_stamp());
+    }
+
+    /// Whether the book on screen is one that could not be read.
+    ///
+    /// Its page is whatever the app last held and names nothing loaded, so a
+    /// save carrying it would make an unreadable book the place a reboot
+    /// returns to. Cleared by the book changing or by a load that works.
+    pub fn book_unreadable(&self) -> bool {
+        self.unreadable_book == Some(self.book_id)
+    }
+
     pub const fn boot() -> Self {
         Self {
             view: AppView::Home,
             page: 0,
+            page_layout: None,
+            unreadable_book: None,
             selection: 0,
             chapter: 0,
             book_id: 1,
@@ -2723,6 +2828,7 @@ impl ReaderState {
                     self.book_id = ReaderSource::sd(0).book_id();
                     self.chapter = 0;
                     self.page = 0;
+                    self.stamp_page_layout();
                     self.dirty = Rect::FULL;
                 }
                 if self.view == AppView::Library {
@@ -2755,6 +2861,9 @@ impl ReaderState {
                 text_replaced: _,
             } => {
                 if self.book_id == book_id {
+                    // Whatever this book could not do before, it has a page
+                    // now, so it may hold the durable record again.
+                    self.unreadable_book = None;
                     self.sd_page_count = pages.max(1);
                     self.sd_chapter_count = chapters.max(1);
                     self.sd_chapter_pages = chapter_pages;
@@ -2765,6 +2874,9 @@ impl ReaderState {
                     self.page = position
                         .unwrap_or(self.page)
                         .min(self.sd_page_count.saturating_sub(1));
+                    // Counted under the settings this open ran with, which is
+                    // what makes the number comparable later.
+                    self.stamp_page_layout();
                     // The firmware owns the true current chapter over the whole
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
@@ -2776,6 +2888,21 @@ impl ReaderState {
                 // The app task owns the rollback: it is the only place that
                 // still remembers which book the reader was on before the
                 // open, so it applies `restore_after_failed_open` itself.
+            }
+            LibraryEvent::BookOpenUnreadable { book_id } => {
+                // Deliberately no page, no chapter, no counts. The store this
+                // would have taken them from is empty.
+                //
+                // The book stays selected. The reader asked for it and the
+                // honest answer is this book with an error on it, rather than
+                // the device quietly going back to the last one that worked.
+                // What waits is the durable record, which is crash recovery
+                // rather than what is on screen.
+                if self.book_id == book_id {
+                    self.unreadable_book = Some(book_id);
+                    self.read_request_pending = false;
+                    self.dirty = Rect::FULL;
+                }
             }
             LibraryEvent::ChapterPage {
                 book_id,
@@ -2893,6 +3020,7 @@ impl ReaderState {
                     self.chapter = 0;
                     self.selection = 0;
                     self.page = 0;
+                    self.stamp_page_layout();
                     self.sd_page_count = 1;
                     self.sd_chapter_count = 1;
                     self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
@@ -3104,6 +3232,7 @@ impl ReaderState {
             book_id: self.book_id,
             chapter: self.chapter,
             page: self.page,
+            page_layout: self.page_layout,
             view: self.view,
             selection: self.selection,
             sd_page_count: self.sd_page_count,
@@ -3122,6 +3251,7 @@ impl ReaderState {
         self.book_id = rollback.book_id;
         self.chapter = rollback.chapter;
         self.page = rollback.page;
+        self.page_layout = rollback.page_layout;
         self.view = rollback.view;
         self.selection = rollback.selection;
         self.sd_page_count = rollback.sd_page_count;
@@ -3188,10 +3318,33 @@ impl ReaderState {
     }
 }
 
+/// Whether a state change owes storage a progress record of its own.
+///
+/// The question is who decided where the reader lands. An open or a chapter
+/// jump hands that to storage and owes nothing, whether or not the book
+/// changed: the app's page stays provisional until storage answers, and a
+/// record carrying it would overwrite the position being resumed. Selecting
+/// the book already open is still an open.
+///
+/// Nothing dispatched with the book changed is a rollback or a refusal, which
+/// touched nothing. What is left the app decided itself, unless the book
+/// could not be read and holds no page worth keeping.
+pub fn progress_owed(
+    previous: &ReaderState,
+    next: &ReaderState,
+    dispatched: Option<&StorageCommand>,
+) -> bool {
+    match dispatched {
+        Some(StorageCommand::OpenBook { .. } | StorageCommand::JumpChapter { .. }) => false,
+        None if previous.book_id != next.book_id => false,
+        _ => previous.persisted() != next.persisted() && !next.book_unreadable(),
+    }
+}
+
 /// Whether an orientation stands the panel's long axis upright. The two
-/// portrait variants share one page geometry, so reading layout keys off
-/// this rather than the exact variant.
-pub fn is_portrait(orientation: DisplayOrientation) -> bool {
+/// portrait variants share one page geometry, so layout keys read off this
+/// rather than off the exact variant.
+pub const fn is_portrait(orientation: DisplayOrientation) -> bool {
     matches!(
         orientation,
         DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight
@@ -4060,6 +4213,247 @@ mod tests {
         assert_eq!(recovered.view, AppView::Reading);
     }
 
+    /// Boot takes its page off the card, so the first open resolves the stored
+    /// place rather than trusting the number. The lowest of every setting
+    /// packs to a stamp of zero, so a zero meaning "unstamped" would read as
+    /// counted under exactly those settings, and a reader on them would reboot
+    /// to the page mirror instead of where they were.
+    #[test]
+    fn a_boot_resolves_its_place_even_on_the_settings_that_pack_to_zero() {
+        let state = ReaderState::boot();
+        assert_eq!(state.page_layout, None, "boot counted no page");
+
+        let restored = state.apply_library_event(
+            CTX,
+            LibraryEvent::Restored {
+                book_id: ReaderSource::sd(2).book_id(),
+                chapter: 13,
+                page: 302,
+                page_count: 400,
+                reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
+                refresh_policy: RefreshPolicy::FullOnWake as u8,
+                font_size: FontSize::Small as u8,
+                line_spacing: LineSpacing::Compact as u8,
+                font_weight: FontWeight::Normal as u8,
+                font_family: FontFamily::Literata as u8,
+                front_buttons: FrontButtons::PagesRight as u8,
+            },
+        );
+        assert_eq!(
+            restored.layout_stamp(),
+            0,
+            "the fixture needs the settings whose stamp is zero"
+        );
+        assert_eq!(
+            restored.page_layout, None,
+            "and the restore adopts a page it did not count"
+        );
+
+        match open_book_command(&restored, 2, 1, None, None) {
+            StorageCommand::OpenBook { resolve_place, .. } => assert!(
+                resolve_place,
+                "the page came off the card, so the place decides where to open"
+            ),
+            other => panic!("expected an open, got {other:?}"),
+        }
+    }
+
+    /// The stamp says whether the page in hand still describes a pagination
+    /// that exists, so it tracks what pagination depends on: the page box.
+    /// Both landscapes share one box and both portraits the other. A stamp
+    /// that moved when the device was turned around would send the next open
+    /// to the stored place instead, which is the last place saved rather than
+    /// the page the reader is on, so a turn inside the save interval would
+    /// cost them the pages since.
+    #[test]
+    fn turning_the_device_around_keeps_the_page_it_was_counted_under() {
+        let mut state = reading(2, 0, 40);
+
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+        state.stamp_page_layout();
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+        assert_eq!(
+            state.page_layout,
+            Some(state.layout_stamp()),
+            "both portraits paginate into the same box"
+        );
+
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.stamp_page_layout();
+        state.orientation = DisplayOrientation::LandscapeButtonsTop;
+        assert_eq!(
+            state.page_layout,
+            Some(state.layout_stamp()),
+            "and so do both landscapes"
+        );
+
+        // The box itself changing is the thing the stamp is for.
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+        assert_ne!(
+            state.page_layout,
+            Some(state.layout_stamp()),
+            "landscape to portrait moves every page boundary"
+        );
+
+        // And the stamp agrees with what the open tells storage.
+        for orientation in [
+            DisplayOrientation::PortraitButtonsLeft,
+            DisplayOrientation::PortraitButtonsRight,
+            DisplayOrientation::LandscapeButtonsBottom,
+            DisplayOrientation::LandscapeButtonsTop,
+        ] {
+            state.orientation = orientation;
+            state.stamp_page_layout();
+            let portrait_bit = (state.page_layout.expect("just stamped") >> 11) & 1 == 1;
+            assert_eq!(
+                portrait_bit,
+                is_portrait(orientation),
+                "the stamp and the open's portrait field are one answer"
+            );
+        }
+    }
+
+    /// Who owes a progress record: whoever decided where the reader lands.
+    /// Asking instead whether the open carried a departing book, or whether
+    /// the book changed, answers a neighboring question and gets the cases
+    /// below wrong.
+    #[test]
+    fn only_a_move_the_app_decided_owes_a_progress_record() {
+        let reading_a = reading(1, 3, 88);
+        let turned = reading(1, 3, 89);
+        let arriving = reading(2, 0, 0);
+        let extend = extend_section_command(&turned, 1, 1);
+        let open = open_book_command(&arriving, 2, 1, Some(reading_a.persisted()), None);
+        let jump = StorageCommand::JumpChapter {
+            request_id: 1,
+            book_id: reading_a.book_id,
+            index: 1,
+            chapter: 7,
+            type_settings: reading_a.type_settings(),
+            portrait: is_portrait(reading_a.orientation),
+        };
+
+        // The app turned a page and told storage to fetch it. It knows where
+        // the reader is.
+        assert!(progress_owed(&reading_a, &turned, Some(&extend)));
+        assert!(progress_owed(&reading_a, &turned, None));
+
+        // Nothing moved.
+        assert!(!progress_owed(&reading_a, &reading_a, None));
+
+        // A switch. The open closes out the book being left and reports where
+        // the arriving one landed.
+        assert!(!progress_owed(&reading_a, &arriving, Some(&open)));
+
+        // The same book, selected again from the Library. The row-open path
+        // resets the page to zero and asks storage to resume it, so the page
+        // in hand is provisional and writing it would overwrite the place the
+        // open is about to resolve.
+        let reselected = reading(1, 0, 0);
+        let reopen = open_book_command(&reselected, 1, 1, None, None);
+        assert!(
+            !progress_owed(&reading_a, &reselected, Some(&reopen)),
+            "an open owns its landing whether or not the book changed"
+        );
+
+        // And a chapter jump, which storage resolves against the on-disk TOC.
+        let jumped = ReaderState {
+            chapter: 7,
+            ..reading_a
+        };
+        assert!(
+            !progress_owed(&reading_a, &jumped, Some(&jump)),
+            "a jump owns its landing too"
+        );
+
+        // A rollback: the book changed and nothing was dispatched.
+        assert!(!progress_owed(&arriving, &reading_a, None));
+
+        // And a book that could not be read holds no page worth keeping.
+        let unreadable = reading_a.apply_library_event(
+            CTX,
+            LibraryEvent::BookOpenUnreadable {
+                book_id: reading_a.book_id,
+            },
+        );
+        let deeper = ReaderState {
+            page: 99,
+            ..unreadable
+        };
+        assert!(!progress_owed(&unreadable, &deeper, None));
+    }
+
+    /// What the transition machinery makes of a rollback, and why the app task
+    /// does not ask it. The two states differ by book, so this reads a
+    /// rollback as an ordinary switch and closes out the failed book, writing
+    /// the page the app briefly held for it over the real one on the card.
+    /// Only the caller knows which way the state moved, and
+    /// `fw::tasks::app::handle_library_event` skips this call when it applied
+    /// a rollback.
+    #[test]
+    fn a_rollback_read_as_a_switch_would_close_out_the_book_that_failed() {
+        // Selecting book 2 put the app on it at page zero; the open was
+        // refused and the rollback puts book 1 back at page 88.
+        let failed = reading(2, 0, 0);
+        let restored = reading(1, 3, 88);
+
+        match storage_command_for_transition(&failed, &restored, 1) {
+            Some(StorageCommand::OpenBook {
+                book_id, previous, ..
+            }) => {
+                assert_eq!(
+                    book_id, restored.book_id,
+                    "an open for the book coming back"
+                );
+                let departing = previous.expect("and a close-out for the one it left");
+                assert_eq!(departing.book_id, failed.book_id);
+                assert_eq!(
+                    departing.screen, 0,
+                    "at a page nothing ever loaded, over whatever that book really had"
+                );
+            }
+            other => panic!("expected an open, got {other:?}"),
+        }
+    }
+
+    /// Selecting a book stamps the current layout on a page of zero, so a
+    /// refused open has to put the old stamp back with the old page. Leaving
+    /// the new one makes a stale page read as current, and the next open of
+    /// that book skips resolving its stored place and resumes at a number
+    /// counted under a pagination that is gone.
+    #[test]
+    fn an_aborted_open_puts_back_the_layout_the_page_was_counted_under() {
+        // Book A, read at page 120 under settings the reader has since left.
+        let mut before = reading(0, 4, 120);
+        before.stamp_page_layout();
+        before.font_size = FontSize::Large;
+        assert_ne!(
+            before.page_layout,
+            Some(before.layout_stamp()),
+            "the fixture needs a page the current layout did not count"
+        );
+        let rollback = before.open_rollback();
+
+        // Book B is selected, which stamps page zero with the layout in hand,
+        // and the storage task refuses the switch.
+        let mut committed = reading(1, 0, 0);
+        committed.font_size = FontSize::Large;
+        committed.stamp_page_layout();
+        let recovered = committed.restore_after_failed_open(rollback);
+
+        assert_eq!(recovered.page, 120);
+        assert_eq!(
+            recovered.page_layout, before.page_layout,
+            "the page came back, so the layout that counted it has to as well"
+        );
+        assert_ne!(
+            recovered.page_layout,
+            Some(recovered.layout_stamp()),
+            "and the next open of this book resolves the place rather than \
+             trusting the number"
+        );
+    }
+
     #[test]
     fn an_aborted_open_leaves_the_reader_able_to_turn_the_page() {
         // Selecting a book from the shelf resets the reader's idea of how long
@@ -4627,13 +5021,17 @@ mod tests {
     /// Every event that releases a lock the app took when it handed work over.
     /// Listed once, so the routing test and the holder tests below cannot
     /// disagree about which events are which.
-    fn settling_events() -> [LibraryEvent; 8] {
+    fn settling_events() -> [LibraryEvent; 9] {
         [
             LibraryEvent::CacheCleared {
                 request_id: 1,
                 ok: true,
             },
             LibraryEvent::BookOpenFailed { book_id: 2 },
+            // The third way an open ends, and the one that looks droppable
+            // because it carries nothing. Losing it holds the input gate and
+            // the sleep block until the device reboots.
+            LibraryEvent::BookOpenUnreadable { book_id: 2 },
             LibraryEvent::Loaded {
                 book_id: 2,
                 pages: 1,
@@ -5495,6 +5893,308 @@ mod tests {
     /// for: it closes out nobody, so the older reading of "can this abort"
     /// said no, while the catalog fence could refuse it all the same. What
     /// followed was worse than a bad screen. The reader stayed in Reading
+    fn resolves_place(command: &StorageCommand) -> bool {
+        matches!(
+            command,
+            StorageCommand::OpenBook {
+                resolve_place: true,
+                ..
+            }
+        )
+    }
+
+    /// The flow the place record exists for. Read to a page, change the type
+    /// size, come back: the page in hand was counted under a pagination that
+    /// no longer exists, so the open has to resolve the stored place instead
+    /// of opening at a number that now names other content.
+    #[test]
+    fn a_typography_change_makes_the_next_open_resolve_the_stored_place() {
+        let mut state = reading(0, 3, 120);
+        state.stamp_page_layout();
+        assert!(
+            !resolves_place(&open_book_command(&state, 0, 1, None, None)),
+            "nothing has changed, so the page in hand still counts"
+        );
+
+        state.selection = 1;
+        state.view = AppView::Settings;
+        let changed = apply_setting(state);
+        assert_ne!(
+            changed.font_size, state.font_size,
+            "the fixture changed one"
+        );
+        assert_eq!(changed.page, 120, "the app still holds the old number");
+        assert!(
+            resolves_place(&open_book_command(&changed, 0, 1, None, None)),
+            "and the open must not open at it"
+        );
+    }
+
+    /// Spacing moves page boundaries without moving wrap points, so the
+    /// pagination cache keeps one copy for both and the page number still
+    /// changes. The open has to resolve for that too.
+    #[test]
+    fn a_spacing_change_counts_as_a_layout_change_for_the_page_in_hand() {
+        let mut state = reading(0, 3, 120);
+        state.stamp_page_layout();
+        state.selection = 3;
+        state.view = AppView::Settings;
+        let changed = apply_setting(state);
+        assert_ne!(changed.line_spacing, state.line_spacing);
+        assert!(resolves_place(&open_book_command(
+            &changed, 0, 1, None, None
+        )));
+    }
+
+    /// Cycling a setting back to where it started leaves the page valid, so
+    /// the open keeps it. The stamp compares layouts, not edits.
+    #[test]
+    fn a_settings_round_trip_keeps_the_page_it_started_with() {
+        let mut state = reading(0, 3, 120);
+        state.stamp_page_layout();
+        state.selection = 2;
+        state.view = AppView::Settings;
+        let there = apply_setting(state);
+        assert!(resolves_place(&open_book_command(&there, 0, 1, None, None)));
+        let back = apply_setting(there);
+        assert_eq!(back.font_weight, state.font_weight, "back where it started");
+        assert!(
+            !resolves_place(&open_book_command(&back, 0, 1, None, None)),
+            "so the page counted under that layout is good again"
+        );
+    }
+
+    /// Leaving a book that would not open owes it nothing. Its page is
+    /// whatever the app held when the open failed, so closing it out would
+    /// write a speculative page over the real one already on the card, and a
+    /// refused write would hold the reader on a book they cannot read.
+    #[test]
+    fn leaving_an_unreadable_book_closes_nothing_out() {
+        let unreadable = ReaderSource::sd(2).book_id();
+        let next_book = ReaderSource::sd(3).book_id();
+
+        // The reader is on a book that would not open.
+        let mut stuck = reading(2, 0, 0);
+        stuck = stuck.apply_library_event(
+            CTX,
+            LibraryEvent::BookOpenUnreadable {
+                book_id: unreadable,
+            },
+        );
+        assert!(stuck.book_unreadable());
+
+        // They pick another one.
+        let mut moving_on = stuck;
+        moving_on.book_id = next_book;
+        moving_on.page = 0;
+        moving_on.chapter = 0;
+        match storage_command_for_transition(&stuck, &moving_on, 1) {
+            Some(StorageCommand::OpenBook { previous, .. }) => assert!(
+                previous.is_none(),
+                "the book that would not open has no position to close out"
+            ),
+            other => panic!("expected an open, got {other:?}"),
+        }
+
+        // A book that did open still closes out, which is the ordinary case.
+        let reading_fine = reading(2, 1, 44);
+        let mut switching = reading_fine;
+        switching.book_id = next_book;
+        switching.page = 0;
+        switching.chapter = 0;
+        match storage_command_for_transition(&reading_fine, &switching, 1) {
+            Some(StorageCommand::OpenBook { previous, .. }) => {
+                let departing = previous.expect("a readable book carries its place");
+                assert_eq!(departing.screen, 44);
+            }
+            other => panic!("expected an open, got {other:?}"),
+        }
+    }
+
+    /// The book the reader chose stays chosen, and the write that follows
+    /// the failure is the one that matters. A book that would not open holds
+    /// no page worth keeping, so it stays off the durable record until it
+    /// produces one, and the record goes on naming the last book that had a
+    /// page. That is crash recovery, not what is on screen.
+    #[test]
+    fn a_book_that_would_not_open_stays_selected_and_off_the_card() {
+        let unreadable = ReaderSource::sd(2).book_id();
+        let attempting = reading(2, 0, 0);
+        assert_eq!(attempting.book_id, unreadable);
+
+        let settled = attempting.apply_library_event(
+            CTX,
+            LibraryEvent::BookOpenUnreadable {
+                book_id: unreadable,
+            },
+        );
+        assert_eq!(
+            settled.book_id, unreadable,
+            "the reader asked for this book, so it is still the book"
+        );
+        assert!(
+            settled.book_unreadable(),
+            "and it is the one that could not be read"
+        );
+        assert!(
+            !settled.read_request_pending,
+            "with the open gate lifted, or the reader is stuck"
+        );
+
+        // A load that works settles it, and the book may hold the record
+        // again.
+        let readable = settled.apply_library_event(
+            CTX,
+            LibraryEvent::Loaded {
+                book_id: unreadable,
+                pages: 40,
+                chapters: 2,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: Some(3),
+                text_replaced: true,
+            },
+        );
+        assert!(
+            !readable.book_unreadable(),
+            "a page arrived, so the book is readable after all"
+        );
+        assert_eq!(readable.page, 3);
+    }
+
+    /// And the book the reader left keeps the durable record meanwhile, where
+    /// a reboot comes back to.
+    #[test]
+    fn a_book_that_would_not_open_leaves_the_durable_record_alone() {
+        let readable = ReaderSource::sd(1).book_id();
+        let unreadable = ReaderSource::sd(2).book_id();
+        let on_a = reading(1, 3, 88);
+        assert_eq!(on_a.persisted().book_id, readable);
+
+        let mut attempting_b = on_a;
+        attempting_b.book_id = unreadable;
+        attempting_b.page = 0;
+        attempting_b.chapter = 0;
+        let settled = attempting_b.apply_library_event(
+            CTX,
+            LibraryEvent::BookOpenUnreadable {
+                book_id: unreadable,
+            },
+        );
+
+        // The app names B, the book the reader chose. The write that would
+        // carry B is the one held back: `book_unreadable` is the
+        // gate the task checks before sending a progress record.
+        assert_eq!(settled.book_id, unreadable);
+        assert!(
+            settled.book_unreadable(),
+            "so no progress write leaves for it, and the card keeps naming A"
+        );
+    }
+
+    /// Every way an open can end has to answer it. The caller hangs the open's
+    /// bookkeeping, the input gate and the sleep block on this, so an ending
+    /// missing from it leaves the reader unable to press anything or go to
+    /// sleep until the device reboots.
+    #[test]
+    fn every_ending_of_an_open_answers_for_it() {
+        let book_id = ReaderSource::sd(3).book_id();
+
+        // It landed.
+        assert_eq!(
+            open_answered_for(&LibraryEvent::Loaded {
+                book_id,
+                pages: 40,
+                chapters: 2,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: Some(9),
+                text_replaced: true,
+            }),
+            Some(book_id)
+        );
+        // It refused before it began.
+        assert_eq!(
+            open_answered_for(&LibraryEvent::BookOpenFailed { book_id }),
+            Some(book_id)
+        );
+        // It ran to its end and read nothing. The one that carries no
+        // navigation metadata, and just as final as the other two.
+        assert_eq!(
+            open_answered_for(&LibraryEvent::BookOpenUnreadable { book_id }),
+            Some(book_id)
+        );
+        // And events that are not an open ending answer for nothing.
+        assert_eq!(
+            open_answered_for(&LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: 1,
+            }),
+            None
+        );
+        assert_eq!(
+            open_answered_for(&LibraryEvent::CustomFont { available: true }),
+            None
+        );
+    }
+
+    /// And the gate the answer feeds: while an open is unresolved it stays
+    /// shut, whatever else is true.
+    #[test]
+    fn the_open_gate_waits_for_that_answer() {
+        assert!(!open_gate_may_lift(true, true, false), "open unresolved");
+        assert!(!open_gate_may_lift(true, false, true), "a frame in flight");
+        assert!(open_gate_may_lift(true, false, false), "answered and idle");
+    }
+
+    /// An open that read nothing must not move the reader, because the state
+    /// it would move them to comes from a store that was emptied on the way
+    /// into the failed load. A `Loaded` carrying that store's counts is the
+    /// shape that does the damage, and it is left here beside the fix so the
+    /// difference is visible.
+    #[test]
+    fn an_unreadable_open_moves_nothing_a_save_would_follow() {
+        let at_page = reading(0, 4, 120);
+        let book_id = at_page.book_id;
+        let before = at_page.persisted();
+
+        // What the storage task would have sent before: an empty store reports
+        // one page, and the clamp takes the reader to the top of the book.
+        let as_loaded = at_page.apply_library_event(
+            CTX,
+            LibraryEvent::Loaded {
+                book_id,
+                pages: 1,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: true,
+            },
+        );
+        assert_eq!(as_loaded.page, 0, "the clamp against an empty store");
+        assert_ne!(
+            as_loaded.persisted().screen,
+            before.screen,
+            "which the ordinary post-event save would then write to the card"
+        );
+
+        // What it sends now.
+        let as_unreadable =
+            at_page.apply_library_event(CTX, LibraryEvent::BookOpenUnreadable { book_id });
+        assert_eq!(as_unreadable.page, 120, "the reader's page is untouched");
+        assert_eq!(as_unreadable.chapter, 4, "and so is their chapter");
+        assert_eq!(
+            as_unreadable.persisted(),
+            before,
+            "so nothing follows the failure to the card"
+        );
+        assert!(
+            !as_unreadable.read_request_pending,
+            "and the open gate lifts, or the reader is stuck"
+        );
+    }
+
     /// over a row number a rebuilt catalog had given to another book, and
     /// the next page turn extends by index without a fence, off a RAM window
     /// that checks the index and not which book the text came from.
@@ -6928,6 +7628,7 @@ mod tests {
                 type_settings: TypeSettings::DEFAULT,
                 portrait: false,
                 previous: None,
+                resolve_place: false,
             },
             StorageCommand::ExtendSection {
                 request_id: 1,

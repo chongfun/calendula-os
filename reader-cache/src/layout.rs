@@ -74,7 +74,17 @@ pub fn rebuild_page_index(library: &mut ReaderStore) -> (PageIndexCursor, bool) 
             &mut overflowed,
         );
     }
+    rebuild_page_offsets(library);
     (cursor, overflowed)
+}
+
+/// A page opens where its first line opens. Taken from the line rather than
+/// computed from the cached text, whose byte length is a rendering's.
+pub(crate) fn rebuild_page_offsets(library: &mut ReaderStore) {
+    for page in 0..library.page_count {
+        let first = library.pages[page].first_block as usize;
+        library.page_offset[page] = library.block_offset.get(first).copied().unwrap_or(0);
+    }
 }
 
 pub fn rebuild_toc_page_targets(library: &mut ReaderStore) {
@@ -145,6 +155,7 @@ pub fn replace_last_block(
     }
     let spine = library.block_spine.get(index).copied().unwrap_or(0);
     let mut overflowed = false;
+    let before = library.page_count;
     ui::reading::apply_last_block_move(
         index,
         spine,
@@ -153,5 +164,12 @@ pub fn replace_last_block(
         &mut library.page_count,
         &mut overflowed,
     );
+    // The move can open a page, and the moved block is the only thing on it,
+    // so that is where the page opens. The walk that sets offsets as pages
+    // open has already been past this one.
+    if library.page_count > before {
+        let page = library.page_count - 1;
+        library.page_offset[page] = library.block_offset.get(index).copied().unwrap_or(0);
+    }
     overflowed
 }

@@ -156,7 +156,6 @@ pub async fn run() {
                 }
 
                 let previous = state;
-                let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
                 // Activity carries the post-input view so entering a view
                 // immediately gets that view's idle leash (e.g. opening a
@@ -196,16 +195,12 @@ pub async fn run() {
                     None,
                 );
                 let awaiting_chapter_list = dispatched.awaiting_chapter_list;
-                let switch_dispatched = dispatched.switch_dispatched;
                 // Read back after the dispatch: a rejected open has rolled the
-                // state to where it started, which leaves nothing to persist
-                // and no risk of writing the arriving book's position for a
-                // switch that never happened.
-                let next_persisted = state.persisted();
-                if previous_persisted != next_persisted && !switch_dispatched {
+                // state to where it started, which leaves nothing to persist.
+                if app_core::progress_owed(&previous, &state, storage_command.as_ref()) {
                     dispatch_storage(
                         &mut pending_storage,
-                        StorageCommand::StoreProgress(next_persisted),
+                        StorageCommand::StoreProgress(state.persisted()),
                     );
                 }
                 if let Some(command) = forget_command_for_transition(&previous, &state) {
@@ -501,6 +496,7 @@ fn fold_library_event(
         }
         return true;
     }
+
     if let Some(book_id) = loaded_book_id(event) {
         if *opening_book == Some(book_id) {
             *opening_book = None;
@@ -574,15 +570,25 @@ async fn handle_library_event(
         return false;
     }
     let request_id = peek_reader_request_id();
-    let command = storage_command_for_transition(&before, state, request_id);
-    let previous_persisted = before.persisted();
+    // A rollback walks the state backwards, and the transition machinery reads
+    // any book change as a switch whichever way it points. It would close out
+    // the book that failed to open, writing the page the app was holding for
+    // it over the real one that book has on the card, and dispatch an open for
+    // a book the store is already holding. The open that failed touched
+    // nothing, so the reader is back where they started and nothing is owed.
+    let rolled_back = matches!(event, crate::LibraryEvent::BookOpenFailed { .. });
+    let command = if rolled_back {
+        None
+    } else {
+        storage_command_for_transition(&before, state, request_id)
+    };
     // The one event whose index came from a row the storage task just looked
     // up. The open it owes is fenced to the catalog that lookup ran against.
     let catalog_fence = match event {
         crate::LibraryEvent::RowIsBook { catalog_epoch, .. } => Some(*catalog_epoch),
         _ => None,
     };
-    let dispatched = dispatch_transition_storage(
+    dispatch_transition_storage(
         parked,
         state,
         &before,
@@ -594,9 +600,8 @@ async fn handle_library_event(
         reader_relayout_pending,
         catalog_fence,
     );
-    let next_persisted = state.persisted();
-    if previous_persisted != next_persisted && !dispatched.switch_dispatched {
-        dispatch_storage(parked, StorageCommand::StoreProgress(next_persisted));
+    if app_core::progress_owed(&before, state, command.as_ref()) {
+        dispatch_storage(parked, StorageCommand::StoreProgress(state.persisted()));
     }
     if *rendering {
         *render_pending = true;
@@ -646,6 +651,9 @@ fn library_event_affects_view(
         }
         // Handled before the reducer; never reaches here.
         crate::LibraryEvent::BookOpenFailed { .. } => true,
+        // The store holds an error where the page was, so the reader is owed
+        // the frame that shows it.
+        crate::LibraryEvent::BookOpenUnreadable { book_id } => state.book_id == book_id,
         crate::LibraryEvent::ChapterPage {
             book_id,
             chapter,
@@ -853,11 +861,15 @@ fn open_book_id(command: StorageCommand) -> Option<u32> {
     }
 }
 
+/// The book an open transaction has finished with, whatever it finished as.
+///
+/// The rule lives in `app_core::open_answered_for`, where it can be tested:
+/// an ending missing from it holds `opening_book`, and with it the input gate
+/// and the sleep block, until the device reboots. `BookOpenFailed` is handled
+/// by the branch above before this is reached, and answering for it here as
+/// well costs nothing and keeps the rule one rule.
 fn loaded_book_id(event: &crate::LibraryEvent) -> Option<u32> {
-    match *event {
-        crate::LibraryEvent::Loaded { book_id, .. } => Some(book_id),
-        _ => None,
-    }
+    app_core::open_answered_for(event)
 }
 
 fn should_block_post_open_confirm(event: InputEvent, block_until: &mut Option<Instant>) -> bool {
@@ -909,7 +921,6 @@ async fn send_render(kind: RenderKind, state: &ReaderState) {
 struct OpenDispatch {
     /// The open carried the departing book's position, so no separate
     /// progress write may follow it.
-    switch_dispatched: bool,
     /// A chapter list is genuinely in flight, so the current frame holds
     /// until it lands.
     awaiting_chapter_list: bool,
@@ -954,6 +965,7 @@ fn dispatch_transition_storage(
             portrait,
             previous,
             catalog_epoch,
+            resolve_place,
         }) => Some(StorageCommand::OpenBook {
             request_id,
             book_id,
@@ -968,27 +980,16 @@ fn dispatch_transition_storage(
             // being read, which the state diff cannot tell from staying put.
             // The reducer's own reading stands only where no event answered.
             catalog_epoch: catalog_fence.or(catalog_epoch),
+            resolve_place,
         }),
         other => other,
     };
-    // A book change closes out the departing book inside its own open. The
-    // separate progress record that used to follow named the *new* book, so it
-    // wrote that book's position file at the page the open had not resolved
-    // yet, erasing the very place the reader was about to resume from.
-    let open_owns_the_switch = matches!(
-        storage_command,
-        Some(StorageCommand::OpenBook {
-            previous: Some(_),
-            ..
-        })
-    );
     // The chapter overview can't paint its rows until the on-disk list lands;
     // hold the current frame and let the Loaded event render once, rather than
     // flashing a partial first frame and spending an extra panel refresh. Only
     // when the command is truly in flight -- a queued command relies on the
     // render's Settled to be drained, so it must still render.
     let mut awaiting_chapter_list = false;
-    let mut switch_dispatched = false;
     if let Some(command) = storage_command {
         match dispatch_storage(parked, command) {
             StorageDispatch::Rejected => {
@@ -1006,7 +1007,6 @@ fn dispatch_transition_storage(
                 // dispatched command syncs the reader store.
                 *reader_relayout_pending = false;
                 commit_reader_request_id(request_id);
-                switch_dispatched = open_owns_the_switch;
                 // What an open in flight leaves the app holding, decided in
                 // `app_core` where a test can walk the whole sequence: the
                 // book being waited on, and where to put the reader back if
@@ -1026,7 +1026,6 @@ fn dispatch_transition_storage(
         }
     }
     OpenDispatch {
-        switch_dispatched,
         awaiting_chapter_list,
     }
 }
