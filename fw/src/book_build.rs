@@ -1313,9 +1313,9 @@ impl SavedPlace {
         match self {
             Self::Place { anchor, .. } => (anchor.spine, 0),
             Self::Page { chapter, page } => (chapter, page),
-            // Nothing is known about where the reader was, so the open takes
-            // the start of the book and the retry moves them if the card
-            // comes back with an answer.
+            // Nothing is known about where the reader was. Callers ask this
+            // only of a place that said something; the open keeps the page it
+            // came in with rather than taking this one.
             Self::Unreadable => (0, 0),
         }
     }

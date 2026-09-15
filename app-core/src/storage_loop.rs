@@ -1015,6 +1015,53 @@ mod tests {
         assert!(!switching.is_extend());
     }
 
+    /// A place the card would not read carries no position, so the open keeps
+    /// the one it came in with rather than being handed a zero.
+    ///
+    /// The page it came in with is a real one: after a boot whose place read
+    /// refused, it is the global mirror's, and after a typography change it is
+    /// the page the app was holding. Adopting a zero instead lands the reader
+    /// at the start of the book with a usable page in hand, and this open is
+    /// resolving a place, so the zero would travel back as an answer.
+    #[test]
+    fn an_unreadable_place_leaves_the_open_on_the_page_it_came_with() {
+        let book_id = ReaderSource::sd(2).book_id();
+        let mut command = open(book_id, 26, 242, None);
+        if let StorageCommand::OpenBook {
+            ref mut resolve_place,
+            ..
+        } = command
+        {
+            *resolve_place = true;
+        }
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        // The card refused, so the caller adopts nothing.
+        open.saved_position(None);
+
+        match open.next() {
+            OpenAction::LoadSection { chapter, page, .. } => assert_eq!(
+                (chapter, page),
+                (26, 242),
+                "the page the open arrived with stands"
+            ),
+            other => panic!("expected a section load, got {other:?}"),
+        }
+
+        // And it claims no position, so the app keeps what it had too.
+        open.section_loaded();
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position, None,
+                "nothing resolved, so nothing to tell the app"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
+
     /// A place that cannot resolve yet still has to say where the open put the
     /// reader. The walk has not reached the page the anchor names, so the open
     /// lands on the provisional one and the place waits; if that landing is

@@ -2033,7 +2033,16 @@ fn handle_storage_command(
                         // to build.
                         opening_place =
                             book_build::load_place(epd, sd_cs, sd_library, index as usize);
-                        open.saved_position(opening_place.map(book_build::SavedPlace::provisional));
+                        // A place the card would not read carries no position
+                        // of its own, so the open keeps the one it came in
+                        // with: the mirror's page after a boot that fell back
+                        // to it, or the page a typography change arrived
+                        // holding. It is still kept, so the resolve after the
+                        // load asks the card again and arms the retry.
+                        open.saved_position(opening_place.and_then(|place| match place {
+                            book_build::SavedPlace::Unreadable => None,
+                            place => Some(place.provisional()),
+                        }));
                         if open.resumed() {
                             esp_println::println!(
                                 "storage: resume book {} at chapter {} screen {}",
