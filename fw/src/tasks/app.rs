@@ -197,7 +197,7 @@ pub async fn run() {
                 let awaiting_chapter_list = dispatched.awaiting_chapter_list;
                 // Read back after the dispatch: a rejected open has rolled the
                 // state to where it started, which leaves nothing to persist.
-                if app_core::progress_owed(&previous, &state) {
+                if app_core::progress_owed(&previous, &state, storage_command.as_ref()) {
                     dispatch_storage(
                         &mut pending_storage,
                         StorageCommand::StoreProgress(state.persisted()),
@@ -600,7 +600,7 @@ async fn handle_library_event(
         reader_relayout_pending,
         catalog_fence,
     );
-    if app_core::progress_owed(&before, state) {
+    if app_core::progress_owed(&before, state, command.as_ref()) {
         dispatch_storage(parked, StorageCommand::StoreProgress(state.persisted()));
     }
     if *rendering {

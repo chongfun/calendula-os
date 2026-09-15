@@ -99,10 +99,17 @@ where
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TwoGenerationRead {
     /// At least one side held a record, and `payload` has the newest of what
-    /// could be read. A side that would not read leaves that possibly one
-    /// generation stale, which is a real position of this book's against no
-    /// position at all.
-    Found,
+    /// could be read.
+    ///
+    /// `saw_both` is false when the other side refused, so a newer record may
+    /// be sitting behind that refusal. What to do about that is the caller's,
+    /// and the two kinds of caller want opposite things. A record with a
+    /// legacy file behind it takes what it can get: missing here sends it to
+    /// the older file or to nothing. A reading place refuses: it has a
+    /// bounded retry that recovers the newer one, and accepting the older
+    /// puts the reader behind where they were and lets the next save write
+    /// that backwards step to the card.
+    Found { saw_both: bool },
     /// Neither side holds a record.
     Absent,
     /// Neither side could be read, so there is no saying whether one is there.
@@ -110,8 +117,10 @@ enum TwoGenerationRead {
 }
 
 impl TwoGenerationRead {
+    /// Whether a record came back at all, for the callers with nothing better
+    /// to fall back on than an older file.
     fn found(self) -> bool {
-        self == Self::Found
+        matches!(self, Self::Found { .. })
     }
 }
 
@@ -145,16 +154,20 @@ where
             TwoGenerationRead::Fault
         }
         (None, None) => TwoGenerationRead::Absent,
-        (Some(_), None) => TwoGenerationRead::Found,
+        (Some(_), None) => TwoGenerationRead::Found {
+            saw_both: b != GenerationRead::Fault,
+        },
         (None, Some(_)) => {
             payload.copy_from_slice(&other[..payload.len()]);
-            TwoGenerationRead::Found
+            TwoGenerationRead::Found {
+                saw_both: a != GenerationRead::Fault,
+            }
         }
         (Some(a), Some(b)) if generation_is_newer(b, a) => {
             payload.copy_from_slice(&other[..payload.len()]);
-            TwoGenerationRead::Found
+            TwoGenerationRead::Found { saw_both: true }
         }
-        (Some(_), Some(_)) => TwoGenerationRead::Found,
+        (Some(_), Some(_)) => TwoGenerationRead::Found { saw_both: true },
     }
 }
 
@@ -502,10 +515,18 @@ where
     match read_two_generation(copy, PLACE_GENERATIONS, PLACE_DURABLE_MAGIC, &mut bytes) {
         TwoGenerationRead::Fault => PlaceRead::Fault,
         TwoGenerationRead::Absent => PlaceRead::Absent,
-        TwoGenerationRead::Found => match proto::nvm::PlaceRecord::decode(&bytes) {
-            Some(record) => PlaceRead::Found(record),
-            None => PlaceRead::Absent,
-        },
+        // A record with the other side unread is one generation behind at
+        // best, and this is the caller that can do better than take it: the
+        // open lands provisionally and the settle slices ask again, and while
+        // they do, the place waiting holds the card's copy against the save
+        // that would write this older one back over it.
+        TwoGenerationRead::Found { saw_both: false } => PlaceRead::Fault,
+        TwoGenerationRead::Found { saw_both: true } => {
+            match proto::nvm::PlaceRecord::decode(&bytes) {
+                Some(record) => PlaceRead::Found(record),
+                None => PlaceRead::Absent,
+            }
+        }
     }
 }
 

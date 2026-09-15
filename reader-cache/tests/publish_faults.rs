@@ -1577,25 +1577,24 @@ fn a_place_write_refuses_while_ownership_is_unreadable() {
     );
 }
 
-/// One side answering is an answer. Both generations hold records here, and a
-/// refusal on the second leaves the first readable: the pair reports what it
-/// read rather than reporting nothing.
+/// A place refuses a record it cannot prove is the newest, because it has a
+/// better move than taking it.
 ///
-/// This is the difference between a position this book really has, at worst
-/// one generation old, and no position at all. The callers that miss here do
-/// not retry: `read_position_file_or_legacy` falls through to the pre-durable
-/// single file, and app state and wifi do the same, so a refusal on one side
-/// would hand back an older record or none.
+/// The open lands provisionally and the settle slices ask again, and while
+/// they do, the waiting place holds the card's copy against the save that
+/// would write the older record back over the newer one. Taking the older one
+/// instead puts the reader behind where they were and makes that the position
+/// the next save publishes.
 #[test]
-fn one_readable_generation_answers_for_the_pair() {
+fn a_place_refuses_the_older_side_while_the_newer_one_is_unread() {
     let disk = new_card();
     let mgr = open_mgr(&disk);
     let root = open_root(&mgr);
 
     let id = book_id(32);
-    let first = proto::anchor::ContentAnchor::at(1, 64);
+    let older = proto::anchor::ContentAnchor::at(1, 64);
     let newest = proto::anchor::ContentAnchor::at(1, 96);
-    files::write_place(&root, id, first, source(), None).expect("the place stores");
+    files::write_place(&root, id, older, source(), None).expect("the place stores");
     files::write_place(&root, id, newest, source(), None).expect("and the other generation");
 
     // The lookup's last read is the second generation's, so faulting it
@@ -1608,17 +1607,46 @@ fn one_readable_generation_answers_for_the_pair() {
     disk.fault.fail_read_in.set(Some(reads - 1));
     let answer = files::read_place(&root, id);
     disk.fault.fail_read_in.set(None);
+    assert!(
+        matches!(answer, files::PlaceRead::Fault),
+        "the older side is not an answer while the newer one is unread"
+    );
 
-    match answer {
-        files::PlaceRead::Found(record) => assert_eq!(
-            record.anchor, first,
-            "the side that still reads is the answer, even though it is the older one"
-        ),
-        files::PlaceRead::Absent => panic!("the readable generation read as no place at all"),
-        files::PlaceRead::Fault => {
-            panic!("one refused side discarded the record the other still held")
-        }
-    }
+    // And the card recovering hands over the newest, which is the whole
+    // reason refusing was worth it.
+    assert_eq!(place_anchor(&root, id), Some(newest));
+}
+
+/// The records with an older file behind them take the opposite trade. A
+/// position that misses here falls through to the pre-durable single file, so
+/// one readable generation beats the fallback.
+#[test]
+fn a_position_takes_the_readable_side_rather_than_its_legacy_file() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    files::write_position_file(&root, &OWNER, 2, 40).expect("the position stores");
+    files::write_position_file(&root, &OWNER, 3, 88).expect("and the other generation");
+
+    let before = disk.reads.get();
+    assert_eq!(
+        files::read_position_file(&root, &OWNER),
+        Some((3, 88)),
+        "both sides readable"
+    );
+    let reads = disk.reads.get() - before;
+    assert!(reads > 1);
+
+    disk.fault.fail_read_in.set(Some(reads - 1));
+    let answer = files::read_position_file(&root, &OWNER);
+    disk.fault.fail_read_in.set(None);
+    assert_eq!(
+        answer,
+        Some((2, 40)),
+        "the side that still reads answers, rather than the fallback below it"
+    );
 }
 
 /// The durable pair's contract, as one property: a write that reports success
