@@ -602,6 +602,40 @@ const _: () = assert!(READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 256);
 /// in bits 5-6, portrait in bit 7, version above. Size, weight, family,
 /// and the page box all change wrap points, so a change in any forces a
 /// full rebuild.
+/// The fields below have fixed widths, and a variant added past one would
+/// overlap the field packed above it. Two layouts would then share a config,
+/// which the section header stores and the index compares, so a book
+/// paginated under one would be served under the other. The matches are
+/// exhaustive so that fails to compile here first.
+const _: () = {
+    const fn families() -> u16 {
+        match display::font::FontFamily::Literata {
+            display::font::FontFamily::Literata
+            | display::font::FontFamily::Merriweather
+            | display::font::FontFamily::Custom => 3,
+        }
+    }
+    const fn weights() -> u16 {
+        match display::font::FontWeight::Normal {
+            display::font::FontWeight::Normal | display::font::FontWeight::Heavy => 2,
+        }
+    }
+    const fn sizes() -> u16 {
+        match FontSize::Small {
+            FontSize::Small | FontSize::Medium | FontSize::Large => 3,
+        }
+    }
+    const fn spacings() -> u16 {
+        match LineSpacing::Compact {
+            LineSpacing::Compact | LineSpacing::Normal | LineSpacing::Relaxed => 3,
+        }
+    }
+    assert!(spacings() <= 4, "line spacing has bits 0 and 1");
+    assert!(sizes() <= 4, "font size has bits 2 and 3");
+    assert!(weights() <= 2, "font weight has bit 4 alone");
+    assert!(families() <= 4, "font family has bits 5 and 6");
+};
+
 pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
     ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
         | ((portrait as u16) << 7)

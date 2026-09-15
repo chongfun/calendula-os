@@ -3112,17 +3112,19 @@ fn book_position(
     // The boot mirror only understands a page, so a place resolves to the
     // chapter it names and page zero inside it. The open that follows refines
     // it against the pagination it builds, the same way an ordinary open does.
-    match book_build::load_place(epd, sd_cs, library, usize::from(index))
-        .map(book_build::SavedPlace::provisional)
-    {
-        Some(position) => position,
-        None => {
+    match book_build::load_place(epd, sd_cs, library, usize::from(index)) {
+        // A card that would not say holds no place this boot can use, and the
+        // mirror is a better provisional landing than the start of the book:
+        // it names a page this book really had. The open that follows asks
+        // the card again either way.
+        None | Some(book_build::SavedPlace::Unreadable) => {
             esp_println::println!(
                 "restore: no per-book position for index={}; using the global mirror",
                 index
             );
             (mirror.chapter, mirror.screen)
         }
+        Some(place) => place.provisional(),
     }
 }
 
