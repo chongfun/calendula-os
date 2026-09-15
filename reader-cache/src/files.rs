@@ -98,12 +98,14 @@ where
 /// What an A/B pair had to say, with the newest valid record in `payload`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TwoGenerationRead {
+    /// At least one side held a record, and `payload` has the newest of what
+    /// could be read. A side that would not read leaves that possibly one
+    /// generation stale, which is a real position of this book's against no
+    /// position at all.
     Found,
     /// Neither side holds a record.
     Absent,
-    /// One side would not read. Reported even when the other side held a
-    /// record, because which of them is newer is exactly what the refused
-    /// side would have said.
+    /// Neither side could be read, so there is no saying whether one is there.
     Fault,
 }
 
@@ -133,10 +135,15 @@ where
     let mut other = [0u8; DURABLE_MAX_BYTES];
     let a = read_generation_file(directory, names[0], magic, payload);
     let b = read_generation_file(directory, names[1], magic, &mut other[..payload.len()]);
-    if a == GenerationRead::Fault || b == GenerationRead::Fault {
-        return TwoGenerationRead::Fault;
-    }
     match (a.valid(), b.valid()) {
+        // A refusal is an absence of evidence only while nothing else
+        // answered. One readable side is a record this book really has, at
+        // worst one generation behind whatever the refused side holds, and
+        // the callers that miss here fall through to an older file or to
+        // nothing at all.
+        (None, None) if a == GenerationRead::Fault || b == GenerationRead::Fault => {
+            TwoGenerationRead::Fault
+        }
         (None, None) => TwoGenerationRead::Absent,
         (Some(_), None) => TwoGenerationRead::Found,
         (None, Some(_)) => {

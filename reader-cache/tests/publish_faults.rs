@@ -1529,9 +1529,11 @@ fn a_refused_place_read_is_not_an_absent_place() {
     assert!(faulted > 0, "the sweep has to reach the lookup's own reads");
 }
 
-/// And a write cannot step over the ownership question while the card is
-/// declining to answer it: the directory is shared by hash, and a refused
-/// read says nothing about who holds it.
+/// A write cannot step over the ownership question while the card is
+/// declining to answer it: the directory is shared by hash, so the write has
+/// to know whose it is. Nothing readable is nothing known, and the write
+/// refuses rather than publishing into a directory that may be another
+/// copy's.
 #[test]
 fn a_place_write_refuses_while_ownership_is_unreadable() {
     let disk = new_card();
@@ -1546,21 +1548,77 @@ fn a_place_write_refuses_while_ownership_is_unreadable() {
     let before = disk.reads.get();
     let _ = files::read_place(&root, id);
     let reads = disk.reads.get() - before;
+
+    // A run of refusals long enough to take both generations, swept across
+    // the reads the lookup makes. Wherever it lands, the write either knows
+    // the owner and stores, or knows nothing and refuses; what it must not do
+    // is report success while the card told it nothing.
     let mut refused = 0;
     for nth in 0..reads {
+        disk.fault.extra_read_faults.set(3);
         disk.fault.fail_read_in.set(Some(nth));
-        if matches!(
-            files::write_place(&root, id, later, source(), None),
-            Err(files::PlaceDenied::Fault)
-        ) {
-            refused += 1;
-        }
+        let wrote = files::write_place(&root, id, later, source(), None);
         disk.fault.fail_read_in.set(None);
+        disk.fault.extra_read_faults.set(0);
+
+        match wrote {
+            Err(files::PlaceDenied::Fault) => refused += 1,
+            Ok(()) => assert_eq!(
+                place_anchor(&root, id),
+                Some(later),
+                "a write that reported success at read {nth} has to be the one stored"
+            ),
+            Err(other) => panic!("unexpected refusal at read {nth}: {other:?}"),
+        }
     }
     assert!(
         refused > 0,
-        "a write whose ownership check could not read has to refuse"
+        "a write whose ownership check could read neither side has to refuse"
     );
+}
+
+/// One side answering is an answer. Both generations hold records here, and a
+/// refusal on the second leaves the first readable: the pair reports what it
+/// read rather than reporting nothing.
+///
+/// This is the difference between a position this book really has, at worst
+/// one generation old, and no position at all. The callers that miss here do
+/// not retry: `read_position_file_or_legacy` falls through to the pre-durable
+/// single file, and app state and wifi do the same, so a refusal on one side
+/// would hand back an older record or none.
+#[test]
+fn one_readable_generation_answers_for_the_pair() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = book_id(32);
+    let first = proto::anchor::ContentAnchor::at(1, 64);
+    let newest = proto::anchor::ContentAnchor::at(1, 96);
+    files::write_place(&root, id, first, source(), None).expect("the place stores");
+    files::write_place(&root, id, newest, source(), None).expect("and the other generation");
+
+    // The lookup's last read is the second generation's, so faulting it
+    // leaves the first readable and nothing else disturbed.
+    let before = disk.reads.get();
+    assert_eq!(place_anchor(&root, id), Some(newest), "both sides readable");
+    let reads = disk.reads.get() - before;
+    assert!(reads > 1, "the lookup reads both generations");
+
+    disk.fault.fail_read_in.set(Some(reads - 1));
+    let answer = files::read_place(&root, id);
+    disk.fault.fail_read_in.set(None);
+
+    match answer {
+        files::PlaceRead::Found(record) => assert_eq!(
+            record.anchor, first,
+            "the side that still reads is the answer, even though it is the older one"
+        ),
+        files::PlaceRead::Absent => panic!("the readable generation read as no place at all"),
+        files::PlaceRead::Fault => {
+            panic!("one refused side discarded the record the other still held")
+        }
+    }
 }
 
 /// The durable pair's contract, as one property: a write that reports success
