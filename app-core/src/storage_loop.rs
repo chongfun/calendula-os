@@ -572,6 +572,10 @@ pub struct OpenSequence {
     /// book's own saved position. Extends never resume.
     resumable: bool,
     resumed: bool,
+    /// Whether the command asked for the stored place. The page it arrived
+    /// with was counted under a layout this open replaces, so it means
+    /// nothing here and whatever this open lands on has to travel back.
+    resolve_place: bool,
     /// Whether this transaction is an extend of the book already open rather
     /// than an open of one. An extend inherits the open's work instead of
     /// replacing it, so whatever that open left outstanding is still owed.
@@ -682,6 +686,7 @@ impl OpenSequence {
             previous,
             resumable,
             resumed: false,
+            resolve_place,
             extend: matches!(command, StorageCommand::ExtendSection { .. }),
         })
     }
@@ -799,7 +804,12 @@ impl OpenSequence {
         if let Some((chapter, screen)) = position {
             self.chapter = chapter;
             self.page = screen.min(u16::MAX as u32) as u16;
-            self.resumed = chapter > 0 || screen > 0;
+            // A provisional landing of `(0, 0)` is an answer when the app's
+            // own page means nothing: an open told to resolve the place came
+            // in with a number counted under the layout it is replacing, so
+            // saying nothing would leave the reader standing on it while the
+            // store holds the start of the book.
+            self.resumed = self.resolve_place || chapter > 0 || screen > 0;
         }
         self.phase = OpenPhase::LoadSection;
     }
@@ -1003,6 +1013,70 @@ mod tests {
         let switching =
             OpenSequence::begin(&open(book_id, 0, 0, Some(previous)), 7, 0).expect("an open");
         assert!(!switching.is_extend());
+    }
+
+    /// A place that cannot resolve yet still has to say where the open put the
+    /// reader. The walk has not reached the page the anchor names, so the open
+    /// lands on the provisional one and the place waits; if that landing is
+    /// the start of the book and the open says nothing, the app keeps the page
+    /// it arrived with. On an open told to resolve the place that page was
+    /// counted under the layout this one replaces, so the reader would be
+    /// standing on a number that means nothing here while the store holds the
+    /// start of the book.
+    #[test]
+    fn a_place_that_has_to_wait_still_says_where_the_open_landed() {
+        let book_id = ReaderSource::sd(2).book_id();
+        // The app is deep in the book under settings it has just left.
+        let mut command = open(book_id, 3, 88, None);
+        if let StorageCommand::OpenBook {
+            ref mut resolve_place,
+            ..
+        } = command
+        {
+            *resolve_place = true;
+        }
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        // The stored place is in the first spine item, so its provisional
+        // landing is the start of the book.
+        open.saved_position(Some((0, 0)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+        // The walk has not reached the anchor, so nothing resolves it.
+        open.section_loaded();
+
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position,
+                Some(0),
+                "the landing travels even when it is zero and the place is still waiting"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
+
+    /// And an open that was not asked to resolve a place leaves the app's page
+    /// alone, as an explicit page request and an extend both need.
+    #[test]
+    fn an_open_that_was_not_asked_to_resume_leaves_the_page_alone() {
+        let book_id = ReaderSource::sd(2).book_id();
+        let mut open = OpenSequence::begin(&open(book_id, 0, 0, None), 7, 0).expect("an open");
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        open.saved_position(Some((0, 0)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+        open.section_loaded();
+
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position, None,
+                "a cold start that resolved nothing says nothing"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
     }
 
     /// A place that resolves to the start of the book has to travel like any
