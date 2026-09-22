@@ -648,6 +648,57 @@ fn an_index_a_build_abandoned_is_recognisable_as_one() {
     );
 }
 
+#[test]
+fn an_index_with_non_monotonic_section_anchors_is_rejected() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let mut records = build_book(&root, &mut store, 2);
+    let pages = total_pages(&records);
+
+    // Corrupt section anchors so that section 1 starts earlier than section 0 (decreasing spine).
+    records[0].spine = 1;
+    records[0].logical_offset = 100;
+    records[1].spine = 0;
+    records[1].logical_offset = 200;
+
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
+    ));
+
+    let mut fresh_store = new_store();
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store);
+    assert_eq!(
+        loaded,
+        files::BookIndexLoadResult::Invalid,
+        "decreasing spine across sections must be rejected as invalid"
+    );
+    assert_eq!(fresh_store.book_section_count(), 0);
+    assert_eq!(fresh_store.advertised_page_count(), 1);
+
+    // Also verify decreasing logical_offset within the same spine is rejected.
+    records[0].spine = 1;
+    records[0].logical_offset = 100;
+    records[1].spine = 1;
+    records[1].logical_offset = 50;
+
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
+    ));
+
+    let mut fresh_store2 = new_store();
+    let loaded2 = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store2);
+    assert_eq!(
+        loaded2,
+        files::BookIndexLoadResult::Invalid,
+        "decreasing offset within same spine must be rejected as invalid"
+    );
+    assert_eq!(fresh_store2.book_section_count(), 0);
+    assert_eq!(fresh_store2.advertised_page_count(), 1);
+}
+
 /// Invariant: a clean publish leaves the reader on the page it was asked for.
 /// The baseline the fault cases are measured against — if this fails, the
 /// assertions above are proving nothing.
@@ -1474,6 +1525,92 @@ fn an_anchor_table_that_stops_short_is_not_the_page_it_got_to() {
         files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
         None,
         "a table that stops short is no answer, not the page the walk reached"
+    );
+}
+
+/// Invariant: page anchors within a section must be monotonically nondecreasing.
+/// A corrupted table with a descending page offset must be refused by both
+/// `page_of_anchor_in_section` (returning `None`) and `load_v2_section_by_global_page`
+/// (returning `CacheLoadResult::Invalid`), rather than settling on the wrong page.
+#[test]
+fn a_page_anchor_table_with_descending_offsets_is_rejected() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    fill_section(&mut store, 0, 60);
+    let pages = store.page_count();
+    assert!(pages >= 3, "the fixture needs at least 3 pages");
+    store.set_cached_spine(0);
+    let wrote = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, 0, &store)
+    });
+    assert!(wrote, "the section writes");
+
+    let layout = store.layout_key();
+    let mut name = heapless::String::<16>::new();
+    proto::cache::section_file_name(layout, 0, &mut name);
+
+    // Read the section file into a buffer so we can corrupt the page anchor table.
+    let mut file_bytes = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadOnly)
+            .expect("the section opens");
+        let len = file.length() as usize;
+        let mut buf = vec![0u8; len];
+        files::read_exact_file(&file, &mut buf).expect("read file");
+        buf
+    });
+
+    // Page anchors start at SECTION_V2_HEADER_BYTES + pages * PAGE_RECORD_BYTES
+    let anchor_start =
+        proto::cache::SECTION_V2_HEADER_BYTES + pages * proto::cache::PAGE_RECORD_BYTES;
+    let page1_anchor_pos = anchor_start + proto::cache::PAGE_ANCHOR_BYTES;
+    let page2_anchor_pos = anchor_start + 2 * proto::cache::PAGE_ANCHOR_BYTES;
+    // Set page 1 offset to 100, page 2 offset to 50 (descending offset)
+    file_bytes[page1_anchor_pos..page1_anchor_pos + 4].copy_from_slice(&100u32.to_le_bytes());
+    file_bytes[page2_anchor_pos..page2_anchor_pos + 4].copy_from_slice(&50u32.to_le_bytes());
+
+    let rewritten = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
+            .expect("the section reopens");
+        file.write(&file_bytes).is_ok()
+    });
+    assert!(
+        rewritten,
+        "the section rewrites with descending page offset"
+    );
+
+    // page_of_anchor_in_section must refuse the section rather than return a page
+    let anchor = proto::anchor::ContentAnchor::at(0, 75);
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, anchor),
+        None,
+        "a descending page anchor table must be refused by page_of_anchor_in_section"
+    );
+
+    // Full-section load via load_v2_section_by_global_page must also reject as Invalid
+    let mut fresh_store = new_store();
+    let records = [proto::cache::BookV2SectionRecord {
+        section: 0,
+        spine: 0,
+        start_page: 0,
+        page_count: pages as u16,
+        partial: false,
+        logical_offset: 0,
+    }];
+    fresh_store.set_book_index(pages as u32, false, &records);
+    let loaded =
+        files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, 0, &mut fresh_store);
+    assert_eq!(
+        loaded,
+        CacheLoadResult::Invalid,
+        "a descending page anchor table must be rejected as Invalid when loading section"
     );
 }
 

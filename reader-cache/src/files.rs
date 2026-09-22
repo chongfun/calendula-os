@@ -7,6 +7,7 @@ use core::ops::ControlFlow;
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
+use proto::anchor::ContentAnchor;
 use proto::cache::{
     decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
     decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
@@ -1797,6 +1798,7 @@ where
             return BookIndexLoadResult::Invalid;
         }
         let mut sections = [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS];
+        let mut prev_anchor: Option<ContentAnchor> = None;
         if !read_records_batched(
             file,
             BOOK_V2_SECTION_RECORD_BYTES,
@@ -1808,6 +1810,13 @@ where
                 if record.page_count == 0 {
                     return false;
                 }
+                let anchor = ContentAnchor::at(record.spine, record.logical_offset);
+                if let Some(prev) = prev_anchor {
+                    if anchor < prev {
+                        return false;
+                    }
+                }
+                prev_anchor = Some(anchor);
                 sections[index] = record;
                 true
             },
@@ -4279,21 +4288,21 @@ where
             let skip = (page_count * PAGE_RECORD_BYTES) as u32;
             file.seek_from_current(skip as i32).ok()?;
             let mut found = 0u16;
-            let mut bytes = [0u8; PAGE_ANCHOR_BYTES];
-            for index in 0..page_count {
-                // A refused read is the card saying no, not an answer about the
-                // place. Stopping here and reporting the last page it managed to
-                // see would hand the open a page the anchor does not name, which
-                // loads and settles as though the place had resolved there.
-                if read_exact_file(file, &mut bytes).is_err() {
-                    return None;
+            let mut prev_offset: Option<u32> = None;
+            if !read_records_batched(file, PAGE_ANCHOR_BYTES, page_count, |index, bytes| {
+                let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                if let Some(prev) = prev_offset {
+                    if offset < prev {
+                        return false;
+                    }
                 }
-                let offset = u32::from_le_bytes(bytes);
-                if proto::anchor::ContentAnchor::at(header.spine, offset) <= anchor {
+                prev_offset = Some(offset);
+                if ContentAnchor::at(header.spine, offset) <= anchor {
                     found = index as u16;
-                } else {
-                    break;
                 }
+                true
+            }) {
+                return None;
             }
             Some(found)
         },
@@ -4603,11 +4612,16 @@ where
     }) {
         return false;
     }
+    let mut prev_page_offset: Option<u32> = None;
     if !read_records_batched(file, PAGE_ANCHOR_BYTES, page_count, |index, bytes| {
-        library.set_cached_page_offset(
-            index,
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        )
+        let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if let Some(prev) = prev_page_offset {
+            if offset < prev {
+                return false;
+            }
+        }
+        prev_page_offset = Some(offset);
+        library.set_cached_page_offset(index, offset)
     }) {
         return false;
     }
