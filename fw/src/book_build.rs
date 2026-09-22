@@ -1022,7 +1022,10 @@ where
         }
     } else {
         let total = library.advertised_page_count().max(1);
-        Some(((u64::from(screen) * u64::from(u16::MAX)) / u64::from(total)) as u16)
+        Some(
+            ((u64::from(screen) * u64::from(u16::MAX)) / u64::from(total)).min(u64::from(u16::MAX))
+                as u16,
+        )
     };
     match files::write_place(root, id, anchor, source, progression) {
         Ok(()) => Ok(()),

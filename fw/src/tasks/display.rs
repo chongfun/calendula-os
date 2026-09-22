@@ -2166,6 +2166,7 @@ fn handle_storage_command(
                                         background_build,
                                     );
                                     if loaded {
+                                        landed_nothing = false;
                                         section_loaded = Some(false);
                                         open.resolve_place(target);
                                         None
@@ -2203,6 +2204,7 @@ fn handle_storage_command(
                                             background_build,
                                         ) {
                                             Some(page) => {
+                                                landed_nothing = false;
                                                 settled = page;
                                                 open.resolve_place(page);
                                             }
