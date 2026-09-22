@@ -2962,7 +2962,7 @@ fn close_out_departing_book(
     }
     let record = record_for_persisted(sd_library, previous);
     let start = Instant::now();
-    // Only overwrite stored place if the hold has been superseded.
+    // Preserve a held place; otherwise the departing position may replace it.
     let stored = book_build::store_book_position(
         epd,
         sd_cs,
