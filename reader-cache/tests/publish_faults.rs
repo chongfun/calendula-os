@@ -882,6 +882,16 @@ fn an_anchor_cannot_resolve_when_section_start_disagrees_with_section_file() {
         valid_store.section_for_anchor(proto::anchor::ContentAnchor::at(0, 700)),
         Some(0)
     );
+    // Section 0 resolves anchor 700 successfully while verifying section 1 on disk
+    assert!(files::page_of_anchor_in_section(
+        &root,
+        &OWNER,
+        &valid_store,
+        IDENTITY,
+        0,
+        proto::anchor::ContentAnchor::at(0, 700)
+    )
+    .is_some());
     // And page_of_anchor_in_section on section 1 for anchor 700 is refused because 700 < 1000
     assert_eq!(
         files::page_of_anchor_in_section(
@@ -909,6 +919,86 @@ fn an_anchor_cannot_resolve_when_section_start_disagrees_with_section_file() {
             proto::anchor::ContentAnchor::at(0, 1050)
         ),
         Some(0)
+    );
+}
+
+#[test]
+fn an_anchor_cannot_resolve_when_next_section_start_is_corrupted_upward() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    // Build section 0 (spine 0, offset 0) and section 1 (spine 0, offset 1000)
+    let sec0 = write_section_with_offset(&root, &mut store, 0, 0, 0, 0);
+    let sec1 = write_section_with_offset(&root, &mut store, 1, 0, 1000, sec0.page_count as u32);
+    let pages = sec0.page_count as u32 + sec1.page_count as u32;
+
+    // Corrupt section 1's logical_offset in BOOK.BIN upward from 1000 to 1500
+    let mut corrupted_records = [sec0, sec1];
+    corrupted_records[1].logical_offset = 1500;
+
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages,
+        &corrupted_records,
+        &store,
+        false,
+        0,
+    ));
+
+    let mut fresh_store = new_store();
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store);
+    assert!(matches!(loaded, files::BookIndexLoadResult::Hit { .. }));
+
+    // In the corrupted index, anchor 1200 maps to section 0 because 1200 < 1500
+    let anchor = proto::anchor::ContentAnchor::at(0, 1200);
+    let selected_section = fresh_store.section_for_anchor(anchor);
+    assert_eq!(selected_section, Some(0));
+
+    // But section 1's actual file starts at offset 1000, so page_of_anchor_in_section
+    // on section 0 must detect that section 1 begins at 1000 (which disagrees with
+    // BOOK.BIN's 1500, and also bounds section 0 strictly below 1200), rejecting resolution (None)
+    let resolved =
+        files::page_of_anchor_in_section(&root, &OWNER, &fresh_store, IDENTITY, 0, anchor);
+    assert_eq!(
+        resolved, None,
+        "an anchor past the actual start of section 1 or where section 1 disagrees with BOOK.BIN must be refused"
+    );
+
+    // Now write the uncorrupted index with logical_offset = 1000
+    let valid_records = [sec0, sec1];
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages,
+        &valid_records,
+        &store,
+        false,
+        0,
+    ));
+    let mut valid_store = new_store();
+    assert!(matches!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut valid_store),
+        files::BookIndexLoadResult::Hit { .. }
+    ));
+
+    // Anchor 1200 belongs to section 1
+    assert_eq!(valid_store.section_for_anchor(anchor), Some(1));
+    // And section 0 refuses anchor 1200 because 1200 >= next section start (1000)
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &valid_store, IDENTITY, 0, anchor,),
+        None
+    );
+    // While section 1 resolves anchor 1200 successfully
+    assert!(
+        files::page_of_anchor_in_section(&root, &OWNER, &valid_store, IDENTITY, 1, anchor,)
+            .is_some()
     );
 }
 

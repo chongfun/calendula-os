@@ -4244,6 +4244,63 @@ where
     Some(f(&file))
 }
 
+fn read_section_start<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    library: &ReaderStore,
+    source_identity: (u32, u32),
+    expected: &BookV2SectionRecord,
+) -> Option<ContentAnchor>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let want_config = layout::reader_layout_config(library.type_settings(), library.portrait());
+    let want_font = library.custom_font_identity();
+    with_v2_section_file(
+        root,
+        owner,
+        library.layout_key(),
+        expected.section,
+        Mode::ReadOnly,
+        |file| {
+            let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
+            if read_exact_file(file, &mut header_bytes).is_err() {
+                return None;
+            }
+            let header = decode_section_v2_header(&header_bytes).ok()?;
+            if header.spine != expected.spine
+                || header.page_count != expected.page_count
+                || header.source_hash != source_identity.0
+                || header.source_size != source_identity.1
+                || header.font_config != want_config
+                || header.custom_font_identity != want_font
+                || header.page_count == 0
+            {
+                return None;
+            }
+            let skip = (header.page_count as usize * PAGE_RECORD_BYTES) as u32;
+            file.seek_from_current(skip as i32).ok()?;
+            let mut anchor_bytes = [0u8; PAGE_ANCHOR_BYTES];
+            if read_exact_file(file, &mut anchor_bytes).is_err() {
+                return None;
+            }
+            let offset = u32::from_le_bytes(anchor_bytes);
+            if offset != expected.logical_offset {
+                return None;
+            }
+            Some(ContentAnchor::at(header.spine, offset))
+        },
+    )
+    .flatten()
+}
+
 /// Which page of one section holds `anchor`, as an index within that section.
 ///
 /// `section` is the section ordinal, which names the file. One spine item can
@@ -4274,7 +4331,7 @@ where
 {
     let want_config = layout::reader_layout_config(library.type_settings(), library.portrait());
     let want_font = library.custom_font_identity();
-    with_v2_section_file(
+    let page = with_v2_section_file(
         root,
         owner,
         library.layout_key(),
@@ -4306,13 +4363,9 @@ where
             }
             let section_record = library.book_section(section as usize);
             if let Some(record) = section_record {
-                if record.spine != header.spine || record.page_count != header.page_count {
-                    return None;
-                }
-            }
-            if let Some(next) = library.book_section(section as usize + 1) {
-                if next.spine == header.spine
-                    && anchor >= ContentAnchor::at(next.spine, next.logical_offset)
+                if record.section != section
+                    || record.spine != header.spine
+                    || record.page_count != header.page_count
                 {
                     return None;
                 }
@@ -4350,7 +4403,22 @@ where
             })
         },
     )
-    .flatten()
+    .flatten()?;
+
+    if let Some((next_sec, next_rec)) = section
+        .checked_add(1)
+        .and_then(|s| library.book_section(s as usize).map(|r| (s, r)))
+    {
+        if next_rec.section != next_sec {
+            return None;
+        }
+        let next_start = read_section_start(root, owner, library, source_identity, &next_rec)?;
+        if anchor >= next_start {
+            return None;
+        }
+    }
+
+    Some(page)
 }
 
 fn with_v2_book_file<
