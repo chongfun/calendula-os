@@ -2240,10 +2240,8 @@ mod tests {
         );
     }
 
-    /// A cached line is a rendering. Inline style markers are bytes in it that
-    /// the content stream does not count, and its edges are trimmed, so its
-    /// byte length says nothing about how far the stream advanced. The offsets
-    /// come from the build, which counted the words.
+    /// Style markers and formatting bytes in a cached line do not advance the
+    /// content offset.
     #[test]
     fn a_styled_line_does_not_move_the_stream_by_its_rendered_length() {
         let mut store = Box::new(ReaderStore::new());
@@ -2285,11 +2283,8 @@ mod tests {
         );
     }
 
-    /// A trailing paragraph mark grows the block that was already placed, and
-    /// a block that no longer fits moves to a page of its own. That page is
-    /// opened after the walk that fills offsets in has gone past, so it used
-    /// to open at offset zero, which resolves to the start of the spine item
-    /// rather than the line the reader is on.
+    /// When a paragraph gap pushes a block onto a new page, that page adopts
+    /// the line's offset.
     #[test]
     fn a_block_moved_by_its_paragraph_gap_takes_its_offset_along() {
         let mut store = Box::new(ReaderStore::new());
@@ -2382,9 +2377,8 @@ mod tests {
         );
     }
 
-    /// The property the whole feature rests on: the reader's place is a
-    /// coordinate in the content, so re-laying the same book under different
-    /// typography moves the page breaks and not the place.
+    /// Re-laying out the same content with different typography preserves
+    /// the content anchor even when page boundaries shift.
     #[test]
     fn the_same_place_survives_a_relayout() {
         let place = ContentAnchor::at(1, 700);

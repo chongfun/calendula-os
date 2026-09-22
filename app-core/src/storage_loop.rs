@@ -487,22 +487,16 @@ enum OpenPhase {
 /// What a saved record says about a [`PlaceHold`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoldVerdict {
-    /// Another book's record. It says nothing about this hold either way.
+    /// Record for another book.
     Unrelated,
-    /// The page the hold stands on, so the stored place keeps it.
+    /// Matches the held page, keeping the hold active.
     Held,
-    /// The reader chose somewhere else in this book. The write goes, and the
-    /// hold is over.
+    /// A different page in the same book was chosen, releasing the hold.
     Superseded,
 }
 
-/// A restore's claim on a book's stored place.
-///
-/// A restore that could not reach the saved position leaves the reader on a
-/// page the open picked rather than one they chose. Saving that page over the
-/// stored place discards the position the restore exists to reach, and the
-/// stored place is the only copy that survives a reboot. The reader going
-/// anywhere else ends the claim.
+/// Holds a book's stored reading position across a restore until the reader
+/// navigates to a new page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlaceHold {
     book_id: u32,
@@ -523,19 +517,12 @@ impl PlaceHold {
         self.landed
     }
 
-    /// Carry the hold to the page a restore settled the reader on. Still a
-    /// page the reader did not choose, so the claim moves with them.
+    /// Updates the held page to a restore's fallback landing page.
     pub fn settled_on(&mut self, page: u32) {
         self.landed = page;
     }
 
-    /// What a save of `page` in `book_id` says about this hold.
-    ///
-    /// Three answers, not two. Another book's save is not the reader moving
-    /// within this one, and reading it as one spends a restore that book is
-    /// still owed. Within this book, answering without ending the hold leaves
-    /// it standing on a page the reader has left, forbidding that page the
-    /// next time they come back to it.
+    /// Evaluates whether saving `page` in `book_id` is unrelated, held, or superseded.
     pub const fn verdict(self, book_id: u32, page: u32) -> HoldVerdict {
         if self.book_id != book_id {
             HoldVerdict::Unrelated
@@ -572,13 +559,9 @@ pub struct OpenSequence {
     /// book's own saved position. Extends never resume.
     resumable: bool,
     resumed: bool,
-    /// Whether the command asked for the stored place. The page it arrived
-    /// with was counted under a layout this open replaces, so it means
-    /// nothing here and whatever this open lands on has to travel back.
+    /// Whether to resolve and report the stored reading position for a layout change.
     resolve_place: bool,
-    /// Whether this transaction is an extend of the book already open rather
-    /// than an open of one. An extend inherits the open's work instead of
-    /// replacing it, so whatever that open left outstanding is still owed.
+    /// Whether this transaction extends an already open book.
     extend: bool,
 }
 
@@ -662,10 +645,7 @@ impl OpenSequence {
         if request_id != latest_request_id {
             return None;
         }
-        // An open resolves the stored place when it says to, and when the
-        // app has no page to offer. The second is the book switch and the
-        // cold start; the first is the typography change, where the app has a
-        // page and the page means nothing.
+        // Resolve stored position on layout changes, cold starts, and book switches.
         let resumable = matches!(command, StorageCommand::OpenBook { .. })
             && (resolve_place || (chapter == 0 && target_pages == 0));
         Some(Self {
@@ -691,10 +671,7 @@ impl OpenSequence {
         })
     }
 
-    /// Whether this transaction extends the book already open rather than
-    /// opening one. An open supersedes what an earlier one left outstanding;
-    /// an extend is that same open asking for more of its book, and inherits
-    /// it.
+    /// Whether this transaction extends the currently open book.
     pub const fn is_extend(&self) -> bool {
         self.extend
     }
@@ -804,11 +781,7 @@ impl OpenSequence {
         if let Some((chapter, screen)) = position {
             self.chapter = chapter;
             self.page = screen.min(u16::MAX as u32) as u16;
-            // A provisional landing of `(0, 0)` is an answer when the app's
-            // own page means nothing: an open told to resolve the place came
-            // in with a number counted under the layout it is replacing, so
-            // saying nothing would leave the reader standing on it while the
-            // store holds the start of the book.
+            // When resolving a place, (0, 0) is a valid landing and must be reported.
             self.resumed = self.resolve_place || chapter > 0 || screen > 0;
         }
         self.phase = OpenPhase::LoadSection;
@@ -816,29 +789,13 @@ impl OpenSequence {
 
     /// The page a stored place resolved to, once the book was paginated for
     /// this open's layout.
-    ///
-    /// Separate from [`saved_position`](Self::saved_position) because the two
-    /// happen at different times and cannot be merged: a place names content,
-    /// and the page that content falls on exists only after the pagination
-    /// this open builds.
     pub fn resolve_place(&mut self, page: u32) {
         self.page = page.min(u16::MAX as u32) as u16;
-        // Page zero counts. A place that resolves to the start of the book is
-        // an answer, and leaving `resumed` false there sends no position, so
-        // the app keeps the page it came in with: the number counted under the
-        // layout this open just replaced.
+        // Always report the resolved page, even when it resolves to page zero.
         self.resumed = true;
     }
 
-    /// The section covering the target page could not be made resident, and
-    /// neither could the one the open was going to land on.
-    ///
-    /// It still announces, because the app clears its open lock on that event
-    /// and the store's own error reaches the reader. It claims no place: the
-    /// pointer keeps naming the book the reader came from, so a reboot goes
-    /// back there rather than to a book with no text, and no position rides
-    /// along, because a page number for a section nobody could read is one the
-    /// app would act on.
+    /// The target section failed to load. Announces the failure without claiming a position.
     pub fn section_failed(&mut self) {
         self.resumed = false;
         self.phase = OpenPhase::Announce;
@@ -891,10 +848,7 @@ impl OpenSequence {
 #[cfg(test)]
 mod tests {
 
-    /// The whole life of a restore's hold, which is where the save rule keeps
-    /// going wrong. It stands on the page the open put the reader on and
-    /// forbids that page being written over the stored place, frees anywhere
-    /// else in the same book, and has to end at the move that freed it.
+    /// A hold protects the landed page, frees on navigation, and terminates.
     #[test]
     fn a_hold_ends_at_the_move_that_frees_it() {
         let book = ReaderSource::sd(2).book_id();
@@ -934,11 +888,7 @@ mod tests {
         );
     }
 
-    /// A hold speaks for its own book. Another book's save is not the reader
-    /// moving within this one, and spending the hold on it leaves the book
-    /// still owed a restore with its stored place open to the next write.
-    /// Reachable through the write coalescer, which holds one book's record
-    /// while the reader opens another and flushes it afterwards.
+    /// A hold applies only to its book; saves for other books return `Unrelated`.
     #[test]
     fn another_books_save_says_nothing_about_this_hold() {
         let book = ReaderSource::sd(2).book_id();
@@ -969,8 +919,7 @@ mod tests {
         );
     }
 
-    /// A restore that settles the reader somewhere carries the hold to that
-    /// page rather than ending it: it is still a page the open picked.
+    /// A restore that settles on a fallback page moves the hold to that page.
     #[test]
     fn a_settled_restore_carries_its_hold_to_where_it_landed() {
         let book = ReaderSource::sd(2).book_id();
@@ -990,10 +939,7 @@ mod tests {
         );
     }
 
-    /// The firmware keeps a waiting place across an extend and ends it on an
-    /// open, so the staging step has to tell them apart. A restore settling
-    /// the reader on a page raises an extend, and reading that as an open has
-    /// the restore's own result cancel the restore.
+    /// An extend continues the existing book session rather than starting a new open.
     #[test]
     fn an_extend_is_not_an_open_of_the_book_it_extends() {
         let book_id = ReaderSource::sd(2).book_id();
@@ -1015,14 +961,8 @@ mod tests {
         assert!(!switching.is_extend());
     }
 
-    /// A place the card would not read carries no position, so the open keeps
-    /// the one it came in with rather than being handed a zero.
-    ///
-    /// The page it came in with is a real one: after a boot whose place read
-    /// refused, it is the global mirror's, and after a typography change it is
-    /// the page the app was holding. Adopting a zero instead lands the reader
-    /// at the start of the book with a usable page in hand, and this open is
-    /// resolving a place, so the zero would travel back as an answer.
+    /// When the stored place cannot be read, the open retains its incoming
+    /// position instead of defaulting to page 0.
     #[test]
     fn an_unreadable_place_leaves_the_open_on_the_page_it_came_with() {
         let book_id = ReaderSource::sd(2).book_id();
@@ -1062,14 +1002,8 @@ mod tests {
         }
     }
 
-    /// A place that cannot resolve yet still has to say where the open put the
-    /// reader. The walk has not reached the page the anchor names, so the open
-    /// lands on the provisional one and the place waits; if that landing is
-    /// the start of the book and the open says nothing, the app keeps the page
-    /// it arrived with. On an open told to resolve the place that page was
-    /// counted under the layout this one replaces, so the reader would be
-    /// standing on a number that means nothing here while the store holds the
-    /// start of the book.
+    /// If an anchor has not yet resolved, announce the provisional landing
+    /// page rather than retaining the previous layout's page.
     #[test]
     fn a_place_that_has_to_wait_still_says_where_the_open_landed() {
         let book_id = ReaderSource::sd(2).book_id();
@@ -1104,8 +1038,7 @@ mod tests {
         }
     }
 
-    /// And an open that was not asked to resolve a place leaves the app's page
-    /// alone, as an explicit page request and an extend both need.
+    /// An open without `resolve_place` does not announce a replacement page.
     #[test]
     fn an_open_that_was_not_asked_to_resume_leaves_the_page_alone() {
         let book_id = ReaderSource::sd(2).book_id();
@@ -1126,10 +1059,8 @@ mod tests {
         }
     }
 
-    /// A place that resolves to the start of the book has to travel like any
-    /// other. The open carries the page the app had, counted under the layout
-    /// this open is replacing, so saying nothing leaves the reader on a number
-    /// that means nothing here.
+    /// A place resolving to page 0 is announced so the app updates from its
+    /// previous layout position.
     #[test]
     fn a_place_that_resolves_to_the_first_page_still_says_so() {
         let book_id = ReaderSource::sd(2).book_id();
@@ -1162,10 +1093,8 @@ mod tests {
         }
     }
 
-    /// A book switch whose section will not load, in either place: the target
-    /// the saved place named, and the page the open was landing on. The open
-    /// has to finish, because the app is holding a lock on it, and it must
-    /// finish without claiming the reader is somewhere.
+    /// When neither the target section nor the landing section loads, announce
+    /// without claiming a position.
     #[test]
     fn an_open_with_no_readable_section_points_at_nothing() {
         let previous = persisted(ReaderSource::sd(1).book_id(), 2, 40);
@@ -1193,8 +1122,8 @@ mod tests {
         assert!(matches!(open.next(), OpenAction::Done));
     }
 
-    /// The same open when the section does load: the pointer is written and
-    /// the resolved page rides out with the announcement.
+    /// When the section loads successfully, write the pointer and announce the
+    /// landed page.
     #[test]
     fn an_open_that_loaded_points_at_the_page_it_landed_on() {
         let previous = persisted(ReaderSource::sd(1).book_id(), 2, 40);

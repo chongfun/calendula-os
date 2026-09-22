@@ -1471,10 +1471,8 @@ pub(crate) fn resolve_place(
     let Some(record) = library.book_section(section) else {
         return PlaceTarget::Unavailable;
     };
-    // A partial index can stop inside the item the anchor names, and its last
-    // section is the one every anchor past it resolves to. Nothing bounds the
-    // place from above there, so the answer would be "the last page built"
-    // dressed up as the reader's place.
+    // When the index is partial and the anchor falls in or beyond the last
+    // built section, extend pagination before resolving.
     if partial && section + 1 >= library.book_section_count() {
         return PlaceTarget::Extend(library.advertised_page_count());
     }
@@ -1503,10 +1501,7 @@ pub(crate) fn resolve_place(
     .flatten();
     match resolved {
         Some(page) => {
-            // The one line a resolution that works prints. Every other
-            // message on this path reports a failure or a deferral, so a
-            // place doing its job was visible only as a second open at a
-            // page nobody asked for.
+            // Log successful place resolution telemetry.
             bench_log!(
                 "bench: storage_place index={} spine={} offset={} section={} page={} t_ms={}",
                 index,
@@ -1518,9 +1513,7 @@ pub(crate) fn resolve_place(
             );
             PlaceTarget::Page(page)
         }
-        // The index put the place in a section and the section would not give
-        // up its anchors. Nothing was learned about the place, so it is not
-        // spent.
+        // Section anchors could not be read; retry later.
         None => PlaceTarget::Unavailable,
     }
 }
@@ -3442,17 +3435,12 @@ struct LibraryBlockSink<
     /// Latched when a page record was dropped past the `pages` capacity,
     /// mirroring the full rebuild's silent drop.
     page_overflowed: bool,
-    /// Where the parser block being consumed starts in the spine item's
-    /// logical content stream, and how long it is.
+    /// Start offset and length of the block in the spine item's logical stream.
     block_offset: u32,
     block_len: u32,
-    /// How much of that block the lines have taken, counted as the words go
-    /// by: the text reaching this sink is decoded and normalized, so it no
-    /// longer indexes the parser's bytes. Clamped to the block, which keeps
-    /// every anchor inside the block it came from and in order.
+    /// Bytes of the block consumed by line formatting, clamped to `block_len`.
     block_consumed: u32,
-    /// Where the line being accumulated began. Becomes the anchor of a page
-    /// when this line is the one that opens it.
+    /// Logical start offset of the line in progress.
     line_offset: u32,
 }
 
@@ -3628,8 +3616,7 @@ where
         self.page_overflowed |=
             layout::place_appended_block(self.library, &mut self.page_cursor, index);
         if self.library.page_count() > pages_before {
-            // This line opened the page, so where the line began is where the
-            // page begins.
+            // Set anchor offset for the newly opened page.
             self.library.set_last_page_offset(self.line_offset);
         }
     }
@@ -3698,8 +3685,7 @@ where
 
         self.library.set_cached_spine(self.spine_index);
         self.library.set_section_partial(partial);
-        // The flush that ends a spine item is the one `finish_spine` makes;
-        // the carry flushes of a long item are mid-item by construction.
+        // True if this section finishes the current spine item.
         self.library.set_section_ends_spine(!carry_incomplete);
         let section_id = (*self.section_count).min(u16::MAX as usize) as u16;
         let write_started = Instant::now();
@@ -3951,11 +3937,7 @@ fn push_styled_preview_fragment<
             let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
             let _ = measure.push_str(sink.line.as_str());
             sink.push_line_ink_str(measure.as_str());
-            // Counted here and not before the wrap, because the wrap decides
-            // which line the word joined. Counting it on the way in and again
-            // on the way out advanced the block twice for one word, and set
-            // the new line's offset past the word that opens it, so a place
-            // saved on that line named content after itself.
+            // Counted after the wrap so the word is attributed to the new line.
             sink.note_word_placed(word.len(), true);
             sink.line_role = role;
             sink.line_align = align;

@@ -602,11 +602,7 @@ const _: () = assert!(READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 256);
 /// in bits 5-6, portrait in bit 7, version above. Size, weight, family,
 /// and the page box all change wrap points, so a change in any forces a
 /// full rebuild.
-/// The fields below have fixed widths, and a variant added past one would
-/// overlap the field packed above it. Two layouts would then share a config,
-/// which the section header stores and the index compares, so a book
-/// paginated under one would be served under the other. The matches are
-/// exhaustive so that fails to compile here first.
+// Compile-time check that type setting variants fit within their allotted bit widths.
 const _: () = {
     const fn families() -> u16 {
         match display::font::FontFamily::Literata {
@@ -645,18 +641,11 @@ pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
         | settings.spacing as u16
 }
 
-/// The part of the layout that names a stored pagination.
+/// Key identifying layout parameters that affect line wrapping: font size,
+/// weight, family, and screen orientation.
 ///
-/// The wrap-point inputs only: size, weight, family, and the page box. Two
-/// layouts differing in any of those break pages in different places, so the
-/// cache names them apart and keeps both.
-///
-/// Line spacing stays out. A spacing change re-walks heights over the same
-/// wrap points, so both spacings share one stored set and the header check
-/// sorts them out. The wrap-rule version and panel salt stay out because a
-/// bump must retire every layout, which each index's own header does by
-/// rejecting itself; in the name it would strand a fresh set of files with no
-/// reader left to delete the old one.
+/// Line spacing and layout version are omitted: spacing does not change line
+/// wrapping, and version bumps invalidate cache headers directly.
 pub fn layout_key(settings: TypeSettings, portrait: bool) -> u8 {
     ((reader_layout_config(settings, portrait) >> 2) & 0x3F) as u8
 }

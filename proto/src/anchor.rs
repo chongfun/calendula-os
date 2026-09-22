@@ -109,8 +109,7 @@ pub const fn block_stream_len(text_len: usize) -> u32 {
 /// Quantize a page index into a 16-bit fixed-point progression (`0..=u16::MAX`).
 ///
 /// Uses ceiling division so that integer-floor decoding restores to the exact
-/// same page index for unchanged totals up to `u16::MAX`, eliminating the
-/// systematic one-page-early truncation of floor-over-floor encoding.
+/// same page index for unchanged totals up to `u16::MAX`.
 pub const fn encode_progression(screen: u32, total: u32) -> u16 {
     let total = if total == 0 { 1 } else { total as u64 };
     let scaled = (screen as u64 * u16::MAX as u64).div_ceil(total);
@@ -194,7 +193,7 @@ mod tests {
 
     #[test]
     fn progression_round_trips_without_early_page_truncation() {
-        // Test totals across orders of magnitude and small counts where floor/floor previously failed.
+        // Test various totals and small counts.
         for total in [1, 2, 3, 4, 5, 10, 50, 100, 384, 1000, u16::MAX as u32] {
             for screen in 0..total.min(200) {
                 let encoded = encode_progression(screen, total);

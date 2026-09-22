@@ -808,6 +808,7 @@ fn an_index_with_mismatched_total_pages_is_rejected() {
     assert_eq!(fresh_store2.book_section_count(), 0);
 }
 
+/// Invariant: section logical offset in BOOK.BIN must match page 0 in the section file.
 #[test]
 fn an_anchor_cannot_resolve_when_section_start_disagrees_with_section_file() {
     let disk = new_card();
@@ -922,6 +923,7 @@ fn an_anchor_cannot_resolve_when_section_start_disagrees_with_section_file() {
     );
 }
 
+/// Invariant: resolving an anchor in section N checks the true start of section N + 1.
 #[test]
 fn an_anchor_cannot_resolve_when_next_section_start_is_corrupted_upward() {
     let disk = new_card();

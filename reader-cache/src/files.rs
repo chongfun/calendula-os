@@ -4244,6 +4244,7 @@ where
     Some(f(&file))
 }
 
+/// Reads the first page anchor of a section file, validating it against expected metadata.
 fn read_section_start<
     D,
     T,
@@ -4303,14 +4304,9 @@ where
 
 /// Which page of one section holds `anchor`, as an index within that section.
 ///
-/// `section` is the section ordinal, which names the file. One spine item can
-/// hold several sections, so the spine is not that name, and the header's own
-/// spine is checked against the anchor to confirm the file holds the item the
-/// anchor names.
-///
-/// Reads the section's page anchors and nothing else. The open that follows
-/// reads the whole section, so this overlaps by a few hundred bytes once per
-/// resume. `None` leaves the caller on the section's first page.
+/// Reads the section's page anchors and verifies offsets against the index.
+/// Returns `None` if the section cannot be read, does not match the index, or
+/// does not contain the anchor.
 pub fn page_of_anchor_in_section<
     D,
     T,
@@ -4343,12 +4339,7 @@ where
                 return None;
             }
             let header = decode_section_v2_header(&header).ok()?;
-            // Everything the anchors depend on, asked here rather than assumed
-            // from the index that named this file. The file's name carries only
-            // the layout key, which is six bits of the config: line spacing and
-            // the wrap-rule version are not in it, and both move the page breaks
-            // these anchors describe. A section from either would answer with a
-            // page that means something else.
+            // Validate all layout, font, and source attributes matching the section.
             if header.spine != anchor.spine
                 || header.source_hash != source_identity.0
                 || header.source_size != source_identity.1

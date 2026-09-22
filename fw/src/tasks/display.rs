@@ -2033,12 +2033,8 @@ fn handle_storage_command(
                         // to build.
                         opening_place =
                             book_build::load_place(epd, sd_cs, sd_library, index as usize);
-                        // A place the card would not read carries no position
-                        // of its own, so the open keeps the one it came in
-                        // with: the mirror's page after a boot that fell back
-                        // to it, or the page a typography change arrived
-                        // holding. It is still kept, so the resolve after the
-                        // load asks the card again and arms the retry.
+                        // If unreadable, keep the incoming position and retry
+                        // resolution after loading the section.
                         open.saved_position(opening_place.and_then(|place| match place {
                             book_build::SavedPlace::Unreadable => None,
                             place => Some(place.provisional()),
@@ -2287,13 +2283,8 @@ fn handle_storage_command(
                         // on the event itself, so withholding it is never a
                         // saved refresh — it decides the repaint for itself in
                         // `loaded_repaints`.
-                        // An open that landed nowhere says so in its own
-                        // event. The counts here come from a store that was
-                        // cleared on the way into the failed load, and an
-                        // empty store reports one page, which the app would
-                        // clamp the reader's place to and then write to the
-                        // card. What it holds is an error for the reader to
-                        // see, and that is all this has to carry.
+                        // Notify the app that the book could not be read,
+                        // avoiding invalid page clamp and save operations.
                         if landed_nothing {
                             send_loaded_library_event(&LibraryEvent::BookOpenUnreadable {
                                 book_id,
@@ -2647,21 +2638,9 @@ fn handle_storage_command(
         }
         StorageCommand::StoreProgress(record) => {
             let record = record_for_persisted(sd_library, record);
-            // The move is the event that ends a restore's claim, not the write
-            // that follows it. Turns inside the write interval coalesce to the
-            // latest one, so a turn away and back leaves no record of the turn
-            // away: the claim would still be standing on the page the reader
-            // came back to, forbidding a save that is now their own. Ahead of
-            // the identity check too, since a record that cannot be written
-            // still says where they went.
+            // Clear superseded hold immediately on navigation, before coalescing.
             retire_superseded_place(pending_place, &record);
-            // A record the store could not give an identity to cannot be
-            // written and cannot become writable later: the retry replays the
-            // record as it is rather than resolving it again. Holding it would
-            // owe a write forever, which refuses sleep every time it is asked
-            // and defers the next book switch behind it. The book's durable
-            // record is the one already on the card, written when it was the
-            // book being read.
+            // Drop records with no source identity since they cannot be written.
             if app_core::ReaderSource::from_book_id(record.book_id).is_sd()
                 && (record.source_hash, record.source_size) == (0, 0)
             {
@@ -2983,9 +2962,7 @@ fn close_out_departing_book(
     }
     let record = record_for_persisted(sd_library, previous);
     let start = Instant::now();
-    // The departing book's own restore may still be owed: switching away
-    // from a book the reader saw only a provisional page of leaves its
-    // stored place the better answer for when they come back.
+    // Only overwrite stored place if the hold has been superseded.
     let stored = book_build::store_book_position(
         epd,
         sd_cs,
@@ -3124,10 +3101,7 @@ fn book_position(
     // chapter it names and page zero inside it. The open that follows refines
     // it against the pagination it builds, the same way an ordinary open does.
     match book_build::load_place(epd, sd_cs, library, usize::from(index)) {
-        // A card that would not say holds no place this boot can use, and the
-        // mirror is a better provisional landing than the start of the book:
-        // it names a page this book really had. The open that follows asks
-        // the card again either way.
+        // If absent or unreadable, fall back to the mirror position.
         None | Some(book_build::SavedPlace::Unreadable) => {
             esp_println::println!(
                 "restore: no per-book position for index={}; using the global mirror",

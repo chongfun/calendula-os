@@ -2890,14 +2890,8 @@ impl ReaderState {
                 // open, so it applies `restore_after_failed_open` itself.
             }
             LibraryEvent::BookOpenUnreadable { book_id } => {
-                // Deliberately no page, no chapter, no counts. The store this
-                // would have taken them from is empty.
-                //
-                // The book stays selected. The reader asked for it and the
-                // honest answer is this book with an error on it, rather than
-                // the device quietly going back to the last one that worked.
-                // What waits is the durable record, which is crash recovery
-                // rather than what is on screen.
+                // Mark the book unreadable without altering page or chapter,
+                // keeping it selected while preventing progress saves.
                 if self.book_id == book_id {
                     self.unreadable_book = Some(book_id);
                     self.read_request_pending = false;
@@ -3318,17 +3312,10 @@ impl ReaderState {
     }
 }
 
-/// Whether a state change owes storage a progress record of its own.
+/// Whether a state transition requires persisting a progress record to storage.
 ///
-/// The question is who decided where the reader lands. An open or a chapter
-/// jump hands that to storage and owes nothing, whether or not the book
-/// changed: the app's page stays provisional until storage answers, and a
-/// record carrying it would overwrite the position being resumed. Selecting
-/// the book already open is still an open.
-///
-/// Nothing dispatched with the book changed is a rollback or a refusal, which
-/// touched nothing. What is left the app decided itself, unless the book
-/// could not be read and holds no page worth keeping.
+/// Returns `false` for open commands, chapter jumps, book switches, rollbacks,
+/// or unreadable books. Otherwise returns `true` if persisted state changed.
 pub fn progress_owed(
     previous: &ReaderState,
     next: &ReaderState,
@@ -4383,13 +4370,8 @@ mod tests {
         assert!(!progress_owed(&unreadable, &deeper, None));
     }
 
-    /// What the transition machinery makes of a rollback, and why the app task
-    /// does not ask it. The two states differ by book, so this reads a
-    /// rollback as an ordinary switch and closes out the failed book, writing
-    /// the page the app briefly held for it over the real one on the card.
-    /// Only the caller knows which way the state moved, and
-    /// `fw::tasks::app::handle_library_event` skips this call when it applied
-    /// a rollback.
+    /// Transition logic interprets a rollback as a book switch; the app task
+    /// must bypass it when applying rollbacks to avoid overwriting state.
     #[test]
     fn a_rollback_read_as_a_switch_would_close_out_the_book_that_failed() {
         // Selecting book 2 put the app on it at page zero; the open was
@@ -4416,11 +4398,7 @@ mod tests {
         }
     }
 
-    /// Selecting a book stamps the current layout on a page of zero, so a
-    /// refused open has to put the old stamp back with the old page. Leaving
-    /// the new one makes a stale page read as current, and the next open of
-    /// that book skips resolving its stored place and resumes at a number
-    /// counted under a pagination that is gone.
+    /// A refused open restores the prior layout stamp alongside the page.
     #[test]
     fn an_aborted_open_puts_back_the_layout_the_page_was_counted_under() {
         // Book A, read at page 120 under settings the reader has since left.
@@ -5013,14 +4991,7 @@ mod tests {
         assert_eq!(resting.library_action_rejected(), resting);
     }
 
-    /// The library-event channel drops events when it is full, and a dropped
-    /// `CacheCleared` would leave the list frozen on "clearing…" for the rest
-    /// of the visit — the work is done, so nothing sends it again. Every event
-    /// that settles a wait the app is holding has to say so, or the firmware's
-    /// sender routes it out the lossy path.
-    /// Every event that releases a lock the app took when it handed work over.
-    /// Listed once, so the routing test and the holder tests below cannot
-    /// disagree about which events are which.
+    /// Events that release a lock the app took when it handed work over.
     fn settling_events() -> [LibraryEvent; 9] {
         [
             LibraryEvent::CacheCleared {
@@ -5093,6 +5064,7 @@ mod tests {
         ]
     }
 
+    /// Events that settle an in-flight wait must never be dropped.
     #[test]
     fn events_that_settle_a_wait_are_not_droppable() {
         for event in settling_events() {
@@ -5964,10 +5936,7 @@ mod tests {
         );
     }
 
-    /// Leaving a book that would not open owes it nothing. Its page is
-    /// whatever the app held when the open failed, so closing it out would
-    /// write a speculative page over the real one already on the card, and a
-    /// refused write would hold the reader on a book they cannot read.
+    /// Switching away from an unreadable book emits no close-out position record.
     #[test]
     fn leaving_an_unreadable_book_closes_nothing_out() {
         let unreadable = ReaderSource::sd(2).book_id();
@@ -6011,11 +5980,8 @@ mod tests {
         }
     }
 
-    /// The book the reader chose stays chosen, and the write that follows
-    /// the failure is the one that matters. A book that would not open holds
-    /// no page worth keeping, so it stays off the durable record until it
-    /// produces one, and the record goes on naming the last book that had a
-    /// page. That is crash recovery, not what is on screen.
+    /// An unreadable book remains selected in the UI but is excluded from
+    /// progress writes until content is successfully loaded.
     #[test]
     fn a_book_that_would_not_open_stays_selected_and_off_the_card() {
         let unreadable = ReaderSource::sd(2).book_id();
@@ -6062,8 +6028,7 @@ mod tests {
         assert_eq!(readable.page, 3);
     }
 
-    /// And the book the reader left keeps the durable record meanwhile, where
-    /// a reboot comes back to.
+    /// An unreadable book leaves the previous durable progress record intact.
     #[test]
     fn a_book_that_would_not_open_leaves_the_durable_record_alone() {
         let readable = ReaderSource::sd(1).book_id();
@@ -6092,10 +6057,7 @@ mod tests {
         );
     }
 
-    /// Every way an open can end has to answer it. The caller hangs the open's
-    /// bookkeeping, the input gate and the sleep block on this, so an ending
-    /// missing from it leaves the reader unable to press anything or go to
-    /// sleep until the device reboots.
+    /// Every terminal open event unblocks the open gate.
     #[test]
     fn every_ending_of_an_open_answers_for_it() {
         let book_id = ReaderSource::sd(3).book_id();
@@ -6138,8 +6100,7 @@ mod tests {
         );
     }
 
-    /// And the gate the answer feeds: while an open is unresolved it stays
-    /// shut, whatever else is true.
+    /// The open gate remains closed while an open is in flight.
     #[test]
     fn the_open_gate_waits_for_that_answer() {
         assert!(!open_gate_may_lift(true, true, false), "open unresolved");
@@ -6147,11 +6108,8 @@ mod tests {
         assert!(open_gate_may_lift(true, false, false), "answered and idle");
     }
 
-    /// An open that read nothing must not move the reader, because the state
-    /// it would move them to comes from a store that was emptied on the way
-    /// into the failed load. A `Loaded` carrying that store's counts is the
-    /// shape that does the damage, and it is left here beside the fix so the
-    /// difference is visible.
+    /// An unreadable open preserves existing page and chapter state, preventing
+    /// spurious page clamping and progress writes.
     #[test]
     fn an_unreadable_open_moves_nothing_a_save_would_follow() {
         let at_page = reading(0, 4, 120);
@@ -6195,9 +6153,8 @@ mod tests {
         );
     }
 
-    /// over a row number a rebuilt catalog had given to another book, and
-    /// the next page turn extends by index without a fence, off a RAM window
-    /// that checks the index and not which book the text came from.
+    /// Verify whether an open command is refusable: either it closes out a
+    /// departing book or it fences on a catalog epoch.
     #[test]
     fn an_open_that_can_be_refused_says_so() {
         let state = in_library(0, 3);
