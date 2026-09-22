@@ -259,8 +259,12 @@ fn new_store() -> Box<ReaderStore> {
 /// Fill the store's line buffer with one section's worth of body text and
 /// paginate it, leaving the store exactly as a finished spine item leaves it.
 fn fill_section(store: &mut ReaderStore, spine: u16, lines: usize) {
+    fill_section_at(store, spine, 0, lines);
+}
+
+fn fill_section_at(store: &mut ReaderStore, spine: u16, start_offset: u32, lines: usize) {
     store.clear_lines();
-    let mut offset = 0u32;
+    let mut offset = start_offset;
     for n in 0..lines {
         let line = format!("section {spine} line {n} with enough words to occupy a row");
         assert!(
@@ -292,15 +296,27 @@ fn write_section(
     section: u16,
     start_page: u32,
 ) -> BookV2SectionRecord {
-    fill_section(store, section, 6);
+    write_section_with_offset(root, store, section, section, 0, start_page)
+}
+
+fn write_section_with_offset(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    section: u16,
+    spine: u16,
+    start_offset: u32,
+    start_page: u32,
+) -> BookV2SectionRecord {
+    fill_section_at(store, spine, start_offset, 6);
     // The section file records `cached_spine`, and the load rejects a file whose
     // spine disagrees with the index record pointing at it. Without this every
     // section is written as spine 0, which happens to match for section 0 and
     // silently fails for every other — a fixture flaw a mutation check caught
     // only once a test reached past the first section.
-    store.set_cached_spine(section);
+    store.set_cached_spine(spine);
     store.set_section_ends_spine(true);
     let page_count = store.page_count().min(u16::MAX as usize) as u16;
+    let logical_offset = store.page_anchor(0).map_or(start_offset, |a| a.offset);
     let wrote = files::with_v2_sections_dir(root, &OWNER, |sections| {
         let sections = sections.expect("sections dir should exist");
         files::write_v2_section_cache_in(sections, IDENTITY, section, store)
@@ -308,11 +324,11 @@ fn write_section(
     assert!(wrote, "section {section} should write");
     BookV2SectionRecord {
         section,
-        spine: section,
+        spine,
         start_page,
         page_count,
         partial: false,
-        logical_offset: 0,
+        logical_offset,
     }
 }
 
@@ -741,6 +757,159 @@ fn an_index_with_corrupted_section_ordinal_is_rejected() {
         "mismatched start_page must be rejected as invalid"
     );
     assert_eq!(fresh_store2.book_section_count(), 0);
+}
+
+#[test]
+fn an_index_with_mismatched_total_pages_is_rejected() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let records = build_book(&root, &mut store, 2);
+    let pages = total_pages(&records);
+
+    // Header total below sum of section page_counts
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages.saturating_sub(1),
+        &records,
+        &store,
+        false,
+        0,
+    ));
+    let mut fresh_store = new_store();
+    assert_eq!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store),
+        files::BookIndexLoadResult::Invalid,
+        "header total below sum of section page_counts must be rejected as invalid"
+    );
+    assert_eq!(fresh_store.book_section_count(), 0);
+
+    // Header total above sum of section page_counts
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages + 1,
+        &records,
+        &store,
+        false,
+        0,
+    ));
+    let mut fresh_store2 = new_store();
+    assert_eq!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store2),
+        files::BookIndexLoadResult::Invalid,
+        "header total above sum of section page_counts must be rejected as invalid"
+    );
+    assert_eq!(fresh_store2.book_section_count(), 0);
+}
+
+#[test]
+fn an_anchor_cannot_resolve_when_section_start_disagrees_with_section_file() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    // Build section 0 (spine 0, offset 0) and section 1 (spine 0, offset 1000)
+    let sec0 = write_section_with_offset(&root, &mut store, 0, 0, 0, 0);
+    let sec1 = write_section_with_offset(&root, &mut store, 1, 0, 1000, sec0.page_count as u32);
+    let pages = sec0.page_count as u32 + sec1.page_count as u32;
+
+    // Corrupt section 1's logical_offset in BOOK.BIN from 1000 to 500
+    let mut corrupted_records = [sec0, sec1];
+    corrupted_records[1].logical_offset = 500;
+
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages,
+        &corrupted_records,
+        &store,
+        false,
+        0,
+    ));
+
+    let mut fresh_store = new_store();
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store);
+    assert!(matches!(loaded, files::BookIndexLoadResult::Hit { .. }));
+
+    // In the corrupted index, anchor 700 maps to section 1 because 500 <= 700
+    let selected_section = fresh_store.section_for_anchor(proto::anchor::ContentAnchor::at(0, 700));
+    assert_eq!(selected_section, Some(1));
+
+    // But section 1's actual file starts at offset 1000, so exact resolution must reject it (None)
+    let resolved = files::page_of_anchor_in_section(
+        &root,
+        &OWNER,
+        &fresh_store,
+        IDENTITY,
+        1,
+        proto::anchor::ContentAnchor::at(0, 700),
+    );
+    assert_eq!(
+        resolved, None,
+        "an anchor that falls before the section's actual page 0 or disagrees with BOOK.BIN must be refused"
+    );
+
+    // Now write the uncorrupted index with logical_offset = 1000
+    let valid_records = [sec0, sec1];
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages,
+        &valid_records,
+        &store,
+        false,
+        0,
+    ));
+    let mut valid_store = new_store();
+    assert!(matches!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut valid_store),
+        files::BookIndexLoadResult::Hit { .. }
+    ));
+
+    // Anchor 700 belongs to section 0
+    assert_eq!(
+        valid_store.section_for_anchor(proto::anchor::ContentAnchor::at(0, 700)),
+        Some(0)
+    );
+    // And page_of_anchor_in_section on section 1 for anchor 700 is refused because 700 < 1000
+    assert_eq!(
+        files::page_of_anchor_in_section(
+            &root,
+            &OWNER,
+            &valid_store,
+            IDENTITY,
+            1,
+            proto::anchor::ContentAnchor::at(0, 700)
+        ),
+        None
+    );
+    // Anchor 1050 belongs to section 1 and resolves successfully to page 0
+    assert_eq!(
+        valid_store.section_for_anchor(proto::anchor::ContentAnchor::at(0, 1050)),
+        Some(1)
+    );
+    assert_eq!(
+        files::page_of_anchor_in_section(
+            &root,
+            &OWNER,
+            &valid_store,
+            IDENTITY,
+            1,
+            proto::anchor::ContentAnchor::at(0, 1050)
+        ),
+        Some(0)
+    );
 }
 
 /// Invariant: a clean publish leaves the reader on the page it was asked for.

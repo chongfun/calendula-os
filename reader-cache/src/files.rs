@@ -1833,6 +1833,9 @@ where
         ) {
             return BookIndexLoadResult::Invalid;
         }
+        if expected_start_page != header.total_pages {
+            return BookIndexLoadResult::Invalid;
+        }
         if !read_v2_toc_into_library(file, &header, library) {
             return BookIndexLoadResult::Invalid;
         }
@@ -4301,12 +4304,32 @@ where
             if page_count == 0 {
                 return None;
             }
+            let section_record = library.book_section(section as usize);
+            if let Some(record) = section_record {
+                if record.spine != header.spine || record.page_count != header.page_count {
+                    return None;
+                }
+            }
+            if let Some(next) = library.book_section(section as usize + 1) {
+                if next.spine == header.spine
+                    && anchor >= ContentAnchor::at(next.spine, next.logical_offset)
+                {
+                    return None;
+                }
+            }
             let skip = (page_count * PAGE_RECORD_BYTES) as u32;
             file.seek_from_current(skip as i32).ok()?;
-            let mut found = 0u16;
+            let mut found = None;
             let mut prev_offset: Option<u32> = None;
             if !read_records_batched(file, PAGE_ANCHOR_BYTES, page_count, |index, bytes| {
                 let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                if index == 0 {
+                    if let Some(record) = section_record {
+                        if record.logical_offset != offset {
+                            return false;
+                        }
+                    }
+                }
                 if let Some(prev) = prev_offset {
                     if offset < prev {
                         return false;
@@ -4314,13 +4337,17 @@ where
                 }
                 prev_offset = Some(offset);
                 if ContentAnchor::at(header.spine, offset) <= anchor {
-                    found = index as u16;
+                    found = Some(index as u16);
                 }
                 true
             }) {
                 return None;
             }
-            Some(found)
+            found.or(if section == 0 && anchor.spine == header.spine {
+                Some(0)
+            } else {
+                None
+            })
         },
     )
     .flatten()
