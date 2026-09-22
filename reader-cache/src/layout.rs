@@ -168,8 +168,8 @@ pub fn replace_last_block(
     // so that is where the page opens. The walk that sets offsets as pages
     // open has already been past this one.
     if library.page_count > before {
-        let page = library.page_count - 1;
-        library.page_offset[page] = library.block_offset.get(index).copied().unwrap_or(0);
+        let offset = library.block_offset.get(index).copied().unwrap_or(0);
+        library.set_last_page_offset(offset);
     }
     overflowed
 }

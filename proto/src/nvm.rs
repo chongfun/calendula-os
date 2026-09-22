@@ -457,6 +457,8 @@ pub struct PlaceRecord {
     pub progression: Option<u16>,
 }
 
+const _: () = assert!(crate::anchor::CONTENT_ANCHOR_BYTES == 6);
+
 impl PlaceRecord {
     pub const ENCODED_LEN: usize = 41;
     const MAGIC: &'static [u8; 4] = b"X4PL";
@@ -812,5 +814,63 @@ mod tests {
         let mut encoded = record().encode();
         encoded[26] ^= 0xFF;
         assert_eq!(AppStateRecord::decode(&encoded), None);
+    }
+
+    #[test]
+    fn place_record_round_trips_and_rejects_corruption() {
+        let id = crate::identity::BookId::from_bytes([
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ])
+        .unwrap();
+        let record_with_prog = PlaceRecord {
+            id,
+            anchor: crate::anchor::ContentAnchor::at(5, 1234),
+            source: PlaceSource { byte_size: 987_654 },
+            progression: Some(32768),
+        };
+        let bytes = record_with_prog.encode();
+        let decoded = PlaceRecord::decode(&bytes).expect("record with progression decodes");
+        assert_eq!(decoded.id, record_with_prog.id);
+        assert_eq!(decoded.anchor, record_with_prog.anchor);
+        assert_eq!(decoded.source, record_with_prog.source);
+        assert_eq!(decoded.progression, record_with_prog.progression);
+
+        let record_no_prog = PlaceRecord {
+            id,
+            anchor: crate::anchor::ContentAnchor::at(0, 0),
+            source: PlaceSource { byte_size: 42 },
+            progression: None,
+        };
+        let bytes_no_prog = record_no_prog.encode();
+        let decoded_no_prog =
+            PlaceRecord::decode(&bytes_no_prog).expect("record without progression decodes");
+        assert_eq!(decoded_no_prog.progression, None);
+        assert_eq!(decoded_no_prog.anchor, record_no_prog.anchor);
+
+        // Corrupted magic
+        let mut corrupt = bytes;
+        corrupt[0] ^= 0xFF;
+        assert_eq!(PlaceRecord::decode(&corrupt), None);
+
+        // Mismatched version
+        corrupt = bytes;
+        corrupt[4] = PlaceRecord::VERSION + 1;
+        assert_eq!(PlaceRecord::decode(&corrupt), None);
+
+        // Mismatched stream version
+        corrupt = bytes;
+        corrupt[5] = crate::anchor::CONTENT_STREAM_VERSION + 1;
+        assert_eq!(PlaceRecord::decode(&corrupt), None);
+
+        // Corrupted payload / checksum mismatch
+        corrupt = bytes;
+        corrupt[20] ^= 0xFF;
+        assert_eq!(PlaceRecord::decode(&corrupt), None);
+
+        // Truncated buffer
+        assert_eq!(
+            PlaceRecord::decode(&bytes[..PlaceRecord::ENCODED_LEN - 1]),
+            None
+        );
     }
 }

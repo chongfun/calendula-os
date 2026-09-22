@@ -5,6 +5,7 @@ use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use esp_hal::gpio::Output;
 use heapless::String;
+use proto::anchor::{decode_progression, encode_progression};
 use proto::book::BookId;
 use proto::cache::{BookV2SectionRecord, CONTENT_HEADER_BYTES};
 use proto::epub::{
@@ -1021,11 +1022,8 @@ where
             }
         }
     } else {
-        let total = library.advertised_page_count().max(1);
-        Some(
-            ((u64::from(screen) * u64::from(u16::MAX)) / u64::from(total)).min(u64::from(u16::MAX))
-                as u16,
-        )
+        let total = library.advertised_page_count();
+        Some(encode_progression(screen, total))
     };
     match files::write_place(root, id, anchor, source, progression) {
         Ok(()) => Ok(()),
@@ -1435,13 +1433,13 @@ pub(crate) fn resolve_place(
         // at page 5 of 10 when it meant page 100 of 200.
         if let (Some(progression), false) = (progression, partial) {
             let total = library.advertised_page_count();
-            let page = ((u64::from(progression) * u64::from(total)) / u64::from(u16::MAX)) as u32;
+            let page = decode_progression(progression, total);
             esp_println::println!(
                 "restore: the source changed; resuming near {}/{}",
                 page,
                 total
             );
-            return PlaceTarget::Page(page.min(total.saturating_sub(1)));
+            return PlaceTarget::Page(page);
         }
         // Publication order carries the rest. The spine item the place was in
         // survives an edit better than an offset into it does, so the reader

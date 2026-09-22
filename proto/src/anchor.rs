@@ -106,6 +106,34 @@ pub const fn block_stream_len(text_len: usize) -> u32 {
     (text_len as u32).saturating_add(1)
 }
 
+/// Quantize a page index into a 16-bit fixed-point progression (`0..=u16::MAX`).
+///
+/// Uses ceiling division so that integer-floor decoding restores to the exact
+/// same page index for unchanged totals up to `u16::MAX`, eliminating the
+/// systematic one-page-early truncation of floor-over-floor encoding.
+pub const fn encode_progression(screen: u32, total: u32) -> u16 {
+    let total = if total == 0 { 1 } else { total as u64 };
+    let scaled = (screen as u64 * u16::MAX as u64).div_ceil(total);
+    if scaled > u16::MAX as u64 {
+        u16::MAX
+    } else {
+        scaled as u16
+    }
+}
+
+/// Decode a 16-bit progression back to a 0-indexed page number within `total` pages.
+pub const fn decode_progression(progression: u16, total: u32) -> u32 {
+    let total_u64 = total as u64;
+    let page = (progression as u64 * total_u64) / u16::MAX as u64;
+    let page = page as u32;
+    let max_page = total.saturating_sub(1);
+    if page > max_page {
+        max_page
+    } else {
+        page
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +190,37 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(block_stream_len(0), 1);
         assert_eq!(block_stream_len(383), 384);
+    }
+
+    #[test]
+    fn progression_round_trips_without_early_page_truncation() {
+        // Test totals across orders of magnitude and small counts where floor/floor previously failed.
+        for total in [1, 2, 3, 4, 5, 10, 50, 100, 384, 1000, u16::MAX as u32] {
+            for screen in 0..total.min(200) {
+                let encoded = encode_progression(screen, total);
+                let decoded = decode_progression(encoded, total);
+                assert_eq!(
+                    decoded, screen,
+                    "round-trip failed for screen={screen}, total={total}, encoded={encoded}"
+                );
+            }
+            // Also test end boundaries
+            for screen in [total.saturating_sub(2), total.saturating_sub(1)] {
+                let encoded = encode_progression(screen, total);
+                let decoded = decode_progression(encoded, total);
+                assert_eq!(
+                    decoded, screen,
+                    "boundary round-trip failed for screen={screen}, total={total}, encoded={encoded}"
+                );
+            }
+        }
+
+        // Test screen >= total clamps safely to last page
+        assert_eq!(decode_progression(encode_progression(100, 100), 100), 99);
+        assert_eq!(decode_progression(encode_progression(150, 100), 100), 99);
+
+        // Test total == 0 does not divide by zero
+        assert_eq!(encode_progression(0, 0), 0);
+        assert_eq!(decode_progression(0, 0), 0);
     }
 }

@@ -699,6 +699,50 @@ fn an_index_with_non_monotonic_section_anchors_is_rejected() {
     assert_eq!(fresh_store2.advertised_page_count(), 1);
 }
 
+#[test]
+fn an_index_with_corrupted_section_ordinal_is_rejected() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let mut records = build_book(&root, &mut store, 2);
+    let pages = total_pages(&records);
+
+    // Corrupt record 0's ordinal to 1 (mismatched slot).
+    records[0].section = 1;
+
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
+    ));
+
+    let mut fresh_store = new_store();
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store);
+    assert_eq!(
+        loaded,
+        files::BookIndexLoadResult::Invalid,
+        "mismatched section ordinal must be rejected as invalid"
+    );
+    assert_eq!(fresh_store.book_section_count(), 0);
+
+    // Also verify non-contiguous start_page is rejected.
+    records[0].section = 0;
+    records[1].start_page += 5;
+
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
+    ));
+
+    let mut fresh_store2 = new_store();
+    let loaded2 = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store2);
+    assert_eq!(
+        loaded2,
+        files::BookIndexLoadResult::Invalid,
+        "mismatched start_page must be rejected as invalid"
+    );
+    assert_eq!(fresh_store2.book_section_count(), 0);
+}
+
 /// Invariant: a clean publish leaves the reader on the page it was asked for.
 /// The baseline the fault cases are measured against — if this fails, the
 /// assertions above are proving nothing.
@@ -1054,17 +1098,9 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
 }
 
 // ---------------------------------------------------------------------------
-// Position survival across the v8 re-key
+// Layout bound and durable place
 // ---------------------------------------------------------------------------
 
-/// A card upgraded across catalog v8 holds every inactive book's reading
-/// position under the key pre-v8 firmware derived from the display path.
-/// Position is the one non-rebuildable thing under a key, so the new lookup
-/// must recover it from the old directory; a mutation that drops the legacy
-/// layer resumes every such book at the beginning.
-/// Write one section file under a layout that is not the store's, by moving
-/// the store to those settings for the write and back afterwards. Stands in
-/// for the reader having used that configuration earlier.
 /// How many layouts the card says this book has. Panics when the card would
 /// not say, which no test here arranges except on purpose.
 fn resident_count(root: &Dir<'_>) -> usize {
@@ -1087,6 +1123,9 @@ fn set_third_layout(store: &mut ReaderStore) -> u8 {
     store.layout_key()
 }
 
+/// Write one section file under a layout that is not the store's, by moving
+/// the store to those settings for the write and back afterwards. Stands in
+/// for the reader having used that configuration earlier.
 fn write_section_under(
     root: &Dir<'_>,
     store: &mut ReaderStore,

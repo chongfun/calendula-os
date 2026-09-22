@@ -1799,6 +1799,7 @@ where
         }
         let mut sections = [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS];
         let mut prev_anchor: Option<ContentAnchor> = None;
+        let mut expected_start_page = 0u32;
         if !read_records_batched(
             file,
             BOOK_V2_SECTION_RECORD_BYTES,
@@ -1807,7 +1808,10 @@ where
                 let Ok(record) = decode_book_v2_section(bytes) else {
                     return false;
                 };
-                if record.page_count == 0 {
+                if record.section as usize != index
+                    || record.page_count == 0
+                    || record.start_page != expected_start_page
+                {
                     return false;
                 }
                 let anchor = ContentAnchor::at(record.spine, record.logical_offset);
@@ -1817,6 +1821,12 @@ where
                     }
                 }
                 prev_anchor = Some(anchor);
+                let Some(next_start) =
+                    expected_start_page.checked_add(u32::from(record.page_count))
+                else {
+                    return false;
+                };
+                expected_start_page = next_start;
                 sections[index] = record;
                 true
             },
@@ -2488,14 +2498,20 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
-        return true;
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
     };
-    let Ok(cache) = cache_root.open_dir(CACHE_V2_DIR) else {
-        return true;
+    let cache = match cache_root.open_dir(CACHE_V2_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
     };
-    let Ok(book) = cache.open_dir(key) else {
-        return true;
+    let book = match cache.open_dir(key) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
     };
     let index_gone = match book.delete_entry_in_dir(CACHE_BOOK_FILE) {
         Ok(()) => true,
