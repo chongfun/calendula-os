@@ -580,6 +580,9 @@ fn storage_command_for_transition(
             type_settings: next.type_settings(),
             portrait: app_core::is_portrait(next.orientation),
             previous: (previous.book_id != next.book_id).then(|| previous.persisted()),
+            // The emulator has no card, so no copy has a stored place to
+            // resolve; its opens land on the page they name.
+            resolve_place: false,
         });
     }
 
