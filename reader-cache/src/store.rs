@@ -2,6 +2,7 @@ use app_core::browse::Browse;
 use app_core::{ReaderSource, MAX_SD_CHAPTERS};
 use display::font::{FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings};
 use heapless::String;
+use proto::anchor::ContentAnchor;
 use proto::cache::{
     BlockRecord, BookV2SectionRecord, PageRecord, TocRecord, CACHE_KEY_BYTES, COVER_BYTES,
     COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH, TOC_CHAPTER_RECORD_BYTES, TOC_CHAPTER_TITLE_BYTES,
@@ -64,6 +65,7 @@ pub(crate) const EMPTY_TOC_RECORD: TocRecord = TocRecord {
     spine_index: -1,
 };
 pub const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionRecord {
+    logical_offset: 0,
     section: 0,
     spine: 0,
     start_page: 0,
@@ -291,11 +293,13 @@ pub struct ReaderStore {
     pub(crate) cover_bits: [u8; COVER_BYTES],
     pub(crate) cached_spine: u16,
     pub(crate) section_partial: bool,
+    pub(crate) section_ends_spine: bool,
     pub(crate) book_total_pages: u32,
     pub current_section_start_page: u32,
     pub current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
+    pub(crate) layout_bound_unmet: bool,
     pub(crate) book_section_count: usize,
     pub(crate) book_sections: [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
@@ -347,6 +351,18 @@ pub struct ReaderStore {
     pub(crate) block_styles: [FontStyle; MAX_READER_BLOCKS],
     pub(crate) block_spine: [u16; MAX_READER_BLOCKS],
     pub(crate) block_page_break_before: [bool; MAX_READER_BLOCKS],
+    /// Where each resident line opens in its spine item's content stream.
+    ///
+    /// Carried from the build rather than derived from the cached text: the
+    /// cached line is a rendering, with inline style markers in it and its
+    /// edges trimmed, so its byte length is not the stream's.
+    ///
+    /// 1536 B of static RAM, the largest single cost of keeping positions as
+    /// content anchors; `page_offset` below adds 384. The store is a static,
+    /// so both come off the stack region rather than any frame, and
+    /// `tools/stack_frames.py` prints that region beside the per-frame ceiling
+    /// on every firmware gate.
+    pub(crate) block_offset: [u32; MAX_READER_BLOCKS],
     pub block_paragraph_end: [bool; MAX_READER_BLOCKS],
     /// True for a block that opens a paragraph (its opening line takes the
     /// first-line indent). Persisted rather than derived so a section that
@@ -356,6 +372,10 @@ pub struct ReaderStore {
     pub(crate) block_count: usize,
     pub(crate) pages: [PageRecord; MAX_READER_PAGES],
     pub(crate) page_spine: [u16; MAX_READER_PAGES],
+    /// Where each page starts in its spine item's logical content stream.
+    /// Together with `page_spine` this is the page's `ContentAnchor`, kept
+    /// as two arrays because that is how the rest of the page state is kept.
+    pub(crate) page_offset: [u32; MAX_READER_PAGES],
     pub(crate) page_count: usize,
     type_settings: TypeSettings,
     /// Whether the current layout paginates into the portrait page box.
@@ -416,11 +436,13 @@ impl ReaderStore {
             cover_bits: [0; COVER_BYTES],
             cached_spine: 0,
             section_partial: false,
+            section_ends_spine: false,
             book_total_pages: 0,
             current_section_start_page: 0,
             current_section_page_count: 0,
             book_cache_ready: false,
             book_cache_partial: false,
+            layout_bound_unmet: false,
             book_section_count: 0,
             book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
@@ -444,11 +466,13 @@ impl ReaderStore {
             block_styles: [FontStyle::Regular; MAX_READER_BLOCKS],
             block_spine: [0; MAX_READER_BLOCKS],
             block_page_break_before: [false; MAX_READER_BLOCKS],
+            block_offset: [0; MAX_READER_BLOCKS],
             block_paragraph_end: [false; MAX_READER_BLOCKS],
             block_paragraph_start: [false; MAX_READER_BLOCKS],
             block_count: 0,
             pages: [EMPTY_PAGE_RECORD; MAX_READER_PAGES],
             page_spine: [0; MAX_READER_PAGES],
+            page_offset: [0; MAX_READER_PAGES],
             page_count: 0,
             type_settings: ZERO_TYPE_SETTINGS,
             portrait: false,
@@ -602,18 +626,6 @@ impl ReaderStore {
     /// The resident list window and its absolute start, for the Library view.
     pub fn catalog_window(&self) -> &[LibraryBookEntry] {
         &self.window[..self.window_len]
-    }
-
-    pub fn catalog_window_start(&self) -> usize {
-        self.window_start
-    }
-
-    /// True when the loaded window already covers `[start, start+len)`, so the
-    /// firmware can skip a re-read while scrolling inside it.
-    pub fn window_covers(&self, start: usize, len: usize) -> bool {
-        self.window_len > 0
-            && start >= self.window_start
-            && start + len <= self.window_start + self.window_len
     }
 
     /// Begin filling a fresh window at `start`; `push_window_entry` appends.
@@ -901,6 +913,7 @@ impl ReaderStore {
         self.block_count = 0;
         self.page_count = 0;
         self.section_partial = false;
+        self.section_ends_spine = false;
         for (index, block) in self.blocks.iter_mut().enumerate() {
             *block = EMPTY_BLOCK_RECORD;
             self.block_styles[index] = FontStyle::Regular;
@@ -908,10 +921,12 @@ impl ReaderStore {
             self.block_page_break_before[index] = false;
             self.block_paragraph_end[index] = true;
             self.block_paragraph_start[index] = false;
+            self.block_offset[index] = 0;
         }
         for (index, page) in self.pages.iter_mut().enumerate() {
             *page = EMPTY_PAGE_RECORD;
             self.page_spine[index] = 0;
+            self.page_offset[index] = 0;
         }
     }
 
@@ -939,6 +954,9 @@ impl ReaderStore {
             self.block_page_break_before[offset] = self.block_page_break_before[src];
             self.block_paragraph_end[offset] = self.block_paragraph_end[src];
             self.block_paragraph_start[offset] = self.block_paragraph_start[src];
+            // The lines move to the front of the arena; where they open in
+            // the content stream moves with them.
+            self.block_offset[offset] = self.block_offset[src];
         }
         for index in carried_blocks..self.block_count {
             self.blocks[index] = EMPTY_BLOCK_RECORD;
@@ -947,6 +965,7 @@ impl ReaderStore {
             self.block_page_break_before[index] = false;
             self.block_paragraph_end[index] = true;
             self.block_paragraph_start[index] = false;
+            self.block_offset[index] = 0;
         }
         self.block_count = carried_blocks;
         self.text_len = carried_text;
@@ -954,6 +973,7 @@ impl ReaderStore {
         for (index, page) in self.pages.iter_mut().enumerate() {
             *page = EMPTY_PAGE_RECORD;
             self.page_spine[index] = 0;
+            self.page_offset[index] = 0;
         }
     }
 
@@ -1130,6 +1150,122 @@ impl ReaderStore {
         true
     }
 
+    /// Where a block read back from a section file starts in its item's
+    /// content. Separate from [`set_cached_block`](Self::set_cached_block)
+    /// because the two come off the card in separate passes.
+    pub(crate) fn set_cached_block_offset(&mut self, index: usize, offset: u32) -> bool {
+        if index >= self.block_offset.len() {
+            return false;
+        }
+        self.block_offset[index] = offset;
+        true
+    }
+
+    pub(crate) fn set_cached_page_offset(&mut self, index: usize, offset: u32) -> bool {
+        if index >= self.page_offset.len() {
+            return false;
+        }
+        self.page_offset[index] = offset;
+        true
+    }
+
+    /// The anchor a page starts at. A reading position stores this when the
+    /// reader turns onto the page.
+    pub fn page_anchor(&self, index: usize) -> Option<ContentAnchor> {
+        if index >= self.page_count {
+            return None;
+        }
+        Some(ContentAnchor::at(
+            self.page_spine[index],
+            self.page_offset[index],
+        ))
+    }
+
+    /// The resident page holding `anchor`, by the rule the whole feature
+    /// keeps: the last page starting at or before it. `None` when no resident
+    /// page starts that early, which is a caller's cue to load the section
+    /// the anchor names rather than to move the reader.
+    pub fn resident_page_containing(&self, anchor: ContentAnchor) -> Option<usize> {
+        let mut found = None;
+        for index in 0..self.page_count {
+            let start = ContentAnchor::at(self.page_spine[index], self.page_offset[index]);
+            if start <= anchor {
+                found = Some(index);
+            } else {
+                break;
+            }
+        }
+        found
+    }
+
+    /// The section holding `anchor`, by the same rule pages follow: the last
+    /// one starting at or before it.
+    ///
+    /// Answered from the book index alone, so resolving a stored place costs
+    /// one section file rather than every section file of the item. `None`
+    /// for a book whose index is not loaded.
+    pub fn section_for_anchor(&self, anchor: ContentAnchor) -> Option<usize> {
+        let mut found = None;
+        for index in 0..self.book_section_count {
+            let record = self.book_sections[index];
+            let start = ContentAnchor::at(record.spine, record.logical_offset);
+            if start <= anchor {
+                found = Some(index);
+            } else {
+                break;
+            }
+        }
+        // A place before the first section is the start of the book, which
+        // the first section holds.
+        found.or(if self.book_section_count > 0 {
+            Some(0)
+        } else {
+            None
+        })
+    }
+
+    /// Which stored pagination this store's current settings name.
+    pub fn layout_key(&self) -> u8 {
+        ui::reading::layout_key(self.type_settings(), self.portrait())
+    }
+
+    /// The anchor of a global page, when that page is in the resident
+    /// window. What a save stores, so the place written is the place the
+    /// reader is looking at.
+    pub fn anchor_for_global_page(&self, global: u32) -> Option<ContentAnchor> {
+        let within = global.checked_sub(self.current_section_start_page)?;
+        self.page_anchor(usize::try_from(within).ok()?)
+    }
+
+    /// Where a spine item starts, as a global page, when the index reaches
+    /// it. `None` for an item a partial index has yet to walk.
+    pub fn first_page_of_spine(&self, spine: u16) -> Option<u32> {
+        (0..self.book_section_count)
+            .map(|index| self.book_sections[index])
+            .find(|record| record.spine == spine)
+            .map(|record| record.start_page)
+    }
+
+    /// How many sections the resident index describes.
+    pub fn book_section_count(&self) -> usize {
+        self.book_section_count
+    }
+
+    /// One record from the book index.
+    pub fn book_section(&self, index: usize) -> Option<BookV2SectionRecord> {
+        (index < self.book_section_count).then(|| self.book_sections[index])
+    }
+
+    /// Record where a page just opened by the build starts. The build appends
+    /// pages in order, so this always names the last one.
+    pub fn set_last_page_offset(&mut self, offset: u32) {
+        if let Some(last) = self.page_count.checked_sub(1) {
+            if last < self.page_offset.len() {
+                self.page_offset[last] = offset;
+            }
+        }
+    }
+
     pub(crate) fn set_cached_block(
         &mut self,
         index: usize,
@@ -1185,12 +1321,14 @@ impl ReaderStore {
         block_count: usize,
         text_len: usize,
         partial: bool,
+        ends_spine: bool,
     ) {
         self.page_count = page_count;
         self.block_count = block_count;
         self.text_len = text_len;
         self.cached_spine = spine;
         self.section_partial = partial;
+        self.section_ends_spine = ends_spine;
         // A real section now occupies the text buffer, replacing any TOC the
         // overview had loaded there.
         self.text_holds_toc = false;
@@ -1199,6 +1337,12 @@ impl ReaderStore {
 
     pub fn set_section_partial(&mut self, partial: bool) {
         self.section_partial = partial;
+    }
+
+    /// Whether the section now in hand carries its spine item to the end.
+    /// The build knows; a reindex has no other way to ask.
+    pub fn set_section_ends_spine(&mut self, ends_spine: bool) {
+        self.section_ends_spine = ends_spine;
     }
 
     pub fn set_cached_spine(&mut self, spine: u16) {
@@ -1334,6 +1478,26 @@ impl ReaderStore {
             .get(index)
             .copied()
             .unwrap_or(FontStyle::Regular)
+    }
+
+    /// Whether the index describes only as much of the book as a build has
+    /// reached so far. A page total taken while this holds is a floor, not a
+    /// length, so nothing may divide by it and call the answer a fraction of
+    /// the book.
+    pub fn book_index_is_partial(&self) -> bool {
+        self.book_cache_partial
+    }
+
+    /// `true` when the card holds more layouts of this book than the bound
+    /// allows and would not free one. Publishers leave the book index unwritten
+    /// while it is set, so the next open cannot fast-hit and has to run the
+    /// eviction again. Set once per open, and not by `clear_book_index`.
+    pub fn layout_bound_unmet(&self) -> bool {
+        self.layout_bound_unmet
+    }
+
+    pub fn set_layout_bound_unmet(&mut self, unmet: bool) {
+        self.layout_bound_unmet = unmet;
     }
 
     pub fn advertised_page_count(&self) -> u32 {
@@ -1630,7 +1794,7 @@ impl ReaderStore {
         role: TextRole,
         align: TextAlign,
         paragraph_end: bool,
-        spine_index: u16,
+        at: ContentAnchor,
     ) -> bool {
         let line = line.trim();
         if line.is_empty() || self.block_count >= self.blocks.len() {
@@ -1652,7 +1816,8 @@ impl ReaderStore {
             align,
         };
         self.block_styles[self.block_count] = style;
-        self.block_spine[self.block_count] = spine_index;
+        self.block_spine[self.block_count] = at.spine;
+        self.block_offset[self.block_count] = at.offset;
         self.block_page_break_before[self.block_count] =
             should_break_before_block(role, self.blocks.get(self.block_count.wrapping_sub(1)));
         self.block_paragraph_end[self.block_count] = paragraph_end;
@@ -1971,5 +2136,274 @@ mod tests {
             (40, 5, 900),
             "all three counters describe one arena and must come back together"
         );
+    }
+
+    /// Push one line of body text at a chosen place in the content stream,
+    /// the way the build does.
+    fn push_line(store: &mut ReaderStore, spine: u16, line: &str, offset: u32) {
+        assert!(store.push_line_block(
+            line,
+            FontStyle::Regular,
+            TextRole::Body,
+            TextAlign::Left,
+            true,
+            ContentAnchor::at(spine, offset),
+        ));
+    }
+
+    /// A long chapter flushes on a page boundary and carries its unfinished
+    /// last page into the next section, where it becomes page zero. That page
+    /// keeps its place in the content stream: the section record written for
+    /// the next section is taken from it, and a saved place resolves through
+    /// those records to find which section holds it.
+    #[test]
+    fn a_carried_page_keeps_where_it_opens() {
+        let mut store = Box::new(ReaderStore::new());
+        for index in 0..4u32 {
+            push_line(&mut store, 5, "a line of body text", 100 + index * 20);
+        }
+        assert!(store.set_cached_page(
+            0,
+            PageRecord {
+                first_block: 0,
+                block_count: 2
+            },
+            5,
+        ));
+        assert!(store.set_cached_page(
+            1,
+            PageRecord {
+                first_block: 2,
+                block_count: 2
+            },
+            5,
+        ));
+        store.page_count = 2;
+        crate::layout::rebuild_page_offsets(&mut store);
+        assert_eq!(store.page_anchor(1), Some(ContentAnchor::at(5, 140)));
+
+        store.carry_last_page(2);
+        crate::layout::rebuild_page_index(&mut store);
+        assert_eq!(
+            store.page_anchor(0),
+            Some(ContentAnchor::at(5, 140)),
+            "the carried page opens where it opened before it moved"
+        );
+    }
+
+    /// A spacing change re-walks heights over the same wrap points, so the
+    /// pages move while the lines stay put. Page offsets that came in with the
+    /// old breaks describe pages that are gone.
+    #[test]
+    fn a_repagination_moves_the_offsets_with_the_pages() {
+        let mut store = Box::new(ReaderStore::new());
+        for index in 0..4u32 {
+            push_line(&mut store, 2, "a line of body text", 40 + index * 9);
+        }
+
+        // As loaded: two pages of two lines.
+        assert!(store.set_cached_page(
+            0,
+            PageRecord {
+                first_block: 0,
+                block_count: 2
+            },
+            2,
+        ));
+        assert!(store.set_cached_page(
+            1,
+            PageRecord {
+                first_block: 2,
+                block_count: 2
+            },
+            2,
+        ));
+        store.page_count = 2;
+        crate::layout::rebuild_page_offsets(&mut store);
+
+        // The breaks move: every line opens a page now. Driven through the
+        // real walk rather than by writing page records, so the call that
+        // re-derives the offsets is on the path this covers.
+        for index in 1..4usize {
+            store.block_page_break_before[index] = true;
+        }
+        crate::layout::rebuild_page_index(&mut store);
+        assert_eq!(store.page_count, 4, "one line per page now");
+
+        assert_eq!(
+            (0..4)
+                .map(|page| store.page_anchor(page).map(|anchor| anchor.offset))
+                .collect::<heapless::Vec<_, 4>>()
+                .as_slice(),
+            &[Some(40), Some(49), Some(58), Some(67)],
+            "each page opens where its own first line opens"
+        );
+    }
+
+    /// Style markers and formatting bytes in a cached line do not advance the
+    /// content offset.
+    #[test]
+    fn a_styled_line_does_not_move_the_stream_by_its_rendered_length() {
+        let mut store = Box::new(ReaderStore::new());
+        // "an ", then italic "italic", then " word": two markers, four bytes
+        // of rendering that are not content.
+        let mut styled = heapless::String::<32>::new();
+        let _ = styled.push_str("an ");
+        let _ = styled.push(display::font::STYLE_MARKER);
+        let _ = styled.push('1');
+        let _ = styled.push_str("italic");
+        let _ = styled.push(display::font::STYLE_MARKER);
+        let _ = styled.push('0');
+        let _ = styled.push_str(" word");
+        let plain = "an italic word";
+        assert_eq!(
+            styled.len(),
+            plain.len() + 4,
+            "the fixture has to carry markers for this to be about them"
+        );
+
+        push_line(&mut store, 1, &styled, 1_000);
+        push_line(&mut store, 1, "the line after it", 1_015);
+
+        for index in 1..2usize {
+            store.block_page_break_before[index] = true;
+        }
+        crate::layout::rebuild_page_index(&mut store);
+        assert_eq!(store.page_count, 2);
+        assert_eq!(
+            store.page_anchor(0),
+            Some(ContentAnchor::at(1, 1_000)),
+            "the first page opens where the build said"
+        );
+        assert_eq!(
+            store.page_anchor(1),
+            Some(ContentAnchor::at(1, 1_015)),
+            "and the next one 15 on, the content's length plus its separator, \
+             not the 19 bytes the rendering takes"
+        );
+    }
+
+    /// When a paragraph gap pushes a block onto a new page, that page adopts
+    /// the line's offset.
+    #[test]
+    fn a_block_moved_by_its_paragraph_gap_takes_its_offset_along() {
+        let mut store = Box::new(ReaderStore::new());
+        push_line(&mut store, 4, "the first line", 500);
+        push_line(&mut store, 4, "the second line", 515);
+
+        let (mut cursor, _) = crate::layout::rebuild_page_index(&mut store);
+        assert_eq!(store.page_count, 1, "both lines start on one page");
+
+        // The gap pushes the last block off the page it had joined.
+        store.block_page_break_before[1] = true;
+        crate::layout::replace_last_block(&mut store, &mut cursor, 1);
+
+        assert_eq!(store.page_count, 2, "the block moved to a page of its own");
+        assert_eq!(
+            store.page_anchor(1),
+            Some(ContentAnchor::at(4, 515)),
+            "and the page opens where that line opens"
+        );
+    }
+
+    /// Lay a book out as pages, the way a build does: each entry is one
+    /// page's first line and where that line begins in the spine item's
+    /// content. Two layouts of one book differ only in where the breaks
+    /// fall, so these tests vary that and nothing else.
+    fn lay_out(store: &mut ReaderStore, spine: u16, starts: &[u32]) {
+        for (index, offset) in starts.iter().enumerate() {
+            assert!(store.set_cached_page(
+                index,
+                PageRecord {
+                    first_block: index as u16,
+                    block_count: 1,
+                },
+                spine,
+            ));
+            assert!(store.set_cached_page_offset(index, *offset));
+        }
+        store.page_count = starts.len();
+    }
+
+    #[test]
+    fn a_page_reports_the_anchor_it_starts_at() {
+        let mut store = Box::new(ReaderStore::new());
+        lay_out(&mut store, 3, &[0, 512, 1_024]);
+        assert_eq!(store.page_anchor(0), Some(ContentAnchor::at(3, 0)));
+        assert_eq!(store.page_anchor(2), Some(ContentAnchor::at(3, 1_024)));
+        assert_eq!(store.page_anchor(3), None, "past the resident pages");
+    }
+
+    #[test]
+    fn a_place_resolves_to_the_page_that_holds_it() {
+        let mut store = Box::new(ReaderStore::new());
+        lay_out(&mut store, 0, &[0, 512, 1_024]);
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(0, 0)),
+            Some(0),
+            "a page owns its own start"
+        );
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(0, 511)),
+            Some(0),
+            "and everything up to the next start"
+        );
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(0, 512)),
+            Some(1),
+            "which the next page owns"
+        );
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(0, 9_999)),
+            Some(2),
+            "a place past the last break is on the last page"
+        );
+    }
+
+    #[test]
+    fn a_place_before_the_resident_window_asks_for_a_load() {
+        let mut store = Box::new(ReaderStore::new());
+        lay_out(&mut store, 4, &[0, 512]);
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(2, 800)),
+            None,
+            "an earlier spine item is not in this window"
+        );
+        assert_eq!(
+            store.resident_page_containing(ContentAnchor::at(9, 0)),
+            Some(1),
+            "a later one resolves to the last page, which is where reading \
+             continues while the next section loads"
+        );
+    }
+
+    /// Re-laying out the same content with different typography preserves
+    /// the content anchor even when page boundaries shift.
+    #[test]
+    fn the_same_place_survives_a_relayout() {
+        let place = ContentAnchor::at(1, 700);
+
+        // A larger font: fewer words per page, so breaks come often.
+        let mut large = Box::new(ReaderStore::new());
+        lay_out(&mut large, 1, &[0, 240, 480, 720, 960]);
+        let on_large = large
+            .resident_page_containing(place)
+            .expect("the place is on a page");
+
+        // A smaller font over the same content: the same text, broken later.
+        let mut small = Box::new(ReaderStore::new());
+        lay_out(&mut small, 1, &[0, 600, 1_200]);
+        let on_small = small
+            .resident_page_containing(place)
+            .expect("the place is on a page here too");
+
+        assert_ne!(on_large, on_small, "the page number is not the same");
+        for (store, page) in [(&large, on_large), (&small, on_small)] {
+            let start = store.page_anchor(page).expect("a start");
+            assert!(start <= place, "and each page begins at or before it");
+            if let Some(next) = store.page_anchor(page + 1) {
+                assert!(place < next, "and ends before the next one begins");
+            }
+        }
     }
 }

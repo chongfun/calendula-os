@@ -519,10 +519,6 @@ pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
-/// Footer band top: 14 rows up from the panel's bottom edge. Panel-relative
-/// so the X3's taller page pushes the footer to its own bottom edge; on the
-/// X4 this is the historical 466.
-pub const READER_FOOTER_TOP: i16 = display::HEIGHT as i16 - 14;
 /// Page-counter text baseline: as low as it goes without clipping (the
 /// slash inks 2 rows below its baseline). Used by `fw::views` so the
 /// footer's exact panel-relative position lives in one place instead of
@@ -606,6 +602,36 @@ const _: () = assert!(READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 256);
 /// in bits 5-6, portrait in bit 7, version above. Size, weight, family,
 /// and the page box all change wrap points, so a change in any forces a
 /// full rebuild.
+// Compile-time check that type setting variants fit within their allotted bit widths.
+const _: () = {
+    const fn families() -> u16 {
+        match display::font::FontFamily::Literata {
+            display::font::FontFamily::Literata
+            | display::font::FontFamily::Merriweather
+            | display::font::FontFamily::Custom => 3,
+        }
+    }
+    const fn weights() -> u16 {
+        match display::font::FontWeight::Normal {
+            display::font::FontWeight::Normal | display::font::FontWeight::Heavy => 2,
+        }
+    }
+    const fn sizes() -> u16 {
+        match FontSize::Small {
+            FontSize::Small | FontSize::Medium | FontSize::Large => 3,
+        }
+    }
+    const fn spacings() -> u16 {
+        match LineSpacing::Compact {
+            LineSpacing::Compact | LineSpacing::Normal | LineSpacing::Relaxed => 3,
+        }
+    }
+    assert!(spacings() <= 4, "line spacing has bits 0 and 1");
+    assert!(sizes() <= 4, "font size has bits 2 and 3");
+    assert!(weights() <= 2, "font weight has bit 4 alone");
+    assert!(families() <= 4, "font family has bits 5 and 6");
+};
+
 pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
     ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
         | ((portrait as u16) << 7)
@@ -613,6 +639,15 @@ pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
         | ((settings.weight as u16) << 4)
         | ((settings.size as u16) << 2)
         | settings.spacing as u16
+}
+
+/// Key identifying layout parameters that affect line wrapping: font size,
+/// weight, family, and screen orientation.
+///
+/// Line spacing and layout version are omitted: spacing does not change line
+/// wrapping, and version bumps invalidate cache headers directly.
+pub fn layout_key(settings: TypeSettings, portrait: bool) -> u8 {
+    ((reader_layout_config(settings, portrait) >> 2) & 0x3F) as u8
 }
 
 /// The reading body face for the given settings and style run.

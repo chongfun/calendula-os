@@ -2,7 +2,7 @@ use crate::text::{FontStyle, TextAlign, TextRole};
 use heapless::String;
 
 pub const CACHE_MAGIC: u32 = 0x5834_5244; // X4RD
-pub const CACHE_VERSION: u16 = 1;
+pub const CACHE_VERSION: u16 = 2;
 // Bumped 21 -> 23 with the spine-cap fix. A long book cached under the old
 // 96-item spine cap was written with partial=false (truncation never tripped
 // book_partial), so it would load as a clean hit and keep stranding the tail
@@ -30,8 +30,8 @@ pub const CACHE_VERSION: u16 = 1;
 // cache on every card to add a value they already carry correctly. Only do the
 // same for a field whose old bytes are a *provably* fixed constant, and pin it
 // with a test the way `book_v2_header` does.
-pub const CACHE_V2_VERSION: u16 = 26;
-const CACHE_V2_COMPAT_VERSION: u16 = 26;
+pub const CACHE_V2_VERSION: u16 = 27;
+const CACHE_V2_COMPAT_VERSION: u16 = 27;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
@@ -49,7 +49,7 @@ pub const CACHE_BOOK_FILE: &str = "BOOK.BIN";
 pub const CACHE_COVER_FILE: &str = "COVER.BIN";
 pub const CACHE_STATE_FILE: &str = "STATE.BIN";
 pub const CACHE_KEY_BYTES: usize = 8;
-pub const CACHE_SECTION_FILE_BYTES: usize = 8;
+pub const CACHE_SECTION_FILE_BYTES: usize = 10;
 pub const BOOK_HEADER_BYTES: usize = 16;
 pub const SPINE_RECORD_BYTES: usize = 12;
 pub const TOC_RECORD_BYTES: usize = 24;
@@ -59,6 +59,16 @@ pub const BOOK_V2_HEADER_BYTES: usize = 56;
 pub const BOOK_V2_SECTION_RECORD_BYTES: usize = 16;
 pub const PAGE_HEADER_BYTES: usize = 28;
 pub const PAGE_RECORD_BYTES: usize = 4;
+/// One page's anchor offset, stored beside the page records rather than in
+/// them. A `PageRecord` says which blocks a page holds, which a reader can
+/// re-derive by walking; where the page sits in the book's content cannot be
+/// re-derived from anything the layout keeps, so it is written down.
+pub const PAGE_ANCHOR_BYTES: usize = 4;
+/// One block's offset in the logical content stream, stored alongside the
+/// block records. Where a page opens is where its first block opens, and a
+/// block's offset is the only thing that survives a repagination moving the
+/// page breaks around.
+pub const BLOCK_ANCHOR_BYTES: usize = 4;
 pub const LINE_RECORD_BYTES: usize = 12;
 pub const WORD_RECORD_BYTES: usize = 12;
 pub const BLOCK_RECORD_BYTES: usize = 12;
@@ -99,9 +109,9 @@ pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;
 /// replay a stream captured under older parse semantics.
 pub const CACHE_CONTENT_FILE: &str = "CONT.BIN";
 pub const CONTENT_MAGIC: u32 = 0x5834_434E; // X4CN
-pub const CONTENT_VERSION: u16 = 3;
+pub const CONTENT_VERSION: u16 = 4;
 pub const CONTENT_HEADER_BYTES: usize = 24;
-pub const CONTENT_RECORD_HEADER_BYTES: usize = 8;
+pub const CONTENT_RECORD_HEADER_BYTES: usize = 12;
 const CONTENT_FLAG_COMPLETE: u8 = 1;
 const CONTENT_RECORD_FLAG_PARAGRAPH_END: u8 = 1;
 const CONTENT_RECORD_FLAG_SPINE_END: u8 = 1 << 1;
@@ -129,6 +139,10 @@ pub struct ContentRecordHeader {
     pub align: TextAlign,
     pub paragraph_end: bool,
     pub spine_end: bool,
+    /// Where this block starts in its spine item's logical content stream.
+    /// A replay rebuilds from these blocks alone and the parser does not run
+    /// again, so an invented offset would move every anchor it rebuilds.
+    pub logical_offset: u32,
 }
 
 pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<usize, CacheError> {
@@ -187,6 +201,7 @@ pub fn encode_content_record_header(
     out[6] = align_byte(record.align);
     out[7] = (u8::from(record.paragraph_end) * CONTENT_RECORD_FLAG_PARAGRAPH_END)
         | (u8::from(record.spine_end) * CONTENT_RECORD_FLAG_SPINE_END);
+    write_u32(out, 8, record.logical_offset);
     Ok(CONTENT_RECORD_HEADER_BYTES)
 }
 
@@ -200,6 +215,7 @@ pub fn decode_content_record_header(input: &[u8]) -> Result<ContentRecordHeader,
         align: align_from_byte(input[6])?,
         paragraph_end: input[7] & CONTENT_RECORD_FLAG_PARAGRAPH_END != 0,
         spine_end: input[7] & CONTENT_RECORD_FLAG_SPINE_END != 0,
+        logical_offset: read_u32(input, 8)?,
     };
     if record.spine_end && record.text_len != 0 {
         return Err(CacheError::BadLength);
@@ -463,6 +479,12 @@ pub struct SectionV2Header {
     pub bytes_consumed: u32,
     pub total_bytes: u32,
     pub partial: bool,
+    /// Whether this section carries its spine item to the end.
+    ///
+    /// False for the intermediate flushes of a long item, and for every
+    /// section written before this flag existed, which reads as no proof and
+    /// sends a reindex to the replay rather than to a truncated book.
+    pub ends_spine: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -507,6 +529,11 @@ pub struct BookV2SectionRecord {
     pub start_page: u32,
     pub page_count: u16,
     pub partial: bool,
+    /// Where this section's first page starts in its spine item's logical
+    /// content stream, so a stored place is resolved from the book index and
+    /// one section file rather than from every section file of the item.
+    /// Written into four bytes the record already reserved.
+    pub logical_offset: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -573,20 +600,6 @@ impl CoverCacheHeader {
     }
 }
 
-pub fn book_cache_size(header: BookCacheHeader) -> usize {
-    BOOK_HEADER_BYTES
-        + header.spine_count as usize * SPINE_RECORD_BYTES
-        + header.toc_count as usize * TOC_RECORD_BYTES
-        + header.string_bytes as usize
-}
-
-pub fn page_cache_size(header: PageCacheHeader) -> usize {
-    PAGE_HEADER_BYTES
-        + header.page_count as usize * PAGE_RECORD_BYTES
-        + header.block_count as usize * BLOCK_RECORD_BYTES
-        + header.text_bytes as usize
-}
-
 pub fn section_cache_size(header: SectionHeader) -> usize {
     SECTION_HEADER_BYTES
         + header.page_count as usize * PAGE_RECORD_BYTES
@@ -600,7 +613,9 @@ pub fn section_cache_size(header: SectionHeader) -> usize {
 pub fn section_v2_cache_size(header: SectionV2Header) -> usize {
     SECTION_V2_HEADER_BYTES
         + header.page_count as usize * PAGE_RECORD_BYTES
+        + header.page_count as usize * PAGE_ANCHOR_BYTES
         + header.block_count as usize * BLOCK_RECORD_BYTES
+        + header.block_count as usize * BLOCK_ANCHOR_BYTES
         + header.block_count as usize
         + header.text_bytes as usize
 }
@@ -939,11 +954,44 @@ pub fn legacy_position_cache_key(
     Some(out)
 }
 
-pub fn section_file_name<const N: usize>(spine: u16, out: &mut String<N>) {
+/// One section's file, named for the layout that paginated it as well as the
+/// spine item it holds, so two layouts of one book sit side by side rather
+/// than overwriting each other.
+pub fn section_file_name<const N: usize>(layout: u8, spine: u16, out: &mut String<N>) {
     out.clear();
     let _ = out.push('S');
+    push_hex(out, u32::from(layout), 2);
     push_dec3(out, spine);
     let _ = out.push_str(".BIN");
+}
+
+/// The layout a section file's name says made it, or `None` for a name that is
+/// not one of ours. Over bytes, for the reason below.
+pub fn layout_of_section_file(name: &str) -> Option<u8> {
+    let bytes = name.as_bytes();
+    if bytes.len() < 6 || !bytes[0].eq_ignore_ascii_case(&b'S') {
+        return None;
+    }
+    let high = (bytes[1] as char).to_digit(16)?;
+    let low = (bytes[2] as char).to_digit(16)?;
+    if !bytes[3..6].iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if !bytes.get(6..)?.eq_ignore_ascii_case(b".BIN") {
+        return None;
+    }
+    Some((high * 16 + low) as u8)
+}
+
+/// Whether a name in a book's SECTIONS directory belongs to `layout`.
+/// Used by the sweep that retires one layout and leaves the others alone.
+///
+/// Compared over bytes, not over `&str` offsets. A FAT short name reaches
+/// this as text the driver wrote one byte at a time, so a byte at or above
+/// 0x80 becomes two UTF-8 bytes and shifts every character boundary past it.
+/// Slicing at computed offsets then reads the wrong field, or panics.
+pub fn section_file_is_layout(name: &str, layout: u8) -> bool {
+    layout_of_section_file(name) == Some(layout)
 }
 
 pub fn encode_book_header(header: BookCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {
@@ -1093,7 +1141,7 @@ pub fn encode_section_v2_header(
     write_u16(out, 8, header.page_count);
     write_u16(out, 10, header.block_count);
     out[12] = header.partial as u8;
-    out[13] = 0;
+    out[13] = header.ends_spine as u8;
     write_u16(out, 14, 0);
     write_u32(out, 16, header.text_bytes);
     write_u16(out, 20, header.viewport_width);
@@ -1122,6 +1170,7 @@ pub fn decode_section_v2_header(input: &[u8]) -> Result<SectionV2Header, CacheEr
         page_count: read_u16(input, 8)?,
         block_count: read_u16(input, 10)?,
         partial: input[12] != 0,
+        ends_spine: input[13] != 0,
         text_bytes: read_u32(input, 16)?,
         viewport_width: read_u16(input, 20)?,
         viewport_height: read_u16(input, 22)?,
@@ -1196,7 +1245,7 @@ pub fn encode_book_v2_section(
     write_u16(out, 8, record.page_count);
     out[10] = record.partial as u8;
     out[11] = 0;
-    write_u32(out, 12, 0);
+    write_u32(out, 12, record.logical_offset);
     Ok(BOOK_V2_SECTION_RECORD_BYTES)
 }
 
@@ -1208,6 +1257,7 @@ pub fn decode_book_v2_section(input: &[u8]) -> Result<BookV2SectionRecord, Cache
         start_page: read_u32(input, 4)?,
         page_count: read_u16(input, 8)?,
         partial: input[10] != 0,
+        logical_offset: read_u32(input, 12)?,
     })
 }
 
@@ -1691,6 +1741,7 @@ mod tests {
             start_page,
             page_count: 10,
             partial: false,
+            logical_offset: 0,
         }
     }
 
@@ -1756,6 +1807,7 @@ mod tests {
             align: TextAlign::Center,
             paragraph_end: true,
             spine_end: false,
+            logical_offset: 0,
         };
         let marker = ContentRecordHeader {
             spine_index: 12,
@@ -1765,6 +1817,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: false,
             spine_end: true,
+            logical_offset: 0,
         };
         for record in [block, marker] {
             let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
@@ -1785,6 +1838,7 @@ mod tests {
                 align: TextAlign::Justify,
                 paragraph_end: false,
                 spine_end: false,
+                logical_offset: 0,
             },
             &mut bytes,
         )
@@ -1806,6 +1860,7 @@ mod tests {
                 align: TextAlign::Left,
                 paragraph_end: false,
                 spine_end: true,
+                logical_offset: 0,
             },
             &mut bytes,
         )
@@ -2016,14 +2071,33 @@ mod tests {
             bytes_consumed: 8192,
             total_bytes: 12_000,
             partial: true,
+            ends_spine: false,
         };
         let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
         encode_section_v2_header(header, &mut bytes).expect("section v2 header encodes");
 
         assert_eq!(decode_section_v2_header(&bytes).unwrap(), header);
+
+        // The two flags sit in adjacent bytes and mean opposite things, so
+        // they are worth proving apart rather than together.
+        let swapped = SectionV2Header {
+            partial: false,
+            ends_spine: true,
+            ..header
+        };
+        let mut swapped_bytes = [0u8; SECTION_V2_HEADER_BYTES];
+        encode_section_v2_header(swapped, &mut swapped_bytes).expect("section v2 header encodes");
+        assert_eq!(decode_section_v2_header(&swapped_bytes).unwrap(), swapped);
+        assert_ne!(bytes[12..14], swapped_bytes[12..14]);
         assert_eq!(
             section_v2_cache_size(header),
-            SECTION_V2_HEADER_BYTES + PAGE_RECORD_BYTES * 2 + BLOCK_RECORD_BYTES * 3 + 3 + 19
+            SECTION_V2_HEADER_BYTES
+                + PAGE_RECORD_BYTES * 2
+                + PAGE_ANCHOR_BYTES * 2
+                + BLOCK_RECORD_BYTES * 3
+                + BLOCK_ANCHOR_BYTES * 3
+                + 3
+                + 19
         );
 
         bytes[4] = CACHE_VERSION as u8;
@@ -2059,6 +2133,7 @@ mod tests {
             start_page: 42,
             page_count: 12,
             partial: false,
+            logical_offset: 0,
         };
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         let mut section_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
@@ -2171,10 +2246,16 @@ mod tests {
         assert!(key.as_str()[1..].bytes().all(|b| b.is_ascii_hexdigit()));
 
         let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-        section_file_name(7, &mut name);
-        assert_eq!(name.as_str(), "S007.BIN");
-        section_file_name(1234, &mut name);
-        assert_eq!(name.as_str(), "S999.BIN");
+        section_file_name(0x2A, 7, &mut name);
+        assert_eq!(name.as_str(), "S2A007.BIN");
+        section_file_name(0x2A, 1234, &mut name);
+        assert_eq!(name.as_str(), "S2A999.BIN");
+        // One book, two layouts, two sets of files.
+        let mut other = String::<CACHE_SECTION_FILE_BYTES>::new();
+        section_file_name(0x2B, 7, &mut other);
+        assert_ne!(name.as_str(), other.as_str());
+        assert!(section_file_is_layout(other.as_str(), 0x2B));
+        assert!(!section_file_is_layout(other.as_str(), 0x2A));
     }
 
     /// The identity input is the full location, not the 64-byte display
@@ -2564,6 +2645,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: true,
             spine_end: false,
+            logical_offset: 0,
         };
         offset += encode_content_record_header(rec1, &mut buffer[offset..]).unwrap();
         buffer[offset..offset + 4].copy_from_slice(b"abcd");
@@ -2578,6 +2660,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: false,
             spine_end: true,
+            logical_offset: 0,
         };
         offset += encode_content_record_header(rec2, &mut buffer[offset..]).unwrap();
         let spine_0_end_offset = offset;
@@ -2592,6 +2675,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: true,
             spine_end: false,
+            logical_offset: 0,
         };
         offset += encode_content_record_header(rec3, &mut buffer[offset..]).unwrap();
         buffer[offset..offset + 4].copy_from_slice(b"efgh");
@@ -2606,6 +2690,7 @@ mod tests {
             align: TextAlign::Left,
             paragraph_end: false,
             spine_end: true,
+            logical_offset: 0,
         };
         offset += encode_content_record_header(rec4, &mut buffer[offset..]).unwrap();
         let full_len = offset;
@@ -2691,6 +2776,7 @@ mod tests {
                 align: TextAlign::Left,
                 paragraph_end: false,
                 spine_end: true,
+                logical_offset: 0,
             },
             &mut flipped[rec4_offset..rec4_offset + CONTENT_RECORD_HEADER_BYTES],
         )

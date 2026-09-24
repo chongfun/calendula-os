@@ -21,9 +21,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use display::font::FontStyle;
+use display::font::{FontSize, FontStyle, LineSpacing, TypeSettings};
 use embedded_sdmmc::{
-    Block, BlockCount, BlockDevice, BlockIdx, Directory, TimeSource, Timestamp, VolumeIdx,
+    Block, BlockCount, BlockDevice, BlockIdx, Directory, Mode, TimeSource, Timestamp, VolumeIdx,
     VolumeManager,
 };
 use proto::cache::{
@@ -35,7 +35,7 @@ use proto::text::{TextAlign, TextRole};
 use reader_cache::files::{self, CacheLoadResult};
 use reader_cache::layout;
 use reader_cache::publish::{self, BookPublishOutcome, PublishError};
-use reader_cache::store::{BookLoadStatus, ReaderStore};
+use reader_cache::store::{BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD};
 
 const BLOCK_BYTES: usize = 512;
 /// 16 MiB card: big enough that fatfs picks FAT16 and small enough to stay fast.
@@ -85,6 +85,10 @@ struct FaultPlan {
     /// in-place overwrite half-covers the record instead, and this is the
     /// only way to put that mixture on the card.
     tear_write_after: Cell<Option<usize>>,
+    /// Reads to fail after the armed one, so a test can ask what an operation
+    /// does when the card answers none of the reads it makes rather than one
+    /// of them. Zero by default, which is the exactly-once model above.
+    extra_read_faults: Cell<u32>,
 }
 
 impl FaultPlan {
@@ -129,6 +133,11 @@ impl BlockDevice for SharedDisk {
     fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), DiskError> {
         self.reads.set(self.reads.get() + 1);
         if FaultPlan::take_fault(&self.fault.fail_read_in) {
+            let extra = self.fault.extra_read_faults.get();
+            if extra > 0 {
+                self.fault.extra_read_faults.set(extra - 1);
+                self.fault.fail_read_in.set(Some(0));
+            }
             return Err(DiskError);
         }
         let data = self.data.borrow();
@@ -250,7 +259,12 @@ fn new_store() -> Box<ReaderStore> {
 /// Fill the store's line buffer with one section's worth of body text and
 /// paginate it, leaving the store exactly as a finished spine item leaves it.
 fn fill_section(store: &mut ReaderStore, spine: u16, lines: usize) {
+    fill_section_at(store, spine, 0, lines);
+}
+
+fn fill_section_at(store: &mut ReaderStore, spine: u16, start_offset: u32, lines: usize) {
     store.clear_lines();
+    let mut offset = start_offset;
     for n in 0..lines {
         let line = format!("section {spine} line {n} with enough words to occupy a row");
         assert!(
@@ -260,10 +274,13 @@ fn fill_section(store: &mut ReaderStore, spine: u16, lines: usize) {
                 TextRole::Body,
                 TextAlign::Left,
                 true,
-                spine,
+                proto::anchor::ContentAnchor::at(spine, offset),
             ),
             "line buffer should hold the fixture text"
         );
+        // Plain fixture text, so the stream advances by the line plus its
+        // separator. Real lines carry style markers the stream does not.
+        offset += line.len() as u32 + 1;
     }
     layout::rebuild_page_index(store);
     assert!(
@@ -279,14 +296,27 @@ fn write_section(
     section: u16,
     start_page: u32,
 ) -> BookV2SectionRecord {
-    fill_section(store, section, 6);
+    write_section_with_offset(root, store, section, section, 0, start_page)
+}
+
+fn write_section_with_offset(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    section: u16,
+    spine: u16,
+    start_offset: u32,
+    start_page: u32,
+) -> BookV2SectionRecord {
+    fill_section_at(store, spine, start_offset, 6);
     // The section file records `cached_spine`, and the load rejects a file whose
     // spine disagrees with the index record pointing at it. Without this every
     // section is written as spine 0, which happens to match for section 0 and
     // silently fails for every other — a fixture flaw a mutation check caught
     // only once a test reached past the first section.
-    store.set_cached_spine(section);
+    store.set_cached_spine(spine);
+    store.set_section_ends_spine(true);
     let page_count = store.page_count().min(u16::MAX as usize) as u16;
+    let logical_offset = store.page_anchor(0).map_or(start_offset, |a| a.offset);
     let wrote = files::with_v2_sections_dir(root, &OWNER, |sections| {
         let sections = sections.expect("sections dir should exist");
         files::write_v2_section_cache_in(sections, IDENTITY, section, store)
@@ -294,10 +324,11 @@ fn write_section(
     assert!(wrote, "section {section} should write");
     BookV2SectionRecord {
         section,
-        spine: section,
+        spine,
         start_page,
         page_count,
         partial: false,
+        logical_offset,
     }
 }
 
@@ -327,7 +358,21 @@ fn total_pages(records: &[BookV2SectionRecord]) -> u32 {
 /// the question the round-2 finding turned on: a failing publish must not take
 /// the files out from under a reader who is reading them.
 fn sections_still_on_card(root: &Dir<'_>, count: usize) -> bool {
-    (0..count).all(|n| file_in_sections_dir(root, &format!("S{n:03}.BIN")))
+    (0..count).all(|n| file_in_sections_dir(root, &section_name(n as u16)))
+}
+
+/// The name a section file takes under the store's default layout, which is
+/// the layout every test in this file builds under.
+fn section_name(section: u16) -> String {
+    let mut name = heapless::String::<{ proto::cache::CACHE_SECTION_FILE_BYTES }>::new();
+    proto::cache::section_file_name(default_layout_key(), section, &mut name);
+    name.as_str().into()
+}
+
+/// Taken from a store rather than assumed, so the fixture and the writer
+/// cannot disagree about which layout named the files.
+fn default_layout_key() -> u8 {
+    new_store().layout_key()
 }
 
 /// Whether one named file exists in the book's `SECTIONS/` directory.
@@ -619,6 +664,346 @@ fn an_index_a_build_abandoned_is_recognisable_as_one() {
     );
 }
 
+#[test]
+fn an_index_with_non_monotonic_section_anchors_is_rejected() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let mut records = build_book(&root, &mut store, 2);
+    let pages = total_pages(&records);
+
+    // Corrupt section anchors so that section 1 starts earlier than section 0 (decreasing spine).
+    records[0].spine = 1;
+    records[0].logical_offset = 100;
+    records[1].spine = 0;
+    records[1].logical_offset = 200;
+
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
+    ));
+
+    let mut fresh_store = new_store();
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store);
+    assert_eq!(
+        loaded,
+        files::BookIndexLoadResult::Invalid,
+        "decreasing spine across sections must be rejected as invalid"
+    );
+    assert_eq!(fresh_store.book_section_count(), 0);
+    assert_eq!(fresh_store.advertised_page_count(), 1);
+
+    // Also verify decreasing logical_offset within the same spine is rejected.
+    records[0].spine = 1;
+    records[0].logical_offset = 100;
+    records[1].spine = 1;
+    records[1].logical_offset = 50;
+
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
+    ));
+
+    let mut fresh_store2 = new_store();
+    let loaded2 = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store2);
+    assert_eq!(
+        loaded2,
+        files::BookIndexLoadResult::Invalid,
+        "decreasing offset within same spine must be rejected as invalid"
+    );
+    assert_eq!(fresh_store2.book_section_count(), 0);
+    assert_eq!(fresh_store2.advertised_page_count(), 1);
+}
+
+#[test]
+fn an_index_with_corrupted_section_ordinal_is_rejected() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let mut records = build_book(&root, &mut store, 2);
+    let pages = total_pages(&records);
+
+    // Corrupt record 0's ordinal to 1 (mismatched slot).
+    records[0].section = 1;
+
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
+    ));
+
+    let mut fresh_store = new_store();
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store);
+    assert_eq!(
+        loaded,
+        files::BookIndexLoadResult::Invalid,
+        "mismatched section ordinal must be rejected as invalid"
+    );
+    assert_eq!(fresh_store.book_section_count(), 0);
+
+    // Also verify non-contiguous start_page is rejected.
+    records[0].section = 0;
+    records[1].start_page += 5;
+
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, pages, &records, &store, false, 0,
+    ));
+
+    let mut fresh_store2 = new_store();
+    let loaded2 = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store2);
+    assert_eq!(
+        loaded2,
+        files::BookIndexLoadResult::Invalid,
+        "mismatched start_page must be rejected as invalid"
+    );
+    assert_eq!(fresh_store2.book_section_count(), 0);
+}
+
+#[test]
+fn an_index_with_mismatched_total_pages_is_rejected() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let records = build_book(&root, &mut store, 2);
+    let pages = total_pages(&records);
+
+    // Header total below sum of section page_counts
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages.saturating_sub(1),
+        &records,
+        &store,
+        false,
+        0,
+    ));
+    let mut fresh_store = new_store();
+    assert_eq!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store),
+        files::BookIndexLoadResult::Invalid,
+        "header total below sum of section page_counts must be rejected as invalid"
+    );
+    assert_eq!(fresh_store.book_section_count(), 0);
+
+    // Header total above sum of section page_counts
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages + 1,
+        &records,
+        &store,
+        false,
+        0,
+    ));
+    let mut fresh_store2 = new_store();
+    assert_eq!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store2),
+        files::BookIndexLoadResult::Invalid,
+        "header total above sum of section page_counts must be rejected as invalid"
+    );
+    assert_eq!(fresh_store2.book_section_count(), 0);
+}
+
+/// Invariant: section logical offset in BOOK.BIN must match page 0 in the section file.
+#[test]
+fn an_anchor_cannot_resolve_when_section_start_disagrees_with_section_file() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    // Build section 0 (spine 0, offset 0) and section 1 (spine 0, offset 1000)
+    let sec0 = write_section_with_offset(&root, &mut store, 0, 0, 0, 0);
+    let sec1 = write_section_with_offset(&root, &mut store, 1, 0, 1000, sec0.page_count as u32);
+    let pages = sec0.page_count as u32 + sec1.page_count as u32;
+
+    // Corrupt section 1's logical_offset in BOOK.BIN from 1000 to 500
+    let mut corrupted_records = [sec0, sec1];
+    corrupted_records[1].logical_offset = 500;
+
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages,
+        &corrupted_records,
+        &store,
+        false,
+        0,
+    ));
+
+    let mut fresh_store = new_store();
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store);
+    assert!(matches!(loaded, files::BookIndexLoadResult::Hit { .. }));
+
+    // In the corrupted index, anchor 700 maps to section 1 because 500 <= 700
+    let selected_section = fresh_store.section_for_anchor(proto::anchor::ContentAnchor::at(0, 700));
+    assert_eq!(selected_section, Some(1));
+
+    // But section 1's actual file starts at offset 1000, so exact resolution must reject it (None)
+    let resolved = files::page_of_anchor_in_section(
+        &root,
+        &OWNER,
+        &fresh_store,
+        IDENTITY,
+        1,
+        proto::anchor::ContentAnchor::at(0, 700),
+    );
+    assert_eq!(
+        resolved, None,
+        "an anchor that falls before the section's actual page 0 or disagrees with BOOK.BIN must be refused"
+    );
+
+    // Now write the uncorrupted index with logical_offset = 1000
+    let valid_records = [sec0, sec1];
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages,
+        &valid_records,
+        &store,
+        false,
+        0,
+    ));
+    let mut valid_store = new_store();
+    assert!(matches!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut valid_store),
+        files::BookIndexLoadResult::Hit { .. }
+    ));
+
+    // Anchor 700 belongs to section 0
+    assert_eq!(
+        valid_store.section_for_anchor(proto::anchor::ContentAnchor::at(0, 700)),
+        Some(0)
+    );
+    // Section 0 resolves anchor 700 successfully while verifying section 1 on disk
+    assert!(files::page_of_anchor_in_section(
+        &root,
+        &OWNER,
+        &valid_store,
+        IDENTITY,
+        0,
+        proto::anchor::ContentAnchor::at(0, 700)
+    )
+    .is_some());
+    // And page_of_anchor_in_section on section 1 for anchor 700 is refused because 700 < 1000
+    assert_eq!(
+        files::page_of_anchor_in_section(
+            &root,
+            &OWNER,
+            &valid_store,
+            IDENTITY,
+            1,
+            proto::anchor::ContentAnchor::at(0, 700)
+        ),
+        None
+    );
+    // Anchor 1050 belongs to section 1 and resolves successfully to page 0
+    assert_eq!(
+        valid_store.section_for_anchor(proto::anchor::ContentAnchor::at(0, 1050)),
+        Some(1)
+    );
+    assert_eq!(
+        files::page_of_anchor_in_section(
+            &root,
+            &OWNER,
+            &valid_store,
+            IDENTITY,
+            1,
+            proto::anchor::ContentAnchor::at(0, 1050)
+        ),
+        Some(0)
+    );
+}
+
+/// Invariant: resolving an anchor in section N checks the true start of section N + 1.
+#[test]
+fn an_anchor_cannot_resolve_when_next_section_start_is_corrupted_upward() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    // Build section 0 (spine 0, offset 0) and section 1 (spine 0, offset 1000)
+    let sec0 = write_section_with_offset(&root, &mut store, 0, 0, 0, 0);
+    let sec1 = write_section_with_offset(&root, &mut store, 1, 0, 1000, sec0.page_count as u32);
+    let pages = sec0.page_count as u32 + sec1.page_count as u32;
+
+    // Corrupt section 1's logical_offset in BOOK.BIN upward from 1000 to 1500
+    let mut corrupted_records = [sec0, sec1];
+    corrupted_records[1].logical_offset = 1500;
+
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages,
+        &corrupted_records,
+        &store,
+        false,
+        0,
+    ));
+
+    let mut fresh_store = new_store();
+    let loaded = files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut fresh_store);
+    assert!(matches!(loaded, files::BookIndexLoadResult::Hit { .. }));
+
+    // In the corrupted index, anchor 1200 maps to section 0 because 1200 < 1500
+    let anchor = proto::anchor::ContentAnchor::at(0, 1200);
+    let selected_section = fresh_store.section_for_anchor(anchor);
+    assert_eq!(selected_section, Some(0));
+
+    // But section 1's actual file starts at offset 1000, so page_of_anchor_in_section
+    // on section 0 must detect that section 1 begins at 1000 (which disagrees with
+    // BOOK.BIN's 1500, and also bounds section 0 strictly below 1200), rejecting resolution (None)
+    let resolved =
+        files::page_of_anchor_in_section(&root, &OWNER, &fresh_store, IDENTITY, 0, anchor);
+    assert_eq!(
+        resolved, None,
+        "an anchor past the actual start of section 1 or where section 1 disagrees with BOOK.BIN must be refused"
+    );
+
+    // Now write the uncorrupted index with logical_offset = 1000
+    let valid_records = [sec0, sec1];
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        pages,
+        &valid_records,
+        &store,
+        false,
+        0,
+    ));
+    let mut valid_store = new_store();
+    assert!(matches!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut valid_store),
+        files::BookIndexLoadResult::Hit { .. }
+    ));
+
+    // Anchor 1200 belongs to section 1
+    assert_eq!(valid_store.section_for_anchor(anchor), Some(1));
+    // And section 0 refuses anchor 1200 because 1200 >= next section start (1000)
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &valid_store, IDENTITY, 0, anchor,),
+        None
+    );
+    // While section 1 resolves anchor 1200 successfully
+    assert!(
+        files::page_of_anchor_in_section(&root, &OWNER, &valid_store, IDENTITY, 1, anchor,)
+            .is_some()
+    );
+}
+
 /// Invariant: a clean publish leaves the reader on the page it was asked for.
 /// The baseline the fault cases are measured against — if this fails, the
 /// assertions above are proving nothing.
@@ -716,7 +1101,8 @@ fn a_rebuild_with_fewer_sections_prunes_the_stranded_tail() {
         "the sections the new index names must survive"
     );
     assert!(
-        !file_in_sections_dir(&root, "S003.BIN") && !file_in_sections_dir(&root, "S004.BIN"),
+        !file_in_sections_dir(&root, &section_name(3))
+            && !file_in_sections_dir(&root, &section_name(4)),
         "the sections the new index no longer names must be gone"
     );
 }
@@ -793,7 +1179,7 @@ fn the_prune_leaves_names_it_does_not_recognise() {
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
 
     assert!(
-        !file_in_sections_dir(&root, "S001.BIN"),
+        !file_in_sections_dir(&root, &section_name(1)),
         "the orphaned section should still go"
     );
     assert!(
@@ -829,10 +1215,11 @@ fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
     assert!(sections_still_on_card(&root, 5));
 
     disk.fault.fail_write_in.set(Some(0));
-    let removed = files::prune_orphan_sections(&root, &OWNER, 2);
+    let removed = files::prune_orphan_sections(&root, &OWNER, default_layout_key(), 2);
 
     assert!(
-        file_in_sections_dir(&root, "S000.BIN") && file_in_sections_dir(&root, "S001.BIN"),
+        file_in_sections_dir(&root, &section_name(0))
+            && file_in_sections_dir(&root, &section_name(1)),
         "the sections the index still names must survive"
     );
     assert_eq!(
@@ -840,9 +1227,9 @@ fn a_refused_delete_does_not_strand_the_orphans_behind_it() {
         "every orphan must come off the card, including the one behind the refused write"
     );
     assert!(
-        !file_in_sections_dir(&root, "S002.BIN")
-            && !file_in_sections_dir(&root, "S003.BIN")
-            && !file_in_sections_dir(&root, "S004.BIN"),
+        !file_in_sections_dir(&root, &section_name(2))
+            && !file_in_sections_dir(&root, &section_name(3))
+            && !file_in_sections_dir(&root, &section_name(4)),
         "a refused delete must not strand the orphans after it"
     );
 }
@@ -972,14 +1359,1175 @@ fn a_step_past_the_batching_threshold_publishes_and_survives_a_refused_write() {
 }
 
 // ---------------------------------------------------------------------------
-// Position survival across the v8 re-key
+// Layout bound and durable place
 // ---------------------------------------------------------------------------
 
-/// A card upgraded across catalog v8 holds every inactive book's reading
-/// position under the key pre-v8 firmware derived from the display path.
-/// Position is the one non-rebuildable thing under a key, so the new lookup
-/// must recover it from the old directory; a mutation that drops the legacy
-/// layer resumes every such book at the beginning.
+/// How many layouts the card says this book has. Panics when the card would
+/// not say, which no test here arranges except on purpose.
+fn resident_count(root: &Dir<'_>) -> usize {
+    files::resident_layouts(root, &OWNER)
+        .expect("the card answers")
+        .len()
+}
+
+/// Leave the store in a layout that is neither of the two `write_section_under`
+/// reaches, so a test can be about a third one arriving. Portrait and
+/// landscape are the only two that flag reaches; the type size is the next
+/// thing the key is made of.
+fn set_third_layout(store: &mut ReaderStore) -> u8 {
+    let base = store.type_settings();
+    let size = match base.size {
+        FontSize::Large => FontSize::Small,
+        _ => FontSize::Large,
+    };
+    store.set_layout(TypeSettings { size, ..base }, false);
+    store.layout_key()
+}
+
+/// Write one section file under a layout that is not the store's, by moving
+/// the store to those settings for the write and back afterwards. Stands in
+/// for the reader having used that configuration earlier.
+fn write_section_under(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    portrait: bool,
+    section: u16,
+) -> u8 {
+    let settings = store.type_settings();
+    let was_portrait = store.portrait();
+    store.set_layout(settings, portrait);
+    let key = store.layout_key();
+    write_section(root, store, section, 0);
+    store.set_layout(settings, was_portrait);
+    key
+}
+
+/// The flow the milestone exists for: A, then B, then back to A, with A's
+/// pagination still on the card.
+#[test]
+fn a_second_layout_does_not_take_the_first_ones_pagination() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let landscape = write_section_under(&root, &mut store, false, 0);
+    let portrait = write_section_under(&root, &mut store, true, 0);
+    assert_ne!(landscape, portrait, "the page box names a layout apart");
+
+    let mut resident = files::resident_layouts(&root, &OWNER).expect("the card answers");
+    resident.sort_unstable();
+    let mut expected = [landscape, portrait];
+    expected.sort_unstable();
+    assert_eq!(
+        resident.as_slice(),
+        &expected[..],
+        "both layouts keep their own pagination"
+    );
+}
+
+/// The bound is on stored layouts, and a third arriving evicts one.
+/// Nothing evicts merely because a layout stopped being current.
+#[test]
+fn a_third_layout_evicts_one_and_only_then() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let first = write_section_under(&root, &mut store, false, 0);
+    let second = write_section_under(&root, &mut store, true, 0);
+    assert_eq!(resident_count(&root), 2);
+
+    // Re-opening one of the two evicts nothing: it is already resident.
+    assert!(files::evict_layouts_for(&root, &OWNER, first));
+    assert_eq!(
+        resident_count(&root),
+        2,
+        "a layout already on the card costs nothing to open"
+    );
+
+    // A third makes room, and the one that goes is not the one arriving.
+    // The book index is one file for the book, so the eviction leaves it for
+    // the layout that stays: without it a reindex has no labels or TOC to
+    // rebuild from and the open falls back to re-parsing the EPUB.
+    let index_before = files::read_cache_header(&root, KEY);
+    let third = first.wrapping_add(64).max(1);
+    assert!(files::evict_layouts_for(&root, &OWNER, third));
+    assert_eq!(
+        files::read_cache_header(&root, KEY),
+        index_before,
+        "the book index survives a layout eviction"
+    );
+    let left = files::resident_layouts(&root, &OWNER).expect("the card answers");
+    assert_eq!(left.len(), 1, "one of the two was evicted");
+    assert!(
+        left.contains(&first) || left.contains(&second),
+        "and the survivor is one of the two that were there"
+    );
+    assert!(!left.contains(&third), "the arriving layout writes its own");
+}
+
+/// A card that refuses a read on the way down to the sections has deleted
+/// nothing, and the caller has to hear that. Reporting success drops the
+/// layout from the resident list. Once a layout is counted as gone while its
+/// files are still there, nothing looks again and the bound is lost rather
+/// than delayed.
+#[test]
+fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let victim = write_section_under(&root, &mut store, false, 0);
+    assert_eq!(resident_count(&root), 1);
+
+    disk.fault.fail_read_in.set(Some(0));
+    assert!(
+        !files::evict_layout_sections(&root, KEY, victim),
+        "a refused read is the card saying no, not a cache that is already gone"
+    );
+    assert_eq!(
+        files::resident_layouts(&root, &OWNER).expect("the card answers"),
+        heapless::Vec::<u8, 64>::from_slice(&[victim]).expect("one layout"),
+        "and the sections are still there to be counted next time"
+    );
+}
+
+/// Write a CONT.BIN for this book covering spine items `0..=last`, marked
+/// complete, exactly as a walk that reached the end of the book leaves one.
+fn capture_through_spine(root: &Dir<'_>, last: u16) {
+    files::ensure_v2_cache_dirs(root, &OWNER).expect("cache dirs");
+    let dir = files::open_v2_book_dir(root, &OWNER).expect("book dir");
+    let mut stage = [0u8; 512];
+    let mut capture = files::ContentCapture::begin(Some(&dir), IDENTITY, &mut stage);
+    for spine in 0..=last {
+        capture.push_block_record(
+            spine,
+            "body text",
+            TextRole::Body,
+            proto::text::FontStyle::Regular,
+            TextAlign::Left,
+            true,
+            0,
+        );
+        capture.spine_end(spine);
+    }
+    assert!(capture.finish(Some(&dir), true), "the capture completes");
+}
+
+/// One section per spine item, for the layout the store is in.
+fn write_section_for_spine(root: &Dir<'_>, store: &mut ReaderStore, spine: u16) {
+    write_section(root, store, spine, 0);
+}
+
+/// A section at a chosen ordinal holding a chosen spine item, so a fixture can
+/// give one item several sections the way a long chapter does. The build
+/// stamps `ends_spine` on the flush that finishes an item.
+fn write_section_at(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    section: u16,
+    spine: u16,
+    ends_spine: bool,
+) {
+    fill_section(store, section, 6);
+    store.set_cached_spine(spine);
+    store.set_section_ends_spine(ends_spine);
+    let wrote = files::with_v2_sections_dir(root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, section, store)
+    });
+    assert!(wrote, "section {section} should write");
+}
+
+/// A TOC carries its navigation in the records, not the text: each one holds
+/// the spine item it targets, and the text is only the label. A book whose
+/// headings are all empty therefore has a TOC worth keeping and no text at
+/// all, and every entry has to survive the read back.
+#[test]
+fn a_toc_with_no_title_text_still_comes_back() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    let book = build_book(&root, &mut store, 2);
+    assert!(store.push_toc_record("", 0, 0), "first chapter");
+    assert!(store.push_toc_record("", 0, 1), "second chapter");
+    assert_eq!(store.toc_count(), 2);
+
+    assert!(
+        files::write_v2_book_index(
+            &root,
+            &OWNER,
+            IDENTITY,
+            total_pages(&book),
+            &book,
+            &store,
+            false,
+            0,
+        ),
+        "the index writes"
+    );
+
+    // A fresh open of the same book, as a flip back does before it reindexes.
+    store.begin_book_load();
+    assert_eq!(store.toc_count(), 0, "the open starts from nothing");
+    assert!(files::load_v2_book_labels_and_toc(
+        &root, &OWNER, IDENTITY, &mut store
+    ));
+    assert_eq!(
+        store.toc_count(),
+        2,
+        "both chapters come back, labels or no labels"
+    );
+}
+
+/// The flip back: a walk that suspends between spine items leaves a
+/// clean final section, so nothing in the section files says more was coming.
+/// The index that knew is gone, overwritten when the other layout published.
+/// Reindexing that prefix would fence the reader at the page the walk happened
+/// to reach, behind an index claiming the book ends there.
+#[test]
+fn a_walk_that_suspended_between_spine_items_does_not_reindex_as_a_whole_book() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // The book runs to spine 4, and the capture that finished says so.
+    capture_through_spine(&root, 4);
+
+    // This layout's walk got through spine 2 and suspended before 3. Its last
+    // section is an ordinary finished one.
+    for spine in 0..=2u16 {
+        write_section_for_spine(&root, &mut store, spine);
+    }
+
+    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_none(),
+        "a prefix of the spine is where a build stopped, not a book"
+    );
+
+    // The rest of the walk lands, and the same set now reindexes.
+    for spine in 3..=4u16 {
+        write_section_for_spine(&root, &mut store, spine);
+    }
+    let (count, total_pages) =
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .expect("a set that reaches the end of the book");
+    assert_eq!(count, 5, "every spine item of the book");
+    assert!(total_pages > 0);
+}
+
+/// A section's header goes down before the body it describes, `ends_spine`
+/// with it. A write that tears partway through therefore leaves a file
+/// claiming to finish a chapter whose text is not there, and the scan reads
+/// only the header and one anchor, so it would take that claim at face value.
+#[test]
+fn a_section_torn_partway_through_does_not_certify_a_layout() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    capture_through_spine(&root, 1);
+    write_section_at(&root, &mut store, 0, 0, true);
+    write_section_at(&root, &mut store, 1, 1, true);
+
+    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_some(),
+        "the whole set reindexes before the tear"
+    );
+
+    // Keep the header, the page records and the first page anchor, which is
+    // everything the scan reads, and drop the rest as a failed write would.
+    let mut name = heapless::String::<16>::new();
+    proto::cache::section_file_name(store.layout_key(), 1, &mut name);
+    let mut prefix = [0u8; 512];
+    let kept = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadOnly)
+            .expect("the section opens");
+        let mut header_bytes = [0u8; proto::cache::SECTION_V2_HEADER_BYTES];
+        files::read_exact_file(&file, &mut header_bytes).expect("the header reads");
+        let header =
+            proto::cache::decode_section_v2_header(&header_bytes).expect("the header decodes");
+        let keep = proto::cache::SECTION_V2_HEADER_BYTES
+            + header.page_count as usize * proto::cache::PAGE_RECORD_BYTES
+            + proto::cache::PAGE_ANCHOR_BYTES;
+        assert!(
+            keep < file.length() as usize && keep <= prefix.len(),
+            "the tear has to drop something"
+        );
+        file.seek_from_start(0).expect("rewind");
+        files::read_exact_file(&file, &mut prefix[..keep]).expect("the prefix reads");
+        keep
+    });
+
+    let rewritten = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
+            .expect("the section reopens");
+        file.write(&prefix[..kept]).is_ok()
+    });
+    assert!(rewritten, "the fixture tears the section");
+
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_none(),
+        "a section that is shorter than its own header says is not a whole one"
+    );
+}
+
+/// Reaching the book's last spine item is not reaching the end of it. A long
+/// chapter spans several sections, and the write of its final one can fail
+/// with nothing behind the gap to give it away: the scan stops where the files
+/// stop, the spine matches, and the file count agrees. Only the flag the build
+/// stamps on the flush that finishes an item tells the two apart.
+#[test]
+fn a_set_that_stops_inside_the_last_chapter_is_not_a_whole_book() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // Two spine items; the second needs two sections.
+    capture_through_spine(&root, 1);
+    write_section_at(&root, &mut store, 0, 0, true);
+    write_section_at(&root, &mut store, 1, 1, false);
+
+    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_none(),
+        "the last chapter is only half here"
+    );
+
+    // The section that finishes the chapter lands, and the set is a book.
+    write_section_at(&root, &mut store, 2, 1, true);
+    let (count, total_pages) =
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .expect("a set that carries the last chapter to its end");
+    assert_eq!(count, 3);
+    assert!(total_pages > 0);
+}
+
+/// The scan stops at the first ordinal it cannot open, and a hole looks the
+/// same from the inside. A section that failed to write mid-build leaves one,
+/// with the rest of the book still on the card behind it.
+#[test]
+fn a_hole_in_the_section_files_is_not_the_end_of_the_book() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+
+    // A book of three spine items whose last one is long enough to need three
+    // sections, so a hole can sit inside it without shortening the spine the
+    // set reaches.
+    capture_through_spine(&root, 2);
+    write_section_at(&root, &mut store, 0, 0, true);
+    write_section_at(&root, &mut store, 1, 1, true);
+    write_section_at(&root, &mut store, 2, 2, false);
+    write_section_at(&root, &mut store, 3, 2, false);
+    write_section_at(&root, &mut store, 4, 2, true);
+
+    // Section 3 never made it to the card, and 4 is sitting behind the gap.
+    let mut name = heapless::String::<16>::new();
+    proto::cache::section_file_name(store.layout_key(), 3, &mut name);
+    let removed = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        sections
+            .expect("sections dir")
+            .delete_entry_in_dir(name.as_str())
+            .is_ok()
+    });
+    assert!(removed, "the fixture removes one section file");
+
+    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
+    assert!(
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
+            .is_none(),
+        "the scan stopped at the hole, and the book continues past it"
+    );
+}
+
+/// Resolving a place walks a section's page anchors looking for the last one
+/// at or before it. A read that stops partway has seen some of them, and the
+/// page it had reached is not an answer about the place: it is an earlier page
+/// that would load, and the open would settle there as though the anchor had
+/// resolved. Saying so sends the open down the retry path instead.
+#[test]
+fn an_anchor_table_that_stops_short_is_not_the_page_it_got_to() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    fill_section(&mut store, 0, 60);
+    let pages = store.page_count();
+    assert!(pages > 2, "the walk needs several anchors to get through");
+    store.set_cached_spine(0);
+    let wrote = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, 0, &store)
+    });
+    assert!(wrote, "the section writes");
+
+    // The place is on the last page, so a walk that stops early is left
+    // holding an earlier page it could report instead.
+    let last = store
+        .page_anchor(pages - 1)
+        .expect("the last page has an anchor");
+    let layout = store.layout_key();
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
+        Some(pages as u16 - 1),
+        "the place is on the last page while the whole table is there"
+    );
+
+    // Cut the file after the first two anchors, as a torn write leaves it.
+    let mut name = heapless::String::<16>::new();
+    proto::cache::section_file_name(layout, 0, &mut name);
+    let mut prefix = [0u8; 2048];
+    let kept = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadOnly)
+            .expect("the section opens");
+        let keep = proto::cache::SECTION_V2_HEADER_BYTES
+            + pages * proto::cache::PAGE_RECORD_BYTES
+            + 2 * proto::cache::PAGE_ANCHOR_BYTES;
+        assert!(keep <= prefix.len(), "the fixture buffer has to hold it");
+        files::read_exact_file(&file, &mut prefix[..keep]).expect("the prefix reads");
+        keep
+    });
+    let rewritten = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
+            .expect("the section reopens");
+        file.write(&prefix[..kept]).is_ok()
+    });
+    assert!(rewritten, "the fixture cuts the anchor table short");
+
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
+        None,
+        "a table that stops short is no answer, not the page the walk reached"
+    );
+}
+
+/// Invariant: page anchors within a section must be monotonically nondecreasing.
+/// A corrupted table with a descending page offset must be refused by both
+/// `page_of_anchor_in_section` (returning `None`) and `load_v2_section_by_global_page`
+/// (returning `CacheLoadResult::Invalid`), rather than settling on the wrong page.
+#[test]
+fn a_page_anchor_table_with_descending_offsets_is_rejected() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    fill_section(&mut store, 0, 60);
+    let pages = store.page_count();
+    assert!(pages >= 3, "the fixture needs at least 3 pages");
+    store.set_cached_spine(0);
+    let wrote = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, 0, &store)
+    });
+    assert!(wrote, "the section writes");
+
+    let layout = store.layout_key();
+    let mut name = heapless::String::<16>::new();
+    proto::cache::section_file_name(layout, 0, &mut name);
+
+    // Read the section file into a buffer so we can corrupt the page anchor table.
+    let mut file_bytes = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadOnly)
+            .expect("the section opens");
+        let len = file.length() as usize;
+        let mut buf = vec![0u8; len];
+        files::read_exact_file(&file, &mut buf).expect("read file");
+        buf
+    });
+
+    // Page anchors start at SECTION_V2_HEADER_BYTES + pages * PAGE_RECORD_BYTES
+    let anchor_start =
+        proto::cache::SECTION_V2_HEADER_BYTES + pages * proto::cache::PAGE_RECORD_BYTES;
+    let page1_anchor_pos = anchor_start + proto::cache::PAGE_ANCHOR_BYTES;
+    let page2_anchor_pos = anchor_start + 2 * proto::cache::PAGE_ANCHOR_BYTES;
+    // Set page 1 offset to 100, page 2 offset to 50 (descending offset)
+    file_bytes[page1_anchor_pos..page1_anchor_pos + 4].copy_from_slice(&100u32.to_le_bytes());
+    file_bytes[page2_anchor_pos..page2_anchor_pos + 4].copy_from_slice(&50u32.to_le_bytes());
+
+    let rewritten = files::with_v2_sections_dir(&root, &OWNER, |dir| {
+        let dir = dir.expect("sections dir");
+        let file = dir
+            .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
+            .expect("the section reopens");
+        file.write(&file_bytes).is_ok()
+    });
+    assert!(
+        rewritten,
+        "the section rewrites with descending page offset"
+    );
+
+    // page_of_anchor_in_section must refuse the section rather than return a page
+    let anchor = proto::anchor::ContentAnchor::at(0, 75);
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, anchor),
+        None,
+        "a descending page anchor table must be refused by page_of_anchor_in_section"
+    );
+
+    // Full-section load via load_v2_section_by_global_page must also reject as Invalid
+    let mut fresh_store = new_store();
+    let records = [proto::cache::BookV2SectionRecord {
+        section: 0,
+        spine: 0,
+        start_page: 0,
+        page_count: pages as u16,
+        partial: false,
+        logical_offset: 0,
+    }];
+    fresh_store.set_book_index(pages as u32, false, &records);
+    let loaded =
+        files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, 0, &mut fresh_store);
+    assert_eq!(
+        loaded,
+        CacheLoadResult::Invalid,
+        "a descending page anchor table must be rejected as Invalid when loading section"
+    );
+}
+
+/// A refused read of a stored place is not the absence of one. Collapsing the
+/// two hands the open a page-keyed fallback, or nothing, over an exact place
+/// the card is holding and would give up on the next look, and the retry path
+/// is reached only through the difference.
+#[test]
+fn a_refused_place_read_is_not_an_absent_place() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = book_id(21);
+    let anchor = proto::anchor::ContentAnchor::at(3, 640);
+    files::write_place(&root, id, anchor, source(), Some(900)).expect("the place stores");
+
+    assert!(
+        matches!(files::read_place(&root, id), files::PlaceRead::Found(place) if place.anchor == anchor),
+        "the place reads back while the card answers"
+    );
+
+    // A book with no place of its own, which is the durable absence.
+    assert!(
+        matches!(
+            files::read_place(&root, book_id(22)),
+            files::PlaceRead::Absent
+        ),
+        "nothing stored reads as absent"
+    );
+
+    // Sweep the fault across the reads the lookup makes. Every answer has to
+    // be the real place or a fault, and the sweep has to feel at least one.
+    let before = disk.reads.get();
+    let _ = files::read_place(&root, id);
+    let reads = disk.reads.get() - before;
+    assert!(reads > 0, "the lookup reads the card");
+    let mut faulted = 0;
+    for nth in 0..reads {
+        disk.fault.fail_read_in.set(Some(nth));
+        match files::read_place(&root, id) {
+            files::PlaceRead::Found(place) => assert_eq!(
+                place.anchor, anchor,
+                "a fault at read {nth} produced a place the card did not hold"
+            ),
+            files::PlaceRead::Fault => faulted += 1,
+            files::PlaceRead::Absent => {
+                panic!("a fault at read {nth} read as no place stored")
+            }
+        }
+        disk.fault.fail_read_in.set(None);
+    }
+    assert!(faulted > 0, "the sweep has to reach the lookup's own reads");
+}
+
+/// A write cannot step over the ownership question while the card is
+/// declining to answer it: the directory is shared by hash, so the write has
+/// to know whose it is. Nothing readable is nothing known, and the write
+/// refuses rather than publishing into a directory that may be another
+/// copy's.
+#[test]
+fn a_place_write_refuses_while_ownership_is_unreadable() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = book_id(31);
+    let anchor = proto::anchor::ContentAnchor::at(1, 64);
+    files::write_place(&root, id, anchor, source(), None).expect("the place stores");
+
+    let later = proto::anchor::ContentAnchor::at(1, 128);
+    let before = disk.reads.get();
+    let _ = files::read_place(&root, id);
+    let reads = disk.reads.get() - before;
+
+    // A run of refusals long enough to take both generations, swept across
+    // the reads the lookup makes. Wherever it lands, the write either knows
+    // the owner and stores, or knows nothing and refuses; what it must not do
+    // is report success while the card told it nothing.
+    let mut refused = 0;
+    for nth in 0..reads {
+        disk.fault.extra_read_faults.set(3);
+        disk.fault.fail_read_in.set(Some(nth));
+        let wrote = files::write_place(&root, id, later, source(), None);
+        disk.fault.fail_read_in.set(None);
+        disk.fault.extra_read_faults.set(0);
+
+        match wrote {
+            Err(files::PlaceDenied::Fault) => refused += 1,
+            Ok(()) => assert_eq!(
+                place_anchor(&root, id),
+                Some(later),
+                "a write that reported success at read {nth} has to be the one stored"
+            ),
+            Err(other) => panic!("unexpected refusal at read {nth}: {other:?}"),
+        }
+    }
+    assert!(
+        refused > 0,
+        "a write whose ownership check could read neither side has to refuse"
+    );
+}
+
+/// A place refuses a record it cannot prove is the newest, because it has a
+/// better move than taking it.
+///
+/// The open lands provisionally and the settle slices ask again, and while
+/// they do, the waiting place holds the card's copy against the save that
+/// would write the older record back over the newer one. Taking the older one
+/// instead puts the reader behind where they were and makes that the position
+/// the next save publishes.
+#[test]
+fn a_place_refuses_the_older_side_while_the_newer_one_is_unread() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = book_id(32);
+    let older = proto::anchor::ContentAnchor::at(1, 64);
+    let newest = proto::anchor::ContentAnchor::at(1, 96);
+    files::write_place(&root, id, older, source(), None).expect("the place stores");
+    files::write_place(&root, id, newest, source(), None).expect("and the other generation");
+
+    // The lookup's last read is the second generation's, so faulting it
+    // leaves the first readable and nothing else disturbed.
+    let before = disk.reads.get();
+    assert_eq!(place_anchor(&root, id), Some(newest), "both sides readable");
+    let reads = disk.reads.get() - before;
+    assert!(reads > 1, "the lookup reads both generations");
+
+    disk.fault.fail_read_in.set(Some(reads - 1));
+    let answer = files::read_place(&root, id);
+    disk.fault.fail_read_in.set(None);
+    assert!(
+        matches!(answer, files::PlaceRead::Fault),
+        "the older side is not an answer while the newer one is unread"
+    );
+
+    // And the card recovering hands over the newest, which is the whole
+    // reason refusing was worth it.
+    assert_eq!(place_anchor(&root, id), Some(newest));
+}
+
+/// The records with an older file behind them take the opposite trade. A
+/// position that misses here falls through to the pre-durable single file, so
+/// one readable generation beats the fallback.
+#[test]
+fn a_position_takes_the_readable_side_rather_than_its_legacy_file() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    files::write_position_file(&root, &OWNER, 2, 40).expect("the position stores");
+    files::write_position_file(&root, &OWNER, 3, 88).expect("and the other generation");
+
+    let before = disk.reads.get();
+    assert_eq!(
+        files::read_position_file(&root, &OWNER),
+        Some((3, 88)),
+        "both sides readable"
+    );
+    let reads = disk.reads.get() - before;
+    assert!(reads > 1);
+
+    disk.fault.fail_read_in.set(Some(reads - 1));
+    let answer = files::read_position_file(&root, &OWNER);
+    disk.fault.fail_read_in.set(None);
+    assert_eq!(
+        answer,
+        Some((2, 40)),
+        "the side that still reads answers, rather than the fallback below it"
+    );
+}
+
+/// The durable pair's contract, as one property: a write that reports success
+/// is the write a healthy read returns. The pair numbers its generations from
+/// what it can read of the two sides, and with both refused it has no basis
+/// for a number, so one it picks can lose to whatever the refused side holds
+/// while verifying against its own target and reporting success.
+#[test]
+fn a_place_write_that_reports_success_is_the_one_that_reads_back() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = book_id(41);
+    let first = proto::anchor::ContentAnchor::at(0, 10);
+    let second = proto::anchor::ContentAnchor::at(0, 20);
+    // Two writes, so the pair holds a generation on each side.
+    files::write_place(&root, id, first, source(), None).expect("the first place stores");
+    files::write_place(&root, id, second, source(), None).expect("the second place stores");
+
+    let wanted = proto::anchor::ContentAnchor::at(7, 4_096);
+    let before = disk.reads.get();
+    let _ = files::read_place(&root, id);
+    let reads = disk.reads.get() - before;
+    assert!(reads > 0, "the lookup reads the card");
+
+    // Fault a run of reads from each starting point, so the sweep covers the
+    // pair's two generation probes failing together as well as singly.
+    let mut reported_ok = 0;
+    for extra in 0..2u32 {
+        for nth in 0..reads + 2 {
+            // Put the pair back the way it started before each attempt.
+            files::write_place(&root, id, first, source(), None).expect("the reset stores");
+            files::write_place(&root, id, second, source(), None).expect("the reset stores");
+
+            disk.fault.extra_read_faults.set(extra);
+            disk.fault.fail_read_in.set(Some(nth));
+            let wrote = files::write_place(&root, id, wanted, source(), None);
+            disk.fault.fail_read_in.set(None);
+            disk.fault.extra_read_faults.set(0);
+
+            if wrote.is_ok() {
+                reported_ok += 1;
+                assert_eq!(
+                    place_anchor(&root, id),
+                    Some(wanted),
+                    "{} refused reads from read {nth} reported a write the card does not serve",
+                    extra + 1
+                );
+            }
+        }
+    }
+    assert!(
+        reported_ok > 0,
+        "the sweep has to get at least one write through"
+    );
+}
+
+/// A section file's name carries the layout key, which is six bits of the
+/// config: line spacing and the wrap-rule version are outside it, so a section
+/// paginated under either shares the name. The per-page anchors inside
+/// describe breaks that move with both, so resolving a place against the wrong
+/// one answers with a page that means something else, and the save that
+/// follows writes that page's anchor back. The resolver asks the header rather
+/// than trusting whatever named the file.
+#[test]
+fn a_section_from_another_layout_says_nothing_about_a_place() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    fill_section(&mut store, 0, 60);
+    let pages = store.page_count();
+    assert!(pages > 1, "the fixture needs more than one page of anchors");
+    store.set_cached_spine(0);
+    let wrote = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, 0, &store)
+    });
+    assert!(wrote, "the section writes");
+
+    let last = store
+        .page_anchor(pages - 1)
+        .expect("the last page has an anchor");
+    let settings = store.type_settings();
+    let key = store.layout_key();
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
+        Some(pages as u16 - 1),
+        "its own layout resolves the place"
+    );
+
+    // Same file, different line spacing.
+    store.set_layout(
+        TypeSettings {
+            spacing: LineSpacing::Relaxed,
+            ..settings
+        },
+        false,
+    );
+    assert_eq!(
+        store.layout_key(),
+        key,
+        "the fixture depends on spacing staying out of the name"
+    );
+    assert_eq!(
+        files::page_of_anchor_in_section(&root, &OWNER, &store, IDENTITY, 0, last),
+        None,
+        "another spacing paginates elsewhere, so its anchors are not these"
+    );
+
+    // And a section belonging to another copy under the same key.
+    store.set_layout(settings, false);
+    assert_eq!(
+        files::page_of_anchor_in_section(
+            &root,
+            &OWNER,
+            &store,
+            (IDENTITY.0, IDENTITY.1 + 1),
+            0,
+            last
+        ),
+        None,
+        "and a section written for another copy is not this copy's pagination"
+    );
+}
+
+/// The whole operation. Two layouts are resident, a third arrives, and
+/// the card will not free a slot. The reader still gets the book, and the
+/// bound is not quietly abandoned. The layout is left without an index, so
+/// the next open has to ask the card again rather than fast-hitting past the
+/// question.
+#[test]
+fn a_third_layout_the_card_would_not_make_room_for_stays_off_the_fast_path() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let first = write_section_under(&root, &mut store, false, 0);
+    let second = write_section_under(&root, &mut store, true, 0);
+    assert_eq!(resident_count(&root), 2);
+
+    // A third layout arrives. The delete is refused, so the eviction reports
+    // that the bound is not met.
+    let third = set_third_layout(&mut store);
+    assert!(
+        third != first && third != second,
+        "the fixture has to reach a layout the first two do not: {first} {second} {third}"
+    );
+    disk.fault.fail_write_in.set(Some(0));
+    let within_bound = files::evict_layouts_for(&root, &OWNER, third);
+    assert!(
+        !within_bound,
+        "a refused delete leaves the layout counted, and the caller has to know"
+    );
+
+    // What the firmware does with that answer: open the book anyway, and
+    // publish without an index.
+    store.set_layout_bound_unmet(!within_bound);
+    let book = build_book(&root, &mut store, 3);
+    store.begin_book_load();
+    let outcome = publish::publish_book_cache(
+        &root,
+        &OWNER,
+        IDENTITY,
+        0,
+        &mut store,
+        &book,
+        total_pages(&book),
+        false,
+        0,
+    );
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert_eq!(
+        outcome.outcome,
+        BookPublishOutcome::Ready,
+        "the reader asked for this book and gets it"
+    );
+    assert!(
+        matches!(
+            files::read_cache_header(&root, KEY),
+            files::CacheHeader::Absent
+        ),
+        "and it is left off the fast path, so the next open cannot skip the eviction"
+    );
+
+    // The next open. Nothing to fast-hit, so the eviction runs again, and
+    // this time the card cooperates.
+    assert_eq!(resident_count(&root), 3, "three until the retry lands");
+    assert!(files::evict_layouts_for(&root, &OWNER, store.layout_key()));
+    let left = files::resident_layouts(&root, &OWNER).expect("the card answers");
+    assert_eq!(left.len(), 2, "the retry brought it back under the bound");
+    assert!(
+        left.contains(&store.layout_key()),
+        "and the layout the reader is on is one of the two"
+    );
+}
+
+/// The other way the bound goes: a card that will not say what is stored. An
+/// empty answer and a refused one look the same to a caller that cannot tell
+/// them apart, and it writes one more layout on top of however many are
+/// really there.
+#[test]
+fn a_card_that_will_not_say_what_is_stored_is_not_an_empty_cache() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let first = write_section_under(&root, &mut store, false, 0);
+    write_section_under(&root, &mut store, true, 0);
+    assert_eq!(resident_count(&root), 2);
+
+    disk.fault.fail_read_in.set(Some(0));
+    assert!(
+        files::resident_layouts(&root, &OWNER).is_none(),
+        "a refused read is not a list of no layouts"
+    );
+
+    disk.fault.fail_read_in.set(Some(0));
+    let third = set_third_layout(&mut store);
+    assert!(third != first);
+    assert!(
+        !files::evict_layouts_for(&root, &OWNER, third),
+        "and an eviction that cannot see the card refuses rather than waving a third layout through"
+    );
+    assert_eq!(resident_count(&root), 2, "nothing was deleted on a guess");
+}
+
+/// Pagination is derived and a place is not. Evicting every layout of a
+/// book leaves the reader's place where it was.
+#[test]
+fn evicting_pagination_leaves_the_place_alone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let id = book_id(11);
+    let anchor = proto::anchor::ContentAnchor::at(2, 900);
+    files::write_place(&root, id, anchor, source(), Some(0)).expect("the place stores");
+
+    let layout = write_section_under(&root, &mut store, false, 0);
+    assert!(files::empty_layout_cache(&root, KEY, layout));
+    assert_eq!(resident_count(&root), 0);
+    assert_eq!(
+        place_anchor(&root, id),
+        Some(anchor),
+        "the place is not pagination and does not go with it"
+    );
+}
+
+/// The content a test writes its places against: a length, and no recorded
+/// hash unless the test is about one.
+fn source() -> proto::nvm::PlaceSource {
+    proto::nvm::PlaceSource {
+        byte_size: IDENTITY.1,
+    }
+}
+
+fn place_anchor(
+    root: &Dir<'_>,
+    id: proto::identity::BookId,
+) -> Option<proto::anchor::ContentAnchor> {
+    files::read_place(root, id)
+        .found()
+        .map(|place| place.anchor)
+}
+
+fn book_id(seed: u8) -> proto::identity::BookId {
+    proto::identity::BookId::from_bytes([seed; 16]).expect("a non-zero id")
+}
+
+/// The case the anchor exists for, and the one a locator-derived source
+/// identity would have thrown away: a proven move keeps the copy's id and
+/// changes nothing about its content, so the place stays exact.
+#[test]
+fn a_move_leaves_a_place_exact() {
+    let was = proto::nvm::PlaceSource {
+        byte_size: 8_123_456,
+    };
+    // Same bytes, somewhere else on the card. Nothing about content moved.
+    assert!(was.describes(&was), "a move is not a source change");
+
+    // A replacement announces itself by length, which is the whole witness
+    // the device has without reading the file.
+    let replaced = proto::nvm::PlaceSource {
+        byte_size: 8_127_552,
+    };
+    assert!(!was.describes(&replaced), "a different length settles it");
+
+    // And the limit, stated rather than papered over: a replacement of the
+    // same length at the same place reads as the same source. That is the
+    // identity rule, and closing it needs a witness of the
+    // bytes as they are now, which nothing here holds.
+    let same_length = proto::nvm::PlaceSource {
+        byte_size: 8_123_456,
+    };
+    assert!(was.describes(&same_length));
+}
+
+/// A place with no trustworthy fraction is still a place. The anchor is the
+/// valuable half and it is exact; the progression is the guess for a source
+/// that changed.
+#[test]
+fn a_place_stores_its_anchor_before_it_knows_the_books_length() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let id = book_id(31);
+    let anchor = proto::anchor::ContentAnchor::at(6, 1_200);
+
+    files::write_place(&root, id, anchor, source(), None).expect("the place stores");
+    let place = files::read_place(&root, id).found().expect("it reads back");
+    assert_eq!(place.anchor, anchor, "the anchor is there");
+    assert_eq!(
+        place.progression, None,
+        "and the fraction is honestly absent"
+    );
+}
+
+/// A place written against other bytes keeps its progression,
+/// and says plainly that the anchor is no longer evidence.
+#[test]
+fn a_place_survives_a_replacement_without_claiming_to_be_exact() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let id = book_id(21);
+    let anchor = proto::anchor::ContentAnchor::at(4, 2_048);
+    // Two thirds of the way through: the part of a place that survives an edit.
+    let progression = (u16::MAX / 3) * 2;
+
+    files::write_place(&root, id, anchor, source(), Some(progression)).expect("the place stores");
+    let place = files::read_place(&root, id).found().expect("it reads back");
+    assert!(
+        place.describes(&source()),
+        "against the bytes it was written for"
+    );
+    assert_eq!(place.anchor, anchor, "so the anchor is exact");
+
+    // A managed replacement keeps the id and changes the bytes, which shows
+    // up in the length whatever else it changes.
+    let replaced = proto::nvm::PlaceSource {
+        byte_size: IDENTITY.1 + 4_096,
+    };
+    assert!(
+        !place.describes(&replaced),
+        "the same place against other bytes is a guess"
+    );
+    assert_eq!(
+        place.progression,
+        Some(progression),
+        "and the guess is made from the progression"
+    );
+    assert_eq!(
+        place.id, id,
+        "the copy is the same copy; only what it holds changed"
+    );
+}
+
+#[test]
+fn a_place_belongs_to_the_copy_rather_than_to_a_file() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let id = book_id(7);
+    let anchor = proto::anchor::ContentAnchor::at(3, 4_096);
+
+    assert_eq!(place_anchor(&root, id), None, "nothing stored yet");
+    files::write_place(&root, id, anchor, source(), Some(0)).expect("the place stores");
+    assert_eq!(place_anchor(&root, id), Some(anchor));
+
+    // Nothing about where the book's file sits reached that write, so nothing
+    // about its locator can invalidate it. A second copy keeps its own.
+    let twin = book_id(9);
+    assert_eq!(place_anchor(&root, twin), None, "a twin starts fresh");
+    let twin_anchor = proto::anchor::ContentAnchor::at(0, 12);
+    files::write_place(&root, twin, twin_anchor, source(), Some(0))
+        .expect("the twin stores its own");
+    assert_eq!(
+        place_anchor(&root, id),
+        Some(anchor),
+        "and not over this one"
+    );
+    assert_eq!(place_anchor(&root, twin), Some(twin_anchor));
+}
+
+#[test]
+fn a_place_is_rewritten_in_place_and_survives_the_write() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let id = book_id(4);
+    for page in 0..6u32 {
+        let anchor = proto::anchor::ContentAnchor::at(1, page * 700);
+        files::write_place(&root, id, anchor, source(), Some(0)).expect("saves");
+        assert_eq!(
+            place_anchor(&root, id),
+            Some(anchor),
+            "each save reads back, so the two generations alternate cleanly"
+        );
+    }
+}
+
+/// A place written by a build whose content stream differs cannot be read as
+/// content, and opening at the start beats opening somewhere wrong.
+#[test]
+fn a_place_from_another_content_stream_is_not_believed() {
+    let mut bytes = proto::nvm::PlaceRecord {
+        id: book_id(2),
+        anchor: proto::anchor::ContentAnchor::at(5, 50),
+        source: source(),
+        progression: Some(0),
+    }
+    .encode();
+    assert!(proto::nvm::PlaceRecord::decode(&bytes).is_some());
+    bytes[5] = bytes[5].wrapping_add(1);
+    assert_eq!(
+        proto::nvm::PlaceRecord::decode(&bytes),
+        None,
+        "a stream version this build does not index the same way"
+    );
+
+    let mut torn = proto::nvm::PlaceRecord {
+        id: book_id(2),
+        anchor: proto::anchor::ContentAnchor::at(5, 50),
+        source: source(),
+        progression: Some(0),
+    }
+    .encode();
+    torn[12] ^= 0xFF;
+    assert_eq!(
+        proto::nvm::PlaceRecord::decode(&torn),
+        None,
+        "and a torn one fails its checksum"
+    );
+}
+
 #[test]
 fn a_position_saved_under_the_old_key_survives_the_re_key() {
     let disk = new_card();

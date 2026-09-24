@@ -484,6 +484,56 @@ enum OpenPhase {
     Done,
 }
 
+/// What a saved record says about a [`PlaceHold`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldVerdict {
+    /// Record for another book.
+    Unrelated,
+    /// Matches the held page, keeping the hold active.
+    Held,
+    /// A different page in the same book was chosen, releasing the hold.
+    Superseded,
+}
+
+/// Holds a book's stored reading position across a restore until the reader
+/// navigates to a new page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaceHold {
+    book_id: u32,
+    landed: u32,
+}
+
+impl PlaceHold {
+    pub const fn new(book_id: u32, landed: u32) -> Self {
+        Self { book_id, landed }
+    }
+
+    pub const fn book_id(self) -> u32 {
+        self.book_id
+    }
+
+    /// The page the hold stands on.
+    pub const fn landed(self) -> u32 {
+        self.landed
+    }
+
+    /// Updates the held page to a restore's fallback landing page.
+    pub fn settled_on(&mut self, page: u32) {
+        self.landed = page;
+    }
+
+    /// Evaluates whether saving `page` in `book_id` is unrelated, held, or superseded.
+    pub const fn verdict(self, book_id: u32, page: u32) -> HoldVerdict {
+        if self.book_id != book_id {
+            HoldVerdict::Unrelated
+        } else if page == self.landed {
+            HoldVerdict::Held
+        } else {
+            HoldVerdict::Superseded
+        }
+    }
+}
+
 /// A book-open (or section-extend) transaction, as the ordered card work it
 /// owes.
 ///
@@ -509,6 +559,10 @@ pub struct OpenSequence {
     /// book's own saved position. Extends never resume.
     resumable: bool,
     resumed: bool,
+    /// Whether to resolve and report the stored reading position for a layout change.
+    resolve_place: bool,
+    /// Whether this transaction extends an already open book.
+    extend: bool,
 }
 
 impl OpenSequence {
@@ -531,56 +585,69 @@ impl OpenSequence {
                 ..
             } if named != catalog_epoch
         );
-        let (request_id, book_id, index, chapter, target_pages, type_settings, portrait, previous) =
-            match *command {
-                StorageCommand::OpenBook {
-                    request_id,
-                    book_id,
-                    index,
-                    chapter,
-                    target_pages,
-                    type_settings,
-                    portrait,
-                    previous,
-                    catalog_epoch: _,
-                } => (
-                    request_id,
-                    book_id,
-                    index,
-                    chapter,
-                    target_pages,
-                    type_settings,
-                    portrait,
-                    previous,
-                ),
-                // An extend stays inside the book already loaded and owes
-                // nothing to any other, so it carries no departing state and
-                // never resumes.
-                StorageCommand::ExtendSection {
-                    request_id,
-                    book_id,
-                    index,
-                    chapter,
-                    target_pages,
-                    type_settings,
-                    portrait,
-                } => (
-                    request_id,
-                    book_id,
-                    index,
-                    chapter,
-                    target_pages,
-                    type_settings,
-                    portrait,
-                    None,
-                ),
-                _ => return None,
-            };
+        let (
+            request_id,
+            book_id,
+            index,
+            chapter,
+            target_pages,
+            type_settings,
+            portrait,
+            previous,
+            resolve_place,
+        ) = match *command {
+            StorageCommand::OpenBook {
+                request_id,
+                book_id,
+                index,
+                chapter,
+                target_pages,
+                type_settings,
+                portrait,
+                previous,
+                catalog_epoch: _,
+                resolve_place,
+            } => (
+                request_id,
+                book_id,
+                index,
+                chapter,
+                target_pages,
+                type_settings,
+                portrait,
+                previous,
+                resolve_place,
+            ),
+            // An extend stays inside the book already loaded and owes
+            // nothing to any other, so it carries no departing state and
+            // never resumes.
+            StorageCommand::ExtendSection {
+                request_id,
+                book_id,
+                index,
+                chapter,
+                target_pages,
+                type_settings,
+                portrait,
+            } => (
+                request_id,
+                book_id,
+                index,
+                chapter,
+                target_pages,
+                type_settings,
+                portrait,
+                None,
+                false,
+            ),
+            _ => return None,
+        };
         if request_id != latest_request_id {
             return None;
         }
-        let resumable =
-            matches!(command, StorageCommand::OpenBook { .. }) && chapter == 0 && target_pages == 0;
+        // Resolve stored position on layout changes, cold starts, and book switches.
+        let resumable = matches!(command, StorageCommand::OpenBook { .. })
+            && (resolve_place || (chapter == 0 && target_pages == 0));
         Some(Self {
             phase: match (fenced_out, previous) {
                 // Nothing has been touched yet, so the refusal is clean: the
@@ -599,7 +666,14 @@ impl OpenSequence {
             previous,
             resumable,
             resumed: false,
+            resolve_place,
+            extend: matches!(command, StorageCommand::ExtendSection { .. }),
         })
+    }
+
+    /// Whether this transaction extends the currently open book.
+    pub const fn is_extend(&self) -> bool {
+        self.extend
     }
 
     pub const fn next(&self) -> OpenAction {
@@ -697,18 +771,34 @@ impl OpenSequence {
         };
     }
 
-    /// The book's own saved position, if it had a usable one.
+    /// The book's own saved place, if it had a usable one.
+    ///
+    /// Adopted whatever it says, including the start of the book. The page
+    /// this open carried may have been counted under another layout, in which
+    /// case it names nothing here, so "the same as the request" is not a
+    /// reason to keep the request.
     pub fn saved_position(&mut self, position: Option<(u16, u32)>) {
         if let Some((chapter, screen)) = position {
-            // A saved start-of-book is indistinguishable from no saved position
-            // and needs no resume: the request already targets chapter 0 page 0.
-            if chapter > 0 || screen > 0 {
-                self.chapter = chapter;
-                self.page = screen.min(u16::MAX as u32) as u16;
-                self.resumed = true;
-            }
+            self.chapter = chapter;
+            self.page = screen.min(u16::MAX as u32) as u16;
+            // When resolving a place, (0, 0) is a valid landing and must be reported.
+            self.resumed = self.resolve_place || chapter > 0 || screen > 0;
         }
         self.phase = OpenPhase::LoadSection;
+    }
+
+    /// The page a stored place resolved to, once the book was paginated for
+    /// this open's layout.
+    pub fn resolve_place(&mut self, page: u32) {
+        self.page = page.min(u16::MAX as u32) as u16;
+        // Always report the resolved page, even when it resolves to page zero.
+        self.resumed = true;
+    }
+
+    /// The target section failed to load. Announces the failure without claiming a position.
+    pub fn section_failed(&mut self) {
+        self.resumed = false;
+        self.phase = OpenPhase::Announce;
     }
 
     /// The section covering the target page is resident.
@@ -757,6 +847,307 @@ impl OpenSequence {
 
 #[cfg(test)]
 mod tests {
+
+    /// A hold protects the landed page, frees on navigation, and terminates.
+    #[test]
+    fn a_hold_ends_at_the_move_that_frees_it() {
+        let book = ReaderSource::sd(2).book_id();
+        let hold = PlaceHold::new(book, 0);
+
+        assert_eq!(
+            hold.verdict(book, 0),
+            HoldVerdict::Held,
+            "the page the reader was put on is the one the hold is for"
+        );
+        assert_eq!(
+            hold.verdict(book, 1),
+            HoldVerdict::Superseded,
+            "anywhere else in the book is the reader choosing"
+        );
+
+        // The reader turns to page 1, which frees the save. Whoever holds
+        // this has to drop it here: asking again once they turn back to page
+        // 0 would forbid the page they are actually on.
+        let mut held = Some(hold);
+        if held.is_some_and(|hold| hold.verdict(book, 1) == HoldVerdict::Superseded) {
+            held = None;
+        }
+        assert!(held.is_none(), "the move that frees the save ends the hold");
+
+        // The first move frees it, not the last one seen. A caller that keeps
+        // only the latest of several moves, which the firmware's write
+        // coalescer does inside its write interval, hands over a turn away
+        // and back as a single record for the page the claim stands on: asked
+        // then and only then, the claim survives both turns and forbids the
+        // page the reader is on. So every arrival asks, whether or not it is
+        // the one that gets written.
+        assert_eq!(
+            PlaceHold::new(book, 0).verdict(book, 0),
+            HoldVerdict::Held,
+            "asked only about where the turns ended, the claim outlives them"
+        );
+    }
+
+    /// A hold applies only to its book; saves for other books return `Unrelated`.
+    #[test]
+    fn another_books_save_says_nothing_about_this_hold() {
+        let book = ReaderSource::sd(2).book_id();
+        let other = ReaderSource::sd(3).book_id();
+        let hold = PlaceHold::new(book, 0);
+
+        assert_eq!(
+            hold.verdict(other, 0),
+            HoldVerdict::Unrelated,
+            "the same page number in another book is another book"
+        );
+        assert_eq!(
+            hold.verdict(other, 7),
+            HoldVerdict::Unrelated,
+            "and so is any other page of it"
+        );
+
+        // So it neither ends the hold nor waits on it.
+        let mut held = Some(hold);
+        if held.is_some_and(|hold| hold.verdict(other, 7) == HoldVerdict::Superseded) {
+            held = None;
+        }
+        assert!(held.is_some(), "the hold outlives another book's save");
+        assert_ne!(
+            hold.verdict(other, 7),
+            HoldVerdict::Held,
+            "and that save is not held back by it either"
+        );
+    }
+
+    /// A restore that settles on a fallback page moves the hold to that page.
+    #[test]
+    fn a_settled_restore_carries_its_hold_to_where_it_landed() {
+        let book = ReaderSource::sd(2).book_id();
+        let mut hold = PlaceHold::new(book, 40);
+        hold.settled_on(0);
+
+        assert_eq!(hold.landed(), 0);
+        assert_eq!(
+            hold.verdict(book, 0),
+            HoldVerdict::Held,
+            "the page the fallback chose is not a page the reader chose"
+        );
+        assert_eq!(
+            hold.verdict(book, 40),
+            HoldVerdict::Superseded,
+            "and the page it left is somewhere they would have to go back to"
+        );
+    }
+
+    /// An extend continues the existing book session rather than starting a new open.
+    #[test]
+    fn an_extend_is_not_an_open_of_the_book_it_extends() {
+        let book_id = ReaderSource::sd(2).book_id();
+
+        let extending = OpenSequence::begin(&extend(book_id, 0, 40), 7, 0).expect("an extend");
+        assert!(matches!(extending.next(), OpenAction::StageBook { .. }));
+        assert!(extending.is_extend());
+
+        // The same book, opened rather than extended. An open reads the
+        // stored place again, so whatever an earlier one left waiting is over.
+        let reopening = OpenSequence::begin(&open(book_id, 0, 40, None), 7, 0).expect("an open");
+        assert!(matches!(reopening.next(), OpenAction::StageBook { .. }));
+        assert!(!reopening.is_extend());
+
+        // And a switch from another book, which stages after its close-out.
+        let previous = persisted(ReaderSource::sd(1).book_id(), 2, 40);
+        let switching =
+            OpenSequence::begin(&open(book_id, 0, 0, Some(previous)), 7, 0).expect("an open");
+        assert!(!switching.is_extend());
+    }
+
+    /// When the stored place cannot be read, the open retains its incoming
+    /// position instead of defaulting to page 0.
+    #[test]
+    fn an_unreadable_place_leaves_the_open_on_the_page_it_came_with() {
+        let book_id = ReaderSource::sd(2).book_id();
+        let mut command = open(book_id, 26, 242, None);
+        if let StorageCommand::OpenBook {
+            ref mut resolve_place,
+            ..
+        } = command
+        {
+            *resolve_place = true;
+        }
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        // The card refused, so the caller adopts nothing.
+        open.saved_position(None);
+
+        match open.next() {
+            OpenAction::LoadSection { chapter, page, .. } => assert_eq!(
+                (chapter, page),
+                (26, 242),
+                "the page the open arrived with stands"
+            ),
+            other => panic!("expected a section load, got {other:?}"),
+        }
+
+        // And it claims no position, so the app keeps what it had too.
+        open.section_loaded();
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position, None,
+                "nothing resolved, so nothing to tell the app"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
+
+    /// If an anchor has not yet resolved, announce the provisional landing
+    /// page rather than retaining the previous layout's page.
+    #[test]
+    fn a_place_that_has_to_wait_still_says_where_the_open_landed() {
+        let book_id = ReaderSource::sd(2).book_id();
+        // The app is deep in the book under settings it has just left.
+        let mut command = open(book_id, 3, 88, None);
+        if let StorageCommand::OpenBook {
+            ref mut resolve_place,
+            ..
+        } = command
+        {
+            *resolve_place = true;
+        }
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        // The stored place is in the first spine item, so its provisional
+        // landing is the start of the book.
+        open.saved_position(Some((0, 0)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+        // The walk has not reached the anchor, so nothing resolves it.
+        open.section_loaded();
+
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position,
+                Some(0),
+                "the landing travels even when it is zero and the place is still waiting"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
+
+    /// An open without `resolve_place` does not announce a replacement page.
+    #[test]
+    fn an_open_that_was_not_asked_to_resume_leaves_the_page_alone() {
+        let book_id = ReaderSource::sd(2).book_id();
+        let mut open = OpenSequence::begin(&open(book_id, 0, 0, None), 7, 0).expect("an open");
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        open.saved_position(Some((0, 0)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+        open.section_loaded();
+
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position, None,
+                "a cold start that resolved nothing says nothing"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
+
+    /// A place resolving to page 0 is announced so the app updates from its
+    /// previous layout position.
+    #[test]
+    fn a_place_that_resolves_to_the_first_page_still_says_so() {
+        let book_id = ReaderSource::sd(2).book_id();
+        let mut command = open(book_id, 4, 120, None);
+        if let StorageCommand::OpenBook {
+            ref mut resolve_place,
+            ..
+        } = command
+        {
+            *resolve_place = true;
+        }
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(
+            matches!(open.next(), OpenAction::LoadSavedPosition { .. }),
+            "a layout change resolves the place even holding a page"
+        );
+        open.saved_position(Some((0, 0)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+        open.resolve_place(0);
+        open.section_loaded();
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position,
+                Some(0),
+                "the start of the book is a place, not the absence of one"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
+
+    /// When neither the target section nor the landing section loads, announce
+    /// without claiming a position.
+    #[test]
+    fn an_open_with_no_readable_section_points_at_nothing() {
+        let previous = persisted(ReaderSource::sd(1).book_id(), 2, 40);
+        let command = open(ReaderSource::sd(2).book_id(), 0, 0, Some(previous));
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+
+        assert!(matches!(open.next(), OpenAction::CloseOutDeparting(_)));
+        open.departing_stored(true);
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        open.saved_position(Some((4, 300)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+
+        // Neither the place's page nor the landing page could be read.
+        open.section_failed();
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(
+                position, None,
+                "an open with nothing resident claims no page"
+            ),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+        open.announced();
+        assert!(matches!(open.next(), OpenAction::Done));
+    }
+
+    /// When the section loads successfully, write the pointer and announce the
+    /// landed page.
+    #[test]
+    fn an_open_that_loaded_points_at_the_page_it_landed_on() {
+        let previous = persisted(ReaderSource::sd(1).book_id(), 2, 40);
+        let command = open(ReaderSource::sd(2).book_id(), 0, 0, Some(previous));
+        let mut open = OpenSequence::begin(&command, 7, 0).expect("an open");
+        assert!(matches!(open.next(), OpenAction::CloseOutDeparting(_)));
+        open.departing_stored(true);
+        assert!(matches!(open.next(), OpenAction::StageBook { .. }));
+        open.staged();
+        assert!(matches!(open.next(), OpenAction::LoadSavedPosition { .. }));
+        open.saved_position(Some((4, 300)));
+        assert!(matches!(open.next(), OpenAction::LoadSection { .. }));
+        open.section_loaded();
+        assert!(
+            matches!(open.next(), OpenAction::StorePointer(_)),
+            "a switch that landed writes the pointer"
+        );
+        open.pointer_stored(true);
+        match open.next() {
+            OpenAction::Announce { position, .. } => assert_eq!(position, Some(300)),
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+    }
+
     use super::*;
     use crate::{book_open_outcome, BookOpenOutcome, ReaderSource};
     use display::font::{FontFamily, FontSize, FontWeight, LineSpacing};
@@ -802,6 +1193,7 @@ mod tests {
             type_settings: SETTINGS,
             portrait: false,
             previous,
+            resolve_place: false,
         }
     }
 
@@ -960,6 +1352,7 @@ mod tests {
             type_settings: TypeSettings::default(),
             portrait: false,
             previous: None,
+            resolve_place: false,
         }
     }
 

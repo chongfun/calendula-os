@@ -5,6 +5,7 @@ use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use esp_hal::gpio::Output;
 use heapless::String;
+use proto::anchor::{decode_progression, encode_progression};
 use proto::book::BookId;
 use proto::cache::{BookV2SectionRecord, CONTENT_HEADER_BYTES};
 use proto::epub::{
@@ -62,7 +63,9 @@ const BACKGROUND_SLICE_MS: u64 = 400;
 /// — see the fast-path split in `build_or_load_book_cache_from_root`, which is
 /// also the only route that leaves an existing walk standing.
 ///
-/// RAM: 24 bytes inside the `EPUB_SCRATCH` static (`.bss`), not on any stack.
+/// RAM: 28 bytes inside the `EPUB_SCRATCH` static (`.bss`), not on any stack.
+/// Four more than before the layout field, which tells a walk which stored
+/// pagination it is building.
 ///
 /// `PartialEq` is load-bearing, not derived for convenience: comparing the
 /// value before and after an open is how [`build_or_load_book_cache`] tells a
@@ -90,7 +93,19 @@ pub(crate) struct BookBuildResume {
     /// Sections already written into the on-disk index. The walk's own frontier
     /// runs ahead of this between publishes; see `publish::INDEX_PUBLISH_SECTIONS`.
     published_sections: u16,
+    /// The layout this walk is paginating for.
+    ///
+    /// Part of what makes a resume ours, now that a book can hold a stored
+    /// pagination per layout. Without it, a walk suspended while building one
+    /// layout would be resumed by a step whose writers derive another, and the
+    /// second copy would be overwritten a section at a time by the first.
+    layout: u8,
 }
+
+// The size the doc above quotes, checked rather than remembered: this rides in
+// a static beside the EPUB scratch, and the budget there is the reason the
+// number is written down at all.
+const _: () = assert!(core::mem::size_of::<BookBuildResume>() == 28);
 
 impl BookBuildResume {
     /// Whether this suspended walk is the one building the book that is *now*
@@ -107,8 +122,10 @@ impl BookBuildResume {
     ///
     /// Every predicate that decides whether a resume is still ours goes through
     /// here, so the fast path and the outcome check cannot drift apart.
-    fn belongs_to(&self, index: usize, source_identity: (u32, u32)) -> bool {
-        self.index as usize == index && self.source_identity == source_identity
+    fn belongs_to(&self, index: usize, source_identity: (u32, u32), layout: u8) -> bool {
+        self.index as usize == index
+            && self.source_identity == source_identity
+            && self.layout == layout
     }
 }
 
@@ -371,7 +388,7 @@ pub(crate) fn build_or_load_book_cache(
     let live = matches!(status, BookLoadStatus::Ready)
         && scratch
             .resume
-            .is_some_and(|state| state.belongs_to(index, source_identity));
+            .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
     if !live {
         scratch.resume = None;
         return BookBuildOutcome::Settled;
@@ -480,7 +497,11 @@ pub(crate) fn continue_book_build(
         esp_println::println!("epub: build continue lost catalog entry, dropping");
         return BackgroundStep::Abandoned;
     };
-    if !resume.belongs_to(resume.index as usize, (entry.source_hash, entry.byte_size)) {
+    if !resume.belongs_to(
+        resume.index as usize,
+        (entry.source_hash, entry.byte_size),
+        library.layout_key(),
+    ) {
         // A rescan moved a different book under this row. Building its spine
         // into the previous book's section table would corrupt both.
         esp_println::println!("epub: build continue entry changed, dropping");
@@ -596,6 +617,9 @@ where
     );
     let cache_key = proto::cache::cache_key_from(source_identity.0);
     library.set_cache_key(cache_key.as_str());
+    // Nothing is owed until this open's eviction says so, and what the book
+    // before this one owed says nothing about this one.
+    library.set_layout_bound_unmet(false);
     // The cache is reachable only with a provable owner: the key and every
     // artifact identity are 32-bit hashes a twin can share, so a row whose
     // locator is not resident gets no cache access, only the build path.
@@ -620,7 +644,7 @@ where
     // for the rest — and "this walk, for this book", not merely for this row.
     let walk_is_live = scratch
         .resume
-        .is_some_and(|state| state.belongs_to(index, source_identity));
+        .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
     let fast_hit = owner.as_ref().is_some_and(|owner| {
         try_load_v2_book_cache(
             root,
@@ -640,7 +664,38 @@ where
         // already been overwritten.
         scratch.resume = None;
     }
+    // The one moment a book gains a layout: the fast path missed, so this
+    // open will write one that was not there. Anything over the bound goes
+    // now, before the writers run.
+    if !fast_hit {
+        if let Some(owner) = owner.as_ref() {
+            let within_bound = files::evict_layouts_for(root, owner, library.layout_key());
+            // A refused delete, or a card that would not say what is here.
+            // The open carries on and gives up the fast path instead: with
+            // no index written, the next open cannot skip this question.
+            library.set_layout_bound_unmet(!within_bound);
+            if !within_bound {
+                esp_println::println!(
+                    "epub: over the layout bound and the card would not free one; no index this open"
+                );
+            }
+        }
+    }
+    // Before the replay: the same book at another layout, whose sections are
+    // still here.
+    let reindexed = !fast_hit
+        && owner.as_ref().is_some_and(|owner| {
+            try_reindex_layout(
+                root,
+                owner,
+                source_identity,
+                target_pages as u32,
+                library,
+                scratch,
+            )
+        });
     let replayed = !fast_hit
+        && !reindexed
         && owner.as_ref().is_some_and(|owner| {
             try_replay_content_cache(
                 root,
@@ -652,7 +707,7 @@ where
                 font_metrics,
             )
         });
-    let status = if fast_hit || replayed {
+    let status = if fast_hit || reindexed || replayed {
         BookLoadStatus::Ready
     } else {
         // The file borrows the directory the walk opened, so the build runs
@@ -913,14 +968,110 @@ fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, Librar
     Some((at, LibraryPath::parse(path).ok()?))
 }
 
+/// Store where the reader is, under the copy's id.
+///
+/// `Ok(())` also covers the cases with nothing to store: a copy with no id
+/// yet, or a page outside the resident window. `Err` is the card refusing,
+/// which the caller owes a retry, because this is the position that survives
+/// a layout change and a move and the page-keyed file beside it is not.
+fn store_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &ReaderStore,
+    index: usize,
+    screen: u32,
+    may_replace: bool,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if !may_replace {
+        // A restore for this book is still owed and the reader is standing
+        // where the open put them, not where they left off. This page's
+        // anchor is the provisional landing, and the stored place is the
+        // position the restore is reaching for: the only copy of it that
+        // survives a reboot. The page file beside it still records where the
+        // reader is.
+        return Ok(());
+    }
+    let Some(id) = record_copy_id(root, library, index) else {
+        return Ok(());
+    };
+    let Some(anchor) = library.anchor_for_global_page(screen) else {
+        return Ok(());
+    };
+    let Some(entry) = library.catalog_entry(index) else {
+        return Ok(());
+    };
+    let source = files::place_source_for(entry.byte_size);
+    // The anchor is written whatever the pagination is doing. Only the
+    // fraction beside it waits for a book with a known length: a page total
+    // from a half-built index is a floor, so dividing by it would call page
+    // 10 of an eventual 200 the halfway mark. A place whose progression is
+    // stale or absent is still a place; one with no anchor is nothing.
+    let progression = if library.book_index_is_partial() {
+        match files::read_place(root, id) {
+            files::PlaceRead::Found(place) => place.progression,
+            files::PlaceRead::Absent => None,
+            // Writing now would publish this anchor with the fraction beside
+            // it dropped, on no evidence that there was one to keep. The save
+            // repeats, so owing it costs a settle interval.
+            files::PlaceRead::Fault => {
+                esp_println::println!("storage: the place read failed; leaving the save owed");
+                return Err(());
+            }
+        }
+    } else {
+        let total = library.advertised_page_count();
+        Some(encode_progression(screen, total))
+    };
+    match files::write_place(root, id, anchor, source, progression) {
+        Ok(()) => Ok(()),
+        // The explicitly chosen collision behavior: another copy's id holds
+        // the directory this one hashes to, and no retry changes that.
+        Err(files::PlaceDenied::Taken) => {
+            esp_println::println!("storage: another copy holds this place directory");
+            Ok(())
+        }
+        Err(files::PlaceDenied::Fault) => {
+            esp_println::println!("storage: the place write failed");
+            Err(())
+        }
+    }
+}
+
+/// The id of the copy at a catalog row, read from the row itself.
+///
+/// The active book's id is resident, and every other row's is not, so this
+/// goes to the card for it. A row with no id yet is a copy adopted by
+/// firmware older than the ledger; it has no place to store and will get one
+/// on the next scan.
+fn record_copy_id<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &ReaderStore,
+    index: usize,
+) -> Option<proto::identity::BookId>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if library.active_index() == Some(index) {
+        if let Some(id) = library.active_copy_id() {
+            return Some(id);
+        }
+    }
+    crate::library_sd::read_catalog_record_at(root, index)?.book_id
+}
+
+/// Row `index`'s location as its catalog record states it, checked against the
+/// expected identity: the root, the locator, and the display name the legacy
+/// position fallback derives from.
+///
+/// Read from the card because the resident window keeps only labels and
+/// identity, and only on paths already running a whole SD session. `None` when
+/// the record is unreadable, names a root this build does not know, or no
+/// longer carries this identity, so no keyed cache access can prove ownership.
 #[inline(never)]
-/// Row `index`'s location as its catalog record states it, verified against
-/// the expected identity: the root, the locator, and the display name the
-/// legacy position fallback derives from. Read from the card because the
-/// resident window keeps only labels and identity; one record read on paths
-/// that already run whole SD sessions. `None` when the record is unreadable,
-/// names a root this build does not know, or no longer carries this
-/// identity, in which case no keyed cache access can prove ownership.
 fn record_location<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     index: usize,
@@ -953,7 +1104,25 @@ pub(crate) fn store_app_state(
     sd_cs: &mut Output<'static>,
     library: &ReaderStore,
     record: AppStateRecord,
+    may_replace_place: bool,
 ) -> bool {
+    // A record for a book whose identity the store cannot supply is refused
+    // rather than written. Restore finds a book by its source hash and size,
+    // so a zeroed pair matches nothing and the record is a slot spent saying
+    // nothing, over one that was saying where the reader was.
+    //
+    // Reachable through a rollback: an open that read nothing puts the app
+    // back on the book it came from, and that book may be outside the catalog
+    // window while the store's active entry is still the one that failed.
+    if app_core::ReaderSource::from_book_id(record.book_id).is_sd()
+        && (record.source_hash, record.source_size) == (0, 0)
+    {
+        esp_println::println!(
+            "storage: refusing a global record with no source identity book_id={}",
+            record.book_id
+        );
+        return false;
+    }
     // The same session lands the global record and, for SD books, the
     // per-book position beside that book's cache, so switching books does
     // not abandon the previous one's place.
@@ -975,7 +1144,18 @@ pub(crate) fn store_app_state(
                         root: at,
                         locator: path.as_str(),
                     };
-                    match files::write_position_file(root, &owner, record.chapter, record.screen) {
+                    // The layout-independent place first, and its fault is
+                    // the save's fault: the page file beside it cannot carry
+                    // a place across a settings change or a move, so treating
+                    // a refused place as success would retire a retry the
+                    // reader needs.
+                    let place = store_place(root, library, index, record.screen, may_replace_place);
+                    let position = match files::write_position_file(
+                        root,
+                        &owner,
+                        record.chapter,
+                        record.screen,
+                    ) {
                         Ok(()) => Ok(()),
                         // A full-hash twin's active claim holds the key.
                         // Deliberate and durable, not a card fault: this
@@ -991,7 +1171,8 @@ pub(crate) fn store_app_state(
                             Ok(())
                         }
                         Err(files::ClaimDenied::Fault) => Err(()),
-                    }
+                    };
+                    place.and(position)
                 }
                 // No provable location means no directory this write can
                 // claim; the global record above still carries the place.
@@ -1025,6 +1206,7 @@ pub(crate) fn store_book_position(
     sd_cs: &mut Output<'static>,
     library: &ReaderStore,
     record: AppStateRecord,
+    may_replace_place: bool,
 ) -> bool {
     let Some(index) = app_core::ReaderSource::from_book_id(record.book_id).sd_index() else {
         return true;
@@ -1046,7 +1228,15 @@ pub(crate) fn store_book_position(
             root: at,
             locator: path.as_str(),
         };
-        match files::write_position_file(root, &owner, record.chapter, record.screen) {
+        let place = store_place(
+            root,
+            library,
+            index as usize,
+            record.screen,
+            may_replace_place,
+        );
+        let position = match files::write_position_file(root, &owner, record.chapter, record.screen)
+        {
             Ok(()) => Ok(()),
             // A twin's active claim holds the key: the departing book's
             // place cannot be stored while it does, and refusing the whole
@@ -1058,7 +1248,11 @@ pub(crate) fn store_book_position(
                 Ok(())
             }
             Err(files::ClaimDenied::Fault) => Err(()),
-        }
+        };
+        // The departing book's place carries the same weight as its page, and
+        // for the same reason: nothing else records where it was in a form
+        // that survives a layout change.
+        place.and(position)
     })
     .ok()
     .is_some_and(|result| result.is_ok())
@@ -1081,19 +1275,66 @@ pub(crate) fn store_global_state(
         .is_some_and(|result| result.is_ok())
 }
 
-/// The saved per-book position for a catalog entry, if any.
+/// What a copy's stored place says, before any pagination exists to resolve
+/// it against.
 ///
-/// Reads through the legacy-key fallback: a card upgraded across the v8
-/// re-key holds every inactive book's position under its old key, and the
-/// place a reader left off is not rebuildable. The next save publishes
-/// under the current key.
+/// Two shapes because two things can be stored. A place names content and has
+/// to be resolved once the book is paginated for this layout, which is the
+/// point of it: the page it lands on depends on the layout, and the layout is
+/// adopted by the open that reads this. A legacy position names a page under
+/// whatever layout wrote it, which is all an older card holds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SavedPlace {
+    Place {
+        anchor: proto::anchor::ContentAnchor,
+        /// Whether the content the anchor was resolved against is still the
+        /// content of this copy. False demotes the anchor to a guess and
+        /// leaves the progression to answer instead.
+        exact: bool,
+        progression: Option<u16>,
+    },
+    Page {
+        chapter: u16,
+        page: u32,
+    },
+    /// The card would not say what is stored. Not a place, and not the
+    /// absence of one: the open takes its provisional page and the settle
+    /// slices read again, under the same refusal budget as any other place
+    /// the card refuses.
+    Unreadable,
+}
+
+impl SavedPlace {
+    /// Where to open while the place is still unresolved.
+    ///
+    /// For a place that is the spine item's first page: the item is known
+    /// from the anchor, and which page inside it needs a pagination that this
+    /// open has yet to build. [`resolve_place`] refines it once there is one.
+    pub(crate) fn provisional(self) -> (u16, u32) {
+        match self {
+            Self::Place { anchor, .. } => (anchor.spine, 0),
+            Self::Page { chapter, page } => (chapter, page),
+            // Nothing is known about where the reader was. Callers ask this
+            // only of a place that said something; the open keeps the page it
+            // came in with rather than taking this one.
+            Self::Unreadable => (0, 0),
+        }
+    }
+}
+
+/// The stored place for a catalog entry's copy, or the page an older card
+/// holds for it.
+///
+/// Reads the place first and falls back to the page-keyed position, so a card
+/// written by earlier firmware resumes where it left off. The next save
+/// publishes a place.
 #[inline(never)]
-pub(crate) fn load_position(
+pub(crate) fn load_place(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     library: &ReaderStore,
     index: usize,
-) -> Option<(u16, u32)> {
+) -> Option<SavedPlace> {
     let entry = library.catalog_entry(index)?;
     let identity = (entry.source_hash, entry.byte_size);
     sd_session::with_root(epd, sd_cs, |root| {
@@ -1104,10 +1345,177 @@ pub(crate) fn load_position(
             root: at,
             locator: path.as_str(),
         };
+        if let Some(id) = record_copy_id(root, library, index) {
+            match files::read_place(root, id) {
+                files::PlaceRead::Found(place) => {
+                    // Against the copy's content, so a book that moved keeps
+                    // its exact place: a move changes the locator and nothing
+                    // else, and the anchor exists to survive exactly that.
+                    let now = files::place_source_for(entry.byte_size);
+                    return Some(SavedPlace::Place {
+                        anchor: place.anchor,
+                        exact: place.describes(&now),
+                        progression: place.progression,
+                    });
+                }
+                // Falling through to the page-keyed position here would take
+                // a layout-specific page, or nothing, over an exact place the
+                // card is holding and would hand over on the next look.
+                files::PlaceRead::Fault => return Some(SavedPlace::Unreadable),
+                files::PlaceRead::Absent => {}
+            }
+        }
         files::read_position_file_or_legacy(root, &owner, display_name.as_str(), entry.byte_size)
+            .map(|(chapter, page)| SavedPlace::Page { chapter, page })
+    })
+    // A session that would not open is the same answer as a place that would
+    // not read, and the same remedy: look again on a later slice.
+    .unwrap_or(Some(SavedPlace::Unreadable))
+}
+
+/// What a stored place asks the open to do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaceTarget {
+    /// The page the place resolves to.
+    Page(u32),
+    /// The index stops before the place. Build at least this far and ask
+    /// again: a progressive build stops once it covers the page it was asked
+    /// for, and the page a place names is not known until the pagination
+    /// holding it exists.
+    Extend(u32),
+    /// Nothing better than where the open already is, and looking again will
+    /// not change that.
+    Keep,
+    /// The card would not answer. Says nothing about the place, so the place
+    /// keeps waiting: a refused read is the one case where trying later is
+    /// the whole remedy.
+    Unavailable,
+}
+
+/// The page a stored place opens at, once the book is paginated for the
+/// layout this open adopted.
+///
+/// Has to run after the index is resident and cannot run before: the index
+/// that names sections and their start pages is the one thing that says where
+/// an anchor falls, and it belongs to a layout. Resolving against the index
+/// that happened to be in RAM would answer with another book's geometry, or
+/// with this book's under the settings the reader just left.
+#[inline(never)]
+pub(crate) fn resolve_place(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    index: usize,
+    place: SavedPlace,
+) -> PlaceTarget {
+    // The one place that reads the card again rather than resolving what it
+    // was handed. The refusal budget above this bounds the asking.
+    let place = match place {
+        SavedPlace::Unreadable => match load_place(epd, sd_cs, library, index) {
+            Some(SavedPlace::Unreadable) | None => return PlaceTarget::Unavailable,
+            Some(read) => read,
+        },
+        read => read,
+    };
+    let SavedPlace::Place {
+        anchor,
+        exact,
+        progression,
+    } = place
+    else {
+        return PlaceTarget::Keep;
+    };
+    let partial = library.book_index_is_partial();
+    if !exact {
+        // The content changed under the copy, so the anchor is a guess. A
+        // progression is a fraction of the whole book and needs the whole
+        // book's length: against a half-built index it would put the reader
+        // at page 5 of 10 when it meant page 100 of 200.
+        if let (Some(progression), false) = (progression, partial) {
+            let total = library.advertised_page_count();
+            let page = decode_progression(progression, total);
+            esp_println::println!(
+                "restore: the source changed; resuming near {}/{}",
+                page,
+                total
+            );
+            return PlaceTarget::Page(page);
+        }
+        // Publication order carries the rest. The spine item the place was in
+        // survives an edit better than an offset into it does, so the reader
+        // opens at the top of it rather than at the top of the book.
+        return match library.first_page_of_spine(anchor.spine) {
+            Some(page) => {
+                esp_println::println!(
+                    "restore: the source changed and no whole-book length is known; \
+                     resuming at spine {}",
+                    anchor.spine
+                );
+                PlaceTarget::Page(page)
+            }
+            // That item is past what this index reaches, so build toward it.
+            None if partial => PlaceTarget::Extend(library.advertised_page_count()),
+            None => PlaceTarget::Keep,
+        };
+    }
+    // None of these three looked at the book. A row that is not staged yet
+    // and an index with no sections in it are states that pass, so they are
+    // unavailable rather than answers about the place.
+    let Some(entry) = library.catalog_entry(index) else {
+        return PlaceTarget::Unavailable;
+    };
+    let identity = (entry.source_hash, entry.byte_size);
+    let Some(section) = library.section_for_anchor(anchor) else {
+        return PlaceTarget::Unavailable;
+    };
+    let Some(record) = library.book_section(section) else {
+        return PlaceTarget::Unavailable;
+    };
+    // When the index is partial and the anchor falls in or beyond the last
+    // built section, extend pagination before resolving.
+    if partial && section + 1 >= library.book_section_count() {
+        return PlaceTarget::Extend(library.advertised_page_count());
+    }
+    let resolved = sd_session::with_root(epd, sd_cs, |root| {
+        let (at, path, _) = record_location(root, index, identity)?;
+        let key = proto::cache::cache_key_from(identity.0);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        // By section, not by spine. One spine item can hold several sections,
+        // and the file is named for the section; the header checks then
+        // confirm the file is this item of this copy under this layout.
+        let within = files::page_of_anchor_in_section(
+            root,
+            &owner,
+            library,
+            identity,
+            record.section,
+            anchor,
+        )?;
+        Some(record.start_page.saturating_add(u32::from(within)))
     })
     .ok()
-    .flatten()
+    .flatten();
+    match resolved {
+        Some(page) => {
+            // Log successful place resolution telemetry.
+            bench_log!(
+                "bench: storage_place index={} spine={} offset={} section={} page={} t_ms={}",
+                index,
+                anchor.spine,
+                anchor.offset,
+                record.section,
+                page,
+                Instant::now().as_millis(),
+            );
+            PlaceTarget::Page(page)
+        }
+        // Section anchors could not be read; retry later.
+        None => PlaceTarget::Unavailable,
+    }
 }
 
 /// Load the book's full chapter list from TOC.BIN into the reader's section
@@ -2194,6 +2602,7 @@ where
             // Replaced below by whichever tail runs; a first open always
             // publishes, a continuation only past the batching threshold.
             published_sections: 0,
+            layout: library.layout_key(),
         };
         return if resume.is_none() {
             publish::publish_first_open(
@@ -2322,12 +2731,16 @@ where
             publish::BookPublishOutcome::IndexWriteFailed => {
                 // The index write failed partway, so BOOK.BIN may be a
                 // truncated file that serves neither the fast path nor
-                // replay (the labels load bails on it). Clear the debris —
-                // sections and CONT.BIN are useless without an index — so
-                // the next open rebuilds from the EPUB cleanly. Safe only
+                // replay (the labels load bails on it). Clear this layout's
+                // debris so the next open rebuilds it cleanly. Safe only
                 // because this arm is the *open* path: the book never became
                 // readable, so nothing is holding these files.
-                let _ = files::empty_cache_dir(root, owner.key);
+                //
+                // This layout's, not the book's. Another layout's pagination
+                // is finished work that this failure says nothing about, and
+                // CONT.BIN is settings-independent: taking it would turn the
+                // next open from a replay into a full re-parse.
+                let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -2376,12 +2789,98 @@ where
         style: proto::text::FontStyle,
         align: TextAlign,
         paragraph_end: bool,
+        logical_offset: u32,
     ) -> Result<(), XhtmlError> {
-        self.capture
-            .push_block_record(self.spine_index, text, role, style, align, paragraph_end);
+        self.capture.push_block_record(
+            self.spine_index,
+            text,
+            role,
+            style,
+            align,
+            paragraph_end,
+            logical_offset,
+        );
         self.inner
-            .push_block(text, role, style, align, paragraph_end)
+            .push_block(text, role, style, align, paragraph_end, logical_offset)
     }
+}
+
+/// Put a book back together from the section files one layout already has.
+///
+/// Runs between the fast path and the replay, on the route a typography flip
+/// takes: the sections for this layout are still on the card and only the
+/// index naming them is gone. A header read per section, against 25 s of
+/// replay or a cold build's minute.
+///
+/// Labels and TOC come from the index being replaced, which holds them for the
+/// book rather than for a layout. Without them the replay runs instead.
+#[inline(never)]
+fn try_reindex_layout<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    source_identity: (u32, u32),
+    requested_page: u32,
+    library: &mut ReaderStore,
+    scratch: &mut ReaderCacheScratch<'_>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let started = Instant::now();
+    // Before the labels, not after: `begin_book_load` clears the title,
+    // author and TOC, and the index this rebuilds is written out of the
+    // store. Clearing after the load published a book with none of them and
+    // put that on the card as the authoritative index.
+    library.begin_book_load();
+    if !files::load_v2_book_labels_and_toc(root, owner, source_identity, library) {
+        return false;
+    }
+    // Answers only for a set that proves it covers the whole book. Anything
+    // short of that is where a build stopped, and publishing it would fence
+    // the reader at that page behind an index claiming to be complete. The
+    // replay below rebuilds from CONT.BIN instead.
+    let Some((count, total_pages)) = files::reindex_layout_from_sections(
+        root,
+        owner,
+        source_identity,
+        library,
+        &mut scratch.book_sections[..],
+    ) else {
+        return false;
+    };
+    let sections = &scratch.book_sections[..count];
+    let published = publish::publish_book_cache(
+        root,
+        owner,
+        source_identity,
+        requested_page,
+        library,
+        sections,
+        total_pages,
+        // Proven, not assumed: the reindex answers only for a set that
+        // reaches the spine item the book ends on.
+        false,
+        // Nothing is coming back for more. A reindex reads what is already
+        // written rather than walking, the same as the replay.
+        0,
+    );
+    if published.outcome != publish::BookPublishOutcome::Ready {
+        esp_println::println!("epub: reindex publish failed, falling back");
+        return false;
+    }
+    esp_println::println!(
+        "epub: reindexed {} section(s) for this layout in {} ms",
+        count,
+        started.elapsed().as_millis()
+    );
+    true
 }
 
 /// Rebuild the section cache by replaying CONT.BIN — the captured
@@ -2524,11 +3023,13 @@ where
         );
     }
     if published.outcome != publish::BookPublishOutcome::Ready {
-        // Either failure leaves the replay's cache state unusable (a
+        // Either failure leaves this layout's cache state unusable (a
         // truncated BOOK.BIN or an unreadable section); the full build
-        // rewrites everything, so clear it all either way.
+        // rewrites it either way. Scoped to the layout: the full build that
+        // follows reads CONT.BIN, and another layout's pagination is not
+        // implicated in this one's failure.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        let _ = files::empty_cache_dir(root, owner.key);
+        let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
         return false;
     }
     true
@@ -2609,6 +3110,7 @@ where
                         record.style,
                         record.align,
                         record.paragraph_end,
+                        record.logical_offset,
                     )
                     .is_err()
                 {
@@ -2933,6 +3435,13 @@ struct LibraryBlockSink<
     /// Latched when a page record was dropped past the `pages` capacity,
     /// mirroring the full rebuild's silent drop.
     page_overflowed: bool,
+    /// Start offset and length of the block in the spine item's logical stream.
+    block_offset: u32,
+    block_len: u32,
+    /// Bytes of the block consumed by line formatting, clamped to `block_len`.
+    block_consumed: u32,
+    /// Logical start offset of the line in progress.
+    line_offset: u32,
 }
 
 impl<'a, 'r, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -2987,6 +3496,10 @@ where
             target_pages,
             generate_toc_from_headings,
             generated_toc_for_spine: false,
+            block_offset: 0,
+            block_len: 0,
+            block_consumed: 0,
+            line_offset: 0,
             page_cursor: ui::reading::PageIndexCursor::start(page_box),
             page_overflowed: false,
         }
@@ -3099,8 +3612,25 @@ where
     /// index through the shared incremental cursor — O(1) per line.
     fn note_block_appended(&mut self) {
         let index = self.library.block_count() - 1;
+        let pages_before = self.library.page_count();
         self.page_overflowed |=
             layout::place_appended_block(self.library, &mut self.page_cursor, index);
+        if self.library.page_count() > pages_before {
+            // Set anchor offset for the newly opened page.
+            self.library.set_last_page_offset(self.line_offset);
+        }
+    }
+
+    /// Take one word into the line in progress.
+    fn note_word_placed(&mut self, word_len: usize, line_was_empty: bool) {
+        if line_was_empty {
+            self.line_offset = self.block_offset.saturating_add(self.block_consumed);
+        }
+        let taken = (word_len as u32).saturating_add(1);
+        self.block_consumed = self
+            .block_consumed
+            .saturating_add(taken)
+            .min(self.block_len);
     }
 
     /// Bounded fix-up for `mark_last_block_paragraph_end`: the mark grows
@@ -3155,6 +3685,8 @@ where
 
         self.library.set_cached_spine(self.spine_index);
         self.library.set_section_partial(partial);
+        // True if this section finishes the current spine item.
+        self.library.set_section_ends_spine(!carry_incomplete);
         let section_id = (*self.section_count).min(u16::MAX as usize) as u16;
         let write_started = Instant::now();
         let wrote = match self.sections_dir {
@@ -3176,6 +3708,11 @@ where
             start_page: *self.total_pages,
             page_count: self.library.page_count().min(u16::MAX as usize) as u16,
             partial,
+            // Where this section opens, taken from the page that opens it.
+            logical_offset: self
+                .library
+                .page_anchor(0)
+                .map_or(0, |anchor| anchor.offset),
         };
         *self.total_pages = (*self.total_pages).saturating_add(self.library.page_count() as u32);
         *self.section_count += 1;
@@ -3225,11 +3762,15 @@ where
         style: proto::text::FontStyle,
         align: TextAlign,
         paragraph_end: bool,
+        logical_offset: u32,
     ) -> Result<(), XhtmlError> {
         if self.stopped {
             return Err(XhtmlError::TooManyRuns);
         }
         self.flush_if_full();
+        self.block_offset = logical_offset;
+        self.block_len = text.len() as u32;
+        self.block_consumed = 0;
         push_styled_preview_fragment(
             self,
             text,
@@ -3364,6 +3905,7 @@ fn push_styled_preview_fragment<
             let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
             let _ = measure.push_str(sink.line.as_str());
             sink.push_line_ink_str(measure.as_str());
+            sink.note_word_placed(word.len(), true);
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;
@@ -3395,11 +3937,14 @@ fn push_styled_preview_fragment<
             let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
             let _ = measure.push_str(sink.line.as_str());
             sink.push_line_ink_str(measure.as_str());
+            // Counted after the wrap so the word is attributed to the new line.
+            sink.note_word_placed(word.len(), true);
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;
             sink.pending_space = false;
         } else {
+            sink.note_word_placed(word.len(), line_was_empty);
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;
@@ -3502,7 +4047,7 @@ fn flush_styled_preview_line<
         role,
         align,
         paragraph_end,
-        sink.spine_index,
+        proto::anchor::ContentAnchor::at(sink.spine_index, sink.line_offset),
     ) {
         // The section arena (text bytes or the block table) just filled.
         // Flush what we have to a section file and retry the line into a
@@ -3518,7 +4063,7 @@ fn flush_styled_preview_line<
             role,
             align,
             paragraph_end,
-            sink.spine_index,
+            proto::anchor::ContentAnchor::at(sink.spine_index, sink.line_offset),
         );
     }
     if sink.library.block_count() > appended_from {

@@ -121,22 +121,30 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let wrote_index = files::write_v2_book_index(
-        root,
-        cache_key,
-        source_identity,
-        total_pages,
-        sections_slice,
-        library,
-        book_partial,
-        resume_spine,
-    );
-    if !wrote_index {
-        return PublishReport {
-            outcome: BookPublishOutcome::IndexWriteFailed,
-            cover: None,
-        };
-    }
+    // Over the layout bound with no way down, so this layout does not get an
+    // index. That is the retry: without one the next open cannot fast-hit, so
+    // it runs the eviction again. The book opens from its sections either way.
+    let indexed = if library.layout_bound_unmet() {
+        cache_log!("cache: over the layout bound; leaving this layout off the fast path");
+        false
+    } else {
+        if !files::write_v2_book_index(
+            root,
+            cache_key,
+            source_identity,
+            total_pages,
+            sections_slice,
+            library,
+            book_partial,
+            resume_spine,
+        ) {
+            return PublishReport {
+                outcome: BookPublishOutcome::IndexWriteFailed,
+                cover: None,
+            };
+        }
+        true
+    };
     // The index naming this section set is now on the card, so any section
     // file past its end is unreachable from it — safe to delete, and nothing
     // a reader could be holding. Order matters: pruning before the index
@@ -147,10 +155,11 @@ where
     // frontier rather than the book's real length; pruning against it would
     // delete the sections that walk is about to need. Only a completed
     // build — which stamps zero — knows the final count.
-    if resume_spine == 0 {
+    if indexed && resume_spine == 0 {
         let pruned = files::prune_orphan_sections(
             root,
             cache_key,
+            library.layout_key(),
             sections_slice.len().min(u16::MAX as usize) as u16,
         );
         if pruned > 0 {
@@ -241,7 +250,10 @@ where
         // truncated one is exactly as unusable and gets the same cleanup.
         BookPublishOutcome::SectionReadFailed => Err(PublishError::SectionRead),
         BookPublishOutcome::IndexWriteFailed => {
-            let _ = files::empty_cache_dir(root, cache_key.key);
+            // This layout's index and sections, not the book's whole cache:
+            // another layout's pagination is finished work, and the content
+            // cache turns the retry into a replay rather than a re-parse.
+            let _ = files::empty_layout_cache(root, cache_key.key, library.layout_key());
             Err(PublishError::IndexWrite)
         }
     }
@@ -415,7 +427,9 @@ where
     // The cursor rides in the index it describes, so a build that never comes
     // back is recognisable as one on the next open instead of masquerading as
     // a short book.
-    let wrote = if grown >= INDEX_PUBLISH_SECTIONS {
+    // Same rule as the open's publish: no index while the bound is unmet, so
+    // the next open has to look at the card again.
+    let wrote = if grown >= INDEX_PUBLISH_SECTIONS && !library.layout_bound_unmet() {
         let ok = files::write_v2_book_index(
             root,
             cache_key,

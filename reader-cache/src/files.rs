@@ -7,18 +7,19 @@ use core::ops::ControlFlow;
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
+use proto::anchor::ContentAnchor;
 use proto::cache::{
     decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
     decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
     encode_book_v2_header, encode_book_v2_section, encode_content_header,
     encode_content_record_header, encode_page, encode_section_v2_header, encode_toc,
     encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord, ContentHeader,
-    ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
-    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE, CACHE_COVER_FILE,
-    CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE,
-    CACHE_V2_DIR, CONTENT_HEADER_BYTES, CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES,
-    PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES,
-    TOC_RECORD_BYTES,
+    ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_ANCHOR_BYTES, BLOCK_RECORD_BYTES,
+    BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE,
+    CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES,
+    CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR, CONTENT_HEADER_BYTES,
+    CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES, PAGE_ANCHOR_BYTES, PAGE_RECORD_BYTES,
+    SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -30,9 +31,31 @@ use proto::durable::{
     DURABLE_OVERHEAD,
 };
 
+/// What one generation file had to say.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenerationRead {
+    /// A record, and the generation it carries.
+    Valid(u32),
+    /// Missing, short, oversized, or corrupt. A durable answer: reading it
+    /// again gets the same one.
+    Absent,
+    /// The card would not answer. Not evidence about the record.
+    Fault,
+}
+
+impl GenerationRead {
+    /// The generation when one was readable, for callers with nothing to do
+    /// about a fault.
+    fn valid(self) -> Option<u32> {
+        match self {
+            Self::Valid(generation) => Some(generation),
+            Self::Absent | Self::Fault => None,
+        }
+    }
+}
+
 /// Read and validate one durable generation file; `payload` receives the
-/// record body and the valid record's generation is returned. Any missing,
-/// short, oversized, or corrupt file reads as `None`.
+/// record body.
 fn read_generation_file<
     D,
     T,
@@ -44,26 +67,62 @@ fn read_generation_file<
     name: &str,
     magic: [u8; 4],
     payload: &mut [u8],
-) -> Option<u32>
+) -> GenerationRead
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let total = payload.len().checked_add(DURABLE_OVERHEAD)?;
+    let Some(total) = payload.len().checked_add(DURABLE_OVERHEAD) else {
+        return GenerationRead::Absent;
+    };
     if total > DURABLE_MAX_BYTES {
-        return None;
+        return GenerationRead::Absent;
     }
-    let file = directory.open_file_in_dir(name, Mode::ReadOnly).ok()?;
+    let file = match directory.open_file_in_dir(name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return GenerationRead::Absent,
+        Err(_) => return GenerationRead::Fault,
+    };
     if file.length() as usize != total {
-        return None;
+        return GenerationRead::Absent;
     }
     let mut bytes = [0u8; DURABLE_MAX_BYTES];
-    read_exact_file(&file, &mut bytes[..total]).ok()?;
-    decode_durable_record(magic, &bytes[..total], payload)
+    if read_exact_file(&file, &mut bytes[..total]).is_err() {
+        return GenerationRead::Fault;
+    }
+    match decode_durable_record(magic, &bytes[..total], payload) {
+        Some(generation) => GenerationRead::Valid(generation),
+        None => GenerationRead::Absent,
+    }
+}
+
+/// What an A/B pair had to say, with the newest valid record in `payload`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TwoGenerationRead {
+    /// At least one side held a record, and `payload` has the newest of what
+    /// could be read.
+    ///
+    /// `saw_both` is false when the other side refused, so a newer record may
+    /// sit behind that refusal, and the two kinds of caller want opposite
+    /// things about it. A record with a legacy file behind it takes what it
+    /// can get. A reading place refuses, having a bounded retry that recovers
+    /// the newer one.
+    Found { saw_both: bool },
+    /// Neither side holds a record.
+    Absent,
+    /// Neither side could be read, so there is no saying whether one is there.
+    Fault,
+}
+
+impl TwoGenerationRead {
+    /// Whether a record came back at all, for the callers with nothing better
+    /// to fall back on than an older file.
+    fn found(self) -> bool {
+        matches!(self, Self::Found { .. })
+    }
 }
 
 /// Read the newest valid generation out of an A/B file pair into `payload`.
-/// False means neither side holds a valid record.
 fn read_two_generation<
     D,
     T,
@@ -75,7 +134,7 @@ fn read_two_generation<
     names: [&str; 2],
     magic: [u8; 4],
     payload: &mut [u8],
-) -> bool
+) -> TwoGenerationRead
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -83,24 +142,33 @@ where
     let mut other = [0u8; DURABLE_MAX_BYTES];
     let a = read_generation_file(directory, names[0], magic, payload);
     let b = read_generation_file(directory, names[1], magic, &mut other[..payload.len()]);
-    match (a, b) {
-        (None, None) => false,
-        (Some(_), None) => true,
+    match (a.valid(), b.valid()) {
+        // A refusal is an absence of evidence only while nothing else
+        // answered. One readable side is a record this book really has, at
+        // worst one generation behind whatever the refused side holds, and
+        // the callers that miss here fall through to an older file or to
+        // nothing at all.
+        (None, None) if a == GenerationRead::Fault || b == GenerationRead::Fault => {
+            TwoGenerationRead::Fault
+        }
+        (None, None) => TwoGenerationRead::Absent,
+        (Some(_), None) => TwoGenerationRead::Found {
+            saw_both: b != GenerationRead::Fault,
+        },
         (None, Some(_)) => {
             payload.copy_from_slice(&other[..payload.len()]);
-            true
+            TwoGenerationRead::Found {
+                saw_both: a != GenerationRead::Fault,
+            }
         }
         (Some(a), Some(b)) if generation_is_newer(b, a) => {
             payload.copy_from_slice(&other[..payload.len()]);
-            true
+            TwoGenerationRead::Found { saw_both: true }
         }
-        (Some(_), Some(_)) => true,
+        (Some(_), Some(_)) => TwoGenerationRead::Found { saw_both: true },
     }
 }
 
-/// Write `payload` as the next generation of an A/B file pair, overwriting
-/// the *older* side so the newest survivor is never the one mid-write, then
-/// prove the write by re-reading it through the validating read path.
 /// Write one whole record over a file that is already exactly that long.
 ///
 /// Truncating first frees the cluster chain and allocates it again for the
@@ -138,6 +206,9 @@ where
     file.write(record).map_err(|_| ())
 }
 
+/// Write `payload` as the next generation of an A/B file pair, overwriting
+/// the *older* side so the newest survivor is never the one mid-write, then
+/// prove the write by re-reading it through the validating read path.
 fn write_two_generation<
     D,
     T,
@@ -157,7 +228,21 @@ where
     let mut scratch = [0u8; DURABLE_MAX_BYTES];
     let a = read_generation_file(directory, names[0], magic, &mut scratch[..payload.len()]);
     let b = read_generation_file(directory, names[1], magic, &mut scratch[..payload.len()]);
-    let (target, generation) = match (a, b) {
+    // Whatever this write lands has to beat what the other side holds, and
+    // only a side that read cleanly says what that is. One readable side sets
+    // the number and the write goes to the other, overwriting it. With
+    // neither readable and one of them refused, a refusal could be hiding a
+    // generation higher than anything this write could claim: the write would
+    // land, verify against its own target, and lose to the other side on the
+    // next read, having reported success. Two absent sides are a fresh pair
+    // and safe to number from one.
+    if a.valid().is_none()
+        && b.valid().is_none()
+        && (a == GenerationRead::Fault || b == GenerationRead::Fault)
+    {
+        return Err(());
+    }
+    let (target, generation) = match (a.valid(), b.valid()) {
         (Some(a), Some(b)) if generation_is_newer(b, a) => (0, b.wrapping_add(1)),
         (Some(a), Some(_)) => (1, a.wrapping_add(1)),
         (Some(a), None) => (1, a.wrapping_add(1)),
@@ -174,7 +259,7 @@ where
         magic,
         &mut verify[..payload.len()],
     );
-    if verified == Some(generation) && &verify[..payload.len()] == payload {
+    if verified.valid() == Some(generation) && &verify[..payload.len()] == payload {
         Ok(())
     } else {
         Err(())
@@ -266,6 +351,181 @@ fn encode_position(chapter: u16, screen: u32) -> [u8; POSITION_BYTES] {
 fn decode_position(bytes: &[u8]) -> Option<(u16, u32)> {
     proto::nvm::PositionRecord::decode(bytes, POSITION_GEOMETRY_SALT)
         .map(|record| (record.chapter, record.screen))
+}
+
+/// Where per-copy reading places live, beside the caches rather than inside
+/// one, because a place belongs to the copy and a cache belongs to a file.
+const PLACES_DIR: &str = "PLACES";
+/// The two generations one copy's place is written across, the same pair the
+/// per-book position files use, in a directory named from the copy's id.
+const PLACE_GENERATIONS: [&str; 2] = ["POSA.BIN", "POSB.BIN"];
+const PLACE_DURABLE_MAGIC: [u8; 4] = *b"X4PL";
+
+/// A copy's directory name: eight hex digits of a hash of its id, which is
+/// the whole 8.3 stem. The id is 32 hex digits and no FAT name holds it, so
+/// the record inside carries it in full and a reader checks it.
+fn place_dir_name(id: proto::identity::BookId) -> heapless::String<8> {
+    let mut hash = 0x811C_9DC5u32;
+    for byte in id.to_bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let mut out = heapless::String::<8>::new();
+    for shift in (0..8).rev() {
+        let nibble = (hash >> (shift * 4)) & 0xF;
+        let _ = out.push(char::from_digit(nibble, 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// Why a place could not be stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaceDenied {
+    /// The card refused a read or a write.
+    Fault,
+    /// Another copy's id already holds this directory. Its place stays, and
+    /// this copy has nowhere durable to put one.
+    Taken,
+}
+
+/// What a place should record as the source it was resolved against.
+///
+/// The copy's length, which is content rather than location: a move changes
+/// where the file sits and leaves this alone, which is the whole point of
+/// storing it instead of the locator-derived cache identity.
+pub const fn place_source_for(byte_size: u32) -> proto::nvm::PlaceSource {
+    proto::nvm::PlaceSource { byte_size }
+}
+
+/// Store where a reader left off in one copy.
+///
+/// The anchor is content, so this survives every layout change and every move
+/// of the file. What it does not survive is the copy being forgotten, which
+/// is the point: a place belongs to a `BookId`.
+///
+/// `source` records the content the anchor was resolved against rather than
+/// the location, so a move leaves it alone. `progression` is how far through
+/// the book the reader was, and `None` while no complete pagination has said
+/// how long the book is.
+pub fn write_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    id: proto::identity::BookId,
+    anchor: proto::anchor::ContentAnchor,
+    source: proto::nvm::PlaceSource,
+    progression: Option<u16>,
+) -> Result<(), PlaceDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|_| PlaceDenied::Fault)?;
+    let places = open_or_make_dir(&cache_root, PLACES_DIR).map_err(|_| PlaceDenied::Fault)?;
+    let name = place_dir_name(id);
+    let copy = open_or_make_dir(&places, name.as_str()).map_err(|_| PlaceDenied::Fault)?;
+    match read_place_in(&copy) {
+        PlaceRead::Found(record) if record.id != id => return Err(PlaceDenied::Taken),
+        // Whether another copy holds this directory is exactly what the card
+        // declined to say, so publishing into it would be a guess.
+        PlaceRead::Fault => return Err(PlaceDenied::Fault),
+        _ => {}
+    }
+    write_two_generation(
+        &copy,
+        PLACE_GENERATIONS,
+        PLACE_DURABLE_MAGIC,
+        &proto::nvm::PlaceRecord {
+            id,
+            anchor,
+            source,
+            progression,
+        }
+        .encode(),
+    )
+    .map_err(|_| PlaceDenied::Fault)
+}
+
+/// What the card says about where the reader left off in this copy.
+///
+/// Three answers, not two. A card that refuses a read has said nothing about
+/// the place, and treating that as "no place stored" turns an exact position
+/// into a page fallback or into nothing, with no later look to correct it.
+/// The same reasoning the cache claim is built on: failure to read ownership
+/// is not evidence that there is no owner.
+///
+/// The whole record comes back. Whether the anchor can be believed depends on
+/// the source stored beside it, which is the caller's question to ask.
+pub enum PlaceRead {
+    /// A record this copy owns.
+    Found(proto::nvm::PlaceRecord),
+    /// Nothing legible stored for it, or a directory another copy's id holds,
+    /// which reads as absent for the same reason a write is refused. Durable
+    /// either way: the next look gets the same answer.
+    Absent,
+    /// The card would not say.
+    Fault,
+}
+
+impl PlaceRead {
+    /// The record when there was one. For callers asking whether a place
+    /// exists rather than what the card could tell them.
+    pub fn found(self) -> Option<proto::nvm::PlaceRecord> {
+        match self {
+            Self::Found(record) => Some(record),
+            Self::Absent | Self::Fault => None,
+        }
+    }
+}
+
+pub fn read_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    id: proto::identity::BookId,
+) -> PlaceRead
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return PlaceRead::Absent,
+        Err(_) => return PlaceRead::Fault,
+    };
+    for step in [PLACES_DIR, place_dir_name(id).as_str()] {
+        match dir.change_dir(step) {
+            Ok(()) => {}
+            Err(embedded_sdmmc::Error::NotFound) => return PlaceRead::Absent,
+            Err(_) => return PlaceRead::Fault,
+        }
+    }
+    match read_place_in(&dir) {
+        PlaceRead::Found(record) if record.id != id => PlaceRead::Absent,
+        answer => answer,
+    }
+}
+
+fn read_place_in<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    copy: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> PlaceRead
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut bytes = [0u8; proto::nvm::PlaceRecord::ENCODED_LEN];
+    match read_two_generation(copy, PLACE_GENERATIONS, PLACE_DURABLE_MAGIC, &mut bytes) {
+        TwoGenerationRead::Fault => PlaceRead::Fault,
+        TwoGenerationRead::Absent => PlaceRead::Absent,
+        // A record with the other side unread is one generation behind at
+        // best, and this is the caller that can do better than take it: the
+        // open lands provisionally and the settle slices ask again, and while
+        // they do, the place waiting holds the card's copy against the save
+        // that would write this older one back over it.
+        TwoGenerationRead::Found { saw_both: false } => PlaceRead::Fault,
+        TwoGenerationRead::Found { saw_both: true } => {
+            match proto::nvm::PlaceRecord::decode(&bytes) {
+                Some(record) => PlaceRead::Found(record),
+                None => PlaceRead::Absent,
+            }
+        }
+    }
 }
 
 /// Per-book reading position beside the book's cache records, so
@@ -547,7 +807,9 @@ where
         POSITION_GENERATIONS,
         POSITION_DURABLE_MAGIC,
         &mut bytes,
-    ) {
+    )
+    .found()
+    {
         return decode_position(&bytes);
     }
     // Legacy single-file fallback, kept readable so an upgrade resumes at
@@ -1082,7 +1344,9 @@ where
         STATE_GENERATIONS,
         STATE_DURABLE_MAGIC,
         &mut bytes,
-    ) {
+    )
+    .found()
+    {
         return proto::nvm::AppStateRecord::decode(&bytes);
     }
     let file = cache_root
@@ -1268,6 +1532,7 @@ where
         WIFI_HINT_DURABLE_MAGIC,
         &mut bytes,
     )
+    .found()
     .then(|| proto::nvm::WifiApHintRecord::decode(&bytes))
     .flatten()
 }
@@ -1294,7 +1559,9 @@ where
         WIFI_GENERATIONS,
         WIFI_DURABLE_MAGIC,
         &mut bytes,
-    ) {
+    )
+    .found()
+    {
         return proto::nvm::WifiCredentialsRecord::decode(&bytes);
     }
     let file = cache_root
@@ -1434,8 +1701,15 @@ where
             return false;
         }
         library.toc_text_len = text_len;
-        library.toc_count = header.toc_count as usize;
     }
+    // Outside the text: the records above carry the spine target, which is
+    // what the TOC navigates by, and a book whose headings are all empty has
+    // records and no text at all. Adopting the records and leaving the count
+    // at zero threw those targets away, and on a reindex wrote the loss back
+    // to the card. Every record here already passed its bounds check against
+    // `toc_text_bytes`, so a title in a book with no text reads as empty
+    // rather than out of range.
+    library.toc_count = header.toc_count as usize;
     true
 }
 
@@ -1524,6 +1798,8 @@ where
             return BookIndexLoadResult::Invalid;
         }
         let mut sections = [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS];
+        let mut prev_anchor: Option<ContentAnchor> = None;
+        let mut expected_start_page = 0u32;
         if !read_records_batched(
             file,
             BOOK_V2_SECTION_RECORD_BYTES,
@@ -1532,13 +1808,32 @@ where
                 let Ok(record) = decode_book_v2_section(bytes) else {
                     return false;
                 };
-                if record.page_count == 0 {
+                if record.section as usize != index
+                    || record.page_count == 0
+                    || record.start_page != expected_start_page
+                {
                     return false;
                 }
+                let anchor = ContentAnchor::at(record.spine, record.logical_offset);
+                if let Some(prev) = prev_anchor {
+                    if anchor < prev {
+                        return false;
+                    }
+                }
+                prev_anchor = Some(anchor);
+                let Some(next_start) =
+                    expected_start_page.checked_add(u32::from(record.page_count))
+                else {
+                    return false;
+                };
+                expected_start_page = next_start;
                 sections[index] = record;
                 true
             },
         ) {
+            return BookIndexLoadResult::Invalid;
+        }
+        if expected_start_page != header.total_pages {
             return BookIndexLoadResult::Invalid;
         }
         if !read_v2_toc_into_library(file, &header, library) {
@@ -1767,6 +2062,530 @@ where
     cleared
 }
 
+/// How many layouts of one book keep their pagination.
+///
+/// Two, because the flow that hurts is the flip and the flip back. A third
+/// costs another paginated copy of the whole book on the card for a
+/// configuration the reader has left.
+pub const MAX_RESIDENT_LAYOUTS: usize = 2;
+
+/// Room for every layout key there is. `ui::reading::layout_key` masks to six
+/// bits, so 64 holds the whole space and a listing cannot come back short. A
+/// smaller buffer would drop names once a card went over the bound, which is
+/// the one situation the listing exists to notice.
+const LAYOUT_KEY_COUNT: usize = 64;
+
+/// The layouts this book has section files for, read off the card.
+///
+/// Listed rather than recorded. A record claiming an eviction that did not
+/// happen loses the bound for good: the files still load, nothing counts them,
+/// and no later pass looks. The directory cannot lie about itself.
+///
+/// `None` is the card declining to answer, which is not the empty list. A
+/// refused read that reads as "nothing here" is the same lost bound by a
+/// different route: the caller decides no eviction is needed and writes one
+/// more layout on top of however many are really there.
+pub fn resident_layouts<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> Option<heapless::Vec<u8, LAYOUT_KEY_COUNT>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let empty: heapless::Vec<u8, LAYOUT_KEY_COUNT> = heapless::Vec::new();
+    // One handle down the chain, as the build does, so this costs one
+    // directory slot rather than four.
+    let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return Some(empty),
+        Err(_) => return None,
+    };
+    for step in [CACHE_V2_DIR, owner.key] {
+        match dir.change_dir(step) {
+            Ok(()) => {}
+            Err(embedded_sdmmc::Error::NotFound) => return Some(empty),
+            Err(_) => return None,
+        }
+    }
+    match book_dir_claim(&dir, owner) {
+        ClaimState::MineActive => {}
+        // The claim is unreadable, so whether anything here is ours is
+        // exactly what cannot be established.
+        ClaimState::Fault => return None,
+        // Someone else's directory, or one nothing vouches for. This book
+        // keeps nothing in it and evicts nothing from it.
+        _ => return Some(empty),
+    }
+    match dir.change_dir(CACHE_SECTIONS_DIR) {
+        Ok(()) => {}
+        Err(embedded_sdmmc::Error::NotFound) => return Some(empty),
+        Err(_) => return None,
+    }
+    let mut found: heapless::Vec<u8, LAYOUT_KEY_COUNT> = heapless::Vec::new();
+    let listed = dir.iterate_dir(|entry| {
+        if entry.attributes.is_directory() || found.is_full() {
+            return ControlFlow::Continue(());
+        }
+        let mut name = String::<SHORT_NAME_BYTES>::new();
+        if write!(name, "{}", entry.name).is_err() {
+            return ControlFlow::Continue(());
+        }
+        if let Some(layout) = proto::cache::layout_of_section_file(name.as_str()) {
+            if !found.contains(&layout) {
+                let _ = found.push(layout);
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    // A listing that stopped partway has seen some of the names, and the ones
+    // it did not see are the ones that matter.
+    listed.ok().map(|()| found)
+}
+
+/// Delete one layout's section files and nothing else.
+///
+/// The book index stays. It is one file for the book rather than one per
+/// layout, and the surviving layout needs its labels and TOC to rebuild an
+/// index from the sections it still has.
+pub fn evict_layout_sections<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    layout: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // Every step down to the sections answers the same way. A directory that
+    // is not there is nothing to delete, so this layout is gone and the bound
+    // holds. Any other error is the card refusing, and the files are still
+    // there and still counted, so the caller has to hear no and try again on
+    // the next open. Reporting success would drop the layout from the
+    // caller's list and lose the bound for good.
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
+    };
+    let cache = match cache_root.open_dir(CACHE_V2_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
+    };
+    let book = match cache.open_dir(key) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
+    };
+    match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => delete_layout_sections(&sections, layout),
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    }
+}
+
+/// Make room for `keep` among this book's stored layouts.
+///
+/// Runs only before a layout's first index is written, the one moment a book
+/// gains one. Evicting on every open would mean evicting whatever the reader
+/// is not using at this instant, which keeps no pagination at all.
+///
+/// `false` means a delete was refused and the layout it named is still
+/// counted, so the next open tries again. The caller builds either way:
+/// eviction only runs when a build was going to happen, so refusing over a
+/// failed delete would refuse a book because the card would not free a file.
+pub fn evict_layouts_for<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    keep: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(mut resident) = resident_layouts(root, owner) else {
+        // Deciding what to evict from a list that might be short is the same
+        // lost bound as evicting nothing, so the answer is no.
+        return false;
+    };
+    // What the bound governs is how many layouts the book holds when this
+    // open is done. One already on the card is one of them; one that is
+    // arriving needs a slot left free for it.
+    let budget = if resident.contains(&keep) {
+        MAX_RESIDENT_LAYOUTS
+    } else {
+        MAX_RESIDENT_LAYOUTS - 1
+    };
+    if resident.len() <= budget {
+        return true;
+    }
+    // Nothing on the card says which layout the reader used last, and a record
+    // that did could drift from the files. The lowest key that is not the one
+    // arriving is the deterministic choice.
+    resident.sort_unstable();
+    while resident.len() > budget {
+        let Some(victim) = resident.iter().copied().find(|layout| *layout != keep) else {
+            break;
+        };
+        if !evict_layout_sections(root, owner.key, victim) {
+            return false;
+        }
+        resident.retain(|layout| *layout != victim);
+    }
+    resident.len() <= budget
+}
+
+/// The spine item a finished content capture ended on.
+///
+/// Once another layout has rewritten the shared book index, this is the only
+/// thing left on the card that knows how far the book goes. A capture's
+/// header stays incomplete until its walk reaches the end, and the last
+/// record that walk writes is its final spine-end marker.
+///
+/// `None` for no capture, one written for another file under the same key, or
+/// one whose walk did not finish.
+pub fn captured_final_spine<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    source_identity: (u32, u32),
+) -> Option<u16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_content_file(root, owner, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; CONTENT_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return None;
+        }
+        let header = proto::cache::decode_content_header(&header_bytes).ok()?;
+        if !header.complete
+            || header.source_hash != source_identity.0
+            || header.source_size != source_identity.1
+        {
+            return None;
+        }
+        // The final record is a bare spine-end marker, so it sits exactly one
+        // record header back from the end.
+        let at = (header.content_len as usize).checked_sub(CONTENT_RECORD_HEADER_BYTES)?;
+        if at < CONTENT_HEADER_BYTES || file.seek_from_start(at as u32).is_err() {
+            return None;
+        }
+        let mut record_bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
+        if read_exact_file(file, &mut record_bytes).is_err() {
+            return None;
+        }
+        let record = proto::cache::decode_content_record_header(&record_bytes).ok()?;
+        record.spine_end.then_some(record.spine_index)
+    })
+    .flatten()
+}
+
+/// How many section files one layout has on the card.
+///
+/// `None` when the card would not say. Counted rather than inferred from the
+/// ordinals a scan reached: a scan stops at the first ordinal it cannot open,
+/// and a set with a hole in it stops early while more files sit past the gap.
+fn layout_section_file_count<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    layout: u8,
+) -> Option<usize>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    with_v2_sections_dir(root, owner, |sections| {
+        let sections = sections?;
+        let mut found = 0usize;
+        let listed = sections.iterate_dir(|entry| {
+            if entry.attributes.is_directory() {
+                return ControlFlow::Continue(());
+            }
+            let mut name = String::<SHORT_NAME_BYTES>::new();
+            if write!(name, "{}", entry.name).is_ok()
+                && proto::cache::layout_of_section_file(name.as_str()) == Some(layout)
+            {
+                found += 1;
+            }
+            ControlFlow::Continue(())
+        });
+        listed.ok().map(|()| found)
+    })
+}
+
+/// Rebuild a book index from the section files already on the card for one
+/// layout.
+///
+/// For the flip and the flip back. The sections are one file per layout and
+/// the index is one per book, so a reader who changes typography and changes
+/// back still has their old pagination and has lost only the index naming it.
+/// Rebuilding reads one header per section instead of re-parsing the EPUB.
+///
+/// A section prefix is not a book, and an abandoned walk leaves one that looks
+/// finished: pagination suspends at spine boundaries, so its last section is
+/// clean. Answers only for a set of whole sections, each matching this layout
+/// and source, carrying the spine item a finished capture ended on through to
+/// its end, with no section files past where the scan stopped. `None` leaves
+/// the caller to build from the EPUB.
+pub fn reindex_layout_from_sections<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+    sections: &mut [proto::cache::BookV2SectionRecord],
+) -> Option<(usize, u32)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let layout = library.layout_key();
+    let want_config = layout::reader_layout_config(library.type_settings(), library.portrait());
+    let want_font = library.custom_font_identity();
+    let Some(final_spine) = captured_final_spine(root, owner, source_identity) else {
+        cache_log!("cache: no finished capture, so nothing vouches for this layout's sections");
+        return None;
+    };
+    let mut count = 0usize;
+    let mut total_pages = 0u32;
+    let mut ends_partial = false;
+    let mut ends_spine = false;
+    while count < sections.len() {
+        let ordinal = count as u16;
+        let read = with_v2_section_file(root, owner, layout, ordinal, Mode::ReadOnly, |file| {
+            let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
+            if read_exact_file(file, &mut bytes).is_err() {
+                return None;
+            }
+            let header = decode_section_v2_header(&bytes).ok()?;
+            if header.source_hash != source_identity.0
+                || header.source_size != source_identity.1
+                || header.font_config != want_config
+                || header.custom_font_identity != want_font
+                || header.page_count == 0
+            {
+                return None;
+            }
+            // The header goes down before the body it describes, `ends_spine`
+            // with it, so a write that tore partway through leaves a section
+            // claiming to finish a chapter it no longer holds. The header says
+            // exactly how long the file should be.
+            if file.length() as usize != proto::cache::section_v2_cache_size(header) {
+                return None;
+            }
+            // Where the section opens in its item's content, which the
+            // index carries for it.
+            let skip = header.page_count as u32 * PAGE_RECORD_BYTES as u32;
+            if file.seek_from_current(skip as i32).is_err() {
+                return None;
+            }
+            let mut anchor = [0u8; PAGE_ANCHOR_BYTES];
+            if read_exact_file(file, &mut anchor).is_err() {
+                return None;
+            }
+            Some((header, u32::from_le_bytes(anchor)))
+        })
+        .flatten();
+        let Some((header, logical_offset)) = read else {
+            break;
+        };
+        sections[count] = proto::cache::BookV2SectionRecord {
+            section: ordinal,
+            spine: header.spine,
+            start_page: total_pages,
+            page_count: header.page_count,
+            partial: header.partial,
+            logical_offset,
+        };
+        total_pages = total_pages.saturating_add(u32::from(header.page_count));
+        ends_spine = header.ends_spine;
+        count += 1;
+        // A partial section is the tail of a build that stopped. Nothing
+        // follows it, and claiming otherwise would fence the reader in behind
+        // a page count nothing will raise.
+        if header.partial {
+            ends_partial = true;
+            break;
+        }
+    }
+    if count == 0 || total_pages == 0 {
+        return None;
+    }
+    if ends_partial {
+        cache_log!("cache: this layout's sections end where a build stopped inside one");
+        return None;
+    }
+    if sections[count - 1].spine != final_spine {
+        cache_log!("cache: this layout's sections stop short of the spine the book ends on");
+        return None;
+    }
+    // Reaching the book's last spine item is not reaching the end of it. A
+    // long item spans several sections, and the write of its last one can
+    // fail with nothing behind the gap to give it away.
+    if !ends_spine {
+        cache_log!("cache: this layout's sections stop inside the spine the book ends on");
+        return None;
+    }
+    // The scan stops at the first ordinal it cannot open, which a hole looks
+    // exactly like. Anything past the gap is still on the card and still part
+    // of the book.
+    if layout_section_file_count(root, owner, layout) != Some(count) {
+        cache_log!("cache: this layout has section files the scan did not reach");
+        return None;
+    }
+    Some((count, total_pages))
+}
+
+/// Clear one layout's pagination and the book index, leaving every other
+/// layout's sections, the content cache, the TOC, the cover and the claim
+/// alone. Reports whether everything it meant to remove is gone.
+///
+/// The narrow form of [`empty_cache_dir`], for the failure paths that have to
+/// throw away a half-written index. Emptying the whole directory takes the
+/// other layout's finished work as collateral, and takes `CONT.BIN` with it,
+/// which turns the next open from a replay into a full re-parse of the EPUB.
+///
+/// Eviction wants [`evict_layout_sections`] instead: the index is one file for
+/// the book, so taking it there would strand the layout that is staying.
+pub fn empty_layout_cache<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    layout: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
+    };
+    let cache = match cache_root.open_dir(CACHE_V2_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
+    };
+    let book = match cache.open_dir(key) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
+    };
+    let index_gone = match book.delete_entry_in_dir(CACHE_BOOK_FILE) {
+        Ok(()) => true,
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    };
+    let sections_gone = match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => delete_layout_sections(&sections, layout),
+        Err(embedded_sdmmc::Error::NotFound) => true,
+        Err(_) => false,
+    };
+    index_gone && sections_gone
+}
+
+/// Delete every section file belonging to `layout`, in bounded batches, the
+/// way the orphan prune does: the directory walk does not promise anything
+/// about deleting while iterating.
+fn delete_layout_sections<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    layout: u8,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let max_passes = MAX_BOOK_SECTIONS.div_ceil(SECTION_SWEEP_BATCH) + 1;
+    for _ in 0..max_passes {
+        let mut names: heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH> =
+            heapless::Vec::new();
+        if sections
+            .iterate_dir(|entry| {
+                if names.is_full() {
+                    return ControlFlow::Break(());
+                }
+                if entry.attributes.is_directory() {
+                    return ControlFlow::Continue(());
+                }
+                let mut name = String::<SHORT_NAME_BYTES>::new();
+                if write!(name, "{}", entry.name).is_err() {
+                    return ControlFlow::Continue(());
+                }
+                if proto::cache::section_file_is_layout(name.as_str(), layout) {
+                    let _ = names.push(name);
+                }
+                ControlFlow::Continue(())
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if names.is_empty() {
+            return true;
+        }
+        for name in &names {
+            if upload_store::remove_file_reclaiming_clusters(sections, name.as_str())
+                == upload_store::RemoveStatus::Failed
+            {
+                return false;
+            }
+        }
+    }
+    false
+}
+
 pub fn empty_cache_dir<
     D,
     T,
@@ -1836,20 +2655,34 @@ where
     cleared
 }
 
-/// The section ordinal a `S###.BIN` name encodes, or `None` for any other
-/// name. Parsed rather than trusted: `SECTIONS/` is on removable media, so a
-/// name that is not one of ours must be left alone, not miscounted into the
-/// prune range.
-fn section_ordinal_from_name(name: &str) -> Option<u16> {
-    let digits = name
-        .strip_prefix(['S', 's'])?
-        .get(..3)
-        .filter(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))?;
-    let suffix = name.get(4..)?;
-    if !suffix.eq_ignore_ascii_case(".BIN") {
+/// The section ordinal a `S<layout><###>.BIN` name encodes, when the name
+/// belongs to `layout`. `None` for any other name, including one belonging to
+/// a different layout.
+///
+/// Parsed rather than trusted: `SECTIONS/` is on removable media, so a name
+/// that is not one of ours is left alone rather than miscounted into the
+/// prune range. Another layout's files count as not ours, since a prune for
+/// one layout must leave the others where they are.
+fn section_ordinal_from_name(name: &str, layout: u8) -> Option<u16> {
+    if !proto::cache::section_file_is_layout(name, layout) {
         return None;
     }
-    digits.parse::<u16>().ok()
+    // Over bytes throughout, for the reason `section_file_is_layout` gives:
+    // one FAT byte past 0x7F turns into two here and moves every offset.
+    let bytes = name.as_bytes();
+    let digits = bytes.get(3..6)?;
+    if !digits.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let suffix = bytes.get(6..)?;
+    if !suffix.eq_ignore_ascii_case(b".BIN") {
+        return None;
+    }
+    let mut ordinal = 0u16;
+    for digit in digits {
+        ordinal = ordinal.wrapping_mul(10) + u16::from(digit - b'0');
+    }
+    Some(ordinal)
 }
 
 /// Delete the section files a freshly published index no longer names.
@@ -1888,6 +2721,7 @@ fn prune_orphan_sections_in<
     const MAX_VOLUMES: usize,
 >(
     sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    layout: u8,
     keep_count: u16,
 ) -> usize
 where
@@ -1918,7 +2752,7 @@ where
                 if write!(name, "{}", entry.name).is_err() {
                     return ControlFlow::Continue(());
                 }
-                match section_ordinal_from_name(name.as_str()) {
+                match section_ordinal_from_name(name.as_str(), layout) {
                     Some(ordinal) if ordinal >= keep_count => {
                         let _ = names.push(name);
                     }
@@ -1973,6 +2807,7 @@ pub fn prune_orphan_sections<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout: u8,
     keep_count: u16,
 ) -> usize
 where
@@ -1980,7 +2815,7 @@ where
     T: TimeSource,
 {
     with_v2_sections_dir(root, owner, |sections| match sections {
-        Some(sections) => prune_orphan_sections_in(sections, keep_count),
+        Some(sections) => prune_orphan_sections_in(sections, layout, keep_count),
         None => 0,
     })
 }
@@ -2278,6 +3113,7 @@ where
     let result = load_v2_section_cache(
         root,
         owner,
+        library.layout_key(),
         source_identity,
         section.section,
         section.spine,
@@ -2287,7 +3123,14 @@ where
     if let CacheLoadResult::Hit { pages, repaginated } = result {
         library.set_current_section_range(section.start_page, pages);
         if repaginated {
-            let _ = write_v2_section_cache(root, owner, source_identity, section.section, library);
+            let _ = write_v2_section_cache(
+                root,
+                owner,
+                library.layout_key(),
+                source_identity,
+                section.section,
+                library,
+            );
         }
     }
     result
@@ -2317,6 +3160,9 @@ where
     }
 }
 
+// The section's identity is spread across its arguments: which book, which
+// layout, which bytes, which section, and where to put it.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn load_v2_section_cache<
     D,
     T,
@@ -2326,6 +3172,7 @@ pub(crate) fn load_v2_section_cache<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout_key: u8,
     source_identity: (u32, u32),
     section: u16,
     expected_spine: u16,
@@ -2336,7 +3183,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_section_file(root, owner, section, Mode::ReadOnly, |file| {
+    with_v2_section_file(root, owner, layout_key, section, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return CacheLoadResult::Invalid;
@@ -2390,6 +3237,7 @@ pub(crate) fn write_v2_section_cache<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout_key: u8,
     source_identity: (u32, u32),
     section: u16,
     library: &ReaderStore,
@@ -2405,6 +3253,7 @@ where
     with_v2_section_file(
         root,
         owner,
+        layout_key,
         section,
         Mode::ReadWriteCreateOrTruncate,
         |file| write_v2_section_body(file, source_identity, library.cached_spine, library),
@@ -2474,7 +3323,7 @@ where
     T: TimeSource,
 {
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-    section_file_name(section, &mut name);
+    section_file_name(library.layout_key(), section, &mut name);
     match sections.open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate) {
         Ok(file) => write_v2_section_body(&file, source_identity, library.cached_spine, library),
         Err(_) => {
@@ -3187,6 +4036,10 @@ where
 
     /// Record one `push_block` call. The text follows the fixed record
     /// header; see `proto::cache::ContentRecordHeader`.
+    // One captured block, written out field by field rather than as a
+    // record struct: the caller is the sink's own push_block, whose
+    // arguments these already are.
+    #[expect(clippy::too_many_arguments)]
     pub fn push_block_record(
         &mut self,
         spine_index: u16,
@@ -3195,6 +4048,7 @@ where
         style: proto::text::FontStyle,
         align: proto::text::TextAlign,
         paragraph_end: bool,
+        logical_offset: u32,
     ) {
         if self.file.is_none() {
             return;
@@ -3217,6 +4071,7 @@ where
                 align,
                 paragraph_end,
                 spine_end: false,
+                logical_offset,
             },
             &mut header,
         )
@@ -3245,6 +4100,7 @@ where
                 role: proto::text::TextRole::Body,
                 style: proto::text::FontStyle::Regular,
                 align: proto::text::TextAlign::Left,
+                logical_offset: 0,
                 paragraph_end: false,
                 spine_end: true,
             },
@@ -3371,6 +4227,7 @@ fn with_v2_section_file<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
+    layout_key: u8,
     spine: u16,
     mode: Mode,
     f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
@@ -3382,9 +4239,177 @@ where
     let book_dir = open_v2_book_dir(root, owner)?;
     let sections = book_dir.open_dir(CACHE_SECTIONS_DIR).ok()?;
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-    section_file_name(spine, &mut name);
+    section_file_name(layout_key, spine, &mut name);
     let file = sections.open_file_in_dir(name.as_str(), mode).ok()?;
     Some(f(&file))
+}
+
+/// Reads the first page anchor of a section file, validating it against expected metadata.
+fn read_section_start<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    library: &ReaderStore,
+    source_identity: (u32, u32),
+    expected: &BookV2SectionRecord,
+) -> Option<ContentAnchor>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let want_config = layout::reader_layout_config(library.type_settings(), library.portrait());
+    let want_font = library.custom_font_identity();
+    with_v2_section_file(
+        root,
+        owner,
+        library.layout_key(),
+        expected.section,
+        Mode::ReadOnly,
+        |file| {
+            let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
+            if read_exact_file(file, &mut header_bytes).is_err() {
+                return None;
+            }
+            let header = decode_section_v2_header(&header_bytes).ok()?;
+            if header.spine != expected.spine
+                || header.page_count != expected.page_count
+                || header.source_hash != source_identity.0
+                || header.source_size != source_identity.1
+                || header.font_config != want_config
+                || header.custom_font_identity != want_font
+                || header.page_count == 0
+            {
+                return None;
+            }
+            let skip = (header.page_count as usize * PAGE_RECORD_BYTES) as u32;
+            file.seek_from_current(skip as i32).ok()?;
+            let mut anchor_bytes = [0u8; PAGE_ANCHOR_BYTES];
+            if read_exact_file(file, &mut anchor_bytes).is_err() {
+                return None;
+            }
+            let offset = u32::from_le_bytes(anchor_bytes);
+            if offset != expected.logical_offset {
+                return None;
+            }
+            Some(ContentAnchor::at(header.spine, offset))
+        },
+    )
+    .flatten()
+}
+
+/// Which page of one section holds `anchor`, as an index within that section.
+///
+/// Reads the section's page anchors and verifies offsets against the index.
+/// Returns `None` if the section cannot be read, does not match the index, or
+/// does not contain the anchor.
+pub fn page_of_anchor_in_section<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    library: &ReaderStore,
+    source_identity: (u32, u32),
+    section: u16,
+    anchor: proto::anchor::ContentAnchor,
+) -> Option<u16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let want_config = layout::reader_layout_config(library.type_settings(), library.portrait());
+    let want_font = library.custom_font_identity();
+    let page = with_v2_section_file(
+        root,
+        owner,
+        library.layout_key(),
+        section,
+        Mode::ReadOnly,
+        |file| {
+            let mut header = [0u8; SECTION_V2_HEADER_BYTES];
+            if read_exact_file(file, &mut header).is_err() {
+                return None;
+            }
+            let header = decode_section_v2_header(&header).ok()?;
+            // Validate all layout, font, and source attributes matching the section.
+            if header.spine != anchor.spine
+                || header.source_hash != source_identity.0
+                || header.source_size != source_identity.1
+                || header.font_config != want_config
+                || header.custom_font_identity != want_font
+            {
+                return None;
+            }
+            let page_count = header.page_count as usize;
+            if page_count == 0 {
+                return None;
+            }
+            let section_record = library.book_section(section as usize);
+            if let Some(record) = section_record {
+                if record.section != section
+                    || record.spine != header.spine
+                    || record.page_count != header.page_count
+                {
+                    return None;
+                }
+            }
+            let skip = (page_count * PAGE_RECORD_BYTES) as u32;
+            file.seek_from_current(skip as i32).ok()?;
+            let mut found = None;
+            let mut prev_offset: Option<u32> = None;
+            if !read_records_batched(file, PAGE_ANCHOR_BYTES, page_count, |index, bytes| {
+                let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                if index == 0 {
+                    if let Some(record) = section_record {
+                        if record.logical_offset != offset {
+                            return false;
+                        }
+                    }
+                }
+                if let Some(prev) = prev_offset {
+                    if offset < prev {
+                        return false;
+                    }
+                }
+                prev_offset = Some(offset);
+                if ContentAnchor::at(header.spine, offset) <= anchor {
+                    found = Some(index as u16);
+                }
+                true
+            }) {
+                return None;
+            }
+            found.or(if section == 0 && anchor.spine == header.spine {
+                Some(0)
+            } else {
+                None
+            })
+        },
+    )
+    .flatten()?;
+
+    if let Some((next_sec, next_rec)) = section
+        .checked_add(1)
+        .and_then(|s| library.book_section(s as usize).map(|r| (s, r)))
+    {
+        if next_rec.section != next_sec {
+            return None;
+        }
+        let next_start = read_section_start(root, owner, library, source_identity, &next_rec)?;
+        if anchor >= next_start {
+            return None;
+        }
+    }
+
+    Some(page)
 }
 
 fn with_v2_book_file<
@@ -3689,6 +4714,19 @@ where
     }) {
         return false;
     }
+    let mut prev_page_offset: Option<u32> = None;
+    if !read_records_batched(file, PAGE_ANCHOR_BYTES, page_count, |index, bytes| {
+        let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if let Some(prev) = prev_page_offset {
+            if offset < prev {
+                return false;
+            }
+        }
+        prev_page_offset = Some(offset);
+        library.set_cached_page_offset(index, offset)
+    }) {
+        return false;
+    }
     if !read_records_batched(file, BLOCK_RECORD_BYTES, block_count, |index, bytes| {
         let Ok(block) = decode_block(bytes) else {
             return false;
@@ -3698,6 +4736,14 @@ where
             block,
             display_style_for_proto_style(block.style),
             header.spine,
+        )
+    }) {
+        return false;
+    }
+    if !read_records_batched(file, BLOCK_ANCHOR_BYTES, block_count, |index, bytes| {
+        library.set_cached_block_offset(
+            index,
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         )
     }) {
         return false;
@@ -3720,6 +4766,7 @@ where
         block_count,
         text_bytes,
         header.partial,
+        header.ends_spine,
     );
     true
 }
@@ -3754,6 +4801,7 @@ where
         bytes_consumed: 0,
         total_bytes: 0,
         partial: library.section_partial,
+        ends_spine: library.section_ends_spine,
     };
     let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
     if encode_section_v2_header(header, &mut bytes).is_err() || file.write(&bytes).is_err() {
@@ -3787,11 +4835,23 @@ where
             return false;
         }
     }
+    for offset in library.page_offset.iter().take(library.page_count) {
+        if stage.push(&offset.to_le_bytes()).is_err() {
+            cache_log!("cache: write page anchor failed");
+            return false;
+        }
+    }
     for block in library.blocks.iter().take(library.block_count) {
         if encode_block(*block, &mut record[..BLOCK_RECORD_BYTES]).is_err()
             || stage.push(&record[..BLOCK_RECORD_BYTES]).is_err()
         {
             cache_log!("cache: write block record failed");
+            return false;
+        }
+    }
+    for offset in library.block_offset.iter().take(library.block_count) {
+        if stage.push(&offset.to_le_bytes()).is_err() {
+            cache_log!("cache: write block anchor failed");
             return false;
         }
     }
