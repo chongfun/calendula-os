@@ -34,22 +34,32 @@
 //!    A single stray match is [`ProbeVerdict::Inconclusive`].
 //! 2. **FLG must be *driven*.** `0x00` and `0xFF` are floating-bus artifacts,
 //!    and a real idle status has `BUSY_N` (bit 0) set.
-//! 3. **The MTP key is an escalation path.** Field UC8279d units answer VER
+//! 3. **The MTP dump is an escalation path.** Field UC8279d units answer VER
 //!    with a blank `FF FF FF FF FF`, which rule 2's floating test rejects — and
 //!    a pulled-up floating bus reads `FF` too. Recovering them needs positive
-//!    evidence, not the absence of negative: the MTP dump must open with the
-//!    `0xA5` refresh-enable key, which only a real UC81xx with a programmed MTP
-//!    can produce.
+//!    evidence, not the absence of negative, and the RMTP dump supplies it in
+//!    one of two shapes:
+//!
+//!    - it opens with the `0xA5` refresh-enable key, which only a UC81xx with
+//!      a *programmed* MTP can produce; or
+//!    - it is **non-uniform and repeats byte for byte on a second read**. The
+//!      UC8279d modules in the field ship a *blank* MTP (FreeInk `3c74ea8`):
+//!      zeros, plus a LUT version stamp at `0x01A`, and no key anywhere. The
+//!      silicon still drives the readback, so the dump is real and stable. A
+//!      part with no RMTP command floats the line to a uniform pull-up
+//!      pattern, and floating garbage can be non-uniform once but cannot
+//!      repeat [`MTP_BYTES`] bytes exactly.
 //!
 //!    **This is not a theoretical guard.** A shipping UC8253 X3, benched
 //!    2026-08-07, answers the probe with `VER = FF FF FF FF FF` and
 //!    `FLG = 0x13` — byte for byte the field UC8279d signature. Its FLG line is
 //!    genuinely driven, so rule 2 passes it; its VER is blank, so the rule 3
 //!    condition is met in full. The *only* thing between that unit and a false
-//!    sibling confirmation is its MTP dump reading all `FF` instead of opening
-//!    with `0xA5`. Relax the key check and this firmware misidentifies the
-//!    controller in the installed base it was written for. See
-//!    `a_shipping_uc8253_is_only_told_apart_by_its_mtp`.
+//!    sibling confirmation is its MTP dump reading a uniform `FF`, which has no
+//!    key and earns no second read. Relax either shape and this firmware
+//!    misidentifies the controller in the installed base it was written for.
+//!    See `a_shipping_uc8253_is_only_told_apart_by_its_mtp` and
+//!    `a_repeating_uniform_dump_is_still_not_evidence`.
 //!
 //!    Rule 3 also constrains *timing*, which is easy to miss because the
 //!    condition lives here and the consequence lives in the caller. A blank-VER
@@ -217,32 +227,74 @@ pub fn needs_identify_confirm(pass1: &PassReading) -> bool {
     pass1.matches_uc81xx() || is_blank_ver_candidate(pass1)
 }
 
-/// Rule 3: the blank-VER recovery, which needs the MTP key as positive
-/// evidence before it will overrule the floating-bus test.
+/// The two passes' half of rule 3: a blank-VER pass 1 whose status pass 2
+/// also drove, both reading the same VER. Only with this in place is the MTP
+/// dump worth consulting at all.
 ///
 /// Both passes must show a driven status. Requiring it of pass 1 alone would
 /// hand rule 1's two-pass agreement away on exactly this path: a pass 2 that
 /// answered nothing reads back an all-`FF` VER, which equals a blank pass 1's
 /// VER, so the equality check below would be satisfied by a bus that supplied
 /// no evidence at all.
-pub fn mtp_key_confirms(
+pub fn blank_ver_recovery_armed(pass1: &PassReading, pass2: &PassReading) -> bool {
+    is_blank_ver_candidate(pass1) && pass2.flg_is_driven() && pass1.ver == pass2.ver
+}
+
+/// Every byte the same: what a part without an RMTP command leaves on the
+/// line (a pulled-up `FF`, or `00` where no pull-up reaches).
+pub fn mtp_is_uniform(mtp: &[u8; MTP_BYTES]) -> bool {
+    mtp.iter().all(|byte| *byte == mtp[0])
+}
+
+/// Whether the dump just taken calls for a second RMTP read.
+///
+/// Only on the armed blank-VER path, and only when the first dump is the
+/// blank-MTP shape: no key (a key settles it on its own) and not uniform (a
+/// uniform dump is a floating line, and reading it twice proves nothing). The
+/// second read costs `MTP_BYTES + 1` bit-banged bytes, so a caller spends it
+/// exactly where the answer can change.
+pub fn needs_mtp_repeat(pass1: &PassReading, pass2: &PassReading, mtp: &[u8; MTP_BYTES]) -> bool {
+    blank_ver_recovery_armed(pass1, pass2)
+        && mtp[0] != MTP_REFRESH_ENABLE_KEY
+        && !mtp_is_uniform(mtp)
+}
+
+/// Rule 3: the blank-VER recovery, which needs positive evidence from the MTP
+/// dump before it will overrule the floating-bus test: the refresh-enable
+/// key, or a non-uniform dump that a second read reproduced exactly.
+///
+/// The uniform check is repeated here rather than trusted to the caller's
+/// [`needs_mtp_repeat`]: a uniform dump handed in twice must still fail, or a
+/// caller that reads the MTP twice unconditionally would confirm a UC8253.
+pub fn mtp_confirms(
     pass1: &PassReading,
     pass2: &PassReading,
     mtp: Option<&[u8; MTP_BYTES]>,
+    mtp_repeat: Option<&[u8; MTP_BYTES]>,
 ) -> bool {
-    is_blank_ver_candidate(pass1)
-        && pass2.flg_is_driven()
-        && pass1.ver == pass2.ver
-        && mtp.is_some_and(|mtp| mtp[0] == MTP_REFRESH_ENABLE_KEY)
+    let Some(mtp) = mtp else {
+        return false;
+    };
+    if !blank_ver_recovery_armed(pass1, pass2) {
+        return false;
+    }
+    if mtp[0] == MTP_REFRESH_ENABLE_KEY {
+        return true;
+    }
+    !mtp_is_uniform(mtp) && mtp_repeat.is_some_and(|repeat| repeat == mtp)
 }
 
-/// The whole decision, from two passes and whatever MTP dump was taken.
+/// The whole decision, from two passes and whatever MTP dumps were taken.
+///
+/// `mtp_repeat` is the second RMTP read a caller took because
+/// [`needs_mtp_repeat`] asked for it; `None` when it did not.
 pub fn resolve(
     pass1: &PassReading,
     pass2: &PassReading,
     mtp: Option<&[u8; MTP_BYTES]>,
+    mtp_repeat: Option<&[u8; MTP_BYTES]>,
 ) -> ProbeVerdict {
-    if agrees_on_uc81xx(pass1, pass2) || mtp_key_confirms(pass1, pass2, mtp) {
+    if agrees_on_uc81xx(pass1, pass2) || mtp_confirms(pass1, pass2, mtp, mtp_repeat) {
         ProbeVerdict::Uc81xxConfirmed
     } else if !pass1.matches_uc81xx() && !pass2.matches_uc81xx() {
         ProbeVerdict::DefaultAssumed
@@ -302,6 +354,14 @@ mod tests {
         mtp
     }
 
+    /// The blank MTP the field UC8279d ships with (FreeInk `3c74ea8`): zeros,
+    /// a LUT version stamp at `0x01A`, and no key.
+    fn mtp_blank_with_stamp() -> [u8; MTP_BYTES] {
+        let mut mtp = [0u8; MTP_BYTES];
+        mtp[0x01A] = 0x66;
+        mtp
+    }
+
     /// Bench truth, 2026-08-07, a shipping UC8253 X3: `VER = FF FF FF FF FF`,
     /// `FLG = 0x13`, MTP all `FF`, on twelve consecutive probes.
     ///
@@ -327,14 +387,103 @@ mod tests {
 
         // ...and the dump is the only thing that refuses it.
         assert_eq!(
-            resolve(&observed, &observed, Some(&mtp_all_ff)),
+            resolve(&observed, &observed, Some(&mtp_all_ff), None),
             ProbeVerdict::DefaultAssumed
+        );
+        assert!(
+            !needs_mtp_repeat(&observed, &observed, &mtp_all_ff),
+            "and a uniform dump does not even earn the second read"
         );
         // Swap in a programmed MTP and the very same reading confirms, which
         // is exactly how little daylight there is between the two parts.
         assert_eq!(
-            resolve(&observed, &observed, Some(&mtp_with_key())),
+            resolve(&observed, &observed, Some(&mtp_with_key()), None),
             ProbeVerdict::Uc81xxConfirmed
+        );
+    }
+
+    /// Rule 3's second shape. The blank-MTP UC8279d has no key to offer, but
+    /// its RMTP readback is driven, so it reads the same twice; that is the
+    /// evidence, and a repeat that differs by one byte is not.
+    #[test]
+    fn a_blank_mtp_uc8279d_confirms_when_its_dump_repeats() {
+        let part = BLANK_VER_DRIVEN_FLG;
+        let dump = mtp_blank_with_stamp();
+        assert!(
+            needs_mtp_repeat(&part, &part, &dump),
+            "keyless and non-uniform: the second read decides"
+        );
+        assert_eq!(
+            resolve(&part, &part, Some(&dump), Some(&dump)),
+            ProbeVerdict::Uc81xxConfirmed
+        );
+        assert_eq!(
+            resolve(&part, &part, Some(&dump), None),
+            ProbeVerdict::DefaultAssumed,
+            "one keyless dump alone is not evidence"
+        );
+        let mut differs = dump;
+        differs[MTP_BYTES - 1] ^= 0x01;
+        assert_eq!(
+            resolve(&part, &part, Some(&dump), Some(&differs)),
+            ProbeVerdict::DefaultAssumed,
+            "a dump that changed between reads is a floating line"
+        );
+    }
+
+    /// The second read is spent only where it can change the answer: not on a
+    /// key (already decisive), not on a uniform dump (a floating line), and
+    /// not off the armed blank-VER path at all.
+    #[test]
+    fn the_second_mtp_read_is_taken_only_for_a_keyless_non_uniform_dump() {
+        let part = BLANK_VER_DRIVEN_FLG;
+        assert!(!needs_mtp_repeat(&part, &part, &mtp_with_key()));
+        assert!(!needs_mtp_repeat(&part, &part, &[0xFF; MTP_BYTES]));
+        assert!(!needs_mtp_repeat(&part, &part, &[0x00; MTP_BYTES]));
+        assert!(!needs_mtp_repeat(
+            &part,
+            &FLOATING_HIGH,
+            &mtp_blank_with_stamp()
+        ));
+        assert!(!needs_mtp_repeat(&UC8179, &UC8179, &mtp_blank_with_stamp()));
+        assert!(needs_mtp_repeat(&part, &part, &mtp_blank_with_stamp()));
+    }
+
+    /// The guard the repeat rule must not loosen. A UC8253's floating `FF`
+    /// dump repeats perfectly too, so a caller that read it twice anyway must
+    /// still get the default controller: uniformity is checked in the verdict,
+    /// not only in the decision to read again.
+    #[test]
+    fn a_repeating_uniform_dump_is_still_not_evidence() {
+        let part = BLANK_VER_DRIVEN_FLG;
+        for dump in [[0xFFu8; MTP_BYTES], [0x00u8; MTP_BYTES]] {
+            assert_eq!(
+                resolve(&part, &part, Some(&dump), Some(&dump)),
+                ProbeVerdict::DefaultAssumed,
+                "uniform dump {:02X} repeated is still a floating line",
+                dump[0]
+            );
+        }
+    }
+
+    /// The repeat shape obeys rules 1 and 2 like the key does: a stable dump
+    /// off a bus whose status line is dead, or whose passes disagree, confirms
+    /// nothing.
+    #[test]
+    fn a_repeating_dump_does_not_override_the_pass_rules() {
+        let dump = mtp_blank_with_stamp();
+        assert_eq!(
+            resolve(&FLOATING_HIGH, &FLOATING_HIGH, Some(&dump), Some(&dump)),
+            ProbeVerdict::DefaultAssumed
+        );
+        assert_eq!(
+            resolve(
+                &BLANK_VER_DRIVEN_FLG,
+                &FLOATING_HIGH,
+                Some(&dump),
+                Some(&dump)
+            ),
+            ProbeVerdict::DefaultAssumed
         );
     }
 
@@ -367,7 +516,7 @@ mod tests {
             "but it is still worth confirming at vendor timing"
         );
         assert_eq!(
-            resolve(&identified, &identified, Some(&mtp_with_key())),
+            resolve(&identified, &identified, Some(&mtp_with_key()), None),
             ProbeVerdict::Uc81xxConfirmed
         );
     }
@@ -383,7 +532,12 @@ mod tests {
             "the two are indistinguishable by VER, which is the trap"
         );
         assert_eq!(
-            resolve(&BLANK_VER_DRIVEN_FLG, &FLOATING_HIGH, Some(&mtp_with_key())),
+            resolve(
+                &BLANK_VER_DRIVEN_FLG,
+                &FLOATING_HIGH,
+                Some(&mtp_with_key()),
+                None
+            ),
             ProbeVerdict::DefaultAssumed,
             "a pass that supplied no evidence must not complete a confirmation"
         );
@@ -396,7 +550,7 @@ mod tests {
     fn a_floating_bus_takes_the_default_controller() {
         for reading in [FLOATING_HIGH, FLOATING_LOW] {
             assert_eq!(
-                resolve(&reading, &reading, None),
+                resolve(&reading, &reading, None, None),
                 ProbeVerdict::DefaultAssumed,
                 "floating read {reading:02X?} must not promote a driver"
             );
@@ -406,7 +560,7 @@ mod tests {
     #[test]
     fn two_agreeing_passes_confirm_the_sibling() {
         assert_eq!(
-            resolve(&UC8179, &UC8179, None),
+            resolve(&UC8179, &UC8179, None, None),
             ProbeVerdict::Uc81xxConfirmed
         );
     }
@@ -416,11 +570,11 @@ mod tests {
     #[test]
     fn one_stray_match_is_inconclusive_either_way_round() {
         assert_eq!(
-            resolve(&UC8179, &FLOATING_HIGH, None),
+            resolve(&UC8179, &FLOATING_HIGH, None, None),
             ProbeVerdict::Inconclusive
         );
         assert_eq!(
-            resolve(&FLOATING_HIGH, &UC8179, None),
+            resolve(&FLOATING_HIGH, &UC8179, None, None),
             ProbeVerdict::Inconclusive
         );
     }
@@ -433,7 +587,10 @@ mod tests {
             ver: [0x00, 0x00, 0x02, 0xFF, 0xFF],
             flg: 0x13,
         };
-        assert_eq!(resolve(&UC8179, &other, None), ProbeVerdict::Inconclusive);
+        assert_eq!(
+            resolve(&UC8179, &other, None, None),
+            ProbeVerdict::Inconclusive
+        );
     }
 
     /// Rule 2. Without the driven-FLG test a plausible-looking VER on a bus
@@ -447,7 +604,7 @@ mod tests {
             };
             assert!(!reading.flg_is_driven());
             assert_eq!(
-                resolve(&reading, &reading, Some(&mtp_with_key())),
+                resolve(&reading, &reading, Some(&mtp_with_key()), None),
                 ProbeVerdict::DefaultAssumed
             );
         }
@@ -462,15 +619,18 @@ mod tests {
             flg: 0x12,
         };
         assert!(!busy.flg_is_driven());
-        assert_eq!(resolve(&busy, &busy, None), ProbeVerdict::DefaultAssumed);
+        assert_eq!(
+            resolve(&busy, &busy, None, None),
+            ProbeVerdict::DefaultAssumed
+        );
     }
 
-    /// Rule 3. A blank VER with a driven status is the field UC8279d, and only
-    /// the MTP key tells it from a pulled-up floating bus.
+    /// Rule 3, first shape. A blank VER with a driven status is the field
+    /// UC8279d, and the MTP key tells it from a pulled-up floating bus.
     #[test]
     fn a_blank_ver_needs_the_mtp_key_to_confirm() {
         assert_eq!(
-            resolve(&BLANK_VER_DRIVEN_FLG, &BLANK_VER_DRIVEN_FLG, None),
+            resolve(&BLANK_VER_DRIVEN_FLG, &BLANK_VER_DRIVEN_FLG, None, None),
             ProbeVerdict::DefaultAssumed,
             "no MTP dump is not evidence"
         );
@@ -478,7 +638,8 @@ mod tests {
             resolve(
                 &BLANK_VER_DRIVEN_FLG,
                 &BLANK_VER_DRIVEN_FLG,
-                Some(&[0xFF; MTP_BYTES])
+                Some(&[0xFF; MTP_BYTES]),
+                None
             ),
             ProbeVerdict::DefaultAssumed,
             "a floating MTP read is not evidence"
@@ -487,7 +648,8 @@ mod tests {
             resolve(
                 &BLANK_VER_DRIVEN_FLG,
                 &BLANK_VER_DRIVEN_FLG,
-                Some(&mtp_with_key())
+                Some(&mtp_with_key()),
+                None
             ),
             ProbeVerdict::Uc81xxConfirmed
         );
@@ -499,7 +661,7 @@ mod tests {
     #[test]
     fn the_mtp_key_does_not_override_a_dead_status_line() {
         assert_eq!(
-            resolve(&FLOATING_HIGH, &FLOATING_HIGH, Some(&mtp_with_key())),
+            resolve(&FLOATING_HIGH, &FLOATING_HIGH, Some(&mtp_with_key()), None),
             ProbeVerdict::DefaultAssumed
         );
     }
@@ -513,7 +675,12 @@ mod tests {
             flg: 0x13,
         };
         assert_eq!(
-            resolve(&BLANK_VER_DRIVEN_FLG, &other_blank, Some(&mtp_with_key())),
+            resolve(
+                &BLANK_VER_DRIVEN_FLG,
+                &other_blank,
+                Some(&mtp_with_key()),
+                None
+            ),
             ProbeVerdict::DefaultAssumed,
             "neither pass matches the plain signature, so this is a clean negative"
         );

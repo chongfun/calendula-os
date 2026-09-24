@@ -144,6 +144,12 @@ pub struct ProbePins<'d> {
 /// behind. A UC8253 X3 is in that class, which is why the X3 spends ~200 ms
 /// here against the X4's ~68; it is once per power cycle, and the
 /// alternative is timing the discriminator out on a real UC8279d.
+///
+/// The MTP is read a second time only when the first dump is the blank-MTP
+/// UC8279d shape (keyless and non-uniform, [`probe::needs_mtp_repeat`]):
+/// `MTP_BYTES + 1` more bit-banged bytes, and a 49-byte stack temporary,
+/// spent on the one path where a repeat can change the verdict. A UC8253's
+/// uniform `FF` dump does not qualify, so the installed base pays nothing.
 pub fn probe(pins: ProbePins<'_>, escalation: ResetEscalation) -> ProbeDiag {
     let mut bus = ProbeBus {
         pins,
@@ -182,10 +188,26 @@ pub fn probe(pins: ProbePins<'_>, escalation: ResetEscalation) -> ProbeDiag {
         mtp.copy_from_slice(&raw[1..]);
     }
 
+    // A keyless, non-uniform dump is either a blank-MTP UC8279d driving its
+    // readback or a floating line caught mid-wobble. Reading it again tells
+    // them apart: the part reproduces every byte, the line cannot.
+    let mut mtp_repeat = [0u8; MTP_BYTES];
+    let repeated = mtp_valid && probe::needs_mtp_repeat(&pass1, &pass2, &mtp);
+    if repeated {
+        let mut raw = [0u8; MTP_BYTES + 1];
+        bus.cmd_read(CMD_RMTP, &mut raw);
+        mtp_repeat.copy_from_slice(&raw[1..]);
+    }
+
     bus.release();
 
     ProbeDiag {
-        verdict: probe::resolve(&pass1, &pass2, mtp_valid.then_some(&mtp)),
+        verdict: probe::resolve(
+            &pass1,
+            &pass2,
+            mtp_valid.then_some(&mtp),
+            repeated.then_some(&mtp_repeat),
+        ),
         ver: probe::authoritative_ver(&pass1, &pass2),
         flg: pass1.flg,
         mtp_valid,

@@ -403,16 +403,23 @@ rules that a datasheet reading would not produce:
    plausible answer, not the same non-trivial answer twice. A single stray
    match is `Inconclusive`.
 2. **FLG must be driven** — not `0x00`, not `0xFF`, and `BUSY_N` set.
-3. **The MTP key rescues a blank VER.** Field UC8279d units answer VER with
-   `FF FF FF FF FF`, which rule 2 rejects; the RMTP (`0xA2`) dump opening with
-   the `0xA5` refresh-enable key is the positive evidence that recovers them.
+3. **The MTP dump rescues a blank VER.** Field UC8279d units answer VER with
+   `FF FF FF FF FF`, which rule 2 rejects; the RMTP (`0xA2`) dump is the
+   positive evidence that recovers them, in either of two shapes: it opens
+   with the `0xA5` refresh-enable key (a programmed MTP), or it is
+   non-uniform and a second read reproduces it byte for byte (the blank MTP
+   these modules ship with: zeros plus a LUT version stamp at `0x01A`, no
+   key, but a driven readback; FreeInk `3c74ea8`). The second read is taken
+   only when the first dump is keyless and non-uniform.
 
 Rule 3 is the load-bearing one, and the bench says so. A shipping UC8253 X3
 answers the probe with `VER = FF FF FF FF FF` and a genuinely driven
 `FLG = 0x13` — byte for byte the field UC8279d signature, clearing every gate
-except the last. Its MTP reads all `FF`, and that absence is the only thing
-that keeps it on the UC8253 driver. The `0xA5` check is not belt-and-braces;
-without it this firmware misidentifies the installed base.
+except the last. Its MTP reads a uniform `FF`: no key, and a uniform dump is a
+floating line that earns no second read and would not count if it got one.
+That is the only thing that keeps it on the UC8253 driver. Neither shape is
+belt-and-braces; loosen either and this firmware misidentifies the installed
+base.
 
 The read never gates on BUSY: which controller is present is the unknown, so
 its BUSY polarity is too (SSD1677 active-high, UC8253 two-phase and idle-high).
@@ -434,7 +441,10 @@ the part could actually have answered. It answers a question about
 soldered hardware, so the scope of one probe is one *power cycle*, not one
 boot: `fw::probe_cache` retains the result in RTC fast RAM beside
 `sleep_marker`'s, and a deep-sleep wake, an OTA reset, or a crash reboot reuses
-it and pays nothing.
+it and pays nothing. The cache magic carries a generation byte that is bumped
+when the layout changes *or* when the matcher's rules would reach a different
+verdict from the same bytes, because an OTA is a reset and would otherwise
+inherit a verdict the new rules disown.
 
 RTC RAM is the store precisely because it is volatile. Flash, NVS and the SD
 card all survive being copied onto another unit — the failure mode that makes
