@@ -185,3 +185,64 @@ rail-level explanation of why UC8253 LUTs cannot carry over.
 The host test `a_shipping_uc8253_is_only_told_apart_by_its_mtp` in
 `display::epd::probe` pins the observed bytes and is the fastest way to see the
 shape of the problem.
+
+**Upstream sweep 2026-09-24 (freeink to `48005e5`, crosspoint to `b88b653a`).**
+Three detection findings and one driver corroboration; nothing changes the
+recipe above.
+
+1. **freeink's X3 detection is now stock-derived, not the rule set we ported.**
+   `4496fe9` (2026-09-09) gave the X3 its own `probeX3DisplayController`,
+   transcribed from the stock V6.3.15 firmware, and `612df6d` reuses it for
+   the X4 Classic. The protocol: RST high 10 ms, low 50 ms, high, 50 ms settle,
+   then a bounded wait of up to 300 ms for BUSY high (a timeout is logged but
+   does not suppress the read), then three bytes of VER with SDA released and
+   no pull-up. `ver[2]` alone decides: `0x66` is a UC8279, `0xFF` is the
+   UC8253, anything else is inconclusive and keeps UC8253. FLG and MTP are not
+   read. freeink's own doc still says hardware validation is pending.
+   Consequences for our probe (`display/src/epd/probe.rs`,
+   `hal-ext/src/epd_probe.rs`): a `00 xx 66 ..` unit passes our matcher as
+   written (leading `0x00`, non-uniform VER, and a driven FLG on both passes),
+   so no rule change is needed for the happy path. Two differences belong on
+   the bring-up list. **(a)** We settle a flat 30 ms after reset and do not gate
+   on BUSY (rule 4); stock allows up to 300 ms. If a real UC8279d is not ready
+   at 30 ms, our read floats, the verdict is `DefaultAssumed`, and
+   `probe_cache` keeps that answer until a battery pull. Log the raw pass bytes
+   on the first unit before trusting the verdict. **(b)** `lut_ver`'s doc
+   lists `0x01`/`0x02`/`0x68`/`0x69`; the X3 value is `0x66`, and freeink
+   `1ff1e92` adds `0x03` (QY class, shares the `0x02` tables) and `0x67`
+   (OTP-only, no external LUT set) from the X4 Pro stock registry. Diagnostics
+   only for us, but the report should not print `0x66` as unknown.
+   Also note: on the X3 stock treats a blank `FF` VER as UC8253. That lowers
+   the odds that the blank-VER UC8279d shape rule 3 recovers exists on X3 at
+   all; rule 3's population is the X4 family.
+
+2. **The open question above is answered: a blank-MTP UC8279d does produce a
+   keyless dump.** freeink `3c74ea8` (2026-08-26): field UC8279d modules ship
+   a blank MTP, all zeros except a LUT version stamp at `0x01A`, with no `0xA5`,
+   and the silicon still drives the RMTP readback. The `0xA5`-only rule
+   classified them as the default controller. Their fix accepts a second
+   shape: a **non-uniform** dump that **repeats byte-for-byte on a second
+   RMTP read**. A UC8253 has no `0xA2` command and floats to a uniform pattern
+   (field-confirmed `FF`), so `a_shipping_uc8253_is_only_told_apart_by_its_mtp`
+   still holds; floating garbage can be non-uniform once but cannot repeat 48
+   bytes exactly. Port shape for us: one extra RMTP read in `epd_probe::probe`
+   when the first dump is non-uniform and keyless, `mtp_key_confirms` gains
+   the repeat rule with host tests for both shapes, and **bump the low byte of
+   `probe_cache::CACHE_MAGIC`**, because the verdict's meaning changes and an
+   OTA is a reset that reuses the cached verdict. Cost is 49 bit-banged bytes
+   on the blank-VER path only. This is the one concrete port from the sweep
+   and it should land with, or before, this driver. **Implemented 2026-09-24**
+   on `feature/probe-mtp-repeat` (branched from `origin/main`): `probe::mtp_confirms` / `needs_mtp_repeat`, the
+   second read in `hal_ext::epd_probe::probe`, `CACHE_MAGIC` to `..02`, and
+   six host tests including the uniform-repeat guard.
+
+3. **UC8279 X3 grayscale in freeink** (`357b806` WW/WB register exchange for
+   the X3 AA tables, `4b8188e`, `e85297e` XTH4 four-tone): all grayscale, all
+   outside this PRD's B/W scope. Unchanged verdict from "If a grayscale path
+   is ever wanted".
+
+*Corroboration, no change needed:* freeink `ed39106` (2026-09-07) fixed a
+redundant `POWER_ON` on an already-powered UC8253 that made their two-phase
+BUSY wait spin its 1000 ms ceiling on every full refresh. That is the
+mechanism our `FULL_POWERED_STEPS` split in `display/src/epd/uc8253.rs`
+already encodes, found independently.

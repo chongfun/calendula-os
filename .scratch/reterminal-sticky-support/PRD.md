@@ -397,6 +397,26 @@ Do not copy X3 task implementation merely because the gauge model matches.
 
 Emit the normal shared application battery state.
 
+### Upstream reference (freeink, swept 2026-09-24)
+
+- `ad7d3fa`: the Sticky's charger enable pin (BQ25616 class) sits in the S3
+  JTAG pin group, whose reset default is a weak pull-up. Left alone, that
+  pull-up disabled charging until sleep isolation released it. freeink drives
+  the pin explicitly at boot and holds it through deep sleep, with polarity a
+  board field (`chargeEnableActiveHigh`). Add the pin to the switched-rail
+  hold table above; it is the same shape as the SD and display rails.
+- `dc214b2`: charge-status polarity is per board. MCP73832-style parts are
+  active-low open-drain; the X4 Pro's GPIO21 is active-high push-pull. Do not
+  inherit the X3's reading.
+- `a587342`, `4837c11`: an S3 cannot see a USB unplug through TinyUSB, because
+  the Arduino core routes no VBUS line to the OTG core and B-session-valid is
+  forced on, so `tud_mounted()` stays true with the cable gone. freeink uses
+  bus suspend (no SOF for 3 ms) as a hint and charger STAT as the second
+  signal. Relevant to the sleep/wake contract's "cable present" decisions.
+- `97947f1`, crosspoint `19a63e0d`: the Sticky's IMU is mounted 90 degrees
+  from the X3 frame, so tilt gestures needed an axis swap. IMU is a non-goal
+  here; noted so the first person to add it does not rediscover this.
+
 ## Physical buttons
 
 Sticky provides:

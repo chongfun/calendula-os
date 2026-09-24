@@ -576,6 +576,58 @@ One issue file each, owning a distinct set of files.
 Each of these was tried, measured, and rejected. The reason is the part that
 matters — without it the idea comes back.
 
+**Assessed and declined from the 2026-09-24 upstream sweep** (crosspoint
+`4970ef1f..b88b653a`, 179 commits; freeink `56efd2e..48005e5`, 213 commits).
+The one port it produced is on `uc8279-x3-driver` (the probe's MTP repeat
+rule); everything else is already ours, structurally absent here, or S3.
+
+- **freeink `ed39106`, gate `POWER_ON` on the panel being off.** A redundant
+  PON on a powered UC8253 gives no BUSY edge, so their phase-1 wait spun its
+  1000 ms ceiling on every full refresh. Ours already splits `FULL_STEPS`
+  from `FULL_POWERED_STEPS` on `screen_powered` (`display/src/epd/uc8253.rs`)
+  for exactly this reason. Independent confirmation, nothing to fix. Same for
+  `c7986a1` (skip POF when already off): that is `sleep_plan(screen_powered)`.
+- **crosspoint `9ba16086`, short presses dropped while idle.** Their main
+  loop stretches to 50 ms polls after 3 s idle, so a press shorter than one
+  gap (~65 ms measured on an X3) is not sampled twice. Our input task is a
+  flat 15 ms tick with a two-tick debounce (`fw/src/tasks/input.rs`) and no
+  idle tier, so the bug cannot occur. It is the failure mode the standing
+  "decimating the 15 ms input tick" rejection below predicts.
+- **crosspoint `04ca1d53`, resolve glyph orientation and clipping once per
+  glyph instead of per pixel.** That is A2, A10-as-shipped and A11 (#46, #50,
+  #57), arrived at from the other direction.
+- **freeink `6644bf2`, keep the SSD1677 first-paint promotion when the caller
+  powers down after every refresh.** Their one-shot lives in driver state and
+  was gated off by `turnOff`. Ours is seeded from the RTC wake cause into the
+  planner (`with_panel_shows_sleep_screen`, C1 in #11), not from driver
+  state, so there is no gate to lose.
+- **freeink `d37a158`, `esp_deep_sleep_start()` returning.** Their fallback
+  was `while (true)`, which draws full-clock current forever and looks like a
+  sleep-drain bug from outside; they now record the abort in RTC RAM and
+  `esp_restart()`. esp-hal's `sleep_deep` ends in `unreachable!()`, so ours
+  aborts rather than spins. Nothing to port; remember it if C2's gauge run
+  ever shows a unit that did not reach sleep current.
+- **freeink `cb7ec59`, polled BUSY grace for light-sleeping hosts.** C10's
+  territory and still blocked on the TIMG0 conflict; our BUSY wait is a WFI on
+  a GPIO edge, so the polled fallback it protects does not exist here.
+- **The X4 Classic wave** (freeink `8eb982d`, `612df6d`, `1ff1e92`; crosspoint
+  `f021d1e5`). An ESP32-S3 X4 variant that can carry SSD1677, UC8179 or UC8279
+  and selects by NVS `hw_calib/screenType` first, VER probe second. S3
+  silicon, so reference material for `reterminal-sticky-support` like the X4
+  Pro wave, not the C3 X4. Its LUT_VER additions are recorded on
+  `uc8279-x3-driver`.
+- **Grayscale and anti-aliasing** (crosspoint `1f3d7458`; freeink `357b806`,
+  `2cca22f`, `e85297e`, `5916724`, the absolute-plane series). No 2-bpp
+  consumer; unchanged since 2026-07-25.
+- **The heap-fragmentation series** (crosspoint `c33a8b0e`, `c80c537f`,
+  `c4d8c395`, `3555ff55`, `93b6fe11`; freeink `64dc507`, `1be4233`). Real
+  fixes for an allocator we do not have on the reading path. Worth knowing
+  their X3 died at 3,536 bytes free with a 1,140-byte largest block; that is
+  the argument for our no-heap rule, restated by someone else's crash.
+- **Everything else** is app-level (library views, TrueType on PSRAM boards,
+  KOSync, OPDS, translations, keyboard layouts, footnotes) or other-board
+  bring-up (EEGO A4, OnePage C61, Waveshare 3.97, T5S3), and not a port.
+
 **Assessed and declined from the 2026-08-13 upstream sweep** (crosspoint
 `255bab31..`, freeink `8b8337b..`). Recorded because each one *looks* like a
 port until you check one fact:
