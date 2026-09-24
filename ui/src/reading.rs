@@ -284,6 +284,11 @@ impl PageIndexCursor {
     /// height. The decision is re-taken all the same, so a retroactive
     /// change that did grow the ink, or set a break, would answer `NewPage`
     /// and the caller would mirror the move with [`apply_last_block_move`].
+    /// No caller makes such a change today: the build's only retroactive
+    /// edit is the paragraph-end mark, and both disjuncts were settled by
+    /// the original placement with the same ink and the same break flag.
+    /// That branch, and the move helper, are held open for a future
+    /// retroactive change, not for one the build reaches.
     /// Heights never shrink here, so a placed `NewPage` decision never
     /// reverts.
     pub fn replace_last_block(
@@ -347,7 +352,11 @@ pub fn apply_block_placement(
 
 /// Mirror a [`PageIndexCursor::replace_last_block`] move: the grown block
 /// leaves the tail of the page in progress and opens a new page. Follows
-/// the same capacity rule as [`apply_block_placement`].
+/// the same capacity rule as [`apply_block_placement`]. Under the ink
+/// rule the build's paragraph-end mark cannot produce this move, so
+/// production does not reach it; it stays for a retroactive change that
+/// grows ink or sets a break, and the store tests drive it with a late
+/// forced break.
 pub fn apply_last_block_move(
     index: usize,
     spine: u16,
