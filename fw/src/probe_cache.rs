@@ -32,12 +32,18 @@ const OFF_VER: usize = 3;
 const OFF_MTP: usize = OFF_VER + VER_BYTES;
 const PAYLOAD_BYTES: usize = OFF_MTP + MTP_BYTES;
 
-/// Written only by [`store`]. The low byte is a layout generation: **bump it
-/// whenever the offsets above change**, so an OTA into firmware that packs
-/// this differently re-probes instead of decoding the old shape. Everything
+/// Written only by [`store`]. The low byte is a generation: **bump it
+/// whenever the offsets above change, or whenever the matcher's rules change
+/// what a stored verdict means**, so an OTA into firmware that packs this
+/// differently, or would now reach a different verdict from the same bytes,
+/// re-probes instead of inheriting the old answer. An OTA is a reset, not a
+/// power cycle, so without the bump the old verdict survives it. Everything
 /// else — first-boot zeroing, brownout garbage — misses the magic and reads as
 /// no cache.
-const CACHE_MAGIC: u32 = 0xC0DE_9A01;
+///
+/// `..02`: rule 3 gained the blank-MTP repeat shape (`probe::mtp_confirms`),
+/// under which a unit cached as `DefaultAssumed` by `..01` may now confirm.
+const CACHE_MAGIC: u32 = 0xC0DE_9A02;
 
 // `persistent`: zeroed once on the first power-on, then left untouched by the
 // runtime across deep sleep and every reset. Same retention `sleep_marker`
