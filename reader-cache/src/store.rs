@@ -2283,10 +2283,11 @@ mod tests {
         );
     }
 
-    /// When a paragraph gap pushes a block onto a new page, that page adopts
-    /// the line's offset.
+    /// When a re-placed last block opens a new page, that page adopts the
+    /// line's offset. A paragraph gap alone cannot do that (the gap is not
+    /// ink), so the retroactive change here is a forced break.
     #[test]
-    fn a_block_moved_by_its_paragraph_gap_takes_its_offset_along() {
+    fn a_block_moved_by_a_late_break_takes_its_offset_along() {
         let mut store = Box::new(ReaderStore::new());
         push_line(&mut store, 4, "the first line", 500);
         push_line(&mut store, 4, "the second line", 515);
@@ -2294,7 +2295,7 @@ mod tests {
         let (mut cursor, _) = crate::layout::rebuild_page_index(&mut store);
         assert_eq!(store.page_count, 1, "both lines start on one page");
 
-        // The gap pushes the last block off the page it had joined.
+        // The break pushes the last block off the page it had joined.
         store.block_page_break_before[1] = true;
         crate::layout::replace_last_block(&mut store, &mut cursor, 1);
 

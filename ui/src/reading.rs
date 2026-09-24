@@ -134,12 +134,22 @@ pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
     height + paragraph_gap_after(source, index)
 }
 
+/// The two heights a block contributes, measured once: the gapped height
+/// the walk advances by, and the ink height charged against the page edge.
+/// Every place that decides whether a block fits its page reads this pair,
+/// the incremental cursor, the two full walks, and the renderer's clip, so
+/// they cannot disagree about where a page ends.
+fn block_heights(source: &impl ReadingBlocks, index: usize) -> (i16, i16) {
+    let height = block_height(source, index);
+    (height, height - paragraph_gap_after(source, index))
+}
+
 /// Block height without the trailing paragraph gap: the rows the block's
-/// own ink occupies. Pagination charges this against the page edge — the
-/// gap only separates blocks that share a page — while the cursor still
+/// own ink occupies. Pagination charges this against the page edge, the
+/// gap only separates blocks that share a page, while the walk still
 /// advances by the gapped height.
 pub fn block_ink_height(source: &impl ReadingBlocks, index: usize) -> i16 {
-    block_height(source, index) - paragraph_gap_after(source, index)
+    block_heights(source, index).1
 }
 
 pub fn paragraph_gap_after(source: &impl ReadingBlocks, index: usize) -> i16 {
@@ -155,71 +165,45 @@ pub fn paragraph_gap_after(source: &impl ReadingBlocks, index: usize) -> i16 {
     }
 }
 
-/// Count the pages the loaded blocks paginate into, using the same height
-/// math as rendering.
+/// Count the pages the loaded blocks paginate into. Driven through the
+/// same [`PageIndexCursor`] the cache build advances, so a count taken here
+/// and a page index written to the card come from one decision. An empty
+/// source still reads as one blank page.
 pub fn paginate_block_pages(source: &impl ReadingBlocks) -> usize {
-    let PageBox {
-        top: page_top,
-        bottom: page_bottom,
-        ..
-    } = source.page_box();
-    let mut pages = 1u32;
-    let mut y = page_top;
-
+    let mut cursor = PageIndexCursor::start(source.page_box());
+    let mut pages = 0usize;
     for index in 0..source.block_count() {
-        if source.page_break_before(index) && y > page_top {
-            pages = pages.saturating_add(1);
-            y = page_top;
+        if cursor.place_next_block(source, index) == BlockPlacement::NewPage || pages == 0 {
+            pages += 1;
         }
-        let height = block_height(source, index);
-
-        if y + block_ink_height(source, index) > page_bottom && y > page_top {
-            pages = pages.saturating_add(1);
-            y = page_top;
-        }
-        y += height;
     }
-
-    pages.max(1) as usize
+    pages.max(1)
 }
 
-/// Walk the blocks until `page_index` and return its page record.
+/// Walk the blocks until `page_index` and return its page record, through
+/// the same cursor as [`paginate_block_pages`]. A `page_index` past the end
+/// answers with the last page.
 pub fn page_record_at(source: &impl ReadingBlocks, page_index: usize) -> PageRecord {
-    let PageBox {
-        top: page_top,
-        bottom: page_bottom,
-        ..
-    } = source.page_box();
-    let mut current = 0usize;
-    let mut first_block = 0usize;
-    let mut block_count = 0usize;
-    let mut y = page_top;
-
+    let mut cursor = PageIndexCursor::start(source.page_box());
+    let mut page = 0usize;
+    let mut current = PageRecord {
+        first_block: 0,
+        block_count: 0,
+    };
     for index in 0..source.block_count() {
-        let height = block_height(source, index);
-        let new_page = (y + block_ink_height(source, index) > page_bottom
-            || source.page_break_before(index))
-            && y > page_top;
-        if new_page {
-            if current == page_index {
-                return PageRecord {
-                    first_block: first_block as u16,
-                    block_count: block_count as u16,
-                };
+        if cursor.place_next_block(source, index) == BlockPlacement::NewPage {
+            if page == page_index {
+                return current;
             }
-            current += 1;
-            first_block = index;
-            block_count = 0;
-            y = page_top;
+            page += 1;
+            current = PageRecord {
+                first_block: index as u16,
+                block_count: 0,
+            };
         }
-        block_count += 1;
-        y += height;
+        current.block_count += 1;
     }
-
-    PageRecord {
-        first_block: first_block as u16,
-        block_count: block_count as u16,
-    }
+    current
 }
 
 /// Where an appended block lands in the page index.
@@ -236,12 +220,21 @@ pub enum BlockPlacement {
 /// as the cache build appends lines — O(1) per line instead of a full
 /// re-walk of every accumulated block.
 ///
+/// The page-edge rule is the renderer's: a block opens a new page when its
+/// ink would cross the bottom of the box, or it demands a break, and the
+/// page already holds something. The trailing paragraph gap is not ink. It
+/// separates blocks that share a page and is charged only when the walk
+/// advances, so a heading whose rows fit stays on the page even when its
+/// gap would not. This is the same test `for_each_drawable_block` applies
+/// when it clips a page, which is what makes a page record drawable.
+///
 /// Invariant: driving [`Self::place_next_block`] over blocks `0..n` and
 /// mirroring each placement with [`apply_block_placement`] yields page
-/// records bit-identical to the full rebuild walk. Page records persist
-/// into section files, so any divergence is silent cache corruption; the
-/// host tests below check the cursor against a naive full walk on every
-/// step, including retroactive paragraph-end growth and capacity overflow.
+/// records bit-identical to [`paginate_block_pages`] and [`page_record_at`],
+/// which run this same cursor, and to the naive walk in the tests below,
+/// which does not. Page records persist into section files, so any
+/// divergence is silent cache corruption; the host tests check every
+/// prefix, retroactive paragraph-end growth, and capacity overflow.
 #[derive(Clone, Copy, Debug)]
 pub struct PageIndexCursor {
     y: i16,
@@ -260,19 +253,17 @@ impl PageIndexCursor {
     }
 
     /// Place the block just appended at `index` (which must be the last
-    /// block, placed exactly once, in order). Uses the same decision as the
-    /// full rebuild walk: a block starts a new page when its gapped height
-    /// overflows the page or it demands a break, and the page already has
-    /// content.
+    /// block, placed exactly once, in order). A block starts a new page
+    /// when its ink overflows the page or it demands a break, and the page
+    /// already has content; the cursor then advances by the gapped height.
     pub fn place_next_block(
         &mut self,
         source: &impl ReadingBlocks,
         index: usize,
     ) -> BlockPlacement {
         let PageBox { top, bottom, .. } = source.page_box();
-        let height = block_height(source, index);
-        let new_page =
-            (self.y + height > bottom || source.page_break_before(index)) && self.y > top;
+        let (height, ink) = block_heights(source, index);
+        let new_page = (self.y + ink > bottom || source.page_break_before(index)) && self.y > top;
         if new_page {
             self.y = top;
         }
@@ -286,13 +277,15 @@ impl PageIndexCursor {
     }
 
     /// Re-place the most recently placed block after a retroactive height
-    /// change — a trailing paragraph-end mark adds the paragraph gap after
-    /// the block has already been placed. Returns `NewPage` when the grown
-    /// block no longer fits the page it joined and a full walk would move it
-    /// to a fresh page (the caller then mirrors the move with
-    /// [`apply_last_block_move`]); a block that already opened its page can
-    /// only grow in place. Heights never shrink here (the gap is
-    /// non-negative), so a placed `NewPage` decision never reverts.
+    /// change: a trailing paragraph-end mark adds the paragraph gap after
+    /// the block has already been placed. The gap is not ink, so the mark
+    /// alone cannot move the block; what changes is the running `y` the
+    /// next block is placed against, and this re-derives it from the grown
+    /// height. The decision is re-taken all the same, so a retroactive
+    /// change that did grow the ink, or set a break, would answer `NewPage`
+    /// and the caller would mirror the move with [`apply_last_block_move`].
+    /// Heights never shrink here, so a placed `NewPage` decision never
+    /// reverts.
     pub fn replace_last_block(
         &mut self,
         source: &impl ReadingBlocks,
@@ -300,9 +293,9 @@ impl PageIndexCursor {
     ) -> BlockPlacement {
         let PageBox { top, bottom, .. } = source.page_box();
         let y_before = self.y - self.last_block_height;
-        let height = block_height(source, index);
+        let (height, ink) = block_heights(source, index);
         let new_page =
-            (y_before + height > bottom || source.page_break_before(index)) && y_before > top;
+            (y_before + ink > bottom || source.page_break_before(index)) && y_before > top;
         self.y = if new_page {
             top + height
         } else {
@@ -398,8 +391,8 @@ pub fn for_each_drawable_block(
         let text = source.block_text(index);
         let advance = line_advance(settings, record.role);
         let style = source.block_style(index);
-        let height = block_height(source, index);
-        if y + block_ink_height(source, index) > page_box.bottom && y > page_box.top {
+        let (height, ink) = block_heights(source, index);
+        if y + ink > page_box.bottom && y > page_box.top {
             break;
         }
         if !visit(ReaderDrawableBlock {
@@ -576,8 +569,13 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// come from the monochrome rasterization mode instead of the antialiased
 /// one, so they contain the bitmap that is actually stored rather than
 /// clipping it. Advances are unchanged, but `x_offset + width` moves on 737
-/// of 49,802 renders, which is a wrap input; existing caches rebuild.
-const READER_LAYOUT_VERSION: u16 = 19;
+/// of 49,802 renders, which is a wrap input; existing caches rebuild. v20:
+/// the incremental cursor that builds the on-card page index charged a
+/// block's gapped height against the page edge, while the full walks and
+/// the renderer's clip charged its ink. A heading whose rows fit but whose
+/// trailing gap did not was indexed a page late. The cursor now charges
+/// ink, and indexes built by the gapped cursor retire.
+const READER_LAYOUT_VERSION: u16 = 20;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
@@ -1759,10 +1757,11 @@ mod tests {
         }
     }
 
-    /// Reference implementation: the pre-incremental firmware
-    /// `rebuild_page_index` walk, verbatim — full gapped height against the
-    /// page edge, completed pages pushed at each boundary plus the trailing
-    /// page, records silently dropped past `capacity`.
+    /// Reference implementation, independent of the cursor: the page-edge
+    /// test `for_each_drawable_block` applies when it clips a page. Ink
+    /// against the edge, advance by the gapped height, completed pages
+    /// pushed at each boundary plus the trailing page, records silently
+    /// dropped past `capacity`.
     fn naive_page_index(
         source: &impl ReadingBlocks,
         capacity: usize,
@@ -1804,8 +1803,9 @@ mod tests {
         let mut y = page_top;
         for index in 0..source.block_count() {
             let height = block_height(source, index);
+            let ink = height - paragraph_gap_after(source, index);
             let new_page =
-                (y + height > page_bottom || source.page_break_before(index)) && y > page_top;
+                (y + ink > page_bottom || source.page_break_before(index)) && y > page_top;
             if new_page {
                 push(
                     &mut pages,
@@ -2015,8 +2015,10 @@ mod tests {
         // Mirror the build's mark_last_block_paragraph_end: blocks arrive
         // with paragraph_end=false, then an empty paragraph-end fragment
         // flips the flag on the last block only — a height-only change that
-        // the cursor must absorb as a bounded one-block fix-up.
-        let mut moved_hit = false;
+        // the cursor must absorb as a bounded one-block fix-up. The gap is
+        // not ink, so the mark can never move the block; what it changes is
+        // where the next block is placed, which the oracle check covers.
+        let mut gapped_mark_hit = false;
         for page_box in [PageBox::LANDSCAPE, PageBox::PORTRAIT] {
             for seed in 5u32..9 {
                 let mut fixture = synth_blocks(seed, 60, TypeSettings::DEFAULT, page_box);
@@ -2035,25 +2037,30 @@ mod tests {
                     if (state >> 16) % 2 == 0 {
                         let before = incremental.page_count;
                         fixture.ends[index] = true;
+                        gapped_mark_hit |= paragraph_gap_after(&fixture, index) > 0;
                         incremental.mark_last_grew(&fixture, index);
-                        moved_hit |= incremental.page_count > before;
+                        assert_eq!(
+                            incremental.page_count, before,
+                            "a paragraph-end mark grows the gap, not the ink: seed {seed} block {index}"
+                        );
                     }
                     incremental.assert_matches(&fixture, &format!("seed {seed} block {index}"));
                 }
             }
         }
         assert!(
-            moved_hit,
-            "the sweep must include a mark that moves the block to a new page"
+            gapped_mark_hit,
+            "the sweep must include a mark on a role with a real trailing gap"
         );
     }
 
     #[test]
-    fn paragraph_end_growth_moves_an_exactly_full_block_to_the_next_page() {
-        // Constructed move: Medium/Normal body advance is 26; a page box of
-        // 6..58 fits exactly two lines ungapped. Marking the second block
-        // (BlockQuote, trailing gap 6) paragraph-end grows it past the edge,
-        // so a full rebuild moves it to a new page — the cursor must agree.
+    fn paragraph_end_growth_keeps_an_exactly_full_block_on_its_page() {
+        // Constructed edge: Medium/Normal body advance is 26; a page box of
+        // 6..58 fits exactly two lines of ink. Marking the second block
+        // (BlockQuote, trailing gap 6) paragraph-end grows its gapped height
+        // past the edge, but its rows still fit, so it stays where the
+        // renderer would draw it. Before v20 the cursor moved it.
         let advance = line_advance(TypeSettings::DEFAULT, TextRole::Body);
         let page_box = PageBox {
             left: 8,
@@ -2078,8 +2085,126 @@ mod tests {
 
         fixture.ends[1] = true;
         incremental.mark_last_grew(&fixture, 1);
-        assert_eq!(incremental.page_count, 2, "the grown block moved");
-        incremental.assert_matches(&fixture, "constructed move");
+        assert_eq!(incremental.page_count, 1, "the grown block stayed");
+        assert_eq!(incremental.pages[0].block_count, 2);
+        incremental.assert_matches(&fixture, "constructed edge");
+        assert_eq!(paginate_block_pages(&fixture), 1);
+        assert_eq!(page_record_at(&fixture, 0).block_count, 2);
+    }
+
+    /// The finding this rule change fixes: a heading whose ink fits the
+    /// page but whose trailing gap does not. Every path has to agree it
+    /// stays on the page, because the renderer draws it there.
+    #[test]
+    fn a_heading_whose_ink_fits_stays_on_the_page_in_every_walk() {
+        let body = line_advance(TypeSettings::DEFAULT, TextRole::Body);
+        // Measure the heading's ink through the real helpers rather than
+        // hard-coding its advance, so a leading change moves the box with it.
+        let probe = PageBlocks {
+            roles: vec![TextRole::Heading1],
+            ends: vec![true],
+            breaks: vec![false],
+            settings: TypeSettings::DEFAULT,
+            page_box: PageBox::LANDSCAPE,
+            len: 1,
+        };
+        let heading_ink = block_ink_height(&probe, 0);
+        assert!(
+            paragraph_gap_after(&probe, 0) > 0,
+            "the case needs a role with a trailing gap"
+        );
+        let page_box = PageBox {
+            left: 8,
+            right: 200,
+            top: 6,
+            bottom: 6 + body + heading_ink,
+        };
+        let fixture = PageBlocks {
+            roles: vec![TextRole::Body, TextRole::Heading1],
+            ends: vec![true, true],
+            breaks: vec![false, false],
+            settings: TypeSettings::DEFAULT,
+            page_box,
+            len: 2,
+        };
+
+        // Cursor, as the cache build and rebuild_page_index drive it.
+        let mut incremental = IncrementalIndex::new(page_box, 96);
+        incremental.append(&fixture, 0);
+        incremental.append(&fixture, 1);
+        assert_eq!(incremental.page_count, 1, "the cursor keeps the heading");
+        // Full walks, as ReaderPagePlan's fallback and the goldens use them.
+        assert_eq!(paginate_block_pages(&fixture), 1);
+        assert_eq!(
+            page_record_at(&fixture, 0),
+            PageRecord {
+                first_block: 0,
+                block_count: 2
+            }
+        );
+        // The renderer's clip, which is the rule the others follow.
+        let mut drawn = 0usize;
+        for_each_drawable_block(&fixture, page_record_at(&fixture, 0), |_| {
+            drawn += 1;
+            true
+        });
+        assert_eq!(drawn, 2, "the renderer draws both blocks on the page");
+        incremental.assert_matches(&fixture, "heading at the page edge");
+    }
+
+    /// The equivalence that was missing: the two public walks and the
+    /// cursor must answer identically on every prefix of every fixture,
+    /// checked against the independent naive walk rather than each other.
+    #[test]
+    fn full_walks_match_the_cursor_on_every_prefix() {
+        let boxes = [
+            PageBox::LANDSCAPE,
+            PageBox::PORTRAIT,
+            PageBox {
+                left: 8,
+                right: 200,
+                top: 6,
+                bottom: 96,
+            },
+        ];
+        for page_box in boxes {
+            for seed in 20u32..24 {
+                let mut fixture = synth_blocks(seed, 60, TypeSettings::DEFAULT, page_box);
+                let total = fixture.len;
+                for len in 0..=total {
+                    fixture.len = len;
+                    let (pages, _, page_count) = naive_page_index(&fixture, 96);
+                    let context = format!("seed {seed} len {len}");
+                    assert_eq!(
+                        paginate_block_pages(&fixture),
+                        page_count.max(1),
+                        "page count: {context}"
+                    );
+                    for (page, expected) in pages.iter().take(page_count).enumerate() {
+                        assert_eq!(
+                            page_record_at(&fixture, page),
+                            *expected,
+                            "page {page}: {context}"
+                        );
+                    }
+                    // Past the end clamps to the last page (or the empty
+                    // record when there is nothing).
+                    let last = if page_count == 0 {
+                        PageRecord {
+                            first_block: 0,
+                            block_count: 0,
+                        }
+                    } else {
+                        pages[page_count - 1]
+                    };
+                    assert_eq!(
+                        page_record_at(&fixture, page_count + 3),
+                        last,
+                        "past the end: {context}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -3635,8 +3635,9 @@ where
 
     /// Bounded fix-up for `mark_last_block_paragraph_end`: the mark grows
     /// the last block by its trailing paragraph gap after placement, so
-    /// re-place just that block; when it no longer fits its page, move it
-    /// to a fresh one, exactly as a full rebuild would.
+    /// re-place just that block. The gap is not charged against the page
+    /// edge, so the block stays put and the running `y` moves; a `NewPage`
+    /// answer is still mirrored, exactly as a full rebuild would.
     fn note_last_block_grew(&mut self, index: usize) {
         self.page_overflowed |=
             layout::replace_last_block(self.library, &mut self.page_cursor, index);
