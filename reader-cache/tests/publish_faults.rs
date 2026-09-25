@@ -5868,3 +5868,29 @@ fn a_failed_publish_cleanup_over_a_refused_settle_frees_nothing() {
         "the settled cleanup freed clusters the departed key still names"
     );
 }
+
+/// A book opened for the first time has no cache directory, and nothing to
+/// evict or settle. Eviction says it is within the bound, so the build that
+/// follows writes its index; refusing here would leave every new book
+/// without a fast path.
+#[test]
+fn eviction_for_a_book_with_no_cache_directory_is_within_the_bound() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let layout = store.layout_key();
+    assert!(
+        files::evict_layouts_for(&root, &OWNER, layout),
+        "no cache root at all"
+    );
+
+    // The cache root exists for another book, but not this one's directory.
+    files::ensure_v2_cache_dirs(&root, &NOW).expect("another book's cache");
+    assert!(
+        files::evict_layouts_for(&root, &OWNER, layout),
+        "no directory under this key"
+    );
+    let third = set_third_layout(&mut store);
+    assert!(files::evict_layouts_for(&root, &OWNER, third));
+}

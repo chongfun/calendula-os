@@ -3216,14 +3216,6 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    // Eviction reclaims section files, and this runs before the build claims
-    // the directory, so an unsettled carry has to be settled here first:
-    // reclaiming a name whose chain the other side still holds would free
-    // what that side names, and the later settle would find no twin left to
-    // recognise. A card that will not settle evicts nothing.
-    if open_v2_book_dir_for_writer(root, owner).is_none() {
-        return false;
-    }
     let Some(mut resident) = resident_layouts(root, owner) else {
         // Deciding what to evict from a list that might be short is the same
         // lost bound as evicting nothing, so the answer is no.
@@ -3239,6 +3231,16 @@ where
     };
     if resident.len() <= budget {
         return true;
+    }
+    // Eviction reclaims section files, and this runs before the build claims
+    // the directory, so an unsettled carry has to be settled here first:
+    // reclaiming a name whose chain the other side still holds would free
+    // what that side names, and the later settle would find no twin left to
+    // recognise. Only a directory this book actively claims lists layouts
+    // over the budget, so a missing or unclaimed one never gets here. A card
+    // that will not settle evicts nothing.
+    if open_v2_book_dir_for_writer(root, owner).is_none() {
+        return false;
     }
     // Nothing on the card says which layout the reader used last, and a record
     // that did could drift from the files. The lowest key that is not the one
