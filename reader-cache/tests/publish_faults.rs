@@ -4358,6 +4358,17 @@ const STRANGER_AT_OLD: proto::cache::CacheOwner<'static> = proto::cache::CacheOw
     locator: "Other/Stranger.epub",
 };
 
+/// The identity a book at `owner`'s place is loaded under: the place's hash
+/// and the size, as the catalog row carries it after a scan. The fixture's
+/// headers are written under `IDENTITY`, which stands for the old place, and
+/// the carry has to re-bind them to this.
+fn identity_at(owner: &proto::cache::CacheOwner<'_>) -> (u32, u32) {
+    (
+        proto::cache::source_hash_at(owner.root, owner.locator, IDENTITY.1),
+        IDENTITY.1,
+    )
+}
+
 /// A published book under `OWNER`, with a cover: three sections, an index, a
 /// cover, no content stream and no chapter list, so the carry has exactly
 /// five entries to move. Returns the records and the page total.
@@ -4499,23 +4510,29 @@ fn write_fault_fired(disk: &SharedDisk, base: u32, probe: u32, cut: bool) -> boo
 
 /// The book loads whole under `owner`: the index reads back with the page
 /// total it was published with, and the page inside the last section reads.
-fn assert_loads_under(root: &Dir<'_>, owner: &proto::cache::CacheOwner<'_>, pages: u32, page: u32) {
+fn assert_loads_under(
+    root: &Dir<'_>,
+    owner: &proto::cache::CacheOwner<'_>,
+    identity: (u32, u32),
+    pages: u32,
+    page: u32,
+) {
     let mut store = new_store();
     assert_eq!(
-        files::read_v2_book_total_pages(root, owner, IDENTITY, &store),
+        files::read_v2_book_total_pages(root, owner, identity, &store),
         pages,
         "the index under {} reports the published total",
         owner.key
     );
     assert_eq!(
-        files::load_v2_book_index(root, owner, IDENTITY, &mut store),
+        files::load_v2_book_index(root, owner, identity, &mut store),
         files::BookIndexLoadResult::Hit { unfinished: false },
         "the index under {} loads",
         owner.key
     );
     assert!(
         matches!(
-            files::load_v2_section_by_global_page(root, owner, IDENTITY, page, &mut store),
+            files::load_v2_section_by_global_page(root, owner, identity, page, &mut store),
             CacheLoadResult::Hit { .. }
         ),
         "page {page} under {} loads from its carried section",
@@ -4542,14 +4559,15 @@ fn a_proven_move_carries_the_pagination_by_entry() {
     let writes_before = disk.writes.get();
     let digest = hashed(b"the book");
 
-    let carried = files::carry_pagination(&root, &OWNER, &NOW, digest)
+    let carried = files::carry_pagination(&root, &OWNER, &NOW, digest, IDENTITY, identity_at(&NOW))
         .expect("the carry is not refused")
         .expect("there was something to carry");
     assert_eq!(
         carried,
         files::CarriedPagination {
             moved: 5,
-            unlinked: 0
+            unlinked: 0,
+            restamped: 4
         },
         "every entry moved, none needed finishing"
     );
@@ -4567,7 +4585,17 @@ fn a_proven_move_carries_the_pagination_by_entry() {
     let writes = disk.writes.get() - writes_before;
     assert!(writes < 64, "a carry by entry took {writes} writes");
 
-    assert_loads_under(&root, &NOW, pages, last_page);
+    assert_loads_under(&root, &NOW, identity_at(&NOW), pages, last_page);
+    assert_ne!(
+        identity_at(&NOW),
+        IDENTITY,
+        "the fixture has to change the identity for this to test anything"
+    );
+    assert_eq!(
+        files::load_v2_book_index(&root, &NOW, IDENTITY, &mut new_store()),
+        files::BookIndexLoadResult::Invalid,
+        "under the old place's identity the carried index is refused: what a move without re-binding would meet"
+    );
     assert_eq!(
         files::read_v2_book_total_pages(&root, &OWNER, IDENTITY, &store),
         0,
@@ -4630,6 +4658,7 @@ fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
             let disk = new_card();
             let pages;
             let last_page;
+            let starts: Vec<u32>;
             {
                 let mgr = open_mgr(&disk);
                 let root = open_root(&mgr);
@@ -4637,10 +4666,18 @@ fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
                 let (records, total) = published_book(&root, &mut store);
                 pages = total;
                 last_page = records[2].start_page;
+                starts = records.iter().map(|record| record.start_page).collect();
 
                 let base = disk.writes.get();
                 arm_write_fault(&disk, base, probe, cut);
-                let first = files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book"));
+                let first = files::carry_pagination(
+                    &root,
+                    &OWNER,
+                    &NOW,
+                    hashed(b"the book"),
+                    IDENTITY,
+                    identity_at(&NOW),
+                );
                 let fired = write_fault_fired(&disk, base, probe, cut);
                 if !fired {
                     assert!(
@@ -4665,10 +4702,41 @@ fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
                         "cut {cut} probe {probe}: the index is under the new key before every section"
                     );
                 }
+                // An index that reads under the new place vouches for its
+                // sections: every one of them must read under it too.
+                let mut probe_store = new_store();
+                let index_reads_under_new =
+                    files::load_v2_book_index(&root, &NOW, identity_at(&NOW), &mut probe_store)
+                        == files::BookIndexLoadResult::Hit { unfinished: false };
+                if index_reads_under_new {
+                    for start in &starts {
+                        assert!(
+                            matches!(
+                                files::load_v2_section_by_global_page(
+                                    &root,
+                                    &NOW,
+                                    identity_at(&NOW),
+                                    *start,
+                                    &mut probe_store
+                                ),
+                                CacheLoadResult::Hit { .. }
+                            ),
+                            "cut {cut} probe {probe}: the index is bound to the new place before the section at page {start}"
+                        );
+                    }
+                }
 
-                files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book")).unwrap_or_else(
-                    |denied| panic!("cut {cut} probe {probe}: the retry was refused: {denied:?}"),
-                );
+                files::carry_pagination(
+                    &root,
+                    &OWNER,
+                    &NOW,
+                    hashed(b"the book"),
+                    IDENTITY,
+                    identity_at(&NOW),
+                )
+                .unwrap_or_else(|denied| {
+                    panic!("cut {cut} probe {probe}: the retry was refused: {denied:?}")
+                });
                 let after = carried_clusters(&root, NOW.key);
                 assert_eq!(
                     after.iter().filter(|c| c.is_some()).count(),
@@ -4694,7 +4762,7 @@ fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
                         "cut {cut} probe {probe}: a carried chain was freed"
                     );
                 }
-                assert_loads_under(&root, &NOW, pages, last_page);
+                assert_loads_under(&root, &NOW, identity_at(&NOW), pages, last_page);
             }
             probe += 1;
             assert!(
@@ -4727,7 +4795,14 @@ fn torn_carry() -> SharedDisk {
             published_book(&root, &mut store);
             let base = disk.writes.get();
             arm_write_fault(&disk, base, probe, true);
-            let _ = files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book"));
+            let _ = files::carry_pagination(
+                &root,
+                &OWNER,
+                &NOW,
+                hashed(b"the book"),
+                IDENTITY,
+                identity_at(&NOW),
+            );
             if !write_fault_fired(&disk, base, probe, true) {
                 break;
             }
@@ -4865,7 +4940,14 @@ fn a_stranger_holding_the_destination_key_refuses_the_carry() {
     let before = carried_clusters(&root, KEY);
 
     assert_eq!(
-        files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book")),
+        files::carry_pagination(
+            &root,
+            &OWNER,
+            &NOW,
+            hashed(b"the book"),
+            IDENTITY,
+            identity_at(&NOW),
+        ),
         Err(files::ClaimDenied::Foreign)
     );
     assert_eq!(
@@ -4891,7 +4973,14 @@ fn a_key_with_no_cache_carries_nothing_and_claims_nothing() {
     let mgr = open_mgr(&disk);
     let root = open_root(&mgr);
     assert_eq!(
-        files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book")),
+        files::carry_pagination(
+            &root,
+            &OWNER,
+            &NOW,
+            hashed(b"the book"),
+            IDENTITY,
+            identity_at(&NOW),
+        ),
         Ok(None)
     );
     assert!(
@@ -4903,7 +4992,14 @@ fn a_key_with_no_cache_carries_nothing_and_claims_nothing() {
     // same answer: positions are not the carry's, and there is no cache.
     files::write_position_file(&root, &OWNER, 2, 20).expect("position");
     assert_eq!(
-        files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book")),
+        files::carry_pagination(
+            &root,
+            &OWNER,
+            &NOW,
+            hashed(b"the book"),
+            IDENTITY,
+            identity_at(&NOW),
+        ),
         Ok(None)
     );
     assert!(book_dir_by_key(&root, NOW.key).is_none());
@@ -4937,17 +5033,23 @@ fn carry_for_move_reads_the_file_now_there_and_carries_place_and_pagination() {
     let (records, pages) = published_book(&root, &mut store);
     files::write_position_file(&root, &OWNER, 4, 40).expect("position");
 
-    let carry = files::carry_for_move(&root, &OWNER, &now).expect("the move carries");
+    let now_identity = (
+        proto::cache::source_hash_at(now.root, now.locator, IDENTITY.1),
+        IDENTITY.1,
+    );
+    let carry = files::carry_for_move(&root, &OWNER, &now, IDENTITY, now_identity)
+        .expect("the move carries");
     assert_eq!(carry.place, Ok(true), "the legacy place came across");
     assert_eq!(
         carry.pagination,
         Ok(Some(files::CarriedPagination {
             moved: 5,
-            unlinked: 0
+            unlinked: 0,
+            restamped: 4
         }))
     );
     assert_eq!(files::read_position_file(&root, &now), Some((4, 40)));
-    assert_loads_under(&root, &now, pages, records[2].start_page);
+    assert_loads_under(&root, &now, now_identity, pages, records[2].start_page);
     match files::read_book_dir_claimant(&root, now.key) {
         files::DirClaimant::Claimed { evidence, .. } => assert_eq!(
             evidence.digest,
@@ -4982,9 +5084,16 @@ fn a_second_move_after_an_unsettled_carry_leaves_the_third_key_whole() {
         "the cut left the back marker on the source of the next move"
     );
 
-    let carried = files::carry_pagination(&root, &NOW, &THIRD, hashed(b"the book"))
-        .expect("the second carry is not refused")
-        .expect("the source held something");
+    let carried = files::carry_pagination(
+        &root,
+        &NOW,
+        &THIRD,
+        hashed(b"the book"),
+        identity_at(&NOW),
+        identity_at(&THIRD),
+    )
+    .expect("the second carry is not refused")
+    .expect("the source held something");
     assert!(carried.moved > 0, "files moved on to the third key");
 
     assert_eq!(
@@ -5053,7 +5162,14 @@ fn a_read_fault_on_the_retry_cannot_remove_the_markers_while_a_twin_stands() {
         assert!(twin_pairs(&root) > 0, "the fixture is a cut carry");
 
         disk.fault.fail_read_in.set(Some(probe));
-        let retry = files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book"));
+        let retry = files::carry_pagination(
+            &root,
+            &OWNER,
+            &NOW,
+            hashed(b"the book"),
+            IDENTITY,
+            identity_at(&NOW),
+        );
         let fired = disk.fault.fail_read_in.get().is_none();
         disk.fault.fail_read_in.set(None);
 

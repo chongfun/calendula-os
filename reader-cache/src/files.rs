@@ -819,7 +819,9 @@ pub struct MoveCarry {
 /// Everything a proven move carries: the legacy position, then the
 /// pagination. One read of the moved file serves both, and only that read
 /// failing refuses the whole; each carry is attempted whatever became of
-/// the other.
+/// the other. `old_identity` and `new_identity` are the `(source_hash,
+/// size)` pairs of the two places, which the scan has; every cache header
+/// binds to the first and has to be re-bound to the second.
 ///
 /// Reached from the firmware on a move the scan has proved, before the
 /// ledger writes it down, so a reset retries it. Nothing else may conclude
@@ -834,6 +836,8 @@ pub fn carry_for_move<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     was: &proto::cache::CacheOwner<'_>,
     now: &proto::cache::CacheOwner<'_>,
+    old_identity: (u32, u32),
+    new_identity: (u32, u32),
 ) -> Result<MoveCarry, ClaimDenied>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -848,7 +852,7 @@ where
     }
     let digest = digest_of_moved(root, now)?;
     let place = carry_position(root, was, now, digest, None);
-    let pagination = carry_pagination(root, was, now, digest);
+    let pagination = carry_pagination(root, was, now, digest, old_identity, new_identity);
     Ok(MoveCarry { place, pagination })
 }
 
@@ -893,6 +897,195 @@ pub struct CarriedPagination {
     /// Names taken away because the destination already held the chain: a
     /// carry cut between a move's two writes, finished on the retry.
     pub unlinked: u16,
+    /// Headers rewritten in place from the old place's identity to the new.
+    pub restamped: u16,
+}
+
+/// Which header a carried file opens with. Every one of them binds the file
+/// to the `(source_hash, source_size)` of the book's place, and every loader
+/// refuses a header bound to another place, so a set moved by entry alone
+/// would be refused under the new key and built again. The identity is
+/// rewritten in place instead, one header at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StampedHeader {
+    Book,
+    Section,
+    Content,
+    Toc,
+}
+
+/// The largest of the four headers, and the read and write buffer for all.
+const MAX_STAMPED_HEADER: usize = 56;
+const _: () = assert!(BOOK_V2_HEADER_BYTES <= MAX_STAMPED_HEADER);
+const _: () = assert!(SECTION_V2_HEADER_BYTES <= MAX_STAMPED_HEADER);
+const _: () = assert!(CONTENT_HEADER_BYTES <= MAX_STAMPED_HEADER);
+const _: () = assert!(TOC_FILE_HEADER_BYTES <= MAX_STAMPED_HEADER);
+
+impl StampedHeader {
+    const fn len(self) -> usize {
+        match self {
+            StampedHeader::Book => BOOK_V2_HEADER_BYTES,
+            StampedHeader::Section => SECTION_V2_HEADER_BYTES,
+            StampedHeader::Content => CONTENT_HEADER_BYTES,
+            StampedHeader::Toc => TOC_FILE_HEADER_BYTES,
+        }
+    }
+
+    /// The identity the header carries, or `None` for bytes that are not
+    /// this header.
+    fn identity(self, bytes: &[u8]) -> Option<(u32, u32)> {
+        match self {
+            StampedHeader::Book => decode_book_v2_header(bytes)
+                .ok()
+                .map(|h| (h.source_hash, h.source_size)),
+            StampedHeader::Section => decode_section_v2_header(bytes)
+                .ok()
+                .map(|h| (h.source_hash, h.source_size)),
+            StampedHeader::Content => proto::cache::decode_content_header(bytes)
+                .ok()
+                .map(|h| (h.source_hash, h.source_size)),
+            StampedHeader::Toc => decode_toc_file_header(bytes)
+                .ok()
+                .map(|h| (h.source_hash, h.source_size)),
+        }
+    }
+
+    /// The same header with `identity` in place of the one it carried.
+    fn with_identity(self, bytes: &[u8], identity: (u32, u32), out: &mut [u8]) -> Option<()> {
+        match self {
+            StampedHeader::Book => {
+                let mut header = decode_book_v2_header(bytes).ok()?;
+                header.source_hash = identity.0;
+                header.source_size = identity.1;
+                encode_book_v2_header(header, out).ok()?;
+            }
+            StampedHeader::Section => {
+                let mut header = decode_section_v2_header(bytes).ok()?;
+                header.source_hash = identity.0;
+                header.source_size = identity.1;
+                encode_section_v2_header(header, out).ok()?;
+            }
+            StampedHeader::Content => {
+                let mut header = proto::cache::decode_content_header(bytes).ok()?;
+                header.source_hash = identity.0;
+                header.source_size = identity.1;
+                encode_content_header(header, out).ok()?;
+            }
+            StampedHeader::Toc => {
+                let mut header = decode_toc_file_header(bytes).ok()?;
+                header.source_hash = identity.0;
+                header.source_size = identity.1;
+                encode_toc_file_header(header, out).ok()?;
+            }
+        }
+        Some(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stamp {
+    Restamped,
+    Left,
+}
+
+/// Rewrite one file's header from `old` to `new`, in place: one sector.
+/// A file that is not there, is shorter than its header, does not decode,
+/// or carries some other identity is left alone; the loader refuses those
+/// anyway, and a stranger's file is not this carry's to touch. A file
+/// already bound to `new` is left too, which is what a retry finds.
+fn restamp_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+    header: StampedHeader,
+    old: (u32, u32),
+    new: (u32, u32),
+) -> Result<Stamp, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = match dir.open_file_in_dir(name, Mode::ReadWriteAppend) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(Stamp::Left),
+        Err(_) => return Err(()),
+    };
+    let len = header.len();
+    if (file.length() as usize) < len {
+        return Ok(Stamp::Left);
+    }
+    let mut bytes = [0u8; MAX_STAMPED_HEADER];
+    file.seek_from_start(0).map_err(|_| ())?;
+    read_exact_file(&file, &mut bytes[..len])?;
+    let Some(identity) = header.identity(&bytes[..len]) else {
+        return Ok(Stamp::Left);
+    };
+    if identity != old {
+        return Ok(Stamp::Left);
+    }
+    let mut out = [0u8; MAX_STAMPED_HEADER];
+    header
+        .with_identity(&bytes[..len], new, &mut out[..len])
+        .ok_or(())?;
+    file.seek_from_start(0).map_err(|_| ())?;
+    file.write(&out[..len]).map_err(|_| ())?;
+    file.close().map_err(|_| ())?;
+    Ok(Stamp::Restamped)
+}
+
+/// Re-bind every carried header under `to` from `old` to `new`: the
+/// sections, then the content stream and chapter list, then the index last,
+/// so an index that reads under the new place vouches only for sections that
+/// do too. Refuses on the first header the card would not rewrite, leaving
+/// the index bound to the old place, which the loader refuses and the retry
+/// finishes. Idempotent: a header already bound to `new` is left alone.
+fn restamp_carried<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    old: (u32, u32),
+    new: (u32, u32),
+    counts: &mut CarriedPagination,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match to.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(sections) => {
+            // Names stay in the listing, so each pass skips what it did.
+            let mut done = 0usize;
+            let mut finished = false;
+            for _ in 0..SECTION_CARRY_PASSES {
+                let mut names = heapless::Vec::new();
+                let _ = section_names(&sections, done, &mut names)?;
+                if names.is_empty() {
+                    finished = true;
+                    break;
+                }
+                for name in &names {
+                    if restamp_file(&sections, name.as_str(), StampedHeader::Section, old, new)?
+                        == Stamp::Restamped
+                    {
+                        counts.restamped = counts.restamped.saturating_add(1);
+                    }
+                }
+                done += names.len();
+            }
+            if !finished {
+                return Err(());
+            }
+        }
+        Err(embedded_sdmmc::Error::NotFound) => {}
+        Err(_) => return Err(()),
+    }
+    for (name, header) in [
+        (CACHE_CONTENT_FILE, StampedHeader::Content),
+        (CACHE_TOC_FILE, StampedHeader::Toc),
+        (CACHE_BOOK_FILE, StampedHeader::Book),
+    ] {
+        if restamp_file(to, name, header, old, new)? == Stamp::Restamped {
+            counts.restamped = counts.restamped.saturating_add(1);
+        }
+    }
+    Ok(())
 }
 
 enum MarkerRead {
@@ -1288,6 +1481,14 @@ where
 /// reset's retry reads to find the move again. A retry finishes what was
 /// cut, by moving what is left and unlinking what already arrived.
 ///
+/// Every cache header binds the file to the `(source_hash, size)` of the
+/// book's place, and the loaders refuse a header bound to another place, so
+/// once the entries have moved each header is rewritten in place from
+/// `old_identity` to `new_identity`: sections, then the content stream and
+/// chapter list, then the index last, one sector each. A retry that finds
+/// nothing left to move still runs that pass, so a cut inside it is finished
+/// too.
+///
 /// `Ok(None)` is nothing to carry: no cache under the old key, or a
 /// directory whose claim is not this book's. A carry that is refused part
 /// way leaves both directories loadable or rebuildable and the markers in
@@ -1304,6 +1505,8 @@ pub fn carry_pagination<
     was: &proto::cache::CacheOwner<'_>,
     now: &proto::cache::CacheOwner<'_>,
     confirmed: proto::source::SourceDigest,
+    old_identity: (u32, u32),
+    new_identity: (u32, u32),
 ) -> Result<Option<CarriedPagination>, ClaimDenied>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1393,19 +1596,25 @@ where
         }
     }
     if !has_sections && !has_files {
-        // Nothing to carry. A marker still here is a settled carry whose
-        // last write did not land; it and its mirror have nothing left to
-        // say. The mirror is touched only in a directory that is already
-        // this book's, and only when it names this one.
-        if remove_marker(&from, FORWARD_MARKER_EXT, now.key).is_err() {
-            return Err(ClaimDenied::Fault);
-        }
+        // Nothing left to move. What may be left is the re-binding: a cut
+        // after the last move and before the last header leaves the set
+        // under the new key bound to the old place, and only this pass
+        // finishes it. Then the markers: one still here is a settled carry
+        // whose last write did not land, and it and its mirror have nothing
+        // left to say. The mirror is touched only in a directory that is
+        // already this book's.
+        let mut counts = CarriedPagination::default();
         if let Some(to) = open_v2_book_dir(root, now) {
+            restamp_carried(&to, old_identity, new_identity, &mut counts)
+                .map_err(|_| ClaimDenied::Fault)?;
             if remove_marker(&to, BACK_MARKER_EXT, was.key).is_err() {
                 return Err(ClaimDenied::Fault);
             }
         }
-        return Ok(None);
+        if remove_marker(&from, FORWARD_MARKER_EXT, now.key).is_err() {
+            return Err(ClaimDenied::Fault);
+        }
+        return Ok((counts.restamped > 0).then_some(counts));
     }
 
     // The destination first: claimed for the book at its new place, with
@@ -1458,6 +1667,10 @@ where
             EntryFate::Absent => {}
         }
     }
+    // Everything is under the new key and bound to the old place. Re-bind
+    // it, index last.
+    restamp_carried(&to, old_identity, new_identity, &mut counts)
+        .map_err(|_| ClaimDenied::Fault)?;
     // Settled: no chain has two names. The markers have nothing left to
     // say, and one a refusal leaves behind costs a later reclaim one look,
     // or the retry that finds nothing to carry takes it away.

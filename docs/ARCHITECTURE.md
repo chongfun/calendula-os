@@ -792,7 +792,12 @@ directory entry, through the fork's short-name `move_file_in_dir`: every
 resident layout's sections first, then the content stream, the chapter list
 and the cover, and `BOOK.BIN` last, so a carry cut short leaves the new key
 with no index to load and the old key with a hole the loader already treats
-as one. Nothing is read but directory sectors. The carry runs inside the
+as one. Every header but the cover's binds its file to the `(source_hash,
+size)` of the book's place, and the loaders refuse a header bound to another
+place, so once the entries have moved the carry rewrites that identity in
+place, one sector per file, sections first and the index last, so an index
+that reads under the new place vouches only for sections that do too.
+Nothing else is read or written but directory sectors. The carry runs inside the
 identity join, before the ledger commits the move, so a reset retries it, and
 it leaves the departed directory's claim untouched because that claim is what
 the retry reads; the retry moves what is left and unlinks what already
