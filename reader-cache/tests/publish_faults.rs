@@ -94,6 +94,12 @@ struct FaultPlan {
     /// operation whose own recovery writes cannot recover either. The state
     /// this leaves is what a remount finds.
     fail_writes_from: Cell<Option<u32>>,
+    /// Tear the (n+1)th write whose sector begins with one of the reader
+    /// cache headers, landing `tear_write_after` bytes of it, and lose every
+    /// write after: power loss inside a header rewrite. Counting only header
+    /// sectors aims the tear at the in-place identity rewrites rather than at
+    /// directory entries, which have their own recovery story.
+    tear_header_write_in: Cell<Option<u32>>,
 }
 
 impl FaultPlan {
@@ -164,7 +170,21 @@ impl BlockDevice for SharedDisk {
         {
             return Err(DiskError);
         }
-        if let Some(bytes) = self.fault.tear_write_after.take() {
+        if self.fault.tear_header_write_in.get().is_some() {
+            let header = proto::cache::decode_book_v2_header(&blocks[0][..56]).is_ok()
+                || proto::cache::decode_section_v2_header(&blocks[0][..56]).is_ok()
+                || proto::cache::decode_content_header(&blocks[0][..24]).is_ok()
+                || proto::cache::decode_toc_file_header(&blocks[0][..16]).is_ok();
+            if header && FaultPlan::take_fault(&self.fault.tear_header_write_in) {
+                let bytes = self.fault.tear_write_after.take().unwrap_or(0);
+                let mut data = self.data.borrow_mut();
+                let at = start.0 as usize * BLOCK_BYTES;
+                let landed = bytes.min(BLOCK_BYTES);
+                data[at..at + landed].copy_from_slice(&blocks[0][..landed]);
+                self.fault.fail_writes_from.set(Some(index + 1));
+                return Err(DiskError);
+            }
+        } else if let Some(bytes) = self.fault.tear_write_after.take() {
             let mut data = self.data.borrow_mut();
             let at = start.0 as usize * BLOCK_BYTES;
             let landed = bytes.min(BLOCK_BYTES);
@@ -4450,6 +4470,18 @@ fn twin_pairs(root: &Dir<'_>) -> usize {
     twin_pairs_between(root, KEY, NOW.key)
 }
 
+/// How many chains two keys name in common, whatever the names. After a
+/// rebuild the same name may stand under both keys on chains of their own,
+/// which is not a twin; what may not remain is one chain under two keys.
+fn shared_chains(root: &Dir<'_>, a: &str, b: &str) -> usize {
+    let left = carried_clusters(root, a);
+    let right = carried_clusters(root, b);
+    left.iter()
+        .flatten()
+        .filter(|cluster| right.iter().flatten().any(|other| other == *cluster))
+        .count()
+}
+
 fn twin_pairs_between(root: &Dir<'_>, a: &str, b: &str) -> usize {
     let old = carried_clusters(root, a);
     let new = carried_clusters(root, b);
@@ -5206,4 +5238,280 @@ fn a_read_fault_on_the_retry_cannot_remove_the_markers_while_a_twin_stands() {
         );
     }
     assert!(refused > 0, "no read in the retry could be failed");
+}
+
+/// A published book under `owner`, written as the build writes one, bound to
+/// `identity`: the shape [`published_book`] has for `OWNER`, for any owner.
+fn published_book_under(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    owner: &proto::cache::CacheOwner<'_>,
+    identity: (u32, u32),
+) -> (Vec<BookV2SectionRecord>, u32) {
+    files::ensure_v2_cache_dirs(root, owner).expect("cache dirs");
+    let mut records = Vec::new();
+    let mut start_page = 0u32;
+    for section in 0..3u16 {
+        fill_section_at(store, section, 0, 6);
+        store.set_cached_spine(section);
+        store.set_section_ends_spine(true);
+        let page_count = store.page_count().min(u16::MAX as usize) as u16;
+        let logical_offset = store.page_anchor(0).map_or(0, |a| a.offset);
+        let wrote = files::with_v2_sections_dir(root, owner, |sections| {
+            files::write_v2_section_cache_in(
+                sections.expect("sections dir"),
+                identity,
+                section,
+                store,
+            )
+        });
+        assert!(wrote, "section {section} writes under {}", owner.key);
+        records.push(BookV2SectionRecord {
+            section,
+            spine: section,
+            start_page,
+            page_count,
+            partial: false,
+            logical_offset,
+        });
+        start_page += u32::from(page_count);
+    }
+    let pages = total_pages(&records);
+    store.begin_book_load();
+    let outcome =
+        publish::publish_book_cache(root, owner, identity, 0, store, &records, pages, false, 0);
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    (records, pages)
+}
+
+/// `(source_hash, source_size)`, as every cache header carries it.
+type Identity = (u32, u32);
+/// Reads an identity out of header bytes, or `None` for bytes that are not
+/// that header.
+type HeaderDecoder<'a> = &'a dyn Fn(&[u8]) -> Option<Identity>;
+
+/// The identity a file's header carries, read back off the card, or `None`
+/// for a file that is not there or does not decode.
+fn header_identity(
+    dir: &Dir<'_>,
+    name: &str,
+    decode: HeaderDecoder<'_>,
+    len: usize,
+) -> Option<Identity> {
+    let file = dir
+        .open_file_in_dir(name, embedded_sdmmc::Mode::ReadOnly)
+        .ok()?;
+    let mut bytes = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        let n = file.read(&mut bytes[read..]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        read += n;
+    }
+    decode(&bytes)
+}
+
+/// The identities the index and each present section under `key` carry.
+fn header_identities_under(root: &Dir<'_>, key: &str) -> (Option<Identity>, Vec<Option<Identity>>) {
+    let Some(book) = book_dir_by_key(root, key) else {
+        return (None, vec![None; 3]);
+    };
+    let index = header_identity(
+        &book,
+        proto::cache::CACHE_BOOK_FILE,
+        &|b| {
+            proto::cache::decode_book_v2_header(b)
+                .ok()
+                .map(|h| (h.source_hash, h.source_size))
+        },
+        proto::cache::BOOK_V2_HEADER_BYTES,
+    );
+    let sections = book.open_dir(proto::cache::CACHE_SECTIONS_DIR).ok();
+    let identities = (0..3u16)
+        .map(|n| {
+            sections.as_ref().and_then(|dir| {
+                header_identity(
+                    dir,
+                    &section_name(n),
+                    &|b| {
+                        proto::cache::decode_section_v2_header(b)
+                            .ok()
+                            .map(|h| (h.source_hash, h.source_size))
+                    },
+                    proto::cache::SECTION_V2_HEADER_BYTES,
+                )
+            })
+        })
+        .collect();
+    (index, identities)
+}
+
+/// The two things a cut inside the re-binding must leave true, read off the
+/// card: an index bound to the new place has every present section bound to
+/// it too, and the back marker stands until every header is.
+fn assert_rebinding_invariants(root: &Dir<'_>, context: &str) {
+    let new = identity_at(&NOW);
+    let (index, sections) = header_identities_under(root, NOW.key);
+    if index == Some(new) {
+        for (n, identity) in sections.iter().enumerate() {
+            if let Some(identity) = identity {
+                assert_eq!(
+                    *identity, new,
+                    "{context}: the index is bound to the new place while section {n} carries {identity:?}"
+                );
+            }
+        }
+    }
+    if !marker_present(root, NOW.key, BACK_MARKER) && book_dir_by_key(root, NOW.key).is_some() {
+        for identity in core::iter::once(&index).chain(sections.iter()).flatten() {
+            assert_eq!(
+                *identity, new,
+                "{context}: the back marker is gone while a header still carries {identity:?}"
+            );
+        }
+    }
+}
+
+/// A power cut inside a header rewrite lands part of one sector. The old
+/// and new sectors differ only in the four hash bytes, so what is left is a
+/// valid header carrying an identity that is neither place. The tear is
+/// aimed at every byte offset through both hash fields, for each header the
+/// carry rewrites, and after a remount the retry has to re-bind it: every
+/// header under the new key reads with the new identity, the index is bound
+/// to the new place only once every section is, and the back marker stands
+/// until then.
+#[test]
+fn a_tear_inside_a_header_rewrite_is_finished_by_the_retry() {
+    let mut torn = 0usize;
+    for tear in [1usize, 8, 9, 10, 11, 12, 36, 37, 38, 39, 40, 55] {
+        let mut probe = 0u32;
+        loop {
+            let disk = new_card();
+            let pages;
+            let last_page;
+            {
+                let mgr = open_mgr(&disk);
+                let root = open_root(&mgr);
+                let mut store = new_store();
+                let (records, total) = published_book(&root, &mut store);
+                pages = total;
+                last_page = records[2].start_page;
+                disk.fault.tear_header_write_in.set(Some(probe));
+                disk.fault.tear_write_after.set(Some(tear));
+                let _ = files::carry_pagination(
+                    &root,
+                    &OWNER,
+                    &NOW,
+                    hashed(b"the book"),
+                    IDENTITY,
+                    identity_at(&NOW),
+                );
+                let fired = disk.fault.tear_header_write_in.get().is_none();
+                disk.fault.tear_header_write_in.set(None);
+                disk.fault.tear_write_after.set(None);
+                disk.fault.fail_writes_from.set(None);
+                if !fired {
+                    break;
+                }
+                torn += 1;
+            }
+            {
+                let mgr = open_mgr(&disk);
+                let root = open_root(&mgr);
+                let context = format!("tear {tear} header write {probe}, before the retry");
+                assert_rebinding_invariants(&root, &context);
+                let (index, sections) = header_identities_under(&root, NOW.key);
+                let mixed = core::iter::once(&index)
+                    .chain(sections.iter())
+                    .flatten()
+                    .any(|identity| *identity != IDENTITY && *identity != identity_at(&NOW));
+                if mixed {
+                    assert!(
+                        marker_present(&root, NOW.key, BACK_MARKER),
+                        "{context}: a torn header with the marker gone has nothing to authorize its repair"
+                    );
+                }
+
+                files::carry_pagination(
+                    &root,
+                    &OWNER,
+                    &NOW,
+                    hashed(b"the book"),
+                    IDENTITY,
+                    identity_at(&NOW),
+                )
+                .unwrap_or_else(|denied| panic!("{context}: the retry was refused: {denied:?}"));
+                let context = format!("tear {tear} header write {probe}, after the retry");
+                let (index, sections) = header_identities_under(&root, NOW.key);
+                assert_eq!(index, Some(identity_at(&NOW)), "{context}: the index");
+                for (n, identity) in sections.iter().enumerate() {
+                    assert_eq!(*identity, Some(identity_at(&NOW)), "{context}: section {n}");
+                }
+                assert!(!marker_present(&root, NOW.key, BACK_MARKER), "{context}");
+                assert!(!marker_present(&root, KEY, FORWARD_MARKER), "{context}");
+                assert_loads_under(&root, &NOW, identity_at(&NOW), pages, last_page);
+            }
+            probe += 1;
+            assert!(probe < 16, "more header writes than the carry makes");
+        }
+    }
+    assert!(torn > 0, "no header write was torn, so nothing was tested");
+}
+
+/// The book is opened at its new place while the carry that brought it
+/// there is unsettled, and a build writes under the new key. A build
+/// truncates the files it rewrites, and truncating a name whose chain the
+/// departed key still holds frees what that key still names. The writer's
+/// claim settles the twins first, so the departed key keeps only chains of
+/// its own, and reclaiming it afterwards leaves the rebuilt book whole.
+#[test]
+fn a_rebuild_over_an_unsettled_carry_settles_the_twins_first() {
+    let disk = torn_carry();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    assert!(twin_pairs(&root) > 0);
+
+    // The build, as the reader would run it at the new place.
+    let mut store = new_store();
+    let (records, pages) = published_book_under(&root, &mut store, &NOW, identity_at(&NOW));
+
+    assert_eq!(
+        shared_chains(&root, KEY, NOW.key),
+        0,
+        "the writer's claim settled the shared names"
+    );
+    assert!(
+        !marker_present(&root, NOW.key, BACK_MARKER),
+        "and took the markers with it"
+    );
+    assert!(!marker_present(&root, KEY, FORWARD_MARKER));
+    for cluster in carried_clusters(&root, KEY).into_iter().flatten() {
+        assert!(
+            chain_is_allocated(&root, cluster),
+            "the build freed a chain the departed key still names"
+        );
+    }
+    let rebuilt: Vec<_> = carried_clusters(&root, NOW.key)
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(
+        rebuilt.len(),
+        4,
+        "three sections and an index under the new key"
+    );
+
+    // The sweep reaches the departed key.
+    assert!(files::release_book_dir_claim(&root, KEY));
+    assert!(files::empty_cache_dir(&root, KEY));
+    for cluster in &rebuilt {
+        assert!(
+            chain_is_allocated(&root, *cluster),
+            "reclaiming the departed key freed a chain of the rebuilt book"
+        );
+    }
+    assert_loads_under(&root, &NOW, identity_at(&NOW), pages, records[2].start_page);
 }

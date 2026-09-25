@@ -844,7 +844,13 @@ where
     T: TimeSource,
 {
     if was.key == now.key {
-        // One directory serves both places; see `carry_position`.
+        // One directory serves both places; see `carry_position`. The
+        // pagination is not re-bound here either: the two places share 28
+        // bits of hash and not the whole, so the headers would need the
+        // rewrite, but the directory's claim names the old place and is
+        // what a retry reads, and the book at the new place cannot write
+        // there until the sweep releases it and adoption empties it. Once
+        // in a few hundred million moves the pagination is built again.
         return Ok(MoveCarry {
             place: Ok(false),
             pagination: Ok(None),
@@ -988,16 +994,24 @@ enum Stamp {
     Left,
 }
 
-/// Rewrite one file's header from `old` to `new`, in place: one sector.
-/// A file that is not there, is shorter than its header, does not decode,
-/// or carries some other identity is left alone; the loader refuses those
-/// anyway, and a stranger's file is not this carry's to touch. A file
+/// Rewrite one file's header to `new`, in place: one sector.
+///
+/// Authorized by the destination's back marker, which the caller has read:
+/// while it stands, every file here came from the departed key, so a
+/// header bound to anything but the new place is this carry's to re-bind.
+/// That includes the mixture a power cut inside the sector write leaves.
+/// The old and new sectors differ only in the four hash bytes, so a tear
+/// lands a valid header carrying some of each, an identity that is neither
+/// place; a check for the old identity alone would leave it forever, and
+/// an index later bound to the new place would vouch for a section that is
+/// not. Only the size tells a foreign file from ours, and a move does not
+/// change it. A file that is not there, is shorter than its header, or
+/// does not decode is left alone; the loader refuses those anyway. A file
 /// already bound to `new` is left too, which is what a retry finds.
 fn restamp_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     name: &str,
     header: StampedHeader,
-    old: (u32, u32),
     new: (u32, u32),
 ) -> Result<Stamp, ()>
 where
@@ -1019,7 +1033,7 @@ where
     let Some(identity) = header.identity(&bytes[..len]) else {
         return Ok(Stamp::Left);
     };
-    if identity != old {
+    if identity == new || identity.1 != new.1 {
         return Ok(Stamp::Left);
     }
     let mut out = [0u8; MAX_STAMPED_HEADER];
@@ -1032,15 +1046,16 @@ where
     Ok(Stamp::Restamped)
 }
 
-/// Re-bind every carried header under `to` from `old` to `new`: the
-/// sections, then the content stream and chapter list, then the index last,
-/// so an index that reads under the new place vouches only for sections that
-/// do too. Refuses on the first header the card would not rewrite, leaving
-/// the index bound to the old place, which the loader refuses and the retry
+/// Re-bind every carried header under `to` to `new`: the sections, then
+/// the content stream and chapter list, then the index last, so an index
+/// that reads under the new place vouches only for sections that do too.
+/// Refuses on the first header the card would not rewrite, leaving the
+/// index bound to the old place, which the loader refuses and the retry
 /// finishes. Idempotent: a header already bound to `new` is left alone.
+/// The caller holds the destination's back marker; see [`restamp_file`]
+/// for what that authorizes.
 fn restamp_carried<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    old: (u32, u32),
     new: (u32, u32),
     counts: &mut CarriedPagination,
 ) -> Result<(), ()>
@@ -1061,7 +1076,7 @@ where
                     break;
                 }
                 for name in &names {
-                    if restamp_file(&sections, name.as_str(), StampedHeader::Section, old, new)?
+                    if restamp_file(&sections, name.as_str(), StampedHeader::Section, new)?
                         == Stamp::Restamped
                     {
                         counts.restamped = counts.restamped.saturating_add(1);
@@ -1081,7 +1096,7 @@ where
         (CACHE_TOC_FILE, StampedHeader::Toc),
         (CACHE_BOOK_FILE, StampedHeader::Book),
     ] {
-        if restamp_file(to, name, header, old, new)? == Stamp::Restamped {
+        if restamp_file(to, name, header, new)? == Stamp::Restamped {
             counts.restamped = counts.restamped.saturating_add(1);
         }
     }
@@ -1401,6 +1416,55 @@ where
     Err(())
 }
 
+/// A writer's directory may still share chains with the other side of a
+/// carry that did not settle, and a build here opens files to truncate them,
+/// which frees what the other side still names. So before a writer is
+/// handed the directory, each marker it holds is settled: the shared names
+/// are taken away from the other side, since this side is the one being
+/// written, and both markers go. A retry of the carry itself passes through
+/// here too, on its way to claiming the destination, and finds the same
+/// twins unlinked that it would have unlinked itself. A card that will not
+/// answer refuses the writer.
+fn settle_markers_for_writer<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner_key: &str,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    for (ext, mirror) in [
+        (BACK_MARKER_EXT, FORWARD_MARKER_EXT),
+        (FORWARD_MARKER_EXT, BACK_MARKER_EXT),
+    ] {
+        match read_marker(book, ext) {
+            MarkerRead::Present(other) => {
+                match open_book_dir_by_key(root, other.as_str()) {
+                    Ok(Some(other_dir)) => {
+                        if !unlink_twins_against(root, &other_dir, owner_key) {
+                            return Err(());
+                        }
+                        remove_marker(&other_dir, mirror, owner_key)?;
+                    }
+                    Ok(None) => {}
+                    Err(()) => return Err(()),
+                }
+                remove_marker(book, ext, other.as_str())?;
+            }
+            MarkerRead::Absent => {}
+            MarkerRead::Fault => return Err(()),
+        }
+    }
+    Ok(())
+}
+
 /// In `book`, take away every name whose chain the directory at `other_key`
 /// also names. What is left owns its chain and may be reclaimed. True when
 /// the question was answered for every name; a card that would not answer
@@ -1515,6 +1579,13 @@ where
     if was.key == now.key {
         return Ok(None);
     }
+    // A move keeps the bytes, so it keeps the size; a pair that disagrees
+    // is not a move, and re-binding under it would bless another book's
+    // files. The old hash itself is not consulted: the marker authorizes
+    // the re-binding, and a torn header may carry neither hash.
+    if old_identity.1 != new_identity.1 {
+        return Err(ClaimDenied::Fault);
+    }
     let from = match open_book_dir_by_key(root, was.key) {
         Ok(Some(dir)) => dir,
         Ok(None) => return Ok(None),
@@ -1605,10 +1676,20 @@ where
         // already this book's.
         let mut counts = CarriedPagination::default();
         if let Some(to) = open_v2_book_dir(root, now) {
-            restamp_carried(&to, old_identity, new_identity, &mut counts)
-                .map_err(|_| ClaimDenied::Fault)?;
-            if remove_marker(&to, BACK_MARKER_EXT, was.key).is_err() {
-                return Err(ClaimDenied::Fault);
+            // The back marker is the evidence that a carry from this key is
+            // in flight there, and what authorizes the re-binding; its
+            // removal is the re-binding's commit. Absent, the set was
+            // settled already, or was never this carry's.
+            match read_marker(&to, BACK_MARKER_EXT) {
+                MarkerRead::Present(key) if key.as_str() == was.key => {
+                    restamp_carried(&to, new_identity, &mut counts)
+                        .map_err(|_| ClaimDenied::Fault)?;
+                    if remove_marker(&to, BACK_MARKER_EXT, was.key).is_err() {
+                        return Err(ClaimDenied::Fault);
+                    }
+                }
+                MarkerRead::Present(_) | MarkerRead::Absent => {}
+                MarkerRead::Fault => return Err(ClaimDenied::Fault),
             }
         }
         if remove_marker(&from, FORWARD_MARKER_EXT, now.key).is_err() {
@@ -1668,9 +1749,8 @@ where
         }
     }
     // Everything is under the new key and bound to the old place. Re-bind
-    // it, index last.
-    restamp_carried(&to, old_identity, new_identity, &mut counts)
-        .map_err(|_| ClaimDenied::Fault)?;
+    // it, index last, under the back marker written above.
+    restamp_carried(&to, new_identity, &mut counts).map_err(|_| ClaimDenied::Fault)?;
     // Settled: no chain has two names. The markers have nothing left to
     // say, and one a refusal leaves behind costs a later reclaim one look,
     // or the retry that finds nothing to carry takes it away.
@@ -4564,12 +4644,16 @@ where
         .map_err(|_| ClaimDenied::Fault)?;
     book.change_dir(owner.key).map_err(|_| ClaimDenied::Fault)?;
     match book_dir_claim(&book, owner) {
-        ClaimState::MineActive => Ok(book),
+        ClaimState::MineActive => {
+            settle_markers_for_writer(root, &book, owner.key).map_err(|_| ClaimDenied::Fault)?;
+            Ok(book)
+        }
         // The sweep retired this directory while its owner was off the
         // card; the owner is back. Reactivating resumes the positions the
         // claim proves are its own.
         ClaimState::MineReleased => {
             write_book_dir_claim(&book, owner, false, None).map_err(|_| ClaimDenied::Fault)?;
+            settle_markers_for_writer(root, &book, owner.key).map_err(|_| ClaimDenied::Fault)?;
             Ok(book)
         }
         ClaimState::OtherActive => Err(ClaimDenied::Foreign),
