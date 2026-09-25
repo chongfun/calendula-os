@@ -795,7 +795,11 @@ intermediate format that carries a page index under a `BookId`.
 - Key pagination by `(LocalCacheIdentity, LayoutId)` for the ordinary open
   path, with no hashing.
 - Leave `(SourceDigest, LayoutId)` for the sharing and recovery path, which
-  arrives with the identity work rather than here.
+  arrives with the identity work rather than here. The recovery half is
+  Milestone 6 below, and it needs no second cache tree: the digest authorizes
+  one transfer between two local keys and the artifact is local again. The
+  sharing half, a `sources/<SourceDigest>/` tree that identical copies read
+  from, stays deferred.
 
 ### Milestone 4: Multi-layout cache retention
 
@@ -853,12 +857,125 @@ bound, on the grounds that the flip and the flip back is the flow that hurts.
 - Persist and use the progression fallback.
 - Do not claim exact content continuity across a changed `SourceDigest`.
 
+### Milestone 6: Pagination follows a proven move
+
+**Status: next. Written 2026-09-24 against `main` at `d650826`, after
+Milestones 1 to 5 shipped as #99, #102 and #104.**
+
+A book tidied into a folder on a computer keeps its place and loses its
+pagination. The place survives because Milestone 2 hung it from `BookId`.
+The pagination does not, because the cache directory is named by where the
+book is: `proto::cache::cache_key_from(source_hash_at(root, locator, size))`,
+28 bits of a hash of the place (`fw/src/library_sd.rs:861`). A move changes
+the key. The scan proves the move (Library Identity M3), calls
+`reader_cache::files::carry_position_for_move` (`reader-cache/src/files.rs:758`),
+which reads the moved file's full digest and writes a claim and the legacy
+position under the new key, and leaves everything else where it was. The
+orphan sweep then retires the departed key's data files. The next open is a
+cold build: minutes for a large book, on a card the reader reorganizes by the
+folder.
+
+This is the recovery path R8 names and the one Done-when item Milestones 1 to
+5 left unmet. It is also Source Identity's first consumer (its Milestone 4),
+and the cleanest one available: the equivalence question is asked exactly once,
+in the call that reads the bytes, and the artifact is scoped to one physical
+file again the moment it lands. No `sources/<SourceDigest>/` tree, no
+persisted digest contributing to any answer.
+
+**What moves.** Every data file under `/READER/CACHE2/E<was>/`:
+`SECTIONS/S<layout><ordinal>.BIN` for every resident layout, `CONT.BIN`,
+`TOC.BIN`, `COVER.BIN`, and `BOOK.BIN`. The claim under the new key already
+records the confirmed digest as evidence, and that evidence marks the carried
+set trusted for this epoch under R11 of Source Identity. `PlaceRecord` under
+`/READER/PLACES/<BookId>/` is not touched and needs nothing: it is keyed by
+copy, not by place.
+
+**How it moves.** By directory entry, not by bytes. The fork's
+`move_file_in_dir_lfn` rewrites the entry and keeps the cluster chain, and the
+installer already relies on it. There is no directory rename in the fork, so
+the set moves one entry at a time: cost is one entry write per file, bounded
+by `MAX_BOOK_SECTIONS` times the resident layout count plus four, against a
+rebuild measured in minutes. Nothing is read except the directory sectors.
+
+**The ordering decision, which is the part that was open.** The carry runs
+where the position carry runs today: inside `assign_book_ids`, after the match
+and before the ledger's new generation is committed
+(`fw/src/library_sd.rs:857`). That placement is deliberate and this milestone
+keeps it. The retry after a reset in that window re-finds the move by hashing
+the file and reads the departed owner's witness from the old directory's
+claim. Moving data files leaves that claim untouched, so the retry stands.
+Two designs were considered and set aside for that reason: re-attributing or
+renaming the old directory before the ledger write (it removes what the retry
+reads; `carry_position` already declines the same-key case on that ground), and
+a second step after the ledger write (it would need its own durable trigger,
+and the fork has no directory rename to make it O(1) anyway).
+
+Within the carry, `BOOK.BIN` moves last. The index marks a set present: a
+reset before it leaves the new key with sections and no index,
+which loads as no cache and builds, and the old key with an index over missing
+sections, which the loader already treats as a hole and the sweep reclaims.
+Either way a torn carry costs a rebuild and not a place, which is this PRD's
+standing rule for either cache tree.
+
+**The sweep.** `scan_books` writes the catalog, re-reads and
+validates it, and only then calls `sweep_orphan_caches`
+(`fw/src/library_sd.rs:188`), so the departed directory is intact when the
+repair fires and the sweep finds the new key live and the old key gone. A
+torn carry's remainder is the sweep's to reclaim, as today.
+
+Requirements:
+
+- Only a move `assign_book_ids` has proved carries pagination: size matched
+  and digest read in this call. Nothing else may conclude that a book moved,
+  and nothing may hand one key's pagination to another on persisted evidence.
+- Every resident layout is carried, not only the active one. R9 holds across
+  a move.
+- The departed key's claim is not modified. The same-key case stays declined,
+  as `carry_position_for_move` declines it today.
+- `BOOK.BIN` is the last entry moved.
+- A refused or partial carry is logged and does not fail the scan, the rule
+  the position bridge set: the copy has its id back either way, and the book
+  builds rather than does not open.
+- No bytes of section or content data are read or copied.
+- An identical copy elsewhere on the card is unaffected: its key names its
+  own place and its claim its own locator, and the size match in
+  `assign_book_ids` is settled by the digest of the file that moved.
+
+Tests, on the host fault harness that already covers the position carry:
+
+- a cut at every entry move, followed by a mount, a scan and an open: the new
+  key either loads its whole set or builds, and no open reads a page from a
+  section the index does not describe;
+- the sweep after a torn carry reclaims only what remains under the departed
+  key;
+- two resident layouts under the departed key both arrive, and a flip back
+  reuses the carried one;
+- the `PlaceRecord` is byte-identical before and after;
+- a same-length twin in another folder keeps its pagination and its place;
+- the `BOOK.BIN`-last order is pinned by a test that cuts immediately before
+  it.
+
+Measurement, on the X3 with the card in a computer for the move: build a
+large book, move it into a folder, boot. The scan reports the move; the next
+open is a cached reopen in tens of milliseconds rather than a build. Record
+the entry writes the scan telemetry counts against the section count, and
+confirm the repair's whole-file read (285 kB/s inside the scan, per Library
+Identity M4) remains the dominant cost, so the carry adds nothing a reader
+would notice to a scan that already reads the file.
+
+Out of scope here, still: pagination shared between identical copies, which
+needs the second tree and a trust story for a digest read for one file being
+believed for another. Nothing in this milestone makes that harder.
+
 ## Done when
 
 - Changing typography does not move the reader's logical place.
 - Reading position contains no authoritative page index.
 - Two identical copies retain independent positions.
-- Identical copies can share pagination.
+- Pagination survives a computer-side move the scan has proved, with no
+  rebuild (Milestone 6).
+- Identical copies can share pagination. **Deferred**: needs the
+  `sources/<SourceDigest>/` tree and a cross-copy trust rule; see Milestone 3.
 - Switching back to a recently used layout reuses its pagination.
 - Deleting/rebuilding pagination cannot erase reading place.
 - A managed EPUB replacement does not automatically orphan the book's position.

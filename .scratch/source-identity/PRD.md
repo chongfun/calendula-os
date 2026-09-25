@@ -450,10 +450,23 @@ it. A persisted record cannot prove anything about the bytes on the card, and
 building the machinery that decides when it may be believed, before anything
 asks, would be guessing at the shape its consumer wants.
 
-### Milestone 4: First consumer
+### Milestone 4: First consumer, pagination follows a proven move
 
-Use `SourceDigest` for the first content-derived feature, preferably
-image-rendering artifacts.
+**Status: next, written 2026-09-24.** The first consumer is Reading Position
+and Layout Durability Milestone 6: when the library scan proves that a book
+moved, the pagination filed under its old cache key moves with it. Image
+rendering artifacts, which this milestone once named first, become the
+second consumer and inherit the same rule.
+
+It goes first for three reasons. It closes a measured user cost today: every
+book reorganized on a computer pays a cold rebuild on its next open, minutes
+for a large one, because the cache key is a hash of the book's place and a
+move changes it. It uses the digest at the one moment the code already reads
+it: `carry_position_for_move` hashes the moved file to confirm the move before
+the ledger commits, so the equivalence question below is asked in the call
+that reads both sides and nothing persisted contributes. And the artifact is
+local again the moment it lands under the new key, so no shared tree, no
+promotion, and no cross-copy trust story is needed to ship it.
 
 **Prerequisite: validation before any claim of equivalence.** This milestone
 is where a persisted digest first authorizes something, so the reading it
@@ -518,6 +531,8 @@ question needs it.
 - Every hotspot-uploaded EPUB can obtain its full SHA-256 without a second full-file read.
 - Existing EPUBs can obtain the same identity lazily.
 - Identical EPUB copies share a `SourceDigest`.
+- A proven move carries the book's pagination to its new locator without a
+  rebuild, on a digest read in the call that carries it.
 - Image-rendering or another content-derived cache can use the identity without depending on the EPUB path.
 - Reading position remains unaffected.
 - Opening a book costs what it costs today. No read path waits on a digest,
