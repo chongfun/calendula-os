@@ -2452,7 +2452,7 @@ where
     //
     // `Ok(Some(next_spine))` means the walk suspended and owes a continuation
     // from that spine item; `Ok(None)` means it reached the end of the book.
-    let walk = files::with_v2_sections_dir(root, owner, |sections_dir| {
+    let walk = files::with_v2_sections_dir_for_writer(root, owner, |sections_dir| {
         for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
             *index >= start_spine_index
                 && *index >= resume_spine_index
@@ -2740,7 +2740,7 @@ where
                 // is finished work that this failure says nothing about, and
                 // CONT.BIN is settings-independent: taking it would turn the
                 // next open from a replay into a full re-parse.
-                let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
+                let _ = files::empty_layout_cache(root, owner, library.layout_key());
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -2929,7 +2929,7 @@ where
     let mut book_partial = false;
     let mut section_write_micros: u64 = 0;
 
-    let replayed = files::with_v2_sections_dir(root, owner, |sections_dir| {
+    let replayed = files::with_v2_sections_dir_for_writer(root, owner, |sections_dir| {
         // One open serves both the header validation and the record
         // stream; the handle stays live for the whole replay.
         files::with_v2_content_file(root, owner, Mode::ReadOnly, |file| {
@@ -3029,7 +3029,7 @@ where
         // follows reads CONT.BIN, and another layout's pagination is not
         // implicated in this one's failure.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
+        let _ = files::empty_layout_cache(root, owner, library.layout_key());
         return false;
     }
     true
