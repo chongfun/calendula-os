@@ -1032,6 +1032,14 @@ believed for another. Nothing in this milestone makes that harder.
   before handing it to a writer: shared names are taken away from the other
   side, both markers go. The carry's own retry passes through the same
   settle on its way to claiming the destination.
+- **Every truncate or reclaim under a claimed directory is a writer's
+  operation.** Layout eviction runs on a cache miss before the build claims
+  the directory and reclaims section files through a raw-key open; over a
+  cut carry it freed a chain the departed key still named, and the later
+  settle found no twin left to recognise. `open_v2_book_dir_for_writer` is
+  the read open plus the settle, and eviction, the truncating file helpers,
+  the content delete, the prune and the firmware's section-writing walks all
+  open through it or through `claim_v2_book_dir`. Reads are unchanged.
 - **Same-key collision** (two places sharing 28 bits of hash): no re-binding,
   one rebuild, the same accepted limitation positions already have.
 - **Handle budget**: the carry holds at most five directories at once (root,
