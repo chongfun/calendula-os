@@ -141,9 +141,12 @@ pub fn place_appended_block(
     overflowed
 }
 
-/// Re-place just the last block after `mark_last_block_paragraph_end` grew it,
-/// moving it to a fresh page when it no longer fits — the bounded fix-up a full
-/// rebuild would arrive at anyway. Returns whether the records overflowed.
+/// Re-place just the last block after `mark_last_block_paragraph_end` grew it.
+/// The gap it grew by is not ink, so the block stays on its page and what
+/// moves is the running `y` the next block is placed against; the decision is
+/// re-taken all the same, and a `NewPage` answer is mirrored into the records
+/// as a full rebuild would arrive at it. Returns whether the records
+/// overflowed.
 pub fn replace_last_block(
     library: &mut ReaderStore,
     cursor: &mut PageIndexCursor,

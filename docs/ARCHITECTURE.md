@@ -627,6 +627,19 @@ aggregates every section sharing a spine. The book index holds up to
 `MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a longer book caches
 `partial`.
 
+Pages break by one rule, and every path reads it from `ui::reading`: a block
+opens a new page when its ink would cross the bottom of the page box, or it
+demands a break, and the page already holds something. The trailing paragraph
+gap is not ink. It separates blocks that share a page and is charged only when
+the walk advances, so a heading whose rows fit stays on the page even when its
+gap would not. The incremental `PageIndexCursor` that builds the on-card page
+index, the full walks `paginate_block_pages` and `page_record_at` that the
+emulator goldens and the resident-miss fallback use, and the renderer's clip in
+`for_each_drawable_block` all take that decision from the same measured pair,
+so a page record is drawable by construction. Layout v20 retired indexes from
+before the cursor followed it, which had charged the gap and placed such a
+heading a page late.
+
 Each section header carries a `font_config` that packs `READER_LAYOUT_VERSION`
 with the type size and spacing it was paginated under. A loaded section whose
 version or size no longer matches is invalid and forces a rebuild, so bumping
