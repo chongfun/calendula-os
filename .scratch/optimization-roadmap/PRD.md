@@ -618,7 +618,14 @@ rule); everything else is already ours, structurally absent here, or S3.
   `uc8279-x3-driver`.
 - **Grayscale and anti-aliasing** (crosspoint `1f3d7458`; freeink `357b806`,
   `2cca22f`, `e85297e`, `5916724`, the absolute-plane series). No 2-bpp
-  consumer; unchanged since 2026-07-25.
+  consumer. **Corrected 2026-09-24:** the RAM half of the 2026-07-25 reason
+  is stale. Upstream's absolute mode streams the two planes as strips and the
+  SSD1677 shows them in one activation, so it fits without a second buffer or
+  heap; the block is the absent consumer, which the image PRD owns. What it
+  would take, and the two-part gate to reopen it, is under "Four-tone panel
+  output" in `on-device-image-rendering`. Text anti-aliasing stays declined
+  on its own: it is upstream's overlay pipeline and needs gray text, which the
+  rasterizer does not produce.
 - **The heap-fragmentation series** (crosspoint `c33a8b0e`, `c80c537f`,
   `c4d8c395`, `3555ff55`, `93b6fe11`; freeink `64dc507`, `1be4233`). Real
   fixes for an allocator we do not have on the reading path. Worth knowing

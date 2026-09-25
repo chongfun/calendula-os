@@ -310,7 +310,9 @@ open itself.
   initial firmware decoder.
 - Source orientations other than absent or 1 in the initial device decoder.
 - Background image decoding or prefetching.
-- Multi-level grayscale panel rendering.
+- Multi-level grayscale panel rendering, in every milestone here. What would
+  reopen it, and what it would cost, is recorded under "Four-tone panel
+  output" so the decision is made once.
 - Library-view cover thumbnails.
 - Matching JPEGDEC's complete API, or treating a textual port of any decoder as
   evidence of correctness.
@@ -1697,6 +1699,88 @@ destination-width error rows, falling back to ordered Bayer. Host policy freezes
 in M0R, and M0D proves the device produces equivalent output inside its
 workspace.
 
+## Four-tone panel output
+
+Not in any milestone. Recorded 2026-09-24 because both panels can show four
+tones, upstream now has a driver path for it that the sweep declined, and the
+roadmap's standing "no grayscale" rejection rests partly on a RAM argument that
+this design no longer needs. The block that remains is the one this PRD owns: a
+consumer.
+
+### What upstream shipped
+
+FreeInk `3080ca2`, `a3db714`, `3c6e110`, `4a69a29` and `5916724` (2026-09-09
+to 09-14), pulled into CrossPoint through the submodule, where it drives sleep
+images, EPUB covers and BMP viewing. Text anti-aliasing stays on their older
+overlay pipeline and is out of scope here entirely.
+
+- **Absolute mode.** The host supplies a complete four-tone image as two
+  planes, LSB then MSB: black `(0,0)`, dark `(1,0)`, light `(0,1)`, white
+  `(1,1)`. Every pixel is present, including background. No black-and-white
+  base is painted first.
+- **SSD1677, our X4: one activation.** Factory selector `0xCC`, factory LUT
+  bytes retained, and the previous image stays on the glass until both planes
+  are in. The power-down is a separate step when requested. The "single
+  pass" in the CrossPoint discussion means this activation. It is a
+  controller property, not an MCU one, and the C3 X4 is the primary target.
+- **UC8253, our X3: two shapes.** Absolute mode with a separate
+  black-and-white conditioning pass, and a "Direct" combined-activation mode
+  behind an opt-in driver config. The four-tone bank is the stock XTH4 set.
+  FreeInk's earlier note (`cd2bcc5`) says the bank needs a dedicated
+  grayscale panel init with different rails and VCOM from the black-and-white
+  init (PSR `3F 4A`, PWR `43 00 78 78 17`, VCOM `0x26`), so on the X3 this is
+  a driver init change, not a LUT upload.
+- **Strip uploads on both.** Full-width rows from row zero, LSB first, strips
+  may then interleave planes. The host streams from its decoder and holds no
+  second full framebuffer.
+- **Recovery is the driver's.** The next black-and-white refresh after an
+  absolute pass, or after a cancelled one, is forced clean. Any normal paint,
+  inversion change, or sleep cancels an incomplete pass.
+- **Validation status.** Host tests and X4 Pro builds. The commit messages say
+  physical panel validation remains, and the SSD1677 power-down split was
+  committed with builds and tests not run. Treat the waveform recipes as
+  upstream's reading of stock firmware, not as bench results.
+- **UC8279 X3.** Its four-tone bank is XTH4 as well, with a register exchange
+  fix in `357b806`. The `uc8279-x3-driver` PRD is black-and-white only, and
+  nothing here changes until that driver exists.
+
+### What it would mean here
+
+- **Consumer.** Covers on Home, the sleep image, and image pages. The sleep
+  image is the natural first one: drawn once, followed by deep sleep, and the
+  forced clean lands on a wake that already pays a clean refresh.
+- **Pixel format.** A second accepted pixel format in the capabilities
+  handshake, a dither policy that quantizes to four evenly spaced levels
+  (CrossPoint uses evenly spaced levels and a separate cache name so
+  AA-tuned caches are not reused), a manifest field saying which format an
+  asset holds, and a resident cover representation at two bits per pixel,
+  which doubles the cover buffer.
+- **Framebuffer.** A full-screen four-tone page is two planes of `FB_BYTES`.
+  With strips the source streams row by row, from the decoder or from a
+  host-preprocessed asset on SD, so no second buffer is required. Where a
+  whole-buffer staging is wanted, the previous-frame buffer is available: the
+  pass invalidates it anyway, and the forced clean that follows rebuilds it.
+  No heap on either route.
+- **Display task.** One flush plan per controller: mode selection, the
+  waveform bank, the separate power-down on the SSD1677, the panel init
+  change on the UC8253, and the forced clean afterwards. `RenderOutcome`
+  gains a four-tone kind, and refresh planning treats leaving it as it treats
+  leaving an image page now, a minimum of `Full`.
+- **Cost on the glass.** An absolute pass plus a forced clean. Unmeasured
+  here, and the number decides whether anything but the sleep image wants it.
+- **Hardware.** On-device acceptance is X3 in this PRD, which means the
+  UC8253 path and its separate panel init, the less-validated of the two
+  upstream. The X4's one-activation path is the cleaner one and cannot be
+  verified here; there is no X4.
+
+### Gate to reopen
+
+Two things, both required: a consumer judged unacceptable at one-bit dither on
+an X3 (a cover or the sleep image, looked at on the glass, not in the
+emulator), and a physical validation report for the UC8253 four-tone path from
+FreeInk or CrossPoint. Until both exist the non-goal stands, and the roadmap's
+rejection should cite this section rather than RAM.
+
 ## M3 bounded persistent device image pages
 
 ### Design choice
@@ -2125,4 +2209,6 @@ payload volume.
 - M3 slot count, page-size limit, index size, filesystem overhead, and write
   amplification;
 - whether M2B needs a rendering plate;
-- progressive device JPEG, SVG wrappers, and inline image layout.
+- progressive device JPEG, SVG wrappers, and inline image layout;
+- four-tone panel output for covers and the sleep image, gated as "Four-tone
+  panel output" records.
