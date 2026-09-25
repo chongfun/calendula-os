@@ -3216,6 +3216,14 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // Eviction reclaims section files, and this runs before the build claims
+    // the directory, so an unsettled carry has to be settled here first:
+    // reclaiming a name whose chain the other side still holds would free
+    // what that side names, and the later settle would find no twin left to
+    // recognise. A card that will not settle evicts nothing.
+    if open_v2_book_dir_for_writer(root, owner).is_none() {
+        return false;
+    }
     let Some(mut resident) = resident_layouts(root, owner) else {
         // Deciding what to evict from a list that might be short is the same
         // lost bound as evicting nothing, so the answer is no.
@@ -3807,7 +3815,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_sections_dir(root, owner, |sections| match sections {
+    with_v2_sections_dir_for_writer(root, owner, |sections| match sections {
         Some(sections) => prune_orphan_sections_in(sections, layout, keep_count),
         None => 0,
     })
@@ -4296,6 +4304,41 @@ where
     f(Some(&dir))
 }
 
+/// [`with_v2_sections_dir`] for a caller that will write, truncate or
+/// reclaim in `SECTIONS/`: the same walk, over the directory opened as a
+/// writer, so an unsettled carry is settled before anything under it
+/// changes. The build and the replay write their sections through this; the
+/// prune reclaims through it.
+pub fn with_v2_sections_dir_for_writer<
+    R,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    f: impl for<'a> FnOnce(Option<&Directory<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>) -> R,
+) -> R
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // One handle walks the chain via change_dir, so the whole build holds a
+    // single directory slot instead of the four-level ladder. The caller is
+    // responsible for `ensure_v2_cache_dirs` when the tree might not exist
+    // yet (the full build runs it once up front); a missing tree lands in
+    // the `f(None)` fallback like any other open failure.
+    let Some(mut dir) = open_v2_book_dir_for_writer(root, owner) else {
+        return f(None);
+    };
+    if dir.change_dir(CACHE_SECTIONS_DIR).is_err() {
+        return f(None);
+    }
+    f(Some(&dir))
+}
+
 /// Write one section file into an already-open SECTIONS directory — the
 /// per-section body of `write_v2_section_cache` without the per-call
 /// directory walk.
@@ -4607,6 +4650,33 @@ where
     }
 }
 
+/// Open the book's cache directory for something that will truncate or
+/// reclaim under it. The same directory [`open_v2_book_dir`] hands a reader,
+/// after the markers of an unsettled carry are settled, so no truncate or
+/// reclaim can free a chain the other side of that carry still names. Every
+/// path that deletes or truncates under a claimed directory opens it here or
+/// through [`claim_v2_book_dir`]; a read never needs to. `None` for a miss,
+/// or for a card that would not settle.
+pub fn open_v2_book_dir_for_writer<
+    'v,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &'v Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+) -> Option<Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let dir = open_v2_book_dir(root, owner)?;
+    settle_markers_for_writer(root, &dir, owner.key).ok()?;
+    Some(dir)
+}
+
 /// Open, creating if needed, the book's cache directory as a writer: verify
 /// or establish the claim. A directory claimed by another book is refused,
 /// so a full-hash twin cannot overwrite the holder's cache; the refused
@@ -4869,7 +4939,11 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let dir = open_v2_book_dir(root, owner)?;
+    let dir = if matches!(mode, Mode::ReadOnly) {
+        open_v2_book_dir(root, owner)?
+    } else {
+        open_v2_book_dir_for_writer(root, owner)?
+    };
     let file = dir.open_file_in_dir(CACHE_CONTENT_FILE, mode).ok()?;
     Some(f(&file))
 }
@@ -4890,7 +4964,7 @@ pub fn delete_v2_content_file<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Some(dir) = open_v2_book_dir(root, owner) else {
+    let Some(dir) = open_v2_book_dir_for_writer(root, owner) else {
         return;
     };
     let _ = upload_store::remove_file_reclaiming_clusters(&dir, CACHE_CONTENT_FILE);
@@ -5426,7 +5500,11 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let book_dir = open_v2_book_dir(root, owner)?;
+    let book_dir = if matches!(mode, Mode::ReadOnly) {
+        open_v2_book_dir(root, owner)?
+    } else {
+        open_v2_book_dir_for_writer(root, owner)?
+    };
     let file = book_dir.open_file_in_dir(CACHE_BOOK_FILE, mode).ok()?;
     Some(f(&file))
 }
@@ -5448,7 +5526,11 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let book_dir = open_v2_book_dir(root, owner)?;
+    let book_dir = if matches!(mode, Mode::ReadOnly) {
+        open_v2_book_dir(root, owner)?
+    } else {
+        open_v2_book_dir_for_writer(root, owner)?
+    };
     let file = book_dir.open_file_in_dir(CACHE_TOC_FILE, mode).ok()?;
     Some(f(&file))
 }

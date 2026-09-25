@@ -5515,3 +5515,151 @@ fn a_rebuild_over_an_unsettled_carry_settles_the_twins_first() {
     }
     assert_loads_under(&root, &NOW, identity_at(&NOW), pages, records[2].start_page);
 }
+
+/// Every chain named by a file under `key`, whatever the file is called:
+/// the book-level files and everything in `SECTIONS/`. Zero-length files
+/// name no chain and are left out.
+fn all_clusters_under(root: &Dir<'_>, key: &str) -> Vec<embedded_sdmmc::ClusterId> {
+    let Some(book) = book_dir_by_key(root, key) else {
+        return Vec::new();
+    };
+    let mut clusters = Vec::new();
+    let mut collect = |dir: &Dir<'_>| {
+        dir.iterate_dir(|entry| {
+            if !entry.attributes.is_directory() && entry.size > 0 {
+                clusters.push(entry.cluster);
+            }
+            core::ops::ControlFlow::Continue(())
+        })
+        .expect("iterate");
+    };
+    collect(&book);
+    if let Ok(sections) = book.open_dir(proto::cache::CACHE_SECTIONS_DIR) {
+        collect(&sections);
+    }
+    clusters
+}
+
+/// How many chains two keys name in common, over every file they hold.
+fn shared_chains_all(root: &Dir<'_>, a: &str, b: &str) -> usize {
+    let left = all_clusters_under(root, a);
+    let right = all_clusters_under(root, b);
+    left.iter()
+        .filter(|cluster| right.contains(cluster))
+        .count()
+}
+
+/// A carry from `OWNER` to `NOW` cut by power loss, over a book `setup`
+/// laid down, remounted, in the first cut state `accept` agrees to.
+fn torn_carry_where(
+    setup: &dyn Fn(&Dir<'_>, &mut ReaderStore),
+    accept: &dyn Fn(&Dir<'_>) -> bool,
+) -> SharedDisk {
+    for probe in 0..400u32 {
+        let disk = new_card();
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            let mut store = new_store();
+            setup(&root, &mut store);
+            let base = disk.writes.get();
+            arm_write_fault(&disk, base, probe, true);
+            let _ = files::carry_pagination(
+                &root,
+                &OWNER,
+                &NOW,
+                hashed(b"the book"),
+                IDENTITY,
+                identity_at(&NOW),
+            );
+            if !write_fault_fired(&disk, base, probe, true) {
+                break;
+            }
+        }
+        let accepted = {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            accept(&root)
+        };
+        if accepted {
+            return disk;
+        }
+    }
+    panic!("no cut left the state the test needs");
+}
+
+/// A book with two resident layouts, three sections each, and an index.
+fn two_layout_book(root: &Dir<'_>, store: &mut ReaderStore) {
+    files::ensure_v2_cache_dirs(root, &OWNER).expect("cache dirs");
+    for section in 0..3u16 {
+        write_section_under(root, store, false, section);
+        write_section_under(root, store, true, section);
+    }
+    assert_eq!(
+        files::resident_layouts(root, &OWNER)
+            .expect("the card answers")
+            .len(),
+        2
+    );
+}
+
+/// The open at the new place under a third layout runs the layout eviction
+/// before the build claims the directory, and eviction reclaims section
+/// files. Over a carry cut with twins remaining, that reclaimed a chain the
+/// departed key still named, and the settle that came later found no twin
+/// left to recognise. Eviction now opens the directory as a writer, which
+/// settles first: after it, no file under either key names a free cluster,
+/// the two keys share no chain, and reclaiming the departed key afterwards
+/// leaves every chain under the new key allocated.
+#[test]
+fn a_layout_eviction_over_an_unsettled_carry_settles_the_twins_first() {
+    let disk = torn_carry_where(&two_layout_book, &|root| {
+        shared_chains_all(root, KEY, NOW.key) > 0
+            && files::resident_layouts(root, &NOW).is_some_and(|layouts| layouts.len() == 2)
+    });
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let third = set_third_layout(&mut store);
+
+    // Production order: evict for the arriving layout, then claim and build.
+    assert!(
+        files::evict_layouts_for(&root, &NOW, third),
+        "eviction runs, settled"
+    );
+    for cluster in all_clusters_under(&root, KEY) {
+        assert!(
+            chain_is_allocated(&root, cluster),
+            "eviction freed a chain the departed key still names"
+        );
+    }
+    for cluster in all_clusters_under(&root, NOW.key) {
+        assert!(chain_is_allocated(&root, cluster));
+    }
+    assert_eq!(
+        shared_chains_all(&root, KEY, NOW.key),
+        0,
+        "the settle left no chain under two keys"
+    );
+    assert_eq!(
+        files::resident_layouts(&root, &NOW)
+            .expect("the card answers")
+            .len(),
+        1,
+        "and one layout made room for the third"
+    );
+    files::ensure_v2_cache_dirs(&root, &NOW).expect("the build claims the directory");
+    assert!(!marker_present(&root, NOW.key, BACK_MARKER));
+    assert!(!marker_present(&root, KEY, FORWARD_MARKER));
+
+    // The sweep reaches the departed key.
+    let survivors = all_clusters_under(&root, NOW.key);
+    assert!(files::release_book_dir_claim(&root, KEY));
+    assert!(files::empty_cache_dir(&root, KEY));
+    for cluster in survivors {
+        assert!(
+            chain_is_allocated(&root, cluster),
+            "reclaiming the departed key freed a chain under the new key"
+        );
+    }
+}
