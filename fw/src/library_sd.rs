@@ -858,16 +858,13 @@ where
     // reset between the two leaves a card whose next scan reports the same
     // move and carries the same place again.
     let mut carry = |found: &upload_store::ledger::FoundAgain<'_>| {
-        let was_key = proto::cache::cache_key_from(proto::cache::source_hash_at(
-            found.was.0,
-            found.was.1,
-            found.was.2,
-        ));
-        let now_key = proto::cache::cache_key_from(proto::cache::source_hash_at(
-            found.now.0,
-            found.now.1,
-            found.now.2,
-        ));
+        // The identity every cache header is bound to is the place's hash
+        // and the size; the key is 28 bits of the same hash. The carry
+        // needs both pairs, to re-bind what it moves.
+        let was_hash = proto::cache::source_hash_at(found.was.0, found.was.1, found.was.2);
+        let now_hash = proto::cache::source_hash_at(found.now.0, found.now.1, found.now.2);
+        let was_key = proto::cache::cache_key_from(was_hash);
+        let now_key = proto::cache::cache_key_from(now_hash);
         let was = proto::cache::CacheOwner {
             key: was_key.as_str(),
             root: found.was.0,
@@ -885,7 +882,13 @@ where
         // scan would let a card that cannot write a cache stop the library
         // being rebuilt. The markers the carry leaves make the sweep safe
         // to run over what it did not finish.
-        let carried = reader_cache::files::carry_for_move(root, &was, &now);
+        let carried = reader_cache::files::carry_for_move(
+            root,
+            &was,
+            &now,
+            (was_hash, found.was.2),
+            (now_hash, found.now.2),
+        );
         // Each half is reported on its own: a place that would not write
         // says nothing about the pagination, and the other way round.
         let (place_ok, place) = match &carried {
@@ -895,13 +898,18 @@ where
             },
             Err(_) => (false, false),
         };
-        let (pagination_ok, moved, unlinked) = match &carried {
+        let (pagination_ok, moved, unlinked, restamped) = match &carried {
             Ok(carry) => match carry.pagination {
-                Ok(Some(pagination)) => (true, pagination.moved, pagination.unlinked),
-                Ok(None) => (true, 0, 0),
-                Err(_) => (false, 0, 0),
+                Ok(Some(pagination)) => (
+                    true,
+                    pagination.moved,
+                    pagination.unlinked,
+                    pagination.restamped,
+                ),
+                Ok(None) => (true, 0, 0, 0),
+                Err(_) => (false, 0, 0, 0),
             },
-            Err(_) => (false, 0, 0),
+            Err(_) => (false, 0, 0, 0),
         };
         match &carried {
             Err(_) => esp_println::println!(
@@ -917,12 +925,13 @@ where
                         found.now.1
                     );
                 }
-                if pagination_ok && (moved > 0 || unlinked > 0) {
+                if pagination_ok && (moved > 0 || unlinked > 0 || restamped > 0) {
                     esp_println::println!(
-                        "sd: carried pagination to '{}': {} moved, {} unlinked",
+                        "sd: carried pagination to '{}': {} moved, {} unlinked, {} re-bound",
                         found.now.1,
                         moved,
-                        unlinked
+                        unlinked,
+                        restamped
                     );
                 } else if !pagination_ok {
                     esp_println::println!("sd: could not carry pagination to '{}'", found.now.1);
@@ -930,13 +939,14 @@ where
             }
         }
         esp_println::println!(
-            "bench: storage_move_carry ok={} place_ok={} place={} pagination_ok={} moved={} unlinked={} elapsed_ms={} t_ms={}",
+            "bench: storage_move_carry ok={} place_ok={} place={} pagination_ok={} moved={} unlinked={} restamped={} elapsed_ms={} t_ms={}",
             carried.is_ok(),
             place_ok,
             place,
             pagination_ok,
             moved,
             unlinked,
+            restamped,
             carry_start.elapsed().as_millis(),
             Instant::now().as_millis()
         );
