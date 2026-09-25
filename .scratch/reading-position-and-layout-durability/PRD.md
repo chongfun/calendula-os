@@ -1003,6 +1003,19 @@ believed for another. Nothing in this milestone makes that harder.
 - **The retry is idempotent to a clean state.** A retry that finds nothing
   left to carry removes a marker whose final delete did not land, on both
   sides, so a settled carry never keeps its markers.
+- **Moving the entries was not enough, and the tests had hidden it.** Every
+  cache header but the cover's binds its file to `(source_hash, size)` of the
+  book's place, the same hash the key is 28 bits of, and every loader refuses
+  a header bound to another place. A set moved by entry alone is refused
+  under the new key and built again, which is the cost this milestone exists
+  to remove. The fixture published and loaded under one arbitrary constant
+  identity, so the transition was never exercised. The carry now rewrites
+  the identity in place after the moves, one sector per file, sections first
+  and `BOOK.BIN` last, so an index that reads under the new place vouches
+  only for sections that do too; a retry that finds nothing left to move runs
+  the same idempotent pass. The scan passes both `(hash, size)` pairs, which
+  it already has. Tests publish under one identity, carry to a place whose
+  hash differs, load under the new one and show the old is refused.
 - **Handle budget**: the carry holds at most five directories at once (root,
   both book directories, both `SECTIONS/`), the twin-aware reclaim inside the
   sweep seven, against the manager's eight.
