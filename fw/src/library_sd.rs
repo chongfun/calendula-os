@@ -878,21 +878,46 @@ where
             root: found.now.0,
             locator: found.now.1,
         };
-        match reader_cache::files::carry_position_for_move(root, &was, &now) {
-            Ok(true) => esp_println::println!("sd: carried a reading place to '{}'", found.now.1),
-            Ok(false) => {}
-            // A place that could not be carried is a place lost, not a scan
-            // that failed: the copy has its id back either way, and the
-            // book opens at its beginning rather than not at all. The one
-            // case this bridge does not cover, and deliberately: failing
-            // the scan would let a card that cannot write a cache stop the
-            // library being rebuilt. It goes when positions hang from the
-            // id and a repaired locator keeps the place with nothing to
-            // copy.
+        let carry_start = Instant::now();
+        // A place or a pagination that could not be carried is lost, not a
+        // scan that failed: the copy has its id back either way, and the
+        // book builds again rather than not opening at all. Failing the
+        // scan would let a card that cannot write a cache stop the library
+        // being rebuilt. The markers the carry leaves make the sweep safe
+        // to run over what it did not finish.
+        let carried = reader_cache::files::carry_for_move(root, &was, &now);
+        match &carried {
+            Ok(carry) => {
+                if carry.place {
+                    esp_println::println!("sd: carried a reading place to '{}'", found.now.1);
+                }
+                if let Some(pagination) = carry.pagination {
+                    esp_println::println!(
+                        "sd: carried pagination to '{}': {} moved, {} unlinked",
+                        found.now.1,
+                        pagination.moved,
+                        pagination.unlinked
+                    );
+                }
+            }
             Err(_) => {
-                esp_println::println!("sd: could not carry a reading place to '{}'", found.now.1)
+                esp_println::println!("sd: could not carry to '{}'", found.now.1)
             }
         }
+        let (moved, unlinked) = carried
+            .as_ref()
+            .ok()
+            .and_then(|carry| carry.pagination)
+            .map_or((0, 0), |pagination| (pagination.moved, pagination.unlinked));
+        esp_println::println!(
+            "bench: storage_move_carry ok={} place={} moved={} unlinked={} elapsed_ms={} t_ms={}",
+            carried.is_ok(),
+            carried.as_ref().is_ok_and(|carry| carry.place),
+            moved,
+            unlinked,
+            carry_start.elapsed().as_millis(),
+            Instant::now().as_millis()
+        );
     };
     let assigned = upload_store::ledger::assign_book_ids(
         root,

@@ -626,9 +626,10 @@ where
 /// accepting it would let a caller pass the departed book's own stored
 /// digest and carry a place onto a candidate nobody hashed.
 ///
-/// Position only. Pagination is keyed on the locator too, so a move
-/// invalidates it whatever happens here, and rebuilding is cheaper than
-/// shuttling section files during a scan the reader is waiting on.
+/// Position only. The pagination is keyed on the locator too and follows in
+/// [`carry_pagination`], by directory entry rather than by bytes, so the
+/// scan the reader is waiting on pays a handful of entry writes and not the
+/// cache's length in reads and writes.
 ///
 /// The claim lands before the position, because a position in a directory
 /// whose claim did not land cannot be read back. Nothing here deletes the
@@ -773,6 +774,20 @@ where
     if was.key == now.key {
         return Ok(false);
     }
+    let digest = digest_of_moved(root, now)?;
+    carry_position(root, was, now, digest, None)
+}
+
+/// Read the bytes of the file now at `now`, so the carry that follows rests
+/// on what is there and not on what a claim remembers.
+fn digest_of_moved<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    now: &proto::cache::CacheOwner<'_>,
+) -> Result<proto::source::SourceDigest, ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     let path =
         proto::library_path::LibraryPath::parse(now.locator).map_err(|_| ClaimDenied::Fault)?;
     let read = upload_store::library::with_book_at(root, now.root, &path, |dir, alias| {
@@ -787,10 +802,622 @@ where
     })
     .map_err(|_| ClaimDenied::Fault)?
     .flatten();
-    let Some(digest) = read else {
-        return Err(ClaimDenied::Fault);
+    read.ok_or(ClaimDenied::Fault)
+}
+
+/// What one proven move carried from the key a book had to the key it has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MoveCarry {
+    /// A legacy reading position was brought across.
+    pub place: bool,
+    /// The pagination was brought across, and how.
+    pub pagination: Option<CarriedPagination>,
+}
+
+/// Everything a proven move carries: the legacy position, then the
+/// pagination. One read of the moved file serves both.
+///
+/// Reached from the firmware on a move the scan has proved, before the
+/// ledger writes it down, so a reset retries it. Nothing else may conclude
+/// that a book moved.
+pub fn carry_for_move<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    was: &proto::cache::CacheOwner<'_>,
+    now: &proto::cache::CacheOwner<'_>,
+) -> Result<MoveCarry, ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if was.key == now.key {
+        // One directory serves both places; see `carry_position`.
+        return Ok(MoveCarry::default());
+    }
+    let digest = digest_of_moved(root, now)?;
+    let place = carry_position(root, was, now, digest, None)?;
+    let pagination = carry_pagination(root, was, now, digest)?;
+    Ok(MoveCarry { place, pagination })
+}
+
+// ---------------------------------------------------------------------------
+// Pagination follows a proven move
+// ---------------------------------------------------------------------------
+
+/// Written in the departed directory before the first entry moves out of it,
+/// naming the key its files are going to. Whoever reclaims that directory
+/// afterwards can then tell a name that still shares its chain with the
+/// destination, because a move was cut between its two writes, from a name
+/// that owns its chain, and take the first away instead of freeing it.
+///
+/// A marker is a zero-length file whose name is the other directory's key
+/// under this extension: `<key>.MVD`. It has no chain, so writing it is one
+/// directory entry, removing it is one directory entry, and no state between
+/// exists in which an entry describes clusters that are already free. What
+/// it says is read from the directory listing.
+const FORWARD_MARKER_EXT: &str = "MVD";
+/// The mirror in the destination, `<key>.LNK`, naming the key its files are
+/// arriving from, so a reclaim of the destination before the carry settled
+/// resolves the same twins from its side. The two together make the outcome
+/// the same whichever directory a sweep reaches first.
+const BACK_MARKER_EXT: &str = "LNK";
+
+/// The book-level files a carry moves, in the order it moves them. The index
+/// goes last: it is what makes a set present, so a cut before it leaves the
+/// new key with no cache to load and the old key with a hole the loader
+/// already treats as one.
+const CARRIED_FILES: [&str; 4] = [
+    CACHE_CONTENT_FILE,
+    CACHE_TOC_FILE,
+    CACHE_COVER_FILE,
+    CACHE_BOOK_FILE,
+];
+
+/// What one proven move did for the pagination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CarriedPagination {
+    /// Entries moved by rewriting their directory entry.
+    pub moved: u16,
+    /// Names taken away because the destination already held the chain: a
+    /// carry cut between a move's two writes, finished on the retry.
+    pub unlinked: u16,
+}
+
+enum MarkerRead {
+    Present(String<{ proto::cache::CACHE_KEY_BYTES }>),
+    Absent,
+    /// The card would not answer, or the directory holds more than one
+    /// marker of this kind, which no sequence of carries writes. Evidence of
+    /// nothing, and a reclaim that meets it must not free anything.
+    Fault,
+}
+
+/// `<key>.<ext>`, or `None` for a key that is not an 8.3 basename.
+fn marker_name(key: &str, ext: &str) -> Option<String<SHORT_NAME_BYTES>> {
+    if key.is_empty() || key.len() > 8 || !key.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut name = String::new();
+    name.push_str(key).ok()?;
+    name.push('.').ok()?;
+    name.push_str(ext).ok()?;
+    Some(name)
+}
+
+/// Read the marker of one kind in an open book directory, from its listing.
+fn read_marker<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    ext: &str,
+) -> MarkerRead
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let mut found: Option<String<{ proto::cache::CACHE_KEY_BYTES }>> = None;
+    let mut ambiguous = false;
+    let walked = book.iterate_dir(|entry| {
+        if entry.attributes.is_directory() {
+            return ControlFlow::Continue(());
+        }
+        let mut name = String::<SHORT_NAME_BYTES>::new();
+        if write!(name, "{}", entry.name).is_err() {
+            return ControlFlow::Continue(());
+        }
+        let Some((base, extension)) = name.as_str().rsplit_once('.') else {
+            return ControlFlow::Continue(());
+        };
+        if extension != ext || base.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        let mut key = String::new();
+        if key.push_str(base).is_err() || found.is_some() {
+            ambiguous = true;
+            return ControlFlow::Break(());
+        }
+        found = Some(key);
+        ControlFlow::Continue(())
+    });
+    if walked.is_err() || ambiguous {
+        return MarkerRead::Fault;
+    }
+    match found {
+        Some(key) => MarkerRead::Present(key),
+        None => MarkerRead::Absent,
+    }
+}
+
+/// Write the marker of one kind naming `key`, and read it back. A marker
+/// already naming `key` is left alone, which is what a retry finds; one
+/// naming another key is refused, since the caller settles that first.
+fn write_marker<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    ext: &str,
+    key: &str,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match read_marker(book, ext) {
+        MarkerRead::Present(stored) if stored.as_str() == key => return Ok(()),
+        MarkerRead::Absent => {}
+        MarkerRead::Present(_) | MarkerRead::Fault => return Err(()),
+    }
+    let name = marker_name(key, ext).ok_or(())?;
+    {
+        let file = book
+            .open_file_in_dir(name.as_str(), Mode::ReadWriteCreate)
+            .map_err(|_| ())?;
+        file.close().map_err(|_| ())?;
+    }
+    match read_marker(book, ext) {
+        MarkerRead::Present(stored) if stored.as_str() == key => Ok(()),
+        _ => Err(()),
+    }
+}
+
+/// Take a marker away. A zero-length file has no chain, so this is one
+/// directory entry and cannot leave an entry over freed clusters. A marker
+/// that is not there is already the end state.
+fn remove_marker<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    ext: &str,
+    key: &str,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let name = marker_name(key, ext).ok_or(())?;
+    match book.delete_entry_in_dir(name.as_str()) {
+        Ok(()) | Err(embedded_sdmmc::Error::NotFound) => Ok(()),
+        Err(_) => Err(()),
+    }
+}
+
+/// Take away whichever marker of one kind the directory holds.
+fn remove_any_marker<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    ext: &str,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match read_marker(book, ext) {
+        MarkerRead::Present(key) => remove_marker(book, ext, key.as_str()),
+        MarkerRead::Absent => Ok(()),
+        MarkerRead::Fault => Err(()),
+    }
+}
+
+/// Open `READER/CACHE2/<key>` with one handle. `Ok(None)` is a directory that
+/// is not there.
+fn open_book_dir_by_key<
+    'v,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &'v Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+) -> Result<Option<Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+        Err(_) => return Err(()),
     };
-    carry_position(root, was, now, digest, None)
+    for step in [CACHE_V2_DIR, key] {
+        match dir.change_dir(step) {
+            Ok(()) => {}
+            Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(Some(dir))
+}
+
+/// What became of one name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryFate {
+    Moved,
+    Unlinked,
+    Absent,
+}
+
+/// Move `name` from `from` to `to` by directory entry. When `to` already
+/// holds that name on the same chain, this is a move cut between its two
+/// writes being finished: the `from` name is taken away and the chain stays
+/// with `to`. A name in `to` on another chain is a stranger's, and refused.
+fn move_or_unlink<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    from: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> Result<EntryFate, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match from.move_file_in_dir(name, to, name) {
+        Ok(()) => Ok(EntryFate::Moved),
+        Err(embedded_sdmmc::Error::NotFound) => Ok(EntryFate::Absent),
+        Err(embedded_sdmmc::Error::FileAlreadyExists) => {
+            if unlink_if_twin(from, to, name)? {
+                Ok(EntryFate::Unlinked)
+            } else {
+                Err(())
+            }
+        }
+        Err(_) => Err(()),
+    }
+}
+
+/// Take `name` away from `dir` when `other` holds the same name on the same
+/// chain, so the chain keeps exactly one name. Two zero-length files share
+/// no chain and lose nothing either way. `Ok(false)` is a name `other` does
+/// not answer to, or answers to with a chain of its own.
+fn unlink_if_twin<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    other: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> Result<bool, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let ours = match dir.find_directory_entry(name) {
+        Ok(entry) => entry,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    let theirs = match other.find_directory_entry(name) {
+        Ok(entry) => entry,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    if ours.attributes.is_directory() || theirs.attributes.is_directory() {
+        return Err(());
+    }
+    if ours.cluster != theirs.cluster {
+        return Ok(false);
+    }
+    dir.delete_entry_in_dir(name).map_err(|_| ())?;
+    Ok(true)
+}
+
+/// List the files in an open `SECTIONS/` directory, `skip` entries in and at
+/// most one batch. `Ok(true)` when something in the pass could not be named
+/// or was a directory; the caller decides whether that blocks it.
+fn section_names<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    sections: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    skip: usize,
+    names: &mut heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH>,
+) -> Result<bool, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    let mut seen = 0usize;
+    let mut blocked = false;
+    sections
+        .iterate_dir(|entry| {
+            let mut name = String::<SHORT_NAME_BYTES>::new();
+            if write!(name, "{}", entry.name).is_err() {
+                blocked = true;
+                return ControlFlow::Continue(());
+            }
+            if name.as_str() == "." || name.as_str() == ".." {
+                return ControlFlow::Continue(());
+            }
+            if entry.attributes.is_directory() {
+                blocked = true;
+                return ControlFlow::Continue(());
+            }
+            if seen < skip {
+                seen += 1;
+                return ControlFlow::Continue(());
+            }
+            if names.push(name).is_err() {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })
+        .map_err(|_| ())?;
+    Ok(blocked)
+}
+
+/// Passes enough to list every section file a directory can hold, plus one
+/// that proves it came back empty rather than ran out of budget.
+const SECTION_CARRY_PASSES: usize =
+    (MAX_BOOK_SECTIONS * MAX_RESIDENT_LAYOUTS).div_ceil(SECTION_SWEEP_BATCH) + 1;
+
+/// Move every section file from `from` to `to`, finishing any cut earlier.
+/// Returns what it did, or refuses on the first name it could not settle,
+/// leaving the rest where they are for the retry or the sweep.
+fn carry_sections<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    from: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    counts: &mut CarriedPagination,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    for _ in 0..SECTION_CARRY_PASSES {
+        let mut names = heapless::Vec::new();
+        // Everything a pass settles leaves the listing, so every pass starts
+        // at the front; the bound is what stops a name that will not go.
+        let blocked = section_names(from, 0, &mut names)?;
+        if names.is_empty() {
+            return if blocked { Err(()) } else { Ok(()) };
+        }
+        for name in &names {
+            match move_or_unlink(from, to, name.as_str())? {
+                EntryFate::Moved => counts.moved = counts.moved.saturating_add(1),
+                EntryFate::Unlinked => counts.unlinked = counts.unlinked.saturating_add(1),
+                EntryFate::Absent => {}
+            }
+        }
+    }
+    Err(())
+}
+
+/// In `book`, take away every name whose chain the directory at `other_key`
+/// also names. What is left owns its chain and may be reclaimed. True when
+/// the question was answered for every name; a card that would not answer
+/// leaves the caller unable to reclaim anything.
+fn unlink_twins_against<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    other_key: &str,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let other = match open_book_dir_by_key(root, other_key) {
+        // Nothing on the other side: no name here shares a chain with it.
+        Ok(None) => return true,
+        Ok(Some(other)) => other,
+        Err(()) => return false,
+    };
+    for name in CARRIED_FILES {
+        if unlink_if_twin(book, &other, name).is_err() {
+            return false;
+        }
+    }
+    let sections = match book.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
+    };
+    let other_sections = match other.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return true,
+        Err(_) => return false,
+    };
+    // Names that stay keep their place in the listing, names taken away
+    // leave it, so the next pass skips exactly the ones kept.
+    let mut kept = 0usize;
+    for _ in 0..SECTION_CARRY_PASSES {
+        let mut names = heapless::Vec::new();
+        let Ok(_) = section_names(&sections, kept, &mut names) else {
+            return false;
+        };
+        if names.is_empty() {
+            return true;
+        }
+        for name in &names {
+            match unlink_if_twin(&sections, &other_sections, name.as_str()) {
+                Ok(true) => {}
+                Ok(false) => kept += 1,
+                Err(()) => return false,
+            }
+        }
+    }
+    false
+}
+
+/// Bring a book's pagination from the key it had to the key it has, once the
+/// scan has proved the move and read the bytes now at `now`.
+///
+/// Every cache file under the departed key moves by directory entry: the
+/// sections of every resident layout, then the content stream, the chapter
+/// list and the cover, then the index last. Nothing is read but directory
+/// sectors, so a scan the reader is waiting on pays one entry write per
+/// file rather than the cache's length. The destination is claimed for `now`
+/// with the digest recorded as its evidence first, and both directories
+/// carry a marker naming the other while the carry is in flight, so a
+/// reclaim of either before it settles takes twin names away instead of
+/// freeing a chain the other side still uses.
+///
+/// Runs before the ledger writes the move down, as the position carry does,
+/// and leaves the departed directory's claim untouched: that claim is what a
+/// reset's retry reads to find the move again. A retry finishes what was
+/// cut, by moving what is left and unlinking what already arrived.
+///
+/// `Ok(None)` is nothing to carry: no cache under the old key, or a
+/// directory whose claim is not this book's. A carry that is refused part
+/// way leaves both directories loadable or rebuildable and the markers in
+/// place for the sweep; the book builds again rather than reading a page
+/// its index does not describe.
+pub fn carry_pagination<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    was: &proto::cache::CacheOwner<'_>,
+    now: &proto::cache::CacheOwner<'_>,
+    confirmed: proto::source::SourceDigest,
+) -> Result<Option<CarriedPagination>, ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if was.key == now.key {
+        return Ok(None);
+    }
+    let from = match open_book_dir_by_key(root, was.key) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return Ok(None),
+        Err(()) => return Err(ClaimDenied::Fault),
+    };
+    match book_dir_claim(&from, was) {
+        ClaimState::MineActive | ClaimState::MineReleased => {}
+        // Not this book's files to move, or nobody's that can be proved.
+        ClaimState::OtherActive | ClaimState::OtherReleased | ClaimState::Unclaimed => {
+            return Ok(None);
+        }
+        ClaimState::Fault => return Err(ClaimDenied::Fault),
+    }
+    match read_marker(&from, FORWARD_MARKER_EXT) {
+        MarkerRead::Absent => {}
+        MarkerRead::Present(key) if key.as_str() == now.key => {}
+        // Forwarded somewhere else before this move was found: a carry cut
+        // by a reset, then the file moved again on a computer. Settle the
+        // names shared with that earlier destination so both directories
+        // own what they hold, and let this book build afresh.
+        MarkerRead::Present(key) => {
+            if !unlink_twins_against(root, &from, key.as_str())
+                || remove_marker(&from, FORWARD_MARKER_EXT, key.as_str()).is_err()
+            {
+                return Err(ClaimDenied::Fault);
+            }
+            return Ok(None);
+        }
+        MarkerRead::Fault => return Err(ClaimDenied::Fault),
+    }
+    let has_sections = match from.open_dir(CACHE_SECTIONS_DIR) {
+        Ok(_) => true,
+        Err(embedded_sdmmc::Error::NotFound) => false,
+        Err(_) => return Err(ClaimDenied::Fault),
+    };
+    let has_files = CARRIED_FILES.iter().any(|name| {
+        matches!(
+            from.find_directory_entry(*name),
+            Ok(entry) if !entry.attributes.is_directory()
+        )
+    });
+    if !has_sections && !has_files {
+        // Nothing to carry. A marker still here is a settled carry whose
+        // last write did not land; it and its mirror have nothing left to
+        // say. The mirror is touched only in a directory that is already
+        // this book's, and only when it names this one.
+        if remove_marker(&from, FORWARD_MARKER_EXT, now.key).is_err() {
+            return Err(ClaimDenied::Fault);
+        }
+        if let Some(to) = open_v2_book_dir(root, now) {
+            if remove_marker(&to, BACK_MARKER_EXT, was.key).is_err() {
+                return Err(ClaimDenied::Fault);
+            }
+        }
+        return Ok(None);
+    }
+
+    // The destination first: claimed for the book at its new place, with
+    // the bytes just read recorded as its evidence. A stranger's leftovers
+    // are emptied by the adoption; this book's own, from a cut carry, stay.
+    record_cache_evidence(root, now, None, Some(confirmed))?;
+    let to = open_v2_book_dir(root, now).ok_or(ClaimDenied::Fault)?;
+    match read_marker(&to, BACK_MARKER_EXT) {
+        MarkerRead::Absent => {}
+        MarkerRead::Present(key) if key.as_str() == was.key => {}
+        // A back marker naming another source: the destination took part in
+        // a carry from somewhere else that did not settle. Settle it from
+        // this side before writing anything, so no chain ends up under
+        // three names.
+        MarkerRead::Present(key) => {
+            if !unlink_twins_against(root, &to, key.as_str())
+                || remove_marker(&to, BACK_MARKER_EXT, key.as_str()).is_err()
+            {
+                return Err(ClaimDenied::Fault);
+            }
+        }
+        MarkerRead::Fault => return Err(ClaimDenied::Fault),
+    }
+    // Markers before any entry moves, forward then back, each read back.
+    if write_marker(&from, FORWARD_MARKER_EXT, now.key).is_err()
+        || write_marker(&to, BACK_MARKER_EXT, was.key).is_err()
+    {
+        return Err(ClaimDenied::Fault);
+    }
+
+    let mut counts = CarriedPagination::default();
+    if has_sections {
+        let from_sections = from
+            .open_dir(CACHE_SECTIONS_DIR)
+            .map_err(|_| ClaimDenied::Fault)?;
+        let to_sections =
+            open_or_make_dir(&to, CACHE_SECTIONS_DIR).map_err(|_| ClaimDenied::Fault)?;
+        carry_sections(&from_sections, &to_sections, &mut counts)
+            .map_err(|_| ClaimDenied::Fault)?;
+        drop(to_sections);
+        drop(from_sections);
+        // Emptied, and a directory entry has no chain to reclaim. A refusal
+        // leaves an empty directory for the sweep, not cache data.
+        let _ = from.delete_entry_in_dir(CACHE_SECTIONS_DIR);
+    }
+    for name in CARRIED_FILES {
+        match move_or_unlink(&from, &to, name).map_err(|_| ClaimDenied::Fault)? {
+            EntryFate::Moved => counts.moved = counts.moved.saturating_add(1),
+            EntryFate::Unlinked => counts.unlinked = counts.unlinked.saturating_add(1),
+            EntryFate::Absent => {}
+        }
+    }
+    // Settled: no chain has two names. The markers have nothing left to
+    // say, and one a refusal leaves behind costs a later reclaim one look,
+    // or the retry that finds nothing to carry takes it away.
+    let _ = remove_marker(&to, BACK_MARKER_EXT, was.key);
+    let _ = remove_marker(&from, FORWARD_MARKER_EXT, now.key);
+    Ok(Some(counts))
 }
 
 /// The position files inside an open book directory.
@@ -2017,6 +2644,14 @@ const SHORT_NAME_BYTES: usize = 12;
 /// as long as the positions it vouches for, so its lifecycle belongs to the
 /// callers, not to this sweep of derivables. True when everything named
 /// went.
+///
+/// A directory that was one side of a carry (see [`carry_pagination`]) may
+/// hold names that still share a chain with the directory on the other side,
+/// if the carry was cut between a move's two writes. Its marker says which
+/// directory that is, and those names are taken away rather than reclaimed,
+/// so the survivor keeps its clusters. A marker the card will not read
+/// refuses the clear: a reclaim that cannot tell a twin from an owner must
+/// not free anything.
 fn empty_book_dir_artifacts<
     D,
     T,
@@ -2024,12 +2659,27 @@ fn empty_book_dir_artifacts<
     const MAX_FILES: usize,
     const MAX_VOLUMES: usize,
 >(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let other = match read_marker(book, FORWARD_MARKER_EXT) {
+        MarkerRead::Present(key) => Some(key),
+        MarkerRead::Absent => match read_marker(book, BACK_MARKER_EXT) {
+            MarkerRead::Present(key) => Some(key),
+            MarkerRead::Absent => None,
+            MarkerRead::Fault => return false,
+        },
+        MarkerRead::Fault => return false,
+    };
+    if let Some(other) = other {
+        if !unlink_twins_against(root, book, other.as_str()) {
+            return false;
+        }
+    }
     let mut cleared = true;
     for name in [
         CACHE_BOOK_FILE,
@@ -2058,6 +2708,12 @@ where
         // leaves an empty directory, not cache data, so it does not make
         // the clear a failure.
         let _ = book.delete_entry_in_dir(CACHE_SECTIONS_DIR);
+    }
+    // The markers have been used; they are derivable like the rest.
+    for ext in [FORWARD_MARKER_EXT, BACK_MARKER_EXT] {
+        if remove_any_marker(book, ext).is_err() {
+            cleared = false;
+        }
     }
     cleared
 }
@@ -2620,7 +3276,7 @@ where
             Err(embedded_sdmmc::Error::NotFound) => return true,
             Err(_) => return false,
         };
-        if !empty_book_dir_artifacts(&book) {
+        if !empty_book_dir_artifacts(root, &book) {
             cleared = false;
         }
         // The claim outlives the clear exactly as long as the positions it
@@ -3665,7 +4321,7 @@ where
         // wrong-book failure this whole layer exists to refuse. They go
         // with the adoption.
         ClaimState::OtherReleased => {
-            if !empty_book_dir_artifacts(&book) || !remove_position_files(&book) {
+            if !empty_book_dir_artifacts(root, &book) || !remove_position_files(&book) {
                 return Err(ClaimDenied::Fault);
             }
             write_book_dir_claim(&book, owner, false, None).map_err(|_| ClaimDenied::Fault)?;
@@ -3676,7 +4332,7 @@ where
         // torn, whose they were is exactly the question that cannot be
         // answered.
         ClaimState::Unclaimed => {
-            if !empty_book_dir_artifacts(&book) || !remove_position_files(&book) {
+            if !empty_book_dir_artifacts(root, &book) || !remove_position_files(&book) {
                 return Err(ClaimDenied::Fault);
             }
             write_book_dir_claim(&book, owner, false, None).map_err(|_| ClaimDenied::Fault)?;

@@ -89,6 +89,11 @@ struct FaultPlan {
     /// does when the card answers none of the reads it makes rather than one
     /// of them. Zero by default, which is the exactly-once model above.
     extra_read_faults: Cell<u32>,
+    /// Fail every write from this one on, counted from the card's first
+    /// write. Power loss, as distinct from a card that refused once: an
+    /// operation whose own recovery writes cannot recover either. The state
+    /// this leaves is what a remount finds.
+    fail_writes_from: Cell<Option<u32>>,
 }
 
 impl FaultPlan {
@@ -149,7 +154,16 @@ impl BlockDevice for SharedDisk {
     }
 
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
-        self.writes.set(self.writes.get() + 1);
+        let index = self.writes.get();
+        self.writes.set(index + 1);
+        if self
+            .fault
+            .fail_writes_from
+            .get()
+            .is_some_and(|from| index >= from)
+        {
+            return Err(DiskError);
+        }
         if let Some(bytes) = self.fault.tear_write_after.take() {
             let mut data = self.data.borrow_mut();
             let at = start.0 as usize * BLOCK_BYTES;
@@ -4316,4 +4330,627 @@ fn a_move_that_shares_a_cache_directory_leaves_the_evidence_alone() {
         }
         other => panic!("the claim is where it was: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pagination follows a proven move
+// ---------------------------------------------------------------------------
+
+/// Where the book is after a computer moved it: another key, another locator,
+/// the same bytes. The key is opaque to the carry, so a fixed one reads
+/// better than a hashed one here.
+const NOW: proto::cache::CacheOwner<'static> = proto::cache::CacheOwner {
+    key: "MOVEDTO1",
+    root: proto::library_path::BookRoot::Library,
+    locator: "Shelf/Test.epub",
+};
+
+/// A stranger who holds a key: same directory name, another book.
+const STRANGER_AT_NOW: proto::cache::CacheOwner<'static> = proto::cache::CacheOwner {
+    key: "MOVEDTO1",
+    root: proto::library_path::BookRoot::Library,
+    locator: "Other/Stranger.epub",
+};
+
+const STRANGER_AT_OLD: proto::cache::CacheOwner<'static> = proto::cache::CacheOwner {
+    key: KEY,
+    root: proto::library_path::BookRoot::Library,
+    locator: "Other/Stranger.epub",
+};
+
+/// A published book under `OWNER`, with a cover: three sections, an index, a
+/// cover, no content stream and no chapter list, so the carry has exactly
+/// five entries to move. Returns the records and the page total.
+fn published_book(root: &Dir<'_>, store: &mut ReaderStore) -> (Vec<BookV2SectionRecord>, u32) {
+    let records = build_book(root, store, 3);
+    write_cover(root);
+    let pages = total_pages(&records);
+    store.begin_book_load();
+    let outcome =
+        publish::publish_book_cache(root, &OWNER, IDENTITY, 0, store, &records, pages, false, 0);
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    (records, pages)
+}
+
+/// `READER/CACHE2/<key>`, claim unchecked: the tests ask about directories
+/// whose claims they are in the middle of moving.
+fn book_dir_by_key<'a>(root: &Dir<'a>, key: &str) -> Option<Dir<'a>> {
+    let mut dir = root.open_dir(proto::cache::CACHE_ROOT_DIR).ok()?;
+    dir.change_dir(proto::cache::CACHE_V2_DIR).ok()?;
+    dir.change_dir(key).ok()?;
+    Some(dir)
+}
+
+/// First cluster of a named file, or `None` for a name that is not there.
+fn cluster_of(dir: &Dir<'_>, name: &str) -> Option<embedded_sdmmc::ClusterId> {
+    dir.find_directory_entry(name)
+        .ok()
+        .map(|entry| entry.cluster)
+}
+
+/// Every data name the carry moves, with the section names the fixture's
+/// three sections take.
+fn carried_names() -> Vec<(bool, String)> {
+    let mut names: Vec<(bool, String)> = (0..3u16).map(|n| (true, section_name(n))).collect();
+    for name in [
+        proto::cache::CACHE_CONTENT_FILE,
+        proto::cache::CACHE_TOC_FILE,
+        proto::cache::CACHE_COVER_FILE,
+        proto::cache::CACHE_BOOK_FILE,
+    ] {
+        names.push((false, name.to_string()));
+    }
+    names
+}
+
+/// The first cluster of each carried name under `key`, `None` where the name
+/// is absent. Reads the directory rather than any header.
+fn carried_clusters(root: &Dir<'_>, key: &str) -> Vec<Option<embedded_sdmmc::ClusterId>> {
+    let Some(book) = book_dir_by_key(root, key) else {
+        return vec![None; carried_names().len()];
+    };
+    let sections = book.open_dir(proto::cache::CACHE_SECTIONS_DIR).ok();
+    carried_names()
+        .iter()
+        .map(|(in_sections, name)| {
+            if *in_sections {
+                sections.as_ref().and_then(|dir| cluster_of(dir, name))
+            } else {
+                cluster_of(&book, name)
+            }
+        })
+        .collect()
+}
+
+/// Whether a chain's first cluster is still allocated. A freed cluster reads
+/// as free in the FAT, which the chain walk refuses to follow; an allocated
+/// one answers with its successor or with the end of the chain. This is the
+/// check that catches a double free, which in-memory bytes cannot: nothing
+/// overwrites a freed cluster until something else is allocated onto it.
+fn chain_is_allocated(root: &Dir<'_>, cluster: embedded_sdmmc::ClusterId) -> bool {
+    root.next_cluster_in_chain(cluster).is_ok()
+}
+
+/// Nothing on the card holds two names for one chain across the two keys,
+/// except as the pair a cut move leaves, which the carry and the reclaims
+/// both know how to finish. Returns how many such pairs there are.
+fn twin_pairs(root: &Dir<'_>) -> usize {
+    let old = carried_clusters(root, KEY);
+    let new = carried_clusters(root, NOW.key);
+    let mut twins = 0;
+    for ((in_old, in_new), (_, name)) in old.iter().zip(new.iter()).zip(carried_names()) {
+        if let (Some(a), Some(b)) = (in_old, in_new) {
+            assert_eq!(a, b, "{name} is in both directories on different chains");
+            twins += 1;
+        }
+    }
+    twins
+}
+
+/// Whether the directory under `key` holds a marker of this kind: a
+/// zero-length `<other key>.<ext>` file, found by listing.
+fn marker_present(root: &Dir<'_>, key: &str, ext: &str) -> bool {
+    let Some(dir) = book_dir_by_key(root, key) else {
+        return false;
+    };
+    let mut present = false;
+    dir.iterate_dir(|entry| {
+        let name = entry.name.to_string();
+        if !entry.attributes.is_directory() && name.ends_with(&format!(".{ext}")) {
+            present = true;
+            return core::ops::ControlFlow::Break(());
+        }
+        core::ops::ControlFlow::Continue(())
+    })
+    .expect("iterate");
+    present
+}
+
+const FORWARD_MARKER: &str = "MVD";
+const BACK_MARKER: &str = "LNK";
+
+/// Arm the card for probe `probe` of a sweep over an operation that starts
+/// after `base` writes. `cut` is power loss from that write on; otherwise the
+/// card refuses that one write and answers again.
+fn arm_write_fault(disk: &SharedDisk, base: u32, probe: u32, cut: bool) {
+    if cut {
+        disk.fault.fail_writes_from.set(Some(base + probe));
+    } else {
+        disk.fault.fail_write_in.set(Some(probe));
+    }
+}
+
+/// Whether the armed fault fired, and disarm.
+fn write_fault_fired(disk: &SharedDisk, base: u32, probe: u32, cut: bool) -> bool {
+    let fired = if cut {
+        disk.writes.get() > base + probe
+    } else {
+        disk.fault.fail_write_in.get().is_none()
+    };
+    disk.fault.fail_writes_from.set(None);
+    disk.fault.fail_write_in.set(None);
+    fired
+}
+
+/// The book loads whole under `owner`: the index reads back with the page
+/// total it was published with, and the page inside the last section reads.
+fn assert_loads_under(root: &Dir<'_>, owner: &proto::cache::CacheOwner<'_>, pages: u32, page: u32) {
+    let mut store = new_store();
+    assert_eq!(
+        files::read_v2_book_total_pages(root, owner, IDENTITY, &store),
+        pages,
+        "the index under {} reports the published total",
+        owner.key
+    );
+    assert_eq!(
+        files::load_v2_book_index(root, owner, IDENTITY, &mut store),
+        files::BookIndexLoadResult::Hit { unfinished: false },
+        "the index under {} loads",
+        owner.key
+    );
+    assert!(
+        matches!(
+            files::load_v2_section_by_global_page(root, owner, IDENTITY, page, &mut store),
+            CacheLoadResult::Hit { .. }
+        ),
+        "page {page} under {} loads from its carried section",
+        owner.key
+    );
+}
+
+/// The whole carry, clean. Every entry moves by directory entry and keeps
+/// its chain, the book loads under the new key and is gone from the old, the
+/// departed claim is untouched, the destination records the digest that
+/// proved the move, and no marker outlives a settled carry.
+#[test]
+fn a_proven_move_carries_the_pagination_by_entry() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let (records, pages) = published_book(&root, &mut store);
+    let last_page = records[2].start_page;
+
+    let before = carried_clusters(&root, KEY);
+    let present_before = before.iter().filter(|c| c.is_some()).count();
+    assert_eq!(present_before, 5, "three sections, an index and a cover");
+    let writes_before = disk.writes.get();
+    let digest = hashed(b"the book");
+
+    let carried = files::carry_pagination(&root, &OWNER, &NOW, digest)
+        .expect("the carry is not refused")
+        .expect("there was something to carry");
+    assert_eq!(
+        carried,
+        files::CarriedPagination {
+            moved: 5,
+            unlinked: 0
+        },
+        "every entry moved, none needed finishing"
+    );
+
+    // By entry: the same first clusters, now under the other key.
+    let after = carried_clusters(&root, NOW.key);
+    assert_eq!(after, before, "each file keeps the chain it had");
+    assert!(
+        carried_clusters(&root, KEY).iter().all(Option::is_none),
+        "nothing carried is left under the old key"
+    );
+    // Directory writes only: two per move, the claim, two markers written
+    // and removed, and directory growth. Well under what one section's
+    // bytes would take.
+    let writes = disk.writes.get() - writes_before;
+    assert!(writes < 64, "a carry by entry took {writes} writes");
+
+    assert_loads_under(&root, &NOW, pages, last_page);
+    assert_eq!(
+        files::read_v2_book_total_pages(&root, &OWNER, IDENTITY, &store),
+        0,
+        "the old key has no index to answer with"
+    );
+    assert!(!sections_still_on_card(&root, 3));
+
+    match files::read_book_dir_claimant(&root, KEY) {
+        files::DirClaimant::Claimed {
+            locator, released, ..
+        } => {
+            assert_eq!(
+                locator.as_str(),
+                OWNER.locator,
+                "the departed claim still names its owner"
+            );
+            assert!(!released, "and is not released: that is the sweep's to do");
+        }
+        other => panic!("the departed claim is where it was: {other:?}"),
+    }
+    match files::read_book_dir_claimant(&root, NOW.key) {
+        files::DirClaimant::Claimed {
+            locator, evidence, ..
+        } => {
+            assert_eq!(locator.as_str(), NOW.locator);
+            assert_eq!(
+                evidence.digest,
+                Some(CachedSourceDigest::new(digest)),
+                "the destination records the bytes that proved the move"
+            );
+        }
+        other => panic!("the destination is claimed: {other:?}"),
+    }
+    assert!(
+        !marker_present(&root, KEY, FORWARD_MARKER),
+        "a settled carry leaves no forward marker"
+    );
+    assert!(
+        !marker_present(&root, NOW.key, BACK_MARKER),
+        "nor a back marker"
+    );
+    assert_eq!(twin_pairs(&root), 0);
+}
+
+/// Every write the carry makes is failed in turn, under both faults a card
+/// can present: one refused write with the card answering afterwards, and
+/// power loss from that write on. The card is remounted as a reset leaves it
+/// and the retry has to finish the job: the whole set under the new key,
+/// nothing under the old, no chain with two names, no marker left, every
+/// carried chain still allocated. Along the way no state may hold a name in
+/// both directories on different chains, and the index must not be under
+/// the new key without every section beside it.
+#[test]
+fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
+    for cut in [false, true] {
+        let mut refusals = 0usize;
+        let mut torn_states = 0usize;
+        let mut probe = 0u32;
+        loop {
+            let disk = new_card();
+            let pages;
+            let last_page;
+            {
+                let mgr = open_mgr(&disk);
+                let root = open_root(&mgr);
+                let mut store = new_store();
+                let (records, total) = published_book(&root, &mut store);
+                pages = total;
+                last_page = records[2].start_page;
+
+                let base = disk.writes.get();
+                arm_write_fault(&disk, base, probe, cut);
+                let first = files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book"));
+                let fired = write_fault_fired(&disk, base, probe, cut);
+                if !fired {
+                    assert!(
+                        matches!(first, Ok(Some(_))),
+                        "cut {cut} probe {probe}: fewer writes than the probe, so the carry finished"
+                    );
+                    break;
+                }
+                if first.is_err() {
+                    refusals += 1;
+                }
+            }
+            // The card as a reset leaves it: caches gone, only what landed.
+            {
+                let mgr = open_mgr(&disk);
+                let root = open_root(&mgr);
+                torn_states += twin_pairs(&root);
+                let new = carried_clusters(&root, NOW.key);
+                if new[6].is_some() {
+                    assert!(
+                        new[..3].iter().all(Option::is_some),
+                        "cut {cut} probe {probe}: the index is under the new key before every section"
+                    );
+                }
+
+                files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book")).unwrap_or_else(
+                    |denied| panic!("cut {cut} probe {probe}: the retry was refused: {denied:?}"),
+                );
+                let after = carried_clusters(&root, NOW.key);
+                assert_eq!(
+                    after.iter().filter(|c| c.is_some()).count(),
+                    5,
+                    "cut {cut} probe {probe}: the retry brought the whole set across"
+                );
+                assert!(
+                    carried_clusters(&root, KEY).iter().all(Option::is_none),
+                    "cut {cut} probe {probe}: the retry left nothing behind"
+                );
+                assert_eq!(twin_pairs(&root), 0, "cut {cut} probe {probe}");
+                assert!(
+                    !marker_present(&root, KEY, FORWARD_MARKER),
+                    "cut {cut} probe {probe}: forward marker left"
+                );
+                assert!(
+                    !marker_present(&root, NOW.key, BACK_MARKER),
+                    "cut {cut} probe {probe}: back marker left"
+                );
+                for cluster in after.into_iter().flatten() {
+                    assert!(
+                        chain_is_allocated(&root, cluster),
+                        "cut {cut} probe {probe}: a carried chain was freed"
+                    );
+                }
+                assert_loads_under(&root, &NOW, pages, last_page);
+            }
+            probe += 1;
+            assert!(
+                probe < 200,
+                "the carry made more writes than the sweep covers"
+            );
+        }
+        assert!(
+            refusals > 0,
+            "cut {cut}: no write in the carry could be failed"
+        );
+        if cut {
+            assert!(
+                torn_states > 0,
+                "no cut left a chain under two names, so the finishing path went untested"
+            );
+        }
+    }
+}
+
+/// Find a cut that leaves one chain under two names, remounted. Returns the
+/// disk in that state.
+fn torn_carry() -> SharedDisk {
+    for probe in 0..200u32 {
+        let disk = new_card();
+        {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            let mut store = new_store();
+            published_book(&root, &mut store);
+            let base = disk.writes.get();
+            arm_write_fault(&disk, base, probe, true);
+            let _ = files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book"));
+            if !write_fault_fired(&disk, base, probe, true) {
+                break;
+            }
+        }
+        let torn = {
+            let mgr = open_mgr(&disk);
+            let root = open_root(&mgr);
+            twin_pairs(&root) > 0
+        };
+        if torn {
+            return disk;
+        }
+    }
+    panic!("no cut left a chain under two names");
+}
+
+/// The sweep reaches the departed side of a cut carry. Its forward marker
+/// says where the files went, so the names that share a chain with the
+/// destination are taken away and the rest reclaimed, and every chain the
+/// destination holds stays allocated.
+#[test]
+fn reclaiming_the_departed_side_of_a_torn_carry_spares_the_destinations_chains() {
+    let disk = torn_carry();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    assert!(
+        marker_present(&root, KEY, FORWARD_MARKER),
+        "the cut left the forward marker"
+    );
+    let survivors: Vec<_> = carried_clusters(&root, NOW.key)
+        .into_iter()
+        .flatten()
+        .collect();
+    assert!(!survivors.is_empty());
+
+    // What the sweep does once the locator is proved gone.
+    assert!(files::release_book_dir_claim(&root, KEY));
+    assert!(
+        files::empty_cache_dir(&root, KEY),
+        "the departed side clears"
+    );
+
+    assert_eq!(twin_pairs(&root), 0, "no name is shared any more");
+    assert!(
+        carried_clusters(&root, KEY).iter().all(Option::is_none),
+        "the departed side holds no data files"
+    );
+    assert!(
+        !marker_present(&root, KEY, FORWARD_MARKER),
+        "the marker went with the clear"
+    );
+    for cluster in survivors {
+        assert!(
+            chain_is_allocated(&root, cluster),
+            "a survivor's chain was freed by the reclaim"
+        );
+    }
+}
+
+/// The other order: the destination of a cut carry is reclaimed first, as it
+/// would be if the book moved again before the carry settled. Its back marker
+/// names the departed side, the shared names are taken away from the
+/// destination, and every chain the departed side still holds stays
+/// allocated. Whichever side a sweep reaches first, the answer is the same.
+#[test]
+fn reclaiming_the_destination_of_a_torn_carry_spares_the_departed_sides_chains() {
+    let disk = torn_carry();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    assert!(
+        marker_present(&root, NOW.key, BACK_MARKER),
+        "the cut left the back marker"
+    );
+    let survivors: Vec<_> = carried_clusters(&root, KEY).into_iter().flatten().collect();
+    assert!(!survivors.is_empty());
+
+    assert!(files::release_book_dir_claim(&root, NOW.key));
+    assert!(
+        files::empty_cache_dir(&root, NOW.key),
+        "the destination clears"
+    );
+
+    assert_eq!(twin_pairs(&root), 0);
+    assert!(carried_clusters(&root, NOW.key).iter().all(Option::is_none));
+    assert!(!marker_present(&root, NOW.key, BACK_MARKER));
+    for cluster in survivors {
+        assert!(
+            chain_is_allocated(&root, cluster),
+            "a survivor's chain was freed by the reclaim"
+        );
+    }
+}
+
+/// A stranger adopting the departed key empties it through the same
+/// twin-aware clear, so an adoption cannot free a chain the destination
+/// holds either.
+#[test]
+fn an_adoption_over_a_torn_carry_unlinks_before_it_empties() {
+    let disk = torn_carry();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let survivors: Vec<_> = carried_clusters(&root, NOW.key)
+        .into_iter()
+        .flatten()
+        .collect();
+
+    assert!(files::release_book_dir_claim(&root, KEY));
+    let adopted = files::claim_v2_book_dir(&root, &STRANGER_AT_OLD).expect("a released key adopts");
+    drop(adopted);
+
+    assert_eq!(twin_pairs(&root), 0);
+    assert!(
+        carried_clusters(&root, KEY).iter().all(Option::is_none),
+        "the adoption emptied the key"
+    );
+    assert!(!marker_present(&root, KEY, FORWARD_MARKER));
+    for cluster in survivors {
+        assert!(
+            chain_is_allocated(&root, cluster),
+            "the adoption freed a chain the destination holds"
+        );
+    }
+}
+
+/// A destination key another book holds is refused, and the refusal leaves
+/// the old side exactly as it was: nothing moved, no marker written.
+#[test]
+fn a_stranger_holding_the_destination_key_refuses_the_carry() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let (_, pages) = published_book(&root, &mut store);
+    files::record_cache_evidence(&root, &STRANGER_AT_NOW, None, None).expect("the stranger claims");
+    let before = carried_clusters(&root, KEY);
+
+    assert_eq!(
+        files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book")),
+        Err(files::ClaimDenied::Foreign)
+    );
+    assert_eq!(
+        carried_clusters(&root, KEY),
+        before,
+        "nothing left the old key"
+    );
+    assert!(
+        !marker_present(&root, KEY, FORWARD_MARKER),
+        "no marker before the destination is ours"
+    );
+    assert_eq!(
+        files::read_v2_book_total_pages(&root, &OWNER, IDENTITY, &store),
+        pages
+    );
+}
+
+/// No cache under the old key is nothing to carry, and the destination is
+/// not touched for it: no directory, no claim, no marker.
+#[test]
+fn a_key_with_no_cache_carries_nothing_and_claims_nothing() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    assert_eq!(
+        files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book")),
+        Ok(None)
+    );
+    assert!(
+        book_dir_by_key(&root, NOW.key).is_none(),
+        "no destination was made"
+    );
+
+    // A claimed directory with a position and nothing rebuildable is the
+    // same answer: positions are not the carry's, and there is no cache.
+    files::write_position_file(&root, &OWNER, 2, 20).expect("position");
+    assert_eq!(
+        files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book")),
+        Ok(None)
+    );
+    assert!(book_dir_by_key(&root, NOW.key).is_none());
+}
+
+/// The whole move as the scan drives it: the file now at the new locator is
+/// read, the digest it yields becomes the destination's evidence, and both
+/// the legacy position and the pagination arrive under the new key.
+#[test]
+fn carry_for_move_reads_the_file_now_there_and_carries_place_and_pagination() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let body = b"the moved book, all of it";
+    {
+        root.make_dir_in_dir("BOOKS").expect("mkdir");
+        let shelf = open_child(&root, "BOOKS");
+        shelf.make_dir_in_dir_lfn("Shelf").expect("mkdir");
+        let folder = open_child(&shelf, "Shelf");
+        let file = folder.create_file_in_dir_lfn("Test.epub").expect("create");
+        file.write(body).expect("write");
+        file.close().expect("close");
+    }
+    let (key, root_kind) = moved_owner("Shelf/Test.epub", body.len() as u32);
+    let now = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: root_kind,
+        locator: "Shelf/Test.epub",
+    };
+    let mut store = new_store();
+    let (records, pages) = published_book(&root, &mut store);
+    files::write_position_file(&root, &OWNER, 4, 40).expect("position");
+
+    let carry = files::carry_for_move(&root, &OWNER, &now).expect("the move carries");
+    assert!(carry.place, "the legacy place came across");
+    assert_eq!(
+        carry.pagination,
+        Some(files::CarriedPagination {
+            moved: 5,
+            unlinked: 0
+        })
+    );
+    assert_eq!(files::read_position_file(&root, &now), Some((4, 40)));
+    assert_loads_under(&root, &now, pages, records[2].start_page);
+    match files::read_book_dir_claimant(&root, now.key) {
+        files::DirClaimant::Claimed { evidence, .. } => assert_eq!(
+            evidence.digest,
+            Some(CachedSourceDigest::new(hashed(body))),
+            "the evidence is the digest of the file now there"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(twin_pairs(&root), 0);
 }
