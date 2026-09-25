@@ -100,6 +100,10 @@ struct FaultPlan {
     /// sectors aims the tear at the in-place identity rewrites rather than at
     /// directory entries, which have their own recovery story.
     tear_header_write_in: Cell<Option<u32>>,
+    /// Refuse every write to these blocks, for as long as they are listed. A
+    /// sector the card will not rewrite while the rest of it still takes
+    /// writes, so one directory can refuse an update another accepts.
+    fail_writes_to: RefCell<Vec<u32>>,
 }
 
 impl FaultPlan {
@@ -167,6 +171,15 @@ impl BlockDevice for SharedDisk {
             .fail_writes_from
             .get()
             .is_some_and(|from| index >= from)
+        {
+            return Err(DiskError);
+        }
+        if self
+            .fault
+            .fail_writes_to
+            .borrow()
+            .iter()
+            .any(|block| (start.0..start.0 + blocks.len() as u32).contains(block))
         {
             return Err(DiskError);
         }
@@ -341,7 +354,19 @@ fn write_section_with_offset(
     start_offset: u32,
     start_page: u32,
 ) -> BookV2SectionRecord {
-    fill_section_at(store, spine, start_offset, 6);
+    write_section_of_lines(root, store, section, spine, start_offset, start_page, 6)
+}
+
+fn write_section_of_lines(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    section: u16,
+    spine: u16,
+    start_offset: u32,
+    start_page: u32,
+    lines: usize,
+) -> BookV2SectionRecord {
+    fill_section_at(store, spine, start_offset, lines);
     // The section file records `cached_spine`, and the load rejects a file whose
     // spine disagrees with the index record pointing at it. Without this every
     // section is written as spine 0, which happens to match for section 0 and
@@ -2366,7 +2391,7 @@ fn evicting_pagination_leaves_the_place_alone() {
     files::write_place(&root, id, anchor, source(), Some(0)).expect("the place stores");
 
     let layout = write_section_under(&root, &mut store, false, 0);
-    assert!(files::empty_layout_cache(&root, KEY, layout));
+    assert!(files::empty_layout_cache(&root, &OWNER, layout));
     assert_eq!(resident_count(&root), 0);
     assert_eq!(
         place_anchor(&root, id),
@@ -5588,21 +5613,6 @@ fn torn_carry_where(
     panic!("no cut left the state the test needs");
 }
 
-/// A book with two resident layouts, three sections each, and an index.
-fn two_layout_book(root: &Dir<'_>, store: &mut ReaderStore) {
-    files::ensure_v2_cache_dirs(root, &OWNER).expect("cache dirs");
-    for section in 0..3u16 {
-        write_section_under(root, store, false, section);
-        write_section_under(root, store, true, section);
-    }
-    assert_eq!(
-        files::resident_layouts(root, &OWNER)
-            .expect("the card answers")
-            .len(),
-        2
-    );
-}
-
 /// The open at the new place under a third layout runs the layout eviction
 /// before the build claims the directory, and eviction reclaims section
 /// files. Over a carry cut with twins remaining, that reclaimed a chain the
@@ -5633,6 +5643,11 @@ fn a_layout_eviction_over_an_unsettled_carry_settles_the_twins_first() {
             "eviction freed a chain the departed key still names"
         );
     }
+    assert_eq!(
+        broken_chains_under(&disk, &root, KEY),
+        Vec::<String>::new(),
+        "eviction freed clusters the departed key still names"
+    );
     for cluster in all_clusters_under(&root, NOW.key) {
         assert!(chain_is_allocated(&root, cluster));
     }
@@ -5662,4 +5677,194 @@ fn a_layout_eviction_over_an_unsettled_carry_settles_the_twins_first() {
             "reclaiming the departed key freed a chain under the new key"
         );
     }
+}
+
+/// The first data block and the blocks per cluster of the FAT16 volume the
+/// card was formatted with.
+fn fat16_geometry(disk: &SharedDisk) -> (u32, u32) {
+    let data = disk.data.borrow();
+    let at = PART_START_BLOCK as usize * BLOCK_BYTES;
+    let bpb = &data[at..at + BLOCK_BYTES];
+    let u16_at = |i: usize| u16::from_le_bytes([bpb[i], bpb[i + 1]]) as u32;
+    let reserved = u16_at(0x0E);
+    let fats = bpb[0x10] as u32;
+    let root_blocks = (u16_at(0x11) * 32).div_ceil(BLOCK_BYTES as u32);
+    let fat_blocks = u16_at(0x16);
+    (
+        PART_START_BLOCK + reserved + fats * fat_blocks + root_blocks,
+        bpb[0x0D] as u32,
+    )
+}
+
+/// Every file under `key` whose chain is shorter than its size says, by name.
+/// A truncate keeps a chain's first cluster and frees the rest, so a twin
+/// truncated from the other side shows up here and not in the first cluster.
+fn broken_chains_under(disk: &SharedDisk, root: &Dir<'_>, key: &str) -> Vec<String> {
+    let cluster_bytes = fat16_geometry(disk).1 * BLOCK_BYTES as u32;
+    let Some(book) = book_dir_by_key(root, key) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    let mut collect = |dir: &Dir<'_>| {
+        dir.iterate_dir(|entry| {
+            if !entry.attributes.is_directory() && entry.size > 0 {
+                files.push((entry.name.to_string(), entry.cluster, entry.size));
+            }
+            core::ops::ControlFlow::Continue(())
+        })
+        .expect("iterate");
+    };
+    collect(&book);
+    if let Ok(sections) = book.open_dir(proto::cache::CACHE_SECTIONS_DIR) {
+        collect(&sections);
+    }
+    files
+        .into_iter()
+        .filter(|(_, first, size)| {
+            let mut length = 0u32;
+            let mut cluster = Some(*first);
+            while let Some(at) = cluster {
+                length += 1;
+                cluster = match root.next_cluster_in_chain(at) {
+                    Ok(next) => next,
+                    Err(_) => return true,
+                };
+            }
+            length < size.div_ceil(cluster_bytes)
+        })
+        .map(|(name, _, _)| name)
+        .collect()
+}
+
+/// Every block of every directory under `key`: the book directory and its
+/// sections directory, read from the FAT16 geometry the card was formatted
+/// with.
+fn directory_blocks_under(disk: &SharedDisk, root: &Dir<'_>, key: &str) -> Vec<u32> {
+    let (data_start, per_cluster) = fat16_geometry(disk);
+    let book = book_dir_by_key(root, key).expect("the directory is there");
+    let cache = {
+        let mut dir = root
+            .open_dir(proto::cache::CACHE_ROOT_DIR)
+            .expect("cache root");
+        dir.change_dir(proto::cache::CACHE_V2_DIR)
+            .expect("cache dir");
+        dir
+    };
+    let mut blocks = Vec::new();
+    for first in [
+        cluster_of(&cache, key).expect("the book directory"),
+        cluster_of(&book, proto::cache::CACHE_SECTIONS_DIR).expect("the sections directory"),
+    ] {
+        let mut cluster = Some(first);
+        while let Some(at) = cluster {
+            let base = data_start + (at.value() - 2) * per_cluster;
+            blocks.extend(base..base + per_cluster);
+            cluster = root.next_cluster_in_chain(at).expect("the chain walks");
+        }
+    }
+    blocks
+}
+
+/// A book with two resident layouts and three sections each, long enough to
+/// span several clusters, so a truncate of one of them frees something.
+fn two_layout_book(root: &Dir<'_>, store: &mut ReaderStore) {
+    files::ensure_v2_cache_dirs(root, &OWNER).expect("cache dirs");
+    let settings = store.type_settings();
+    let was_portrait = store.portrait();
+    for section in 0..3u16 {
+        for portrait in [false, true] {
+            store.set_layout(settings, portrait);
+            write_section_of_lines(root, store, section, section, 0, 0, 200);
+        }
+    }
+    store.set_layout(settings, was_portrait);
+    assert_eq!(
+        files::resident_layouts(root, &OWNER)
+            .expect("the card answers")
+            .len(),
+        2
+    );
+}
+
+/// The failure tails of a publish clear the layout they were building, and
+/// they are often failing because the writer's settle was refused. A card
+/// that will not update the departed directory refuses the settle, and the
+/// cleanup has to leave both sides alone rather than free the chains the
+/// departed key still names. Once the card answers, the next writer settles.
+#[test]
+fn a_failed_publish_cleanup_over_a_refused_settle_frees_nothing() {
+    // A section chain under both keys that is longer than one cluster: the
+    // truncate keeps a first cluster, so only a longer chain loses anything.
+    let disk = torn_carry_where(&two_layout_book, &|root| {
+        marker_present(root, KEY, FORWARD_MARKER)
+            && marker_present(root, NOW.key, BACK_MARKER)
+            && book_dir_by_key(root, KEY).is_some_and(|book| {
+                let Ok(sections) = book.open_dir(proto::cache::CACHE_SECTIONS_DIR) else {
+                    return false;
+                };
+                let mut clusters = Vec::new();
+                sections
+                    .iterate_dir(|entry| {
+                        if entry.size > 0 {
+                            clusters.push(entry.cluster);
+                        }
+                        core::ops::ControlFlow::Continue(())
+                    })
+                    .expect("iterate");
+                let under_now = all_clusters_under(root, NOW.key);
+                clusters.iter().any(|cluster| {
+                    under_now.contains(cluster)
+                        && root
+                            .next_cluster_in_chain(*cluster)
+                            .is_ok_and(|next| next.is_some())
+                })
+            })
+    });
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let layouts = files::resident_layouts(&root, &NOW).expect("the card answers");
+    assert!(!layouts.is_empty());
+    let departed = all_clusters_under(&root, KEY);
+    let arrived = all_clusters_under(&root, NOW.key);
+
+    *disk.fault.fail_writes_to.borrow_mut() = directory_blocks_under(&disk, &root, KEY);
+    assert!(
+        files::open_v2_book_dir_for_writer(&root, &NOW).is_none(),
+        "the departed directory will not update, so the writer is refused"
+    );
+    for &layout in layouts.iter() {
+        assert!(
+            !files::empty_layout_cache(&root, &NOW, layout),
+            "the cleanup reports that it left the layout"
+        );
+    }
+    assert_eq!(
+        broken_chains_under(&disk, &root, KEY),
+        Vec::<String>::new(),
+        "the cleanup freed clusters the departed key still names"
+    );
+    assert_eq!(all_clusters_under(&root, KEY), departed);
+    assert_eq!(
+        all_clusters_under(&root, NOW.key),
+        arrived,
+        "nothing was deleted"
+    );
+    assert!(marker_present(&root, KEY, FORWARD_MARKER));
+    assert!(marker_present(&root, NOW.key, BACK_MARKER));
+
+    disk.fault.fail_writes_to.borrow_mut().clear();
+    for &layout in layouts.iter() {
+        assert!(
+            files::empty_layout_cache(&root, &NOW, layout),
+            "with the card answering, the cleanup settles and runs"
+        );
+    }
+    assert!(!marker_present(&root, KEY, FORWARD_MARKER));
+    assert!(!marker_present(&root, NOW.key, BACK_MARKER));
+    assert_eq!(shared_chains_all(&root, KEY, NOW.key), 0);
+    assert_eq!(
+        broken_chains_under(&disk, &root, KEY),
+        Vec::<String>::new(),
+        "the settled cleanup freed clusters the departed key still names"
+    );
 }

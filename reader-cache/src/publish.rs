@@ -253,7 +253,7 @@ where
             // This layout's index and sections, not the book's whole cache:
             // another layout's pagination is finished work, and the content
             // cache turns the retry into a replay rather than a re-parse.
-            let _ = files::empty_layout_cache(root, cache_key.key, library.layout_key());
+            let _ = files::empty_layout_cache(root, cache_key, library.layout_key());
             Err(PublishError::IndexWrite)
         }
     }

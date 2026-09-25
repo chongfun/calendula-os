@@ -3487,6 +3487,12 @@ where
 ///
 /// Eviction wants [`evict_layout_sections`] instead: the index is one file for
 /// the book, so taking it there would strand the layout that is staying.
+///
+/// A writer's operation, so it opens the directory through
+/// [`open_v2_book_dir_for_writer`]. The failure paths that call it are often
+/// failing because that settle was refused, and a reclaim that went ahead
+/// anyway would free chains the other side of an unsettled carry still names.
+/// A refused settle leaves the layout where it is, and reports it.
 pub fn empty_layout_cache<
     D,
     T,
@@ -3495,7 +3501,7 @@ pub fn empty_layout_cache<
     const MAX_VOLUMES: usize,
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
+    owner: &proto::cache::CacheOwner<'_>,
     layout: u8,
 ) -> bool
 where
@@ -3512,10 +3518,13 @@ where
         Err(embedded_sdmmc::Error::NotFound) => return true,
         Err(_) => return false,
     };
-    let book = match cache.open_dir(key) {
-        Ok(dir) => dir,
+    match cache.open_dir(owner.key) {
+        Ok(_) => {}
         Err(embedded_sdmmc::Error::NotFound) => return true,
         Err(_) => return false,
+    }
+    let Some(book) = open_v2_book_dir_for_writer(root, owner) else {
+        return false;
     };
     let index_gone = match book.delete_entry_in_dir(CACHE_BOOK_FILE) {
         Ok(()) => true,

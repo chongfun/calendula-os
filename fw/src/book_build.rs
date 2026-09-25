@@ -2740,7 +2740,7 @@ where
                 // is finished work that this failure says nothing about, and
                 // CONT.BIN is settings-independent: taking it would turn the
                 // next open from a replay into a full re-parse.
-                let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
+                let _ = files::empty_layout_cache(root, owner, library.layout_key());
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -3029,7 +3029,7 @@ where
         // follows reads CONT.BIN, and another layout's pagination is not
         // implicated in this one's failure.
         esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
+        let _ = files::empty_layout_cache(root, owner, library.layout_key());
         return false;
     }
     true
