@@ -1375,12 +1375,23 @@ where
         Err(embedded_sdmmc::Error::NotFound) => false,
         Err(_) => return Err(ClaimDenied::Fault),
     };
-    let has_files = CARRIED_FILES.iter().any(|name| {
-        matches!(
-            from.find_directory_entry(*name),
-            Ok(entry) if !entry.attributes.is_directory()
-        )
-    });
+    // Three answers, as for the sections: a name that is not there, a name
+    // that is, and a card that would not say. The last must not read as
+    // absence, because absence is what removes the markers, and a twin the
+    // card did not answer for would then be reclaimed as an owner.
+    let mut has_files = false;
+    for name in CARRIED_FILES {
+        match from.find_directory_entry(name) {
+            Ok(entry) => {
+                if !entry.attributes.is_directory() {
+                    has_files = true;
+                    break;
+                }
+            }
+            Err(embedded_sdmmc::Error::NotFound) => {}
+            Err(_) => return Err(ClaimDenied::Fault),
+        }
+    }
     if !has_sections && !has_files {
         // Nothing to carry. A marker still here is a settled carry whose
         // last write did not land; it and its mirror have nothing left to

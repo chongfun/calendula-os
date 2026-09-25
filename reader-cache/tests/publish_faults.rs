@@ -5036,3 +5036,58 @@ fn a_second_move_after_an_unsettled_carry_leaves_the_third_key_whole() {
         );
     }
 }
+
+/// Every read the retry makes over a cut carry is failed in turn. Whatever
+/// the retry answers, it may not take a marker away while a chain still has
+/// two names: a read the card refused is not evidence that a name is absent,
+/// and absence is what removes the markers. A retry that does answer with a
+/// carry has finished the job.
+#[test]
+fn a_read_fault_on_the_retry_cannot_remove_the_markers_while_a_twin_stands() {
+    let mut refused = 0usize;
+    let mut probe = 0u32;
+    loop {
+        let disk = torn_carry();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        assert!(twin_pairs(&root) > 0, "the fixture is a cut carry");
+
+        disk.fault.fail_read_in.set(Some(probe));
+        let retry = files::carry_pagination(&root, &OWNER, &NOW, hashed(b"the book"));
+        let fired = disk.fault.fail_read_in.get().is_none();
+        disk.fault.fail_read_in.set(None);
+
+        let twins = twin_pairs(&root);
+        if twins > 0 {
+            assert!(
+                marker_present(&root, KEY, FORWARD_MARKER),
+                "probe {probe}: the forward marker went while a chain has two names"
+            );
+            assert!(
+                marker_present(&root, NOW.key, BACK_MARKER),
+                "probe {probe}: the back marker went while a chain has two names"
+            );
+        }
+        match retry {
+            Ok(Some(_)) => {
+                assert_eq!(twins, 0, "probe {probe}: a carry that answered left a twin");
+            }
+            Ok(None) => {
+                assert_eq!(
+                    twins, 0,
+                    "probe {probe}: nothing to carry, yet a chain has two names"
+                );
+            }
+            Err(_) => refused += 1,
+        }
+        if !fired {
+            break;
+        }
+        probe += 1;
+        assert!(
+            probe < 400,
+            "the retry made more reads than the sweep covers"
+        );
+    }
+    assert!(refused > 0, "no read in the retry could be failed");
+}
