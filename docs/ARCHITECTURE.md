@@ -797,7 +797,8 @@ size)` of the book's place, and the loaders refuse a header bound to another
 place, so once the entries have moved the carry rewrites that identity in
 place, one sector per file, sections first and the index last, so an index
 that reads under the new place vouches only for sections that do too.
-Nothing else is read or written but directory sectors. The carry runs inside the
+Beyond directory sectors, that header sector is the only byte of each file
+the carry reads or writes. The carry runs inside the
 identity join, before the ledger commits the move, so a reset retries it, and
 it leaves the departed directory's claim untouched because that claim is what
 the retry reads; the retry moves what is left and unlinks what already
