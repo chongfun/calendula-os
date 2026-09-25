@@ -806,16 +806,20 @@ where
 }
 
 /// What one proven move carried from the key a book had to the key it has.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Each half answers for itself: a position write that did not land does
+/// not forfeit the pagination, and the caller can report both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoveCarry {
-    /// A legacy reading position was brought across.
-    pub place: bool,
-    /// The pagination was brought across, and how.
-    pub pagination: Option<CarriedPagination>,
+    /// Whether a legacy reading position was brought across.
+    pub place: Result<bool, ClaimDenied>,
+    /// Whether the pagination was brought across, and how.
+    pub pagination: Result<Option<CarriedPagination>, ClaimDenied>,
 }
 
 /// Everything a proven move carries: the legacy position, then the
-/// pagination. One read of the moved file serves both.
+/// pagination. One read of the moved file serves both, and only that read
+/// failing refuses the whole; each carry is attempted whatever became of
+/// the other.
 ///
 /// Reached from the firmware on a move the scan has proved, before the
 /// ledger writes it down, so a reset retries it. Nothing else may conclude
@@ -837,11 +841,14 @@ where
 {
     if was.key == now.key {
         // One directory serves both places; see `carry_position`.
-        return Ok(MoveCarry::default());
+        return Ok(MoveCarry {
+            place: Ok(false),
+            pagination: Ok(None),
+        });
     }
     let digest = digest_of_moved(root, now)?;
-    let place = carry_position(root, was, now, digest, None)?;
-    let pagination = carry_pagination(root, was, now, digest)?;
+    let place = carry_position(root, was, now, digest, None);
+    let pagination = carry_pagination(root, was, now, digest);
     Ok(MoveCarry { place, pagination })
 }
 
@@ -1332,6 +1339,34 @@ where
                 return Err(ClaimDenied::Fault);
             }
             return Ok(None);
+        }
+        MarkerRead::Fault => return Err(ClaimDenied::Fault),
+    }
+    // A back marker here means this directory was itself the destination
+    // of a carry that did not settle, and may still share chains with the
+    // directory that carry came from. Settle that first, by taking the
+    // shared names away from that earlier departed directory, so what moves
+    // on from here owns every chain it names; otherwise the third key would
+    // share chains with the first and no marker would join them. The
+    // earlier directory's forward marker and this back marker have nothing
+    // left to say afterwards.
+    match read_marker(&from, BACK_MARKER_EXT) {
+        MarkerRead::Absent => {}
+        MarkerRead::Present(earlier) => {
+            match open_book_dir_by_key(root, earlier.as_str()) {
+                Ok(Some(earlier_dir)) => {
+                    if !unlink_twins_against(root, &earlier_dir, was.key)
+                        || remove_marker(&earlier_dir, FORWARD_MARKER_EXT, was.key).is_err()
+                    {
+                        return Err(ClaimDenied::Fault);
+                    }
+                }
+                Ok(None) => {}
+                Err(()) => return Err(ClaimDenied::Fault),
+            }
+            if remove_marker(&from, BACK_MARKER_EXT, earlier.as_str()).is_err() {
+                return Err(ClaimDenied::Fault);
+            }
         }
         MarkerRead::Fault => return Err(ClaimDenied::Fault),
     }
@@ -2647,11 +2682,12 @@ const SHORT_NAME_BYTES: usize = 12;
 ///
 /// A directory that was one side of a carry (see [`carry_pagination`]) may
 /// hold names that still share a chain with the directory on the other side,
-/// if the carry was cut between a move's two writes. Its marker says which
-/// directory that is, and those names are taken away rather than reclaimed,
-/// so the survivor keeps its clusters. A marker the card will not read
-/// refuses the clear: a reclaim that cannot tell a twin from an owner must
-/// not free anything.
+/// if the carry was cut between a move's two writes. Its markers say which
+/// directories those are, both of them when it was the destination of one
+/// carry and the departed side of another, and those names are taken away
+/// rather than reclaimed, so the survivor keeps its clusters. A marker the
+/// card will not read refuses the clear: a reclaim that cannot tell a twin
+/// from an owner must not free anything.
 fn empty_book_dir_artifacts<
     D,
     T,
@@ -2666,18 +2702,15 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let other = match read_marker(book, FORWARD_MARKER_EXT) {
-        MarkerRead::Present(key) => Some(key),
-        MarkerRead::Absent => match read_marker(book, BACK_MARKER_EXT) {
-            MarkerRead::Present(key) => Some(key),
-            MarkerRead::Absent => None,
+    for ext in [FORWARD_MARKER_EXT, BACK_MARKER_EXT] {
+        match read_marker(book, ext) {
+            MarkerRead::Present(other) => {
+                if !unlink_twins_against(root, book, other.as_str()) {
+                    return false;
+                }
+            }
+            MarkerRead::Absent => {}
             MarkerRead::Fault => return false,
-        },
-        MarkerRead::Fault => return false,
-    };
-    if let Some(other) = other {
-        if !unlink_twins_against(root, book, other.as_str()) {
-            return false;
         }
     }
     let mut cleared = true;

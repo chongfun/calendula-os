@@ -4436,8 +4436,12 @@ fn chain_is_allocated(root: &Dir<'_>, cluster: embedded_sdmmc::ClusterId) -> boo
 /// except as the pair a cut move leaves, which the carry and the reclaims
 /// both know how to finish. Returns how many such pairs there are.
 fn twin_pairs(root: &Dir<'_>) -> usize {
-    let old = carried_clusters(root, KEY);
-    let new = carried_clusters(root, NOW.key);
+    twin_pairs_between(root, KEY, NOW.key)
+}
+
+fn twin_pairs_between(root: &Dir<'_>, a: &str, b: &str) -> usize {
+    let old = carried_clusters(root, a);
+    let new = carried_clusters(root, b);
     let mut twins = 0;
     for ((in_old, in_new), (_, name)) in old.iter().zip(new.iter()).zip(carried_names()) {
         if let (Some(a), Some(b)) = (in_old, in_new) {
@@ -4934,13 +4938,13 @@ fn carry_for_move_reads_the_file_now_there_and_carries_place_and_pagination() {
     files::write_position_file(&root, &OWNER, 4, 40).expect("position");
 
     let carry = files::carry_for_move(&root, &OWNER, &now).expect("the move carries");
-    assert!(carry.place, "the legacy place came across");
+    assert_eq!(carry.place, Ok(true), "the legacy place came across");
     assert_eq!(
         carry.pagination,
-        Some(files::CarriedPagination {
+        Ok(Some(files::CarriedPagination {
             moved: 5,
             unlinked: 0
-        })
+        }))
     );
     assert_eq!(files::read_position_file(&root, &now), Some((4, 40)));
     assert_loads_under(&root, &now, pages, records[2].start_page);
@@ -4953,4 +4957,82 @@ fn carry_for_move_reads_the_file_now_there_and_carries_place_and_pagination() {
         other => panic!("{other:?}"),
     }
     assert_eq!(twin_pairs(&root), 0);
+}
+
+/// A third place for the book, for the move after the move.
+const THIRD: proto::cache::CacheOwner<'static> = proto::cache::CacheOwner {
+    key: "THIRDKEY",
+    root: proto::library_path::BookRoot::Library,
+    locator: "Else/Test.epub",
+};
+
+/// A carry cut short, committed by the ledger without a retry, and then the
+/// book moves again. The second carry finds a back marker on its source and
+/// settles the earlier pair before forwarding anything, so the third key
+/// shares no chain with the first, and reclaiming either earlier key leaves
+/// every chain under the third allocated. Without the settle, the twins
+/// would travel on with no marker joining the first key to the third.
+#[test]
+fn a_second_move_after_an_unsettled_carry_leaves_the_third_key_whole() {
+    let disk = torn_carry();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    assert!(
+        marker_present(&root, NOW.key, BACK_MARKER),
+        "the cut left the back marker on the source of the next move"
+    );
+
+    let carried = files::carry_pagination(&root, &NOW, &THIRD, hashed(b"the book"))
+        .expect("the second carry is not refused")
+        .expect("the source held something");
+    assert!(carried.moved > 0, "files moved on to the third key");
+
+    assert_eq!(
+        twin_pairs_between(&root, KEY, NOW.key),
+        0,
+        "the earlier pair was settled"
+    );
+    assert_eq!(
+        twin_pairs_between(&root, KEY, THIRD.key),
+        0,
+        "and nothing shared travelled on"
+    );
+    assert_eq!(twin_pairs_between(&root, NOW.key, THIRD.key), 0);
+    assert!(
+        !marker_present(&root, KEY, FORWARD_MARKER),
+        "the first key's forward marker went with the settle"
+    );
+    assert!(!marker_present(&root, NOW.key, BACK_MARKER));
+    assert!(
+        !marker_present(&root, NOW.key, FORWARD_MARKER),
+        "the second carry settled too"
+    );
+    assert!(!marker_present(&root, THIRD.key, BACK_MARKER));
+
+    let survivors: Vec<_> = carried_clusters(&root, THIRD.key)
+        .into_iter()
+        .flatten()
+        .collect();
+    assert!(!survivors.is_empty());
+
+    // The sweep reaches the two departed keys, in either order.
+    assert!(files::release_book_dir_claim(&root, KEY));
+    assert!(files::empty_cache_dir(&root, KEY), "the first key clears");
+    for cluster in &survivors {
+        assert!(
+            chain_is_allocated(&root, *cluster),
+            "reclaiming the first key freed a chain under the third"
+        );
+    }
+    assert!(files::release_book_dir_claim(&root, NOW.key));
+    assert!(
+        files::empty_cache_dir(&root, NOW.key),
+        "the second key clears"
+    );
+    for cluster in &survivors {
+        assert!(
+            chain_is_allocated(&root, *cluster),
+            "reclaiming the second key freed a chain under the third"
+        );
+    }
 }

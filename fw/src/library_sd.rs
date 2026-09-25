@@ -886,33 +886,55 @@ where
         // being rebuilt. The markers the carry leaves make the sweep safe
         // to run over what it did not finish.
         let carried = reader_cache::files::carry_for_move(root, &was, &now);
+        // Each half is reported on its own: a place that would not write
+        // says nothing about the pagination, and the other way round.
+        let (place_ok, place) = match &carried {
+            Ok(carry) => match carry.place {
+                Ok(carried) => (true, carried),
+                Err(_) => (false, false),
+            },
+            Err(_) => (false, false),
+        };
+        let (pagination_ok, moved, unlinked) = match &carried {
+            Ok(carry) => match carry.pagination {
+                Ok(Some(pagination)) => (true, pagination.moved, pagination.unlinked),
+                Ok(None) => (true, 0, 0),
+                Err(_) => (false, 0, 0),
+            },
+            Err(_) => (false, 0, 0),
+        };
         match &carried {
-            Ok(carry) => {
-                if carry.place {
+            Err(_) => esp_println::println!(
+                "sd: could not read the book now at '{}', nothing carried",
+                found.now.1
+            ),
+            Ok(_) => {
+                if place {
                     esp_println::println!("sd: carried a reading place to '{}'", found.now.1);
+                } else if !place_ok {
+                    esp_println::println!(
+                        "sd: could not carry a reading place to '{}'",
+                        found.now.1
+                    );
                 }
-                if let Some(pagination) = carry.pagination {
+                if pagination_ok && (moved > 0 || unlinked > 0) {
                     esp_println::println!(
                         "sd: carried pagination to '{}': {} moved, {} unlinked",
                         found.now.1,
-                        pagination.moved,
-                        pagination.unlinked
+                        moved,
+                        unlinked
                     );
+                } else if !pagination_ok {
+                    esp_println::println!("sd: could not carry pagination to '{}'", found.now.1);
                 }
             }
-            Err(_) => {
-                esp_println::println!("sd: could not carry to '{}'", found.now.1)
-            }
         }
-        let (moved, unlinked) = carried
-            .as_ref()
-            .ok()
-            .and_then(|carry| carry.pagination)
-            .map_or((0, 0), |pagination| (pagination.moved, pagination.unlinked));
         esp_println::println!(
-            "bench: storage_move_carry ok={} place={} moved={} unlinked={} elapsed_ms={} t_ms={}",
+            "bench: storage_move_carry ok={} place_ok={} place={} pagination_ok={} moved={} unlinked={} elapsed_ms={} t_ms={}",
             carried.is_ok(),
-            carried.as_ref().is_ok_and(|carry| carry.place),
+            place_ok,
+            place,
+            pagination_ok,
             moved,
             unlinked,
             carry_start.elapsed().as_millis(),

@@ -799,7 +799,8 @@ the retry reads; the retry moves what is left and unlinks what already
 arrived. A FAT move is two writes, and a cut between them leaves one chain
 under two names, where freeing either would free the other's clusters. So
 while a carry is in flight each side carries a marker naming the other,
-`MOVED.BIN` in the departed directory and `LINKED.BIN` in the destination,
+a zero-length `<new key>.MVD` in the departed directory and `<old key>.LNK`
+in the destination,
 and any reclaim of a directory bearing one, the sweep's or a stranger's
 adoption, first takes away the names whose chain the other side also holds
 and only then frees what remains. Whichever side a sweep reaches first, one
