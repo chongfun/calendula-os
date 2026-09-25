@@ -967,6 +967,50 @@ Out of scope here, still: pagination shared between identical copies, which
 needs the second tree and a trust story for a digest read for one file being
 believed for another. Nothing in this milestone makes that harder.
 
+**What implementation settled, 2026-09-24 (branch `feature/pagination-follows-move`).**
+
+- **The fork needed a short-name move.** `move_file_in_dir_lfn` derives an
+  alias for whatever it is given, so `BOOK.BIN` would have landed as long
+  name `BOOK.BIN` with alias `BOOK~1.BIN`, and every loader open and the
+  section prune resolve by short name. The fork gained `move_file_in_dir`
+  and `link_file_in_dir` (chongfun/embedded-sdmmc-rs `f1a0f20`, branch
+  `calendula/short-name-move`): the exact 8.3 name as one plain entry, same
+  two writes, same recovery. The pin moved with the seventh fork change
+  recorded in the root manifest.
+- **Twins are the hazard, and single faults do not make them.** A FAT move is
+  a link then an unlink; the fork undoes its link when the unlink fails, so
+  one refused write leaves no twin. Power loss between the writes does, and
+  so does a double fault. The ledger commits the move whether or not the
+  carry finished, so a twin can outlive the retry and meet the sweep or a
+  stranger's adoption, and freeing either name frees the other's clusters.
+  The test harness gained a power-loss mode (`fail_writes_from`) because the
+  exactly-once fault could not reach this state at all.
+- **Markers are zero-length files named for the other key**: `<now key>.MVD`
+  in the departed directory, `<was key>.LNK` in the destination, written and
+  read back before the first entry moves, removed once no chain has two
+  names. No chain means one directory-entry write to create or remove and no
+  state in which an entry describes clusters already free, which is the
+  documented hazard of `remove_file_reclaiming_clusters` and the reason a
+  first draft with 13-byte marker files was thrown out: a fault in its final
+  delete left an entry over a freed cluster, and a later reclaim of that
+  entry would have freed the cluster a second time.
+- **Every reclaim of a book directory is twin-aware**: `empty_book_dir_artifacts`
+  reads either marker, opens the other key, and for each name compares first
+  clusters, unlinking a shared one and freeing an owned one. That covers the
+  sweep (`empty_cache_dir`) and adoption (`claim_v2_book_dir`) in one place,
+  and it works whichever side is reached first, which the tests pin in both
+  orders. A card that will not read the marker refuses the clear.
+- **The retry is idempotent to a clean state.** A retry that finds nothing
+  left to carry removes a marker whose final delete did not land, on both
+  sides, so a settled carry never keeps its markers.
+- **Handle budget**: the carry holds at most five directories at once (root,
+  both book directories, both `SECTIONS/`), the twin-aware reclaim inside the
+  sweep seven, against the manager's eight.
+- **Measured on the host harness**: the clean carry of three sections, an
+  index and a cover is five entry moves and fewer than 64 block writes in
+  all, markers and claim included; the same set is 40 KB or more of
+  section bytes.
+
 ## Done when
 
 - Changing typography does not move the reader's logical place.
