@@ -231,8 +231,8 @@ recipe above.
    `probe_cache::CACHE_MAGIC`**, because the verdict's meaning changes and an
    OTA is a reset that reuses the cached verdict. Cost is 49 bit-banged bytes
    on the blank-VER path only. This is the one concrete port from the sweep
-   and it should land with, or before, this driver. **Implemented 2026-09-24**
-   on `feature/probe-mtp-repeat` (branched from `origin/main`): `probe::mtp_confirms` / `needs_mtp_repeat`, the
+   and it should land with, or before, this driver. **Landed on main 2026-09-24 as
+   #103 (`cd6c81c`): `probe::mtp_confirms` / `needs_mtp_repeat`, the
    second read in `hal_ext::epd_probe::probe`, `CACHE_MAGIC` to `..02`, and
    six host tests including the uniform-repeat guard.
 
