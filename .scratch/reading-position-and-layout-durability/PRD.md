@@ -1016,6 +1016,24 @@ believed for another. Nothing in this milestone makes that harder.
   the same idempotent pass. The scan passes both `(hash, size)` pairs, which
   it already has. Tests publish under one identity, carry to a place whose
   hash differs, load under the new one and show the old is refused.
+- **The back marker authorizes the re-binding, not the old hash.** A power
+  cut inside a header rewrite lands part of one sector, and the old and new
+  sectors differ only in the four hash bytes, so what is left is a valid
+  header carrying an identity that is neither place. A pass that rewrote only
+  headers bound to the old identity left that forever while binding the index
+  to the new place. Rule: while the destination's `.LNK` marker stands, every
+  decodable header of the book's size not yet at the new identity is the
+  carry's to re-bind; only the size tells a foreign file, and a move does not
+  change it. The marker's removal is the re-binding's commit. The harness
+  gained a tear aimed at header sectors only, swept through both hash fields.
+- **Any writer settles the markers first.** A build at the new place while a
+  carry is unsettled truncates files whose chains the departed key still
+  names. `claim_v2_book_dir` now settles each marker the directory holds
+  before handing it to a writer: shared names are taken away from the other
+  side, both markers go. The carry's own retry passes through the same
+  settle on its way to claiming the destination.
+- **Same-key collision** (two places sharing 28 bits of hash): no re-binding,
+  one rebuild, the same accepted limitation positions already have.
 - **Handle budget**: the carry holds at most five directories at once (root,
   both book directories, both `SECTIONS/`), the twin-aware reclaim inside the
   sweep seven, against the manager's eight.
