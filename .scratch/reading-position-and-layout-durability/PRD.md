@@ -1049,6 +1049,25 @@ believed for another. Nothing in this milestone makes that harder.
   index and a cover is five entry moves and fewer than 64 block writes in
   all, markers and claim included; the same set is 40 KB or more of
   section bytes.
+- **Measured on the X3 (2026-09-27, PR #105 at 2ee235c, 64 GB card, FAT32,
+  32 KB clusters).** *86 - Volume 02* (11.7 MB, 453 pages, 52 sections)
+  built at the new layout version, read to page 14, slept (the sleep flush
+  wrote page 14), then moved in Finder from `86/` to `86/MOVED/`. Boot kept
+  the snapshot; choosing the moved row found it stale and rescanned. The
+  carry: `ok=true place=true pagination_ok=true moved=147 unlinked=0
+  restamped=101 elapsed_ms=28572`; the ledger found the book again with one
+  hash (`repaired=1 hashed=1`), the scan 51.7 s in all. The reopen under
+  the new key was a fast hit: index in 33 ms, open 330 ms, page 14, no
+  build. **The behavior is proved; the cost is not acceptable yet.**
+  - 147 entries for a 52-section book: the directory held more than the
+    current layout's sections (older layouts' files, which the carry moves
+    like any other). Unexplained until the card's `SECTIONS/` is listed.
+  - About 115 ms per file, against the host harness's handful of block
+    writes. The fork's move checks the destination namespace and finds the
+    source entry by walking each directory, so the cost grows with the
+    directory; that per-entry walk is the first suspect, unmeasured.
+  - The UI sits on the library for the whole scan with no progress shown,
+    so the open looks like it has hung.
 
 ## Done when
 
