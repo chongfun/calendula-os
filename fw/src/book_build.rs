@@ -980,6 +980,7 @@ fn store_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VO
     index: usize,
     screen: u32,
     may_replace: bool,
+    byte_size: u32,
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -994,16 +995,16 @@ where
         // reader is.
         return Ok(());
     }
+    if library.loaded_index != Some(index) {
+        return Ok(());
+    }
     let Some(id) = record_copy_id(root, library, index) else {
         return Ok(());
     };
     let Some(anchor) = library.anchor_for_global_page(screen) else {
         return Ok(());
     };
-    let Some(entry) = library.catalog_entry(index) else {
-        return Ok(());
-    };
-    let source = files::place_source_for(entry.byte_size);
+    let source = files::place_source_for(byte_size);
     // The anchor is written whatever the pagination is doing. Only the
     // fraction beside it waits for a book with a known length: a page total
     // from a half-built index is a floor, so dividing by it would call page
@@ -1149,7 +1150,14 @@ pub(crate) fn store_app_state(
                     // a place across a settings change or a move, so treating
                     // a refused place as success would retire a retry the
                     // reader needs.
-                    let place = store_place(root, library, index, record.screen, may_replace_place);
+                    let place = store_place(
+                        root,
+                        library,
+                        index,
+                        record.screen,
+                        may_replace_place,
+                        identity.1,
+                    );
                     let position = match files::write_position_file(
                         root,
                         &owner,
@@ -1211,17 +1219,21 @@ pub(crate) fn store_book_position(
     let Some(index) = app_core::ReaderSource::from_book_id(record.book_id).sd_index() else {
         return true;
     };
-    let Some(entry) = library.catalog_entry(index as usize) else {
-        esp_println::println!(
-            "storage: no catalog entry for departing book_id={} index={}",
-            record.book_id,
-            index
-        );
-        return false;
-    };
-    let identity = (entry.source_hash, entry.byte_size);
-    sd_session::with_root(epd, sd_cs, |root| {
-        let (at, path, _) = record_location(root, index as usize, identity).ok_or(())?;
+    let stored = sd_session::with_root(epd, sd_cs, |root| {
+        let (at, path, identity) = match library.catalog_entry(index as usize) {
+            Some(entry) => {
+                let identity = (entry.source_hash, entry.byte_size);
+                let (at, path, _) = record_location(root, index as usize, identity).ok_or(())?;
+                (at, path, identity)
+            }
+            None => {
+                let cat_record =
+                    crate::library_sd::read_catalog_record_at(root, index as usize).ok_or(())?;
+                let at = cat_record.root.ok_or(())?;
+                let identity = (cat_record.source_hash, cat_record.byte_size);
+                (at, cat_record.path, identity)
+            }
+        };
         let key = proto::cache::cache_key_from(identity.0);
         let owner = proto::cache::CacheOwner {
             key: key.as_str(),
@@ -1234,6 +1246,7 @@ pub(crate) fn store_book_position(
             index as usize,
             record.screen,
             may_replace_place,
+            identity.1,
         );
         let position = match files::write_position_file(root, &owner, record.chapter, record.screen)
         {
@@ -1255,7 +1268,16 @@ pub(crate) fn store_book_position(
         place.and(position)
     })
     .ok()
-    .is_some_and(|result| result.is_ok())
+    .is_some_and(|result| result.is_ok());
+
+    if !stored {
+        esp_println::println!(
+            "storage: no catalog entry for departing book_id={} index={}",
+            record.book_id,
+            index
+        );
+    }
+    stored
 }
 
 /// Writes only the global state file: which book is active, and the reader
