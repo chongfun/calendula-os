@@ -977,7 +977,7 @@ fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, Librar
 fn store_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     library: &ReaderStore,
-    index: usize,
+    copy_id: Option<proto::identity::BookId>,
     screen: u32,
     may_replace: bool,
     byte_size: u32,
@@ -995,10 +995,10 @@ where
         // reader is.
         return Ok(());
     }
-    if library.loaded_index != Some(index) {
+    if library.loaded_index.is_none() {
         return Ok(());
     }
-    let Some(id) = record_copy_id(root, library, index) else {
+    let Some(id) = copy_id else {
         return Ok(());
     };
     let Some(anchor) = library.anchor_for_global_page(screen) else {
@@ -1041,32 +1041,9 @@ where
     }
 }
 
-/// The id of the copy at a catalog row, read from the row itself.
-///
-/// The active book's id is resident, and every other row's is not, so this
-/// goes to the card for it. A row with no id yet is a copy adopted by
-/// firmware older than the ledger; it has no place to store and will get one
-/// on the next scan.
-fn record_copy_id<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    library: &ReaderStore,
-    index: usize,
-) -> Option<proto::identity::BookId>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    if library.active_index() == Some(index) {
-        if let Some(id) = library.active_copy_id() {
-            return Some(id);
-        }
-    }
-    crate::library_sd::read_catalog_record_at(root, index)?.book_id
-}
-
 /// Row `index`'s location as its catalog record states it, checked against the
-/// expected identity: the root, the locator, and the display name the legacy
-/// position fallback derives from.
+/// expected identity: the root, the locator, the display name the legacy
+/// position fallback derives from, and the copy id if assigned.
 ///
 /// Read from the card because the resident window keeps only labels and
 /// identity, and only on paths already running a whole SD session. `None` when
@@ -1081,6 +1058,7 @@ fn record_location<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MA
     BookRoot,
     String<{ proto::library_path::MAX_PATH_BYTES }>,
     String<64>,
+    Option<proto::identity::BookId>,
 )>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1090,7 +1068,12 @@ where
     if (record.source_hash, record.byte_size) != identity {
         return None;
     }
-    Some((record.root?, record.path, record.display_name))
+    Some((
+        record.root?,
+        record.path,
+        record.display_name,
+        record.book_id,
+    ))
 }
 
 /// Persists a reading position to both places it lives, in one card session.
@@ -1127,37 +1110,80 @@ pub(crate) fn store_app_state(
     // The same session lands the global record and, for SD books, the
     // per-book position beside that book's cache, so switching books does
     // not abandon the previous one's place.
-    let book = app_core::ReaderSource::from_book_id(record.book_id)
-        .sd_index()
-        .and_then(|index| {
-            library
-                .catalog_entry(index as usize)
-                .map(|entry| (index as usize, (entry.source_hash, entry.byte_size)))
-        });
+    let sd_index = app_core::ReaderSource::from_book_id(record.book_id).sd_index();
+    let active_snapshot = sd_index.and_then(|index| {
+        library.active_book_snapshot().filter(|snapshot| {
+            library.active_index() == Some(index as usize)
+                || library.loaded_index == Some(index as usize)
+                || (record.source_hash != 0
+                    && (record.source_hash, record.source_size) == snapshot.identity)
+        })
+    });
+    let book = sd_index.and_then(|index| {
+        library
+            .catalog_entry(index as usize)
+            .map(|entry| (index as usize, (entry.source_hash, entry.byte_size)))
+    });
     sd_session::with_root(epd, sd_cs, |root| {
         let state = files::write_state_file(root, record);
-        let position = if let Some((index, identity)) = book {
+        let position = if let Some(snapshot) = active_snapshot {
+            let key = proto::cache::cache_key_from(snapshot.identity.0);
+            let owner = proto::cache::CacheOwner {
+                key: key.as_str(),
+                root: snapshot.root,
+                locator: snapshot.path,
+            };
+            let place = store_place(
+                root,
+                library,
+                snapshot.copy_id,
+                record.screen,
+                may_replace_place,
+                snapshot.identity.1,
+            );
+            let position =
+                match files::write_position_file(root, &owner, record.chapter, record.screen) {
+                    Ok(()) => Ok(()),
+                    Err(files::ClaimDenied::Foreign) => {
+                        esp_println::println!("storage: position write refused by a foreign claim");
+                        Ok(())
+                    }
+                    Err(files::ClaimDenied::Fault) => Err(()),
+                };
+            place.and(position)
+        } else if let Some((index, identity)) = book {
             match record_location(root, index, identity) {
-                Some((at, path, _)) => {
+                Some((at, path, _, cat_copy_id)) => {
                     let key = proto::cache::cache_key_from(identity.0);
                     let owner = proto::cache::CacheOwner {
                         key: key.as_str(),
                         root: at,
                         locator: path.as_str(),
                     };
+                    let copy_id = if library.active_index() == Some(index)
+                        || library.loaded_index == Some(index)
+                    {
+                        library.active_copy_id().or(cat_copy_id)
+                    } else {
+                        cat_copy_id
+                    };
                     // The layout-independent place first, and its fault is
                     // the save's fault: the page file beside it cannot carry
                     // a place across a settings change or a move, so treating
                     // a refused place as success would retire a retry the
                     // reader needs.
-                    let place = store_place(
-                        root,
-                        library,
-                        index,
-                        record.screen,
-                        may_replace_place,
-                        identity.1,
-                    );
+                    let place = if library.loaded_index == Some(index) {
+                        store_place(
+                            root,
+                            library,
+                            copy_id,
+                            record.screen,
+                            may_replace_place,
+                            identity.1,
+                        )
+                    } else {
+                        Ok(())
+                    };
                     let position = match files::write_position_file(
                         root,
                         &owner,
@@ -1219,53 +1245,91 @@ pub(crate) fn store_book_position(
     let Some(index) = app_core::ReaderSource::from_book_id(record.book_id).sd_index() else {
         return true;
     };
+    let active_snapshot = library.active_book_snapshot().filter(|snapshot| {
+        library.active_index() == Some(index as usize)
+            || library.loaded_index == Some(index as usize)
+            || (record.source_hash != 0
+                && (record.source_hash, record.source_size) == snapshot.identity)
+    });
     let stored = sd_session::with_root(epd, sd_cs, |root| {
-        let (at, path, identity) = match library.catalog_entry(index as usize) {
-            Some(entry) => {
-                let identity = (entry.source_hash, entry.byte_size);
-                let (at, path, _) = record_location(root, index as usize, identity).ok_or(())?;
-                (at, path, identity)
-            }
-            None => {
-                let cat_record =
-                    crate::library_sd::read_catalog_record_at(root, index as usize).ok_or(())?;
-                let at = cat_record.root.ok_or(())?;
-                let identity = (cat_record.source_hash, cat_record.byte_size);
-                (at, cat_record.path, identity)
-            }
-        };
-        let key = proto::cache::cache_key_from(identity.0);
-        let owner = proto::cache::CacheOwner {
-            key: key.as_str(),
-            root: at,
-            locator: path.as_str(),
-        };
-        let place = store_place(
-            root,
-            library,
-            index as usize,
-            record.screen,
-            may_replace_place,
-            identity.1,
-        );
-        let position = match files::write_position_file(root, &owner, record.chapter, record.screen)
-        {
-            Ok(()) => Ok(()),
-            // A twin's active claim holds the key: the departing book's
-            // place cannot be stored while it does, and refusing the whole
-            // book-open transaction over it would leave the reader stuck on
-            // this book. The loss is bounded to this book's place, which no
-            // write can land anyway.
-            Err(files::ClaimDenied::Foreign) => {
-                esp_println::println!("storage: departing position refused by a foreign claim");
+        if let Some(snapshot) = active_snapshot {
+            let key = proto::cache::cache_key_from(snapshot.identity.0);
+            let owner = proto::cache::CacheOwner {
+                key: key.as_str(),
+                root: snapshot.root,
+                locator: snapshot.path,
+            };
+            let place = store_place(
+                root,
+                library,
+                snapshot.copy_id,
+                record.screen,
+                may_replace_place,
+                snapshot.identity.1,
+            );
+            let position =
+                match files::write_position_file(root, &owner, record.chapter, record.screen) {
+                    Ok(()) => Ok(()),
+                    Err(files::ClaimDenied::Foreign) => {
+                        esp_println::println!(
+                            "storage: departing position refused by a foreign claim"
+                        );
+                        Ok(())
+                    }
+                    Err(files::ClaimDenied::Fault) => Err(()),
+                };
+            place.and(position)
+        } else {
+            let entry = library.catalog_entry(index as usize).ok_or(())?;
+            let identity = (entry.source_hash, entry.byte_size);
+            let (at, path, _, cat_copy_id) =
+                record_location(root, index as usize, identity).ok_or(())?;
+            let copy_id = if library.active_index() == Some(index as usize)
+                || library.loaded_index == Some(index as usize)
+            {
+                library.active_copy_id().or(cat_copy_id)
+            } else {
+                cat_copy_id
+            };
+            let key = proto::cache::cache_key_from(identity.0);
+            let owner = proto::cache::CacheOwner {
+                key: key.as_str(),
+                root: at,
+                locator: path.as_str(),
+            };
+            let place = if library.loaded_index == Some(index as usize) {
+                store_place(
+                    root,
+                    library,
+                    copy_id,
+                    record.screen,
+                    may_replace_place,
+                    identity.1,
+                )
+            } else {
                 Ok(())
-            }
-            Err(files::ClaimDenied::Fault) => Err(()),
-        };
-        // The departing book's place carries the same weight as its page, and
-        // for the same reason: nothing else records where it was in a form
-        // that survives a layout change.
-        place.and(position)
+            };
+            let position =
+                match files::write_position_file(root, &owner, record.chapter, record.screen) {
+                    Ok(()) => Ok(()),
+                    // A twin's active claim holds the key: the departing book's
+                    // place cannot be stored while it does, and refusing the whole
+                    // book-open transaction over it would leave the reader stuck on
+                    // this book. The loss is bounded to this book's place, which no
+                    // write can land anyway.
+                    Err(files::ClaimDenied::Foreign) => {
+                        esp_println::println!(
+                            "storage: departing position refused by a foreign claim"
+                        );
+                        Ok(())
+                    }
+                    Err(files::ClaimDenied::Fault) => Err(()),
+                };
+            // The departing book's place carries the same weight as its page, and
+            // for the same reason: nothing else records where it was in a form
+            // that survives a layout change.
+            place.and(position)
+        }
     })
     .ok()
     .is_some_and(|result| result.is_ok());
@@ -1360,14 +1424,20 @@ pub(crate) fn load_place(
     let entry = library.catalog_entry(index)?;
     let identity = (entry.source_hash, entry.byte_size);
     sd_session::with_root(epd, sd_cs, |root| {
-        let (at, path, display_name) = record_location(root, index, identity)?;
+        let (at, path, display_name, cat_copy_id) = record_location(root, index, identity)?;
         let key = proto::cache::cache_key_from(identity.0);
         let owner = proto::cache::CacheOwner {
             key: key.as_str(),
             root: at,
             locator: path.as_str(),
         };
-        if let Some(id) = record_copy_id(root, library, index) {
+        let copy_id =
+            if library.active_index() == Some(index) || library.loaded_index == Some(index) {
+                library.active_copy_id().or(cat_copy_id)
+            } else {
+                cat_copy_id
+            };
+        if let Some(id) = copy_id {
             match files::read_place(root, id) {
                 files::PlaceRead::Found(place) => {
                     // Against the copy's content, so a book that moved keeps
@@ -1499,7 +1569,7 @@ pub(crate) fn resolve_place(
         return PlaceTarget::Extend(library.advertised_page_count());
     }
     let resolved = sd_session::with_root(epd, sd_cs, |root| {
-        let (at, path, _) = record_location(root, index, identity)?;
+        let (at, path, _, _) = record_location(root, index, identity)?;
         let key = proto::cache::cache_key_from(identity.0);
         let owner = proto::cache::CacheOwner {
             key: key.as_str(),
@@ -1678,7 +1748,7 @@ pub(crate) fn clear_book_cache(
         // identity test below, and without this gate the wrong row could
         // clear the claim holder's cache. Unclaimed directories fall through
         // to the identity test, which is all pre-claim caches ever had.
-        if let Some((at, path, _)) = record_location(root, index, (source_hash, source_size)) {
+        if let Some((at, path, _, _)) = record_location(root, index, (source_hash, source_size)) {
             let owner = proto::cache::CacheOwner {
                 key: cache_key.as_str(),
                 root: at,

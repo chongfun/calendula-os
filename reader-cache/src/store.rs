@@ -209,6 +209,18 @@ pub struct TrimmedTail {
     text_len: usize,
 }
 
+/// The retained snapshot of the book currently staged or open in the reader.
+///
+/// Kept apart from the catalog list window, surviving catalog rebuilds (which
+/// reset `active_index`) and folder navigation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveBookSnapshot<'a> {
+    pub root: proto::library_path::BookRoot,
+    pub path: &'a str,
+    pub identity: (u32, u32),
+    pub copy_id: Option<proto::identity::BookId>,
+}
+
 pub struct ReaderStore {
     pub status: LibraryScanStatus,
     /// Full book count across CATALOG.BIN (the source of truth), independent of
@@ -820,10 +832,31 @@ impl ReaderStore {
     /// as active, so `None` here means the staging failed or the record named
     /// a root this build cannot place.
     pub fn book_location(&self, index: usize) -> Option<(proto::library_path::BookRoot, &str)> {
-        if self.active_index != Some(index) || self.active_path.is_empty() {
+        if (self.active_index != Some(index) && self.loaded_index != Some(index))
+            || self.active_path.is_empty()
+        {
             return None;
         }
         Some((self.active_root?, self.active_path.as_str()))
+    }
+
+    /// The retained snapshot of the book currently staged or open in the reader:
+    /// its root, locator path, source identity (hash, size), and copy ID.
+    ///
+    /// These fields outlive catalog rescans (where `active_index` is cleared)
+    /// and folder browsing, allowing position and place to be saved for the
+    /// departing book without relying on stale catalog indices.
+    pub fn active_book_snapshot(&self) -> Option<ActiveBookSnapshot<'_>> {
+        let root = self.active_root?;
+        if self.active_path.is_empty() {
+            return None;
+        }
+        Some(ActiveBookSnapshot {
+            root,
+            path: self.active_path.as_str(),
+            identity: (self.active_entry.source_hash, self.active_entry.byte_size),
+            copy_id: self.active_copy_id,
+        })
     }
 
     /// Copy the loaded book's title into the resident catalog entries for
@@ -870,9 +903,15 @@ impl ReaderStore {
     }
 
     pub fn source_identity(&self, book_id: u32) -> (u32, u32) {
-        let Some(entry) =
-            Self::selected_book_index(book_id).and_then(|index| self.catalog_entry(index))
-        else {
+        let Some(index) = Self::selected_book_index(book_id) else {
+            return (0, 0);
+        };
+        if (self.active_index == Some(index) || self.loaded_index == Some(index))
+            && !self.active_path.is_empty()
+        {
+            return (self.active_entry.source_hash, self.active_entry.byte_size);
+        }
+        let Some(entry) = self.catalog_entry(index) else {
             return (0, 0);
         };
         (entry.source_hash, entry.byte_size)
@@ -2016,6 +2055,58 @@ mod tests {
             None,
         );
         assert_eq!(store.active_copy_id(), None);
+    }
+
+    /// The active book's snapshot, location, and source identity survive a
+    /// catalog rebuild: the catalog row number may change or become invalid,
+    /// but the open book's identity, locator path, and copy id remain intact.
+    #[test]
+    fn active_book_snapshot_and_identity_survive_catalog_rebuild() {
+        let mut store = Box::new(ReaderStore::new());
+        assert_eq!(store.active_book_snapshot(), None, "nothing is open yet");
+        let id = proto::identity::BookId::from_bytes([7u8; 16]).expect("an id");
+        let book_id = app_core::ReaderSource::sd(4).book_id();
+
+        store.set_active_entry(
+            4,
+            "/books/Dune.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Dune.epub",
+            3_000,
+            0x1234_5678,
+            None,
+            Some(id),
+        );
+        store.finish_book_load(4, 0, BookLoadStatus::Ready);
+
+        let snap = store.active_book_snapshot().expect("snapshot present");
+        assert_eq!(snap.root, proto::library_path::BookRoot::Library);
+        assert_eq!(snap.path, "Dune.epub");
+        assert_eq!(snap.identity, (0x1234_5678, 3_000));
+        assert_eq!(snap.copy_id, Some(id));
+        assert_eq!(store.source_identity(book_id), (0x1234_5678, 3_000));
+        assert_eq!(
+            store.book_location(4),
+            Some((proto::library_path::BookRoot::Library, "Dune.epub"))
+        );
+
+        // A catalog rescan clears catalog window and resets active_index to None.
+        store.clear_catalog();
+        assert_eq!(store.active_index(), None);
+
+        // Snapshot, location, and identity still resolve the active book!
+        let snap_after = store
+            .active_book_snapshot()
+            .expect("snapshot survives rebuild");
+        assert_eq!(snap_after.root, proto::library_path::BookRoot::Library);
+        assert_eq!(snap_after.path, "Dune.epub");
+        assert_eq!(snap_after.identity, (0x1234_5678, 3_000));
+        assert_eq!(snap_after.copy_id, Some(id));
+        assert_eq!(
+            store.book_location(4),
+            Some((proto::library_path::BookRoot::Library, "Dune.epub"))
+        );
+        assert_eq!(store.source_identity(book_id), (0x1234_5678, 3_000));
     }
 
     /// Invariant: a move that fails leaves browsing exactly where it was.
