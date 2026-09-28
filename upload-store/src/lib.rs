@@ -29,7 +29,7 @@ pub mod library;
 pub mod reclaim;
 pub mod replace;
 
-use embedded_sdmmc::{Directory, Mode, TimeSource};
+use embedded_sdmmc::{Block, Directory, Mode, TimeSource};
 use heapless::String;
 use proto::cache::CACHE_ROOT_DIR;
 use proto::library_path::BookRoot;
@@ -478,9 +478,12 @@ where
     Ok(Some(first == second))
 }
 
-/// Bytes read per pass while hashing a book already on the card. One sector,
-/// on the caller's stack.
-const DIGEST_READ_BYTES: usize = 512;
+/// Blocks read per pass while hashing a book already on the card, 4 KB on the
+/// caller's stack. The card answers a run of blocks in one command, and the
+/// command and its wait for the data token cost as much as a block again: a
+/// block at a time, an X3 hashed an 11.7 MB book at 540 KB/s, 13.7 s of its
+/// 21.3 s spent waiting on single-block reads.
+const DIGEST_READ_BLOCKS: usize = 8;
 
 /// The identity of a book already on the card, read out of it.
 ///
@@ -502,10 +505,10 @@ where
     };
     let length = file.length();
     let mut hasher = proto::source::SourceHasher::new();
-    let mut buf = [0u8; DIGEST_READ_BYTES];
+    let mut blocks: [Block; DIGEST_READ_BLOCKS] = core::array::from_fn(|_| Block::new());
     let mut total = 0u32;
     while !file.is_eof() {
-        let read = match file.read(&mut buf) {
+        let read = match file.read_blocks(&mut blocks) {
             Ok(0) => break,
             Ok(read) => read,
             Err(_) => {
@@ -513,7 +516,16 @@ where
                 return Err(install::InstallError::Card);
             }
         };
-        hasher.update(&buf[..read]);
+        // Every block is filled; only `read` bytes of them are the file.
+        let mut left = read;
+        for block in &blocks {
+            let take = left.min(Block::LEN);
+            hasher.update(&block.contents[..take]);
+            left -= take;
+            if left == 0 {
+                break;
+            }
+        }
         total = total.saturating_add(read as u32);
     }
     if file.close().is_err() {

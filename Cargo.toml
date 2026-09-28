@@ -16,10 +16,10 @@ resolver = "2"
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
-# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/short-name-move,
-# which is calendula/long-names-and-error-fidelity plus one commit.
+# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/multi-block-read,
+# which is calendula/long-names-and-error-fidelity plus two commits.
 # Upstream v0.10, plus Jon-Vii's create_file_in_dir_lfn so wireless uploads land
-# under a real filename instead of an 8.3 alias, plus seven changes of ours.
+# under a real filename instead of an 8.3 alias, plus eight changes of ours.
 #
 # Two are the same bug in different clothes: a FAT read that failed was
 # reported as a file that is absent, and elsewhere as a disk that is full.
@@ -83,16 +83,24 @@ resolver = "2"
 # scan proves the book moved; these file the exact name asked for, as one
 # plain entry, under the same two-write contract and the same recovery.
 #
-# Regression coverage for all seven of our changes lives in the fork, not here:
+# The eighth is File::read_blocks, whole blocks of a file read straight into
+# the caller's buffer, one device call per run of blocks that lie together on
+# the disk. read fetches through the single-block cache one block per call
+# however large its buffer, and on the SPI card each call is a command and a
+# wait for the data token: hashing an 11.7 MB book to prove a move spent 13.7
+# s reading it that way on an X3, 8.0 s in runs of eight.
+#
+# Regression coverage for all eight of our changes lives in the fork, not here:
 # tests/fat_chain_errors.rs for the error-propagation fixes, tests/move_file.rs
 # for the move, the link, the recorded cluster, and the short-named pair,
-# tests/free_clusters.rs for the reclaim primitives. A bump that loses them would still compile against
+# tests/free_clusters.rs for the reclaim primitives, tests/read_file.rs for
+# read_blocks. A bump that loses them would still compile against
 # this workspace, so re-run the fork's suite when moving the rev. There is no upstream issue or PR to track: the fork we branched from
 # is unmaintained, so this rev is where these fixes live.
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "f1a0f20a1107eeab5e32c479fe3f3f732d978c75", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "420fa8a0b309aae13f26355a297f5b22283c2260", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an
