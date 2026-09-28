@@ -1146,9 +1146,17 @@ pub(crate) fn store_book_position(
         } else {
             let identity = (record.source_hash, record.source_size);
             if identity == (0, 0) {
+                esp_println::println!("storage: departing book has no source identity");
                 return Err(());
             }
-            let (at, path, _, _) = resolve_record_location(root, identity).ok_or(())?;
+            let Some((at, path, _, _)) = resolve_record_location(root, identity) else {
+                esp_println::println!(
+                    "storage: no single catalog record for hash={:08x} size={}",
+                    identity.0,
+                    identity.1
+                );
+                return Err(());
+            };
             let key = proto::cache::cache_key_from(identity.0);
             let owner = proto::cache::CacheOwner {
                 key: key.as_str(),
@@ -1264,20 +1272,7 @@ pub(crate) fn load_place(
             root: at,
             locator: path.as_str(),
         };
-        let copy_id = if library
-            .loaded_book_snapshot()
-            .is_some_and(|l| l.identity == identity)
-        {
-            library.loaded_copy_id()
-        } else if library.active_index() == Some(index) {
-            library
-                .active_book_snapshot()
-                .filter(|s| s.identity == identity)
-                .and_then(|s| s.copy_id)
-        } else {
-            None
-        }
-        .or(cat_copy_id);
+        let copy_id = library.staged_copy_id(index, identity).or(cat_copy_id);
         if let Some(id) = copy_id {
             match files::read_place(root, id) {
                 files::PlaceRead::Found(place) => {

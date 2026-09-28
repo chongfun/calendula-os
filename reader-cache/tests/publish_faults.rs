@@ -4713,3 +4713,57 @@ fn close_out_refuses_after_a_failed_load() {
     assert!(files::close_out_loaded_book(&root, &store, record, true).is_err());
     assert_eq!(files::read_position_file(&root, &owner_b), None);
 }
+
+/// Regression: two copies with identical bytes share a content identity and
+/// keep separate places. With copy A loaded and copy B staged for its open,
+/// B's place is read under B's copy id, not the loaded A's.
+#[test]
+fn opening_an_identical_second_copy_reads_its_own_place() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id_a = proto::identity::BookId::from_bytes([0x0A; 16]).expect("an id");
+    let id_b = proto::identity::BookId::from_bytes([0x0B; 16]).expect("an id");
+    let identity = (0xAAAA_1111, 4_000);
+    let source = files::place_source_for(identity.1);
+    let anchor_a = proto::anchor::ContentAnchor::at(1, 100);
+    let anchor_b = proto::anchor::ContentAnchor::at(7, 900);
+    files::write_place(&root, id_a, anchor_a, source, None).expect("place a");
+    files::write_place(&root, id_b, anchor_b, source, None).expect("place b");
+
+    let mut store = Box::new(ReaderStore::new());
+    store.set_active_entry(
+        4,
+        "Fiction/Copy.epub",
+        Some(proto::library_path::BookRoot::Library),
+        "Fiction/Copy.epub",
+        identity.1,
+        identity.0,
+        None,
+        Some(id_a),
+    );
+    store.finish_book_load(4, 0, BookLoadStatus::Ready);
+    store.set_active_entry(
+        5,
+        "Other/Copy.epub",
+        Some(proto::library_path::BookRoot::Library),
+        "Other/Copy.epub",
+        identity.1,
+        identity.0,
+        None,
+        Some(id_b),
+    );
+
+    let copy_id = store.staged_copy_id(5, identity);
+    assert_eq!(copy_id, Some(id_b), "the target's own copy id");
+    assert_eq!(
+        store.staged_copy_id(4, identity),
+        None,
+        "row 4 is not staged"
+    );
+    match files::read_place(&root, copy_id.expect("an id")) {
+        files::PlaceRead::Found(place) => assert_eq!(place.anchor, anchor_b),
+        _ => panic!("expected copy B's place"),
+    }
+}

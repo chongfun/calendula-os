@@ -299,6 +299,12 @@ pub struct ReaderStore {
     pub(crate) loaded_epoch: u32,
     pub(crate) loaded_chapter: u16,
     pub loaded_identity: (u32, u32),
+    /// The book the reader state names, as the handle the app was given for
+    /// it and its identity. Set by a boot restore, which names a book without
+    /// loading it, and by every Ready load. Staging another row, browsing, and
+    /// rebuilds leave it alone, so a departing save can still name the book.
+    reading_index: Option<usize>,
+    reading_identity: (u32, u32),
     pub(crate) loaded_root: Option<proto::library_path::BookRoot>,
     pub(crate) loaded_path: String<{ proto::library_path::MAX_PATH_BYTES }>,
     pub(crate) loaded_copy_id: Option<proto::identity::BookId>,
@@ -447,6 +453,8 @@ impl ReaderStore {
             loaded_epoch: 0,
             loaded_chapter: 0,
             loaded_identity: (0, 0),
+            reading_index: None,
+            reading_identity: (0, 0),
             loaded_root: None,
             loaded_path: String::new(),
             loaded_copy_id: None,
@@ -894,8 +902,23 @@ impl ReaderStore {
         })
     }
 
-    pub fn loaded_copy_id(&self) -> Option<proto::identity::BookId> {
-        self.loaded_copy_id
+    /// The copy id of the book staged at `index`, when its staged identity is
+    /// `identity`: the id an open of that row reads its place under.
+    ///
+    /// Only the target answers. Two copies with identical bytes share a
+    /// content identity and keep separate places, so a loaded book whose
+    /// identity matches is no evidence that it is the copy being opened.
+    pub fn staged_copy_id(
+        &self,
+        index: usize,
+        identity: (u32, u32),
+    ) -> Option<proto::identity::BookId> {
+        if self.active_index != Some(index) {
+            return None;
+        }
+        self.active_book_snapshot()
+            .filter(|staged| staged.identity == identity)
+            .and_then(|staged| staged.copy_id)
     }
 
     /// Copy the loaded book's title into the resident catalog entries for
@@ -989,7 +1012,30 @@ impl ReaderStore {
     /// the departing page into the other book.
     pub fn persisted_identity(&self, book_id: u32) -> (u32, u32) {
         self.loaded_book_identity(book_id)
+            .or_else(|| self.reading_book_identity(book_id))
             .unwrap_or_else(|| self.current_catalog_identity(book_id))
+    }
+
+    /// The identity of the book the reader state names, when `book_id` is the
+    /// handle it was named under. Not epoch-scoped, for the same reason as
+    /// [`Self::loaded_book_identity`].
+    pub fn reading_book_identity(&self, book_id: u32) -> Option<(u32, u32)> {
+        let index = Self::selected_book_index(book_id)?;
+        (self.reading_index == Some(index) && self.reading_identity != (0, 0))
+            .then_some(self.reading_identity)
+    }
+
+    /// Record that the reader state names the book staged at `index`, as a
+    /// boot restore does before the book is opened. False when that row is
+    /// not the staged one.
+    pub fn adopt_active_as_reading_book(&mut self, index: usize) -> bool {
+        let identity = (self.active_entry.source_hash, self.active_entry.byte_size);
+        if self.active_index != Some(index) || identity == (0, 0) {
+            return false;
+        }
+        self.reading_index = Some(index);
+        self.reading_identity = identity;
+        true
     }
 
     pub fn clear_toc(&mut self) {
@@ -1162,6 +1208,10 @@ impl ReaderStore {
                     // No locator resident for this row, so no snapshot, but
                     // the identity still names the book for a later save.
                     self.loaded_identity = (entry.source_hash, entry.byte_size);
+                }
+                if self.loaded_identity != (0, 0) {
+                    self.reading_index = Some(index);
+                    self.reading_identity = self.loaded_identity;
                 }
             }
             // Bake the just-learned title into the resident list/active entries
@@ -2335,6 +2385,97 @@ mod tests {
         store.finish_book_load(5, 0, BookLoadStatus::Error);
         assert_eq!(store.loaded_book_snapshot(), None);
         assert_eq!(store.loaded_book_identity(book_id5), None);
+    }
+
+    /// A restored book is named by the reader state but never loaded, and
+    /// staging the row under the Library cursor replaces it as the active
+    /// entry. A departing save for it must still name it.
+    #[test]
+    fn a_restored_book_keeps_its_identity_once_another_row_is_staged() {
+        let mut store = Box::new(ReaderStore::new());
+        let restored = app_core::ReaderSource::sd(40).book_id();
+        store.set_active_entry(
+            40,
+            "Dune.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Dune.epub",
+            3_000,
+            0x1234_5678,
+            None,
+            None,
+        );
+        assert!(store.adopt_active_as_reading_book(40));
+        assert!(
+            !store.adopt_active_as_reading_book(41),
+            "not the staged row"
+        );
+
+        store.set_active_entry(
+            33,
+            "Emma.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Emma.epub",
+            2_000,
+            0x9abc_def0,
+            None,
+            None,
+        );
+        store.clear_folder_page();
+        assert_eq!(store.current_catalog_identity(restored), (0, 0));
+        assert_eq!(store.persisted_identity(restored), (0x1234_5678, 3_000));
+
+        store.clear_catalog();
+        assert_eq!(store.persisted_identity(restored), (0x1234_5678, 3_000));
+    }
+
+    /// A Ready load makes its book the reading book; a failed one leaves the
+    /// book the reader rolls back to.
+    #[test]
+    fn only_a_ready_load_moves_the_reading_book() {
+        let mut store = Box::new(ReaderStore::new());
+        let book_id4 = app_core::ReaderSource::sd(4).book_id();
+        let book_id5 = app_core::ReaderSource::sd(5).book_id();
+        store.set_active_entry(
+            4,
+            "Book4.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Book4.epub",
+            4_000,
+            0x4444_4444,
+            None,
+            None,
+        );
+        store.begin_book_load();
+        store.finish_book_load(4, 0, BookLoadStatus::Ready);
+        store.set_active_entry(
+            5,
+            "Book5.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Book5.epub",
+            5_000,
+            0x5555_5555,
+            None,
+            None,
+        );
+        store.begin_book_load();
+        store.finish_book_load(5, 0, BookLoadStatus::Error);
+        store.set_active_entry(
+            6,
+            "Book6.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Book6.epub",
+            6_000,
+            0x6666_6666,
+            None,
+            None,
+        );
+        assert_eq!(store.loaded_book_identity(book_id4), None);
+        assert_eq!(
+            store.reading_book_identity(book_id4),
+            Some((0x4444_4444, 4_000))
+        );
+        assert_eq!(store.persisted_identity(book_id4), (0x4444_4444, 4_000));
+        assert_eq!(store.reading_book_identity(book_id5), None);
     }
 
     #[test]

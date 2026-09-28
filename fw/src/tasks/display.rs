@@ -3151,6 +3151,15 @@ fn restore_saved_state(
     // page-count reads below resolve it, and so the first Home paint names it
     // before any open.
     crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
+    // The app is about to hold this book under `index` without opening it,
+    // and staging the row under the Library cursor replaces the active entry.
+    // Without this, the save as the reader leaves it has no identity to name.
+    if !library.adopt_active_as_reading_book(usize::from(index)) {
+        esp_println::println!(
+            "restore: index={} not staged; its departure cannot be saved",
+            index
+        );
+    }
     let (chapter, screen) = book_position(epd, sd_cs, library, index, record);
     esp_println::println!(
         "restore: index={} chapter={} screen={}",
