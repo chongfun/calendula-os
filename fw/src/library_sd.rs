@@ -876,6 +876,7 @@ where
             locator: found.now.1,
         };
         let carry_start = Instant::now();
+        let carry_io = crate::sd_session::sd_stats::snapshot();
         // A place or a pagination that could not be carried is lost, not a
         // scan that failed: the copy has its id back either way, and the
         // book builds again rather than not opening at all. Failing the
@@ -922,14 +923,17 @@ where
         } else if !pagination_ok {
             esp_println::println!("sd: could not carry pagination to '{}'", found.now.1);
         }
+        let io = crate::sd_session::sd_stats::snapshot().since(carry_io);
         esp_println::println!(
-            "bench: storage_move_carry place_ok={} place={} pagination_ok={} moved={} unlinked={} restamped={} elapsed_ms={} t_ms={}",
+            "bench: storage_move_carry place_ok={} place={} pagination_ok={} moved={} unlinked={} restamped={} rd_blocks={} wr_blocks={} elapsed_ms={} t_ms={}",
             place_ok,
             place,
             pagination_ok,
             moved,
             unlinked,
             restamped,
+            io.read_blocks,
+            io.write_blocks,
             carry_start.elapsed().as_millis(),
             Instant::now().as_millis()
         );
