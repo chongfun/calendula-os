@@ -2960,6 +2960,20 @@ fn close_out_departing_book(
     {
         return false;
     }
+    // A book the store holds nothing under was neither opened nor restored
+    // this session, so its position is already on the card and the page in
+    // hand is a default. Writing it would put that guess over the real one,
+    // or under whatever book a rescan has since put at that row.
+    if ReaderSource::from_book_id(previous.book_id).is_sd()
+        && !sd_library.holds_book(previous.book_id)
+    {
+        esp_println::println!(
+            "storage: nothing held for departing book_id={}; nothing to close out",
+            previous.book_id
+        );
+        *pending_progress = None;
+        return true;
+    }
     let record = record_for_persisted(sd_library, previous);
     let start = Instant::now();
     // Preserve a held place; otherwise the departing position may replace it.

@@ -1025,6 +1025,15 @@ impl ReaderStore {
             .then_some(self.reading_identity)
     }
 
+    /// Whether the store knows which book `book_id` names for the reader:
+    /// the loaded book or the reading book. A number the app holds without
+    /// either was neither opened nor restored this session.
+    pub fn holds_book(&self, book_id: u32) -> bool {
+        self.loaded_book_identity(book_id)
+            .or_else(|| self.reading_book_identity(book_id))
+            .is_some()
+    }
+
     /// Record that the reader state names the book staged at `index`, as a
     /// boot restore does before the book is opened. False when that row is
     /// not the staged one.
@@ -2426,6 +2435,11 @@ mod tests {
 
         store.clear_catalog();
         assert_eq!(store.persisted_identity(restored), (0x1234_5678, 3_000));
+        assert!(store.holds_book(restored));
+        assert!(
+            !store.holds_book(app_core::ReaderSource::sd(33).book_id()),
+            "staged for the cursor, not named by the reader"
+        );
     }
 
     /// A Ready load makes its book the reading book; a failed one leaves the
