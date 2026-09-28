@@ -5642,8 +5642,14 @@ fn carry_for_move_reads_the_file_now_there_and_carries_place_and_pagination() {
         proto::cache::source_hash_at(now.root, now.locator, IDENTITY.1),
         IDENTITY.1,
     );
-    let carry = files::carry_for_move(&root, &OWNER, &now, IDENTITY, now_identity)
-        .expect("the move carries");
+    let carry = files::carry_for_move(
+        &root,
+        &OWNER,
+        &now,
+        proto::source::digest_of(body),
+        IDENTITY,
+        now_identity,
+    );
     assert_eq!(carry.place, Ok(true), "the legacy place came across");
     assert_eq!(
         carry.pagination,

@@ -718,7 +718,7 @@ where
 ///
 /// `Ok(false)` is a departed directory with no position to carry.
 ///
-/// Reached from the firmware through [`carry_position_for_move`], on a move
+/// Reached from the firmware through [`carry_for_move`], on a move
 /// the scan has proved. Nothing else may conclude that a book moved.
 pub fn carry_position<
     D,
@@ -898,11 +898,18 @@ pub struct MoveCarry {
 }
 
 /// Everything a proven move carries: the legacy position, then the
-/// pagination. One read of the moved file serves both, and only that read
-/// failing refuses the whole; each carry is attempted whatever became of
-/// the other. `old_identity` and `new_identity` are the `(source_hash,
-/// size)` pairs of the two places, which the scan has; every cache header
-/// binds to the first and has to be re-bound to the second.
+/// pagination. Each carry is attempted whatever became of the other.
+/// `old_identity` and `new_identity` are the `(source_hash, size)` pairs of
+/// the two places, which the scan has; every cache header binds to the first
+/// and has to be re-bound to the second.
+///
+/// `digest` is what the claim and the evidence at the new place will say the
+/// bytes there are, so it has to have been computed from them, as
+/// [`carry_position_for_move`] insists. The scan's proof of the move is
+/// exactly such a read, of the same file in the same scan, and the ledger
+/// hands it on rather than have this read an eleven-megabyte book a second
+/// time. A digest rebuilt from a record cannot be passed here: there is no
+/// way to make one.
 ///
 /// Reached from the firmware on a move the scan has proved, before the
 /// ledger writes it down, so a reset retries it. Nothing else may conclude
@@ -917,9 +924,10 @@ pub fn carry_for_move<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     was: &proto::cache::CacheOwner<'_>,
     now: &proto::cache::CacheOwner<'_>,
+    digest: proto::source::SourceDigest,
     old_identity: (u32, u32),
     new_identity: (u32, u32),
-) -> Result<MoveCarry, ClaimDenied>
+) -> MoveCarry
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -932,15 +940,14 @@ where
         // what a retry reads, and the book at the new place cannot write
         // there until the sweep releases it and adoption empties it. Once
         // in a few hundred million moves the pagination is built again.
-        return Ok(MoveCarry {
+        return MoveCarry {
             place: Ok(false),
             pagination: Ok(None),
-        });
+        };
     }
-    let digest = digest_of_moved(root, now)?;
     let place = carry_position(root, was, now, digest, None);
     let pagination = carry_pagination(root, was, now, digest, old_identity, new_identity);
-    Ok(MoveCarry { place, pagination })
+    MoveCarry { place, pagination }
 }
 
 // ---------------------------------------------------------------------------

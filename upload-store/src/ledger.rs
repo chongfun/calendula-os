@@ -98,7 +98,9 @@ use proto::identity::{
     LEDGER_JOURNAL_SLOT_BYTES, LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
 };
 use proto::library_path::{BookRoot, MAX_PATH_BYTES};
-use proto::source::{encode_cached_record, parse_record, CachedSourceDigest, SOURCE_RECORD_BYTES};
+use proto::source::{
+    encode_cached_record, parse_record, CachedSourceDigest, SourceDigest, SOURCE_RECORD_BYTES,
+};
 
 /// The two generations, under the cache root.
 pub const LEDGER_FILES: [&str; 2] = ["LEDGERA.BIN", "LEDGERB.BIN"];
@@ -878,6 +880,10 @@ pub struct FoundAgain<'a> {
     pub was: (BookRoot, &'a str, u32),
     /// Where it is, as the row that holds it has it.
     pub now: (BookRoot, &'a str, u32),
+    /// The digest this scan computed from the bytes now at `now`, the one
+    /// that proved the move. Handed on so a caller filing things under the
+    /// new place does not read the whole book a second time to learn it.
+    pub digest: SourceDigest,
 }
 
 /// What the directory a copy keeps its reading place in says its bytes
@@ -1143,6 +1149,10 @@ where
     let mut slots = 0usize;
     let capacity = (keys.len() / MOVE_ENTRY_BYTES).min(MOVES_CONSIDERED);
     let table = &mut keys[..capacity * MOVE_ENTRY_BYTES];
+    // The digest each slot was matched by, kept as computed rather than in
+    // the byte table: a digest rebuilt from bytes is a record, and a record
+    // proves nothing. Scan-lived, about 3 KB at the bound.
+    let mut proved: [Option<SourceDigest>; MOVES_CONSIDERED] = [None; MOVES_CONSIDERED];
     if let Some(live) = live {
         if missing_records > 0 && new_rows > 0 && capacity > 0 {
             for_each_record(root, &live, &mut |index, entry| {
@@ -1241,6 +1251,7 @@ where
                 } else if entry[MOVE_MATCHES] == 0 {
                     entry[MOVE_MATCHES] = 1;
                     entry[MOVE_ROW..MOVE_MATCHES].copy_from_slice(&(row as u16).to_le_bytes());
+                    proved[slot] = Some(found);
                 }
             }
         }
@@ -1250,7 +1261,7 @@ where
     // a second file holding the same bytes makes one ambiguous, and
     // a caller acting on a move that turns out to be two would file a
     // reader's place under another book.
-    for slot in 0..slots {
+    for (slot, proved) in proved.iter().enumerate().take(slots) {
         let entry = move_entry(table, slot);
         // The same test the ledger is written by. A copy with one match and
         // a file nobody read is not a copy that has been found: telling a
@@ -1259,6 +1270,10 @@ where
         if !move_settled(entry) {
             continue;
         }
+        // A settled slot had exactly one match, which set this.
+        let Some(digest) = *proved else {
+            continue;
+        };
         let row = move_u16(entry, MOVE_ROW) as usize;
         seek_row(catalog, row)?;
         if !read_exact(catalog, &mut record)? {
@@ -1286,6 +1301,7 @@ where
                 u32::from_le_bytes(entry[MOVE_SIZE..MOVE_ID].try_into().expect("four bytes")),
             ),
             now: (at, locator, byte_size),
+            digest,
         });
     }
 

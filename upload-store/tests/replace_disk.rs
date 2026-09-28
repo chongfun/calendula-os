@@ -302,11 +302,19 @@ thread_local! {
     /// What the scan reported finding again, most recent scan last: the id
     /// that was kept, where it was, and where it is now.
     static FOUND_AGAIN: RefCell<Vec<(BookId, String, String)>> = const { RefCell::new(Vec::new()) };
+    /// The digest each of those reports carried, in the same order.
+    static FOUND_DIGESTS: RefCell<Vec<SourceDigest>> = const { RefCell::new(Vec::new()) };
 }
 
 /// What the scans since the last call reported, and clear it.
 fn found_again() -> Vec<(BookId, String, String)> {
+    FOUND_DIGESTS.with(|seen| seen.borrow_mut().clear());
     FOUND_AGAIN.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
+}
+
+/// The digests the scans since the last call handed on, and clear them.
+fn found_digests() -> Vec<SourceDigest> {
+    FOUND_DIGESTS.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
 }
 
 /// One row of the catalog a scan would write.
@@ -367,6 +375,7 @@ fn scan_minting(
                 seen.borrow_mut()
                     .push((found.id, found.was.1.to_owned(), found.now.1.to_owned()))
             });
+            FOUND_DIGESTS.with(|seen| seen.borrow_mut().push(found.digest));
         },
     )?;
     encode_catalog_header(rows.len() as u16, &mut header);
@@ -2427,6 +2436,13 @@ fn a_sideloaded_copy_that_was_read_is_found_again_where_it_went() {
     assert_eq!(assigned.minted, 0);
     assert_eq!(ids[0], Some(id), "under the id it was adopted with");
 
+    // With the digest that proved it, computed from the bytes now at the new
+    // place, so the carry need not read the book again.
+    assert_eq!(
+        found_digests(),
+        vec![digest_of(&bytes)],
+        "the proof is handed on"
+    );
     // And the move is reported with both places, so what is filed under the
     // old one can be carried to the new one.
     assert_eq!(
