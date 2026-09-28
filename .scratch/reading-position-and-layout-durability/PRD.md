@@ -1068,6 +1068,27 @@ believed for another. Nothing in this milestone makes that harder.
     directory; that per-entry walk is the first suspect, unmeasured.
   - The UI sits on the library for the whole scan with no progress shown,
     so the open looks like it has hung.
+- **Second X3 pass (2026-09-28, bbf33d1): 28.6 s was mostly a second
+  hash.** The carry read the whole book again for its digest, right after
+  the ledger had hashed it to prove the move (main's place carry did the
+  same). The ledger now hands its digest on in `FoundAgain`. Moving the book
+  back: carry `elapsed_ms=5085 rd_blocks=5767 wr_blocks=680`, scan 27.1 s
+  (was 51.7), reopen fast hit on page 14. What is left:
+  - The 147 were 52 sections of the current layout (`S2A`), 46 of a second
+    live layout (`S21`), 46 old-firmware files named `S000` to `S045` with
+    header version 0x1a, and three book files. The old names are not ours
+    to `layout_of_section_file`, so no eviction or prune ever reclaims them,
+    and the carry moves them for nothing (`restamped=101` is everything
+    but those). Every book cached before layout-named sections may hold a
+    set.
+  - The carry's 5.1 s is directory walks: each short-name move finds the
+    source, checks the destination's namespace, finds a free slot and
+    unlinks the source, one walk each, so the cost grows with the square of
+    the directory. A batched move in the fork, one pass over each directory
+    block, would take most of the reads out.
+  - The scan's largest cost is now the one hash that proves the move,
+    about 21.7 s for 11.7 MB (540 KB/s). Unmeasured whether the card read or
+    software SHA-256 bounds it; the C3 has a SHA peripheral.
 
 ## Done when
 
