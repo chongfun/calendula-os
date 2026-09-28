@@ -296,6 +296,7 @@ pub struct ReaderStore {
     active_index: Option<usize>,
     pub(crate) current_index: Option<usize>,
     pub loaded_index: Option<usize>,
+    pub(crate) loaded_epoch: u32,
     pub(crate) loaded_chapter: u16,
     pub loaded_identity: (u32, u32),
     pub(crate) loaded_root: Option<proto::library_path::BookRoot>,
@@ -443,6 +444,7 @@ impl ReaderStore {
             active_index: None,
             current_index: None,
             loaded_index: None,
+            loaded_epoch: 0,
             loaded_chapter: 0,
             loaded_identity: (0, 0),
             loaded_root: None,
@@ -839,15 +841,19 @@ impl ReaderStore {
     /// and the locator.
     ///
     /// Checks the actively staged book first, then falls back to the loaded book's
-    /// retained root and path. A row the list merely shows has no locator resident,
-    /// so `None` means neither book occupies row `index` or the record named a root
-    /// this build cannot place.
+    /// retained root and path when its row belongs to the current catalog epoch.
+    /// A row the list merely shows has no locator resident, so `None` means neither
+    /// book occupies row `index` in this epoch or the record named a root this build
+    /// cannot place.
     pub fn book_location(&self, index: usize) -> Option<(proto::library_path::BookRoot, &str)> {
         if self.active_index == Some(index) && !self.active_path.is_empty() {
             let root = self.active_root?;
             return Some((root, self.active_path.as_str()));
         }
-        if self.loaded_index == Some(index) && !self.loaded_path.is_empty() {
+        if self.loaded_epoch == self.catalog_epoch
+            && self.loaded_index == Some(index)
+            && !self.loaded_path.is_empty()
+        {
             let root = self.loaded_root?;
             return Some((root, self.loaded_path.as_str()));
         }
@@ -942,7 +948,10 @@ impl ReaderStore {
         if self.active_index == Some(index) && !self.active_path.is_empty() {
             return (self.active_entry.source_hash, self.active_entry.byte_size);
         }
-        if self.loaded_index == Some(index) && self.loaded_identity != (0, 0) {
+        if self.loaded_epoch == self.catalog_epoch
+            && self.loaded_index == Some(index)
+            && self.loaded_identity != (0, 0)
+        {
             return self.loaded_identity;
         }
         let Some(entry) = self.catalog_entry(index) else {
@@ -1067,6 +1076,7 @@ impl ReaderStore {
 
     pub fn begin_book_load(&mut self) {
         self.loaded_index = None;
+        self.loaded_epoch = 0;
         self.loaded_identity = (0, 0);
         self.loaded_root = None;
         self.loaded_path.clear();
@@ -1086,6 +1096,7 @@ impl ReaderStore {
         }
         if matches!(status, BookLoadStatus::Ready | BookLoadStatus::Error) {
             self.loaded_index = Some(index);
+            self.loaded_epoch = self.catalog_epoch;
             self.loaded_chapter = chapter;
             if self.active_index == Some(index) {
                 self.loaded_root = self.active_root;
@@ -1280,6 +1291,7 @@ impl ReaderStore {
 
     /// Sets a page anchor and updates page count for testing.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_test_page_anchor(&mut self, index: usize, spine: u16, offset: u32) {
         if index < self.page_offset.len() && index < self.page_spine.len() {
             self.page_spine[index] = spine;
@@ -2164,19 +2176,26 @@ mod tests {
         store.clear_catalog();
         assert_eq!(store.active_index(), None);
 
-        // Snapshot, location, and identity still resolve the active book!
+        // Row-based APIs must not resolve the stale row from the old epoch:
+        assert_eq!(store.book_location(4), None);
+        assert_eq!(store.source_identity(book_id), (0, 0));
+
+        // Retained snapshots survive the catalog rebuild!
         let snap_after = store
             .active_book_snapshot()
-            .expect("snapshot survives rebuild");
+            .expect("active snapshot survives rebuild");
         assert_eq!(snap_after.root, proto::library_path::BookRoot::Library);
         assert_eq!(snap_after.path, "Dune.epub");
         assert_eq!(snap_after.identity, (0x1234_5678, 3_000));
         assert_eq!(snap_after.copy_id, Some(id));
-        assert_eq!(
-            store.book_location(4),
-            Some((proto::library_path::BookRoot::Library, "Dune.epub"))
-        );
-        assert_eq!(store.source_identity(book_id), (0x1234_5678, 3_000));
+
+        let loaded_after = store
+            .loaded_book_snapshot()
+            .expect("loaded snapshot survives rebuild");
+        assert_eq!(loaded_after.root, proto::library_path::BookRoot::Library);
+        assert_eq!(loaded_after.path, "Dune.epub");
+        assert_eq!(loaded_after.identity, (0x1234_5678, 3_000));
+        assert_eq!(loaded_after.copy_id, Some(id));
     }
 
     /// When book 4 is loaded and book 5 is later staged as active (e.g. while

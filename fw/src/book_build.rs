@@ -1003,6 +1003,42 @@ where
     ))
 }
 
+/// Resolve a book's location by identity under the one-match rule.
+///
+/// Used when saving position for a book that is not resident in `library.loaded_book_snapshot()`.
+/// Because row numbers are only valid within a single catalog epoch, the saved row
+/// cannot be trusted after a catalog rebuild or rescan. To prevent cross-book corruption
+/// in the presence of 32-bit identity collisions (legal twins), this scans the catalog
+/// and resolves the record only if exactly one book matches.
+#[inline(never)]
+fn resolve_record_location<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    identity: (u32, u32),
+) -> Option<(
+    BookRoot,
+    String<{ proto::library_path::MAX_PATH_BYTES }>,
+    String<64>,
+    Option<proto::identity::BookId>,
+)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let record = crate::library_sd::find_catalog_record(root, identity.0, identity.1)?;
+    Some((
+        record.root?,
+        record.path,
+        record.display_name,
+        record.book_id,
+    ))
+}
+
 /// Persists a reading position to both places it lives, in one card session.
 ///
 /// The per-book position file is what this firmware reads back; the copy inside
@@ -1039,15 +1075,14 @@ pub(crate) fn store_app_state(
     // not abandon the previous one's place.
     let sd_index = app_core::ReaderSource::from_book_id(record.book_id).sd_index();
     sd_session::with_root(epd, sd_cs, |root| {
-        let state = files::write_state_file(root, record);
         let position = if library
             .loaded_book_snapshot()
             .is_some_and(|l| (record.source_hash, record.source_size) == l.identity)
         {
             files::close_out_loaded_book(root, library, record, may_replace_place)
-        } else if let Some(index) = sd_index {
+        } else if sd_index.is_some() {
             let identity = (record.source_hash, record.source_size);
-            match record_location(root, index as usize, identity) {
+            match resolve_record_location(root, identity) {
                 Some((at, path, _, _)) => {
                     let key = proto::cache::cache_key_from(identity.0);
                     let owner = proto::cache::CacheOwner {
@@ -1071,6 +1106,7 @@ pub(crate) fn store_app_state(
         } else {
             Ok(())
         };
+        let state = files::write_state_file(root, record);
         state.and(position)
     })
     .ok()
@@ -1098,7 +1134,7 @@ pub(crate) fn store_book_position(
     record: AppStateRecord,
     may_replace_place: bool,
 ) -> bool {
-    let Some(index) = app_core::ReaderSource::from_book_id(record.book_id).sd_index() else {
+    let Some(_) = app_core::ReaderSource::from_book_id(record.book_id).sd_index() else {
         return true;
     };
     let stored = sd_session::with_root(epd, sd_cs, |root| {
@@ -1112,7 +1148,7 @@ pub(crate) fn store_book_position(
             if identity == (0, 0) {
                 return Err(());
             }
-            let (at, path, _, _) = record_location(root, index as usize, identity).ok_or(())?;
+            let (at, path, _, _) = resolve_record_location(root, identity).ok_or(())?;
             let key = proto::cache::cache_key_from(identity.0);
             let owner = proto::cache::CacheOwner {
                 key: key.as_str(),

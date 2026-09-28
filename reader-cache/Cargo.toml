@@ -15,6 +15,8 @@ esp-log = ["dep:esp-println"]
 # holds on the X4, so a crate seeing X3 dimensions without this feature on
 # fails to build -- deliberately, rather than silently rejecting every POS.BIN.
 device-x3 = ["display/device-x3"]
+# Test support helpers kept out of production firmware.
+test-support = []
 
 [dependencies]
 app-core = { path = "../app-core" }
@@ -32,3 +34,4 @@ esp-println = { version = "0.17.0", features = ["esp32c3"], optional = true }
 # Formats the in-memory FAT image the fault-injection tests run against, the
 # same way upload-store/tests/transaction.rs does.
 fatfs = "0.3.6"
+reader-cache = { path = ".", features = ["test-support"] }
