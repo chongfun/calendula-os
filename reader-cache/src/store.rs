@@ -941,7 +941,13 @@ impl ReaderStore {
             .map(|index| index as usize)
     }
 
-    pub fn source_identity(&self, book_id: u32) -> (u32, u32) {
+    /// What row `book_id` holds in the current catalog, or `(0, 0)` when no
+    /// resident entry answers.
+    ///
+    /// Epoch-scoped: after a rebuild the loaded book's old row names whatever
+    /// the new catalog put there. Use [`Self::loaded_book_identity`] for a
+    /// state known to belong to the loaded book.
+    pub fn current_catalog_identity(&self, book_id: u32) -> (u32, u32) {
         let Some(index) = Self::selected_book_index(book_id) else {
             return (0, 0);
         };
@@ -958,6 +964,32 @@ impl ReaderStore {
             return (0, 0);
         };
         (entry.source_hash, entry.byte_size)
+    }
+
+    /// The identity of the book resident under `book_id`, when that is the
+    /// handle the loaded book was loaded under.
+    ///
+    /// Deliberately not epoch-scoped. `loaded_index` is read here as the
+    /// app-side handle of the resident book, not as a row in today's catalog,
+    /// and the descriptor it guards survives rebuilds on purpose: closing out
+    /// the book the reader was in must name that book however many times the
+    /// catalog has been rebuilt since it opened.
+    pub fn loaded_book_identity(&self, book_id: u32) -> Option<(u32, u32)> {
+        let index = Self::selected_book_index(book_id)?;
+        (self.loaded_index == Some(index) && self.loaded_identity != (0, 0))
+            .then_some(self.loaded_identity)
+    }
+
+    /// The identity a persisted state for `book_id` belongs to: the loaded
+    /// book's when it is the one loaded under that id, else the current
+    /// catalog row's.
+    ///
+    /// Loaded first: after a rebuild the row answers `(0, 0)` or another
+    /// book's identity for the departing book, and a save keyed on that writes
+    /// the departing page into the other book.
+    pub fn persisted_identity(&self, book_id: u32) -> (u32, u32) {
+        self.loaded_book_identity(book_id)
+            .unwrap_or_else(|| self.current_catalog_identity(book_id))
     }
 
     pub fn clear_toc(&mut self) {
@@ -1074,13 +1106,27 @@ impl ReaderStore {
         self.chapter_start_ready = false;
     }
 
-    pub fn begin_book_load(&mut self) {
+    /// Forget which book is loaded: its handle and its descriptor together.
+    ///
+    /// The descriptor stands for the book whose content arena is resident, so
+    /// every path that stops that being true drops both. A descriptor left
+    /// behind would let a close-out write a position for a book the store no
+    /// longer holds.
+    pub fn forget_loaded_book(&mut self) {
         self.loaded_index = None;
+        self.clear_loaded_descriptor();
+    }
+
+    fn clear_loaded_descriptor(&mut self) {
         self.loaded_epoch = 0;
         self.loaded_identity = (0, 0);
         self.loaded_root = None;
         self.loaded_path.clear();
         self.loaded_copy_id = None;
+    }
+
+    pub fn begin_book_load(&mut self) {
+        self.forget_loaded_book();
         self.reader_status = BookLoadStatus::Loading;
         self.title.clear();
         self.author.clear();
@@ -1095,28 +1141,28 @@ impl ReaderStore {
             self.set_current_index(index);
         }
         if matches!(status, BookLoadStatus::Ready | BookLoadStatus::Error) {
+            // The handle is set for an error too: the reader view matches it
+            // against the request to show this book's error rather than a
+            // loading plate.
             self.loaded_index = Some(index);
-            self.loaded_epoch = self.catalog_epoch;
             self.loaded_chapter = chapter;
-            if self.active_index == Some(index) {
-                self.loaded_root = self.active_root;
-                self.loaded_path = self.active_path.clone();
-                self.loaded_identity = (self.active_entry.source_hash, self.active_entry.byte_size);
-                self.loaded_copy_id = self.active_copy_id;
-            } else if let Some(identity) = self
-                .catalog_entry(index)
-                .map(|e| (e.source_hash, e.byte_size))
-            {
-                // Retain identity for source_identity reporting even when no location is loaded.
-                self.loaded_root = None;
-                self.loaded_path.clear();
-                self.loaded_identity = identity;
-                self.loaded_copy_id = None;
-            } else {
-                self.loaded_root = None;
-                self.loaded_path.clear();
-                self.loaded_identity = (0, 0);
-                self.loaded_copy_id = None;
+            // The descriptor is not. It stands for the book whose arena is
+            // resident, and a load that failed made no book resident, so a
+            // failed open leaves nothing a close-out could write under.
+            self.clear_loaded_descriptor();
+            if matches!(status, BookLoadStatus::Ready) {
+                self.loaded_epoch = self.catalog_epoch;
+                if self.active_index == Some(index) {
+                    self.loaded_root = self.active_root;
+                    self.loaded_path = self.active_path.clone();
+                    self.loaded_identity =
+                        (self.active_entry.source_hash, self.active_entry.byte_size);
+                    self.loaded_copy_id = self.active_copy_id;
+                } else if let Some(entry) = self.catalog_entry(index) {
+                    // No locator resident for this row, so no snapshot, but
+                    // the identity still names the book for a later save.
+                    self.loaded_identity = (entry.source_hash, entry.byte_size);
+                }
             }
             // Bake the just-learned title into the resident list/active entries
             // so the Library keeps showing it once the cursor moves to another
@@ -2166,7 +2212,10 @@ mod tests {
         assert_eq!(snap.path, "Dune.epub");
         assert_eq!(snap.identity, (0x1234_5678, 3_000));
         assert_eq!(snap.copy_id, Some(id));
-        assert_eq!(store.source_identity(book_id), (0x1234_5678, 3_000));
+        assert_eq!(
+            store.current_catalog_identity(book_id),
+            (0x1234_5678, 3_000)
+        );
         assert_eq!(
             store.book_location(4),
             Some((proto::library_path::BookRoot::Library, "Dune.epub"))
@@ -2178,7 +2227,13 @@ mod tests {
 
         // Row-based APIs must not resolve the stale row from the old epoch:
         assert_eq!(store.book_location(4), None);
-        assert_eq!(store.source_identity(book_id), (0, 0));
+        assert_eq!(store.current_catalog_identity(book_id), (0, 0));
+        // but a state for the loaded book still names it.
+        assert_eq!(
+            store.loaded_book_identity(book_id),
+            Some((0x1234_5678, 3_000))
+        );
+        assert_eq!(store.persisted_identity(book_id), (0x1234_5678, 3_000));
 
         // Retained snapshots survive the catalog rebuild!
         let snap_after = store
@@ -2196,6 +2251,111 @@ mod tests {
         assert_eq!(loaded_after.path, "Dune.epub");
         assert_eq!(loaded_after.identity, (0x1234_5678, 3_000));
         assert_eq!(loaded_after.copy_id, Some(id));
+    }
+
+    /// A rebuild that puts another book at the loaded book's old row changes
+    /// what the row says, and not what a state for the loaded book names.
+    #[test]
+    fn loaded_book_identity_outlives_its_row_being_reused() {
+        let mut store = Box::new(ReaderStore::new());
+        let book_id = app_core::ReaderSource::sd(0).book_id();
+        store.set_active_entry(
+            0,
+            "Dune.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Dune.epub",
+            3_000,
+            0x1234_5678,
+            None,
+            None,
+        );
+        store.finish_book_load(0, 0, BookLoadStatus::Ready);
+
+        store.clear_catalog();
+        store.begin_window(0);
+        store.push_window_entry("Emma.epub", 2_000, 0x9abc_def0, None);
+
+        assert_eq!(
+            store.current_catalog_identity(book_id),
+            (0x9abc_def0, 2_000)
+        );
+        assert_eq!(
+            store.loaded_book_identity(book_id),
+            Some((0x1234_5678, 3_000))
+        );
+        assert_eq!(store.persisted_identity(book_id), (0x1234_5678, 3_000));
+        // Another handle is not the loaded book's, so it gets the row.
+        let other = app_core::ReaderSource::sd(1).book_id();
+        assert_eq!(store.loaded_book_identity(other), None);
+    }
+
+    /// A failed open keeps the handle, so the reader view shows this book's
+    /// error, and leaves no descriptor, so no close-out writes under a book
+    /// that never became resident.
+    #[test]
+    fn a_failed_load_leaves_no_loaded_descriptor() {
+        let mut store = Box::new(ReaderStore::new());
+        let book_id4 = app_core::ReaderSource::sd(4).book_id();
+        let book_id5 = app_core::ReaderSource::sd(5).book_id();
+        store.set_active_entry(
+            4,
+            "Book4.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Book4.epub",
+            4_000,
+            0x4444_4444,
+            None,
+            None,
+        );
+        store.finish_book_load(4, 0, BookLoadStatus::Ready);
+        assert!(store.loaded_book_snapshot().is_some());
+
+        store.set_active_entry(
+            5,
+            "Book5.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Book5.epub",
+            5_000,
+            0x5555_5555,
+            None,
+            None,
+        );
+        store.begin_book_load();
+        store.finish_book_load(5, 0, BookLoadStatus::Error);
+        assert_eq!(store.loaded_index, Some(5));
+        assert_eq!(store.loaded_book_snapshot(), None);
+        assert_eq!(store.loaded_book_identity(book_id5), None);
+        assert_eq!(store.loaded_book_identity(book_id4), None);
+        // A save for the failed book falls back to what its row says.
+        assert_eq!(store.persisted_identity(book_id5), (0x5555_5555, 5_000));
+
+        // Even an error reported without a fresh begin drops the old book's
+        // descriptor, rather than pairing book 4's identity with handle 5.
+        store.finish_book_load(4, 0, BookLoadStatus::Ready);
+        store.finish_book_load(5, 0, BookLoadStatus::Error);
+        assert_eq!(store.loaded_book_snapshot(), None);
+        assert_eq!(store.loaded_book_identity(book_id5), None);
+    }
+
+    #[test]
+    fn forgetting_the_loaded_book_drops_its_descriptor() {
+        let mut store = Box::new(ReaderStore::new());
+        let book_id = app_core::ReaderSource::sd(4).book_id();
+        store.set_active_entry(
+            4,
+            "Book4.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "Book4.epub",
+            4_000,
+            0x4444_4444,
+            None,
+            None,
+        );
+        store.finish_book_load(4, 0, BookLoadStatus::Ready);
+        store.forget_loaded_book();
+        assert_eq!(store.loaded_index, None);
+        assert_eq!(store.loaded_book_snapshot(), None);
+        assert_eq!(store.loaded_book_identity(book_id), None);
     }
 
     /// When book 4 is loaded and book 5 is later staged as active (e.g. while
@@ -2226,7 +2386,10 @@ mod tests {
             store.book_location(4),
             Some((proto::library_path::BookRoot::Library, "Book4.epub"))
         );
-        assert_eq!(store.source_identity(book_id4), (0x4444_4444, 4_000));
+        assert_eq!(
+            store.current_catalog_identity(book_id4),
+            (0x4444_4444, 4_000)
+        );
 
         // 2. Stage Book 5 as active (before Book 5 finishes loading, Book 4 is still loaded)
         store.set_active_entry(
@@ -2245,7 +2408,10 @@ mod tests {
             store.book_location(5),
             Some((proto::library_path::BookRoot::Library, "Book5.epub"))
         );
-        assert_eq!(store.source_identity(book_id5), (0x5555_5555, 5_000));
+        assert_eq!(
+            store.current_catalog_identity(book_id5),
+            (0x5555_5555, 5_000)
+        );
 
         // Book 4 is still loaded: book_location(4), source_identity(4), and loaded_book_snapshot
         // must continue to return Book 4's data, completely isolated from Book 5.
@@ -2253,7 +2419,10 @@ mod tests {
             store.book_location(4),
             Some((proto::library_path::BookRoot::Library, "Book4.epub"))
         );
-        assert_eq!(store.source_identity(book_id4), (0x4444_4444, 4_000));
+        assert_eq!(
+            store.current_catalog_identity(book_id4),
+            (0x4444_4444, 4_000)
+        );
         let snap4 = store.loaded_book_snapshot().expect("loaded snapshot");
         assert_eq!(snap4.path, "Book4.epub");
         assert_eq!(snap4.identity, (0x4444_4444, 4_000));

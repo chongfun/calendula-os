@@ -1647,7 +1647,7 @@ pub(crate) fn clear_book_cache(
     // what the failed clear will need anyway.
     if attempted {
         if library.loaded_index == Some(index) {
-            library.loaded_index = None;
+            library.forget_loaded_book();
             library.clear_book_index();
             library.clear_lines();
             library.clear_toc();

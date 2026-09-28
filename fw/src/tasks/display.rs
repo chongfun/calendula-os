@@ -3026,7 +3026,7 @@ fn ensure_epub_scratch<'a>(
 }
 
 fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
-    library.source_identity(book_id)
+    library.current_catalog_identity(book_id)
 }
 
 /// The on-card record for a state the app persisted, with the fields only the
@@ -3048,7 +3048,9 @@ fn last_portrait(planner: &RefreshPlanner) -> bool {
 }
 
 fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppStateRecord {
-    let (source_hash, source_size) = source_identity(library, state.book_id);
+    // The loaded book's own identity when the state is for it, not its row's:
+    // the catalog may have been rebuilt under that row since it opened.
+    let (source_hash, source_size) = library.persisted_identity(state.book_id);
     let chapter = if ReaderSource::from_book_id(state.book_id).is_sd()
         && library.loaded_index == ReaderStore::selected_book_index(state.book_id)
     {

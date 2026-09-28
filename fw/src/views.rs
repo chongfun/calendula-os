@@ -122,7 +122,8 @@ fn ui_model<'a>(
     // Keyed on source identity (not the loaded book) so it survives boot
     // restore, where the title is read before the book is opened.
     let chapter_title = if !sd_library.current_chapter_title().is_empty()
-        && sd_library.current_chapter_source() == sd_library.source_identity(request.book_id)
+        && sd_library.current_chapter_source()
+            == sd_library.current_catalog_identity(request.book_id)
     {
         sd_library.current_chapter_title()
     } else {
