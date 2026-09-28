@@ -17,7 +17,7 @@ resolver = "2"
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
 # Our fork: chongfun/embedded-sdmmc-rs, branch calendula/multi-block-read,
-# which is calendula/long-names-and-error-fidelity plus five commits.
+# which is calendula/long-names-and-error-fidelity plus nine commits.
 # Upstream v0.10, plus Jon-Vii's create_file_in_dir_lfn so wireless uploads land
 # under a real filename instead of an 8.3 alias, plus eight changes of ours.
 #
@@ -92,7 +92,17 @@ resolver = "2"
 # driver's multi-block read an everyday path, so the same revision fixes that
 # read to send CMD12 whenever the CMD18 write was attempted, even when the
 # write, the response or a block reports failure; before, the card was left
-# streaming into the next command.
+# streaming into the next command. Multi-block writes get the same stop.
+#
+# The same branch fixes places the driver treated a write that reported an
+# error as one that had not landed. BlockDevice promises no such thing, and
+# the SPI card contradicts it: a single-block write can fail its busy wait or
+# CMD13 after the card took the sector. A move whose source unlink failed so
+# undid itself into a file with no name; a make_dir whose name had landed
+# freed the live directory's cluster; the long-name writer stripped a landed
+# entry back to its alias. Each now looks at the disk before undoing. And
+# truncation stopped undercounting the free clusters, which had let an
+# allocation decrement a count of zero.
 #
 # Regression coverage for all eight of our changes lives in the fork, not here:
 # tests/fat_chain_errors.rs for the error-propagation fixes, tests/move_file.rs
@@ -104,7 +114,7 @@ resolver = "2"
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "dd89c1f65b33c188f5f858016df7411a8114ce4a", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "caa03a587cc37951af366be9c0c99836da813647", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an
