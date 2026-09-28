@@ -444,6 +444,87 @@ where
     .map_err(|_| PlaceDenied::Fault)
 }
 
+/// Save position and durable place for a loaded book, using its retained snapshot.
+///
+/// This does not consult the catalog, resident catalog window, or staged/active book:
+/// the position and anchor are strictly tied to the loaded book whose content arena
+/// is resident in `library`.
+#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
+pub fn close_out_loaded_book<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &ReaderStore,
+    record: proto::nvm::AppStateRecord,
+    may_replace_place: bool,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(loaded) = library.loaded_book_snapshot() else {
+        cache_log!("storage: refusing to close out with no loaded book snapshot");
+        return Err(());
+    };
+    if (record.source_hash, record.source_size) != loaded.identity {
+        cache_log!("storage: refusing to close out with mismatched loaded book identity");
+        return Err(());
+    }
+    let key = proto::cache::cache_key_from(loaded.identity.0);
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: loaded.root,
+        locator: loaded.path,
+    };
+    let place = if !may_replace_place {
+        Ok(())
+    } else if let (Some(id), Some(anchor)) = (
+        loaded.copy_id,
+        library.anchor_for_global_page(record.screen),
+    ) {
+        let source = place_source_for(loaded.identity.1);
+        let progression = if library.book_index_is_partial() {
+            match read_place(root, id) {
+                PlaceRead::Found(place) => place.progression,
+                PlaceRead::Absent => None,
+                PlaceRead::Fault => {
+                    cache_log!("storage: the place read failed; leaving the save owed");
+                    return Err(());
+                }
+            }
+        } else {
+            let total = library.advertised_page_count();
+            Some(proto::anchor::encode_progression(record.screen, total))
+        };
+        match write_place(root, id, anchor, source, progression) {
+            Ok(()) => Ok(()),
+            Err(PlaceDenied::Taken) => {
+                cache_log!("storage: another copy holds this place directory");
+                Ok(())
+            }
+            Err(PlaceDenied::Fault) => {
+                cache_log!("storage: the place write failed");
+                Err(())
+            }
+        }
+    } else {
+        Ok(())
+    };
+    let position = match write_position_file(root, &owner, record.chapter, record.screen) {
+        Ok(()) => Ok(()),
+        Err(ClaimDenied::Foreign) => {
+            cache_log!("storage: departing position refused by a foreign claim");
+            Ok(())
+        }
+        Err(ClaimDenied::Fault) => Err(()),
+    };
+    place.and(position)
+}
+
 /// What the card says about where the reader left off in this copy.
 ///
 /// Three answers, not two. A card that refuses a read has said nothing about

@@ -4317,3 +4317,231 @@ fn a_move_that_shares_a_cache_directory_leaves_the_evidence_alone() {
         other => panic!("the claim is where it was: {other:?}"),
     }
 }
+
+/// Regression: when Book A is loaded and Book B is staged as active (e.g. while
+/// preparing to open B), closing out departing Book A persists A's position under A's
+/// key/owner, writes A's anchor under A's copy ID, and does not alter B's position or place.
+#[test]
+fn departing_book_close_out_when_another_book_is_staged() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id_a = proto::identity::BookId::from_bytes([0x0A; 16]).expect("an id");
+    let id_b = proto::identity::BookId::from_bytes([0x0B; 16]).expect("an id");
+    let identity_a = (0xAAAA_1111, 4_000);
+    let identity_b = (0xBBBB_2222, 5_000);
+    let path_a = "Fiction/BookA.epub";
+    let path_b = "Fiction/BookB.epub";
+    let key_a = proto::cache::cache_key_from(identity_a.0);
+    let key_b = proto::cache::cache_key_from(identity_b.0);
+    let owner_a = proto::cache::CacheOwner {
+        key: key_a.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: path_a,
+    };
+    let owner_b = proto::cache::CacheOwner {
+        key: key_b.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: path_b,
+    };
+
+    // Claim directories on the card for both books
+    files::record_cache_evidence(&root, &owner_a, None, Some(hashed(b"book A content")))
+        .expect("record a");
+    files::record_cache_evidence(&root, &owner_b, None, Some(hashed(b"book B content")))
+        .expect("record b");
+
+    let mut store = Box::new(ReaderStore::new());
+
+    // 1. Stage and finish loading Book A at row 4
+    store.set_active_entry(
+        4,
+        path_a,
+        Some(proto::library_path::BookRoot::Library),
+        path_a,
+        identity_a.1,
+        identity_a.0,
+        None,
+        Some(id_a),
+    );
+    store.set_test_page_anchor(0, 1, 128);
+    store.current_section_start_page = 0;
+    store.finish_book_load(4, 1, BookLoadStatus::Ready);
+
+    // 2. Stage Book B at row 5 (as happens during pre-open render)
+    store.set_active_entry(
+        5,
+        path_b,
+        Some(proto::library_path::BookRoot::Library),
+        path_b,
+        identity_b.1,
+        identity_b.0,
+        None,
+        Some(id_b),
+    );
+
+    // 3. Book A is NOT resident in the catalog window
+    store.clear_folder_page();
+
+    // 4. Construct departing record for A
+    let departing_record = proto::nvm::AppStateRecord {
+        book_id: app_core::ReaderSource::sd(4).book_id(),
+        chapter: 2,
+        screen: 0,
+        shell_orientation: 0,
+        reading_orientation: 0,
+        refresh_policy: 0,
+        font_size: 0,
+        line_spacing: 0,
+        font_weight: 0,
+        font_family: 0,
+        front_buttons: 0,
+        source_hash: identity_a.0,
+        source_size: identity_a.1,
+        legacy_source_identity: false,
+    };
+
+    // 5. Close out departing Book A
+    files::close_out_loaded_book(&root, &store, departing_record, true)
+        .expect("close out departing book succeeds");
+
+    // 6. Assertions:
+    // A's position is written under owner_a (chapter 2, screen 0)
+    assert_eq!(
+        files::read_position_file(&root, &owner_a),
+        Some((2, 0)),
+        "Book A's position file must be stored under Book A's owner"
+    );
+    // A's place is written under id_a with anchor (1, 128)
+    match files::read_place(&root, id_a) {
+        files::PlaceRead::Found(place) => {
+            assert_eq!(place.anchor, proto::anchor::ContentAnchor::at(1, 128));
+        }
+        _ => panic!("expected Book A place to be found"),
+    }
+
+    // B is completely untouched
+    assert_eq!(
+        files::read_position_file(&root, &owner_b),
+        None,
+        "Book B's position file must not be created or touched"
+    );
+    assert!(
+        matches!(files::read_place(&root, id_b), files::PlaceRead::Absent),
+        "Book B's place file must not be created or touched"
+    );
+}
+
+/// Regression: when Book A was loaded, catalog is rebuilt/rescanned, row 4 is now Book B,
+/// and Book B is staged as active, closing out departing Book A persists A's position
+/// and place under A without being corrupted by the new occupant of row 4.
+#[test]
+fn departing_book_close_out_after_catalog_rebuild_with_staged_book() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id_a = proto::identity::BookId::from_bytes([0x0A; 16]).expect("an id");
+    let id_b = proto::identity::BookId::from_bytes([0x0B; 16]).expect("an id");
+    let identity_a = (0xAAAA_1111, 4_000);
+    let identity_b = (0xBBBB_2222, 5_000);
+    let path_a = "Fiction/BookA.epub";
+    let path_b = "Fiction/BookB.epub";
+    let key_a = proto::cache::cache_key_from(identity_a.0);
+    let key_b = proto::cache::cache_key_from(identity_b.0);
+    let owner_a = proto::cache::CacheOwner {
+        key: key_a.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: path_a,
+    };
+    let owner_b = proto::cache::CacheOwner {
+        key: key_b.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: path_b,
+    };
+
+    // Claim directories on the card for both books
+    files::record_cache_evidence(&root, &owner_a, None, Some(hashed(b"book A content")))
+        .expect("record a");
+    files::record_cache_evidence(&root, &owner_b, None, Some(hashed(b"book B content")))
+        .expect("record b");
+
+    let mut store = Box::new(ReaderStore::new());
+
+    // 1. Stage and finish loading Book A at row 4
+    store.set_active_entry(
+        4,
+        path_a,
+        Some(proto::library_path::BookRoot::Library),
+        path_a,
+        identity_a.1,
+        identity_a.0,
+        None,
+        Some(id_a),
+    );
+    store.set_test_page_anchor(0, 1, 256);
+    store.current_section_start_page = 0;
+    store.finish_book_load(4, 1, BookLoadStatus::Ready);
+
+    // 2. Catalog rescan/rebuild occurs: active_index is cleared, catalog window is wiped
+    store.clear_catalog();
+
+    // 3. In the rebuilt catalog, row 4 now belongs to Book B! Stage Book B at row 4:
+    store.set_active_entry(
+        4,
+        path_b,
+        Some(proto::library_path::BookRoot::Library),
+        path_b,
+        identity_b.1,
+        identity_b.0,
+        None,
+        Some(id_b),
+    );
+
+    // 4. Construct departing record for A
+    let departing_record = proto::nvm::AppStateRecord {
+        book_id: app_core::ReaderSource::sd(4).book_id(),
+        chapter: 3,
+        screen: 0,
+        shell_orientation: 0,
+        reading_orientation: 0,
+        refresh_policy: 0,
+        font_size: 0,
+        line_spacing: 0,
+        font_weight: 0,
+        font_family: 0,
+        front_buttons: 0,
+        source_hash: identity_a.0,
+        source_size: identity_a.1,
+        legacy_source_identity: false,
+    };
+
+    // 5. Close out departing Book A
+    files::close_out_loaded_book(&root, &store, departing_record, true)
+        .expect("close out departing book succeeds");
+
+    // 6. Assertions:
+    assert_eq!(
+        files::read_position_file(&root, &owner_a),
+        Some((3, 0)),
+        "Book A's position file must be stored under Book A's owner"
+    );
+    match files::read_place(&root, id_a) {
+        files::PlaceRead::Found(place) => {
+            assert_eq!(place.anchor, proto::anchor::ContentAnchor::at(1, 256));
+        }
+        _ => panic!("expected Book A place to be found"),
+    }
+
+    // Book B must not be altered
+    assert_eq!(
+        files::read_position_file(&root, &owner_b),
+        None,
+        "Book B's position file must not be created or touched"
+    );
+    assert!(
+        matches!(files::read_place(&root, id_b), files::PlaceRead::Absent),
+        "Book B's place file must not be created or touched"
+    );
+}
