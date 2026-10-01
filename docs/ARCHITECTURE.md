@@ -784,8 +784,10 @@ where it was.
 
 Only the scan proves a move. A catalog rebuild matches a departed ledger
 record to a new row by size, then by hashing the row's bytes. A proved move
-carries the legacy reading position and the pagination
-(`reader_cache::files::carry_for_move`) to the new key.
+carries the legacy reading position, the pagination
+(`reader_cache::files::carry_for_move`) and the saved reader state to the new
+key. The new claim's evidence is the digest the scan already computed, so the
+book is hashed once.
 
 The pagination moves by directory entry, through the fork's short-name
 `move_file_in_dir`: each resident layout's sections, then the content
@@ -799,7 +801,9 @@ sections that do too.
 
 The carry runs inside the identity join, before the ledger commits the move,
 so a reset retries it. It leaves the departed directory's claim in place,
-since the retry reads it. A FAT move is two writes, and a cut between them
+since the retry reads it. A refused carry does not fail the scan: the copy
+keeps its `BookId`, whatever was not carried is lost to the new key, and
+the book builds again. A FAT move is two writes, and a cut between them
 leaves one chain under two names. While a carry is in flight each side holds
 a zero-length marker naming the other, `<new key>.MVD` in the departed
 directory and `<old key>.LNK` in the destination. Any reclaim of a marked
