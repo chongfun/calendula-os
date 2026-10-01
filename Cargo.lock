@@ -1557,6 +1557,7 @@ dependencies = [
  "fatfs",
  "heapless 0.9.3",
  "proto",
+ "reader-cache",
  "ui",
  "upload-store",
 ]

@@ -1106,6 +1106,46 @@ where
     .flatten()
 }
 
+/// Find the unique catalog record of the book with the given (path-hash, byte-size).
+///
+/// One streamed pass with the one-match rule: the identity is a 32-bit
+/// hash and two legal books can share it, so a hinted or first match could
+/// be the other one. Ruling out a second match requires reading every record,
+/// and resolution refuses if zero or more than one record matches.
+pub(crate) fn find_catalog_record<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    source_hash: u32,
+    byte_size: u32,
+) -> Option<CatalogRecord>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if source_hash == 0 && byte_size == 0 {
+        return None;
+    }
+    with_catalog_file(root, |file, count| {
+        seek_to_record(file, 0)?;
+        let mut scan = proto::catalog::IdentityScan::new(source_hash, byte_size);
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        for index in 0..count as usize {
+            read_exact_file(file, &mut record)?;
+            scan.offer(index as u16, &record);
+        }
+        let found_index = scan.finish().ok_or(CatalogFault::Invalid)?;
+        seek_to_record(file, found_index as usize)?;
+        read_exact_file(file, &mut record)?;
+        Ok(decode_catalog_record(&record))
+    })
+    .ok()
+}
+
 /// Find the catalog index of the book at an exact place on the card.
 ///
 /// One streamed pass, like the identity lookups, because ruling out a second

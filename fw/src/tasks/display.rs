@@ -2960,6 +2960,20 @@ fn close_out_departing_book(
     {
         return false;
     }
+    // A book the store holds nothing under was neither opened nor restored
+    // this session, so its position is already on the card and the page in
+    // hand is a default. Writing it would put that guess over the real one,
+    // or under whatever book a rescan has since put at that row.
+    if ReaderSource::from_book_id(previous.book_id).is_sd()
+        && !sd_library.holds_book(previous.book_id)
+    {
+        esp_println::println!(
+            "storage: nothing held for departing book_id={}; nothing to close out",
+            previous.book_id
+        );
+        *pending_progress = None;
+        return true;
+    }
     let record = record_for_persisted(sd_library, previous);
     let start = Instant::now();
     // Preserve a held place; otherwise the departing position may replace it.
@@ -3026,7 +3040,7 @@ fn ensure_epub_scratch<'a>(
 }
 
 fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
-    library.source_identity(book_id)
+    library.current_catalog_identity(book_id)
 }
 
 /// The on-card record for a state the app persisted, with the fields only the
@@ -3048,7 +3062,9 @@ fn last_portrait(planner: &RefreshPlanner) -> bool {
 }
 
 fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppStateRecord {
-    let (source_hash, source_size) = source_identity(library, state.book_id);
+    // The loaded book's own identity when the state is for it, not its row's:
+    // the catalog may have been rebuilt under that row since it opened.
+    let (source_hash, source_size) = library.persisted_identity(state.book_id);
     let chapter = if ReaderSource::from_book_id(state.book_id).is_sd()
         && library.loaded_index == ReaderStore::selected_book_index(state.book_id)
     {
@@ -3149,6 +3165,15 @@ fn restore_saved_state(
     // page-count reads below resolve it, and so the first Home paint names it
     // before any open.
     crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
+    // The app is about to hold this book under `index` without opening it,
+    // and staging the row under the Library cursor replaces the active entry.
+    // Without this, the save as the reader leaves it has no identity to name.
+    if !library.adopt_active_as_reading_book(usize::from(index)) {
+        esp_println::println!(
+            "restore: index={} not staged; its departure cannot be saved",
+            index
+        );
+    }
     let (chapter, screen) = book_position(epd, sd_cs, library, index, record);
     esp_println::println!(
         "restore: index={} chapter={} screen={}",

@@ -1056,9 +1056,14 @@ pub fn storage_command_for_transition(
     // from staying put. Firmware holds the answering event and stamps the
     // epoch from it, overriding this; see `dispatch_transition_storage`.
     let fence = (previous.view == AppView::Library).then_some(next.catalog_epoch);
-    if previous.book_id != next.book_id {
-        // The one case that closes out another book. Everything the switch
-        // owes rides in this command.
+    // A row open closes out the book in hand even when the row carries the
+    // same number: after a rescan that number can name another book, and only
+    // storage can tell. Storage writes nothing for a book it holds nothing
+    // under, so a number the app was merely defaulted to costs no write.
+    let row_open = previous.view == AppView::Library;
+    if previous.book_id != next.book_id || row_open {
+        // The cases that close out the book being left. Everything the
+        // switch owes rides in this command.
         //
         // Unless the book being left could not be read. Its page is whatever
         // the app was holding when the open failed, which names nothing that
@@ -5796,9 +5801,10 @@ mod tests {
     /// The whole sequence, because pinning only the classification let the
     /// arming be reverted without a test noticing.
     ///
-    /// A reader on book B enters Library and picks B's own row. Nothing
-    /// closes out, so the open carries no departing book, and it carries the
-    /// catalog the row was resolved in. If that catalog is replaced before
+    /// A reader on book B enters Library and picks B's own row. The open
+    /// closes out the book in hand, since only storage can tell whether the
+    /// row still names it, and it carries the catalog the row was resolved
+    /// in. If that catalog is replaced before
     /// the open runs, storage refuses it. Without a rollback the reader stays
     /// in Reading over a row number that now names another book, and the next
     /// page turn extends by that index off a RAM window that checks the index
@@ -5833,12 +5839,12 @@ mod tests {
             matches!(
                 command,
                 StorageCommand::OpenBook {
-                    previous: None,
+                    previous: Some(departing),
                     catalog_epoch: Some(EPOCH),
                     ..
-                }
+                } if departing == library.persisted()
             ),
-            "closes out nobody, and names the catalog it was resolved in: {command:?}"
+            "closes out the book in hand, and names the catalog it was resolved in: {command:?}"
         );
 
         let hold = open_hold(&command, &library);
@@ -5857,6 +5863,58 @@ mod tests {
         assert_eq!(landed.book_id, library.book_id);
         assert_eq!(landed.chapter, library.chapter);
         assert_eq!(landed.page, library.page);
+    }
+
+    /// A rescan can put another book under the row number the reader is
+    /// holding. Picking that row then looks like reselecting the same book,
+    /// and the open must still close out the book being read, or its latest
+    /// position is left behind when the new book replaces it.
+    #[test]
+    fn a_row_reused_by_a_rescan_closes_out_the_book_being_read() {
+        let mut library = in_library(4, 6);
+        library.book_id = ReaderSource::sd(4).book_id();
+        library.chapter = 3;
+        library.page = 88;
+        let rescanned = library.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 6,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(
+            rescanned.book_id, library.book_id,
+            "a scan keeps the number"
+        );
+        let mut choosing = rescanned;
+        choosing.library_browse = LibraryBrowse::Choosing {
+            index: 4,
+            request_id: 4,
+            browse_epoch: EPOCH,
+        };
+
+        let reading = choosing.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: 4,
+                index: 4,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(reading.book_id, choosing.book_id);
+
+        let command = storage_command_for_transition(&choosing, &reading, 1)
+            .expect("entering Reading owes an open");
+        let StorageCommand::OpenBook {
+            previous: Some(departing),
+            catalog_epoch,
+            ..
+        } = command
+        else {
+            panic!("the book being read is closed out: {command:?}");
+        };
+        assert_eq!(catalog_epoch, Some(EPOCH + 1));
+        assert_eq!((departing.chapter, departing.screen), (3, 88));
     }
 
     /// An open that can be refused needs somewhere to land when it is.
