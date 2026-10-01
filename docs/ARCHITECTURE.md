@@ -974,7 +974,7 @@ A repaired locator on its own would leave the reader's place behind, since
 a position is filed under the place a book was read from. So the scan
 reports each copy it finds again, before it writes the ledger, and the
 firmware carries the position from the old directory to the new one,
-reading the destination once more to say what it is vouching for. Reporting
+reusing the digest the scan computed to say what it is vouching for. Reporting
 before the write costs a reset nothing: the record is still missing and the
 row still unadopted, so the next scan finds the same move and carries the
 same place again. A card that refuses the carry itself is the one case this
