@@ -184,6 +184,24 @@ impl Card {
         });
     }
 
+    /// The short names in the folder at `path`, without `.` and `..`.
+    pub fn list(&self, path: &str) -> Vec<String> {
+        self.session(|root| {
+            let folders: Vec<&str> = path.split('/').collect();
+            let dir = walk(root, &folders);
+            let mut names = Vec::new();
+            dir.iterate_dir(|entry| {
+                let name = entry.name.to_string();
+                if name != "." && name != ".." {
+                    names.push(name);
+                }
+                core::ops::ControlFlow::Continue(())
+            })
+            .expect("list the folder");
+            names
+        })
+    }
+
     /// The bytes of the file at `path`, if there is one.
     pub fn read(&self, path: &str) -> Option<Vec<u8>> {
         self.session(|root| {

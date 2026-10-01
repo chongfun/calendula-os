@@ -1477,6 +1477,34 @@ pub fn handle_storage_command(
                 font_metrics,
             );
             apply_build_outcome(background_build, outcome, book_id);
+            // A failed build leaves the store cleared, which announces as a
+            // one-page book. Fall back as an open does: the first page, then
+            // the book's error state.
+            let mut landed = target_page as u32;
+            if !sd_library.covers_global_page(index as usize, landed) {
+                let fell_back = landed != 0
+                    && load_target_page(
+                        card,
+                        host,
+                        sd_library,
+                        index,
+                        0,
+                        book_id,
+                        epub_scratch,
+                        font_metrics,
+                        background_build,
+                    );
+                if !fell_back {
+                    slog!("jump: no page of this book would load");
+                    host.send_loaded(&LibraryEvent::BookOpenUnreadable { book_id });
+                    return;
+                }
+                slog!(
+                    "jump: page {} would not load; falling back to the start of the book",
+                    landed
+                );
+                landed = 0;
+            }
             // The page came from the on-disk TOC, not from the app, so it
             // rides with the load rather than following as a second event.
             host.send_loaded(&LibraryEvent::Loaded {
@@ -1485,7 +1513,7 @@ pub fn handle_storage_command(
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
-                position: Some(target_page as u32),
+                position: Some(landed),
                 // A jump lands the reader on another chapter's text.
                 text_replaced: true,
             });
