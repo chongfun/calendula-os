@@ -667,7 +667,7 @@ fn library_event_affects_view(
                     .unwrap_or(false)
         }
         crate::LibraryEvent::CustomFont { .. } => state.view == AppView::Settings,
-        crate::LibraryEvent::Restored { .. } => true,
+        crate::LibraryEvent::Restored { .. } | crate::LibraryEvent::SettingsRestored { .. } => true,
         // The settled note only shows while the user is still waiting in
         // Library on this very request; an abandoned clear's answer changes
         // nothing on screen, so it must not cost a panel refresh either.
@@ -703,7 +703,9 @@ fn library_event_affects_view(
 fn library_event_allows_first_render(event: &crate::LibraryEvent) -> bool {
     matches!(
         event,
-        crate::LibraryEvent::Restored { .. } | crate::LibraryEvent::Scanned { .. }
+        crate::LibraryEvent::Restored { .. }
+            | crate::LibraryEvent::SettingsRestored { .. }
+            | crate::LibraryEvent::Scanned { .. }
     )
 }
 

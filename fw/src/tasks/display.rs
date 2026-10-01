@@ -3242,6 +3242,18 @@ fn restore_saved_state(
             record.source_size
         );
         *state_restored = StateRestore::Missed;
+        // The settings are the reader's whatever became of the book. Without
+        // them the session runs on the defaults, and the next save writes
+        // those over the reader's own.
+        send_required_library_event(&LibraryEvent::SettingsRestored {
+            reading_orientation: record.reading_orientation,
+            refresh_policy: record.refresh_policy,
+            font_size: record.font_size,
+            line_spacing: record.line_spacing,
+            font_weight: record.font_weight,
+            font_family: record.font_family,
+            front_buttons: record.front_buttons,
+        });
         return;
     };
     // Stage the restored book's catalog entry so the position, colophon, and

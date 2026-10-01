@@ -1650,6 +1650,20 @@ pub enum LibraryEvent {
         font_family: u8,
         front_buttons: u8,
     },
+    /// The saved reading settings, when the saved state names a book the
+    /// catalog does not hold: one a computer moved or deleted while the
+    /// device was off. The settings are the reader's whatever became of the
+    /// book, and without them the session runs on the defaults and the next
+    /// save writes those over the reader's own.
+    SettingsRestored {
+        reading_orientation: u8,
+        refresh_policy: u8,
+        font_size: u8,
+        line_spacing: u8,
+        font_weight: u8,
+        font_family: u8,
+        front_buttons: u8,
+    },
     /// A `ClearBookCache` settled. `ok` is false when the row was stale (the
     /// catalog changed under it), could not be resolved, its identity did not
     /// match the cache on card, or something rebuildable survived the delete.
@@ -2005,6 +2019,9 @@ impl LibraryEvent {
     /// - `CacheCleared` settles a per-book action's `LibraryMenu::Busy`, which
     ///   holds the whole Library list still while it waits.
     /// - `Restored` is what the boot render waits for before drawing.
+    ///   `SettingsRestored` stands in for it when the saved book is gone, and
+    ///   losing it puts the defaults over the reader's settings at the next
+    ///   save.
     ///
     /// The senders route on this, so an event that settles something is
     /// protected by naming it here rather than by every call site
@@ -2017,6 +2034,7 @@ impl LibraryEvent {
                 | Self::BookOpenUnreadable { .. }
                 | Self::CacheCleared { .. }
                 | Self::Restored { .. }
+                | Self::SettingsRestored { .. }
                 // The three that settle a `LibraryBrowse`. Dropping one
                 // leaves the Library rail waiting on a move that already
                 // happened, with no second press able to start another.
@@ -2809,6 +2827,46 @@ impl ReaderState {
         self
     }
 
+    /// The reading settings a saved state carries, each kept only when it
+    /// decodes.
+    #[allow(clippy::too_many_arguments)] // One per setting the record carries, decoded here and nowhere else.
+    fn adopt_saved_settings(
+        &mut self,
+        reading_orientation: u8,
+        refresh_policy: u8,
+        font_size: u8,
+        line_spacing: u8,
+        font_weight: u8,
+        font_family: u8,
+        front_buttons: u8,
+    ) {
+        if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
+            self.orientation = orientation;
+        }
+        if let Some(policy) = refresh_policy_from_u8(refresh_policy) {
+            self.refresh_policy = policy;
+        }
+        if let Some(size) = FontSize::from_u8(font_size) {
+            self.font_size = size;
+        }
+        if let Some(spacing) = LineSpacing::from_u8(line_spacing) {
+            self.line_spacing = spacing;
+        }
+        if let Some(weight) = FontWeight::from_u8(font_weight) {
+            self.font_weight = weight;
+        }
+        if let Some(family) = FontFamily::from_u8(font_family) {
+            self.font_family = if family == FontFamily::Custom && !self.custom_font_available {
+                FontFamily::Literata
+            } else {
+                family
+            };
+        }
+        if let Some(front) = front_buttons_from_u8(front_buttons) {
+            self.front_buttons = front;
+        }
+    }
+
     pub fn apply_library_event(mut self, ctx: ReducerContext, event: LibraryEvent) -> Self {
         match event {
             LibraryEvent::Scanned {
@@ -3087,32 +3145,35 @@ impl ReaderState {
                     self.selection = chapter;
                 }
                 self.read_request_pending = false;
-                if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
-                    self.orientation = orientation;
-                }
-                if let Some(policy) = refresh_policy_from_u8(refresh_policy) {
-                    self.refresh_policy = policy;
-                }
-                if let Some(size) = FontSize::from_u8(font_size) {
-                    self.font_size = size;
-                }
-                if let Some(spacing) = LineSpacing::from_u8(line_spacing) {
-                    self.line_spacing = spacing;
-                }
-                if let Some(weight) = FontWeight::from_u8(font_weight) {
-                    self.font_weight = weight;
-                }
-                if let Some(family) = FontFamily::from_u8(font_family) {
-                    self.font_family =
-                        if family == FontFamily::Custom && !self.custom_font_available {
-                            FontFamily::Literata
-                        } else {
-                            family
-                        };
-                }
-                if let Some(front) = front_buttons_from_u8(front_buttons) {
-                    self.front_buttons = front;
-                }
+                self.adopt_saved_settings(
+                    reading_orientation,
+                    refresh_policy,
+                    font_size,
+                    line_spacing,
+                    font_weight,
+                    font_family,
+                    front_buttons,
+                );
+                self.dirty = Rect::FULL;
+            }
+            LibraryEvent::SettingsRestored {
+                reading_orientation,
+                refresh_policy,
+                font_size,
+                line_spacing,
+                font_weight,
+                font_family,
+                front_buttons,
+            } => {
+                self.adopt_saved_settings(
+                    reading_orientation,
+                    refresh_policy,
+                    font_size,
+                    line_spacing,
+                    font_weight,
+                    font_family,
+                    front_buttons,
+                );
                 self.dirty = Rect::FULL;
             }
         }
@@ -6719,6 +6780,68 @@ mod tests {
             (1, 1, 1),
             "the folder's own rows, not the catalog total"
         );
+    }
+
+    /// The saved book is gone from the catalog, so only the settings come
+    /// back: they are adopted, and the book, place and view are left alone.
+    #[test]
+    fn saved_settings_restore_without_their_book() {
+        let before = in_library(0, 3);
+        let restored = before.apply_library_event(
+            CTX,
+            LibraryEvent::SettingsRestored {
+                reading_orientation: 1,
+                refresh_policy: 1,
+                font_size: 2,
+                line_spacing: 2,
+                font_weight: 1,
+                font_family: 1,
+                front_buttons: 1,
+            },
+        );
+        assert_ne!(
+            (
+                before.font_size,
+                before.line_spacing,
+                before.font_weight,
+                before.font_family
+            ),
+            (
+                restored.font_size,
+                restored.line_spacing,
+                restored.font_weight,
+                restored.font_family
+            ),
+            "the fixture's settings differ from the defaults, or this proves nothing"
+        );
+        assert_eq!(restored.font_size, FontSize::Large);
+        assert_eq!(restored.font_family, FontFamily::Merriweather);
+        assert_eq!(restored.line_spacing, LineSpacing::Relaxed);
+        assert_eq!(restored.font_weight, FontWeight::Heavy);
+        assert_eq!(
+            restored.refresh_policy,
+            refresh_policy_from_u8(1).expect("a policy")
+        );
+        assert_eq!(
+            (
+                restored.book_id,
+                restored.chapter,
+                restored.page,
+                restored.view
+            ),
+            (before.book_id, before.chapter, before.page, before.view),
+            "no book came back, so none is named"
+        );
+        assert!(LibraryEvent::SettingsRestored {
+            reading_orientation: 0,
+            refresh_policy: 0,
+            font_size: 0,
+            line_spacing: 0,
+            font_weight: 0,
+            font_family: 0,
+            front_buttons: 0,
+        }
+        .must_be_delivered());
     }
 
     /// A row that cannot be acted on ends the wait and moves nothing.
