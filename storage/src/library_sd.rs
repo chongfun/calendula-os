@@ -963,7 +963,7 @@ where
             slog!("sd: could not carry pagination to '{}'", found.now.1);
         }
         let io = crate::sd_stats::snapshot().since(carry_io);
-        slog!(
+        bench_log!(
             "bench: storage_move_carry place_ok={} place={} pagination_ok={} moved={} unlinked={} restamped={} rd_blocks={} wr_blocks={} elapsed_ms={} t_ms={}",
             place_ok,
             place,
