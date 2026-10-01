@@ -486,19 +486,18 @@ where
 /// block at a time, an X3 hashed an 11.7 MB book at 540 KB/s, 13.7 s of its
 /// 21.3 s spent waiting on single-block reads.
 ///
-/// The deepest stack this sits on is the scan proving a move, measured on the
-/// release builds by summing prologue frames along the call graph, the same
-/// on both boards: about 3.2 KB of `main` and the executor beneath the display
-/// task; 11.3 KB from the task through `run_sd_session` and the firmware's
-/// SHA-unit wrapper to `assign_book_ids`, whose 4.8 KB frame holds the 64
-/// digests it proves moves with; and 7.0 KB below `digest_at`, where this
-/// function and its buffer inline into `with_book`'s 4.6 KB frame. About
-/// 21.5 KB in all, against stack regions of 32,608 B on the X3 and 41,672 B
-/// on the X4. The carry the scan calls back into goes 4.5 KB deep, and the
-/// engine behind `dyn Sha256Engine` at most 240 B, both less. The call graph
-/// cannot follow `dyn` calls, and `tools/stack_frames.py` reads the two
-/// largest frames here as zero, since each allocates in several steps, so
-/// re-measure the chain, not the frames, when this grows.
+/// The deepest stack this sits on is the scan proving a move: the display
+/// task, `run_sd_session`, the firmware's SHA-unit wrapper, `assign_book_ids`
+/// (whose 4.8 KB frame holds the 64 digests it proves moves with), `digest_at`
+/// and `with_book`, into whose 4.6 KB frame this function and its buffer
+/// inline. With `tools/stack_frames.py`'s frames summed along the release
+/// builds' call graph, that chain is about 24.4 KB from the display task down
+/// on both boards, against about 34.8 KB for the book open the stack floor is
+/// sized for, so the scan does not set the high-water mark. Both figures
+/// overstate a real stack, since a static call graph joins branches that are
+/// not live together, so compare chains measured the same way rather than
+/// reading either against the stack region, and re-measure the chain when
+/// this grows: the per-function check only bounds one frame at a time.
 const DIGEST_READ_BLOCKS: usize = 8;
 
 /// The identity of a book already on the card, read out of it.
