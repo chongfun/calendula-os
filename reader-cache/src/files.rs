@@ -742,7 +742,8 @@ where
         write_book_dir_claim(&book, to, false, Some(evidence)).map_err(|_| ClaimDenied::Fault)?;
         return Ok(true);
     }
-    let book = claim_v2_book_dir(root, to)?;
+    // Keep the markers: a retry re-binds the carried headers under them.
+    let book = claim_v2_book_dir_settling(root, to, false)?;
     write_book_dir_claim(&book, to, false, Some(evidence)).map_err(|_| ClaimDenied::Fault)?;
     write_two_generation(
         &book,
@@ -4667,6 +4668,28 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    claim_v2_book_dir_settling(root, owner, true)
+}
+
+/// [`claim_v2_book_dir`], choosing whether this book's own directory settles
+/// its carry markers. Only a caller that writes the claim and position files,
+/// which a carry does not move, may pass `false`.
+fn claim_v2_book_dir_settling<
+    'v,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &'v Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    settle: bool,
+) -> Result<Directory<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>, ClaimDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     {
         let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|_| ClaimDenied::Fault)?;
         let cache = open_or_make_dir(&cache_root, CACHE_V2_DIR).map_err(|_| ClaimDenied::Fault)?;
@@ -4682,7 +4705,10 @@ where
     book.change_dir(owner.key).map_err(|_| ClaimDenied::Fault)?;
     match book_dir_claim(&book, owner) {
         ClaimState::MineActive => {
-            settle_markers_for_writer(root, &book, owner.key).map_err(|_| ClaimDenied::Fault)?;
+            if settle {
+                settle_markers_for_writer(root, &book, owner.key)
+                    .map_err(|_| ClaimDenied::Fault)?;
+            }
             Ok(book)
         }
         // The sweep retired this directory while its owner was off the
@@ -4690,7 +4716,10 @@ where
         // claim proves are its own.
         ClaimState::MineReleased => {
             write_book_dir_claim(&book, owner, false, None).map_err(|_| ClaimDenied::Fault)?;
-            settle_markers_for_writer(root, &book, owner.key).map_err(|_| ClaimDenied::Fault)?;
+            if settle {
+                settle_markers_for_writer(root, &book, owner.key)
+                    .map_err(|_| ClaimDenied::Fault)?;
+            }
             Ok(book)
         }
         ClaimState::OtherActive => Err(ClaimDenied::Foreign),

@@ -5369,6 +5369,106 @@ fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
     }
 }
 
+/// The same sweep through `carry_for_move` with a legacy position, so the
+/// retry claims the destination for the position before the pagination runs.
+/// That claim keeps the markers, or a cut re-binding is left unfinished.
+#[test]
+fn a_cut_move_with_a_legacy_position_is_finished_by_the_retry() {
+    for cut in [false, true] {
+        let mut probe = 0u32;
+        loop {
+            let disk = new_card();
+            let pages;
+            let last_page;
+            let starts: Vec<u32>;
+            {
+                let mgr = open_mgr(&disk);
+                let root = open_root(&mgr);
+                let mut store = new_store();
+                let (records, total) = published_book(&root, &mut store);
+                pages = total;
+                last_page = records[2].start_page;
+                starts = records.iter().map(|record| record.start_page).collect();
+                files::write_position_file(&root, &OWNER, 4, 40).expect("position");
+
+                let base = disk.writes.get();
+                arm_write_fault(&disk, base, probe, cut);
+                let first = files::carry_for_move(
+                    &root,
+                    &OWNER,
+                    &NOW,
+                    hashed(b"the book"),
+                    IDENTITY,
+                    identity_at(&NOW),
+                );
+                if !write_fault_fired(&disk, base, probe, cut) {
+                    assert_eq!(first.place, Ok(true), "cut {cut} probe {probe}");
+                    assert!(
+                        matches!(first.pagination, Ok(Some(_))),
+                        "cut {cut} probe {probe}: fewer writes than the probe, so the carry finished"
+                    );
+                    break;
+                }
+            }
+            {
+                let mgr = open_mgr(&disk);
+                let root = open_root(&mgr);
+                let retry = files::carry_for_move(
+                    &root,
+                    &OWNER,
+                    &NOW,
+                    hashed(b"the book"),
+                    IDENTITY,
+                    identity_at(&NOW),
+                );
+                assert_eq!(retry.place, Ok(true), "cut {cut} probe {probe}");
+                assert!(
+                    retry.pagination.is_ok(),
+                    "cut {cut} probe {probe}: the retry was refused: {:?}",
+                    retry.pagination
+                );
+                assert_eq!(
+                    files::read_position_file(&root, &NOW),
+                    Some((4, 40)),
+                    "cut {cut} probe {probe}"
+                );
+                assert_eq!(twin_pairs(&root), 0, "cut {cut} probe {probe}");
+                assert!(
+                    !marker_present(&root, NOW.key, BACK_MARKER),
+                    "cut {cut} probe {probe}: back marker left"
+                );
+                assert_loads_under(&root, &NOW, identity_at(&NOW), pages, last_page);
+                let mut probe_store = new_store();
+                assert_eq!(
+                    files::load_v2_book_index(&root, &NOW, identity_at(&NOW), &mut probe_store),
+                    files::BookIndexLoadResult::Hit { unfinished: false },
+                    "cut {cut} probe {probe}"
+                );
+                for start in &starts {
+                    assert!(
+                        matches!(
+                            files::load_v2_section_by_global_page(
+                                &root,
+                                &NOW,
+                                identity_at(&NOW),
+                                *start,
+                                &mut probe_store
+                            ),
+                            CacheLoadResult::Hit { .. }
+                        ),
+                        "cut {cut} probe {probe}: the section at page {start} reads under the new place"
+                    );
+                }
+            }
+            probe += 1;
+            assert!(
+                probe < 200,
+                "the carry made more writes than the sweep covers"
+            );
+        }
+    }
+}
+
 /// Return a remounted disk where a cut left one chain under two names.
 fn torn_carry() -> SharedDisk {
     for probe in 0..200u32 {
