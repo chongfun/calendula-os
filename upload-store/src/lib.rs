@@ -489,12 +489,12 @@ where
 /// The deepest stack this sits on is the scan proving a move, measured on the
 /// release builds by summing prologue frames along the call graph, the same
 /// on both boards: about 3.2 KB of `main` and the executor beneath the display
-/// task; 10.5 KB from the task through `run_sd_session` and the firmware's
+/// task; 11.3 KB from the task through `run_sd_session` and the firmware's
 /// SHA-unit wrapper to `assign_book_ids`, whose 4.8 KB frame holds the 64
 /// digests it proves moves with; and 7.0 KB below `digest_at`, where this
 /// function and its buffer inline into `with_book`'s 4.6 KB frame. About
-/// 20.7 KB in all, against stack regions of 32,608 B on the X3 and 41,672 B
-/// on the X4. The carry the scan calls back into goes 4.2 KB deep, and the
+/// 21.5 KB in all, against stack regions of 32,608 B on the X3 and 41,672 B
+/// on the X4. The carry the scan calls back into goes 4.5 KB deep, and the
 /// engine behind `dyn Sha256Engine` at most 240 B, both less. The call graph
 /// cannot follow `dyn` calls, and `tools/stack_frames.py` reads the two
 /// largest frames here as zero, since each allocates in several steps, so

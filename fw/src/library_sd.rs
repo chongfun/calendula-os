@@ -160,7 +160,24 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
                     // section window is invalidated below so a stale page
                     // can't be served from clobbered text afterwards.
                     library.clear_catalog();
-                    write_catalog_streaming(root, library.arena_as_scratch(), ledger)
+                    let follow = library.identities_to_follow();
+                    let mut followed = heapless::Vec::new();
+                    let written = write_catalog_streaming(
+                        root,
+                        library.arena_as_scratch(),
+                        ledger,
+                        follow,
+                        &mut followed,
+                    );
+                    for moved in &followed {
+                        library.follow_move(
+                            moved.was,
+                            moved.now,
+                            moved.root,
+                            moved.locator.as_str(),
+                        );
+                    }
+                    written
                 }
             }
         };
@@ -718,6 +735,16 @@ fn fold_walk_entry(
 /// finding each next subfolder re-iterates its parent; a directory with `s`
 /// subfolders is read `s + 1` times per pass. That multiplier is the number
 /// to watch before reaching for the derived index.
+/// A book the store was holding by its place that a scan proved moved, and
+/// where to: what [`ReaderStore::follow_move`] needs once the scan's scratch
+/// borrow of the store is over.
+struct FollowedMove {
+    was: (u32, u32),
+    now: (u32, u32),
+    root: BookRoot,
+    locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
+}
+
 fn write_catalog_streaming<
     D,
     T,
@@ -728,6 +755,8 @@ fn write_catalog_streaming<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     scratch: &mut [u8],
     ledger: Option<upload_store::ledger::Ledger>,
+    follow: [(u32, u32); 2],
+    followed: &mut heapless::Vec<FollowedMove, 2>,
 ) -> Result<u16, ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -877,6 +906,19 @@ where
             root: found.now.0,
             locator: found.now.1,
         };
+        // The reading or loaded book, named by the place it left: the store
+        // follows it to the new one once the scan returns.
+        if (was_hash, found.was.2) != (0, 0) && follow.contains(&(was_hash, found.was.2)) {
+            let mut locator = String::new();
+            if locator.push_str(found.now.1).is_ok() {
+                let _ = followed.push(FollowedMove {
+                    was: (was_hash, found.was.2),
+                    now: (now_hash, found.now.2),
+                    root: found.now.0,
+                    locator,
+                });
+            }
+        }
         let carry_start = Instant::now();
         let carry_io = crate::sd_session::sd_stats::snapshot();
         // A place or a pagination that could not be carried is lost, not a

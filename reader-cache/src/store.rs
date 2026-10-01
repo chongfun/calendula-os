@@ -1034,6 +1034,38 @@ impl ReaderStore {
             .is_some()
     }
 
+    /// The identities a scan should report moves of: the reading book's and
+    /// the loaded book's. Both name their book by place, and a computer can
+    /// move it while the device is off.
+    pub fn identities_to_follow(&self) -> [(u32, u32); 2] {
+        [self.reading_identity, self.loaded_identity]
+    }
+
+    /// A scan proved the book at `was` moved to `locator` under `root`, with
+    /// identity `now`. The reading book and the loaded book follow it, or a
+    /// departing save would name a place no catalog row answers to and the
+    /// open it guards would be refused.
+    pub fn follow_move(
+        &mut self,
+        was: (u32, u32),
+        now: (u32, u32),
+        root: proto::library_path::BookRoot,
+        locator: &str,
+    ) {
+        if was == (0, 0) {
+            return;
+        }
+        if self.reading_identity == was {
+            self.reading_identity = now;
+        }
+        if self.loaded_identity == was {
+            self.loaded_identity = now;
+            self.loaded_root = Some(root);
+            self.loaded_path.clear();
+            let _ = self.loaded_path.push_str(locator);
+        }
+    }
+
     /// Record that the reader state names the book staged at `index`, as a
     /// boot restore does before the book is opened. False when that row is
     /// not the staged one.
@@ -2490,6 +2522,66 @@ mod tests {
         );
         assert_eq!(store.persisted_identity(book_id4), (0x4444_4444, 4_000));
         assert_eq!(store.reading_book_identity(book_id5), None);
+    }
+
+    /// A book the reader state names, restored without being opened, and a
+    /// loaded book both follow a move the scan proved, so a departing save
+    /// names the place the book is at now. A move of any other book leaves
+    /// them where they are.
+    #[test]
+    fn the_reading_and_loaded_books_follow_a_proven_move() {
+        let mut store = Box::new(ReaderStore::new());
+        let restored = app_core::ReaderSource::sd(0).book_id();
+        let was = (0x9509_62c5, 11_716_929);
+        let now = (0x2888_b329, 11_716_929);
+        store.set_active_entry(
+            0,
+            "86 - Volume 02.epub",
+            Some(proto::library_path::BookRoot::Library),
+            "86/86 - Volume 02.epub",
+            was.1,
+            was.0,
+            None,
+            None,
+        );
+        assert!(store.adopt_active_as_reading_book(0));
+        assert_eq!(store.identities_to_follow()[0], was);
+
+        store.follow_move(
+            (0x1234_5678, 99),
+            (0x8765_4321, 99),
+            proto::library_path::BookRoot::Library,
+            "Elsewhere.epub",
+        );
+        assert_eq!(
+            store.reading_book_identity(restored),
+            Some(was),
+            "another book's move"
+        );
+
+        store.follow_move(
+            was,
+            now,
+            proto::library_path::BookRoot::Library,
+            "86/MOVED/86 - Volume 02.epub",
+        );
+        assert_eq!(store.reading_book_identity(restored), Some(now));
+        assert_eq!(store.persisted_identity(restored), now);
+
+        // A loaded book takes the new place along with the identity.
+        store.begin_book_load();
+        store.finish_book_load(0, 0, BookLoadStatus::Ready);
+        let loaded = store.loaded_book_snapshot().expect("loaded").identity;
+        store.follow_move(
+            loaded,
+            (0x0bad_cafe, loaded.1),
+            proto::library_path::BookRoot::CardRoot,
+            "Moved Again.epub",
+        );
+        let snapshot = store.loaded_book_snapshot().expect("still loaded");
+        assert_eq!(snapshot.identity, (0x0bad_cafe, loaded.1));
+        assert_eq!(snapshot.path, "Moved Again.epub");
+        assert_eq!(snapshot.root, proto::library_path::BookRoot::CardRoot);
     }
 
     #[test]
