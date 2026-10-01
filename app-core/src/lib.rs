@@ -6784,7 +6784,7 @@ mod tests {
             CTX,
             LibraryEvent::SettingsRestored {
                 reading_orientation: 1,
-                refresh_policy: 1,
+                refresh_policy: 2,
                 font_size: 2,
                 line_spacing: 2,
                 font_weight: 1,
@@ -6792,29 +6792,24 @@ mod tests {
                 front_buttons: 1,
             },
         );
-        assert_ne!(
-            (
-                before.font_size,
-                before.line_spacing,
-                before.font_weight,
-                before.font_family
-            ),
-            (
-                restored.font_size,
-                restored.line_spacing,
-                restored.font_weight,
-                restored.font_family
-            ),
-            "the fixture's settings differ from the defaults, or this proves nothing"
+        // Every field differs from the boot default, or adopting it proves nothing.
+        assert_ne!(before.orientation, restored.orientation);
+        assert_ne!(before.refresh_policy, restored.refresh_policy);
+        assert_ne!(before.font_size, restored.font_size);
+        assert_ne!(before.line_spacing, restored.line_spacing);
+        assert_ne!(before.font_weight, restored.font_weight);
+        assert_ne!(before.font_family, restored.font_family);
+        assert_ne!(before.front_buttons, restored.front_buttons);
+        assert_eq!(
+            restored.orientation,
+            DisplayOrientation::LandscapeButtonsTop
         );
+        assert_eq!(restored.front_buttons, FrontButtons::PagesLeft);
         assert_eq!(restored.font_size, FontSize::Large);
         assert_eq!(restored.font_family, FontFamily::Merriweather);
         assert_eq!(restored.line_spacing, LineSpacing::Relaxed);
         assert_eq!(restored.font_weight, FontWeight::Heavy);
-        assert_eq!(
-            restored.refresh_policy,
-            refresh_policy_from_u8(1).expect("a policy")
-        );
+        assert_eq!(restored.refresh_policy, RefreshPolicy::FullEveryTen);
         assert_eq!(
             (
                 restored.book_id,
