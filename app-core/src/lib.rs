@@ -6670,6 +6670,57 @@ mod tests {
         assert_eq!(fresh.book_id, ReaderSource::sd(1).book_id());
     }
 
+    /// A book the catalog had not heard of, picked in a folder: the storage
+    /// task rescans, then answers the press with the book's new row, then
+    /// lists the folder again unasked. The book opens, and the folder keeps
+    /// its own row count rather than the catalog total `Scanned` carried.
+    #[test]
+    fn a_book_picked_before_a_rescan_opens_and_its_folder_keeps_its_rows() {
+        let waiting = press(in_folder(0, 1, 0), Button::Confirm);
+        let outstanding = waiting.library_browse.request_id().expect("a move is out");
+        let rebuilt = waiting.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 56,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        let opened = rebuilt.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: outstanding,
+                index: 7,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(opened.view, AppView::Reading);
+        assert_eq!(opened.book_id, ReaderSource::sd(7).book_id());
+        assert!(opened.library_browse.is_idle());
+
+        let listed = opened.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH,
+                depth: 1,
+                count: 1,
+                books: 1,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.view, AppView::Reading, "the book stays open");
+        assert_eq!(listed.book_id, opened.book_id);
+        assert_eq!(
+            (
+                listed.library_depth,
+                listed.library_count,
+                listed.library_books
+            ),
+            (1, 1, 1),
+            "the folder's own rows, not the catalog total"
+        );
+    }
+
     /// A row that cannot be acted on ends the wait and moves nothing.
     #[test]
     fn a_row_that_fails_leaves_the_list_alone() {

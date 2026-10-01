@@ -1494,6 +1494,34 @@ fn relist_library_folder(
     }
 }
 
+/// List the folder browsing is in, unasked, without moving it: the listing a
+/// rescan owes when it has shown the folder is still there.
+fn relist_library_folder_here(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &mut ReaderStore,
+    portrait: bool,
+) {
+    let listed = crate::sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache::browse::list_here(sd_library, root, portrait)
+    })
+    .ok()
+    .flatten();
+    match listed {
+        Some(listing) => send_required_library_event(&LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: sd_library.browse_epoch(),
+            depth: listing.depth,
+            count: listing.count,
+            books: listing.books,
+            selection: listing.selection,
+        }),
+        // The folder would not list after all: fall back to the root, which
+        // reports for itself if that will not list either.
+        None => relist_library_folder(epd, sd_cs, sd_library, portrait),
+    }
+}
+
 /// Places the settling event [`send_required_library_event`] could not, once
 /// the channel has room. Pending forever when nothing is held, so it can sit
 /// in the main loop's select as a branch that only fires when it has work.
@@ -2587,7 +2615,7 @@ fn handle_storage_command(
                 crate::library_sd::RowChoice::Failed => {
                     send_required_library_event(&LibraryEvent::RowFailed { request_id });
                 }
-                crate::library_sd::RowChoice::Stale => {
+                crate::library_sd::RowChoice::Stale { at, locator, size } => {
                     // A book the card holds and the catalog does not, because
                     // boot keeps a snapshot that still loads and a computer
                     // can add or move books while the device is off. Rebuild
@@ -2601,12 +2629,41 @@ fn handle_storage_command(
                         count: sd_library.catalog_count_u16(),
                         catalog_epoch: sd_library.catalog_epoch(),
                     });
-                    // The scan takes browsing back to the root, so this
-                    // request's row number no longer names the same child.
-                    // Relist and let the reader pick from what they see; the
-                    // book is in the catalog now, so the next press opens it.
-                    relist_library_folder(epd, sd_cs, sd_library, portrait);
-                    send_required_library_event(&LibraryEvent::RowFailed { request_id });
+                    // The reader picked a book, so open it: found again by
+                    // where it is, as any chosen row is, now that the catalog
+                    // holds it. The answer goes after `Scanned`, whose epoch
+                    // it carries.
+                    match crate::library_sd::find_index_by_locator(
+                        epd,
+                        sd_cs,
+                        at,
+                        locator.as_str(),
+                        size,
+                    ) {
+                        crate::library_sd::CatalogRow::Found(index) => {
+                            send_required_library_event(&LibraryEvent::RowIsBook {
+                                request_id,
+                                index,
+                                catalog_epoch: sd_library.catalog_epoch(),
+                            });
+                            // The scan rewrote the catalog and nothing under
+                            // the shelf, so the folder the book was picked in
+                            // still lists what is there, and browsing stays in
+                            // it. Listed again unasked, after the answer, so
+                            // the app takes the folder's rows back from the
+                            // catalog total `Scanned` left in their place.
+                            relist_library_folder_here(epd, sd_cs, sd_library, portrait);
+                        }
+                        // Still not in the catalog: a scan that could not
+                        // finish, or a card that would not say. Back to the
+                        // root, as after any rescan, for the reader to pick
+                        // from what is there.
+                        crate::library_sd::CatalogRow::Rebuild
+                        | crate::library_sd::CatalogRow::Unreadable => {
+                            relist_library_folder(epd, sd_cs, sd_library, portrait);
+                            send_required_library_event(&LibraryEvent::RowFailed { request_id });
+                        }
+                    }
                 }
             }
         }

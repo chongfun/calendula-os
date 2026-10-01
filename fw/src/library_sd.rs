@@ -1375,7 +1375,12 @@ pub(crate) use reader_cache::browse::Listing;
 
 /// What the row a reader pressed turned out to be, once the catalog has had
 /// its say about a book.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Stale` carries the whole locator, a few hundred bytes, the trade
+/// [`reader_cache::browse::RowChoice`] makes for the same reason: there is no
+/// allocator, and the value lives for one press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RowChoice {
     /// A folder, now listed.
     Entered(Listing),
@@ -1383,8 +1388,12 @@ pub(crate) enum RowChoice {
     Book(u16),
     /// The row named a book the card holds and the catalog does not, which
     /// is a catalog written before somebody edited the card on a computer.
-    /// The caller rescans and asks again.
-    Stale,
+    /// The caller rescans and finds this book again by where it is.
+    Stale {
+        at: BookRoot,
+        locator: proto::library_path::LibraryPath,
+        size: u32,
+    },
     /// Gone since the listing, unnameable from here, or a card that would
     /// not answer. Nothing moved.
     Failed,
@@ -1486,7 +1495,7 @@ pub(crate) fn choose_library_row(
                         locator.as_str(),
                         size
                     );
-                    RowChoice::Stale
+                    RowChoice::Stale { at, locator, size }
                 }
             }
         }
