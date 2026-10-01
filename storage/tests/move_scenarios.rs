@@ -1,12 +1,8 @@
 //! A computer moves a book while the device is off, and the reader comes back
-//! to it. Each scenario here is a defect that reached the device in September
-//! 2026 and was caught only by a person with the device in hand: the storage
-//! task, the library scan and the app's reducer were each tested on their
-//! own, and the way they fit together was not tested at all.
+//! to it. Each scenario pins a bug first found by hand on the X3.
 //!
-//! Every test runs the real storage task over a FAT image and the real
-//! reducer over the events it sends, through power cycles that keep only the
-//! card. See `support`.
+//! Tests run the real storage task over a FAT image and the real reducer over
+//! its events, through power cycles that keep only the card. See `support`.
 
 mod support;
 
@@ -18,16 +14,14 @@ const BOOK: &str = "86 - Volume 02.epub";
 const HOME: &str = "BOOKS/86/86 - Volume 02.epub";
 const MOVED: &str = "BOOKS/86/MOVED/86 - Volume 02.epub";
 
-/// A card with two books in one folder, and a session that read one of them
-/// at a non-default font size to page `page`, then slept. Returns the card and
-/// the book's page count, as the finished build put it.
+/// Two books in one folder; read one at a large font to `page`, then sleep.
+/// Returns the card and the book's finished page count.
 fn read_and_sleep(page: u32) -> (Card, u32) {
     let card = Card::blank();
     card.put(HOME, &epub("86 Volume 2", 6, 2));
     card.put("BOOKS/86/86 - Volume 01.epub", &epub("86 Volume 1", 6, 1));
     let mut device = Device::wake(&card);
-    // Chosen in Settings at some point before; the app persists it with every
-    // record it saves.
+    // As if chosen in Settings earlier; every saved record carries it.
     device.app.font_size = FontSize::Large;
     device.open_library();
     device.choose("86");
@@ -40,8 +34,7 @@ fn read_and_sleep(page: u32) -> (Card, u32) {
     (card, pages)
 }
 
-/// The first `Loaded` after the reader picked the moved book: what the open
-/// put on screen before any background slice grew it.
+/// The first `Loaded` after the pick, before any background slice grew it.
 fn first_open(device: &Device) -> LibraryEvent {
     let picked = device
         .log
@@ -73,10 +66,8 @@ fn the_harness_boots_a_card_and_opens_a_book() {
     );
 }
 
-/// Picking the moved book opens it, on the page the reader left, from the
-/// pagination the move carried: no second press, no refused open, no
-/// rebuild from the cover. Afterwards the library is still in the folder the
-/// book was picked from.
+/// One press opens the moved book on its page, from the carried pagination,
+/// and browsing stays in the folder it was picked from.
 #[test]
 fn a_moved_book_opens_from_its_new_folder_on_the_page_it_was_left() {
     let (card, pages) = read_and_sleep(12);
@@ -127,9 +118,8 @@ fn a_moved_book_opens_from_its_new_folder_on_the_page_it_was_left() {
     );
 }
 
-/// The saved state names the book by its place, and carries the reading
-/// settings. After a move it is carried to the new place, so the settings
-/// come back and the book opens at the layout its pagination was built for.
+/// The saved state, which holds the reading settings, follows the book, so
+/// the book opens at the layout its pagination was built for.
 #[test]
 fn a_moved_book_opens_with_the_settings_it_was_read_at() {
     let (card, pages) = read_and_sleep(9);
@@ -162,14 +152,12 @@ fn a_moved_book_opens_with_the_settings_it_was_read_at() {
     assert_eq!(device.app.font_size, FontSize::Large);
 }
 
-/// A saved state can name a book the catalog no longer holds: deleted on a
-/// computer, or left naming a place by an older firmware. The settings are
-/// the reader's whatever became of the book, so they come back without it.
+/// The settings come back even when the saved state names a book the
+/// catalog no longer holds.
 #[test]
 fn the_reading_settings_come_back_when_the_saved_book_is_gone() {
     let (card, _) = read_and_sleep(4);
-    // Rewrite the saved state as if its book had been somewhere that is not
-    // on the card now.
+    // Point the saved state at a place not on the card.
     card.session(|root| {
         let mut record = reader_cache::files::read_state_file(root).expect("a saved state");
         record.source_hash ^= 0x5a5a_5a5a;
@@ -185,9 +173,8 @@ fn the_reading_settings_come_back_when_the_saved_book_is_gone() {
     );
 }
 
-/// The device's own sequence: moved into a folder, then back out again,
-/// opening it each time. Each move carries the pagination, the place and the
-/// state, and each open lands on the page from the cache.
+/// The sequence tried on the X3: into a folder and back out, opening the book
+/// each time.
 #[test]
 fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
     let (card, pages) = read_and_sleep(7);
@@ -223,11 +210,9 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
     assert_eq!(device.app.font_size, FontSize::Large);
 }
 
-/// The catalog snapshot can be gone at boot: an upload session invalidates
-/// it, and so can an interrupted scan. Then the boot rescans before it
-/// restores, and the saved state has to name the book where the move left it,
-/// or the restore finds nothing and the reader's book is no longer the one
-/// Home continues.
+/// With no catalog at boot (after an upload session or an interrupted scan),
+/// the boot rescans before restoring, and Home must still continue the moved
+/// book.
 #[test]
 fn a_moved_book_is_still_the_one_home_continues_after_a_boot_that_rescans() {
     let (card, pages) = read_and_sleep(6);

@@ -135,8 +135,8 @@ pub mod bench_selftest;
 mod board_guard;
 pub mod catalog;
 mod display_flush;
-// The storage half of the display task, host-tested in its own crate; kept
-// at these paths so the rest of the firmware names them as it always has.
+// The storage half of the display task, host-tested in its own crate and
+// re-exported at the paths the rest of fw uses.
 pub(crate) use storage::{book_build, custom_font, library_sd};
 mod hw_sha;
 mod mmu;

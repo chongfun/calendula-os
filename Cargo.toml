@@ -76,42 +76,29 @@ resolver = "2"
 # crate-internal there, because a handle read back from an open directory is not
 # one its holder should close. See upload-store's reclaim module.
 #
-# The seventh is move_file_in_dir and link_file_in_dir, the short-name pair
-# beside the long-name move and link. The long-name move derives an alias for
-# whatever it is given, so BOOK.BIN would land as BOOK~1.BIN with a long-name
-# entry beside it, and every open of a cache file here resolves by short name.
-# reader-cache moves a book's pagination between cache directories when the
-# scan proves the book moved; these file the exact name asked for, as one
-# plain entry, under the same two-write contract and the same recovery.
+# The seventh is move_file_in_dir and link_file_in_dir, short-name versions of
+# the long-name move and link. The long-name move would file BOOK.BIN as
+# BOOK~1.BIN, and cache files open by short name. reader-cache uses these to
+# move a book's pagination when the scan proves the book moved.
 #
-# The eighth is File::read_blocks, whole blocks of a file read straight into
-# the caller's buffer, one device call per run of blocks that lie together on
-# the disk. read fetches through the single-block cache one block per call
-# however large its buffer, and on the SPI card each call is a command and a
-# wait for the data token: hashing an 11.7 MB book to prove a move spent 13.7
-# s reading it that way on an X3, 8.0 s in runs of eight. It makes the SPI
-# driver's multi-block read an everyday path, so the same revision fixes that
-# read to send CMD12 whenever the CMD18 write was attempted, even when the
-# write, the response or a block reports failure; before, the card was left
-# streaming into the next command. Multi-block writes get the same stop.
+# The eighth is File::read_blocks: one device call per run of contiguous
+# blocks, read straight into the caller's buffer. read takes one call per
+# block, and hashing an 11.7 MB book on the X3 drops from 13.7 s to 8.0 s.
+# The SPI multi-block read now sends CMD12 whenever CMD18 was attempted,
+# even on failure, and multi-block writes always send their stop token.
 #
-# The same branch fixes places the driver treated a write that reported an
-# error as one that had not landed. BlockDevice promises no such thing, and
-# the SPI card contradicts it: a single-block write can fail its busy wait or
-# CMD13 after the card took the sector. A move whose source unlink failed so
-# undid itself into a file with no name; a make_dir whose name had landed
-# freed the live directory's cluster; the long-name writer stripped a landed
-# entry back to its alias. Each now looks at the disk before undoing. And
-# truncation stopped undercounting the free clusters, which had let an
-# allocation decrement a count of zero.
+# The branch also treats a write that reported an error as one that may have
+# landed, since a card can take a sector and then fail its busy wait or CMD13.
+# Move, make_dir and the long-name writer now check the disk before undoing,
+# and truncation no longer undercounts free clusters.
 #
 # Regression coverage for all eight of our changes lives in the fork, not here:
 # tests/fat_chain_errors.rs for the error-propagation fixes, tests/move_file.rs
 # for the move, the link, the recorded cluster, and the short-named pair,
 # tests/free_clusters.rs for the reclaim primitives, tests/read_file.rs for
-# read_blocks. A bump that loses them would still compile against
-# this workspace, so re-run the fork's suite when moving the rev. There is no upstream issue or PR to track: the fork we branched from
-# is unmaintained, so this rev is where these fixes live.
+# read_blocks. A bump that loses them would still compile here, so run the
+# fork's suite when moving the rev. The fork we branched from is unmaintained,
+# so there is no upstream issue or PR to track.
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.

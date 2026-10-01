@@ -1,11 +1,9 @@
-//! The storage task: the commands the app sends the display task's storage
-//! half, the background walk it owes itself, and the state between them.
+//! The storage task: the app's storage commands, the background walk, and
+//! the state between them.
 //!
-//! Moved out of `fw/src/tasks/display.rs` so the whole of it runs on the
-//! host. What it needs from the firmware beyond the card goes through
-//! [`Host`]: the event channels, the scratch the firmware keeps in statics,
-//! the newest reader request, and the one command, the sync memory loan,
-//! that ends in code only the firmware may run.
+//! Everything it needs from the firmware beyond the card goes through
+//! [`Host`]: event channels, the scratch in statics, the newest reader
+//! request, and the sync memory loan.
 
 use crate::book_build::{self, ReaderCacheScratch};
 use crate::card::Card;
@@ -66,9 +64,8 @@ pub struct StorageTask {
 impl StorageTask {
     /// Run one storage command.
     ///
-    /// Out of line, as every entry point here is: the arms carry multi-KB
-    /// scratch, and inlined into the task loop they would sit in its poll
-    /// frame for every render.
+    /// Every entry point here is out of line, so the arms' multi-KB scratch
+    /// stays out of the task loop's poll frame.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     pub fn handle(
@@ -814,8 +811,8 @@ pub fn relist_library_folder(
     }
 }
 
-/// List the folder browsing is in, unasked, without moving it: the listing a
-/// rescan owes when it has shown the folder is still there.
+/// Relist the folder browsing is in, unasked, after a rescan shows it still
+/// exists.
 pub fn relist_library_folder_here(
     card: &mut impl Card,
     host: &mut impl Host,
@@ -835,8 +832,8 @@ pub fn relist_library_folder_here(
             books: listing.books,
             selection: listing.selection,
         }),
-        // The folder would not list after all: fall back to the root, which
-        // reports for itself if that will not list either.
+        // The folder would not list, so fall back to the root, which reports
+        // its own failure.
         None => relist_library_folder(card, host, sd_library, portrait),
     }
 }
@@ -1673,10 +1670,8 @@ pub fn handle_storage_command(
                         count: sd_library.catalog_count_u16(),
                         catalog_epoch: sd_library.catalog_epoch(),
                     });
-                    // The reader picked a book, so open it: found again by
-                    // where it is, as any chosen row is, now that the catalog
-                    // holds it. The answer goes after `Scanned`, whose epoch
-                    // it carries.
+                    // Find the picked book by its place in the new catalog.
+                    // The answer carries `Scanned`'s epoch, so it goes after.
                     match crate::library_sd::find_index_by_locator(card, at, locator.as_str(), size)
                     {
                         crate::library_sd::CatalogRow::Found(index) => {
@@ -1685,18 +1680,13 @@ pub fn handle_storage_command(
                                 index,
                                 catalog_epoch: sd_library.catalog_epoch(),
                             });
-                            // The scan rewrote the catalog and nothing under
-                            // the shelf, so the folder the book was picked in
-                            // still lists what is there, and browsing stays in
-                            // it. Listed again unasked, after the answer, so
-                            // the app takes the folder's rows back from the
-                            // catalog total `Scanned` left in their place.
+                            // The scan changed only the catalog, so browsing
+                            // stays in this folder. Relist it after the answer
+                            // to replace the catalog total `Scanned` showed.
                             relist_library_folder_here(card, host, sd_library, portrait);
                         }
-                        // Still not in the catalog: a scan that could not
-                        // finish, or a card that would not say. Back to the
-                        // root, as after any rescan, for the reader to pick
-                        // from what is there.
+                        // Still not in the catalog, or the card would not
+                        // answer: back to the root, as after any rescan.
                         crate::library_sd::CatalogRow::Rebuild
                         | crate::library_sd::CatalogRow::Unreadable => {
                             relist_library_folder(card, host, sd_library, portrait);
@@ -1964,10 +1954,8 @@ pub enum StateRestore {
     Pending,
     /// Handed over, or there was nothing to hand over.
     Done,
-    /// Tried, and the catalog held no book under the saved identity: a
-    /// snapshot written before the book moved on a computer. The reading
-    /// settings travel in the same event, so until this is retried they are
-    /// the defaults.
+    /// Tried, and the catalog held no book under the saved identity, usually
+    /// because the book moved on a computer. The settings were sent anyway.
     Missed,
 }
 
@@ -1976,10 +1964,9 @@ pub enum StateRestore {
 /// saved position to the app as a `Restored` event. The volatile book id
 /// stored in the record is never trusted directly.
 ///
-/// `retry_missed` lets a caller try again after a lookup that found nothing,
-/// once a rescan has caught the catalog up. Only one that is about to tell
-/// the app which book to open may: `Restored` sets the current book, and
-/// any other caller could move it under a reader.
+/// `retry_missed` retries a lookup that found nothing, after a rescan. Only
+/// a caller about to name the book to open may set it, because `Restored`
+/// changes the current book.
 pub fn restore_saved_state(
     card: &mut impl Card,
     host: &mut impl Host,
@@ -2012,9 +1999,8 @@ pub fn restore_saved_state(
             record.source_size
         );
         *state_restored = StateRestore::Missed;
-        // The settings are the reader's whatever became of the book. Without
-        // them the session runs on the defaults, and the next save writes
-        // those over the reader's own.
+        // Send the settings even without the book, or the next save writes
+        // the defaults over them.
         host.send_required(&LibraryEvent::SettingsRestored {
             reading_orientation: record.reading_orientation,
             refresh_policy: record.refresh_policy,

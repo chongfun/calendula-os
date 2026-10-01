@@ -80,9 +80,8 @@ pub async fn run(
     // Storage-command admission for the sync session lifecycle; the loan
     // transition and refusal rules live in app-core with the contracts.
     let mut sync_session = SyncSession::default();
-    // The storage half's own state: the background walk and the place
-    // waiting on it, the evidence job, the coalesced progress record, and
-    // whether durable state has been restored. See `storage::task`.
+    // Storage state: the background walk, the evidence job, the pending
+    // progress record and the restore latch. See `storage::task`.
     let mut storage_task = storage::task::StorageTask::default();
     // On a deep-sleep (Power button) wake the panel still shows the sleep
     // screen: deep_sleep_wake is true only when the RTC wake cause is the

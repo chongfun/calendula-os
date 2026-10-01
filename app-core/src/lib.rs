@@ -1650,11 +1650,9 @@ pub enum LibraryEvent {
         font_family: u8,
         front_buttons: u8,
     },
-    /// The saved reading settings, when the saved state names a book the
-    /// catalog does not hold: one a computer moved or deleted while the
-    /// device was off. The settings are the reader's whatever became of the
-    /// book, and without them the session runs on the defaults and the next
-    /// save writes those over the reader's own.
+    /// The saved reading settings, sent when the saved book is no longer in
+    /// the catalog. Without them the next save writes the defaults over the
+    /// reader's settings.
     SettingsRestored {
         reading_orientation: u8,
         refresh_policy: u8,
@@ -2019,9 +2017,7 @@ impl LibraryEvent {
     /// - `CacheCleared` settles a per-book action's `LibraryMenu::Busy`, which
     ///   holds the whole Library list still while it waits.
     /// - `Restored` is what the boot render waits for before drawing.
-    ///   `SettingsRestored` stands in for it when the saved book is gone, and
-    ///   losing it puts the defaults over the reader's settings at the next
-    ///   save.
+    ///   `SettingsRestored` replaces it when the saved book is gone.
     ///
     /// The senders route on this, so an event that settles something is
     /// protected by naming it here rather than by every call site
@@ -2827,8 +2823,7 @@ impl ReaderState {
         self
     }
 
-    /// The reading settings a saved state carries, each kept only when it
-    /// decodes.
+    /// Adopt the saved reading settings, skipping any that do not decode.
     #[allow(clippy::too_many_arguments)] // One per setting the record carries, decoded here and nowhere else.
     fn adopt_saved_settings(
         &mut self,
@@ -6731,10 +6726,9 @@ mod tests {
         assert_eq!(fresh.book_id, ReaderSource::sd(1).book_id());
     }
 
-    /// A book the catalog had not heard of, picked in a folder: the storage
-    /// task rescans, then answers the press with the book's new row, then
-    /// lists the folder again unasked. The book opens, and the folder keeps
-    /// its own row count rather than the catalog total `Scanned` carried.
+    /// Picking a book the catalog lacks makes storage rescan, answer with the
+    /// book's new row, then relist the folder. The folder keeps its own row
+    /// count, not the catalog total `Scanned` carried.
     #[test]
     fn a_book_picked_before_a_rescan_opens_and_its_folder_keeps_its_rows() {
         let waiting = press(in_folder(0, 1, 0), Button::Confirm);
@@ -6782,8 +6776,7 @@ mod tests {
         );
     }
 
-    /// The saved book is gone from the catalog, so only the settings come
-    /// back: they are adopted, and the book, place and view are left alone.
+    /// The book, place and view stay as they were.
     #[test]
     fn saved_settings_restore_without_their_book() {
         let before = in_library(0, 3);

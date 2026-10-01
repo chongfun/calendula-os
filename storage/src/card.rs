@@ -1,12 +1,12 @@
-//! The card, as the storage code sees it: a session that hands out the root
-//! directory for the length of one closure.
+//! The card as the storage code sees it: a session that lends out the root
+//! directory for one closure.
 
 use embedded_sdmmc::{Directory, TimeSource, Timestamp};
 
 /// Why a session did not reach the root directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionError {
-    /// The card would not initialise.
+    /// The card would not initialize.
     CardInit,
     /// The volume would not open.
     Volume,
@@ -14,8 +14,8 @@ pub enum SessionError {
     Root,
 }
 
-/// The fixed clock directory entries are stamped with. The device keeps no
-/// wall time, and an honest constant beats a guess that looks real.
+/// The fixed timestamp on every directory entry, since the device keeps no
+/// wall time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StaticTime;
 
@@ -37,10 +37,9 @@ pub type Root<'a, D> = Directory<'a, D, StaticTime, 8, 8, 1>;
 
 /// A card the storage code can open a session on.
 ///
-/// The firmware's session brings the SPI bus up for the card and puts it
-/// back for the panel around the closure; a test's is a volume manager over
-/// a FAT image in RAM. Nothing inside the closure can open a second session,
-/// which is the rule the firmware's bus sharing already imposes.
+/// The firmware's session takes the SPI bus from the panel for the closure;
+/// a test's is a volume manager over a FAT image in RAM. The closure cannot
+/// open a second session.
 pub trait Card {
     /// The block device a session reads and writes through.
     type Device<'a>: embedded_sdmmc::BlockDevice

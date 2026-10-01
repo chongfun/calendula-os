@@ -782,35 +782,29 @@ whose locator is definitively gone retires: the cache is reclaimed, and the
 reading position stays in its directory, waiting for the book to come back to
 where it was.
 
-A move is proved by the scan, not inferred by the sweep. The library ledger
-described below records which copy each file is, and a catalog rebuild
-matches a departed record to a new row by size and then by reading the row's
-bytes; nothing else may conclude that a book moved. Once proved, the move
-carries what the old key held: the legacy reading position, and the
-pagination (`reader_cache::files::carry_for_move`). The pagination moves by
-directory entry, through the fork's short-name `move_file_in_dir`: every
-resident layout's sections first, then the content stream, the chapter list
-and the cover, and `BOOK.BIN` last, so a carry cut short leaves the new key
-with no index to load and the old key with a hole the loader already treats
-as one. Every header but the cover's binds its file to the `(source_hash,
-size)` of the book's place, and the loaders refuse a header bound to another
-place, so once the entries have moved the carry rewrites that identity in
-place, one sector per file, sections first and the index last, so an index
-that reads under the new place vouches only for sections that do too.
-Beyond directory sectors, that header sector is the only byte of each file
-the carry reads or writes. The carry runs inside the
-identity join, before the ledger commits the move, so a reset retries it, and
-it leaves the departed directory's claim untouched because that claim is what
-the retry reads; the retry moves what is left and unlinks what already
-arrived. A FAT move is two writes, and a cut between them leaves one chain
-under two names, where freeing either would free the other's clusters. So
-while a carry is in flight each side carries a marker naming the other,
-a zero-length `<new key>.MVD` in the departed directory and `<old key>.LNK`
-in the destination,
-and any reclaim of a directory bearing one, the sweep's or a stranger's
-adoption, first takes away the names whose chain the other side also holds
-and only then frees what remains. Whichever side a sweep reaches first, one
-name survives per chain.
+Only the scan proves a move. A catalog rebuild matches a departed ledger
+record to a new row by size, then by hashing the row's bytes. A proved move
+carries the legacy reading position and the pagination
+(`reader_cache::files::carry_for_move`) to the new key.
+
+The pagination moves by directory entry, through the fork's short-name
+`move_file_in_dir`: each resident layout's sections, then the content
+stream, the chapter list and the cover, and `BOOK.BIN` last. A carry cut
+short leaves the new key with no index, and the old key with a gap the
+loader already handles. Every header but the cover's names the `(source_hash,
+size)` of the book's place, and loaders refuse a header for another place.
+So the carry then rewrites that one header sector per file, sections first
+and the index last: an index that reads under the new place vouches only for
+sections that do too.
+
+The carry runs inside the identity join, before the ledger commits the move,
+so a reset retries it. It leaves the departed directory's claim in place,
+since the retry reads it. A FAT move is two writes, and a cut between them
+leaves one chain under two names. While a carry is in flight each side holds
+a zero-length marker naming the other, `<new key>.MVD` in the departed
+directory and `<old key>.LNK` in the destination. Any reclaim of a marked
+directory first removes the names the other side also holds, then frees the
+rest, so one name survives per chain.
 
 The library ledger,
 `/READER/LEDGERA.BIN` and `LEDGERB.BIN`, adopts every physical EPUB the scan

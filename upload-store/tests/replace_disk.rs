@@ -312,7 +312,7 @@ fn found_again() -> Vec<(BookId, String, String)> {
     FOUND_AGAIN.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
 }
 
-/// The digests the scans since the last call handed on, and clear them.
+/// Take the digests the scans reported since the last call.
 fn found_digests() -> Vec<SourceDigest> {
     FOUND_DIGESTS.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
 }
@@ -2438,8 +2438,7 @@ fn a_sideloaded_copy_that_was_read_is_found_again_where_it_went() {
     assert_eq!(assigned.minted, 0);
     assert_eq!(ids[0], Some(id), "under the id it was adopted with");
 
-    // With the digest that proved it, computed from the bytes now at the new
-    // place, so the carry need not read the book again.
+    // The report carries the digest of the bytes at the new place.
     assert_eq!(
         found_digests(),
         vec![digest_of(&bytes)],

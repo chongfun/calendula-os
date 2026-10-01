@@ -1,10 +1,8 @@
-//! What the storage code needs from the chip and nothing else can supply:
-//! the SHA unit and a random source, plus a campaign build's recovery report.
+//! What the storage code needs from the chip: the SHA unit, a random source,
+//! and a campaign build's recovery report.
 //!
-//! Installed once by `fw` at boot. These are reached from deep inside a card
-//! session, where threading another handle through every caller would buy
-//! nothing: the SHA unit is one piece of hardware, and the random source is
-//! one generator. A test runs on the software defaults.
+//! `fw` installs it once at boot, so code deep in a card session reaches it
+//! without a handle. Tests run on the software defaults.
 
 use core::cell::Cell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -17,8 +15,7 @@ pub type ShaRunner = fn(&mut dyn FnMut(&mut dyn Sha256Engine));
 
 /// The chip's half of the storage code.
 pub struct Platform {
-    /// Run the closure with a SHA-256 engine, the chip's unit where it can
-    /// lend one.
+    /// Run the closure with a SHA-256 engine, the chip's unit when free.
     pub with_sha256: ShaRunner,
     /// A random word, for minting book ids.
     pub random_u32: fn() -> u32,
@@ -56,8 +53,7 @@ pub fn with_sha256<R>(f: impl FnOnce(&mut dyn Sha256Engine) -> R) -> R {
     });
     match result {
         Some(result) => result,
-        // A platform that did not call back: hash in software rather than
-        // fail, since the answer is the same either way.
+        // The platform did not call back, so hash in software.
         None => match f.take() {
             Some(f) => f(&mut SoftSha256::new()),
             None => unreachable!("the closure ran or it did not"),
@@ -80,7 +76,7 @@ fn software_sha256(f: &mut dyn FnMut(&mut dyn Sha256Engine)) {
     f(&mut SoftSha256::new())
 }
 
-/// xorshift32: deterministic, which is what a test wants from it.
+/// xorshift32, deterministic for tests.
 fn software_random() -> u32 {
     static STATE: AtomicU32 = AtomicU32::new(0x2545_f491);
     let mut x = STATE.load(Ordering::Relaxed);

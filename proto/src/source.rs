@@ -92,13 +92,10 @@ impl Default for SourceHasher {
     }
 }
 
-/// A SHA-256 implementation a [`EngineHasher`] can drive: the software one
-/// here, or a hardware unit the firmware owns and this crate cannot name.
-///
-/// The contract is the algorithm, nothing looser. What an engine returns
-/// becomes a [`SourceDigest`], which claims the bytes it was fed are those
-/// bytes, so an implementation must compute SHA-256 over exactly what
-/// [`Sha256Engine::update`] was given since [`Sha256Engine::start`].
+/// A SHA-256 implementation for [`EngineHasher`]: [`SoftSha256`] or the
+/// firmware's hardware unit. It must compute exact SHA-256 over the bytes
+/// given since [`Sha256Engine::start`], since the result becomes a
+/// [`SourceDigest`].
 pub trait Sha256Engine {
     /// Begin a new digest, discarding any unfinished one.
     fn start(&mut self);
@@ -132,8 +129,8 @@ impl Sha256Engine for SoftSha256 {
     }
 }
 
-/// [`SourceHasher`] over an engine the caller supplies, for the one hash
-/// long enough for the engine to matter: a whole book read back off the card.
+/// [`SourceHasher`] over a caller-supplied engine, for hashing a whole book
+/// read back off the card.
 pub struct EngineHasher<'e> {
     engine: &'e mut dyn Sha256Engine,
     byte_len: u64,

@@ -1035,16 +1035,14 @@ impl ReaderStore {
     }
 
     /// The identities a scan should report moves of: the reading book's and
-    /// the loaded book's. Both name their book by place, and a computer can
-    /// move it while the device is off.
+    /// the loaded book's, since both name their book by place.
     pub fn identities_to_follow(&self) -> [(u32, u32); 2] {
         [self.reading_identity, self.loaded_identity]
     }
 
-    /// A scan proved the book at `was` moved to `locator` under `root`, with
-    /// identity `now`. The reading book and the loaded book follow it, or a
-    /// departing save would name a place no catalog row answers to and the
-    /// open it guards would be refused.
+    /// Point the reading and loaded books at `locator` under `root`, identity
+    /// `now`, after a scan proved the book at `was` moved there. Otherwise a
+    /// departing save would name a place no catalog row has.
     pub fn follow_move(
         &mut self,
         was: (u32, u32),
@@ -2524,10 +2522,8 @@ mod tests {
         assert_eq!(store.reading_book_identity(book_id5), None);
     }
 
-    /// A book the reader state names, restored without being opened, and a
-    /// loaded book both follow a move the scan proved, so a departing save
-    /// names the place the book is at now. A move of any other book leaves
-    /// them where they are.
+    /// The restored and the loaded book both follow a proven move, so a
+    /// departing save names the new place. Other books' moves change nothing.
     #[test]
     fn the_reading_and_loaded_books_follow_a_proven_move() {
         let mut store = Box::new(ReaderStore::new());

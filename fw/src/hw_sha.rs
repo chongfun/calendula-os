@@ -1,17 +1,8 @@
-//! The SHA-256 a whole book is hashed with: the C3's SHA unit, lent out one
-//! digest at a time.
+//! SHA-256 on the C3's SHA unit, lent out one digest at a time. On the X3 it
+//! hashes a MiB in 56 ms against software's 611.
 //!
-//! Proving a move or settling a replacement reads the whole book and hashes
-//! it, and in software that was 6.8 s of an 11.7 MB book on the X3, a third
-//! of the proof. Measured there, the unit hashes a MiB in 56 ms against
-//! software's 611, and the whole book's digest fell from 15.4 s to 8.7 s, of
-//! which 8.0 s is reading it.
-//!
-//! Nothing else on the chip drives it. The Wi-Fi blob's supplicant links its
-//! own software SHA-1 and SHA-256 (`sha1_vector`, `sha256_vector` and the
-//! HMACs are defined in `libwpa_supplicant.a`, and no blob library refers to
-//! a ROM or hardware SHA symbol), so hashing during an upload session shares
-//! the unit with nobody.
+//! The Wi-Fi supplicant links its own software SHA (`libwpa_supplicant.a`), so
+//! nothing else drives the unit, even during an upload session.
 
 use core::cell::RefCell;
 
@@ -19,8 +10,8 @@ use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex};
 use esp_hal::sha::{Sha, Sha256, ShaDigest};
 use proto::source::{Sha256Engine, SoftSha256, SHA256_BYTES};
 
-/// Taken out for the length of one caller, and put back after: the lock is
-/// held only to move it, not across a hash.
+/// Taken out for one caller and put back after. The lock is held only to move
+/// the unit, not across a hash.
 static UNIT: Mutex<CriticalSectionRawMutex, RefCell<Option<Sha<'static>>>> =
     Mutex::new(RefCell::new(None));
 
@@ -35,10 +26,8 @@ pub fn install(sha: Sha<'static>) {
     UNIT.lock(|unit| *unit.borrow_mut() = Some(sha));
 }
 
-/// Run `f` with the unit as its engine, or with software SHA-256 when the
-/// unit is lent out already, was not installed, or fails a known-answer
-/// check. A digest is a claim about bytes, so an engine that cannot prove it
-/// computes SHA-256 does not get to make one.
+/// Run `f` with the unit as its engine. Fall back to software SHA-256 when the
+/// unit is lent out, not installed, or fails the known-answer check.
 pub fn with_sha256<R>(f: impl FnOnce(&mut dyn Sha256Engine) -> R) -> R {
     let Some(sha) = UNIT.lock(|unit| unit.borrow_mut().take()) else {
         return f(&mut SoftSha256::new());

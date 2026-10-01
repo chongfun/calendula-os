@@ -422,7 +422,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    // Nothing in the firmware asks this, so the software engine serves.
+    // The firmware does not call this, so software SHA is enough.
     let engine = &mut proto::source::SoftSha256::new();
     let found = if key.in_books() {
         match library::open_library_root(root)? {
@@ -480,24 +480,14 @@ where
     Ok(Some(first == second))
 }
 
-/// Blocks read per pass while hashing a book already on the card, 4 KB on the
-/// caller's stack. The card answers a run of blocks in one command, and the
-/// command and its wait for the data token cost as much as a block again: a
-/// block at a time, an X3 hashed an 11.7 MB book at 540 KB/s, 13.7 s of its
-/// 21.3 s spent waiting on single-block reads.
+/// Blocks read per command while hashing a book on the card, 4 KB on the
+/// caller's stack. Each command costs about a block's time in overhead, so
+/// single-block reads spent most of an X3 hash waiting on the card.
 ///
-/// The deepest stack this sits on is the scan proving a move: the display
-/// task, `run_sd_session`, the firmware's SHA-unit wrapper, `assign_book_ids`
-/// (whose 4.8 KB frame holds the 64 digests it proves moves with), `digest_at`
-/// and `with_book`, into whose 4.6 KB frame this function and its buffer
-/// inline. With `tools/stack_frames.py`'s frames summed along the release
-/// builds' call graph, that chain is about 24.4 KB from the display task down
-/// on both boards, against about 34.8 KB for the book open the stack floor is
-/// sized for, so the scan does not set the high-water mark. Both figures
-/// overstate a real stack, since a static call graph joins branches that are
-/// not live together, so compare chains measured the same way rather than
-/// reading either against the stack region, and re-measure the chain when
-/// this grows: the per-function check only bounds one frame at a time.
+/// The deepest caller is the move-proving scan, through `assign_book_ids`
+/// (4.8 KB frame) and `with_book` (4.6 KB, with this function inlined). Summed
+/// with `tools/stack_frames.py`, that chain is about 24.4 KB on both boards,
+/// under the 34.8 KB book open that sizes the stack. Re-measure when this grows.
 const DIGEST_READ_BLOCKS: usize = 8;
 
 /// The identity of a book already on the card, read out of it.

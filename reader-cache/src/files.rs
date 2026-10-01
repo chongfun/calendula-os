@@ -698,28 +698,13 @@ where
     write_book_dir_claim(&book, owner, false, Some(&merged)).map_err(|_| ClaimDenied::Fault)
 }
 
-/// Carry a reading position from the key a book used to have to the key it
-/// has now.
+/// Carry a reading position from a book's old cache key to its new one.
+/// Takes a [`proto::source::SourceDigest`], not the cached form, so the
+/// caller must have hashed the destination's bytes.
 ///
-/// Takes a [`proto::source::SourceDigest`] rather than the cached form so
-/// the caller must have read the destination's bytes. The cached type comes
-/// off a claim and describes a file that may since have changed, so
-/// accepting it would let a caller pass the departed book's own stored
-/// digest and carry a place onto a candidate nobody hashed.
-///
-/// Position only. The pagination is keyed on the locator too and follows in
-/// [`carry_pagination`], by directory entry rather than by bytes, so the
-/// scan the reader is waiting on pays a handful of entry writes and not the
-/// cache's length in reads and writes.
-///
-/// The claim lands before the position, because a position in a directory
-/// whose claim did not land cannot be read back. Nothing here deletes the
-/// old copy, so an interruption leaves the place where it was.
-///
-/// `Ok(false)` is a departed directory with no position to carry.
-///
-/// Reached from the firmware through [`carry_for_move`], on a move
-/// the scan has proved. Nothing else may conclude that a book moved.
+/// The claim lands before the position, and the old copy is left in place,
+/// so an interruption loses nothing. `Ok(false)` means there was no position.
+/// Only [`carry_for_move`] calls this, on a move the scan has proved.
 pub fn carry_position<
     D,
     T,
@@ -745,25 +730,9 @@ where
         return Ok(false);
     };
     if from.key == to.key {
-        // The book moved and its key did not follow. Keys are 28 bits of a
-        // hash of the place, so two locators can share one, and then the
-        // place the reader left is already in the directory the moved book
-        // will use. Nothing is carried. What has to change is whose
-        // directory it is, because the claim still names a locator that is
-        // gone, and the ordinary adoption path reads a claim naming another
-        // locator as another book's and clears the positions under it.
-        //
-        // Re-attributing without going through the claim gate is the whole
-        // point: the gate would refuse, since by its reading this is a
-        // stranger. The digest is what says otherwise, and having one means
-        // somebody read these bytes and found the departed owner's witness
-        // in them.
-        //
-        // It rewrites the one thing a departed copy's evidence lives in, so
-        // a caller whose durable record of the move has not landed yet must
-        // not reach here: what it would take away is what the retry reads.
-        // See [`carry_position_for_move`], which declines this case for
-        // exactly that reason.
+        // Both locators share one key, so only the claim changes, written past
+        // the claim gate. It overwrites the evidence a retry reads, so call
+        // this only after the move is durable; see `carry_position_for_move`.
         let mut book = root
             .open_dir(CACHE_ROOT_DIR)
             .map_err(|_| ClaimDenied::Fault)?;
@@ -817,26 +786,12 @@ where
     }
 }
 
-/// Carry a reading position to where a copy has been found again.
+/// Carry a reading position to where a copy has been found again, hashing
+/// the destination's bytes for the claim it writes.
 ///
-/// The place a reader left is filed under where the copy used to be, so a
-/// repaired locator on its own would leave it behind. The scan proves the
-/// move by the bytes; this reads the destination again rather than taking
-/// that word for it, because what it writes into the claim is a statement
-/// about the bytes at the new place and the only way to make one is to read
-/// them.
-///
-/// `Ok(false)` is a copy that had no place to carry, which is most of a
-/// library, or one whose two places share a cache directory. That last is
-/// declined rather than carried: with one directory between them the carry
-/// would have to re-attribute it, which rewrites the claim the copy's
-/// bytes are recorded in, and this runs before the ledger has written the
-/// move down. A reset in that window would leave a ledger naming the old
-/// place and a claim naming the new one, so the retry the ordering exists
-/// for would find no evidence and mint the copy afresh. The reader's place
-/// is lost in that case, which the bridge already allows for, and the
-/// copy's identity is not, which it does not. Two locators share a key
-/// once in a few hundred million.
+/// `Ok(false)` means no position, or both places share one cache key. That
+/// case is declined: this runs before the ledger records the move, and
+/// rewriting the shared claim then would lose the copy's identity on a reset.
 pub fn carry_position_for_move<
     D,
     T,
@@ -859,8 +814,7 @@ where
     carry_position(root, was, now, digest, None)
 }
 
-/// Read the bytes of the file now at `now`, so the carry that follows rests
-/// on what is there and not on what a claim remembers.
+/// Hash the file now at `now`.
 fn digest_of_moved<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     now: &proto::cache::CacheOwner<'_>,
@@ -886,9 +840,8 @@ where
     read.ok_or(ClaimDenied::Fault)
 }
 
-/// What one proven move carried from the key a book had to the key it has.
-/// Each half answers for itself: a position write that did not land does
-/// not forfeit the pagination, and the caller can report both.
+/// What one proven move carried. The halves are independent: a failed
+/// position write does not cancel the pagination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoveCarry {
     /// Whether a legacy reading position was brought across.
@@ -897,23 +850,13 @@ pub struct MoveCarry {
     pub pagination: Result<Option<CarriedPagination>, ClaimDenied>,
 }
 
-/// Everything a proven move carries: the legacy position, then the
-/// pagination. Each carry is attempted whatever became of the other.
-/// `old_identity` and `new_identity` are the `(source_hash, size)` pairs of
-/// the two places, which the scan has; every cache header binds to the first
-/// and has to be re-bound to the second.
+/// Carry the legacy position, then the pagination, for a move the scan has
+/// proved. Each is attempted whatever became of the other. Headers are
+/// re-bound from `old_identity` to `new_identity`, each a `(source_hash, size)`.
 ///
-/// `digest` is what the claim and the evidence at the new place will say the
-/// bytes there are, so it has to have been computed from them, as
-/// [`carry_position_for_move`] insists. The scan's proof of the move is
-/// exactly such a read, of the same file in the same scan, and the ledger
-/// hands it on rather than have this read an eleven-megabyte book a second
-/// time. A digest rebuilt from a record cannot be passed here: there is no
-/// way to make one.
-///
-/// Reached from the firmware on a move the scan has proved, before the
-/// ledger writes it down, so a reset retries it. Nothing else may conclude
-/// that a book moved.
+/// `digest` must come from hashing the bytes at the new place; the ledger
+/// passes on the one the scan computed to prove the move. This runs before
+/// the ledger records the move, so a reset retries it.
 pub fn carry_for_move<
     D,
     T,
@@ -933,13 +876,9 @@ where
     T: TimeSource,
 {
     if was.key == now.key {
-        // One directory serves both places; see `carry_position`. The
-        // pagination is not re-bound here either: the two places share 28
-        // bits of hash and not the whole, so the headers would need the
-        // rewrite, but the directory's claim names the old place and is
-        // what a retry reads, and the book at the new place cannot write
-        // there until the sweep releases it and adoption empties it. Once
-        // in a few hundred million moves the pagination is built again.
+        // One directory serves both places. Its claim names the old place
+        // and a retry reads it, so nothing is carried and the pagination is
+        // rebuilt. Two locators share a key once in a few hundred million.
         return MoveCarry {
             place: Ok(false),
             pagination: Ok(None),
@@ -954,28 +893,16 @@ where
 // Pagination follows a proven move
 // ---------------------------------------------------------------------------
 
-/// Written in the departed directory before the first entry moves out of it,
-/// naming the key its files are going to. Whoever reclaims that directory
-/// afterwards can then tell a name that still shares its chain with the
-/// destination, because a move was cut between its two writes, from a name
-/// that owns its chain, and take the first away instead of freeing it.
-///
-/// A marker is a zero-length file whose name is the other directory's key
-/// under this extension: `<key>.MVD`. It has no chain, so writing it is one
-/// directory entry, removing it is one directory entry, and no state between
-/// exists in which an entry describes clusters that are already free. What
-/// it says is read from the directory listing.
+/// `<key>.MVD`, a zero-length file written in the departed directory before
+/// any entry moves out, naming the destination key. A reclaim that finds it
+/// unlinks names still sharing a chain with the destination, not frees them.
 const FORWARD_MARKER_EXT: &str = "MVD";
-/// The mirror in the destination, `<key>.LNK`, naming the key its files are
-/// arriving from, so a reclaim of the destination before the carry settled
-/// resolves the same twins from its side. The two together make the outcome
-/// the same whichever directory a sweep reaches first.
+/// `<key>.LNK`, the mirror in the destination, naming the departed key, so
+/// a sweep resolves the same twins whichever directory it reaches first.
 const BACK_MARKER_EXT: &str = "LNK";
 
-/// The book-level files a carry moves, in the order it moves them. The index
-/// goes last: it is what makes a set present, so a cut before it leaves the
-/// new key with no cache to load and the old key with a hole the loader
-/// already treats as one.
+/// The book-level files a carry moves, in order. The index goes last because
+/// it makes a set present, so a cut before it leaves nothing to load.
 const CARRIED_FILES: [&str; 4] = [
     CACHE_CONTENT_FILE,
     CACHE_TOC_FILE,
@@ -988,18 +915,15 @@ const CARRIED_FILES: [&str; 4] = [
 pub struct CarriedPagination {
     /// Entries moved by rewriting their directory entry.
     pub moved: u16,
-    /// Names taken away because the destination already held the chain: a
-    /// carry cut between a move's two writes, finished on the retry.
+    /// Names unlinked because the destination already held the chain, after
+    /// a carry was cut between a move's two writes.
     pub unlinked: u16,
     /// Headers rewritten in place from the old place's identity to the new.
     pub restamped: u16,
 }
 
-/// Which header a carried file opens with. Every one of them binds the file
-/// to the `(source_hash, source_size)` of the book's place, and every loader
-/// refuses a header bound to another place, so a set moved by entry alone
-/// would be refused under the new key and built again. The identity is
-/// rewritten in place instead, one header at a time.
+/// Which header a carried file opens with. Each binds the file to its
+/// place's `(source_hash, source_size)`, so a carry rewrites it in place.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StampedHeader {
     Book,
@@ -1082,20 +1006,12 @@ enum Stamp {
     Left,
 }
 
-/// Rewrite one file's header to `new`, in place: one sector.
+/// Rewrite one file's header to `new`, in place, in one sector write.
 ///
-/// Authorized by the destination's back marker, which the caller has read:
-/// while it stands, every file here came from the departed key, so a
-/// header bound to anything but the new place is this carry's to re-bind.
-/// That includes the mixture a power cut inside the sector write leaves.
-/// The old and new sectors differ only in the four hash bytes, so a tear
-/// lands a valid header carrying some of each, an identity that is neither
-/// place; a check for the old identity alone would leave it forever, and
-/// an index later bound to the new place would vouch for a section that is
-/// not. Only the size tells a foreign file from ours, and a move does not
-/// change it. A file that is not there, is shorter than its header, or
-/// does not decode is left alone; the loader refuses those anyway. A file
-/// already bound to `new` is left too, which is what a retry finds.
+/// The caller holds the destination's back marker, so any header here not
+/// bound to `new` is this carry's to re-bind, including one torn into a mix
+/// of both hashes. Only the size is checked, since a move does not change it.
+/// Missing, short, undecodable or already re-bound files are left alone.
 fn restamp_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     name: &str,
@@ -1134,14 +1050,10 @@ where
     Ok(Stamp::Restamped)
 }
 
-/// Re-bind every carried header under `to` to `new`: the sections, then
-/// the content stream and chapter list, then the index last, so an index
-/// that reads under the new place vouches only for sections that do too.
-/// Refuses on the first header the card would not rewrite, leaving the
-/// index bound to the old place, which the loader refuses and the retry
-/// finishes. Idempotent: a header already bound to `new` is left alone.
-/// The caller holds the destination's back marker; see [`restamp_file`]
-/// for what that authorizes.
+/// Re-bind every carried header under `to` to `new`: sections, then content
+/// and chapter list, then the index last, so the index vouches only for
+/// re-bound sections. Stops at the first failed write, which a retry
+/// finishes. The caller holds the back marker; see [`restamp_file`].
 fn restamp_carried<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     new: (u32, u32),
@@ -1195,8 +1107,7 @@ enum MarkerRead {
     Present(String<{ proto::cache::CACHE_KEY_BYTES }>),
     Absent,
     /// The card would not answer, or the directory holds more than one
-    /// marker of this kind, which no sequence of carries writes. Evidence of
-    /// nothing, and a reclaim that meets it must not free anything.
+    /// marker of this kind. A reclaim that meets this must free nothing.
     Fault,
 }
 
@@ -1285,9 +1196,7 @@ where
     }
 }
 
-/// Take a marker away. A zero-length file has no chain, so this is one
-/// directory entry and cannot leave an entry over freed clusters. A marker
-/// that is not there is already the end state.
+/// Remove a marker, one directory entry. A missing marker is success.
 fn remove_marker<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     book: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     ext: &str,
@@ -1366,10 +1275,9 @@ enum EntryFate {
     Absent,
 }
 
-/// Move `name` from `from` to `to` by directory entry. When `to` already
-/// holds that name on the same chain, this is a move cut between its two
-/// writes being finished: the `from` name is taken away and the chain stays
-/// with `to`. A name in `to` on another chain is a stranger's, and refused.
+/// Move `name` from `from` to `to` by directory entry. If `to` already holds
+/// it on the same chain, a cut move is finished by unlinking the `from` name.
+/// A name in `to` on another chain is refused.
 fn move_or_unlink<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     from: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
@@ -1393,10 +1301,8 @@ where
     }
 }
 
-/// Take `name` away from `dir` when `other` holds the same name on the same
-/// chain, so the chain keeps exactly one name. Two zero-length files share
-/// no chain and lose nothing either way. `Ok(false)` is a name `other` does
-/// not answer to, or answers to with a chain of its own.
+/// Unlink `name` from `dir` when `other` holds it on the same chain, so the
+/// chain keeps one name. `Ok(false)` means `other` lacks it or has its own chain.
 fn unlink_if_twin<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     other: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
@@ -1487,8 +1393,8 @@ where
 {
     for _ in 0..SECTION_CARRY_PASSES {
         let mut names = heapless::Vec::new();
-        // Everything a pass settles leaves the listing, so every pass starts
-        // at the front; the bound is what stops a name that will not go.
+        // Settled names leave the listing, so each pass starts at the front.
+        // The bound stops a name that will not go.
         let blocked = section_names(from, 0, &mut names)?;
         if names.is_empty() {
             return if blocked { Err(()) } else { Ok(()) };
@@ -1504,15 +1410,10 @@ where
     Err(())
 }
 
-/// A writer's directory may still share chains with the other side of a
-/// carry that did not settle, and a build here opens files to truncate them,
-/// which frees what the other side still names. So before a writer is
-/// handed the directory, each marker it holds is settled: the shared names
-/// are taken away from the other side, since this side is the one being
-/// written, and both markers go. A retry of the carry itself passes through
-/// here too, on its way to claiming the destination, and finds the same
-/// twins unlinked that it would have unlinked itself. A card that will not
-/// answer refuses the writer.
+/// Settle any unsettled carry before a writer gets this directory, since a
+/// build truncates files and would free chains the other side still names.
+/// Shared names are unlinked from the other side and both markers removed.
+/// A card that will not answer refuses the writer.
 fn settle_markers_for_writer<
     D,
     T,
@@ -1553,10 +1454,9 @@ where
     Ok(())
 }
 
-/// In `book`, take away every name whose chain the directory at `other_key`
-/// also names. What is left owns its chain and may be reclaimed. True when
-/// the question was answered for every name; a card that would not answer
-/// leaves the caller unable to reclaim anything.
+/// Unlink every name in `book` whose chain the directory at `other_key` also
+/// names, leaving names that own their chains. False if the card would not
+/// answer for every name, in which case nothing may be reclaimed.
 fn unlink_twins_against<
     D,
     T,
@@ -1593,8 +1493,7 @@ where
         Err(embedded_sdmmc::Error::NotFound) => return true,
         Err(_) => return false,
     };
-    // Names that stay keep their place in the listing, names taken away
-    // leave it, so the next pass skips exactly the ones kept.
+    // Kept names stay in the listing, so the next pass skips them.
     let mut kept = 0usize;
     for _ in 0..SECTION_CARRY_PASSES {
         let mut names = heapless::Vec::new();
@@ -1615,37 +1514,14 @@ where
     false
 }
 
-/// Bring a book's pagination from the key it had to the key it has, once the
-/// scan has proved the move and read the bytes now at `now`.
+/// Move a book's pagination from its old cache key to its new one, after
+/// the scan has proved the move. Files move by directory entry, index last,
+/// then each header is re-bound from `old_identity` to `new_identity`.
 ///
-/// Every cache file under the departed key moves by directory entry: the
-/// sections of every resident layout, then the content stream, the chapter
-/// list and the cover, then the index last. Nothing is read but directory
-/// sectors, so a scan the reader is waiting on pays one entry write per
-/// file rather than the cache's length. The destination is claimed for `now`
-/// with the digest recorded as its evidence first, and both directories
-/// carry a marker naming the other while the carry is in flight, so a
-/// reclaim of either before it settles takes twin names away instead of
-/// freeing a chain the other side still uses.
-///
-/// Runs before the ledger writes the move down, as the position carry does,
-/// and leaves the departed directory's claim untouched: that claim is what a
-/// reset's retry reads to find the move again. A retry finishes what was
-/// cut, by moving what is left and unlinking what already arrived.
-///
-/// Every cache header binds the file to the `(source_hash, size)` of the
-/// book's place, and the loaders refuse a header bound to another place, so
-/// once the entries have moved each header is rewritten in place from
-/// `old_identity` to `new_identity`: sections, then the content stream and
-/// chapter list, then the index last, one sector each. A retry that finds
-/// nothing left to move still runs that pass, so a cut inside it is finished
-/// too.
-///
-/// `Ok(None)` is nothing to carry: no cache under the old key, or a
-/// directory whose claim is not this book's. A carry that is refused part
-/// way leaves both directories loadable or rebuildable and the markers in
-/// place for the sweep; the book builds again rather than reading a page
-/// its index does not describe.
+/// The destination is claimed first with `confirmed` as its evidence, and
+/// each directory holds a marker naming the other until the carry settles.
+/// The departed claim is left alone because a retry reads it. `Ok(None)`
+/// means no cache, or a claim that is not this book's.
 pub fn carry_pagination<
     D,
     T,
@@ -1667,10 +1543,8 @@ where
     if was.key == now.key {
         return Ok(None);
     }
-    // A move keeps the bytes, so it keeps the size; a pair that disagrees
-    // is not a move, and re-binding under it would bless another book's
-    // files. The old hash itself is not consulted: the marker authorizes
-    // the re-binding, and a torn header may carry neither hash.
+    // A move keeps the size. A mismatch is not a move, and re-binding would
+    // claim another book's files.
     if old_identity.1 != new_identity.1 {
         return Err(ClaimDenied::Fault);
     }
@@ -1690,10 +1564,8 @@ where
     match read_marker(&from, FORWARD_MARKER_EXT) {
         MarkerRead::Absent => {}
         MarkerRead::Present(key) if key.as_str() == now.key => {}
-        // Forwarded somewhere else before this move was found: a carry cut
-        // by a reset, then the file moved again on a computer. Settle the
-        // names shared with that earlier destination so both directories
-        // own what they hold, and let this book build afresh.
+        // A cut carry to another key, then a second move. Settle the names
+        // shared with that earlier destination and let this book rebuild.
         MarkerRead::Present(key) => {
             if !unlink_twins_against(root, &from, key.as_str())
                 || remove_marker(&from, FORWARD_MARKER_EXT, key.as_str()).is_err()
@@ -1704,14 +1576,9 @@ where
         }
         MarkerRead::Fault => return Err(ClaimDenied::Fault),
     }
-    // A back marker here means this directory was itself the destination
-    // of a carry that did not settle, and may still share chains with the
-    // directory that carry came from. Settle that first, by taking the
-    // shared names away from that earlier departed directory, so what moves
-    // on from here owns every chain it names; otherwise the third key would
-    // share chains with the first and no marker would join them. The
-    // earlier directory's forward marker and this back marker have nothing
-    // left to say afterwards.
+    // This directory was the destination of an unsettled carry. Unlink the
+    // shared names from that earlier directory first, or the new key would
+    // share chains with it and no marker would join them.
     match read_marker(&from, BACK_MARKER_EXT) {
         MarkerRead::Absent => {}
         MarkerRead::Present(earlier) => {
@@ -1737,10 +1604,8 @@ where
         Err(embedded_sdmmc::Error::NotFound) => false,
         Err(_) => return Err(ClaimDenied::Fault),
     };
-    // Three answers, as for the sections: a name that is not there, a name
-    // that is, and a card that would not say. The last must not read as
-    // absence, because absence is what removes the markers, and a twin the
-    // card did not answer for would then be reclaimed as an owner.
+    // A card that would not answer must not read as absence, because
+    // absence removes the markers.
     let mut has_files = false;
     for name in CARRIED_FILES {
         match from.find_directory_entry(name) {
@@ -1755,19 +1620,12 @@ where
         }
     }
     if !has_sections && !has_files {
-        // Nothing left to move. What may be left is the re-binding: a cut
-        // after the last move and before the last header leaves the set
-        // under the new key bound to the old place, and only this pass
-        // finishes it. Then the markers: one still here is a settled carry
-        // whose last write did not land, and it and its mirror have nothing
-        // left to say. The mirror is touched only in a directory that is
-        // already this book's.
+        // Nothing left to move. Finish any cut re-binding, then remove the
+        // markers.
         let mut counts = CarriedPagination::default();
         if let Some(to) = open_v2_book_dir(root, now) {
-            // The back marker is the evidence that a carry from this key is
-            // in flight there, and what authorizes the re-binding; its
-            // removal is the re-binding's commit. Absent, the set was
-            // settled already, or was never this carry's.
+            // The back marker authorizes the re-binding, and removing it
+            // commits it.
             match read_marker(&to, BACK_MARKER_EXT) {
                 MarkerRead::Present(key) if key.as_str() == was.key => {
                     restamp_carried(&to, new_identity, &mut counts)
@@ -1786,18 +1644,15 @@ where
         return Ok((counts.restamped > 0).then_some(counts));
     }
 
-    // The destination first: claimed for the book at its new place, with
-    // the bytes just read recorded as its evidence. A stranger's leftovers
-    // are emptied by the adoption; this book's own, from a cut carry, stay.
+    // Claim the destination first. Adoption empties a stranger's leftovers
+    // and keeps this book's own from a cut carry.
     record_cache_evidence(root, now, None, Some(confirmed))?;
     let to = open_v2_book_dir(root, now).ok_or(ClaimDenied::Fault)?;
     match read_marker(&to, BACK_MARKER_EXT) {
         MarkerRead::Absent => {}
         MarkerRead::Present(key) if key.as_str() == was.key => {}
-        // A back marker naming another source: the destination took part in
-        // a carry from somewhere else that did not settle. Settle it from
-        // this side before writing anything, so no chain ends up under
-        // three names.
+        // An unsettled carry from another source. Settle it first so no
+        // chain ends up under three names.
         MarkerRead::Present(key) => {
             if !unlink_twins_against(root, &to, key.as_str())
                 || remove_marker(&to, BACK_MARKER_EXT, key.as_str()).is_err()
@@ -1839,9 +1694,8 @@ where
     // Everything is under the new key and bound to the old place. Re-bind
     // it, index last, under the back marker written above.
     restamp_carried(&to, new_identity, &mut counts).map_err(|_| ClaimDenied::Fault)?;
-    // Settled: no chain has two names. The markers have nothing left to
-    // say, and one a refusal leaves behind costs a later reclaim one look,
-    // or the retry that finds nothing to carry takes it away.
+    // Settled. A marker a refused removal leaves behind is taken away by
+    // the retry or a later reclaim.
     let _ = remove_marker(&to, BACK_MARKER_EXT, was.key);
     let _ = remove_marker(&from, FORWARD_MARKER_EXT, now.key);
     Ok(Some(counts))
@@ -2371,17 +2225,10 @@ where
     )
 }
 
-/// Re-key the saved reader state when it names the place a proven move just
-/// left, so it names the book where it is now.
-///
-/// The state's only identity for its book is the place's `(source_hash,
-/// size)`, so after a move nothing in the catalog answers to it: the restore
-/// at the next boot finds no book, and the reading settings that travel with
-/// it are lost for the session. The scan knows both places, and this runs
-/// beside the other carries, before the ledger writes the move down, so a
-/// reset retries it. A record already re-keyed no longer names the old place
-/// and is left alone. `Ok(false)` for a record about another book, a legacy
-/// one whose hash is from the older rule, or no record.
+/// Re-key the saved reader state from the place a proven move left to the
+/// book's new place. The state names its book only by `(source_hash, size)`,
+/// so without this the next boot finds no book and drops its settings.
+/// `Ok(false)` for no record, another book's, or a legacy one.
 #[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and the only caller branches on success.
 pub fn carry_app_state_for_move<
     D,
@@ -3111,14 +2958,9 @@ const SHORT_NAME_BYTES: usize = 12;
 /// callers, not to this sweep of derivables. True when everything named
 /// went.
 ///
-/// A directory that was one side of a carry (see [`carry_pagination`]) may
-/// hold names that still share a chain with the directory on the other side,
-/// if the carry was cut between a move's two writes. Its markers say which
-/// directories those are, both of them when it was the destination of one
-/// carry and the departed side of another, and those names are taken away
-/// rather than reclaimed, so the survivor keeps its clusters. A marker the
-/// card will not read refuses the clear: a reclaim that cannot tell a twin
-/// from an owner must not free anything.
+/// Names that a cut carry (see [`carry_pagination`]) left sharing a chain
+/// with the directory its markers name are unlinked, not freed. A marker the
+/// card will not read refuses the clear.
 fn empty_book_dir_artifacts<
     D,
     T,
@@ -3359,13 +3201,9 @@ where
     if resident.len() <= budget {
         return true;
     }
-    // Eviction reclaims section files, and this runs before the build claims
-    // the directory, so an unsettled carry has to be settled here first:
-    // reclaiming a name whose chain the other side still holds would free
-    // what that side names, and the later settle would find no twin left to
-    // recognise. Only a directory this book actively claims lists layouts
-    // over the budget, so a missing or unclaimed one never gets here. A card
-    // that will not settle evicts nothing.
+    // Eviction frees section files before the build claims the directory,
+    // so settle any unsettled carry first. A card that will not settle
+    // evicts nothing.
     if open_v2_book_dir_for_writer(root, owner).is_none() {
         return false;
     }
@@ -3617,11 +3455,8 @@ where
 /// Eviction wants [`evict_layout_sections`] instead: the index is one file for
 /// the book, so taking it there would strand the layout that is staying.
 ///
-/// A writer's operation, so it opens the directory through
-/// [`open_v2_book_dir_for_writer`]. The failure paths that call it are often
-/// failing because that settle was refused, and a reclaim that went ahead
-/// anyway would free chains the other side of an unsettled carry still names.
-/// A refused settle leaves the layout where it is, and reports it.
+/// Opens the directory through [`open_v2_book_dir_for_writer`], so a refused
+/// settle leaves the layout in place and reports failure.
 pub fn empty_layout_cache<
     D,
     T,
@@ -4442,11 +4277,8 @@ where
     f(Some(&dir))
 }
 
-/// [`with_v2_sections_dir`] for a caller that will write, truncate or
-/// reclaim in `SECTIONS/`: the same walk, over the directory opened as a
-/// writer, so an unsettled carry is settled before anything under it
-/// changes. The build and the replay write their sections through this; the
-/// prune reclaims through it.
+/// [`with_v2_sections_dir`] for a caller that writes, truncates or reclaims
+/// in `SECTIONS/`, so an unsettled carry is settled first.
 pub fn with_v2_sections_dir_for_writer<
     R,
     D,
@@ -4788,13 +4620,10 @@ where
     }
 }
 
-/// Open the book's cache directory for something that will truncate or
-/// reclaim under it. The same directory [`open_v2_book_dir`] hands a reader,
-/// after the markers of an unsettled carry are settled, so no truncate or
-/// reclaim can free a chain the other side of that carry still names. Every
-/// path that deletes or truncates under a claimed directory opens it here or
-/// through [`claim_v2_book_dir`]; a read never needs to. `None` for a miss,
-/// or for a card that would not settle.
+/// [`open_v2_book_dir`] for a caller that truncates or reclaims, after
+/// settling any unsettled carry. Every delete or truncate under a claimed
+/// directory goes through here or [`claim_v2_book_dir`]. `None` for a miss
+/// or a card that would not settle.
 pub fn open_v2_book_dir_for_writer<
     'v,
     D,

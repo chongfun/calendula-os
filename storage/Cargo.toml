@@ -7,10 +7,9 @@ edition = "2021"
 workspace = true
 
 [features]
-# Off by default so the crate builds and tests on the host. `fw` turns these on:
-# `esp-log` routes slog! (errors, boot identity, storage narration) at
-# esp-println, and `serial-log` additionally routes bench_log! telemetry, the
-# split fw's own `serial-log` feature draws.
+# Off by default so the crate builds and tests on the host. `esp-log` sends
+# slog! to esp-println; `serial-log` adds bench_log! telemetry, matching fw's
+# own `serial-log` feature.
 esp-log = ["dep:esp-println"]
 serial-log = ["esp-log"]
 device-x3 = ["display/device-x3", "reader-cache/device-x3"]

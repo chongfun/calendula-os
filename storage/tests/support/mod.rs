@@ -2,11 +2,10 @@
 //! app's reducer over the events it sends, wired the way `fw/src/tasks/app.rs`
 //! and `fw/src/tasks/display.rs` wire them.
 //!
-//! The card is the only thing that survives a power cycle, as on the device:
-//! [`Device::sleep`] flushes what the firmware flushes before deep sleep and
-//! [`Device::wake`] starts the store, the storage task and the app afresh over
-//! the same card. Between the two, [`Card::rename`] stands in for a computer
-//! moving a book while the device is off.
+//! Only the card survives a power cycle. [`Device::sleep`] flushes what the
+//! firmware flushes before deep sleep, [`Device::wake`] starts everything
+//! fresh over the same card, and [`Card::rename`] is a computer moving a book
+//! in between.
 
 #![allow(dead_code)]
 
@@ -56,8 +55,8 @@ pub struct Disk {
 }
 
 impl Disk {
-    /// Blocks written since the card was made, a witness for "nothing was
-    /// rebuilt" that does not depend on log lines.
+    /// Blocks written since the card was made, to check that nothing was
+    /// rebuilt without relying on log lines.
     pub fn writes(&self) -> u64 {
         self.writes.get()
     }
@@ -567,8 +566,8 @@ impl Device {
         device
     }
 
-    /// What the firmware does before deep sleep: put a coalesced position on
-    /// the card. Everything else is RAM, and goes.
+    /// Flush the coalesced position, as the firmware does before deep sleep.
+    /// Everything else is lost with RAM.
     pub fn sleep(mut self) {
         self.settle();
         assert!(

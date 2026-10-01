@@ -720,9 +720,8 @@ fn fold_walk_entry(
 /// finding each next subfolder re-iterates its parent; a directory with `s`
 /// subfolders is read `s + 1` times per pass. That multiplier is the number
 /// to watch before reaching for the derived index.
-/// A book the store was holding by its place that a scan proved moved, and
-/// where to: what [`ReaderStore::follow_move`] needs once the scan's scratch
-/// borrow of the store is over.
+/// A book the store holds by place that the scan proved moved, kept for
+/// [`ReaderStore::follow_move`] once the scan's borrow of the store ends.
 struct FollowedMove {
     was: (u32, u32),
     now: (u32, u32),
@@ -873,9 +872,8 @@ where
     // reset between the two leaves a card whose next scan reports the same
     // move and carries the same place again.
     let mut carry = |found: &upload_store::ledger::FoundAgain<'_>| {
-        // The identity every cache header is bound to is the place's hash
-        // and the size; the key is 28 bits of the same hash. The carry
-        // needs both pairs, to re-bind what it moves.
+        // Cache headers are bound to the place's hash and size, and the key
+        // is 28 bits of that hash. The carry re-binds from one pair to the other.
         let was_hash = proto::cache::source_hash_at(found.was.0, found.was.1, found.was.2);
         let now_hash = proto::cache::source_hash_at(found.now.0, found.now.1, found.now.2);
         let was_key = proto::cache::cache_key_from(was_hash);
@@ -890,8 +888,8 @@ where
             root: found.now.0,
             locator: found.now.1,
         };
-        // The reading or loaded book, named by the place it left: the store
-        // follows it to the new one once the scan returns.
+        // The open or loaded book: the store follows it to its new place
+        // once the scan returns.
         if (was_hash, found.was.2) != (0, 0) && follow.contains(&(was_hash, found.was.2)) {
             let mut locator = String::new();
             if locator.push_str(found.now.1).is_ok() {
@@ -905,12 +903,9 @@ where
         }
         let carry_start = Instant::now();
         let carry_io = crate::sd_stats::snapshot();
-        // A place or a pagination that could not be carried is lost, not a
-        // scan that failed: the copy has its id back either way, and the
-        // book builds again rather than not opening at all. Failing the
-        // scan would let a card that cannot write a cache stop the library
-        // being rebuilt. The markers the carry leaves make the sweep safe
-        // to run over what it did not finish.
+        // A failed carry loses the place or pagination but not the scan: the
+        // copy keeps its id and the book builds again. The carry's markers
+        // keep the sweep safe over whatever it did not finish.
         let carried = reader_cache::files::carry_for_move(
             root,
             &was,
@@ -919,9 +914,8 @@ where
             (was_hash, found.was.2),
             (now_hash, found.now.2),
         );
-        // The saved reader state names its book by place too, and carries
-        // the reading settings: left naming the old place, the next restore
-        // finds no book and the settings with it.
+        // The saved reader state names its book by place and holds the
+        // reading settings, so it moves too or the next restore loses both.
         match reader_cache::files::carry_app_state_for_move(
             root,
             (was_hash, found.was.2),
@@ -936,8 +930,8 @@ where
                 found.now.1
             ),
         }
-        // Each half is reported on its own: a place that would not write
-        // says nothing about the pagination, and the other way round.
+        // Report the place and the pagination separately; one failing says
+        // nothing about the other.
         let (place_ok, place) = match carried.place {
             Ok(carried) => (true, carried),
             Err(_) => (false, false),
@@ -1419,9 +1413,9 @@ pub use reader_cache::browse::Listing;
 /// What the row a reader pressed turned out to be, once the catalog has had
 /// its say about a book.
 ///
-/// `Stale` carries the whole locator, a few hundred bytes, the trade
-/// [`reader_cache::browse::RowChoice`] makes for the same reason: there is no
-/// allocator, and the value lives for one press.
+/// `Stale` carries the whole locator, a few hundred bytes, as
+/// [`reader_cache::browse::RowChoice`] does: there is no allocator, and the
+/// value lives for one press.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum RowChoice {
@@ -1429,9 +1423,9 @@ pub enum RowChoice {
     Entered(Listing),
     /// A book, at this catalog row.
     Book(u16),
-    /// The row named a book the card holds and the catalog does not, which
-    /// is a catalog written before somebody edited the card on a computer.
-    /// The caller rescans and finds this book again by where it is.
+    /// The card holds the row's book and the catalog does not, because the
+    /// card changed on a computer. The caller rescans and finds the book by
+    /// its new place.
     Stale {
         at: BookRoot,
         locator: proto::library_path::LibraryPath,

@@ -134,8 +134,8 @@ pub(crate) fn dismantle_scratch(
         ptr: parts.ptr,
         len: parts.len,
     };
-    // SAFETY: each pointer addresses a distinct 'static allocation whose
-    // only other path was the scratch struct just retired.
+    // SAFETY: each pointer addresses a distinct 'static allocation, reachable
+    // otherwise only through the scratch struct just consumed.
     unsafe {
         SyncLoan {
             heap_a: raw(regions.inflate),

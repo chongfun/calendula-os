@@ -1,9 +1,8 @@
 //! Serial output, routed at esp-println only when `fw` asks for it.
 //!
-//! Both macros type-check their arguments in every feature state, the way
-//! reader-cache's `cache_log!` does, so a wrong placeholder fails the host
-//! build rather than the first firmware build. The `if false` keeps a disabled
-//! line from evaluating operands such as `Instant::now()`.
+//! Both macros type-check their arguments in every feature state, so a wrong
+//! placeholder fails the host build. The `if false` keeps a disabled line from
+//! evaluating operands such as `Instant::now()`.
 
 /// Errors, boot identity and storage narration: always on in firmware.
 #[cfg(feature = "esp-log")]

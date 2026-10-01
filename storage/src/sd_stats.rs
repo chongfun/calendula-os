@@ -1,6 +1,5 @@
-//! Block transactions on their way to the card, for bench telemetry. The
-//! firmware's counting device bumps these; the storage code reads them around
-//! the operations it reports on.
+//! Block transaction counters for bench telemetry. The firmware's counting
+//! device bumps them; the storage code reads them around what it reports.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

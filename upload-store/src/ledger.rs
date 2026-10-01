@@ -880,9 +880,8 @@ pub struct FoundAgain<'a> {
     pub was: (BookRoot, &'a str, u32),
     /// Where it is, as the row that holds it has it.
     pub now: (BookRoot, &'a str, u32),
-    /// The digest this scan computed from the bytes now at `now`, the one
-    /// that proved the move. Handed on so a caller filing things under the
-    /// new place does not read the whole book a second time to learn it.
+    /// The digest that proved the move, computed from the bytes at `now`.
+    /// Callers reuse it instead of hashing the book again.
     pub digest: SourceDigest,
 }
 
@@ -1151,9 +1150,8 @@ where
     let mut slots = 0usize;
     let capacity = (keys.len() / MOVE_ENTRY_BYTES).min(MOVES_CONSIDERED);
     let table = &mut keys[..capacity * MOVE_ENTRY_BYTES];
-    // The digest each slot was matched by, kept as computed rather than in
-    // the byte table: a digest rebuilt from bytes is a record, and a record
-    // proves nothing. Scan-lived, about 3 KB at the bound.
+    // The digest each slot matched, kept as computed. A digest decoded from
+    // the byte table is only a record and proves nothing. About 3 KB.
     let mut proved: [Option<SourceDigest>; MOVES_CONSIDERED] = [None; MOVES_CONSIDERED];
     if let Some(live) = live {
         if missing_records > 0 && new_rows > 0 && capacity > 0 {

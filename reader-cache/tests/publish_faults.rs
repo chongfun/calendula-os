@@ -89,20 +89,15 @@ struct FaultPlan {
     /// does when the card answers none of the reads it makes rather than one
     /// of them. Zero by default, which is the exactly-once model above.
     extra_read_faults: Cell<u32>,
-    /// Fail every write from this one on, counted from the card's first
-    /// write. Power loss, as distinct from a card that refused once: an
-    /// operation whose own recovery writes cannot recover either. The state
-    /// this leaves is what a remount finds.
+    /// Fail every write from this one on, counted from the card's first write.
+    /// This is power loss: recovery writes fail too, and a remount sees the result.
     fail_writes_from: Cell<Option<u32>>,
-    /// Tear the (n+1)th write whose sector begins with one of the reader
-    /// cache headers, landing `tear_write_after` bytes of it, and lose every
-    /// write after: power loss inside a header rewrite. Counting only header
-    /// sectors aims the tear at the in-place identity rewrites rather than at
-    /// directory entries, which have their own recovery story.
+    /// Tear the (n+1)th write to a reader cache header sector after
+    /// `tear_write_after` bytes, and lose every later write. Counting only header
+    /// sectors aims the tear at the identity rewrites, not at directory entries.
     tear_header_write_in: Cell<Option<u32>>,
-    /// Refuse every write to these blocks, for as long as they are listed. A
-    /// sector the card will not rewrite while the rest of it still takes
-    /// writes, so one directory can refuse an update another accepts.
+    /// Refuse every write to these blocks while they are listed, so one directory
+    /// can refuse an update another accepts.
     fail_writes_to: RefCell<Vec<u32>>,
 }
 
@@ -4929,9 +4924,8 @@ fn a_row_reused_by_a_rescan_closes_out_the_loaded_book_under_that_number() {
 // Pagination follows a proven move
 // ---------------------------------------------------------------------------
 
-/// Where the book is after a computer moved it: another key, another locator,
-/// the same bytes. The key is opaque to the carry, so a fixed one reads
-/// better than a hashed one here.
+/// The book's place after a computer moved it: another key and locator, the
+/// same bytes. The carry treats the key as opaque, so a fixed one is fine.
 const NOW: proto::cache::CacheOwner<'static> = proto::cache::CacheOwner {
     key: "MOVEDTO1",
     root: proto::library_path::BookRoot::Library,
@@ -4951,9 +4945,8 @@ const STRANGER_AT_OLD: proto::cache::CacheOwner<'static> = proto::cache::CacheOw
     locator: "Other/Stranger.epub",
 };
 
-/// The identity a book at `owner`'s place is loaded under: the place's hash
-/// and the size, as the catalog row carries it after a scan. The fixture's
-/// headers are written under `IDENTITY`, which stands for the old place, and
+/// The identity a book at `owner`'s place loads under, as a scan's catalog row
+/// carries it. The fixture writes headers under `IDENTITY`, the old place, and
 /// the carry has to re-bind them to this.
 fn identity_at(owner: &proto::cache::CacheOwner<'_>) -> (u32, u32) {
     (
@@ -4962,9 +4955,8 @@ fn identity_at(owner: &proto::cache::CacheOwner<'_>) -> (u32, u32) {
     )
 }
 
-/// A published book under `OWNER`, with a cover: three sections, an index, a
-/// cover, no content stream and no chapter list, so the carry has exactly
-/// five entries to move. Returns the records and the page total.
+/// A published book under `OWNER`: three sections, an index and a cover, so the
+/// carry moves exactly five entries. Returns the records and the page total.
 fn published_book(root: &Dir<'_>, store: &mut ReaderStore) -> (Vec<BookV2SectionRecord>, u32) {
     let records = build_book(root, store, 3);
     write_cover(root);
@@ -4993,8 +4985,7 @@ fn cluster_of(dir: &Dir<'_>, name: &str) -> Option<embedded_sdmmc::ClusterId> {
         .map(|entry| entry.cluster)
 }
 
-/// Every data name the carry moves, with the section names the fixture's
-/// three sections take.
+/// Every data name the carry moves, including the fixture's three sections.
 fn carried_names() -> Vec<(bool, String)> {
     let mut names: Vec<(bool, String)> = (0..3u16).map(|n| (true, section_name(n))).collect();
     for name in [
@@ -5027,25 +5018,21 @@ fn carried_clusters(root: &Dir<'_>, key: &str) -> Vec<Option<embedded_sdmmc::Clu
         .collect()
 }
 
-/// Whether a chain's first cluster is still allocated. A freed cluster reads
-/// as free in the FAT, which the chain walk refuses to follow; an allocated
-/// one answers with its successor or with the end of the chain. This is the
-/// check that catches a double free, which in-memory bytes cannot: nothing
-/// overwrites a freed cluster until something else is allocated onto it.
+/// Whether a chain's first cluster is still allocated. This catches a double
+/// free, which file contents cannot show until something reuses the cluster.
 fn chain_is_allocated(root: &Dir<'_>, cluster: embedded_sdmmc::ClusterId) -> bool {
     root.next_cluster_in_chain(cluster).is_ok()
 }
 
-/// Nothing on the card holds two names for one chain across the two keys,
-/// except as the pair a cut move leaves, which the carry and the reclaims
-/// both know how to finish. Returns how many such pairs there are.
+/// Count the twins between `KEY` and `NOW.key`: chains with one name under each,
+/// as a cut move leaves them.
 fn twin_pairs(root: &Dir<'_>) -> usize {
     twin_pairs_between(root, KEY, NOW.key)
 }
 
 /// How many chains two keys name in common, whatever the names. After a
-/// rebuild the same name may stand under both keys on chains of their own,
-/// which is not a twin; what may not remain is one chain under two keys.
+/// rebuild the same name may exist under both keys on separate chains, and that
+/// is fine.
 fn shared_chains(root: &Dir<'_>, a: &str, b: &str) -> usize {
     let left = carried_clusters(root, a);
     let right = carried_clusters(root, b);
@@ -5090,9 +5077,9 @@ fn marker_present(root: &Dir<'_>, key: &str, ext: &str) -> bool {
 const FORWARD_MARKER: &str = "MVD";
 const BACK_MARKER: &str = "LNK";
 
-/// Arm the card for probe `probe` of a sweep over an operation that starts
-/// after `base` writes. `cut` is power loss from that write on; otherwise the
-/// card refuses that one write and answers again.
+/// Arm the card for probe `probe` of an operation that starts after `base`
+/// writes. `cut` is power loss from that write on; otherwise the card refuses
+/// that one write and recovers.
 fn arm_write_fault(disk: &SharedDisk, base: u32, probe: u32, cut: bool) {
     if cut {
         disk.fault.fail_writes_from.set(Some(base + probe));
@@ -5113,8 +5100,8 @@ fn write_fault_fired(disk: &SharedDisk, base: u32, probe: u32, cut: bool) -> boo
     fired
 }
 
-/// The book loads whole under `owner`: the index reads back with the page
-/// total it was published with, and the page inside the last section reads.
+/// Assert the book loads under `owner`: the index has the published page total
+/// and a page in the last section reads.
 fn assert_loads_under(
     root: &Dir<'_>,
     owner: &proto::cache::CacheOwner<'_>,
@@ -5145,10 +5132,9 @@ fn assert_loads_under(
     );
 }
 
-/// The whole carry, clean. Every entry moves by directory entry and keeps
-/// its chain, the book loads under the new key and is gone from the old, the
-/// departed claim is untouched, the destination records the digest that
-/// proved the move, and no marker outlives a settled carry.
+/// A clean carry moves every entry by directory entry, keeping its chain. The
+/// book loads under the new key only, the departed claim is untouched, the
+/// destination records the proving digest, and no marker remains.
 #[test]
 fn a_proven_move_carries_the_pagination_by_entry() {
     let disk = new_card();
@@ -5184,9 +5170,8 @@ fn a_proven_move_carries_the_pagination_by_entry() {
         carried_clusters(&root, KEY).iter().all(Option::is_none),
         "nothing carried is left under the old key"
     );
-    // Directory writes only: two per move, the claim, two markers written
-    // and removed, and directory growth. Well under what one section's
-    // bytes would take.
+    // Directory writes only: two per move, the claim, two markers written and
+    // removed, and directory growth.
     let writes = disk.writes.get() - writes_before;
     assert!(writes < 64, "a carry by entry took {writes} writes");
 
@@ -5245,14 +5230,10 @@ fn a_proven_move_carries_the_pagination_by_entry() {
     assert_eq!(twin_pairs(&root), 0);
 }
 
-/// Every write the carry makes is failed in turn, under both faults a card
-/// can present: one refused write with the card answering afterwards, and
-/// power loss from that write on. The card is remounted as a reset leaves it
-/// and the retry has to finish the job: the whole set under the new key,
-/// nothing under the old, no chain with two names, no marker left, every
-/// carried chain still allocated. Along the way no state may hold a name in
-/// both directories on different chains, and the index must not be under
-/// the new key without every section beside it.
+/// Fail each carry write in turn, as a refused write and as power loss, then
+/// remount and retry. The retry must finish: everything under the new key, no
+/// shared chains, no markers, every chain allocated. No intermediate state may
+/// show the index under the new key without all its sections.
 #[test]
 fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
     for cut in [false, true] {
@@ -5307,8 +5288,8 @@ fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
                         "cut {cut} probe {probe}: the index is under the new key before every section"
                     );
                 }
-                // An index that reads under the new place vouches for its
-                // sections: every one of them must read under it too.
+                // An index that reads under the new place requires every section to
+                // read under it too.
                 let mut probe_store = new_store();
                 let index_reads_under_new =
                     files::load_v2_book_index(&root, &NOW, identity_at(&NOW), &mut probe_store)
@@ -5388,8 +5369,7 @@ fn a_carry_cut_at_any_write_is_finished_by_the_retry() {
     }
 }
 
-/// Find a cut that leaves one chain under two names, remounted. Returns the
-/// disk in that state.
+/// Return a remounted disk where a cut left one chain under two names.
 fn torn_carry() -> SharedDisk {
     for probe in 0..200u32 {
         let disk = new_card();
@@ -5424,10 +5404,8 @@ fn torn_carry() -> SharedDisk {
     panic!("no cut left a chain under two names");
 }
 
-/// The sweep reaches the departed side of a cut carry. Its forward marker
-/// says where the files went, so the names that share a chain with the
-/// destination are taken away and the rest reclaimed, and every chain the
-/// destination holds stays allocated.
+/// Reclaiming the departed side of a cut carry follows its forward marker: it
+/// unlinks the names shared with the destination and frees only the rest.
 #[test]
 fn reclaiming_the_departed_side_of_a_torn_carry_spares_the_destinations_chains() {
     let disk = torn_carry();
@@ -5467,11 +5445,9 @@ fn reclaiming_the_departed_side_of_a_torn_carry_spares_the_destinations_chains()
     }
 }
 
-/// The other order: the destination of a cut carry is reclaimed first, as it
-/// would be if the book moved again before the carry settled. Its back marker
-/// names the departed side, the shared names are taken away from the
-/// destination, and every chain the departed side still holds stays
-/// allocated. Whichever side a sweep reaches first, the answer is the same.
+/// Reclaiming the destination first, as when the book moves again before the
+/// carry settles, follows its back marker and spares the departed side's
+/// chains. Either order gives the same result.
 #[test]
 fn reclaiming_the_destination_of_a_torn_carry_spares_the_departed_sides_chains() {
     let disk = torn_carry();
@@ -5501,9 +5477,8 @@ fn reclaiming_the_destination_of_a_torn_carry_spares_the_departed_sides_chains()
     }
 }
 
-/// A stranger adopting the departed key empties it through the same
-/// twin-aware clear, so an adoption cannot free a chain the destination
-/// holds either.
+/// A stranger adopting the departed key empties it with the same twin-aware
+/// clear, so it cannot free a chain the destination holds.
 #[test]
 fn an_adoption_over_a_torn_carry_unlinks_before_it_empties() {
     let disk = torn_carry();
@@ -5532,8 +5507,8 @@ fn an_adoption_over_a_torn_carry_unlinks_before_it_empties() {
     }
 }
 
-/// A destination key another book holds is refused, and the refusal leaves
-/// the old side exactly as it was: nothing moved, no marker written.
+/// A carry into a key another book holds is refused, leaving the old side
+/// untouched and no marker written.
 #[test]
 fn a_stranger_holding_the_destination_key_refuses_the_carry() {
     let disk = new_card();
@@ -5570,8 +5545,8 @@ fn a_stranger_holding_the_destination_key_refuses_the_carry() {
     );
 }
 
-/// No cache under the old key is nothing to carry, and the destination is
-/// not touched for it: no directory, no claim, no marker.
+/// With no cache under the old key there is nothing to carry, and the
+/// destination gets no directory, claim or marker.
 #[test]
 fn a_key_with_no_cache_carries_nothing_and_claims_nothing() {
     let disk = new_card();
@@ -5593,8 +5568,8 @@ fn a_key_with_no_cache_carries_nothing_and_claims_nothing() {
         "no destination was made"
     );
 
-    // A claimed directory with a position and nothing rebuildable is the
-    // same answer: positions are not the carry's, and there is no cache.
+    // A claimed directory holding only a position gives the same answer:
+    // positions are not the carry's to move.
     files::write_position_file(&root, &OWNER, 2, 20).expect("position");
     assert_eq!(
         files::carry_pagination(
@@ -5610,9 +5585,9 @@ fn a_key_with_no_cache_carries_nothing_and_claims_nothing() {
     assert!(book_dir_by_key(&root, NOW.key).is_none());
 }
 
-/// The whole move as the scan drives it: the file now at the new locator is
-/// read, the digest it yields becomes the destination's evidence, and both
-/// the legacy position and the pagination arrive under the new key.
+/// The move as the scan drives it: the file at the new locator is read, its
+/// digest becomes the destination's evidence, and the legacy position and the
+/// pagination arrive under the new key.
 #[test]
 fn carry_for_move_reads_the_file_now_there_and_carries_place_and_pagination() {
     let disk = new_card();
@@ -5679,12 +5654,10 @@ const THIRD: proto::cache::CacheOwner<'static> = proto::cache::CacheOwner {
     locator: "Else/Test.epub",
 };
 
-/// A carry cut short, committed by the ledger without a retry, and then the
-/// book moves again. The second carry finds a back marker on its source and
-/// settles the earlier pair before forwarding anything, so the third key
-/// shares no chain with the first, and reclaiming either earlier key leaves
-/// every chain under the third allocated. Without the settle, the twins
-/// would travel on with no marker joining the first key to the third.
+/// A cut carry the ledger committed without a retry, then a second move. The
+/// second carry settles the earlier twins before forwarding, so the third key
+/// shares no chain with the first, and reclaiming either earlier key leaves the
+/// third key's chains allocated.
 #[test]
 fn a_second_move_after_an_unsettled_carry_leaves_the_third_key_whole() {
     let disk = torn_carry();
@@ -5757,11 +5730,9 @@ fn a_second_move_after_an_unsettled_carry_leaves_the_third_key_whole() {
     }
 }
 
-/// Every read the retry makes over a cut carry is failed in turn. Whatever
-/// the retry answers, it may not take a marker away while a chain still has
-/// two names: a read the card refused is not evidence that a name is absent,
-/// and absence is what removes the markers. A retry that does answer with a
-/// carry has finished the job.
+/// Fail each read the retry makes over a cut carry in turn. A refused read is
+/// not proof a name is absent, so the retry must keep the markers while a chain
+/// has two names. A retry that reports a carry must have finished it.
 #[test]
 fn a_read_fault_on_the_retry_cannot_remove_the_markers_while_a_twin_stands() {
     let mut refused = 0usize;
@@ -5819,8 +5790,7 @@ fn a_read_fault_on_the_retry_cannot_remove_the_markers_while_a_twin_stands() {
     assert!(refused > 0, "no read in the retry could be failed");
 }
 
-/// A published book under `owner`, written as the build writes one, bound to
-/// `identity`: the shape [`published_book`] has for `OWNER`, for any owner.
+/// [`published_book`] for any owner, bound to `identity`.
 fn published_book_under(
     root: &Dir<'_>,
     store: &mut ReaderStore,
@@ -5928,9 +5898,9 @@ fn header_identities_under(root: &Dir<'_>, key: &str) -> (Option<Identity>, Vec<
     (index, identities)
 }
 
-/// The two things a cut inside the re-binding must leave true, read off the
-/// card: an index bound to the new place has every present section bound to
-/// it too, and the back marker stands until every header is.
+/// Assert what a cut inside the re-binding must leave: an index bound to the new
+/// place has every present section bound to it, and the back marker stays until
+/// every header is.
 fn assert_rebinding_invariants(root: &Dir<'_>, context: &str) {
     let new = identity_at(&NOW);
     let (index, sections) = header_identities_under(root, NOW.key);
@@ -5954,14 +5924,9 @@ fn assert_rebinding_invariants(root: &Dir<'_>, context: &str) {
     }
 }
 
-/// A power cut inside a header rewrite lands part of one sector. The old
-/// and new sectors differ only in the four hash bytes, so what is left is a
-/// valid header carrying an identity that is neither place. The tear is
-/// aimed at every byte offset through both hash fields, for each header the
-/// carry rewrites, and after a remount the retry has to re-bind it: every
-/// header under the new key reads with the new identity, the index is bound
-/// to the new place only once every section is, and the back marker stands
-/// until then.
+/// Tear each header rewrite at every byte of the hash fields. The torn header
+/// stays valid but names neither place. After a remount the retry must re-bind
+/// every header, binding the index last and keeping the back marker until done.
 #[test]
 fn a_tear_inside_a_header_rewrite_is_finished_by_the_retry() {
     let mut torn = 0usize;
@@ -6040,12 +6005,9 @@ fn a_tear_inside_a_header_rewrite_is_finished_by_the_retry() {
     assert!(torn > 0, "no header write was torn, so nothing was tested");
 }
 
-/// The book is opened at its new place while the carry that brought it
-/// there is unsettled, and a build writes under the new key. A build
-/// truncates the files it rewrites, and truncating a name whose chain the
-/// departed key still holds frees what that key still names. The writer's
-/// claim settles the twins first, so the departed key keeps only chains of
-/// its own, and reclaiming it afterwards leaves the rebuilt book whole.
+/// A build at the new place over an unsettled carry truncates files whose
+/// chains the departed key may still name. The writer's claim settles the twins
+/// first, so reclaiming the departed key afterwards leaves the rebuilt book whole.
 #[test]
 fn a_rebuild_over_an_unsettled_carry_settles_the_twins_first() {
     let disk = torn_carry();
@@ -6095,9 +6057,8 @@ fn a_rebuild_over_an_unsettled_carry_settles_the_twins_first() {
     assert_loads_under(&root, &NOW, identity_at(&NOW), pages, records[2].start_page);
 }
 
-/// Every chain named by a file under `key`, whatever the file is called:
-/// the book-level files and everything in `SECTIONS/`. Zero-length files
-/// name no chain and are left out.
+/// Every chain a file under `key` names, including `SECTIONS/`. Zero-length
+/// files name no chain.
 fn all_clusters_under(root: &Dir<'_>, key: &str) -> Vec<embedded_sdmmc::ClusterId> {
     let Some(book) = book_dir_by_key(root, key) else {
         return Vec::new();
@@ -6128,8 +6089,8 @@ fn shared_chains_all(root: &Dir<'_>, a: &str, b: &str) -> usize {
         .count()
 }
 
-/// A carry from `OWNER` to `NOW` cut by power loss, over a book `setup`
-/// laid down, remounted, in the first cut state `accept` agrees to.
+/// Cut a carry from `OWNER` to `NOW` by power loss over the book `setup` wrote,
+/// and return the first remounted state `accept` agrees to.
 fn torn_carry_where(
     setup: &dyn Fn(&Dir<'_>, &mut ReaderStore),
     accept: &dyn Fn(&Dir<'_>) -> bool,
@@ -6167,14 +6128,10 @@ fn torn_carry_where(
     panic!("no cut left the state the test needs");
 }
 
-/// The open at the new place under a third layout runs the layout eviction
-/// before the build claims the directory, and eviction reclaims section
-/// files. Over a carry cut with twins remaining, that reclaimed a chain the
-/// departed key still named, and the settle that came later found no twin
-/// left to recognise. Eviction now opens the directory as a writer, which
-/// settles first: after it, no file under either key names a free cluster,
-/// the two keys share no chain, and reclaiming the departed key afterwards
-/// leaves every chain under the new key allocated.
+/// Layout eviction runs before the build claims the directory and reclaims
+/// section files. It opens the directory as a writer, which settles the twins
+/// first, so no file under either key names a free cluster and reclaiming the
+/// departed key leaves the new key's chains allocated.
 #[test]
 fn a_layout_eviction_over_an_unsettled_carry_settles_the_twins_first() {
     let disk = torn_carry_where(&two_layout_book, &|root| {
@@ -6250,9 +6207,9 @@ fn fat16_geometry(disk: &SharedDisk) -> (u32, u32) {
     )
 }
 
-/// Every file under `key` whose chain is shorter than its size says, by name.
-/// A truncate keeps a chain's first cluster and frees the rest, so a twin
-/// truncated from the other side shows up here and not in the first cluster.
+/// Every file under `key` whose chain is shorter than its size, by name. A
+/// truncate keeps the first cluster and frees the rest, so this catches a twin
+/// truncated from the other side.
 fn broken_chains_under(disk: &SharedDisk, root: &Dir<'_>, key: &str) -> Vec<String> {
     let cluster_bytes = fat16_geometry(disk).1 * BLOCK_BYTES as u32;
     let Some(book) = book_dir_by_key(root, key) else {
@@ -6290,9 +6247,7 @@ fn broken_chains_under(disk: &SharedDisk, root: &Dir<'_>, key: &str) -> Vec<Stri
         .collect()
 }
 
-/// Every block of every directory under `key`: the book directory and its
-/// sections directory, read from the FAT16 geometry the card was formatted
-/// with.
+/// Every block of the book directory and its sections directory under `key`.
 fn directory_blocks_under(disk: &SharedDisk, root: &Dir<'_>, key: &str) -> Vec<u32> {
     let (data_start, per_cluster) = fat16_geometry(disk);
     let book = book_dir_by_key(root, key).expect("the directory is there");
@@ -6340,15 +6295,14 @@ fn two_layout_book(root: &Dir<'_>, store: &mut ReaderStore) {
     );
 }
 
-/// The failure tails of a publish clear the layout they were building, and
-/// they are often failing because the writer's settle was refused. A card
-/// that will not update the departed directory refuses the settle, and the
-/// cleanup has to leave both sides alone rather than free the chains the
-/// departed key still names. Once the card answers, the next writer settles.
+/// A failed publish clears the layout it was building, often because the
+/// writer's settle was refused. While the card refuses to update the departed
+/// directory, the cleanup must free nothing. Once the card answers, the next
+/// writer settles.
 #[test]
 fn a_failed_publish_cleanup_over_a_refused_settle_frees_nothing() {
-    // A section chain under both keys that is longer than one cluster: the
-    // truncate keeps a first cluster, so only a longer chain loses anything.
+    // A section chain longer than one cluster under both keys, since a truncate
+    // keeps the first cluster.
     let disk = torn_carry_where(&two_layout_book, &|root| {
         marker_present(root, KEY, FORWARD_MARKER)
             && marker_present(root, NOW.key, BACK_MARKER)
@@ -6423,10 +6377,8 @@ fn a_failed_publish_cleanup_over_a_refused_settle_frees_nothing() {
     );
 }
 
-/// A book opened for the first time has no cache directory, and nothing to
-/// evict or settle. Eviction says it is within the bound, so the build that
-/// follows writes its index; refusing here would leave every new book
-/// without a fast path.
+/// A first-time book has no cache directory. Eviction must report it within the
+/// bound, or the build skips the index and the book has no fast path.
 #[test]
 fn eviction_for_a_book_with_no_cache_directory_is_within_the_bound() {
     let disk = new_card();
@@ -6469,9 +6421,9 @@ fn saved_state(identity: (u32, u32)) -> proto::nvm::AppStateRecord {
     }
 }
 
-/// The saved state names its book by place, so a proven move re-keys it to
-/// the new place: the next restore then finds the book, and the reading
-/// settings that travel with it. Everything else in the record is kept.
+/// The saved state names its book by place, so a proven move re-keys it and
+/// the next restore finds the book and its settings. The rest of the record is
+/// kept.
 #[test]
 fn a_proven_move_re_keys_the_saved_state_that_names_the_old_place() {
     let disk = new_card();
@@ -6490,10 +6442,8 @@ fn a_proven_move_re_keys_the_saved_state_that_names_the_old_place() {
     assert_eq!(files::read_state_file(&root), Some(saved_state(now)));
 }
 
-/// State about another book, and no state at all, are none of the move's
-/// business. (A legacy record cannot be written here: the flag is derived
-/// from an older version byte at decode, and the writer writes the current
-/// version.)
+/// State about another book, or no state, is left alone. A legacy record cannot
+/// be built here, since the writer always writes the current version.
 #[test]
 fn a_proven_move_leaves_saved_state_about_anything_else_alone() {
     let disk = new_card();

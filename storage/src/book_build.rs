@@ -225,9 +225,8 @@ pub struct RawParts {
     pub len: usize,
 }
 
-/// Every region of the reader's scratch memory, for a caller retiring the
-/// scratch to hand its memory on for good: the firmware's sync session, which
-/// loans it to the radio until the reset that ends the session.
+/// Every region of the reader's scratch memory. The firmware's sync session
+/// loans them to the radio until the reset that ends the session.
 #[derive(Clone, Copy, Debug)]
 pub struct ScratchRegions {
     pub xhtml: RawParts,
@@ -242,9 +241,9 @@ pub struct ScratchRegions {
 }
 
 impl ReaderCacheScratch<'static> {
-    /// Retire the scratch into the raw parts of its backing memory. Only the
-    /// pointers come out: each addresses a distinct `'static` allocation
-    /// whose only other path was this scratch, which the caller gives up.
+    /// Consume the scratch into the raw parts of its backing memory. Each
+    /// pointer addresses a distinct `'static` allocation that only this
+    /// scratch reached.
     pub fn into_raw_regions(&'static mut self) -> ScratchRegions {
         let decoder = match self.zip_inflate.take_decompressor() {
             Some(decompressor) => RawParts {
