@@ -119,3 +119,35 @@ pub fn donate_heap(heap_a: RawRegion, heap_b: RawRegion, heap_c: RawRegion) {
         }
     }
 }
+
+/// Tears the built scratch down into the raw regions the sync session
+/// loans to the radio. One-way: the regions alias the scratch's borrowed
+/// arrays, the separate inflate decoder static, and its own struct storage
+/// (the inflate window is the bulk of it), so the scratch must never be used
+/// as a scratch again — only the session-ending software reset brings the
+/// reader pipeline back.
+pub(crate) fn dismantle_scratch(
+    scratch: &'static mut storage::book_build::ReaderCacheScratch<'static>,
+) -> SyncLoan {
+    let regions = scratch.into_raw_regions();
+    let raw = |parts: storage::book_build::RawParts| RawRegion {
+        ptr: parts.ptr,
+        len: parts.len,
+    };
+    // SAFETY: each pointer addresses a distinct 'static allocation whose
+    // only other path was the scratch struct just retired.
+    unsafe {
+        SyncLoan {
+            heap_a: raw(regions.inflate),
+            heap_b: raw(regions.xhtml),
+            heap_c: raw(regions.decoder),
+            tcp_rx: core::slice::from_raw_parts_mut(regions.opf.ptr, regions.opf.len),
+            tcp_tx: core::slice::from_raw_parts_mut(regions.compressed.ptr, regions.compressed.len),
+            http_a: core::slice::from_raw_parts_mut(regions.container.ptr, regions.container.len),
+            http_b: core::slice::from_raw_parts_mut(regions.tail.ptr, regions.tail.len),
+            wifi: None,
+            wifi_hint: None,
+            catalog_len: 0,
+        }
+    }
+}

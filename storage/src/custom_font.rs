@@ -24,7 +24,7 @@ use ui::custom_font::{MetricRecord, PackReader, PackSource};
 
 /// The metric cache is pure RAM bookkeeping, so it lives with the
 /// measurement logic in `ui`; firmware keeps the name it has always used.
-pub(crate) use ui::custom_font::MetricCache;
+pub use ui::custom_font::MetricCache;
 
 const MAX_ROW_BYTES: usize = 32;
 /// Whole-glyph read ceiling for the draw path: 32 row bytes x 256 rows is
@@ -110,7 +110,7 @@ where
 // deliberately separate so the caller's cursor state stays the only owner
 // of layout context; bundling them would just invent a one-use struct.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn for_each_metric<
+pub fn for_each_metric<
     D,
     T,
     const MAX_DIRS: usize,
@@ -140,7 +140,7 @@ pub(crate) fn for_each_metric<
     );
 }
 
-pub(crate) fn draw_reading_page_body<
+pub fn draw_reading_page_body<
     D,
     T,
     const MAX_DIRS: usize,

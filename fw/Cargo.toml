@@ -23,7 +23,7 @@ default = ["serial-log"]
 # book_build's build chatter, and fw still hard-enables reader-cache/esp-log.
 # So a cold build or boot is only partly reduced. Extending it is mechanical;
 # the seam is what needed to exist first.
-serial-log = []
+serial-log = ["storage/serial-log"]
 # Temporary on-device validation of the flash + otadata path without an SD card:
 # on first boot, copy the running image into the inactive slot and switch
 # otadata to it. Never enabled in a release build. See fw::ota_update.
@@ -36,7 +36,7 @@ ota-selftest = []
 # validation; SD card power stays up, so card-level power-loss physics
 # still need the bench rig. Never enabled in a release build.
 # See fw::powercut and tools/powercut_campaign.py.
-powercut-selftest = []
+powercut-selftest = ["storage/powercut-selftest"]
 # Device-driven bench scenarios: presses buttons from a task so a timing
 # capture runs unattended, with cadence taken from the settle rather than a
 # host timer. bench.py only listens, so every suite has been operator-driven
@@ -45,10 +45,10 @@ powercut-selftest = []
 # calibrate that offset against a hand-pressed run before quoting a number
 # from this path. Never enabled in a release build.
 # See fw::bench_selftest and docs/agents/bench.md.
-bench-selftest = ["hal-ext/bench-selftest", "upload-store/bench-selftest"]
+bench-selftest = ["hal-ext/bench-selftest", "upload-store/bench-selftest", "storage/bench-selftest"]
 # Build for the Xteink X3 (792x528 UC8253 panel, BQ27220 battery gauge).
 # Off = Xteink X4, the default. See docs/plans/2026-07-06-x3-support-plan.md.
-device-x3 = ["display/device-x3", "reader-cache/device-x3"]
+device-x3 = ["display/device-x3", "reader-cache/device-x3", "storage/device-x3"]
 # Compile a generated custom typeface into firmware. Requires
 # display/src/custom_generated.rs, produced by tools/font_pack_to_rust.py.
 builtin-custom-font = ["display/builtin-custom-font"]
@@ -61,6 +61,7 @@ proto = { path = "../proto" }
 hal-ext = { path = "../hal-ext" }
 upload-store = { path = "../upload-store" }
 reader-cache = { path = "../reader-cache", features = ["esp-log"] }
+storage = { path = "../storage", features = ["esp-log"] }
 
 embassy-executor  = "0.10.0"
 embassy-time      = "0.5.1"

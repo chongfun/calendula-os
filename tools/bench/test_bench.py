@@ -4331,7 +4331,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
     def test_every_firmware_result_token_is_known_to_the_host(self) -> None:
         """The two sides agree on the vocabulary, or a token means nothing."""
         source = Path(bench.__file__).read_text(encoding="utf-8")
-        firmware = Path(__file__).resolve().parents[2] / "fw" / "src" / "library_sd.rs"
+        firmware = Path(__file__).resolve().parents[2] / "storage" / "src" / "library_sd.rs"
         emitted = set(re.findall(r'Self::\w+ => "(\w+)"', firmware.read_text(encoding="utf-8")))
         self.assertTrue(emitted, "no result tokens found -- the scan is broken")
         # "hit" is produced by the caller rather than the fault enum.

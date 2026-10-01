@@ -1305,8 +1305,9 @@ interfaces:
 ```text
 fw::board_guard         wrong-board refusal: SD diagnostic, then halt
 fw::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sleep
-fw::library_sd          FAT scan, SD chip-select handling, and file discovery
-fw::sd_session          SD session open/close and the upload write pump
+storage::library_sd     FAT scan, catalog, ledger and move carry (host-tested)
+storage::book_build     book open, cache build and replay, saved state (host-tested)
+fw::sd_session          SD session open/close, the storage::card::Card impl, uploads
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
 fw::reader_cache_files  cache/state/credential/label file records on the card
 fw::reader_layout       page indexing, line wrapping, style markers, measurements

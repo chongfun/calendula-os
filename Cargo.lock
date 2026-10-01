@@ -526,6 +526,7 @@ dependencies = [
  "critical-section",
  "document-features",
  "embassy-time-driver",
+ "embassy-time-queue-utils",
  "embedded-hal 0.2.7",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
@@ -1150,6 +1151,7 @@ dependencies = [
  "proto",
  "reader-cache",
  "static_cell",
+ "storage",
  "ui",
  "upload-store",
 ]
@@ -1791,6 +1793,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0530892bb4fa575ee0da4b86f86c667132a94b74bb72160f58ee5a4afec74c23"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "storage"
+version = "0.1.0"
+dependencies = [
+ "app-core",
+ "critical-section",
+ "display",
+ "embassy-time",
+ "embedded-sdmmc",
+ "esp-println",
+ "fatfs",
+ "heapless 0.9.3",
+ "proto",
+ "reader-cache",
+ "ui",
+ "upload-store",
 ]
 
 [[package]]

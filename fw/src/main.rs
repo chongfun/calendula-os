@@ -133,12 +133,12 @@ mod log;
 #[cfg(feature = "bench-selftest")]
 pub mod bench_selftest;
 mod board_guard;
-mod book_build;
 pub mod catalog;
-mod custom_font;
 mod display_flush;
+// The storage half of the display task, host-tested in its own crate; kept
+// at these paths so the rest of the firmware names them as it always has.
+pub(crate) use storage::{book_build, custom_font, library_sd};
 mod hw_sha;
-mod library_sd;
 mod mmu;
 mod ota_update;
 #[cfg(feature = "powercut-selftest")]
@@ -151,6 +151,15 @@ mod sync_mem;
 pub mod tasks;
 pub mod upload;
 mod views;
+
+/// What the storage code needs from the chip: the SHA unit, the hardware
+/// random source, and a campaign build's recovery report.
+static STORAGE_PLATFORM: storage::platform::Platform = storage::platform::Platform {
+    with_sha256: |f| hw_sha::with_sha256(|engine| f(engine)),
+    random_u32: || esp_hal::rng::Rng::new().random(),
+    #[cfg(feature = "powercut-selftest")]
+    report_install_recovery: powercut::report_recovery,
+};
 
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
 pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
@@ -373,6 +382,7 @@ fn main() -> ! {
     let mut peripherals = esp_hal::init(config);
     esp_println::println!("calendula-os: boot");
     hw_sha::install(esp_hal::sha::Sha::new(peripherals.SHA));
+    storage::platform::install(&STORAGE_PLATFORM);
 
     // Deep sleep is terminal, so waking is this cold boot; the RTC wake
     // cause and RTC RAM are its only trace. Fast wake needs both: the

@@ -132,7 +132,12 @@ fn resolve_pending_place(
     let index = waiting.index;
     let landed = waiting.hold.landed();
     let place = waiting.place;
-    match book_build::resolve_place(epd, sd_cs, sd_library, index as usize, place) {
+    match book_build::resolve_place(
+        &mut crate::sd_session::card(epd, sd_cs),
+        sd_library,
+        index as usize,
+        place,
+    ) {
         book_build::PlaceTarget::Page(target) => {
             if load_target_page(
                 epd,
@@ -253,8 +258,7 @@ fn load_target_page(
     }
     let scratch = ensure_epub_scratch(epub_scratch);
     let outcome = book_build::build_or_load_book_cache(
-        epd,
-        sd_cs,
+        &mut crate::sd_session::card(epd, sd_cs),
         sd_library,
         index as usize,
         0,
@@ -660,7 +664,10 @@ pub async fn run(
                     }
                     if let Some(job) = &mut pending_evidence {
                         let place = job.place().clone();
-                        match book_build::continue_source_evidence(&mut epd, &mut sd_cs, job) {
+                        match book_build::continue_source_evidence(
+                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                            job,
+                        ) {
                             book_build::EvidenceStep::Continued => {}
                             // Settled either way: a copy the card would not
                             // give up is not asked for again in this
@@ -694,8 +701,7 @@ pub async fn run(
                     .map_or(0, |request| request.page);
                 let scratch = ensure_epub_scratch(&mut epub_scratch);
                 let step = book_build::continue_book_build(
-                    &mut epd,
-                    &mut sd_cs,
+                    &mut crate::sd_session::card(&mut epd, &mut sd_cs),
                     sd_library,
                     reader_page,
                     scratch,
@@ -884,8 +890,7 @@ pub async fn run(
                         // window over the flat catalog: slide the page over
                         // the rows this render will show.
                         crate::library_sd::ensure_folder_page(
-                            &mut epd,
-                            &mut sd_cs,
+                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
                             sd_library,
                             request.selection,
                             app_core::is_portrait(request.orientation),
@@ -894,15 +899,16 @@ pub async fn run(
                         if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
                             if content_context_changed {
                                 crate::library_sd::load_active_entry(
-                                    &mut epd, &mut sd_cs, sd_library, index,
+                                    &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                                    sd_library,
+                                    index,
                                 );
                             }
                             // Long TOCs are windowed like the catalog; slide
                             // the window over the rows this render will show.
                             if request.view == AppView::Chapters && sd_library.text_holds_toc() {
                                 book_build::ensure_toc_window(
-                                    &mut epd,
-                                    &mut sd_cs,
+                                    &mut crate::sd_session::card(&mut epd, &mut sd_cs),
                                     sd_library,
                                     index,
                                     request.selection as usize,
@@ -1001,8 +1007,7 @@ pub async fn run(
                     // promise that (see DisplayEvent::Settled).
                     let chapter_cursor = if request.view == AppView::Reading {
                         book_build::track_reading_chapter(
-                            &mut epd,
-                            &mut sd_cs,
+                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
                             request.page,
                             sd_library,
                         )
@@ -1875,15 +1880,16 @@ fn handle_storage_command(
             // the session ends in a reset, so there is nothing left to schedule.
             *background_build = None;
             sync_session.loan_granted();
-            let mut loan = book_build::dismantle_scratch(scratch);
-            let stored_wifi = book_build::load_wifi_credentials(epd, sd_cs);
+            let mut loan = crate::sync_mem::dismantle_scratch(scratch);
+            let stored_wifi =
+                book_build::load_wifi_credentials(&mut crate::sd_session::card(epd, sd_cs));
             // The hint is matched against the credentials here rather than in
             // the wifi task, because this is the one place holding both
             // records — and a hint for another network must never steer this
             // join. A mismatch is not an error; it just means scan.
             loan.wifi_hint = stored_wifi.as_ref().and_then(|creds| {
                 let ssid = &creds.ssid[..creds.ssid_len.min(32) as usize];
-                book_build::load_wifi_ap_hint(epd, sd_cs)
+                book_build::load_wifi_ap_hint(&mut crate::sd_session::card(epd, sd_cs))
                     .filter(|hint| hint.matches_ssid(ssid))
                     .map(|hint| app_core::WifiApHint {
                         bssid: hint.bssid,
@@ -1896,7 +1902,10 @@ fn handle_storage_command(
                 password: record.password,
                 password_len: record.password_len,
             });
-            loan.catalog_len = crate::library_sd::write_catalog_listing(epd, sd_cs, loan.http_b);
+            loan.catalog_len = crate::library_sd::write_catalog_listing(
+                &mut crate::sd_session::card(epd, sd_cs),
+                loan.http_b,
+            );
             if crate::SYNC_LOANS.try_send(Ok(loan)).is_err() {
                 // Unreachable in practice: the wifi task blocks on each
                 // answer before it can request again. The memory is gone
@@ -1908,7 +1917,9 @@ fn handle_storage_command(
             // Boot-time probe: name the saved network so the Wireless
             // screen can offer connect/forget honestly. The command runs
             // once per boot, before any session can start.
-            if let Some(record) = book_build::load_wifi_credentials(epd, sd_cs) {
+            if let Some(record) =
+                book_build::load_wifi_credentials(&mut crate::sd_session::card(epd, sd_cs))
+            {
                 let ssid = app_core::WifiSsid {
                     bytes: record.ssid,
                     len: record.ssid_len,
@@ -1918,11 +1929,17 @@ fn handle_storage_command(
             } else {
                 esp_println::println!("wifi: no saved network");
             }
-            book_build::load_custom_font_manifest(epd, sd_cs, sd_library);
+            book_build::load_custom_font_manifest(
+                &mut crate::sd_session::card(epd, sd_cs),
+                sd_library,
+            );
             send_library_event(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
-            if crate::library_sd::load_catalog_cache(epd, sd_cs, sd_library) {
+            if crate::library_sd::load_catalog_cache(
+                &mut crate::sd_session::card(epd, sd_cs),
+                sd_library,
+            ) {
                 // Restored goes out first so the very next Home repaint
                 // already shows the saved book; the Scanned default then
                 // sees an SD book active and leaves it alone.
@@ -1938,11 +1955,14 @@ fn handle_storage_command(
             }
         }
         StorageCommand::RefreshCatalog => {
-            book_build::load_custom_font_manifest(epd, sd_cs, sd_library);
+            book_build::load_custom_font_manifest(
+                &mut crate::sd_session::card(epd, sd_cs),
+                sd_library,
+            );
             send_library_event(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
-            crate::library_sd::scan_books(epd, sd_cs, sd_library);
+            crate::library_sd::scan_books(&mut crate::sd_session::card(epd, sd_cs), sd_library);
             restore_saved_state(epd, sd_cs, sd_library, state_restored, false);
             send_library_event(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),
@@ -2042,8 +2062,7 @@ fn handle_storage_command(
                         // the list window. A failure leaves the entry unset and
                         // the open falls through to the usual bad-index error.
                         crate::library_sd::load_active_entry(
-                            epd,
-                            sd_cs,
+                            &mut crate::sd_session::card(epd, sd_cs),
                             sd_library,
                             index as usize,
                         );
@@ -2059,8 +2078,11 @@ fn handle_storage_command(
                         // it names content, and which page that content falls
                         // on is decided by the pagination this open is about
                         // to build.
-                        opening_place =
-                            book_build::load_place(epd, sd_cs, sd_library, index as usize);
+                        opening_place = book_build::load_place(
+                            &mut crate::sd_session::card(epd, sd_cs),
+                            sd_library,
+                            index as usize,
+                        );
                         // If unreadable, keep the incoming position and retry
                         // resolution after loading the section.
                         open.saved_position(opening_place.and_then(|place| match place {
@@ -2110,8 +2132,7 @@ fn handle_storage_command(
                             // this book's position is real whether or not its
                             // tail is indexed yet.
                             let outcome = book_build::build_or_load_book_cache(
-                                epd,
-                                sd_cs,
+                                &mut crate::sd_session::card(epd, sd_cs),
                                 sd_library,
                                 index as usize,
                                 chapter,
@@ -2162,8 +2183,7 @@ fn handle_storage_command(
                         // working while it does.
                         if let Some(place) = opening_place.take() {
                             let resolved = book_build::resolve_place(
-                                epd,
-                                sd_cs,
+                                &mut crate::sd_session::card(epd, sd_cs),
                                 sd_library,
                                 index as usize,
                                 place,
@@ -2271,7 +2291,10 @@ fn handle_storage_command(
                     }
                     OpenAction::StorePointer(state) => {
                         let record = record_for_persisted(sd_library, state);
-                        let stored = book_build::store_global_state(epd, sd_cs, record);
+                        let stored = book_build::store_global_state(
+                            &mut crate::sd_session::card(epd, sd_cs),
+                            record,
+                        );
                         if stored {
                             *pending_progress = None;
                             *last_progress_write = Some(Instant::now());
@@ -2366,12 +2389,15 @@ fn handle_storage_command(
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
             }
-            crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
+            crate::library_sd::load_active_entry(
+                &mut crate::sd_session::card(epd, sd_cs),
+                sd_library,
+                index as usize,
+            );
             // The overview opens with the cursor on the current chapter, so
             // center the first TOC window there.
             let ok = book_build::load_chapters_into_store(
-                epd,
-                sd_cs,
+                &mut crate::sd_session::card(epd, sd_cs),
                 sd_library,
                 index as usize,
                 sd_library.current_chapter() as usize,
@@ -2408,14 +2434,17 @@ fn handle_storage_command(
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
             }
-            crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
+            crate::library_sd::load_active_entry(
+                &mut crate::sd_session::card(epd, sd_cs),
+                sd_library,
+                index as usize,
+            );
             sd_library.set_layout(type_settings, portrait);
             // The TOC is still in the buffer; resolve the chapter's start page
             // before loading the section overwrites it. Re-ensure the window
             // covers the selection in case it slid since the overview render.
             book_build::ensure_toc_window(
-                epd,
-                sd_cs,
+                &mut crate::sd_session::card(epd, sd_cs),
                 sd_library,
                 index as usize,
                 chapter as usize,
@@ -2424,8 +2453,7 @@ fn handle_storage_command(
             let target_page = sd_library.overview_page_at(chapter as usize);
             let scratch = ensure_epub_scratch(epub_scratch);
             let outcome = book_build::build_or_load_book_cache(
-                epd,
-                sd_cs,
+                &mut crate::sd_session::card(epd, sd_cs),
                 sd_library,
                 index as usize,
                 chapter,
@@ -2458,14 +2486,17 @@ fn handle_storage_command(
                 password: credentials.password,
                 password_len: credentials.password_len,
             };
-            let written = book_build::store_wifi_credentials(epd, sd_cs, record);
+            let written = book_build::store_wifi_credentials(
+                &mut crate::sd_session::card(epd, sd_cs),
+                record,
+            );
             // Reacquire the card and use the exact boot-time read path before
             // telling the portal it may show success. This proves the record
             // survived handle/volume closure, closing the race where the
             // portal's success page beat a write that never actually landed
             // and the session-ending reset lost the credentials.
             let confirmed = written
-                && book_build::load_wifi_credentials(epd, sd_cs)
+                && book_build::load_wifi_credentials(&mut crate::sd_session::card(epd, sd_cs))
                     .is_some_and(|stored| stored == record);
             esp_println::println!(
                 "storage: wifi credentials written={} confirmed={}",
@@ -2482,7 +2513,8 @@ fn handle_storage_command(
             };
             // No confirmation channel, unlike the credentials: nothing waits
             // on this and a lost hint costs one scan.
-            let written = book_build::store_wifi_ap_hint(epd, sd_cs, record);
+            let written =
+                book_build::store_wifi_ap_hint(&mut crate::sd_session::card(epd, sd_cs), record);
             esp_println::println!(
                 "storage: wifi ap hint written={} channel={}",
                 written,
@@ -2490,7 +2522,8 @@ fn handle_storage_command(
             );
         }
         StorageCommand::ForgetWifiCredentials => {
-            let forgotten = book_build::forget_wifi_credentials(epd, sd_cs);
+            let forgotten =
+                book_build::forget_wifi_credentials(&mut crate::sd_session::card(epd, sd_cs));
             esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
         StorageCommand::ClearBookCache {
@@ -2530,14 +2563,17 @@ fn handle_storage_command(
                         // and can collide, and clearing nothing is the mild
                         // end of that.
                         match crate::library_sd::find_index_by_locator(
-                            epd,
-                            sd_cs,
+                            &mut crate::sd_session::card(epd, sd_cs),
                             at,
                             locator.as_str(),
                             size,
                         ) {
                             crate::library_sd::CatalogRow::Found(row) => {
-                                book_build::clear_book_cache(epd, sd_cs, sd_library, row)
+                                book_build::clear_book_cache(
+                                    &mut crate::sd_session::card(epd, sd_cs),
+                                    sd_library,
+                                    row,
+                                )
                             }
                             // Clearing a cache is not worth a rebuild, and a
                             // catalog that would not answer is not worth
@@ -2577,7 +2613,12 @@ fn handle_storage_command(
             // rather than guess, and the reader picks again from the list
             // they can see.
             let choice = if browse_epoch == sd_library.browse_epoch() {
-                crate::library_sd::choose_library_row(epd, sd_cs, sd_library, index, portrait)
+                crate::library_sd::choose_library_row(
+                    &mut crate::sd_session::card(epd, sd_cs),
+                    sd_library,
+                    index,
+                    portrait,
+                )
             } else {
                 esp_println::println!(
                     "storage: choose row={} stale browse epoch={} now={}",
@@ -2623,7 +2664,10 @@ fn handle_storage_command(
                     // cannot be opened. Only a card edited since the last
                     // scan pays for this, once, which is what keeps every
                     // other boot on the warm snapshot.
-                    crate::library_sd::scan_books(epd, sd_cs, sd_library);
+                    crate::library_sd::scan_books(
+                        &mut crate::sd_session::card(epd, sd_cs),
+                        sd_library,
+                    );
                     restore_saved_state(epd, sd_cs, sd_library, state_restored, true);
                     send_library_event(&LibraryEvent::Scanned {
                         count: sd_library.catalog_count_u16(),
@@ -2634,8 +2678,7 @@ fn handle_storage_command(
                     // holds it. The answer goes after `Scanned`, whose epoch
                     // it carries.
                     match crate::library_sd::find_index_by_locator(
-                        epd,
-                        sd_cs,
+                        &mut crate::sd_session::card(epd, sd_cs),
                         at,
                         locator.as_str(),
                         size,
@@ -2672,7 +2715,11 @@ fn handle_storage_command(
             browse_epoch,
         } => {
             let listed = if browse_epoch == sd_library.browse_epoch() {
-                crate::library_sd::leave_library_folder(epd, sd_cs, sd_library, portrait)
+                crate::library_sd::leave_library_folder(
+                    &mut crate::sd_session::card(epd, sd_cs),
+                    sd_library,
+                    portrait,
+                )
             } else {
                 esp_println::println!(
                     "storage: leave folder stale browse epoch={} now={}",
@@ -2745,8 +2792,7 @@ fn handle_storage_command(
             if context_changed || due {
                 let progress_start = Instant::now();
                 let stored = book_build::store_app_state(
-                    epd,
-                    sd_cs,
+                    &mut crate::sd_session::card(epd, sd_cs),
                     sd_library,
                     record,
                     place_may_be_replaced(pending_place, &record),
@@ -3035,8 +3081,7 @@ fn close_out_departing_book(
     let start = Instant::now();
     // Preserve a held place; otherwise the departing position may replace it.
     let stored = book_build::store_book_position(
-        epd,
-        sd_cs,
+        &mut crate::sd_session::card(epd, sd_cs),
         sd_library,
         record,
         place_may_be_replaced(pending_place, &record),
@@ -3173,7 +3218,11 @@ fn book_position(
     // The boot mirror only understands a page, so a place resolves to the
     // chapter it names and page zero inside it. The open that follows refines
     // it against the pagination it builds, the same way an ordinary open does.
-    match book_build::load_place(epd, sd_cs, library, usize::from(index)) {
+    match book_build::load_place(
+        &mut crate::sd_session::card(epd, sd_cs),
+        library,
+        usize::from(index),
+    ) {
         // If absent or unreadable, fall back to the mirror position.
         None | Some(book_build::SavedPlace::Unreadable) => {
             esp_println::println!(
@@ -3225,13 +3274,12 @@ fn restore_saved_state(
         return;
     }
     *state_restored = StateRestore::Done;
-    let Some(record) = book_build::load_app_state(epd, sd_cs) else {
+    let Some(record) = book_build::load_app_state(&mut crate::sd_session::card(epd, sd_cs)) else {
         esp_println::println!("restore: no usable durable state");
         return;
     };
     let Some(index) = crate::library_sd::find_index_by_identity(
-        epd,
-        sd_cs,
+        &mut crate::sd_session::card(epd, sd_cs),
         record.source_hash,
         record.source_size,
         record.legacy_source_identity,
@@ -3259,7 +3307,11 @@ fn restore_saved_state(
     // Stage the restored book's catalog entry so the position, colophon, and
     // page-count reads below resolve it, and so the first Home paint names it
     // before any open.
-    crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
+    crate::library_sd::load_active_entry(
+        &mut crate::sd_session::card(epd, sd_cs),
+        library,
+        usize::from(index),
+    );
     // The app is about to hold this book under `index` without opening it,
     // and staging the row under the Library cursor replaces the active entry.
     // Without this, the save as the reader leaves it has no identity to name.
@@ -3279,10 +3331,19 @@ fn restore_saved_state(
     // Resolve the chapter title now so wake-to-Home (rendered before the book
     // is opened) names the chapter; without this the colophon shows a numeral
     // until the book is first opened this session.
-    book_build::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
+    book_build::load_chapter_title(
+        &mut crate::sd_session::card(epd, sd_cs),
+        usize::from(index),
+        chapter,
+        library,
+    );
     // The book's total page count, so the Home progress bar has a denominator
     // on wake before the book is opened (read from the cache index header).
-    let page_count = book_build::restore_book_page_count(epd, sd_cs, usize::from(index), library);
+    let page_count = book_build::restore_book_page_count(
+        &mut crate::sd_session::card(epd, sd_cs),
+        usize::from(index),
+        library,
+    );
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
         chapter,
@@ -3309,23 +3370,38 @@ fn sleep_request_from_saved_state(
     // to the book's own position file.
     let (record, unflushed) = match *pending_progress {
         Some(record) => (record, true),
-        None => (book_build::load_app_state(epd, sd_cs)?, false),
+        None => (
+            book_build::load_app_state(&mut crate::sd_session::card(epd, sd_cs))?,
+            false,
+        ),
     };
     let index = crate::library_sd::find_index_by_identity(
-        epd,
-        sd_cs,
+        &mut crate::sd_session::card(epd, sd_cs),
         record.source_hash,
         record.source_size,
         record.legacy_source_identity,
     )?;
-    crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
+    crate::library_sd::load_active_entry(
+        &mut crate::sd_session::card(epd, sd_cs),
+        library,
+        usize::from(index),
+    );
     let (chapter, screen) = if unflushed {
         (record.chapter, record.screen)
     } else {
         book_position(epd, sd_cs, library, index, record)
     };
-    book_build::load_chapter_title(epd, sd_cs, usize::from(index), chapter, library);
-    let page_count = book_build::restore_book_page_count(epd, sd_cs, usize::from(index), library);
+    book_build::load_chapter_title(
+        &mut crate::sd_session::card(epd, sd_cs),
+        usize::from(index),
+        chapter,
+        library,
+    );
+    let page_count = book_build::restore_book_page_count(
+        &mut crate::sd_session::card(epd, sd_cs),
+        usize::from(index),
+        library,
+    );
     Some(RenderRequest {
         kind: RenderKind::Page,
         // The sleep frame is not queued and answers no press.
@@ -3378,7 +3454,12 @@ fn flush_pending_progress(
     if let Some(record) = *pending_progress {
         let start = Instant::now();
         let may_replace = place_may_be_replaced(pending_place, &record);
-        let stored = book_build::store_app_state(epd, sd_cs, sd_library, record, may_replace);
+        let stored = book_build::store_app_state(
+            &mut crate::sd_session::card(epd, sd_cs),
+            sd_library,
+            record,
+            may_replace,
+        );
         if stored {
             *pending_progress = None;
             *last_progress_write = Some(Instant::now());

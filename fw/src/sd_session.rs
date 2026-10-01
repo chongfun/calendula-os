@@ -12,7 +12,7 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
 use embedded_sdmmc::embedded_sdmmc_types::sdcard::CardType;
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
-use embedded_sdmmc::{Directory, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{Directory, SdCard, TimeSource, VolumeIdx, VolumeManager};
 use esp_hal::gpio::Output;
 use esp_hal::spi::master::{Config as SpiConfig, SpiDmaBus};
 use esp_hal::time::Rate;
@@ -37,47 +37,7 @@ const DISPLAY_FREQ_HZ: u32 = display::epd::SPI_HZ;
 /// enough on this RV32IMC core — no RMW atomics needed. Read via `snapshot`
 /// deltas around a workload; never reset, so concurrent snapshots stay
 /// comparable.
-pub(crate) mod sd_stats {
-    use core::sync::atomic::{AtomicU32, Ordering};
-
-    pub(crate) static READ_CALLS: AtomicU32 = AtomicU32::new(0);
-    pub(crate) static READ_BLOCKS: AtomicU32 = AtomicU32::new(0);
-    pub(crate) static WRITE_CALLS: AtomicU32 = AtomicU32::new(0);
-    pub(crate) static WRITE_BLOCKS: AtomicU32 = AtomicU32::new(0);
-
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub(crate) struct Snapshot {
-        pub(crate) read_calls: u32,
-        pub(crate) read_blocks: u32,
-        pub(crate) write_calls: u32,
-        pub(crate) write_blocks: u32,
-    }
-
-    pub(crate) fn snapshot() -> Snapshot {
-        Snapshot {
-            read_calls: READ_CALLS.load(Ordering::Relaxed),
-            read_blocks: READ_BLOCKS.load(Ordering::Relaxed),
-            write_calls: WRITE_CALLS.load(Ordering::Relaxed),
-            write_blocks: WRITE_BLOCKS.load(Ordering::Relaxed),
-        }
-    }
-
-    impl Snapshot {
-        pub(crate) fn since(self, start: Snapshot) -> Snapshot {
-            Snapshot {
-                read_calls: self.read_calls.wrapping_sub(start.read_calls),
-                read_blocks: self.read_blocks.wrapping_sub(start.read_blocks),
-                write_calls: self.write_calls.wrapping_sub(start.write_calls),
-                write_blocks: self.write_blocks.wrapping_sub(start.write_blocks),
-            }
-        }
-    }
-
-    pub(crate) fn bump(counter: &AtomicU32, amount: u32) {
-        let value = counter.load(Ordering::Relaxed).wrapping_add(amount);
-        counter.store(value, Ordering::Relaxed);
-    }
-}
+pub(crate) use storage::sd_stats;
 
 /// Counts physical block transactions on their way to the SD card, so bench
 /// telemetry can report exact CMD17/CMD24-level traffic per workload.
@@ -103,20 +63,7 @@ impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
     }
 }
 
-pub(crate) struct StaticTime;
-
-impl TimeSource for StaticTime {
-    fn get_timestamp(&self) -> Timestamp {
-        Timestamp {
-            year_since_1970: 56,
-            zero_indexed_month: 4,
-            zero_indexed_day: 19,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
-        }
-    }
-}
+pub(crate) use storage::card::StaticTime;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SdDelay;
@@ -297,11 +244,32 @@ type SdSpi<'a> = SdSpiDevice<'a, SpiDmaBus<'static, Async>, Output<'static>>;
 type SdCardDevice<'a> = CountingDevice<SdCard<SdSpi<'a>, SdDelay>>;
 pub(crate) type SdRoot<'a> = Directory<'a, SdCardDevice<'a>, StaticTime, 8, 8, 1>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SdSessionError {
-    CardInit,
-    Volume,
-    Root,
+pub(crate) use storage::card::SessionError as SdSessionError;
+
+/// The firmware's card: one SPI session per closure, the bus taken from the
+/// panel for its length and handed back after.
+pub(crate) struct FwCard<'a> {
+    epd: &'a mut Epd,
+    sd_cs: &'a mut Output<'static>,
+}
+
+/// The card behind the panel's bus, for the storage code.
+pub(crate) fn card<'a>(epd: &'a mut Epd, sd_cs: &'a mut Output<'static>) -> FwCard<'a> {
+    FwCard { epd, sd_cs }
+}
+
+impl storage::card::Card for FwCard<'_> {
+    type Device<'a>
+        = SdCardDevice<'a>
+    where
+        Self: 'a;
+
+    fn with_root<R>(
+        &mut self,
+        f: impl for<'a> FnOnce(&SdRoot<'a>) -> R,
+    ) -> Result<R, SdSessionError> {
+        with_root(self.epd, self.sd_cs, f)
+    }
 }
 
 /// Each per-page-turn SD access shares the SPI bus with the panel, so the
