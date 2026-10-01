@@ -2371,6 +2371,45 @@ where
     )
 }
 
+/// Re-key the saved reader state when it names the place a proven move just
+/// left, so it names the book where it is now.
+///
+/// The state's only identity for its book is the place's `(source_hash,
+/// size)`, so after a move nothing in the catalog answers to it: the restore
+/// at the next boot finds no book, and the reading settings that travel with
+/// it are lost for the session. The scan knows both places, and this runs
+/// beside the other carries, before the ledger writes the move down, so a
+/// reset retries it. A record already re-keyed no longer names the old place
+/// and is left alone. `Ok(false)` for a record about another book, a legacy
+/// one whose hash is from the older rule, or no record.
+#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and the only caller branches on success.
+pub fn carry_app_state_for_move<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    was: (u32, u32),
+    now: (u32, u32),
+) -> Result<bool, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(mut record) = read_state_file(root) else {
+        return Ok(false);
+    };
+    if record.legacy_source_identity || (record.source_hash, record.source_size) != was {
+        return Ok(false);
+    }
+    record.source_hash = now.0;
+    record.source_size = now.1;
+    write_state_file(root, record)?;
+    Ok(true)
+}
+
 const STATE_GENERATIONS: [&str; 2] = ["STATEA.BIN", "STATEB.BIN"];
 /// MarigoldOS v0.4.x durable-state magic; byte-identical for card interchange.
 const STATE_DURABLE_MAGIC: [u8; 4] = *b"MGST";

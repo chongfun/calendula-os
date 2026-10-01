@@ -458,7 +458,7 @@ pub async fn run(
     let mut last_progress_write: Option<Instant> = None;
     // Durable state is consulted once per boot, after the first catalog with
     // entries lands; later catalog refreshes must not yank reading state.
-    let mut state_restored = false;
+    let mut state_restored = StateRestore::Pending;
     // True while RED RAM is known to hold exactly prev_fb's content, letting
     // a fast refresh skip its previous-frame stream. Reset on any failure,
     // sleep, or panel re-init; false just means the next flush writes RED.
@@ -1826,7 +1826,7 @@ fn handle_storage_command(
     sync_session: &mut SyncSession,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
-    state_restored: &mut bool,
+    state_restored: &mut StateRestore,
     background_build: &mut Option<BackgroundBuild>,
     pending_place: &mut Option<PendingPlace>,
     portrait: bool,
@@ -1926,7 +1926,7 @@ fn handle_storage_command(
                 // Restored goes out first so the very next Home repaint
                 // already shows the saved book; the Scanned default then
                 // sees an SD book active and leaves it alone.
-                restore_saved_state(epd, sd_cs, sd_library, state_restored);
+                restore_saved_state(epd, sd_cs, sd_library, state_restored, false);
                 let count = sd_library.catalog_count_u16();
                 send_library_event(&LibraryEvent::Scanned {
                     count,
@@ -1943,7 +1943,7 @@ fn handle_storage_command(
                 available: sd_library.custom_font_available(),
             });
             crate::library_sd::scan_books(epd, sd_cs, sd_library);
-            restore_saved_state(epd, sd_cs, sd_library, state_restored);
+            restore_saved_state(epd, sd_cs, sd_library, state_restored, false);
             send_library_event(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),
                 catalog_epoch: sd_library.catalog_epoch(),
@@ -2624,7 +2624,7 @@ fn handle_storage_command(
                     // scan pays for this, once, which is what keeps every
                     // other boot on the warm snapshot.
                     crate::library_sd::scan_books(epd, sd_cs, sd_library);
-                    restore_saved_state(epd, sd_cs, sd_library, state_restored);
+                    restore_saved_state(epd, sd_cs, sd_library, state_restored, true);
                     send_library_event(&LibraryEvent::Scanned {
                         count: sd_library.catalog_count_u16(),
                         catalog_epoch: sd_library.catalog_epoch(),
@@ -3186,20 +3186,45 @@ fn book_position(
     }
 }
 
+/// Whether durable reader state has been handed to the app this boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateRestore {
+    /// Not yet tried: no catalog with entries has landed.
+    Pending,
+    /// Handed over, or there was nothing to hand over.
+    Done,
+    /// Tried, and the catalog held no book under the saved identity: a
+    /// snapshot written before the book moved on a computer. The reading
+    /// settings travel in the same event, so until this is retried they are
+    /// the defaults.
+    Missed,
+}
+
 /// One boot-time attempt to map durable reader state back onto the scanned
 /// catalog by stable source identity (path hash + byte size) and hand the
 /// saved position to the app as a `Restored` event. The volatile book id
 /// stored in the record is never trusted directly.
+///
+/// `retry_missed` lets a caller try again after a lookup that found nothing,
+/// once a rescan has caught the catalog up. Only one that is about to tell
+/// the app which book to open may: `Restored` sets the current book, and
+/// any other caller could move it under a reader.
 fn restore_saved_state(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
-    state_restored: &mut bool,
+    state_restored: &mut StateRestore,
+    retry_missed: bool,
 ) {
-    if *state_restored || library.catalog_is_empty() {
+    let due = match *state_restored {
+        StateRestore::Pending => true,
+        StateRestore::Missed => retry_missed,
+        StateRestore::Done => false,
+    };
+    if !due || library.catalog_is_empty() {
         return;
     }
-    *state_restored = true;
+    *state_restored = StateRestore::Done;
     let Some(record) = book_build::load_app_state(epd, sd_cs) else {
         esp_println::println!("restore: no usable durable state");
         return;
@@ -3216,6 +3241,7 @@ fn restore_saved_state(
             record.source_hash,
             record.source_size
         );
+        *state_restored = StateRestore::Missed;
         return;
     };
     // Stage the restored book's catalog entry so the position, colophon, and

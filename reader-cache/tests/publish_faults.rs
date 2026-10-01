@@ -6448,3 +6448,63 @@ fn eviction_for_a_book_with_no_cache_directory_is_within_the_bound() {
     let third = set_third_layout(&mut store);
     assert!(files::evict_layouts_for(&root, &OWNER, third));
 }
+
+/// The saved reader state as a reader left it in a book at `identity`.
+fn saved_state(identity: (u32, u32)) -> proto::nvm::AppStateRecord {
+    proto::nvm::AppStateRecord {
+        book_id: 3,
+        chapter: 8,
+        screen: 14,
+        shell_orientation: 0,
+        reading_orientation: 1,
+        refresh_policy: 2,
+        font_size: 3,
+        line_spacing: 1,
+        font_weight: 1,
+        font_family: 2,
+        front_buttons: 1,
+        source_hash: identity.0,
+        source_size: identity.1,
+        legacy_source_identity: false,
+    }
+}
+
+/// The saved state names its book by place, so a proven move re-keys it to
+/// the new place: the next restore then finds the book, and the reading
+/// settings that travel with it. Everything else in the record is kept.
+#[test]
+fn a_proven_move_re_keys_the_saved_state_that_names_the_old_place() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let was = identity_at(&OWNER);
+    let now = identity_at(&NOW);
+    files::write_state_file(&root, saved_state(was)).expect("state");
+
+    assert_eq!(files::carry_app_state_for_move(&root, was, now), Ok(true));
+    let carried = files::read_state_file(&root).expect("the state is still there");
+    assert_eq!(carried, saved_state(now), "only the identity changed");
+
+    // A retry finds it re-keyed already and leaves it.
+    assert_eq!(files::carry_app_state_for_move(&root, was, now), Ok(false));
+    assert_eq!(files::read_state_file(&root), Some(saved_state(now)));
+}
+
+/// State about another book, and no state at all, are none of the move's
+/// business. (A legacy record cannot be written here: the flag is derived
+/// from an older version byte at decode, and the writer writes the current
+/// version.)
+#[test]
+fn a_proven_move_leaves_saved_state_about_anything_else_alone() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let was = identity_at(&OWNER);
+    let now = identity_at(&NOW);
+    assert_eq!(files::carry_app_state_for_move(&root, was, now), Ok(false));
+
+    let other = (was.0 ^ 1, was.1);
+    files::write_state_file(&root, saved_state(other)).expect("state");
+    assert_eq!(files::carry_app_state_for_move(&root, was, now), Ok(false));
+    assert_eq!(files::read_state_file(&root), Some(saved_state(other)));
+}

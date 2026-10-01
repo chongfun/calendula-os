@@ -893,6 +893,23 @@ where
             (was_hash, found.was.2),
             (now_hash, found.now.2),
         );
+        // The saved reader state names its book by place too, and carries
+        // the reading settings: left naming the old place, the next restore
+        // finds no book and the settings with it.
+        match reader_cache::files::carry_app_state_for_move(
+            root,
+            (was_hash, found.was.2),
+            (now_hash, found.now.2),
+        ) {
+            Ok(true) => {
+                esp_println::println!("sd: carried the saved reader state to '{}'", found.now.1)
+            }
+            Ok(false) => {}
+            Err(()) => esp_println::println!(
+                "sd: could not carry the saved reader state to '{}'",
+                found.now.1
+            ),
+        }
         // Each half is reported on its own: a place that would not write
         // says nothing about the pagination, and the other way round.
         let (place_ok, place) = match carried.place {
