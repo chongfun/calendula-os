@@ -689,7 +689,7 @@ impl Device {
     /// Fold the storage task's events into the app, as the app task does,
     /// dispatching whatever a fold owes.
     fn deliver(&mut self) {
-        let events: Vec<LibraryEvent> = self.host.events.drain(..).collect();
+        let events = std::mem::take(&mut self.host.events);
         for event in events {
             self.log.push(event);
             let before = self.app;
