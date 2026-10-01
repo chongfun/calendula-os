@@ -137,6 +137,7 @@ mod book_build;
 pub mod catalog;
 mod custom_font;
 mod display_flush;
+mod hw_sha;
 mod library_sd;
 mod mmu;
 mod ota_update;
@@ -371,6 +372,7 @@ fn main() -> ! {
     // them back before the real drivers are built.
     let mut peripherals = esp_hal::init(config);
     esp_println::println!("calendula-os: boot");
+    hw_sha::install(esp_hal::sha::Sha::new(peripherals.SHA));
 
     // Deep sleep is terminal, so waking is this cold boot; the RTC wake
     // cause and RTC RAM are its only trace. Fast wake needs both: the

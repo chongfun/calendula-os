@@ -366,6 +366,7 @@ pub enum Recovery {
 /// can hold only one of.
 pub fn recover<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
+    engine: &mut dyn proto::source::Sha256Engine,
 ) -> Result<Recovery, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -379,11 +380,11 @@ where
     let Some(intent) = standing(&cache_root)? else {
         return Ok(Recovery::Nothing);
     };
-    let mut destination = digest_at(root, intent.root, intent.locator.as_str())?;
+    let mut destination = digest_at(root, intent.root, intent.locator.as_str(), engine)?;
     if destination.is_none() {
         if let Some(spelled) = &intent.predecessor_locator {
             if spelled.as_str() != intent.locator.as_str() {
-                destination = digest_at(root, intent.root, spelled.as_str())?;
+                destination = digest_at(root, intent.root, spelled.as_str(), engine)?;
             }
         }
     }
@@ -401,6 +402,7 @@ pub(crate) fn digest_at<D, T, const MD: usize, const MF: usize, const MV: usize>
     root: &Directory<'_, D, T, MD, MF, MV>,
     at: BookRoot,
     locator: &str,
+    engine: &mut dyn proto::source::Sha256Engine,
 ) -> Result<Option<SourceDigest>, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -412,7 +414,7 @@ where
         if write!(name, "{}", alias).is_err() {
             return Err(crate::install::InstallError::Card);
         }
-        crate::digest_of_file(dir, name.as_str())
+        crate::digest_of_file(dir, name.as_str(), engine)
     })
     .map_err(|_| LedgerFault::Device)?;
     match found {

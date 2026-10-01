@@ -710,7 +710,8 @@ where
         } else {
             // The library's intent last, once the filesystem has decided
             // what the destination holds.
-            match upload_store::replace::recover(root) {
+            match crate::hw_sha::with_sha256(|engine| upload_store::replace::recover(root, engine))
+            {
                 Ok(upload_store::replace::Recovery::Nothing) => {}
                 Ok(upload_store::replace::Recovery::Settled(landed)) => {
                     esp_println::println!("upload: settled a replacement in flight ({:?})", landed);
@@ -924,7 +925,7 @@ where
     // replacement that will not resolve owns its place, and nothing else
     // may change the shelf beside it.
     matches!(
-        upload_store::replace::recover(root),
+        crate::hw_sha::with_sha256(|engine| upload_store::replace::recover(root, engine)),
         Ok(upload_store::replace::Recovery::Nothing | upload_store::replace::Recovery::Settled(_))
     )
 }

@@ -1039,6 +1039,7 @@ fn move_slot_of_row(table: &[u8], slots: usize, row: u16) -> Option<usize> {
 /// ledger either committed, in which case they are right, or did not, in
 /// which case the caller must not commit the catalog either, and the next
 /// scan starts over from the generation that stands.
+#[expect(clippy::too_many_arguments)] // The card, the rows, working memory, and three things only the firmware has: randomness, the carry, and the SHA unit.
 pub fn assign_book_ids<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     catalog: &File<'_, D, T, MD, MF, MV>,
@@ -1047,6 +1048,7 @@ pub fn assign_book_ids<D, T, const MD: usize, const MF: usize, const MV: usize>(
     random: &mut impl FnMut() -> u32,
     ledger: Option<Ledger>,
     found_again: &mut dyn FnMut(&FoundAgain<'_>),
+    engine: &mut dyn proto::source::Sha256Engine,
 ) -> Result<Assignment, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1225,7 +1227,7 @@ where
             // any of those copies' bytes, so the length stops being
             // decidable and every copy of it is left alone. The file is
             // adopted in its own right, as it would have been.
-            let Ok(Some(found)) = crate::replace::digest_at(root, at, locator) else {
+            let Ok(Some(found)) = crate::replace::digest_at(root, at, locator, engine) else {
                 move_undecidable(table, slots, byte_size, &mut assigned.unreadable);
                 continue;
             };

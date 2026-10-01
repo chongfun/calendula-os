@@ -333,7 +333,9 @@ where
             // there to read a landing from, so this resolves what it can and
             // refuses the rest rather than refusing everything.
             let settled = if complete {
-                match upload_store::replace::recover(root) {
+                match crate::hw_sha::with_sha256(|engine| {
+                    upload_store::replace::recover(root, engine)
+                }) {
                     Ok(upload_store::replace::Recovery::Nothing) => true,
                     Ok(upload_store::replace::Recovery::Settled(landed)) => {
                         esp_println::println!("sd: settled a replacement in flight ({:?})", landed);
@@ -442,7 +444,7 @@ where
     // filesystem has now settled, and the ledger has to be told what that
     // means before any scan reads the place as a stranger and mints for it.
     if outcome.complete {
-        match upload_store::replace::recover(root) {
+        match crate::hw_sha::with_sha256(|engine| upload_store::replace::recover(root, engine)) {
             Ok(upload_store::replace::Recovery::Nothing) => {}
             Ok(upload_store::replace::Recovery::Settled(landed)) => {
                 esp_println::println!("sd: settled a replacement in flight ({:?})", landed);
@@ -938,15 +940,18 @@ where
             Instant::now().as_millis()
         );
     };
-    let assigned = upload_store::ledger::assign_book_ids(
-        root,
-        &file,
-        count,
-        scratch,
-        &mut || rng.random(),
-        ledger,
-        &mut carry,
-    )
+    let assigned = crate::hw_sha::with_sha256(|engine| {
+        upload_store::ledger::assign_book_ids(
+            root,
+            &file,
+            count,
+            scratch,
+            &mut || rng.random(),
+            ledger,
+            &mut carry,
+            engine,
+        )
+    })
     .map_err(|fault| {
         esp_println::println!("sd: library ledger refused: {:?}", fault);
     })?;

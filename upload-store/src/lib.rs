@@ -422,14 +422,16 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // Nothing in the firmware asks this, so the software engine serves.
+    let engine = &mut proto::source::SoftSha256::new();
     let found = if key.in_books() {
         match library::open_library_root(root)? {
-            Some(books) => digest_of_file(&books, key.alias())?,
+            Some(books) => digest_of_file(&books, key.alias(), engine)?,
             // No shelf holds no sidecar, which reads as no recorded identity.
             None => None,
         }
     } else {
-        digest_of_file(root, key.alias())?
+        digest_of_file(root, key.alias(), engine)?
     };
     Ok(found)
 }
@@ -487,14 +489,16 @@ where
 /// The deepest stack this sits on is the scan proving a move, measured on the
 /// release builds by summing prologue frames along the call graph, the same
 /// on both boards: about 3.2 KB of `main` and the executor beneath the display
-/// task; 10.4 KB from the task through `run_sd_session` to `assign_book_ids`,
-/// whose 4.8 KB frame holds the 64 digests it proves moves with; and 7.1 KB
-/// below `digest_at`, where this function and its buffer inline into
-/// `with_book`'s 4.75 KB frame. About 20.7 KB in all, against stack regions
-/// of 32,920 B on the X3 and 41,992 B on the X4. The carry the scan calls
-/// back into goes 4.2 KB deep, which is less. `tools/stack_frames.py` reads
-/// the two largest frames here as zero, since each allocates in several
-/// steps, so re-measure the chain rather than the frames when this grows.
+/// task; 10.5 KB from the task through `run_sd_session` and the firmware's
+/// SHA-unit wrapper to `assign_book_ids`, whose 4.8 KB frame holds the 64
+/// digests it proves moves with; and 7.0 KB below `digest_at`, where this
+/// function and its buffer inline into `with_book`'s 4.6 KB frame. About
+/// 20.7 KB in all, against stack regions of 32,608 B on the X3 and 41,672 B
+/// on the X4. The carry the scan calls back into goes 4.2 KB deep, and the
+/// engine behind `dyn Sha256Engine` at most 240 B, both less. The call graph
+/// cannot follow `dyn` calls, and `tools/stack_frames.py` reads the two
+/// largest frames here as zero, since each allocates in several steps, so
+/// re-measure the chain, not the frames, when this grows.
 const DIGEST_READ_BLOCKS: usize = 8;
 
 /// The identity of a book already on the card, read out of it.
@@ -505,6 +509,7 @@ const DIGEST_READ_BLOCKS: usize = 8;
 pub fn digest_of_file<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     name: &str,
+    engine: &mut dyn proto::source::Sha256Engine,
 ) -> Result<Option<proto::source::SourceDigest>, install::InstallError>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -516,7 +521,7 @@ where
         Err(_) => return Err(install::InstallError::Card),
     };
     let length = file.length();
-    let mut hasher = proto::source::SourceHasher::new();
+    let mut hasher = proto::source::EngineHasher::new(engine);
     let mut blocks: [Block; DIGEST_READ_BLOCKS] = core::array::from_fn(|_| Block::new());
     let mut total = 0u32;
     while !file.is_eof() {

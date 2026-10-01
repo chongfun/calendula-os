@@ -377,6 +377,7 @@ fn scan_minting(
             });
             FOUND_DIGESTS.with(|seen| seen.borrow_mut().push(found.digest));
         },
+        &mut proto::source::SoftSha256::new(),
     )?;
     encode_catalog_header(rows.len() as u16, &mut header);
     file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
@@ -450,7 +451,8 @@ fn recover(root: &Dir<'_>, books: &Dir<'_>) -> Recovery {
     reclaim::recover(root, Some(books)).expect("reclaim settles");
     let outcome = install::recover_installs(root, books);
     assert!(outcome.complete, "the install journal settles: {outcome:?}");
-    replace::recover(root).expect("the library intent resolves or refuses")
+    replace::recover(root, &mut proto::source::SoftSha256::new())
+        .expect("the library intent resolves or refuses")
 }
 
 fn digest_agrees(recorded: Option<CachedSourceDigest>, bytes: &[u8]) -> bool {
@@ -985,7 +987,7 @@ fn a_card_root_replacement_is_answered_on_a_card_with_no_shelf() {
     // parked.
     overwrite_at(&root, BookRoot::CardRoot, LOOSE, &new);
     assert_eq!(
-        replace::recover(&root),
+        replace::recover(&root, &mut proto::source::SoftSha256::new()),
         Ok(Recovery::Settled(Landing::New)),
         "the new bytes at the place are the new landing"
     );
@@ -1045,7 +1047,7 @@ fn a_refused_replacement_leaves_the_install_journal_reporting_nothing() {
     assert!(!outcome.had_intent, "and reports no intent of its own");
     assert!(!outcome.touched_shelf, "and changed nothing on the shelf");
     assert_eq!(
-        replace::recover(&root),
+        replace::recover(&root, &mut proto::source::SoftSha256::new()),
         Ok(Recovery::Refused),
         "while the library intent cannot say what stands at the place"
     );

@@ -877,7 +877,7 @@ where
         if write!(name, "{}", alias).is_err() {
             return None;
         }
-        upload_store::digest_of_file(dir, name.as_str())
+        upload_store::digest_of_file(dir, name.as_str(), &mut proto::source::SoftSha256::new())
             .ok()
             .flatten()
     })
