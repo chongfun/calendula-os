@@ -22,3 +22,4 @@ pub mod custom_font;
 pub mod library_sd;
 pub mod platform;
 pub mod sd_stats;
+pub mod task;
