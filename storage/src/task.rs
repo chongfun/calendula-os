@@ -2156,7 +2156,8 @@ fn scan_books_after_flush(
         return false;
     }
     // A scan that lands is the refresh any refused one was owed. One that
-    // fails leaves it owed for the background retry.
+    // fails leaves it as it was: still owed after a pick's scan, and settled
+    // by the RefreshCatalog arm after the refresh's own.
     if crate::library_sd::scan_books(card, sd_library) {
         *catalog_refresh = CatalogRefresh::default();
     }
