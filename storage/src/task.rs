@@ -2150,9 +2150,11 @@ fn scan_books_after_flush(
         slog!("sd: the reading position would not save; not scanning over it");
         return false;
     }
-    crate::library_sd::scan_books(card, sd_library);
-    // This scan is the refresh any refused one was owed.
-    *catalog_refresh = CatalogRefresh::default();
+    // A scan that lands is the refresh any refused one was owed. One that
+    // fails leaves it owed for the background retry.
+    if crate::library_sd::scan_books(card, sd_library) {
+        *catalog_refresh = CatalogRefresh::default();
+    }
     true
 }
 

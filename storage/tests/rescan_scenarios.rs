@@ -207,3 +207,52 @@ fn a_scan_by_a_pick_settles_an_owed_refresh() {
     assert_eq!(scans, 1, "one scan, not a second for the owed refresh");
     assert!(!device.task.catalog_refresh.owed);
 }
+
+/// A refresh is owed when a stale-row pick scans, and that scan fails on the
+/// card. The refresh stays owed, and a later background slice retries it.
+#[test]
+fn a_failed_scan_by_a_pick_leaves_the_refresh_owed() {
+    let (card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    device.point_at(ADDED);
+    card.disk.refuse_next_writes(1);
+    device.send(StorageCommand::RefreshCatalog);
+    device.run_queued();
+    assert!(device.task.catalog_refresh.owed);
+    // Page 9 lands now, so the pick has nothing to write before its scan,
+    // and every write the scan makes is refused.
+    assert!(device
+        .task
+        .flush_pending_progress(&mut device.card, &mut device.store));
+    let books = device.store.catalog_count();
+    card.disk.refuse_next_writes(u32::MAX);
+
+    let before = device.log.len();
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert!(
+        device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::RowFailed { .. })),
+        "{:?}",
+        &device.log[before..]
+    );
+    assert_ne!(
+        device.store.catalog_count(),
+        books + 1,
+        "the scan did not land"
+    );
+    assert!(
+        device.task.catalog_refresh.owed,
+        "the refresh is still owed"
+    );
+
+    card.disk.refuse_next_writes(0);
+    device.settle();
+    assert!(!device.task.catalog_refresh.owed);
+    assert_eq!(
+        device.store.catalog_count(),
+        books + 1,
+        "the retried refresh catalogued the added book"
+    );
+}

@@ -609,6 +609,12 @@ impl Device {
 
     /// Press a button, and let both tasks run until neither owes anything.
     pub fn press(&mut self, button: Button) {
+        self.press_only(button);
+        self.settle();
+    }
+
+    /// Press a button and queue what it owes, running nothing.
+    pub fn press_only(&mut self, button: Button) {
         let previous = self.app;
         self.app = self.app.apply_input(CTX, InputEvent::button(button));
         let request_id = self.next_request_id;
@@ -625,7 +631,6 @@ impl Device {
             self.queue.push_back(command);
         }
         self.render();
-        self.settle();
     }
 
     /// The fold an open owes, stamped with the catalog a `RowIsBook` was
