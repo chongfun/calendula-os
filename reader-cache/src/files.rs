@@ -1459,7 +1459,9 @@ where
                     counts.unlinked = counts.unlinked.saturating_add(1);
                 }
             } else {
-                let _ = refs.push(name.as_str());
+                // `names` and `refs` share the batch capacity.
+                refs.push(name.as_str())
+                    .expect("a listing batch holds at most one move batch of names");
             }
         }
         if !refs.is_empty() {
