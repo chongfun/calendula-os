@@ -686,7 +686,7 @@ impl Device {
     /// Everything else is lost with RAM.
     pub fn sleep(mut self) {
         self.power_pressed();
-        self.settle();
+        self.drain_before_sleep();
         assert!(
             self.task
                 .flush_pending_progress(&mut self.card, &mut self.store),
@@ -701,6 +701,37 @@ impl Device {
             self.task.abandon_rescan(owed, &mut self.host);
             self.deliver();
         }
+    }
+
+    /// The Sleep arm's drain: [`Self::settle`], except that a pick among the
+    /// queued commands that would rescan is refused as one already owed was.
+    pub fn drain_before_sleep(&mut self) {
+        for _ in 0..10_000 {
+            if self.rescan_owed() {
+                self.power_pressed();
+                continue;
+            }
+            if self.handle_one() {
+                continue;
+            }
+            if let Some(command) = self.host.requeued.pop_front() {
+                self.queue.push_back(command);
+                continue;
+            }
+            if self.task.background_owed(&self.store) && !self.store.text_holds_toc() {
+                self.task.background_step(
+                    &mut self.card,
+                    &mut self.host,
+                    &mut self.store,
+                    &mut self.metrics,
+                    self.last_render,
+                );
+                self.deliver();
+                continue;
+            }
+            return;
+        }
+        panic!("the storage task never went quiet");
     }
 
     /// Whether a pick's rescan is owed and not yet run.

@@ -405,6 +405,61 @@ fn back_during_the_note_is_painted_before_the_loop_runs_the_owed_rescan() {
     assert!(frame.library_rescanning);
 }
 
+/// Power pressed with the pick still queued, ahead of the storage task. The
+/// drain before sleep handles it, and the rescan it would owe is refused the
+/// same way: no scan, the catalog untouched, and the next boot's pick scans.
+#[test]
+fn power_with_the_pick_still_queued_refuses_it_in_the_drain() {
+    let (card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    let books = device.store.catalog_count();
+    device.point_at(ADDED);
+    device.press_only(Button::Confirm);
+    let pick = device
+        .app
+        .library_browse
+        .request_id()
+        .expect("a pick waits");
+    assert!(!device.rescan_owed(), "the pick is still queued");
+
+    let before = device.log.len();
+    device.power_pressed();
+    device.drain_before_sleep();
+    let events = &device.log[before..];
+    assert!(
+        events.contains(&LibraryEvent::RowFailed { request_id: pick }),
+        "the pick is refused: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "no scan: {events:?}"
+    );
+    assert!(!device.rescan_owed());
+    assert_eq!(
+        device.store.catalog_count(),
+        books,
+        "the catalog is untouched"
+    );
+    assert!(device.app.library_browse.is_idle());
+    assert!(device.before_rescan.is_empty());
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    let before = device.log.len();
+    device.choose(ADDED);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert!(
+        device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "the next boot's pick rescans: {:?}",
+        &device.log[before..]
+    );
+}
+
 /// Power pressed while the note is painting. Sleep is terminal, so the pick
 /// is refused instead of scanned: no scan holds the note on the panel ahead
 /// of the sleep image, and a sleep a late press abandons finds the Library
