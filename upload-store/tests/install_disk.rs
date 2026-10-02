@@ -911,6 +911,110 @@ fn a_book_copied_onto_the_installed_chain_does_not_get_the_predecessor_freed() {
     parked.close().expect("close");
 }
 
+/// The parked copy can go the same way. Retired to `/READER/ROLLBACK`, the
+/// predecessor is deleted from a computer, which frees its chain, and a
+/// different file copied on under the parked name lands on its first cluster.
+/// With the upload lost too, that file is all that holds the rollback name,
+/// and it is not the predecessor: putting it on the shelf under the book's
+/// real name would publish somebody else's file.
+#[test]
+fn a_file_that_took_the_parked_name_and_chain_is_not_restored_as_the_predecessor() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let parked = alias_of(&rollback, intent.rollback.as_str()).expect("the parked predecessor");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&rollback, parked.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    let stranger = rollback
+        .create_file_in_dir_lfn(intent.rollback.as_str())
+        .expect("a different file under the parked name");
+    stranger.write(b"a different book entirely").expect("write");
+    stranger.close().expect("close");
+    let old = intent
+        .old
+        .as_ref()
+        .expect("a replacement records its predecessor");
+    let squatter = holder_of(&rollback, intent.rollback.as_str()).expect("the stranger");
+    assert_eq!(
+        squatter.chain, old.chain,
+        "the stranger must start on the predecessor's first cluster"
+    );
+    assert_ne!(squatter.size, old.size);
+
+    let upload_dir = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&upload_dir, intent.stage.alias.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    drop(upload_dir);
+    drop(rollback);
+    drop(cache_root);
+
+    recover_installs(&root, &books);
+    assert!(
+        holder_of(&books, BOOK_NAME).is_none(),
+        "nothing may be put on the shelf under the book's name: the predecessor is gone \
+         and the file at its parked name is not it ({:?})",
+        shelf_long_names(&books)
+    );
+}
+
+/// And once the upload has landed, the same stranger at the parked name is
+/// not the obsolete predecessor either, so it is not reclaimed in its place.
+#[test]
+fn a_file_that_took_the_parked_name_and_chain_is_not_reclaimed_as_the_predecessor() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+    install::apply_step(&root, &books, &intent, Step::InstallStage).expect("install");
+
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let parked = alias_of(&rollback, intent.rollback.as_str()).expect("the parked predecessor");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&rollback, parked.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    let stranger = rollback
+        .create_file_in_dir_lfn(intent.rollback.as_str())
+        .expect("a different file under the parked name");
+    stranger.write(b"a different book entirely").expect("write");
+    stranger.close().expect("close");
+    let old = intent
+        .old
+        .as_ref()
+        .expect("a replacement records its predecessor");
+    let squatter = holder_of(&rollback, intent.rollback.as_str()).expect("the stranger");
+    assert_eq!(squatter.chain, old.chain);
+    assert_ne!(squatter.size, old.size);
+    drop(rollback);
+    drop(cache_root);
+
+    let step = install::plan(
+        &intent,
+        install::observe(&root, &books, &intent).expect("observe"),
+    );
+    assert_ne!(
+        step,
+        Step::ReclaimRollback,
+        "the file at the parked name is not the predecessor, so it is not freed as it"
+    );
+    assert_eq!(body_named(&books, BOOK_NAME), new_body());
+}
+
 /// Retiring the predecessor frees its alias, and the driver hands a free alias
 /// to the next file that needs one. So the recorded alias stops meaning "the
 /// predecessor" the moment the retire completes, and recovery must not treat

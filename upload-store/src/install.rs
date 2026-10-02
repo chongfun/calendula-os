@@ -159,6 +159,16 @@ impl Located {
     }
 }
 
+impl InstallIntent {
+    /// Whether an entry under the parked name on `chain` holding `size` bytes
+    /// is the predecessor this record retired there. A move changes neither,
+    /// while a delete from a computer frees both to whatever is copied on
+    /// next under that name; and a record with no predecessor parked nothing.
+    fn parked_is_old(&self, chain: u32, size: u32) -> bool {
+        self.old.as_ref().is_some_and(|old| old.is(chain, size))
+    }
+}
+
 /// What an install is trying to achieve, in full, before it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallIntent {
@@ -315,7 +325,11 @@ fn read_name(bytes: &[u8]) -> Option<ShortName> {
 pub struct Presence {
     /// The predecessor is still under its own name in `/BOOKS`.
     pub old: bool,
-    /// A copy is parked in `/READER/ROLLBACK`.
+    /// The predecessor is parked in `/READER/ROLLBACK`: the file under the
+    /// parked name is on its recorded chain at its recorded size. A delete
+    /// from a computer frees both to whatever is copied on next under that
+    /// name, and such a file is not the predecessor, so it is neither put on
+    /// the shelf in its place nor freed as it.
     pub rollback: bool,
     /// The finished upload is still in `/READER/UPLOAD`, on the chain and at
     /// the size the record named, not merely under that name, which a
@@ -433,7 +447,9 @@ pub fn plan(intent: &InstallIntent, at: Presence) -> Step {
             (false, true) if intent.old.is_some() => Step::RestoreOldHolder,
             // A parked copy with no predecessor recorded is not this
             // transaction's to interpret, and unlinking it would discard the
-            // only name some other file has left.
+            // only name some other file has left. `observe` reports a parked
+            // copy only against a recorded predecessor, so this is reached by
+            // a hand-built observation alone; the planner stays total.
             (false, true) => Step::Done,
             // The predecessor stands and nothing else happened, or there was
             // never anything to install. Either way the shelf is consistent.
@@ -689,8 +705,13 @@ where
     // book carries the scratch file's, the predecessor the parked copy's.
     let staged = entry_chain(&upload, intent.stage.alias.as_str()).ok_or(InstallError::Card)?;
     // By the name it was parked under: the move gave it a derived alias.
-    let parked = holder_of_long_name(&rollback, intent.rollback.as_str())?
+    let under_parked_name = holder_of_long_name(&rollback, intent.rollback.as_str())?
         .map(|(_, cluster, size)| (cluster.value(), size));
+    // The parked predecessor is the file under that name only if it is the
+    // one recorded. Every step that acts on a parked copy either puts it on
+    // the shelf under the book's real name or frees its chain, so a stranger
+    // there is nobody's to act on, exactly as one holding the long name is.
+    let parked = under_parked_name.filter(|&(chain, size)| intent.parked_is_old(chain, size));
     let holder = holder_of_long_name(books, intent.long_name.as_str())?
         .map(|(_, cluster, size)| (cluster.value(), size));
 
@@ -703,8 +724,11 @@ where
     // A shelf entry on the parked copy's chain *is* the predecessor, whatever
     // it is called: a restore cut between its two writes puts the book back
     // under a derived alias, and the recorded one is no help there. Both
-    // entries are read live, and a cut move leaves them alike in size too.
-    let restored = holder.is_some() && holder == parked;
+    // entries are read live and compared to each other rather than to the
+    // record: two names on one chain can only have come from this firmware's
+    // own move, and a record with no predecessor meeting such a pair is the
+    // case recovery settles as `Malformed` rather than walks.
+    let restored = holder.is_some() && holder == under_parked_name;
 
     // Otherwise by its recorded alias, not the long name: a book stored
     // before long names has none, which is why it needs replacing rather than
@@ -748,7 +772,26 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    Ok(holder_of_long_name(rollback, intent.rollback.as_str())?.map(|(alias, _, _)| alias))
+    Ok(parked_predecessor(rollback, intent)?.map(|(alias, _, _)| alias))
+}
+
+/// The parked predecessor: its alias, chain and size, or `None` if nothing
+/// under the parked name is it.
+///
+/// By the name it was parked under, since the move gave it a derived alias,
+/// and only if what holds that name is the predecessor the record describes;
+/// see `observe` for why a stranger there is left alone.
+fn parked_predecessor<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    rollback: &Dir<'_, D, T, MD, MF, MV>,
+    intent: &InstallIntent,
+) -> Result<Option<(ShortName, u32, u32)>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    Ok(holder_of_long_name(rollback, intent.rollback.as_str())?
+        .map(|(alias, cluster, size)| (alias, cluster.value(), size))
+        .filter(|&(_, chain, size)| intent.parked_is_old(chain, size)))
 }
 
 /// Carry out one step. `Ok(true)` if `/BOOKS` changed.
