@@ -25,7 +25,7 @@ use reader_cache::store::ReaderStore;
 use storage::book_build::ReaderCacheScratch;
 use storage::card::{Root, SessionError, StaticTime};
 use storage::custom_font::MetricCache;
-use storage::task::{Host, StorageTask};
+use storage::task::{Host, OwedRescan, StorageTask};
 
 // ---------------------------------------------------------------------------
 // The card
@@ -647,6 +647,9 @@ pub struct Device {
     queue: VecDeque<StorageCommand>,
     next_request_id: u32,
     last_render: Option<RenderRequest>,
+    /// A pick's rescan the loop owes, as the firmware keeps it between the
+    /// note and the scan.
+    owed_rescan: Option<OwedRescan>,
     /// The frame on screen as each rescan began.
     pub before_rescan: Vec<Option<RenderRequest>>,
 }
@@ -669,6 +672,7 @@ impl Device {
             queue: VecDeque::new(),
             next_request_id: 1,
             last_render: None,
+            owed_rescan: None,
             before_rescan: Vec::new(),
         };
         device.render();
@@ -681,12 +685,32 @@ impl Device {
     /// Flush the coalesced position, as the firmware does before deep sleep.
     /// Everything else is lost with RAM.
     pub fn sleep(mut self) {
+        self.power_pressed();
         self.settle();
         assert!(
             self.task
                 .flush_pending_progress(&mut self.card, &mut self.store),
             "the position reached the card before sleep"
         );
+    }
+
+    /// The Sleep arm's first act: a pick still waiting on its rescan is
+    /// refused rather than scanned, and the refusal is folded into the app.
+    pub fn power_pressed(&mut self) {
+        if let Some(owed) = self.owed_rescan.take() {
+            self.task.abandon_rescan(owed, &mut self.host);
+            self.deliver();
+        }
+    }
+
+    /// Whether a pick's rescan is owed and not yet run.
+    pub fn rescan_owed(&self) -> bool {
+        self.owed_rescan.is_some()
+    }
+
+    /// The frame on screen now.
+    pub fn frame(&self) -> Option<RenderRequest> {
+        self.last_render
     }
 
     /// Press a button, and let both tasks run until neither owes anything.
@@ -764,10 +788,15 @@ impl Device {
         self.last_render = Some(self.app.render_request(RenderKind::Page));
     }
 
-    /// Run the storage task until it owes nothing: the queued commands, then
-    /// background slices, each event folded into the app as it arrives.
+    /// Run the storage task until it owes nothing: an owed rescan, the queued
+    /// commands, then background slices, each event folded into the app as
+    /// it arrives.
     pub fn settle(&mut self) {
         for _ in 0..10_000 {
+            if self.rescan_owed() {
+                self.rescan();
+                continue;
+            }
             if self.handle_one() {
                 continue;
             }
@@ -796,10 +825,30 @@ impl Device {
         self.queue.push_back(command);
     }
 
-    /// Run the queued commands only: no requeued command and no background
-    /// slice, which the firmware reaches only after a wait.
+    /// Run the queued commands only: no requeued command, no background
+    /// slice, and no owed rescan, all of which the firmware reaches only
+    /// after a wait. Stops at a pick that leaves a rescan owed, as the
+    /// firmware's storage branch stands down there.
     pub fn run_queued(&mut self) {
         while self.handle_one() {}
+    }
+
+    /// Run the rescan a pick left owed, as the firmware's loop does after its
+    /// wait, with whatever the app asked for meanwhile already on screen.
+    pub fn rescan(&mut self) {
+        let owed = self.owed_rescan.take().expect("a rescan is owed");
+        self.before_rescan.push(self.last_render);
+        // What the app task published before it last yielded.
+        self.host.library_browse_request = self.app.library_browse.request_id();
+        let portrait = app_core::is_portrait(self.app.orientation);
+        self.task.rescan(
+            owed,
+            &mut self.card,
+            &mut self.host,
+            &mut self.store,
+            portrait,
+        );
+        self.deliver();
     }
 
     /// Run one background slice, as the firmware does after its wait.
@@ -817,16 +866,22 @@ impl Device {
         }
     }
 
+    /// Apply the next queued command. False with nothing queued, or while a
+    /// rescan is owed: storage stands down for the pick's second half.
     fn handle_one(&mut self) -> bool {
         self.handle_one_with(|_| {})
     }
 
     /// Run the next queued command, with `during_note` as what the reader
-    /// does while the firmware paints the rescan note: between the two halves
-    /// of a pick that rescans, after the app has folded `Rescanning` and
-    /// before the scan holds the card. Presses there queue their commands
-    /// behind the scan, as the display task's channel would hold them.
+    /// does while the firmware paints the rescan note: after the app has
+    /// folded `Rescanning` and before the loop runs the scan it owes. Presses
+    /// there reduce at once, as the app task runs during the refresh, and the
+    /// commands they queue wait behind the pick's second half, as the
+    /// firmware's storage branch stands down for it.
     pub fn handle_one_with(&mut self, during_note: impl FnOnce(&mut Device)) -> bool {
+        if self.rescan_owed() {
+            return false;
+        }
         let Some(command) = self.queue.pop_front() else {
             return false;
         };
@@ -841,20 +896,11 @@ impl Device {
             portrait,
         );
         self.deliver();
-        if let Some(owed) = owed {
-            // The firmware paints here, before the scan holds the card, and
-            // the app runs while the panel refreshes.
-            self.before_rescan.push(self.last_render);
+        // The firmware paints the note here and leaves the scan to its loop,
+        // and the app runs while the panel refreshes.
+        self.owed_rescan = owed;
+        if self.rescan_owed() {
             during_note(self);
-            self.host.library_browse_request = self.app.library_browse.request_id();
-            self.task.rescan(
-                owed,
-                &mut self.card,
-                &mut self.host,
-                &mut self.store,
-                portrait,
-            );
-            self.deliver();
         }
         true
     }

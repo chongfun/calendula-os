@@ -324,6 +324,147 @@ fn a_newer_pick_during_the_note_gets_the_scan_in_place_of_the_older() {
     assert_eq!(device.app.page, 0, "the added book opened at its start");
 }
 
+/// Back pressed while the note is painting, seen from the loop. The note's
+/// flush yields, so the app has the Home frame queued by the time it settles,
+/// and the loop paints that frame before it reaches the scan it still owes:
+/// the frame on screen as the pick's second half runs is Home, not the note.
+/// Storage stands down in between, so nothing Back queued runs ahead of it.
+/// The second half then finds the pick walked away from and refuses it
+/// without a scan; the next pick the reader waits for scans.
+#[test]
+fn back_during_the_note_is_painted_before_the_loop_runs_the_owed_rescan() {
+    let (_card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    let books = device.store.catalog_count();
+    device.point_at(ADDED);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert!(device.rescan_owed(), "the pick left its scan to the loop");
+    assert!(device.app.library_browse.rescanning());
+    let note = device.frame().expect("a frame");
+    assert_eq!(note.view, AppView::Library);
+    assert!(note.library_rescanning, "the note is on the glass");
+
+    // Back lands while the plate settles: the app reduces it and queues Home.
+    device.press_only(Button::Back);
+    assert_eq!(device.app.view, AppView::Home);
+    assert!(device.app.library_browse.is_idle(), "the wait went with it");
+    device.run_queued();
+    assert!(
+        device.rescan_owed(),
+        "storage stands down until the pick's second half has run"
+    );
+
+    let before = device.log.len();
+    device.rescan();
+    let frame = device
+        .before_rescan
+        .last()
+        .copied()
+        .flatten()
+        .expect("a frame");
+    assert_eq!(
+        frame.view,
+        AppView::Home,
+        "Home was painted before the scan"
+    );
+    assert!(!frame.library_rescanning);
+    let events = &device.log[before..];
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "no scan for a pick walked away from: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::RowFailed { .. })),
+        "which is still answered: {events:?}"
+    );
+    assert_eq!(device.app.view, AppView::Home, "{events:?}");
+    assert_eq!(
+        device.store.catalog_count(),
+        books,
+        "the catalog is untouched"
+    );
+    device.settle();
+    assert_eq!(device.app.view, AppView::Home);
+
+    // A pick the reader waits for scans, with the note on the glass.
+    device.open_library();
+    let before = device.log.len();
+    device.choose(ADDED);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert!(device.log[before..]
+        .iter()
+        .any(|event| matches!(event, LibraryEvent::Scanned { .. })));
+    let [_, Some(frame)] = device.before_rescan[..] else {
+        panic!("two second halves: {:?}", device.before_rescan);
+    };
+    assert!(frame.library_rescanning);
+}
+
+/// Power pressed while the note is painting. Sleep is terminal, so the pick
+/// is refused instead of scanned: no scan holds the note on the panel ahead
+/// of the sleep image, and a sleep a late press abandons finds the Library
+/// with nothing waiting. The catalog still lacks the book, so the next boot's
+/// pick rescans.
+#[test]
+fn power_during_the_note_refuses_the_pick_instead_of_scanning() {
+    let (card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    let books = device.store.catalog_count();
+    device.point_at(ADDED);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert!(device.rescan_owed());
+    let pick = device
+        .app
+        .library_browse
+        .request_id()
+        .expect("a pick waits");
+
+    let before = device.log.len();
+    device.power_pressed();
+    let events = &device.log[before..];
+    assert!(
+        events.contains(&LibraryEvent::RowFailed { request_id: pick }),
+        "the pick is refused: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "no scan: {events:?}"
+    );
+    assert!(!device.rescan_owed());
+    assert_eq!(
+        device.store.catalog_count(),
+        books,
+        "the catalog is untouched"
+    );
+    // An abandoned sleep returns here: the Library, with nothing waiting.
+    assert_eq!(device.app.view, AppView::Library);
+    assert!(device.app.library_browse.is_idle());
+    assert!(!device.frame().expect("a frame").library_rescanning);
+    assert!(device.before_rescan.is_empty());
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    let before = device.log.len();
+    device.choose(ADDED);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert!(
+        device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Rescanning { .. })),
+        "the pick refused before sleep still owes its scan: {:?}",
+        &device.log[before..]
+    );
+}
+
 /// The write before the rescan is refused. The scan would drop the pages that
 /// turn page 9 into a place, so the pick is refused instead, and the next pick
 /// writes the page before it scans.
@@ -472,6 +613,8 @@ fn a_failed_scan_by_a_pick_leaves_the_refresh_owed() {
     let before = device.log.len();
     device.press_only(Button::Confirm);
     device.run_queued();
+    // The loop runs the scan the pick left owed, after its wait.
+    device.rescan();
     assert!(
         device.log[before..]
             .iter()

@@ -5,7 +5,8 @@ use crate::{
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use app_core::storage_loop::{
-    loop_arm, Drained, LoopArm, OpenAction, OpenSequence, SleepAction, SleepRefusal, SleepSequence,
+    loop_arm, owed_work, owed_work_delay_ms, storage_may_run, Drained, LoopArm, OpenAction,
+    OpenSequence, OwedWork, SleepAction, SleepRefusal, SleepSequence,
 };
 use app_core::{
     display_orientation_from_u8, refresh_policy_from_u8, AppView, ChapterCursor,
@@ -29,6 +30,7 @@ use reader_cache::{
     READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
 };
 use static_cell::ConstStaticCell;
+use storage::task::OwedRescan;
 
 static EPUB_TAIL: ConstStaticCell<[u8; READER_TAIL_SCRATCH]> =
     ConstStaticCell::new([0; READER_TAIL_SCRATCH]);
@@ -83,6 +85,9 @@ pub async fn run(
     // Storage state: the background walk, the evidence job, the pending
     // progress record and the restore latch. See `storage::task`.
     let mut storage_task = storage::task::StorageTask::default();
+    // A pick whose rescan the loop still owes: announced and painted, run by
+    // the loop's own branch behind any frame queued meanwhile. One byte.
+    let mut owed_rescan: Option<OwedRescan> = None;
     // On a deep-sleep (Power button) wake the panel still shows the sleep
     // screen: deep_sleep_wake is true only when the RTC wake cause is the
     // armed GPIO *and* the pre-sleep handshake recorded that the sleep frame
@@ -172,27 +177,30 @@ pub async fn run(
         // produces acknowledgements, but it is also what releases the app to
         // drain them, so standing down would be waiting on itself.
         //
-        // The fifth is the only one nobody else is waiting on: it is work this
-        // task already owes itself, so it comes last on purpose and runs a
-        // slice of a suspended book build whenever the four above have nothing.
-        // It waits before claiming the loop, which is what keeps a ready branch
-        // from starving the others — and what gives every other task a
-        // scheduling point between slices, where a single unsliced build used
-        // to hold the executor for a minute. A yield was not enough of a wait:
-        // it hands the app task one poll, which does not cover receiving a
-        // button, reducing it and sending the render, so the loop would commit
-        // to another multi-second slice ahead of a page turn already pressed.
-        // See `background_build_step_due`.
+        // The fifth is the only one nobody else is waiting on: work this task
+        // already owes itself, so it comes last on purpose and runs when the
+        // four above have nothing. That is a pick's rescan once its note is
+        // painted, or else a slice of a suspended book build. The rescan is
+        // not run straight after its note: the note's flush yields, and a
+        // Back or Power pressed in that window has its render or sleep queued
+        // by the time the plate settles, so the 12 s scan must come after it.
+        // Storage stands down while a rescan is owed, since it is one
+        // command's second half. The branch waits before claiming the loop;
+        // a bare yield hands the app task one poll, which does not cover
+        // receiving a button, reducing it and sending the render. See
+        // `owed_work_due`.
+        let due = owed_work(
+            owed_rescan.is_some(),
+            storage_task.background_owed(sd_library) && !sd_library.text_holds_toc(),
+        )
+        .filter(|_| !sync_session.active() && holder().storage_may_run());
         match select5(
             DISPLAY_COMMANDS.receive(),
-            storage_command_while_free(),
+            storage_command_while_free(owed_rescan.is_some()),
             place_held_library_event(),
             place_held_display_event(),
-            background_build_step_due(
-                storage_task.background_owed(sd_library)
-                    && !sync_session.active()
-                    && holder().storage_may_run()
-                    && !sd_library.text_holds_toc(),
+            owed_work_due(
+                due,
                 // A place the card refused backs off on the same curve a
                 // refused build does. Without it the retry runs at the settle
                 // interval, which is 50 ms of cache work against a card that
@@ -202,15 +210,30 @@ pub async fn run(
         )
         .await
         {
-            Either5::Fifth(()) => {
-                storage_task.background_step(
-                    &mut crate::sd_session::card(&mut epd, &mut sd_cs),
-                    &mut FwHost,
-                    sd_library,
-                    font_metrics,
-                    refresh_planner.last_request(),
-                );
-            }
+            Either5::Fifth(()) => match due {
+                Some(OwedWork::Rescan) => {
+                    if let Some(owed) = owed_rescan.take() {
+                        storage_task.rescan(
+                            owed,
+                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                            &mut FwHost,
+                            sd_library,
+                            last_portrait(&refresh_planner),
+                        );
+                    }
+                }
+                Some(OwedWork::BuildSlice) => {
+                    storage_task.background_step(
+                        &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                        &mut FwHost,
+                        sd_library,
+                        font_metrics,
+                        refresh_planner.last_request(),
+                    );
+                }
+                // The branch is pending with nothing owed.
+                None => {}
+            },
             Either5::Third(()) | Either5::Fourth(()) => {}
             Either5::First(DisplayCommand::Render(request)) => {
                 // The dequeue instant. This is NOT the pairing boundary --
@@ -472,6 +495,14 @@ pub async fn run(
                 // not a queued command — it is a branch of the loop's select —
                 // so it can never spend the drain's budget or delay the panel.
                 //
+                // A pick still waiting on its rescan is refused rather than
+                // scanned: sleep is terminal, and the scan would hold the
+                // note on the panel for 12 s ahead of the sleep image. The
+                // refusal is a required event, so it is sent before the
+                // holder is checked below.
+                if let Some(owed) = owed_rescan.take() {
+                    storage_task.abandon_rescan(owed, &mut FwHost);
+                }
                 // Everything owed to the card, in order, before the panel goes
                 // down. The ordering rules live in `SleepSequence` so they can
                 // be driven from a host test; this arm only does what it is
@@ -505,16 +536,11 @@ pub async fn run(
                                         &mut sync_session,
                                         portrait,
                                     );
-                                    // No note: the panel is about to show the
-                                    // sleep image. The pick is still answered.
+                                    // A pick that would rescan is refused, as
+                                    // one already owed is above: the panel is
+                                    // about to show the sleep image.
                                     if let Some(owed) = owed {
-                                        storage_task.rescan(
-                                            owed,
-                                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
-                                            &mut FwHost,
-                                            sd_library,
-                                            portrait,
-                                        );
+                                        storage_task.abandon_rescan(owed, &mut FwHost);
                                     }
                                     sleep.applied();
                                     may_keep_draining = holder().sleep_may_proceed();
@@ -750,7 +776,11 @@ pub async fn run(
                     if let Some(owed) = owed {
                         // A pick of a book the catalog does not know yet. Its
                         // rescan holds the card, and with it the bus, for
-                        // about 12 s on a large library, so say so first.
+                        // about 12 s on a large library, so say so first, and
+                        // then leave the scan to the loop's own branch: the
+                        // plate's flush yields, and a render or sleep queued
+                        // meanwhile goes first. Storage stood down the moment
+                        // the last one was owed, so none is pending here.
                         if let Some(note) = rescan_plate_request(&refresh_planner) {
                             crate::library_sd::ensure_folder_page(
                                 &mut crate::sd_session::card(&mut epd, &mut sd_cs),
@@ -769,17 +799,7 @@ pub async fn run(
                             )
                             .await;
                         }
-                        // The refresh yielded, and the app may have walked
-                        // away from the pick. `rescan` asks before it scans,
-                        // and nothing lets the app run again before the scan
-                        // ends: one executor, and no await in the scan.
-                        storage_task.rescan(
-                            owed,
-                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
-                            &mut FwHost,
-                            sd_library,
-                            portrait,
-                        );
+                        owed_rescan = Some(owed);
                     }
                 }
             },
@@ -874,25 +894,28 @@ async fn place_held_library_event() {
     let _ = with_holder(LibraryEventHolder::placed);
 }
 
-/// The next storage command, but only while nothing is held.
+/// The next storage command, but only while nothing is held and no rescan is
+/// owed.
 ///
 /// Storage is where settling events come from and the holder has one slot, so
 /// applying another command while one waits could produce a second with
-/// nowhere to go. Pending forever until the holder clears, which the loop's
-/// other branches are free to do meanwhile.
-async fn storage_command_while_free() -> StorageCommand {
-    if !holder().storage_may_run() {
+/// nowhere to go. And an owed rescan is one command's second half; a second
+/// pick applied under it would replace the pick it stands for. Pending forever
+/// until both clear, which the loop's other branches are free to do meanwhile.
+async fn storage_command_while_free(rescan_owed: bool) -> StorageCommand {
+    if !storage_may_run(holder().storage_may_run(), rescan_owed) {
         return core::future::pending::<StorageCommand>().await;
     }
     STORAGE_COMMANDS.receive().await
 }
 
-/// Ready when the loop should spend a slice on a suspended book build.
+/// Ready when the loop should run the work it owes itself: a pick's rescan, or
+/// a slice of a suspended book build.
 ///
-/// The gate is the same one storage answers to, for the same reason: a step can
-/// produce a settling `Loaded`, and the holder has one slot. It also stands
-/// down for a sync session, whose loan takes the scratch the build is walking
-/// out of.
+/// The gate is the same one storage answers to, for the same reason: both can
+/// produce a settling event, and the holder has one slot. It also stands down
+/// for a sync session, whose loan takes the scratch the build is walking out
+/// of.
 ///
 /// And it stands down for the Chapters overview. That screen borrows the same
 /// single text arena the build writes through, and says so with
@@ -910,24 +933,21 @@ async fn storage_command_while_free() -> StorageCommand {
 /// pressed 86 ms earlier still not reduced into a render, so the reader waited
 /// out another 2912 ms step for a page that already existed. Waiting
 /// `BACKGROUND_SETTLE_MS` gives the app room to produce that render, which the
-/// first branch then services ahead of the next slice.
+/// first branch then services ahead of the next slice. The same window covers a
+/// rescan: a Back pressed as its note finished painting becomes the Home frame
+/// the loop paints before the scan.
 ///
 /// A walk that is only retrying waits on its backoff instead, which is what
 /// lets a step that never began be kept indefinitely rather than given up on.
-async fn background_build_step_due(pending: bool, attempts: u8) {
-    if !pending {
+async fn owed_work_due(work: Option<OwedWork>, attempts: u8) {
+    let Some(work) = work else {
         return core::future::pending::<()>().await;
-    }
+    };
     // Always a wait, never a bare yield. The two reasons differ but the failure
     // of yielding is the same in both: this branch is ready again the instant a
     // step ends, so a single poll is not enough for the app task to get its
     // work in, and the loop commits to another multi-second slice ahead of it.
-    let wait = if attempts > 0 {
-        app_core::storage_loop::background_retry_delay_ms(attempts)
-    } else {
-        app_core::storage_loop::BACKGROUND_SETTLE_MS
-    };
-    Timer::after(Duration::from_millis(wait)).await;
+    Timer::after(Duration::from_millis(owed_work_delay_ms(work, attempts))).await;
 }
 
 /// Holds the display task still from the moment the panel goes down until the

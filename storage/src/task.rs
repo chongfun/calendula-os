@@ -55,11 +55,14 @@ pub trait Host {
 
 /// A pick of a book the catalog does not know yet, announced and waiting on
 /// its rescan. The scan holds the card, and the bus the panel shares, for
-/// about 12 s on a 1,100-book X3 card, so the caller paints the note first.
+/// about 12 s on a 1,100-book X3 card, so the caller paints the note first
+/// and then runs the scan as work its loop owes, behind any frame the reader
+/// asked for meanwhile. A sleep refuses the pick instead, through
+/// [`StorageTask::abandon_rescan`].
 ///
 /// Empty: the pick itself waits in [`StorageTask`], out of the caller's poll
 /// frame. It exists so that dropping it is a compile warning.
-#[must_use = "a pick waits on this rescan; run it with StorageTask::rescan"]
+#[must_use = "a pick waits on this rescan; run it with StorageTask::rescan or refuse it with abandon_rescan"]
 pub struct OwedRescan(());
 
 /// The pick an [`OwedRescan`] stands for.
@@ -103,10 +106,11 @@ impl StorageTask {
     /// stays out of the task loop's poll frame.
     ///
     /// A pick that needs a rescan comes back unfinished, so the caller can
-    /// paint before the scan holds the card. Pass it to [`Self::rescan`].
+    /// paint before the scan holds the card. Pass it to [`Self::rescan`], or
+    /// to [`Self::abandon_rescan`] when the panel is about to sleep.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    #[must_use = "a pick waits on this rescan; run it with StorageTask::rescan"]
+    #[must_use = "a pick waits on this rescan; run it with StorageTask::rescan or refuse it with abandon_rescan"]
     pub fn handle(
         &mut self,
         command: StorageCommand,
@@ -209,6 +213,21 @@ impl StorageTask {
                 relist_library_folder(card, host, sd_library, portrait);
                 host.send_required(&LibraryEvent::RowFailed { request_id });
             }
+        }
+    }
+
+    /// Refuse the pick [`Self::handle`] left owing a rescan, without scanning.
+    ///
+    /// For a sleep, which is terminal: a 12 s scan now would only hold the
+    /// note on the panel ahead of the sleep image. The refusal is required,
+    /// so a sleep a late press abandons finds the Library with nothing
+    /// waiting. The catalog is untouched, and `handle` already wrote the
+    /// position.
+    #[inline(never)]
+    pub fn abandon_rescan(&mut self, _owed: OwedRescan, host: &mut impl Host) {
+        if let Some(PendingRescan { request_id, .. }) = self.pending_rescan.take() {
+            slog!("sd: sleeping instead of rescanning for a pick; refusing it");
+            host.send_required(&LibraryEvent::RowFailed { request_id });
         }
     }
 

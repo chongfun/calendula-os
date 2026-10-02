@@ -729,12 +729,24 @@ card. So the pick runs in two halves. `StorageTask::handle` writes any
 coalesced position, sends `LibraryEvent::Rescanning`, keeps the pick, and
 returns an `OwedRescan` token the caller cannot drop without a compile warning. The
 display task then paints the Library frame already on the glass with an
-"updating the library..." footer, one fast refresh, and only then calls
-`StorageTask::rescan`, which scans and answers with `Scanned` and the row. The
-app folds `Rescanning` into the pick's wait without asking for a frame, since
-one would only run after the scan, and `Scanned` clears it. The kept pick holds the
-book's locator in the storage task, which lives in the display task's future:
-152 bytes more of it on both boards, and 80 bytes more of its poll frame.
+"updating the library..." footer, one fast refresh, and hands the token to its
+loop as work it owes itself (`storage_loop::owed_work`, ahead of a build
+slice): that branch waits the settle interval and then calls
+`StorageTask::rescan`, which scans and answers with `Scanned` and the row, or
+refuses a pick walked away from (next paragraph). The scan does not run
+straight after the note because the note's flush yields, and
+a Back or Power pressed in that window has its render or sleep queued by the
+time the plate settles; the loop takes display commands first, so the Home
+frame or the sleep goes ahead of the 12 s scan. Storage stands down while a
+rescan is owed, since it is one command's second half. A `Sleep` refuses the
+pick through `StorageTask::abandon_rescan` (a required `RowFailed`) rather than
+scanning, sleep being terminal; the pre-sleep drain does the same for a pick it
+drains. The app folds `Rescanning` into the pick's wait without asking for a
+frame, since one would only run after the scan, and `Scanned` clears it. The
+kept pick holds the book's locator in the storage task, which lives in the
+display task's future: 152 bytes more of it on both boards, and 80 bytes more
+of its poll frame. The owed token is a byte of the future and nothing of the
+poll frame, which measured the same before and after the deferral.
 
 The note's refresh is a yield, and the app runs during it. Back is the one
 press a waiting pick takes, and from Home the reader can then ask for the book

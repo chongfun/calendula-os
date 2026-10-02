@@ -386,6 +386,64 @@ pub const BACKGROUND_SETTLE_MS: u64 = 50;
 /// began.
 pub const BACKGROUND_RETRY_CEILING_MS: u64 = 30_000;
 
+/// Work the display task owes itself, which its loop takes only when nothing
+/// another task is waiting on is ready: a queued render or sleep goes first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwedWork {
+    /// The second half of a pick of a book the catalog does not know: scan the
+    /// card, then answer the pick. Announced and painted already, and about 12
+    /// s on a large library, so it runs here rather than straight after the
+    /// note, where a Back or Power pressed while the note was painting would
+    /// wait out the whole scan behind it.
+    Rescan,
+    /// One slice of a suspended book build, or a waiting place's retry.
+    BuildSlice,
+}
+
+/// Which owed work the loop's own branch runs next.
+///
+/// A rescan outranks a build slice. It is a command already half applied, and
+/// the storage queue stands down until it is done (see
+/// [`storage_may_run`]), so a slice ahead of it would hold up both.
+pub const fn owed_work(rescan_owed: bool, build_owed: bool) -> Option<OwedWork> {
+    if rescan_owed {
+        Some(OwedWork::Rescan)
+    } else if build_owed {
+        Some(OwedWork::BuildSlice)
+    } else {
+        None
+    }
+}
+
+/// Whether the loop may take the next storage command.
+///
+/// Not while a settling event is held, which is the holder's rule, and not
+/// while a rescan is owed: that is one command's second half, and a second
+/// pick applied in between would replace the pick it stands for.
+pub const fn storage_may_run(nothing_held: bool, rescan_owed: bool) -> bool {
+    nothing_held && !rescan_owed
+}
+
+/// How long the loop waits before running owed work, after `attempts` failed
+/// beginnings of a build step.
+///
+/// Always a wait, never a bare yield: the branch is ready again the instant a
+/// step or a plate ends, and one poll is not enough for the app task to turn a
+/// button into a render the loop would service first. A rescan owes no
+/// backoff, since its pick has already begun.
+pub const fn owed_work_delay_ms(work: OwedWork, attempts: u8) -> u64 {
+    match work {
+        OwedWork::Rescan => BACKGROUND_SETTLE_MS,
+        OwedWork::BuildSlice => {
+            if attempts > 0 {
+                background_retry_delay_ms(attempts)
+            } else {
+                BACKGROUND_SETTLE_MS
+            }
+        }
+    }
+}
+
 /// How long to wait before re-attempting a step that never began, after
 /// `attempts` consecutive failures to begin.
 ///
@@ -847,6 +905,51 @@ impl OpenSequence {
 
 #[cfg(test)]
 mod tests {
+
+    /// The loop's own branch runs a pick's owed rescan ahead of a build slice,
+    /// and the storage queue stands down until the rescan has run. The branch
+    /// waits the settle interval first, so a press that landed as the note
+    /// finished painting becomes a render the loop services before the scan.
+    #[test]
+    fn an_owed_rescan_is_loop_work_that_stands_storage_down() {
+        assert_eq!(owed_work(false, false), None);
+        assert_eq!(owed_work(false, true), Some(OwedWork::BuildSlice));
+        assert_eq!(owed_work(true, false), Some(OwedWork::Rescan));
+        assert_eq!(
+            owed_work(true, true),
+            Some(OwedWork::Rescan),
+            "the half-applied pick goes before a slice"
+        );
+
+        assert!(storage_may_run(true, false));
+        assert!(
+            !storage_may_run(true, true),
+            "no second pick under the first"
+        );
+        assert!(
+            !storage_may_run(false, false),
+            "the holder's rule still stands"
+        );
+
+        assert_eq!(
+            owed_work_delay_ms(OwedWork::Rescan, 0),
+            BACKGROUND_SETTLE_MS,
+            "a wait, never a yield: the window a press becomes a render in"
+        );
+        assert_eq!(
+            owed_work_delay_ms(OwedWork::Rescan, 3),
+            BACKGROUND_SETTLE_MS,
+            "a build's backoff does not delay a pick already begun"
+        );
+        assert_eq!(
+            owed_work_delay_ms(OwedWork::BuildSlice, 0),
+            BACKGROUND_SETTLE_MS
+        );
+        assert_eq!(
+            owed_work_delay_ms(OwedWork::BuildSlice, 3),
+            background_retry_delay_ms(3)
+        );
+    }
 
     /// A hold protects the landed page, frees on navigation, and terminates.
     #[test]
