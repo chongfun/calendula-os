@@ -28,24 +28,12 @@ impl JobProgress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuildProgressView {
     pub book_id: u32,
-    pub done: u16,
-    pub total: u16,
+    pub progress: JobProgress,
 }
 
 impl BuildProgressView {
     pub const fn new(book_id: u32, progress: JobProgress) -> Self {
-        Self {
-            book_id,
-            done: progress.done,
-            total: progress.total,
-        }
-    }
-
-    pub const fn progress(self) -> JobProgress {
-        JobProgress {
-            done: self.done,
-            total: self.total,
-        }
+        Self { book_id, progress }
     }
 }
 

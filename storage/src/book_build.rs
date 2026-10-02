@@ -63,25 +63,44 @@ const BACKGROUND_SLICE_MS: u64 = 400;
 ///
 /// RAM: 28 bytes inside the `EPUB_SCRATCH` static (`.bss`), not on any stack.
 /// Four more than before the layout field, which tells a walk which stored
-/// pagination it is building.
+/// pagination it is building. `total_spines` took two bytes of what was
+/// padding, so the progress it reports cost nothing.
 ///
 /// `PartialEq` is load-bearing, not derived for convenience: comparing the
 /// value before and after an open is how [`build_or_load_book_cache`] tells a
 /// walk that survived from one that was replaced.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BookBuildResume {
-    source_identity: (u32, u32),
-    total_pages: u32,
+    /// Catalog row the build is walking. Re-resolved (and re-checked against
+    /// `source_identity`) at every step: a rescan between steps can move a
+    /// different book under the same row.
     index: u16,
+    source_identity: (u32, u32),
+    /// First spine item the next step must build. Always a boundary: the
+    /// walk cannot suspend inside an item.
     next_spine: u16,
+    /// Spine items the OPF lists, the denominator of [`Self::progress`].
     total_spines: u16,
     section_count: u16,
-    content_spine_count: u16,
-    published_sections: u16,
-    layout: u8,
+    total_pages: u32,
     book_partial: bool,
+    /// Decided once, from the TOC the first step parsed. A continuation never
+    /// re-reads the TOC, so it cannot re-derive this.
     generate_toc_from_headings: bool,
+    /// Whether CONT.BIN is still being captured, and how many spine groups it
+    /// holds. Once false it stays false for the rest of the build.
     content_ok: bool,
+    content_spine_count: u16,
+    /// Sections already written into the on-disk index. The walk's own frontier
+    /// runs ahead of this between publishes; see `publish::INDEX_PUBLISH_SECTIONS`.
+    published_sections: u16,
+    /// The layout this walk is paginating for.
+    ///
+    /// Part of what makes a resume ours, now that a book can hold a stored
+    /// pagination per layout. Without it, a walk suspended while building one
+    /// layout would be resumed by a step whose writers derive another, and the
+    /// second copy would be overwritten a section at a time by the first.
+    layout: u8,
 }
 
 // The size the doc above quotes, checked rather than remembered: this rides in
@@ -379,16 +398,15 @@ pub fn build_or_load_book_cache(
     // An open of a *different* book reaches here with the resume intact — its
     // fast path never touched the records — and continuing that walk would
     // append one book's sections to another book's live index.
-    let live = matches!(status, BookLoadStatus::Ready)
-        && scratch
-            .resume
-            .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
-    if !live {
+    let live = scratch.resume.filter(|state| {
+        matches!(status, BookLoadStatus::Ready)
+            && state.belongs_to(index, source_identity, library.layout_key())
+    });
+    let Some(resume) = live else {
         scratch.resume = None;
         return BookBuildOutcome::Settled;
-    }
-    let resume = scratch.resume.expect("live implies resume is Some");
-    if scratch.resume == entry_resume {
+    };
+    if live == entry_resume {
         BookBuildOutcome::Carried(resume.progress())
     } else {
         BookBuildOutcome::Started(resume.progress())
@@ -2467,18 +2485,20 @@ where
         let (content_ok, content_spine_count) = content.suspend();
         let total_spines = package.spine.len().min(u16::MAX as usize) as u16;
         let mut state = BookBuildResume {
-            source_identity,
-            total_pages,
             index: catalog_index,
+            source_identity,
             next_spine,
             total_spines,
             section_count: section_count.min(u16::MAX as usize) as u16,
-            content_spine_count,
-            published_sections: 0,
-            layout: library.layout_key(),
+            total_pages,
             book_partial,
             generate_toc_from_headings,
             content_ok,
+            content_spine_count,
+            // Replaced below by whichever tail runs; a first open always
+            // publishes, a continuation only past the batching threshold.
+            published_sections: 0,
+            layout: library.layout_key(),
         };
         return if resume.is_none() {
             publish::publish_first_open(

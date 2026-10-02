@@ -879,12 +879,12 @@ async fn flush_plate(
     }
 }
 
-/// Repaints the rescan note's percentage while the scan holds the card.
+/// Repaints the rescan note's progress rule while the scan holds the card.
 ///
 /// Called from inside the scan's card session, between card operations,
 /// with the bus clocked for the panel and the card deselected. The rows
 /// cannot be redrawn there (the scan has the catalog and the arena they
-/// come from), so only the note's line is redrawn, over the frame on the
+/// come from), so only the note and its rule are redrawn, over the frame on the
 /// glass, and flushed on a fast refresh.
 struct RescanPainter<'a> {
     fb: &'a mut Framebuffer,

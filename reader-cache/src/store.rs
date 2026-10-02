@@ -337,6 +337,8 @@ pub struct ReaderStore {
     pub current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
+    /// The open walk's progress, for the reading footer: 12 bytes more of the
+    /// 47 KB static.
     pub(crate) build_progress: Option<proto::progress::BuildProgressView>,
     pub(crate) layout_bound_unmet: bool,
     pub(crate) book_section_count: usize,
@@ -1824,13 +1826,9 @@ impl ReaderStore {
     /// Returns `None` if no progress is recorded or if recorded progress belongs
     /// to another book.
     pub fn background_build_progress(&self, book_id: u32) -> Option<proto::progress::JobProgress> {
-        self.build_progress.and_then(|view| {
-            if view.book_id == book_id {
-                Some(view.progress())
-            } else {
-                None
-            }
-        })
+        self.build_progress
+            .filter(|view| view.book_id == book_id)
+            .map(|view| view.progress)
     }
 
     /// Set or clear the background build progress projection.

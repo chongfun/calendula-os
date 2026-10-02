@@ -489,12 +489,8 @@ impl WebEmulator {
             // Straddle the panel's vertical center (X4: 232/268) so the plate
             // stays centered on the taller X3 instead of riding high.
             let mid = HEIGHT as i16 / 2;
-            let title_y = mid - 8;
-            let author_y = title_y + 36;
-            draw_centered(&mut self.fb, literata(FontStyle::Bold), source.title, title_y);
-            if !source.author.is_empty() {
-                draw_centered(&mut self.fb, literata(FontStyle::Italic), source.author, author_y);
-            }
+            draw_centered(&mut self.fb, literata(FontStyle::Bold), source.title, mid - 8);
+            draw_centered(&mut self.fb, literata(FontStyle::Italic), source.author, mid + 28);
             return;
         }
         let store = self.store.as_ref().unwrap();

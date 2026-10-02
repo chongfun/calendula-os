@@ -322,7 +322,7 @@ pub(crate) fn chapter_colophon_width(
 }
 
 /// The 1px rule with a 3px head filled to the reading position.
-pub fn progress_rule(fb: &mut Framebuffer, x: i16, y: i16, w: i16, permille: u16) {
+pub(crate) fn progress_rule(fb: &mut Framebuffer, x: i16, y: i16, w: i16, permille: u16) {
     hline(fb, x, y, w);
     let fill = ((w as i32 * permille.min(1000) as i32) / 1000) as i16;
     fill_rect(
@@ -587,29 +587,30 @@ const RESCAN_RULE_WIDTH: i16 = 200;
 /// Room either side of the rescan note and rule, for italic overhang.
 const RESCAN_NOTE_PAD: i16 = 8;
 
-// At the rows' size: the reader waits on this, so it has to be read.
+/// The note's baseline and the rule's line, straddling the footer line. The
+/// redraw clears between them, so both read them from here.
+const fn rescan_lines(layout: ShellLayout) -> (i16, i16) {
+    (layout.footer_y() - 10, layout.footer_y() + 6)
+}
+
+// In the apparatus size, with the rule below carrying how far the scan has got.
 fn rescan_footer(fb: &mut Framebuffer, layout: ShellLayout, percent: Option<u8>) {
     let font = literata_small(FontStyle::Italic);
-    draw_text_centered(
-        fb,
-        font,
-        RESCAN_NOTE,
-        layout.heading_cx,
-        layout.footer_y() - 10,
-    );
-    let permille = percent.map_or(0, |p| (p as u16) * 10);
+    let (note_y, rule_y) = rescan_lines(layout);
+    draw_text_centered(fb, font, RESCAN_NOTE, layout.heading_cx, note_y);
+    let permille = percent.map_or(0, |p| u16::from(p) * 10);
     progress_rule(
         fb,
         layout.heading_cx - RESCAN_RULE_WIDTH / 2,
-        layout.footer_y() + 6,
+        rule_y,
         RESCAN_RULE_WIDTH,
         permille,
     );
 }
 
-/// Clear the rescan note and progress rule, as wide as the rule and no wider,
-/// and draw it again at `percent`. The battery shares the line in
-/// landscape, so the clear stops short of the corner.
+/// Clear the rescan note and progress rule, as wide as the wider of the two
+/// and no wider, and draw them again at `percent`. The battery shares the
+/// line in landscape, so the clear stops short of the corner.
 pub(crate) fn redraw_rescan_footer(
     fb: &mut Framebuffer,
     orientation: UiOrientation,
@@ -620,8 +621,10 @@ pub(crate) fn redraw_rescan_footer(
     let text_w = measure_text(font, RESCAN_NOTE) as i16;
     let widest = RESCAN_RULE_WIDTH.max(text_w);
     let x = layout.heading_cx - widest / 2 - RESCAN_NOTE_PAD;
-    let y = layout.footer_y() - 10 - font.baseline as i16 - 2;
-    let h = (font.baseline as i16 + 2) + 16 + 3 + 2;
+    let (note_y, rule_y) = rescan_lines(layout);
+    // From above the note's ascent to below the rule's 3px head.
+    let y = note_y - font.baseline as i16 - 2;
+    let h = rule_y + 5 - y;
     fill_rect(
         fb,
         Rect::new(
@@ -1759,10 +1762,25 @@ mod tests {
         assert!(second.is_empty());
     }
 
-    /// The note text is static while the progress rule below it carries the percentage.
+    /// The rule carries the percent: it reads empty until the scan says, it
+    /// grows with the percent, and it stops at full.
     #[test]
-    fn the_rescan_note_is_static() {
-        assert_eq!(RESCAN_NOTE, "updating the library\u{2026}");
+    fn the_rescan_rule_carries_its_percent() {
+        let footer = |percent: Option<u8>| {
+            let mut fb = Framebuffer::new();
+            fb.set_frame(FbFrame::Landscape);
+            fb.clear(true);
+            rescan_footer(
+                &mut fb,
+                ShellLayout::for_orientation(UiOrientation::LandscapeButtonsBottom),
+                percent,
+            );
+            fb.bytes().to_vec()
+        };
+        assert_eq!(footer(None), footer(Some(0)));
+        assert_ne!(footer(Some(0)), footer(Some(40)));
+        assert_ne!(footer(Some(40)), footer(Some(100)));
+        assert_eq!(footer(Some(250)), footer(Some(100)));
     }
 
     fn rescan_shell(orientation: UiOrientation, percent: Option<u8>) -> UiShell<'static> {

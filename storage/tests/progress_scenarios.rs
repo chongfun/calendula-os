@@ -211,6 +211,17 @@ fn carried_foreground_load_preserves_build_progress() {
         "build progress must be preserved across Carried foreground load"
     );
 
+    // A step that continues moves the projection forward; one that finishes clears it.
+    device.step_background();
+    match device.store.background_build_progress(device.app.book_id) {
+        Some(stepped) => {
+            assert!(device.task.background_owed(&device.store));
+            assert!(stepped.done > initial_progress.unwrap().done, "{stepped:?}");
+            assert_eq!(stepped.total, 6);
+        }
+        None => assert!(device.task.background_build.is_none()),
+    }
+
     // When the remaining background steps settle and the build finishes, progress clears.
     device.settle();
     assert!(!device.task.background_owed(&device.store));

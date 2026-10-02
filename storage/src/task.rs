@@ -418,7 +418,6 @@ impl StorageTask {
                 // single one somewhere in a minute of building.
                 self.background_build = Some(BackgroundBuild {
                     attempts: 0,
-                    progress,
                     ..pending
                 });
                 sd_library.set_background_build_progress(Some(
@@ -1012,14 +1011,13 @@ pub fn relist_library_folder_here(
 /// loop needs: which book, and when the walk began, for the closing bench line.
 #[derive(Clone, Copy)]
 pub struct BackgroundBuild {
-    pub book_id: u32,
-    pub started: Instant,
+    book_id: u32,
+    started: Instant,
     /// Consecutive steps that never began. Cleared by anything that proves the
     /// card is answering — a step that actually ran, or a foreground open that
     /// carried this walk through — so a hiccup does not go on slowing a build
     /// the card has already come back for.
-    pub attempts: u8,
-    pub progress: proto::progress::JobProgress,
+    attempts: u8,
 }
 
 /// Carry the loop's background-build handle across one open or extend.
@@ -1045,7 +1043,6 @@ pub fn apply_build_outcome(
                 book_id,
                 started: Instant::now(),
                 attempts: 0,
-                progress,
             });
             sd_library.set_background_build_progress(Some(
                 proto::progress::BuildProgressView::new(book_id, progress),
@@ -1068,17 +1065,13 @@ pub fn apply_build_outcome(
                 proto::progress::BuildProgressView::new(book_id, progress),
             ));
             match background_build {
-                Some(pending) if pending.book_id == book_id => {
-                    pending.attempts = 0;
-                    pending.progress = progress;
-                }
+                Some(pending) if pending.book_id == book_id => pending.attempts = 0,
                 _ => {
                     *background_build = Some(BackgroundBuild {
                         book_id,
                         started: Instant::now(),
                         attempts: 0,
-                        progress,
-                    });
+                    })
                 }
             }
         }
@@ -1153,6 +1146,7 @@ pub fn handle_storage_command(
             // section records with it. Past this point the loan is granted and
             // the session ends in a reset, so there is nothing left to schedule.
             *background_build = None;
+            sd_library.set_background_build_progress(None);
             sync_session.loan_granted();
             host.grant_sync_loan(card, scratch);
         }

@@ -798,8 +798,8 @@ end of the last repaint. On the device, `FwCard` built by `card_reporting`
 hands the scan a sink that borrows the card's device from the open
 `VolumeManager` (`VolumeManager::device`, then `SdCard::spi`), which reaches
 the panel bus through `SdSpiDevice`, now holding the whole `Epd`. With SD CS
-high it restores the panel clock, and `RescanPainter` redraws only the note's
-line over a copy of the glass (`ui::app_render::render_library_rescan_progress`:
+high it restores the panel clock, and `RescanPainter` redraws only the note
+and its rule over a copy of the glass (`ui::app_render::render_library_rescan_progress`:
 the rows cannot be redrawn, since the scan holds the catalog and the arena)
 and flushes it with `flush_plate`, polled to completion with the display
 task's own waker, because the scan holds the executor anyway and embassy-time
