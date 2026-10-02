@@ -572,7 +572,14 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             ),
             _ => position_footer(fb, layout, selected_index + 1, total),
         },
-        LibraryFooterLine::Rescanning => footer_note(fb, layout, "updating the library\u{2026}"),
+        // At the rows' size: the reader waits on this, so it has to be read.
+        LibraryFooterLine::Rescanning => draw_text_centered(
+            fb,
+            literata(FontStyle::Italic),
+            "updating the library\u{2026}",
+            layout.heading_cx,
+            layout.footer_y(),
+        ),
         LibraryFooterLine::Position => position_footer(fb, layout, selected_index + 1, total),
         LibraryFooterLine::Hint => library_footer(fb, layout, selected_index + 1, total),
     }
