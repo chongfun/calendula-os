@@ -8,9 +8,16 @@
 set -euo pipefail
 
 # The pin in rust-toolchain.toml is the default, so this script and a bare
-# `cargo` in the repo agree on the compiler, and so does CI.
-PINNED="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$(dirname "$0")/../rust-toolchain.toml")"
-TOOLCHAIN="${RUSTUP_TOOLCHAIN:-${PINNED:-stable}}"
+# `cargo` in the repo agree on the compiler, and so does CI. The match
+# tolerates TOML spacing, either quote style, and a trailing comment; if no
+# channel parses at all, stop rather than quietly drift onto floating stable.
+TOOLCHAIN_FILE="$(dirname "$0")/../rust-toolchain.toml"
+PINNED="$(sed -n -E 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']+)["'"'"'].*$/\1/p' "$TOOLCHAIN_FILE" | head -n 1)"
+if [ -z "${RUSTUP_TOOLCHAIN:-}" ] && [ -z "$PINNED" ]; then
+  echo "error: no channel found in $TOOLCHAIN_FILE; set RUSTUP_TOOLCHAIN to override." >&2
+  exit 1
+fi
+TOOLCHAIN="${RUSTUP_TOOLCHAIN:-$PINNED}"
 
 if ! command -v rustup >/dev/null 2>&1; then
   cat >&2 <<'EOF'
