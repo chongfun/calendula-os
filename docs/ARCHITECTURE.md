@@ -722,6 +722,44 @@ that did not come from resolving a row carry no fence, since their index comes
 from the app's own active book and refusing those would refuse a boot restore
 whose scan the app has not folded yet.
 
+A pick of a book the card holds and the catalog does not (a computer added or
+moved books while the device was off) rescans before it answers, and that scan
+holds the card, and the bus the panel shares, for about 12 s on a 1,100-book X3
+card. So the pick runs in two halves. `StorageTask::handle` writes any
+coalesced position, sends `LibraryEvent::Rescanning`, keeps the pick, and
+returns an `OwedRescan` token the caller cannot drop without a compile warning. The
+display task then paints the Library frame already on the glass with an
+"updating the library..." footer, one fast refresh, and hands the token to its
+loop as work it owes itself (`storage_loop::owed_work`, ahead of a build
+slice): that branch waits the settle interval and then calls
+`StorageTask::rescan`, which scans and answers with `Scanned` and the row, or
+refuses a pick walked away from (next paragraph). The scan does not run
+straight after the note because the note's flush yields, and
+a Back or Power pressed in that window has its render or sleep queued by the
+time the plate settles; the loop takes display commands first, so the Home
+frame or the sleep goes ahead of the 12 s scan. Storage stands down while a
+rescan is owed, since it is one command's second half. A `Sleep` refuses the
+pick through `StorageTask::abandon_rescan` (a required `RowFailed`) rather than
+scanning, sleep being terminal; the pre-sleep drain does the same for a pick it
+drains. The app folds `Rescanning` into the pick's wait without asking for a
+frame, since one would only run after the scan, and `Scanned` clears it. The
+kept pick holds the book's locator in the storage task, which lives in the
+display task's future: 152 bytes more of it on both boards, and 80 bytes more
+of its poll frame. The owed token is a byte of the future and nothing of the
+poll frame, which measured the same before and after the deferral.
+
+The note's refresh is a yield, and the app runs during it. Back is the one
+press a waiting pick takes, and from Home the reader can then ask for the book
+being read by the row it holds, an unfenced open the scan would renumber
+under. So `StorageTask::rescan` first asks the host whether the app still
+waits on the pick (`LIBRARY_BROWSE_REQUEST_ID`, which the app task publishes
+at every fold that can end a Library wait, before it next yields), and refuses
+a pick walked away from without scanning. The answer holds through the scan:
+both tasks share the thread-mode executor and the scan does not await, so
+nothing the app queued against the old catalog runs against a new one. A pick
+the reader waits for scans as before, and a newer pick made during the note
+gets its own.
+
 Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
 435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
 book set, and stays what the orphan sweep judges against, the wifi shelf

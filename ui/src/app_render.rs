@@ -59,6 +59,9 @@ pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest
     );
 }
 
+/// Set the framebuffer's drawing orientation and render the requested view
+/// using the supplied model. Reading uses the built-in book renderer and any
+/// requested key sheet; other views use the shell, including Library wait notices.
 pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
     fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {
@@ -99,6 +102,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         .unwrap_or(""),
         library_menu: request.library_menu,
         library_move_pending: request.library_move_pending,
+        library_rescanning: request.library_rescanning,
     };
     render_shell(fb, &shell);
 }

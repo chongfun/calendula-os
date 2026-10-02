@@ -1,8 +1,8 @@
 use crate::{
     catalog, Button, DisplayCommand, DisplayEvent, InputEvent, PowerEvent, ReaderSource,
     RenderKind, StorageCommand, SyncCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS, INPUT_EVENTS,
-    LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS, SYNC_COMMANDS,
-    SYNC_EVENTS,
+    LATEST_READER_REQUEST_ID, LIBRARY_BROWSE_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS,
+    STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
 };
 use app_core::{
     extend_section_command, library_action_command_for_transition,
@@ -16,6 +16,8 @@ use embassy_time::{Duration, Instant};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
 
+/// Own the reader state and dispatch input, storage replies, and display
+/// acknowledgements, coalescing repaints while a render is in flight.
 #[embassy_executor::task]
 pub async fn run() {
     esp_println::println!("app: started");
@@ -157,6 +159,7 @@ pub async fn run() {
 
                 let previous = state;
                 state = state.apply_input(ctx, event);
+                publish_library_browse(&state);
                 // Activity carries the post-input view so entering a view
                 // immediately gets that view's idle leash (e.g. opening a
                 // book starts the long Reading timeout right away).
@@ -214,6 +217,7 @@ pub async fn run() {
                         // task sends -- and it never got the command. Settle
                         // the wait here or the list stays frozen for good.
                         state = state.library_browse_rejected();
+                        publish_library_browse(&state);
                     }
                 }
                 if let Some(command) = library_action_command_for_transition(&previous, &state) {
@@ -514,6 +518,7 @@ fn fold_library_event(
         library_event_affects_view(state, &folded, event)
     };
     *state = folded;
+    publish_library_browse(state);
     should_render
 }
 
@@ -613,6 +618,8 @@ async fn handle_library_event(
     true
 }
 
+/// Whether folding `event` from `state` into `folded` calls for a repaint.
+/// Rescan notices return false because the display task paints their plate.
 fn library_event_affects_view(
     state: &ReaderState,
     folded: &ReaderState,
@@ -687,6 +694,10 @@ fn library_event_affects_view(
         // the fold cannot see it, so a repaint that waited on the fold moving
         // would leave the panel showing rows the store no longer has.
         crate::LibraryEvent::LibraryUnreadable { .. } => true,
+        // The display task paints this note itself, before the scan. A render
+        // asked for here would run only after the scan, over the new catalog,
+        // and `Scanned` already owes the frame that replaces the note.
+        crate::LibraryEvent::Rescanning { .. } => false,
         crate::LibraryEvent::FolderListed { .. }
         | crate::LibraryEvent::RowIsBook { .. }
         | crate::LibraryEvent::RowFailed { .. } => {
@@ -1172,4 +1183,15 @@ fn peek_reader_request_id() -> u32 {
 
 fn commit_reader_request_id(request_id: u32) {
     LATEST_READER_REQUEST_ID.store(request_id, Ordering::Relaxed);
+}
+
+/// Publishes the Library move `state` is waiting on, for the storage task to
+/// read before a pick's rescan. Called at every fold that can end the wait and
+/// before this task next yields: a wait ended but published only at the top
+/// of the loop would be invisible past an await in between.
+fn publish_library_browse(state: &ReaderState) {
+    LIBRARY_BROWSE_REQUEST_ID.store(
+        state.library_browse.request_id().unwrap_or(0),
+        Ordering::Relaxed,
+    );
 }

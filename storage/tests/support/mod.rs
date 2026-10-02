@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use app_core::storage_loop::{Drained, SleepAction, SleepRefusal, SleepSequence};
 use app_core::{
     library_action_command_for_transition, library_browse_command_for_transition,
     storage_command_for_transition, AppView, Button, InputEvent, LibraryEvent, ReaderState,
@@ -25,7 +26,7 @@ use reader_cache::store::ReaderStore;
 use storage::book_build::ReaderCacheScratch;
 use storage::card::{Root, SessionError, StaticTime};
 use storage::custom_font::MetricCache;
-use storage::task::{Host, StorageTask};
+use storage::task::{Host, OwedRescan, StorageTask};
 
 // ---------------------------------------------------------------------------
 // The card
@@ -556,6 +557,10 @@ pub struct TestHost {
     pub events: Vec<LibraryEvent>,
     pub latest_request: u32,
     pub requeued: VecDeque<StorageCommand>,
+    /// The Library move the app waits on, as the app task publishes it
+    /// before each yield: `Device` copies it from the reducer before a
+    /// rescan, after whatever the reader did while the note painted.
+    pub library_browse_request: Option<u32>,
 }
 
 impl Host for TestHost {
@@ -573,6 +578,10 @@ impl Host for TestHost {
 
     fn latest_reader_request_id(&self) -> u32 {
         self.latest_request
+    }
+
+    fn waiting_on_pick(&self, request_id: u32) -> bool {
+        self.library_browse_request == Some(request_id)
     }
 
     fn requeue(&mut self, command: StorageCommand) {
@@ -625,6 +634,10 @@ impl Host for TestHost {
 
 const CTX: ReducerContext = ReducerContext::new(1, 4);
 
+/// The storage channel's depth, `STORAGE_COMMANDS` in `fw/src/main.rs`: the
+/// most commands a sleep can find queued, and so the drain's budget.
+const STORAGE_QUEUE_DEPTH: usize = 4;
+
 /// One power-on of the device: everything in RAM, over a card that outlives it.
 pub struct Device {
     pub card: SessionCard,
@@ -639,6 +652,11 @@ pub struct Device {
     queue: VecDeque<StorageCommand>,
     next_request_id: u32,
     last_render: Option<RenderRequest>,
+    /// A pick's rescan the loop owes, as the firmware keeps it between the
+    /// note and the scan.
+    owed_rescan: Option<OwedRescan>,
+    /// The frame on screen as each rescan began.
+    pub before_rescan: Vec<Option<RenderRequest>>,
 }
 
 impl Device {
@@ -659,6 +677,8 @@ impl Device {
             queue: VecDeque::new(),
             next_request_id: 1,
             last_render: None,
+            owed_rescan: None,
+            before_rescan: Vec::new(),
         };
         device.render();
         // The app asks for the catalog once the first frame settles.
@@ -667,15 +687,76 @@ impl Device {
         device
     }
 
-    /// Flush the coalesced position, as the firmware does before deep sleep.
-    /// Everything else is lost with RAM.
+    /// Power off, as the firmware does before deep sleep: the Sleep arm, which
+    /// must proceed. Everything but the card is lost with RAM.
     pub fn sleep(mut self) {
-        self.settle();
-        assert!(
-            self.task
-                .flush_pending_progress(&mut self.card, &mut self.store),
-            "the position reached the card before sleep"
-        );
+        assert_eq!(self.power_pressed(), None, "the sleep proceeded");
+    }
+
+    /// The Sleep arm, driven by the same [`SleepSequence`] as the firmware's:
+    /// a pick waiting on its rescan is refused, not scanned, before and
+    /// during the drain, and background work stays out, since it is not
+    /// queued work. `None` when the sleep proceeds, after which only the
+    /// card is worth looking at.
+    pub fn power_pressed(&mut self) -> Option<SleepRefusal> {
+        if let Some(owed) = self.owed_rescan.take() {
+            self.task.abandon_rescan(owed, &mut self.host);
+            self.deliver();
+        }
+        let mut sleep = SleepSequence::new(STORAGE_QUEUE_DEPTH);
+        loop {
+            match sleep.next() {
+                SleepAction::TakeQueued => match self.queue.pop_front() {
+                    None => sleep.queue_empty(),
+                    Some(command) => match sleep.drained(&command) {
+                        Drained::Apply => {
+                            let portrait = app_core::is_portrait(self.app.orientation);
+                            let owed = self.task.handle(
+                                command,
+                                &mut self.card,
+                                &mut self.host,
+                                &mut self.store,
+                                &mut self.metrics,
+                                &mut self.sync,
+                                portrait,
+                            );
+                            if let Some(owed) = owed {
+                                self.task.abandon_rescan(owed, &mut self.host);
+                            }
+                            self.deliver();
+                            // A requeue goes back on the channel, where the
+                            // drain finds it within its budget.
+                            while let Some(command) = self.host.requeued.pop_front() {
+                                self.queue.push_back(command);
+                            }
+                            sleep.applied();
+                        }
+                        Drained::RequeueAndRefuse => {
+                            self.queue.push_front(command);
+                            sleep.requeued(true);
+                        }
+                    },
+                },
+                SleepAction::FlushProgress => {
+                    let stored = self
+                        .task
+                        .flush_pending_progress(&mut self.card, &mut self.store);
+                    sleep.flushed(stored);
+                }
+                SleepAction::Refuse(refusal) => return Some(refusal),
+                SleepAction::Proceed => return None,
+            }
+        }
+    }
+
+    /// Whether a pick's rescan is owed and not yet run.
+    pub fn rescan_owed(&self) -> bool {
+        self.owed_rescan.is_some()
+    }
+
+    /// The frame on screen now.
+    pub fn frame(&self) -> Option<RenderRequest> {
+        self.last_render
     }
 
     /// Press a button, and let both tasks run until neither owes anything.
@@ -753,10 +834,15 @@ impl Device {
         self.last_render = Some(self.app.render_request(RenderKind::Page));
     }
 
-    /// Run the storage task until it owes nothing: the queued commands, then
-    /// background slices, each event folded into the app as it arrives.
+    /// Run the storage task until it owes nothing: an owed rescan, the queued
+    /// commands, then background slices, each event folded into the app as
+    /// it arrives.
     pub fn settle(&mut self) {
         for _ in 0..10_000 {
+            if self.rescan_owed() {
+                self.rescan();
+                continue;
+            }
             if self.handle_one() {
                 continue;
             }
@@ -785,10 +871,30 @@ impl Device {
         self.queue.push_back(command);
     }
 
-    /// Run the queued commands only: no requeued command and no background
-    /// slice, which the firmware reaches only after a wait.
+    /// Run the queued commands only: no requeued command, no background
+    /// slice, and no owed rescan, all of which the firmware reaches only
+    /// after a wait. Stops at a pick that leaves a rescan owed, as the
+    /// firmware's storage branch stands down there.
     pub fn run_queued(&mut self) {
         while self.handle_one() {}
+    }
+
+    /// Run the rescan a pick left owed, as the firmware's loop does after its
+    /// wait, with whatever the app asked for meanwhile already on screen.
+    pub fn rescan(&mut self) {
+        let owed = self.owed_rescan.take().expect("a rescan is owed");
+        self.before_rescan.push(self.last_render);
+        // What the app task published before it last yielded.
+        self.host.library_browse_request = self.app.library_browse.request_id();
+        let portrait = app_core::is_portrait(self.app.orientation);
+        self.task.rescan(
+            owed,
+            &mut self.card,
+            &mut self.host,
+            &mut self.store,
+            portrait,
+        );
+        self.deliver();
     }
 
     /// Run one background slice, as the firmware does after its wait.
@@ -806,12 +912,27 @@ impl Device {
         }
     }
 
+    /// Apply the next queued command. False with nothing queued, or while a
+    /// rescan is owed: storage stands down for the pick's second half.
     fn handle_one(&mut self) -> bool {
+        self.handle_one_with(|_| {})
+    }
+
+    /// Run the next queued command, with `during_note` as what the reader
+    /// does while the firmware paints the rescan note: after the app has
+    /// folded `Rescanning` and before the loop runs the scan it owes. Presses
+    /// there reduce at once, as the app task runs during the refresh, and the
+    /// commands they queue wait behind the pick's second half, as the
+    /// firmware's storage branch stands down for it.
+    pub fn handle_one_with(&mut self, during_note: impl FnOnce(&mut Device)) -> bool {
+        if self.rescan_owed() {
+            return false;
+        }
         let Some(command) = self.queue.pop_front() else {
             return false;
         };
         let portrait = app_core::is_portrait(self.app.orientation);
-        self.task.handle(
+        let owed = self.task.handle(
             command,
             &mut self.card,
             &mut self.host,
@@ -821,6 +942,12 @@ impl Device {
             portrait,
         );
         self.deliver();
+        // The firmware paints the note here and leaves the scan to its loop,
+        // and the app runs while the panel refreshes.
+        self.owed_rescan = owed;
+        if self.rescan_owed() {
+            during_note(self);
+        }
         true
     }
 

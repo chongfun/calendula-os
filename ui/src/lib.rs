@@ -159,6 +159,9 @@ pub struct UiShell<'a> {
     /// held still while it is, so the rail has to stop offering the presses
     /// that wait swallows.
     pub library_move_pending: bool,
+    /// The move is a pick waiting on a rescan of the card; the footer says
+    /// so in place of the position line.
+    pub library_rescanning: bool,
 }
 
 #[cfg(test)]
@@ -203,6 +206,7 @@ mod tests {
             wifi_ssid: "",
             library_menu: app_core::LibraryMenu::None,
             library_move_pending: false,
+            library_rescanning: false,
         };
         for rendered in [format!("{status:?}"), format!("{shell:?}")] {
             assert!(

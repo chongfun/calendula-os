@@ -358,6 +358,10 @@ fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
 enum LibraryFooterLine {
     /// A picked action's wait or its result has something of its own to say.
     Note,
+    /// A pick is waiting on a rescan of the card, which takes seconds on a
+    /// large library. Said in place of the position, so the wait does not
+    /// read as a hang.
+    Rescanning,
     /// Just the position. The teaching line names the sheet key, and that
     /// press does something else here, or nothing.
     Position,
@@ -369,13 +373,18 @@ enum LibraryFooterLine {
 ///
 /// The teaching line is the only thing here that promises a press, so it
 /// only appears when that press opens the sheet. A move through the tree
-/// swallows it exactly as the sheet being up already redirects it, and
-/// neither wait has a note of its own to show instead.
-fn library_footer_line(menu: app_core::LibraryMenu, move_pending: bool) -> LibraryFooterLine {
+/// swallows it exactly as the sheet being up already redirects it. An action
+/// note takes priority, followed by a rescan notice; other waits show position.
+fn library_footer_line(
+    menu: app_core::LibraryMenu,
+    move_pending: bool,
+    rescanning: bool,
+) -> LibraryFooterLine {
     match menu {
         app_core::LibraryMenu::Busy { .. } | app_core::LibraryMenu::Done { .. } => {
             LibraryFooterLine::Note
         }
+        _ if rescanning => LibraryFooterLine::Rescanning,
         app_core::LibraryMenu::Sheet { .. } => LibraryFooterLine::Position,
         app_core::LibraryMenu::None if move_pending => LibraryFooterLine::Position,
         app_core::LibraryMenu::None => LibraryFooterLine::Hint,
@@ -416,6 +425,9 @@ fn library_rail(in_folder: bool, menu: app_core::LibraryMenu, move_pending: bool
     }
 }
 
+/// Clear and draw the Library's resident rows, selection, controls, and footer.
+/// Unavailable or empty listings show a status note; rows outside the resident
+/// window stay blank. Action and rescan notices replace the position footer.
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     let layout = shell_layout(shell);
@@ -539,7 +551,11 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             .unwrap_or("this book");
         render_library_sheet(fb, layout, selected_entry, row);
     }
-    match library_footer_line(shell.library_menu, shell.library_move_pending) {
+    match library_footer_line(
+        shell.library_menu,
+        shell.library_move_pending,
+        shell.library_rescanning,
+    ) {
         LibraryFooterLine::Note => match shell.library_menu {
             app_core::LibraryMenu::Busy {
                 action: app_core::LibraryAction::ClearCache,
@@ -559,6 +575,14 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             ),
             _ => position_footer(fb, layout, selected_index + 1, total),
         },
+        // At the rows' size: the reader waits on this, so it has to be read.
+        LibraryFooterLine::Rescanning => draw_text_centered(
+            fb,
+            literata(FontStyle::Italic),
+            "updating the library\u{2026}",
+            layout.heading_cx,
+            layout.footer_y(),
+        ),
         LibraryFooterLine::Position => position_footer(fb, layout, selected_index + 1, total),
         LibraryFooterLine::Hint => library_footer(fb, layout, selected_index + 1, total),
     }
@@ -1576,22 +1600,37 @@ mod tests {
     #[test]
     fn a_pending_move_drops_the_line_that_teaches_a_swallowed_key() {
         assert_eq!(
-            library_footer_line(app_core::LibraryMenu::None, true),
+            library_footer_line(app_core::LibraryMenu::None, true, false),
             LibraryFooterLine::Position
         );
         assert_eq!(
-            library_footer_line(app_core::LibraryMenu::None, false),
+            library_footer_line(app_core::LibraryMenu::None, false, false),
             LibraryFooterLine::Hint,
             "at rest the key it names works"
         );
         assert_eq!(
-            library_footer_line(app_core::LibraryMenu::Sheet { row: 0 }, false),
+            library_footer_line(app_core::LibraryMenu::Sheet { row: 0 }, false, false),
             LibraryFooterLine::Position
         );
         assert_eq!(
-            library_footer_line(BUSY, false),
+            library_footer_line(BUSY, false, false),
             LibraryFooterLine::Note,
             "a picked action says what it is doing"
+        );
+    }
+
+    /// A pick waiting on a rescan says so where the position sits, since the
+    /// wait runs to seconds and a bare footer reads as a hang.
+    #[test]
+    fn a_pick_waiting_on_a_rescan_says_so() {
+        assert_eq!(
+            library_footer_line(app_core::LibraryMenu::None, true, true),
+            LibraryFooterLine::Rescanning
+        );
+        assert_eq!(
+            library_rail(false, app_core::LibraryMenu::None, true),
+            LibraryRail::Held,
+            "and the rail still offers only home"
         );
     }
 

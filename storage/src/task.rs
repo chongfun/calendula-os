@@ -26,6 +26,11 @@ pub trait Host {
     fn send_loaded(&mut self, event: &LibraryEvent);
     /// The newest reader request the app has issued.
     fn latest_reader_request_id(&self) -> u32;
+    /// Whether the app is still waiting on the Library pick `request_id`.
+    /// Read between the note painted for a pick's rescan and the scan, where
+    /// the app has had its turn and nothing lets it run again before the
+    /// scan ends.
+    fn waiting_on_pick(&self, request_id: u32) -> bool;
     /// Put a command back on the storage queue for a later pass.
     fn requeue(&mut self, command: StorageCommand);
     /// The reader's scratch, built on first use.
@@ -48,6 +53,26 @@ pub trait Host {
     fn refuse_sync_loan(&mut self);
 }
 
+/// A pick of a book the catalog does not know yet, announced and waiting on
+/// its rescan. The scan holds the card, and the bus the panel shares, for
+/// about 12 s on a 1,100-book X3 card, so the caller paints the note first
+/// and then runs the scan as work its loop owes, behind any frame the reader
+/// asked for meanwhile. A sleep refuses the pick instead, through
+/// [`StorageTask::abandon_rescan`].
+///
+/// Empty: the pick itself waits in [`StorageTask`], out of the caller's poll
+/// frame. It exists so that dropping it is a compile warning.
+#[must_use = "a pick waits on this rescan; run it with StorageTask::rescan or refuse it with abandon_rescan"]
+pub struct OwedRescan(());
+
+/// The pick an [`OwedRescan`] stands for.
+pub struct PendingRescan {
+    request_id: u32,
+    at: proto::library_path::BookRoot,
+    locator: proto::library_path::LibraryPath,
+    size: u32,
+}
+
 /// The storage task's own state, between commands and background slices.
 #[derive(Default)]
 pub struct StorageTask {
@@ -60,6 +85,7 @@ pub struct StorageTask {
     pub evidence_settled: Option<book_build::EvidencePlace>,
     pub pending_evidence: Option<book_build::SourceEvidenceJob>,
     pub catalog_refresh: CatalogRefresh,
+    pending_rescan: Option<PendingRescan>,
 }
 
 /// A catalog refresh that waited on a refused position write. A background
@@ -78,8 +104,14 @@ impl StorageTask {
     ///
     /// Every entry point here is out of line, so the arms' multi-KB scratch
     /// stays out of the task loop's poll frame.
+    ///
+    /// A pick that needs a rescan comes back unfinished, so the caller can
+    /// paint before the scan holds the card. Pass it to [`Self::rescan`], or
+    /// to [`Self::abandon_rescan`] when the panel is about to sleep. Finish or
+    /// abandon that pick before handling another storage command.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
+    #[must_use = "a pick waits on this rescan; run it with StorageTask::rescan or refuse it with abandon_rescan"]
     pub fn handle(
         &mut self,
         command: StorageCommand,
@@ -89,7 +121,7 @@ impl StorageTask {
         font_metrics: &mut crate::custom_font::MetricCache,
         sync_session: &mut SyncSession,
         portrait: bool,
-    ) {
+    ) -> Option<OwedRescan> {
         handle_storage_command(
             command,
             card,
@@ -105,7 +137,105 @@ impl StorageTask {
             &mut self.pending_place,
             &mut self.catalog_refresh,
             portrait,
+            &mut self.pending_rescan,
         );
+        self.pending_rescan.as_ref().map(|_| OwedRescan(()))
+    }
+
+    /// Finish a pick that [`Self::handle`] left owing a rescan: attempt the
+    /// scan, then answer the pick from the available catalog.
+    ///
+    /// Sends `RowFailed` without scanning if the app no longer waits on the
+    /// pick, by [`Host::waiting_on_pick`], or pending progress cannot be saved.
+    /// After a scan attempt, sends `Scanned` even if the old catalog was retained.
+    /// A missing or unreadable row sends `RowFailed` and relists the root; a found
+    /// row sends `RowIsBook` and relists the current folder. `portrait` selects
+    /// the listing's layout.
+    #[inline(never)]
+    pub fn rescan(
+        &mut self,
+        _owed: OwedRescan,
+        card: &mut impl Card,
+        host: &mut impl Host,
+        sd_library: &mut ReaderStore,
+        portrait: bool,
+    ) {
+        let Some(PendingRescan {
+            request_id,
+            at,
+            locator,
+            size,
+        }) = self.pending_rescan.take()
+        else {
+            return;
+        };
+        // The note's refresh let the app run, and Back is the one press it
+        // takes while a pick waits. A pick walked away from gets no scan: the
+        // app may since have asked for its own book by the row it holds in
+        // this catalog, and a scan would renumber that row under it. Answered
+        // anyway, so a wait this host misjudged still ends.
+        if !host.waiting_on_pick(request_id) {
+            slog!(
+                "sd: pick request={} walked away from before its rescan",
+                request_id
+            );
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+            return;
+        }
+        if !scan_books_after_flush(
+            card,
+            sd_library,
+            &mut self.pending_progress,
+            &mut self.last_progress_write,
+            &mut self.pending_place,
+            &mut self.catalog_refresh,
+        ) {
+            // Nothing moved, and the page is still resident for the next
+            // pick to write.
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+            return;
+        }
+        restore_saved_state(card, host, sd_library, &mut self.state_restored, true);
+        host.send(&LibraryEvent::Scanned {
+            count: sd_library.catalog_count_u16(),
+            catalog_epoch: sd_library.catalog_epoch(),
+        });
+        // Find the picked book by its place in the new catalog. The answer
+        // carries `Scanned`'s epoch, so it goes after.
+        match crate::library_sd::find_index_by_locator(card, at, locator.as_str(), size) {
+            crate::library_sd::CatalogRow::Found(index) => {
+                host.send_required(&LibraryEvent::RowIsBook {
+                    request_id,
+                    index,
+                    catalog_epoch: sd_library.catalog_epoch(),
+                });
+                // The scan changed only the catalog, so browsing stays in
+                // this folder. Relist it after the answer to replace the
+                // catalog total `Scanned` showed.
+                relist_library_folder_here(card, host, sd_library, portrait);
+            }
+            // Still not in the catalog, or the card would not answer: back to
+            // the root, as after any rescan.
+            crate::library_sd::CatalogRow::Rebuild | crate::library_sd::CatalogRow::Unreadable => {
+                relist_library_folder(card, host, sd_library, portrait);
+                host.send_required(&LibraryEvent::RowFailed { request_id });
+            }
+        }
+    }
+
+    /// Refuse the pick [`Self::handle`] left owing a rescan, without scanning.
+    ///
+    /// For a sleep, which is terminal: a 12 s scan now would only hold the
+    /// note on the panel ahead of the sleep image. The refusal is required,
+    /// so a sleep a late press abandons finds the Library with nothing
+    /// waiting. The catalog is untouched, and `handle` already wrote the
+    /// position.
+    #[inline(never)]
+    pub fn abandon_rescan(&mut self, _owed: OwedRescan, host: &mut impl Host) {
+        if let Some(PendingRescan { request_id, .. }) = self.pending_rescan.take() {
+            slog!("sd: sleeping instead of rescanning for a pick; refusing it");
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+        }
     }
 
     /// Put a coalesced position on the card, as a sleep or a loan must first.
@@ -925,6 +1055,11 @@ pub fn apply_build_outcome(
     }
 }
 
+/// Apply one admitted storage command, updating the store and reporting
+/// outcomes through `host`. `portrait` selects the folder listing's layout.
+/// A stale pick whose progress flush succeeds is announced and retained in
+/// `pending_rescan` for the caller to finish after painting its progress plate.
+///
 /// Kept out of line so the task loop's poll frame stays small; the storage
 /// arms below carry multi-KB scratch and run near the stack floor.
 #[inline(never)]
@@ -944,6 +1079,7 @@ pub fn handle_storage_command(
     pending_place: &mut Option<PendingPlace>,
     catalog_refresh: &mut CatalogRefresh,
     portrait: bool,
+    pending_rescan: &mut Option<PendingRescan>,
 ) {
     // The session decides what may run: progress writes stay alive during a
     // sync session (they are cheap and harmless); everything
@@ -1731,47 +1867,31 @@ pub fn handle_storage_command(
                     // cannot be opened. Only a card edited since the last
                     // scan pays for this, once, which is what keeps every
                     // other boot on the warm snapshot.
-                    if !scan_books_after_flush(
+                    //
+                    // The scan drops the pages the coalesced position is
+                    // anchored to, so that goes to the card first.
+                    if !flush_pending_progress(
                         card,
                         sd_library,
                         pending_progress,
                         last_progress_write,
                         pending_place,
-                        catalog_refresh,
                     ) {
+                        slog!("sd: the reading position would not save; not scanning over it");
                         // Nothing moved, and the page is still resident for
                         // the next pick to write.
                         host.send_required(&LibraryEvent::RowFailed { request_id });
                         return;
                     }
-                    restore_saved_state(card, host, sd_library, state_restored, true);
-                    host.send(&LibraryEvent::Scanned {
-                        count: sd_library.catalog_count_u16(),
-                        catalog_epoch: sd_library.catalog_epoch(),
+                    // Say so before the scan, then hand it back: the caller
+                    // paints the note while it still has the bus.
+                    host.send(&LibraryEvent::Rescanning { request_id });
+                    *pending_rescan = Some(PendingRescan {
+                        request_id,
+                        at,
+                        locator,
+                        size,
                     });
-                    // Find the picked book by its place in the new catalog.
-                    // The answer carries `Scanned`'s epoch, so it goes after.
-                    match crate::library_sd::find_index_by_locator(card, at, locator.as_str(), size)
-                    {
-                        crate::library_sd::CatalogRow::Found(index) => {
-                            host.send_required(&LibraryEvent::RowIsBook {
-                                request_id,
-                                index,
-                                catalog_epoch: sd_library.catalog_epoch(),
-                            });
-                            // The scan changed only the catalog, so browsing
-                            // stays in this folder. Relist it after the answer
-                            // to replace the catalog total `Scanned` showed.
-                            relist_library_folder_here(card, host, sd_library, portrait);
-                        }
-                        // Still not in the catalog, or the card would not
-                        // answer: back to the root, as after any rescan.
-                        crate::library_sd::CatalogRow::Rebuild
-                        | crate::library_sd::CatalogRow::Unreadable => {
-                            relist_library_folder(card, host, sd_library, portrait);
-                            host.send_required(&LibraryEvent::RowFailed { request_id });
-                        }
-                    }
                 }
             }
         }

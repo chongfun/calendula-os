@@ -163,6 +163,12 @@ static STORAGE_PLATFORM: storage::platform::Platform = storage::platform::Platfo
 
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
 pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
+/// The Library move the app is waiting on: a row pick or a folder leave, by
+/// its request id, or 0 for none. The app task writes it as soon as its state
+/// changes and before it next yields, and the storage task reads it before a
+/// pick's rescan, to skip the scan for a pick the reader has walked away from
+/// (Back) while the "updating the library" note was painting.
+pub static LIBRARY_BROWSE_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 4> = Channel::new();
 // 8 slots (270 B each) is enough for the cache-build burst case, and the
 // ~2.1 KB of .bss saved by not going wider widens the main stack region. A
