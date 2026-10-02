@@ -425,8 +425,8 @@ fn a_landed_refresh_moves_the_epoch_with_the_count_unchanged() {
 /// from it; after that the library is empty, never rows the card cannot back.
 #[test]
 fn a_refresh_failing_partway_keeps_the_old_catalog_only_while_the_card_does() {
-    let (mut kept, mut cleared) = (0, 0);
-    for landed in 0.. {
+    let (mut kept, mut cleared, mut finished) = (0, 0, false);
+    for landed in 0..200 {
         let card = Card::blank();
         card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
         card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
@@ -439,7 +439,10 @@ fn a_refresh_failing_partway_keeps_the_old_catalog_only_while_the_card_does() {
         device.send(StorageCommand::RefreshCatalog);
         device.run_queued();
         match device.store.catalog_count() {
-            3 => break,
+            3 => {
+                finished = true;
+                break;
+            }
             2 => {
                 kept += 1;
                 assert_eq!(
@@ -458,6 +461,10 @@ fn a_refresh_failing_partway_keeps_the_old_catalog_only_while_the_card_does() {
             }
         }
     }
+    assert!(
+        finished,
+        "the refresh made more writes than the sweep covers"
+    );
     assert!(kept > 0, "some failures came before the truncation");
     assert!(cleared > 0, "and some after it");
 }
@@ -468,8 +475,8 @@ fn a_refresh_failing_partway_keeps_the_old_catalog_only_while_the_card_does() {
 /// are that file's rows, and an epoch the app agrees on.
 #[test]
 fn a_write_that_lands_and_fails_leaves_the_rows_the_file_holds() {
-    let mut landed_new = 0;
-    for landed in 0.. {
+    let (mut landed_new, mut finished) = (0, false);
+    for landed in 0..200 {
         let card = Card::blank();
         card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
         card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
@@ -485,6 +492,7 @@ fn a_write_that_lands_and_fails_leaves_the_rows_the_file_holds() {
         device.send(StorageCommand::RefreshCatalog);
         device.run_queued();
         if !card.disk.failed() {
+            finished = true;
             break;
         }
         let on_card: Vec<_> = (0..)
@@ -507,6 +515,10 @@ fn a_write_that_lands_and_fails_leaves_the_rows_the_file_holds() {
         }
     }
     assert!(
+        finished,
+        "the refresh made more writes than the sweep covers"
+    );
+    assert!(
         landed_new > 0,
         "some failures left the new catalog on the card"
     );
@@ -515,4 +527,60 @@ fn a_write_that_lands_and_fails_leaves_the_rows_the_file_holds() {
 fn catalog_identity(device: &Device, index: usize) -> (u32, u32) {
     let entry = device.store.catalog_entry(index).expect("a resident row");
     (entry.source_hash, entry.byte_size)
+}
+
+/// A write lands and reports failure, and then one read of the reload that
+/// follows is refused. A catalog that did not load in full is no catalog:
+/// either every resident row is there and matches the file, or none is.
+#[test]
+fn a_reload_cut_short_after_a_failed_write_leaves_no_partial_catalog() {
+    let mut cut_reloads = 0;
+    for landed in 0..200 {
+        let mut finished = false;
+        for reads in 0..200 {
+            let card = Card::blank();
+            card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
+            card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
+            Device::wake(&card).sleep();
+            card.delete(&format!("BOOKS/Shelf/{SECOND}"));
+            card.put("BOOKS/Shelf/Gamma.epub", &epub("Gamma", 6, 4));
+
+            let mut device = Device::wake(&card);
+            card.disk.land_then_fail_after(landed);
+            card.disk.refuse_read_after_the_failed_write(reads);
+            device.send(StorageCommand::RefreshCatalog);
+            device.run_queued();
+            if !card.disk.failed() {
+                return assert!(cut_reloads > 0, "some reload was cut short");
+            }
+            if !card.disk.read_failed() {
+                finished = true;
+                break;
+            }
+            let count = device.store.catalog_count();
+            let window = device.store.catalog_window().len();
+            if count > 0 {
+                assert_eq!(
+                    window,
+                    count.min(16),
+                    "after {landed} writes, {reads} reads"
+                );
+                let on_card: Vec<_> = (0..count)
+                    .map(|i| {
+                        card.session(|root| storage::library_sd::read_catalog_record_at(root, i))
+                            .map(|record| (record.source_hash, record.byte_size))
+                    })
+                    .collect();
+                let resident: Vec<_> = (0..count)
+                    .map(|i| Some(catalog_identity(&device, i)))
+                    .collect();
+                assert_eq!(resident, on_card, "after {landed} writes, {reads} reads");
+            } else {
+                cut_reloads += 1;
+            }
+            assert_eq!(device.app.catalog_epoch, device.store.catalog_epoch());
+        }
+        assert!(finished, "after {landed} writes the reads ran out first");
+    }
+    panic!("the refresh made more writes than the sweep covers");
 }

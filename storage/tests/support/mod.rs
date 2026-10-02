@@ -56,6 +56,8 @@ pub struct Disk {
     fail_after: Rc<Cell<Option<u32>>>,
     land_failing: Rc<Cell<bool>>,
     failed: Rc<Cell<bool>>,
+    read_fault: Rc<Cell<Option<u32>>>,
+    read_failed: Rc<Cell<bool>>,
 }
 
 impl Disk {
@@ -93,12 +95,34 @@ impl Disk {
     pub fn failed(&self) -> bool {
         self.failed.get()
     }
+
+    /// Once a write has failed, answer `count` more reads and then refuse
+    /// one, as a card still faulting does. Reads after that answer normally.
+    pub fn refuse_read_after_the_failed_write(&self, count: u32) {
+        self.read_fault.set(Some(count));
+        self.read_failed.set(false);
+    }
+
+    /// Whether the read fault fired.
+    pub fn read_failed(&self) -> bool {
+        self.read_failed.get()
+    }
 }
 
 impl BlockDevice for Disk {
     type Error = DiskError;
 
     fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), DiskError> {
+        if self.failed.get() {
+            if let Some(left) = self.read_fault.get() {
+                if left == 0 {
+                    self.read_fault.set(None);
+                    self.read_failed.set(true);
+                    return Err(DiskError);
+                }
+                self.read_fault.set(Some(left - 1));
+            }
+        }
         let bytes = self.bytes.borrow();
         for (i, block) in blocks.iter_mut().enumerate() {
             let at = (start.0 as usize + i) * BLOCK_BYTES;
@@ -173,6 +197,8 @@ impl Card {
                 fail_after: Rc::new(Cell::new(None)),
                 land_failing: Rc::new(Cell::new(false)),
                 failed: Rc::new(Cell::new(false)),
+                read_fault: Rc::new(Cell::new(None)),
+                read_failed: Rc::new(Cell::new(false)),
             },
         }
     }

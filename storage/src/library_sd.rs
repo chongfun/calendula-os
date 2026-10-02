@@ -183,6 +183,7 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
                         // CATALOG.BIN, so serve whichever validates, under the
                         // new epoch, rather than guess which it is.
                         if written.is_err() {
+                            // Empty when the file does not load in full.
                             let _ = read_catalog_window(root, library, 0);
                         }
                         written
@@ -1114,7 +1115,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_catalog_file(root, |file, count| {
+    let loaded = with_catalog_file(root, |file, count| {
         library.set_catalog_total(count);
         library.begin_window(start);
         if start >= count as usize {
@@ -1140,7 +1141,14 @@ where
             );
         }
         Ok(())
-    })
+    });
+    // A window cut short is not a catalog. Every caller has already retired
+    // the old one, so leave none rather than a count with missing rows.
+    if loaded.is_err() {
+        library.set_catalog_total(0);
+        library.begin_window(0);
+    }
+    loaded
 }
 
 /// Read a single catalog record by absolute index.
