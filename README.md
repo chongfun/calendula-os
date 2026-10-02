@@ -77,10 +77,12 @@ driver, exactly as it did before the check existed.
 
 ## Development
 
-Install Rust with `rustup`, then the firmware target and the flashing tool:
+Install Rust with `rustup`. `rust-toolchain.toml` pins the compiler release
+and lists the firmware and wasm targets, so running `rustup toolchain install`
+in the checkout fetches exactly what CI builds with. Then the flashing tool:
 
 ```sh
-rustup target add riscv32imc-unknown-none-elf wasm32-unknown-unknown
+rustup toolchain install
 cargo install espflash
 ./tools/install-hooks.sh                                  # optional: git hooks for local feedback
 ```

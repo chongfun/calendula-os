@@ -93,7 +93,7 @@ ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
 tools/emulator/ host-side development emulator and scenario runner
-tools/cargo.sh  rustup-stable Cargo wrapper for firmware builds/checks
+tools/cargo.sh  Cargo wrapper on the rust-toolchain.toml pin for firmware builds/checks
 tools/bench/    serial bench harness for hardware timing, storage/cache,
                 sleep, soak, and host channel-stress checks
 ```

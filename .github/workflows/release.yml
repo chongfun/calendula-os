@@ -18,10 +18,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust (stable, firmware target)
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add riscv32imc-unknown-none-elf --toolchain stable
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
 
       - name: Install espflash
         run: CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo install espflash --locked

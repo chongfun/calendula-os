@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run Cargo with the rustup stable toolchain and matching compiler tools.
+# Run Cargo with the toolchain rust-toolchain.toml pins and matching compiler tools.
 #
 # Some development machines have another cargo/rustc/rustdoc earlier on PATH.
 # That can make firmware builds fail with "can't find crate for `core`" even
@@ -7,7 +7,10 @@
 # and rustdoc to come from the same rustup toolchain.
 set -euo pipefail
 
-TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
+# The pin in rust-toolchain.toml is the default, so this script and a bare
+# `cargo` in the repo agree on the compiler, and so does CI.
+PINNED="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$(dirname "$0")/../rust-toolchain.toml")"
+TOOLCHAIN="${RUSTUP_TOOLCHAIN:-${PINNED:-stable}}"
 
 if ! command -v rustup >/dev/null 2>&1; then
   cat >&2 <<'EOF'

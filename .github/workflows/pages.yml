@@ -39,10 +39,8 @@ jobs:
         with:
           ref: ${{ inputs.release_tag || github.sha }}
           persist-credentials: false
-      - name: Install Rust (stable, wasm target)
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add wasm32-unknown-unknown --toolchain stable
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build wasm emulators (all boards) and assemble site
