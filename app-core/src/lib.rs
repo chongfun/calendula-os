@@ -246,8 +246,9 @@ impl RefreshPlanner {
 
     /// The frame a rescan's progress repaint draws: the rescan note on the
     /// glass, now reading `percent`. None unless the glass shows that note
-    /// and the repaint rides a fast refresh, since a flash every two seconds
-    /// would cost more than the number tells.
+    /// and the repaint is a fast refresh, or the one-flicker clean a
+    /// FullEveryTen policy has come due for. A full waveform every two
+    /// seconds would cost more than the number tells.
     pub fn rescan_progress_frame(&self, percent: u8) -> Option<RenderRequest> {
         let last = self.last_request?;
         if last.view != AppView::Library || !last.library_rescanning {
@@ -263,7 +264,13 @@ impl RefreshPlanner {
             library_rescan_percent: Some(percent),
             ..last
         };
-        (self.mode_for(frame) == RefreshMode::Fast).then_some(frame)
+        // The due clean is let through: refusing it records nothing, so the
+        // clean would stay due and refuse every later update too.
+        matches!(
+            self.mode_for(frame),
+            RefreshMode::Fast | RefreshMode::FastClean
+        )
+        .then_some(frame)
     }
 
     pub fn record_render(&mut self, request: RenderRequest, mode: RefreshMode) {
@@ -7774,6 +7781,43 @@ mod tests {
         off.record_render(note, RefreshMode::Fast);
         off.record_failure();
         assert_eq!(off.rescan_progress_frame(60), None);
+    }
+
+    /// Under FullEveryTen the periodic clean comes due partway through a long
+    /// rescan. The due clean is painted and recorded like any other, and the
+    /// updates after it are fast again, rather than every later percentage
+    /// being refused behind a clean nobody records.
+    #[test]
+    fn a_due_clean_does_not_stop_the_rescan_progress() {
+        let mut state = in_library(1, 4);
+        state.refresh_policy = RefreshPolicy::FullEveryTen;
+        let picked = press(state, Button::Confirm);
+        let note = picked
+            .apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 1 })
+            .render_request(RenderKind::Page);
+        let mut planner = RefreshPlanner::new();
+        planner.record_render(picked.render_request(RenderKind::Page), RefreshMode::Full);
+        // One fast refresh short of the clean.
+        for _ in 1..DEFAULT_FULL_REFRESH_INTERVAL {
+            planner.record_render(note, RefreshMode::Fast);
+        }
+        let mut cleans = 0;
+        let mut after_clean = None;
+        for step in 1..=(2 * DEFAULT_FULL_REFRESH_INTERVAL) {
+            let frame = planner
+                .rescan_progress_frame(step * 4)
+                .unwrap_or_else(|| panic!("update {step} painted"));
+            let mode = planner.mode_for(frame);
+            if after_clean == Some(step) {
+                assert_eq!(mode, RefreshMode::Fast, "fast again after the clean");
+            }
+            if mode == RefreshMode::FastClean {
+                cleans += 1;
+                after_clean = Some(step + 1);
+            }
+            planner.record_render(frame, mode);
+        }
+        assert!(cleans >= 2, "the clean came due and was recorded: {cleans}");
     }
 
     /// Every step of the actions sheet covers or uncovers list rows, so each
