@@ -1512,6 +1512,7 @@ fn sleep_request_from_saved_state(
         library_menu: app_core::LibraryMenu::None,
         library_move_pending: false,
         library_rescanning: false,
+        library_rescan_percent: None,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

@@ -575,18 +575,65 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             ),
             _ => position_footer(fb, layout, selected_index + 1, total),
         },
-        // At the rows' size: the reader waits on this, so it has to be read.
-        LibraryFooterLine::Rescanning => draw_text_centered(
-            fb,
-            literata(FontStyle::Italic),
-            "updating the library\u{2026}",
-            layout.heading_cx,
-            layout.footer_y(),
-        ),
+        LibraryFooterLine::Rescanning => rescan_footer(fb, layout, shell.library_rescan_percent),
         LibraryFooterLine::Position => position_footer(fb, layout, selected_index + 1, total),
         LibraryFooterLine::Hint => library_footer(fb, layout, selected_index + 1, total),
     }
     finish_working_screen(fb, shell, layout);
+}
+
+/// The rescan note, with how far the scan has got once it has said.
+fn rescan_note(percent: Option<u8>, buf: &mut [u8; 40]) -> &str {
+    let mut cursor = 0;
+    push_str(buf, &mut cursor, "updating the library\u{2026}");
+    if let Some(percent) = percent {
+        push_str(buf, &mut cursor, " ");
+        push_usize(buf, &mut cursor, usize::from(percent.min(100)));
+        push_str(buf, &mut cursor, "%");
+    }
+    core::str::from_utf8(&buf[..cursor]).unwrap_or("updating the library\u{2026}")
+}
+
+// At the rows' size: the reader waits on this, so it has to be read.
+fn rescan_footer(fb: &mut Framebuffer, layout: ShellLayout, percent: Option<u8>) {
+    let mut buf = [0u8; 40];
+    draw_text_centered(
+        fb,
+        literata(FontStyle::Italic),
+        rescan_note(percent, &mut buf),
+        layout.heading_cx,
+        layout.footer_y(),
+    );
+}
+
+/// Room either side of the widest rescan note, for italic overhang.
+const RESCAN_NOTE_PAD: i16 = 6;
+
+/// Clear the rescan note's line, as wide as the note at 100 % and no wider,
+/// and draw it again at `percent`. The battery shares the line in
+/// landscape, so the clear stops short of the corner.
+pub(crate) fn redraw_rescan_footer(
+    fb: &mut Framebuffer,
+    orientation: UiOrientation,
+    percent: Option<u8>,
+) {
+    let layout = ShellLayout::for_orientation(orientation);
+    let font = literata(FontStyle::Italic);
+    let mut buf = [0u8; 40];
+    let widest = measure_text(font, rescan_note(Some(100), &mut buf)) as i16;
+    let x = layout.heading_cx - widest / 2 - RESCAN_NOTE_PAD;
+    let y = layout.footer_y() - font.baseline as i16;
+    fill_rect(
+        fb,
+        Rect::new(
+            x as u16,
+            y as u16,
+            (widest + 2 * RESCAN_NOTE_PAD) as u16,
+            u16::from(font.line_height),
+        ),
+        true,
+    );
+    rescan_footer(fb, layout, percent);
 }
 
 /// Library's resting footer teaches the sheet key — the shell's only
@@ -1711,5 +1758,124 @@ mod tests {
         let (first, second) = wrap_title(font, title, 200);
         assert!(measure_text(font, first) <= 200);
         assert!(second.is_empty());
+    }
+
+    /// The note reads how far the rescan has got once the scan says, and
+    /// reads as before until then.
+    #[test]
+    fn the_rescan_note_carries_its_percent() {
+        let mut buf = [0u8; 40];
+        assert_eq!(rescan_note(None, &mut buf), "updating the library\u{2026}");
+        assert_eq!(
+            rescan_note(Some(40), &mut buf),
+            "updating the library\u{2026} 40%"
+        );
+        assert_eq!(
+            rescan_note(Some(0), &mut buf),
+            "updating the library\u{2026} 0%"
+        );
+        assert_eq!(
+            rescan_note(Some(250), &mut buf),
+            "updating the library\u{2026} 100%"
+        );
+    }
+
+    fn rescan_shell(orientation: UiOrientation, percent: Option<u8>) -> UiShell<'static> {
+        const ROWS: [crate::UiLibraryRow<'static>; 3] = [
+            crate::UiLibraryRow {
+                name: "Shelf",
+                is_folder: true,
+            },
+            crate::UiLibraryRow {
+                name: "A Very Long Book Title That Runs Past The Column",
+                is_folder: false,
+            },
+            crate::UiLibraryRow {
+                name: "Added",
+                is_folder: false,
+            },
+        ];
+        UiShell {
+            view: UiView::Library,
+            orientation,
+            front_pages_left: false,
+            refresh_policy: UiRefreshPolicy::FullOnWake,
+            font_size: Default::default(),
+            line_spacing: Default::default(),
+            font_weight: Default::default(),
+            font_family: Default::default(),
+            custom_font_name: "",
+            selection: 2,
+            chapter: 0,
+            chapter_title: "",
+            page: 0,
+            page_count: 0,
+            // Three digits: the widest corner the clear has to stop short of.
+            battery_percent: 100,
+            active_book: crate::UiBook {
+                title: "",
+                author: "",
+                progress_permille: 0,
+                cover: None,
+            },
+            library_status: UiLibraryStatus::Ready,
+            library_entries: &ROWS,
+            library_window_start: 0,
+            library_folder: "",
+            library_total: 3,
+            chapters: &[],
+            chapters_window_start: 0,
+            chapters_total: 0,
+            sync_status: UiSyncStatus::NotConfigured,
+            wifi_ssid: "",
+            library_menu: app_core::LibraryMenu::None,
+            library_move_pending: true,
+            library_rescanning: true,
+            library_rescan_percent: percent,
+        }
+    }
+
+    fn frame_for(orientation: UiOrientation) -> FbFrame {
+        match orientation {
+            UiOrientation::LandscapeButtonsBottom => FbFrame::Landscape,
+            UiOrientation::LandscapeButtonsTop => FbFrame::LandscapeFlipped,
+            UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => {
+                FbFrame::Portrait
+            }
+        }
+    }
+
+    /// The firmware's progress repaint redraws only the note, over a frame
+    /// whose rows it cannot read mid-scan. What it leaves must be exactly the
+    /// frame a full render draws, in every orientation, and the battery in
+    /// the corner of the same line must survive it.
+    #[test]
+    fn a_progress_redraw_is_the_full_frame_at_that_percent() {
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+        ] {
+            for (from, to) in [
+                (None, Some(40)),
+                (Some(40), Some(87)),
+                (Some(9), Some(100)),
+                (Some(100), Some(1)),
+            ] {
+                let mut redrawn = Framebuffer::new();
+                redrawn.set_frame(frame_for(orientation));
+                render_shell(&mut redrawn, &rescan_shell(orientation, from));
+                redraw_rescan_footer(&mut redrawn, orientation, to);
+
+                let mut full = Framebuffer::new();
+                full.set_frame(frame_for(orientation));
+                render_shell(&mut full, &rescan_shell(orientation, to));
+                assert!(
+                    redrawn.bytes() == full.bytes(),
+                    "{orientation:?}: {from:?} redrawn as {to:?}"
+                );
+            }
+        }
     }
 }

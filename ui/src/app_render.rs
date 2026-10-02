@@ -103,8 +103,21 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         library_menu: request.library_menu,
         library_move_pending: request.library_move_pending,
         library_rescanning: request.library_rescanning,
+        library_rescan_percent: request.library_rescan_percent,
     };
     render_shell(fb, &shell);
+}
+
+/// Redraw only the rescan note of the Library frame in `fb`, giving the
+/// frame [`render_request`] draws for `request`. For progress repaints
+/// mid-scan, when the scan holds the rows' catalog and arena.
+pub fn render_library_rescan_progress(fb: &mut Framebuffer, request: RenderRequest) {
+    fb.set_frame(fb_frame(request.orientation));
+    crate::render::redraw_rescan_footer(
+        fb,
+        ui_orientation(request.orientation),
+        request.library_rescan_percent,
+    );
 }
 
 fn ui_sync_status(status: SyncStatus) -> UiSyncStatus {

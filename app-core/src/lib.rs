@@ -244,6 +244,28 @@ impl RefreshPlanner {
         }
     }
 
+    /// The frame a rescan's progress repaint draws: the rescan note on the
+    /// glass, now reading `percent`. None unless the glass shows that note
+    /// and the repaint rides a fast refresh, since a flash every two seconds
+    /// would cost more than the number tells.
+    pub fn rescan_progress_frame(&self, percent: u8) -> Option<RenderRequest> {
+        let last = self.last_request?;
+        if last.view != AppView::Library || !last.library_rescanning {
+            return None;
+        }
+        if last
+            .library_rescan_percent
+            .is_some_and(|shown| shown >= percent)
+        {
+            return None;
+        }
+        let frame = RenderRequest {
+            library_rescan_percent: Some(percent),
+            ..last
+        };
+        (self.mode_for(frame) == RefreshMode::Fast).then_some(frame)
+    }
+
     pub fn record_render(&mut self, request: RenderRequest, mode: RefreshMode) {
         self.screen_on = true;
         self.last_request = Some(request);
@@ -334,6 +356,9 @@ pub struct RenderRequest {
     /// The pick in flight is waiting on a rescan of the card, which takes
     /// seconds on a large library; the footer says so.
     pub library_rescanning: bool,
+    /// How far that rescan has got, for the footer. Only the display task's
+    /// progress repaints set it, mid-scan, while the app task cannot run.
+    pub library_rescan_percent: Option<u8>,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -3289,6 +3314,7 @@ impl ReaderState {
             library_menu: self.library_menu,
             library_move_pending: !self.library_browse.is_idle(),
             library_rescanning: self.library_browse.rescanning(),
+            library_rescan_percent: None,
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -7694,6 +7720,60 @@ mod tests {
             .render_request(RenderKind::Page);
         assert!(note.library_rescanning);
         assert_eq!(planner.mode_for(note), RefreshMode::Fast);
+    }
+
+    /// A rescan's progress repaints the note on the glass with a rising
+    /// percentage, on a fast refresh, and nothing else.
+    #[test]
+    fn a_rescan_progress_frame_is_the_note_with_its_percent() {
+        let picked = press(in_library(1, 4), Button::Confirm);
+        let note = picked
+            .apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 1 })
+            .render_request(RenderKind::Page);
+        assert_eq!(
+            note.library_rescan_percent, None,
+            "the reducer's frames carry none"
+        );
+        let mut planner = RefreshPlanner::new();
+        planner.record_render(picked.render_request(RenderKind::Page), RefreshMode::Full);
+        assert_eq!(
+            planner.rescan_progress_frame(40),
+            None,
+            "not before the note is up"
+        );
+        planner.record_render(note, RefreshMode::Fast);
+
+        let frame = planner.rescan_progress_frame(40).expect("over the note");
+        assert_eq!(
+            frame,
+            RenderRequest {
+                library_rescan_percent: Some(40),
+                ..note
+            }
+        );
+        planner.record_render(frame, RefreshMode::Fast);
+        assert_eq!(planner.rescan_progress_frame(40), None, "only rising");
+        assert_eq!(planner.rescan_progress_frame(12), None);
+        assert_eq!(
+            planner
+                .rescan_progress_frame(55)
+                .and_then(|frame| frame.library_rescan_percent),
+            Some(55)
+        );
+
+        // A press served before the scan left the note: no repaint over it.
+        let home = press(picked, Button::Back).render_request(RenderKind::Page);
+        planner.record_render(home, RefreshMode::FastClean);
+        assert_eq!(planner.rescan_progress_frame(60), None);
+
+        // Nor where the repaint would flash.
+        let mut full_only = RefreshPlanner::new().with_fast_refresh_enabled(false);
+        full_only.record_render(note, RefreshMode::Full);
+        assert_eq!(full_only.rescan_progress_frame(60), None);
+        let mut off = RefreshPlanner::new();
+        off.record_render(note, RefreshMode::Fast);
+        off.record_failure();
+        assert_eq!(off.rescan_progress_frame(60), None);
     }
 
     /// Every step of the actions sheet covers or uncovers list rows, so each

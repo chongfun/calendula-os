@@ -1893,6 +1893,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         library_folder: "",
         library_move_pending: false,
         library_rescanning: false,
+        library_rescan_percent: None,
         library_window_start: 0,
         library_total: entries.len() as u16,
         chapters: &chapters,
