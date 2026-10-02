@@ -827,9 +827,12 @@ carries the legacy reading position, the pagination
 key. The new claim's evidence is the digest the scan already computed, so the
 book is hashed once.
 
-The pagination moves by directory entry, through the fork's short-name
-`move_file_in_dir`: each resident layout's sections, then the content
-stream, the chapter list and the cover, and `BOOK.BIN` last. A carry cut
+The pagination moves by directory entry, through the fork's batched
+short-name `move_files_in_dir`: each resident layout's sections, sixteen
+names per batch, then the content stream, the chapter list and the cover,
+and `BOOK.BIN` last and alone. A batch walks each directory twice whatever
+its size and writes each block it touches once, where a move per name walked
+six times. Each batch links every name before unlinking any. A carry cut
 short leaves the new key with no index, and the old key with a gap the
 loader already handles. Every header but the cover's names the `(source_hash,
 size)` of the book's place, and loaders refuse a header for another place.

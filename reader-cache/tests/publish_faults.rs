@@ -124,6 +124,9 @@ struct FaultyDisk {
     fault: FaultPlan,
     writes: Cell<u32>,
     reads: Cell<u32>,
+    /// Blocks asked for, as the firmware's `sd_stats` counts them.
+    read_blocks: Cell<u32>,
+    write_blocks: Cell<u32>,
 }
 
 /// The test holds one `Rc` handle for arming faults while the `VolumeManager`
@@ -144,6 +147,8 @@ impl BlockDevice for SharedDisk {
 
     fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), DiskError> {
         self.reads.set(self.reads.get() + 1);
+        self.read_blocks
+            .set(self.read_blocks.get() + blocks.len() as u32);
         if FaultPlan::take_fault(&self.fault.fail_read_in) {
             let extra = self.fault.extra_read_faults.get();
             if extra > 0 {
@@ -163,6 +168,8 @@ impl BlockDevice for SharedDisk {
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
         let index = self.writes.get();
         self.writes.set(index + 1);
+        self.write_blocks
+            .set(self.write_blocks.get() + blocks.len() as u32);
         if self
             .fault
             .fail_writes_from
@@ -267,6 +274,8 @@ fn new_card() -> SharedDisk {
         fault: FaultPlan::default(),
         writes: Cell::new(0),
         reads: Cell::new(0),
+        read_blocks: Cell::new(0),
+        write_blocks: Cell::new(0),
     }))
 }
 
@@ -5231,6 +5240,59 @@ fn a_proven_move_carries_the_pagination_by_entry() {
         "nor a back marker"
     );
     assert_eq!(twin_pairs(&root), 0);
+}
+
+/// A carry of 147 sections, the count measured on the X3, walks each
+/// directory a fixed number of times per batch of names rather than several
+/// times per file. Prints the block counts the firmware reports.
+#[test]
+fn a_carry_of_many_sections_walks_per_batch_not_per_file() {
+    const SECTIONS: usize = 147;
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let records = build_book(&root, &mut store, SECTIONS);
+    write_cover(&root);
+    let pages = total_pages(&records);
+    store.begin_book_load();
+    let outcome = publish::publish_book_cache(
+        &root, &OWNER, IDENTITY, 0, &mut store, &records, pages, false, 0,
+    );
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+
+    let (reads, writes) = (disk.read_blocks.get(), disk.write_blocks.get());
+    let carried = files::carry_pagination(
+        &root,
+        &OWNER,
+        &NOW,
+        hashed(b"the book"),
+        IDENTITY,
+        identity_at(&NOW),
+    )
+    .expect("the carry is not refused")
+    .expect("there was something to carry");
+    let rd_blocks = disk.read_blocks.get() - reads;
+    let wr_blocks = disk.write_blocks.get() - writes;
+    println!("carry of {SECTIONS} sections: rd_blocks={rd_blocks} wr_blocks={wr_blocks}");
+    // One move at a time took 7,792 and 641; re-binding headers is most of
+    // what is left.
+    assert!(rd_blocks < 2_500, "the carry read {rd_blocks} blocks");
+    assert!(wr_blocks < 450, "the carry wrote {wr_blocks} blocks");
+    assert_eq!(
+        carried.moved as usize,
+        SECTIONS + 2,
+        "the sections, index and cover"
+    );
+    assert_eq!(carried.restamped as usize, SECTIONS + 1);
+    assert_loads_under(
+        &root,
+        &NOW,
+        identity_at(&NOW),
+        pages,
+        records[SECTIONS - 1].start_page,
+    );
 }
 
 /// Fail each carry write in turn, as a refused write and as power loss, then
