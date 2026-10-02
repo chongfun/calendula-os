@@ -59,6 +59,16 @@ pub struct StorageTask {
     pub pending_place: Option<PendingPlace>,
     pub evidence_settled: Option<book_build::EvidencePlace>,
     pub pending_evidence: Option<book_build::SourceEvidenceJob>,
+    pub catalog_refresh: CatalogRefresh,
+}
+
+/// A catalog refresh that waited on a refused position write. A background
+/// slice requeues it after the slice's backoff, so a card that keeps refusing
+/// is retried on a timer rather than straight away.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CatalogRefresh {
+    pub owed: bool,
+    pub refusals: u8,
 }
 
 impl StorageTask {
@@ -91,6 +101,7 @@ impl StorageTask {
             &mut self.state_restored,
             &mut self.background_build,
             &mut self.pending_place,
+            &mut self.catalog_refresh,
             portrait,
         );
     }
@@ -114,7 +125,8 @@ impl StorageTask {
     /// Whether this task owes itself a background slice: a walk, a waiting
     /// place, or reading the open book's bytes.
     pub fn background_owed(&self, sd_library: &ReaderStore) -> bool {
-        self.background_build.is_some()
+        self.catalog_refresh.owed
+            || self.background_build.is_some()
             || self
                 .pending_place
                 .as_ref()
@@ -134,6 +146,11 @@ impl StorageTask {
                     .filter(|waiting| !waiting.stopped)
                     .map_or(0, |waiting| waiting.refusals),
             )
+            .max(if self.catalog_refresh.owed {
+                self.catalog_refresh.refusals
+            } else {
+                0
+            })
     }
 
     /// Run one background slice. `last_request` is the last render, which
@@ -147,6 +164,11 @@ impl StorageTask {
         font_metrics: &mut crate::custom_font::MetricCache,
         last_request: Option<RenderRequest>,
     ) {
+        if self.catalog_refresh.owed {
+            self.catalog_refresh.owed = false;
+            host.requeue(StorageCommand::RefreshCatalog);
+            return;
+        }
         let Some(pending) = self.background_build else {
             // A place waiting on a card that refused a read, with no
             // walk to carry it. Its retry rides this slice instead:
@@ -918,6 +940,7 @@ pub fn handle_storage_command(
     state_restored: &mut StateRestore,
     background_build: &mut Option<BackgroundBuild>,
     pending_place: &mut Option<PendingPlace>,
+    catalog_refresh: &mut CatalogRefresh,
     portrait: bool,
 ) {
     // The session decides what may run: progress writes stay alive during a
@@ -1010,9 +1033,11 @@ pub fn handle_storage_command(
                 last_progress_write,
                 pending_place,
             ) {
-                host.requeue(StorageCommand::RefreshCatalog);
+                catalog_refresh.owed = true;
+                catalog_refresh.refusals = catalog_refresh.refusals.saturating_add(1);
                 return;
             }
+            catalog_refresh.refusals = 0;
             restore_saved_state(card, host, sd_library, state_restored, false);
             host.send(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),

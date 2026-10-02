@@ -6,7 +6,7 @@
 
 mod support;
 
-use app_core::{AppView, Button, LibraryEvent};
+use app_core::{AppView, Button, LibraryEvent, StorageCommand};
 use support::{epub, Card, Device};
 
 const FIRST: &str = "Alpha.epub";
@@ -131,6 +131,54 @@ fn a_refused_write_before_the_rescan_refuses_the_pick() {
 
     device.choose(ADDED);
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.sleep();
+
+    let device = open_after_boot(&card, "Shelf", SECOND);
+    assert_eq!(device.app.page, 9, "the second book kept its page");
+}
+
+/// A catalog refresh while the card keeps refusing the position write. Each
+/// refusal leaves the refresh owed to a background slice, which the firmware
+/// runs only after a backoff, instead of putting it straight back on the
+/// queue. Once the card takes writes, the refresh scans and the page is kept.
+#[test]
+fn a_refresh_over_a_refusing_card_waits_for_a_background_slice() {
+    let (card, mut device) = second_book_read_with_a_book_added();
+    let before = device.log.len();
+    card.disk.refuse_next_writes(3);
+    device.send(StorageCommand::RefreshCatalog);
+    device.run_queued();
+    let scanned = |device: &Device| {
+        device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. }))
+    };
+    assert!(
+        !scanned(&device),
+        "no scan dropped the pages: {:?}",
+        device.log
+    );
+    assert!(
+        device.host.requeued.is_empty(),
+        "not requeued straight away"
+    );
+    assert!(device.task.catalog_refresh.owed);
+    assert_eq!(device.task.background_attempts(), 1, "the slice backs off");
+    assert_eq!(
+        device.task.pending_progress.map(|record| record.screen),
+        Some(9),
+        "page 9 is still owed"
+    );
+
+    device.settle();
+    assert!(
+        scanned(&device),
+        "the refresh ran once the card took writes: {:?}",
+        device.log
+    );
+    assert!(!device.task.catalog_refresh.owed);
+    assert_eq!(device.task.catalog_refresh.refusals, 0);
+    assert_eq!(device.task.pending_progress, None);
     device.sleep();
 
     let device = open_after_boot(&card, "Shelf", SECOND);

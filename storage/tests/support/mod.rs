@@ -681,18 +681,7 @@ impl Device {
     /// background slices, each event folded into the app as it arrives.
     pub fn settle(&mut self) {
         for _ in 0..10_000 {
-            if let Some(command) = self.queue.pop_front() {
-                let portrait = app_core::is_portrait(self.app.orientation);
-                self.task.handle(
-                    command,
-                    &mut self.card,
-                    &mut self.host,
-                    &mut self.store,
-                    &mut self.metrics,
-                    &mut self.sync,
-                    portrait,
-                );
-                self.deliver();
+            if self.handle_one() {
                 continue;
             }
             if let Some(command) = self.host.requeued.pop_front() {
@@ -713,6 +702,35 @@ impl Device {
             return;
         }
         panic!("the storage task never went quiet");
+    }
+
+    /// Queue a storage command as if the storage task's channel received it.
+    pub fn send(&mut self, command: StorageCommand) {
+        self.queue.push_back(command);
+    }
+
+    /// Run the queued commands only: no requeued command and no background
+    /// slice, which the firmware reaches only after a wait.
+    pub fn run_queued(&mut self) {
+        while self.handle_one() {}
+    }
+
+    fn handle_one(&mut self) -> bool {
+        let Some(command) = self.queue.pop_front() else {
+            return false;
+        };
+        let portrait = app_core::is_portrait(self.app.orientation);
+        self.task.handle(
+            command,
+            &mut self.card,
+            &mut self.host,
+            &mut self.store,
+            &mut self.metrics,
+            &mut self.sync,
+            portrait,
+        );
+        self.deliver();
+        true
     }
 
     /// Fold the storage task's events into the app, as the app task does,
