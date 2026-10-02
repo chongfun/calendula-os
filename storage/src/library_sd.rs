@@ -940,41 +940,44 @@ where
             Ok(carried) => (true, carried),
             Err(_) => (false, false),
         };
-        let (pagination_ok, moved, unlinked, restamped) = match carried.pagination {
+        let (pagination_ok, moved, unlinked, restamped, reclaimed) = match carried.pagination {
             Ok(Some(pagination)) => (
                 true,
                 pagination.moved,
                 pagination.unlinked,
                 pagination.restamped,
+                pagination.reclaimed,
             ),
-            Ok(None) => (true, 0, 0, 0),
-            Err(_) => (false, 0, 0, 0),
+            Ok(None) => (true, 0, 0, 0, 0),
+            Err(_) => (false, 0, 0, 0, 0),
         };
         if place {
             slog!("sd: carried a reading place to '{}'", found.now.1);
         } else if !place_ok {
             slog!("sd: could not carry a reading place to '{}'", found.now.1);
         }
-        if pagination_ok && (moved > 0 || unlinked > 0 || restamped > 0) {
+        if pagination_ok && (moved > 0 || unlinked > 0 || restamped > 0 || reclaimed > 0) {
             slog!(
-                "sd: carried pagination to '{}': {} moved, {} unlinked, {} re-bound",
+                "sd: carried pagination to '{}': {} moved, {} unlinked, {} re-bound, {} old freed",
                 found.now.1,
                 moved,
                 unlinked,
-                restamped
+                restamped,
+                reclaimed
             );
         } else if !pagination_ok {
             slog!("sd: could not carry pagination to '{}'", found.now.1);
         }
         let io = crate::sd_stats::snapshot().since(carry_io);
         bench_log!(
-            "bench: storage_move_carry place_ok={} place={} pagination_ok={} moved={} unlinked={} restamped={} rd_blocks={} wr_blocks={} elapsed_ms={} t_ms={}",
+            "bench: storage_move_carry place_ok={} place={} pagination_ok={} moved={} unlinked={} restamped={} reclaimed={} rd_blocks={} wr_blocks={} elapsed_ms={} t_ms={}",
             place_ok,
             place,
             pagination_ok,
             moved,
             unlinked,
             restamped,
+            reclaimed,
             io.read_blocks,
             io.write_blocks,
             carry_start.elapsed().as_millis(),

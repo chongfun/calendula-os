@@ -118,6 +118,85 @@ fn a_moved_book_opens_from_its_new_folder_on_the_page_it_was_left() {
     );
 }
 
+/// Old firmware's `S000.BIN`.. section files under the book's cache are freed
+/// by the carry, not moved: on the X3 a carry moved 46 of them for nothing.
+/// The boot rescans with no catalog, so the carry runs before any open could
+/// prune them.
+#[test]
+fn a_moved_book_frees_old_firmware_sections_rather_than_carrying_them() {
+    let (card, pages) = read_and_sleep(5);
+    let keys = card.list("READER/CACHE2");
+    assert_eq!(keys.len(), 1, "one book was opened: {keys:?}");
+    // Plain 8.3 entries, as old firmware wrote them.
+    card.session(|root| {
+        let mut sections = root.open_dir("READER").expect("the cache root");
+        for step in ["CACHE2", keys[0].as_str(), "SECTIONS"] {
+            sections.change_dir(step).expect("down to the sections");
+        }
+        for n in 0..12 {
+            let file = sections
+                .open_file_in_dir(
+                    format!("S{n:03}.BIN").as_str(),
+                    embedded_sdmmc::Mode::ReadWriteCreate,
+                )
+                .expect("create an old section");
+            file.write(&[0x5A; 3000]).expect("write it");
+            file.close().expect("close it");
+        }
+    });
+    assert_eq!(old_sections(&card).len(), 12);
+    card.rename(HOME, MOVED);
+    card.delete("READER/CATALOG.BIN");
+
+    let device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    device.sleep();
+    assert_eq!(
+        card.list("READER/CACHE2").len(),
+        2,
+        "the scan carried the book to a second key"
+    );
+    assert_eq!(old_sections(&card), Vec::<String>::new());
+
+    let mut device = Device::wake(&card);
+    device.press(app_core::Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    let opened = device
+        .log
+        .iter()
+        .find(|event| matches!(event, LibraryEvent::Loaded { .. }))
+        .copied()
+        .expect("Home continued the book");
+    match opened {
+        LibraryEvent::Loaded {
+            pages: opened,
+            position,
+            ..
+        } => {
+            assert_eq!(opened, pages, "from the carried pagination");
+            assert_eq!(position, Some(5));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Every old-firmware section name under any book's cache, as `<key>/<name>`.
+fn old_sections(card: &Card) -> Vec<String> {
+    let mut found = Vec::new();
+    for key in card.list("READER/CACHE2") {
+        let dir = format!("READER/CACHE2/{key}");
+        if !card.list(&dir).contains(&"SECTIONS".to_owned()) {
+            continue;
+        }
+        for name in card.list(&format!("{dir}/SECTIONS")) {
+            if proto::cache::is_legacy_section_file(&name) {
+                found.push(format!("{key}/{name}"));
+            }
+        }
+    }
+    found
+}
+
 /// The saved state, which holds the reading settings, follows the book, so
 /// the book opens at the layout its pagination was built for.
 #[test]

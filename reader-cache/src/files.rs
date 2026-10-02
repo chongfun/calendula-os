@@ -921,6 +921,8 @@ pub struct CarriedPagination {
     pub unlinked: u16,
     /// Headers rewritten in place from the old place's identity to the new.
     pub restamped: u16,
+    /// Old firmware's section files freed rather than carried.
+    pub reclaimed: u16,
 }
 
 /// Which header a carried file opens with. Each binds the file to its
@@ -1401,6 +1403,14 @@ where
             return if blocked { Err(()) } else { Ok(()) };
         }
         for name in &names {
+            if proto::cache::is_legacy_section_file(name.as_str()) {
+                if reclaim_legacy_section(from, to, name.as_str())? {
+                    counts.reclaimed = counts.reclaimed.saturating_add(1);
+                } else {
+                    counts.unlinked = counts.unlinked.saturating_add(1);
+                }
+                continue;
+            }
             match move_or_unlink(from, to, name.as_str())? {
                 EntryFate::Moved => counts.moved = counts.moved.saturating_add(1),
                 EntryFate::Unlinked => counts.unlinked = counts.unlinked.saturating_add(1),
@@ -1409,6 +1419,36 @@ where
         }
     }
     Err(())
+}
+
+/// Free an old firmware section file instead of carrying it. Nothing loads
+/// it, so moving it only spends a directory write per name.
+///
+/// Claiming `to` settled any earlier carry, so no chain here should be shared.
+/// If one is, the name is unlinked and `Ok(false)` returned; `to`'s next prune
+/// frees the chain.
+fn reclaim_legacy_section<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    from: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> Result<bool, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if unlink_if_twin(from, to, name)? {
+        return Ok(false);
+    }
+    match upload_store::remove_file_reclaiming_clusters(from, name) {
+        upload_store::RemoveStatus::Failed => Err(()),
+        _ => Ok(true),
+    }
 }
 
 /// Settle any unsettled carry before a writer gets this directory, since a
@@ -3678,6 +3718,9 @@ fn section_ordinal_from_name(name: &str, layout: u8) -> Option<u16> {
 /// which re-derives fewer sections over the same content and strands the old
 /// tail. This exists for that case; it is insurance, not a present-day leak.
 ///
+/// It also takes old firmware's `S###.BIN` files, whatever `layout` is: no
+/// index names them and no layout counts them, so nothing else frees them.
+///
 /// **Only ever call this with a final section count.** A suspended walk is
 /// coming back to write more sections, and pruning against its provisional
 /// count would delete the ones it is about to need.
@@ -3727,11 +3770,12 @@ where
                 if write!(name, "{}", entry.name).is_err() {
                     return ControlFlow::Continue(());
                 }
-                match section_ordinal_from_name(name.as_str(), layout) {
-                    Some(ordinal) if ordinal >= keep_count => {
-                        let _ = names.push(name);
-                    }
-                    _ => {}
+                let orphan = match section_ordinal_from_name(name.as_str(), layout) {
+                    Some(ordinal) => ordinal >= keep_count,
+                    None => proto::cache::is_legacy_section_file(name.as_str()),
+                };
+                if orphan {
+                    let _ = names.push(name);
                 }
                 ControlFlow::Continue(())
             })
