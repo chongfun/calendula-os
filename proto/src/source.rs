@@ -92,6 +92,74 @@ impl Default for SourceHasher {
     }
 }
 
+/// A SHA-256 implementation for [`EngineHasher`]: [`SoftSha256`] or the
+/// firmware's hardware unit. It must compute exact SHA-256 over the bytes
+/// given since [`Sha256Engine::start`], since the result becomes a
+/// [`SourceDigest`].
+pub trait Sha256Engine {
+    /// Begin a new digest, discarding any unfinished one.
+    fn start(&mut self);
+    /// Add the next bytes of the stream.
+    fn update(&mut self, bytes: &[u8]);
+    /// Finish the digest begun by the last [`Sha256Engine::start`].
+    fn finish(&mut self) -> [u8; SHA256_BYTES];
+}
+
+/// SHA-256 in software, as [`SourceHasher`] computes it.
+#[derive(Clone, Default)]
+pub struct SoftSha256(Sha256);
+
+impl SoftSha256 {
+    pub fn new() -> Self {
+        Self(Sha256::new())
+    }
+}
+
+impl Sha256Engine for SoftSha256 {
+    fn start(&mut self) {
+        self.0 = Sha256::new();
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fn finish(&mut self) -> [u8; SHA256_BYTES] {
+        core::mem::take(&mut self.0).finalize().into()
+    }
+}
+
+/// [`SourceHasher`] over a caller-supplied engine, for hashing a whole book
+/// read back off the card.
+pub struct EngineHasher<'e> {
+    engine: &'e mut dyn Sha256Engine,
+    byte_len: u64,
+}
+
+impl<'e> EngineHasher<'e> {
+    pub fn new(engine: &'e mut dyn Sha256Engine) -> Self {
+        engine.start();
+        Self {
+            engine,
+            byte_len: 0,
+        }
+    }
+
+    /// Add the next bytes of the stream.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.engine.update(bytes);
+        self.byte_len = self.byte_len.saturating_add(bytes.len() as u64);
+    }
+
+    /// Finish the stream and take its identity.
+    pub fn finish(self) -> SourceDigest {
+        SourceDigest {
+            byte_len: self.byte_len,
+            sha256: self.engine.finish(),
+        }
+    }
+}
+
 /// The digest of a slice already in memory.
 pub fn digest_of(bytes: &[u8]) -> SourceDigest {
     let mut hasher = SourceHasher::new();
@@ -281,6 +349,23 @@ mod tests {
     #[test]
     fn known_vector_matches() {
         assert_eq!(digest_of(b"abc").sha256(), &ABC_SHA256);
+    }
+
+    #[test]
+    fn an_engine_hasher_agrees_with_the_streaming_hasher_and_restarts_clean() {
+        let body: [u8; 10_000] = core::array::from_fn(|i| (i % 253) as u8);
+        let mut engine = SoftSha256::new();
+        // Unfinished work from before a start is not part of the next digest.
+        engine.update(b"left over from a digest nobody finished");
+        let mut hasher = EngineHasher::new(&mut engine);
+        for chunk in body.chunks(777) {
+            hasher.update(chunk);
+        }
+        assert_eq!(hasher.finish(), digest_of(&body));
+        // And the same engine serves the next digest.
+        let mut hasher = EngineHasher::new(&mut engine);
+        hasher.update(b"abc");
+        assert_eq!(hasher.finish().sha256(), &ABC_SHA256);
     }
 
     #[test]

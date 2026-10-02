@@ -2556,9 +2556,13 @@ fn a_sideloaded_book_can_be_hashed_on_demand() {
     file.close().expect("close");
 
     let alias = holder_of(&books, BOOK_NAME).expect("shelved").alias;
-    let digest = upload_store::digest_of_file(&books, alias.as_str())
-        .expect("read")
-        .expect("the book is there");
+    let digest = upload_store::digest_of_file(
+        &books,
+        alias.as_str(),
+        &mut proto::source::SoftSha256::new(),
+    )
+    .expect("read")
+    .expect("the book is there");
 
     assert_eq!(digest, proto::source::digest_of(&old_body()));
     assert_eq!(digest.byte_len(), old_body().len() as u64);
@@ -2573,9 +2577,13 @@ fn reading_a_book_back_agrees_with_the_upload_that_wrote_it() {
     let (root, books) = open_dirs(&mgr);
 
     let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
-    let reread = upload_store::digest_of_file(&books, landed.alias.as_str())
-        .expect("read")
-        .expect("the book is there");
+    let reread = upload_store::digest_of_file(
+        &books,
+        landed.alias.as_str(),
+        &mut proto::source::SoftSha256::new(),
+    )
+    .expect("read")
+    .expect("the book is there");
 
     assert_eq!(reread, landed.source);
 }
@@ -2589,9 +2597,13 @@ fn hashing_a_missing_book_is_an_absence() {
     let mgr = open_mgr(disk.clone());
     let (_root, books) = open_dirs(&mgr);
 
-    assert!(upload_store::digest_of_file(&books, "NOSUCH.EPU")
-        .expect("read")
-        .is_none());
+    assert!(upload_store::digest_of_file(
+        &books,
+        "NOSUCH.EPU",
+        &mut proto::source::SoftSha256::new()
+    )
+    .expect("read")
+    .is_none());
 }
 
 /// An empty file is a legitimate zero-length identity rather than an error,
@@ -2606,9 +2618,13 @@ fn an_empty_file_hashes_to_the_empty_identity() {
     file.close().expect("close");
     let alias = holder_of(&books, "Empty.epub").expect("shelved").alias;
 
-    let digest = upload_store::digest_of_file(&books, alias.as_str())
-        .expect("read")
-        .expect("present");
+    let digest = upload_store::digest_of_file(
+        &books,
+        alias.as_str(),
+        &mut proto::source::SoftSha256::new(),
+    )
+    .expect("read")
+    .expect("present");
     assert_eq!(digest, proto::source::digest_of(&[]));
     assert_eq!(digest.byte_len(), 0);
 }

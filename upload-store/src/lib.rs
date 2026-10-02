@@ -29,7 +29,7 @@ pub mod library;
 pub mod reclaim;
 pub mod replace;
 
-use embedded_sdmmc::{Directory, Mode, TimeSource};
+use embedded_sdmmc::{Block, Directory, Mode, TimeSource};
 use heapless::String;
 use proto::cache::CACHE_ROOT_DIR;
 use proto::library_path::BookRoot;
@@ -422,14 +422,16 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // The firmware does not call this, so software SHA is enough.
+    let engine = &mut proto::source::SoftSha256::new();
     let found = if key.in_books() {
         match library::open_library_root(root)? {
-            Some(books) => digest_of_file(&books, key.alias())?,
+            Some(books) => digest_of_file(&books, key.alias(), engine)?,
             // No shelf holds no sidecar, which reads as no recorded identity.
             None => None,
         }
     } else {
-        digest_of_file(root, key.alias())?
+        digest_of_file(root, key.alias(), engine)?
     };
     Ok(found)
 }
@@ -478,9 +480,15 @@ where
     Ok(Some(first == second))
 }
 
-/// Bytes read per pass while hashing a book already on the card. One sector,
-/// on the caller's stack.
-const DIGEST_READ_BYTES: usize = 512;
+/// Blocks read per command while hashing a book on the card, 4 KB on the
+/// caller's stack. Each command costs about a block's time in overhead, so
+/// single-block reads spent most of an X3 hash waiting on the card.
+///
+/// The deepest caller is the move-proving scan, through `assign_book_ids`
+/// (4.8 KB frame) and `with_book` (4.6 KB, with this function inlined). Summed
+/// with `tools/stack_frames.py`, that chain is about 24.4 KB on both boards,
+/// under the 34.8 KB book open that sizes the stack. Re-measure when this grows.
+const DIGEST_READ_BLOCKS: usize = 8;
 
 /// The identity of a book already on the card, read out of it.
 ///
@@ -490,6 +498,7 @@ const DIGEST_READ_BYTES: usize = 512;
 pub fn digest_of_file<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     name: &str,
+    engine: &mut dyn proto::source::Sha256Engine,
 ) -> Result<Option<proto::source::SourceDigest>, install::InstallError>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -501,11 +510,11 @@ where
         Err(_) => return Err(install::InstallError::Card),
     };
     let length = file.length();
-    let mut hasher = proto::source::SourceHasher::new();
-    let mut buf = [0u8; DIGEST_READ_BYTES];
+    let mut hasher = proto::source::EngineHasher::new(engine);
+    let mut blocks: [Block; DIGEST_READ_BLOCKS] = core::array::from_fn(|_| Block::new());
     let mut total = 0u32;
     while !file.is_eof() {
-        let read = match file.read(&mut buf) {
+        let read = match file.read_blocks(&mut blocks) {
             Ok(0) => break,
             Ok(read) => read,
             Err(_) => {
@@ -513,7 +522,16 @@ where
                 return Err(install::InstallError::Card);
             }
         };
-        hasher.update(&buf[..read]);
+        // Every block is filled; only `read` bytes of them are the file.
+        let mut left = read;
+        for block in &blocks {
+            let take = left.min(Block::LEN);
+            hasher.update(&block.contents[..take]);
+            left -= take;
+            if left == 0 {
+                break;
+            }
+        }
         total = total.saturating_add(read as u32);
     }
     if file.close().is_err() {

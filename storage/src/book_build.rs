@@ -1,9 +1,7 @@
-use crate::display_flush::Epd;
-use crate::sd_session::{self, SdSessionError};
+use crate::card::{Card, SessionError as SdSessionError};
 use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
-use esp_hal::gpio::Output;
 use heapless::String;
 use proto::anchor::decode_progression;
 use proto::book::BookId;
@@ -71,7 +69,7 @@ const BACKGROUND_SLICE_MS: u64 = 400;
 /// value before and after an open is how [`build_or_load_book_cache`] tells a
 /// walk that survived from one that was replaced.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BookBuildResume {
+pub struct BookBuildResume {
     /// Catalog row the build is walking. Re-resolved (and re-checked against
     /// `source_identity`) at every step: a rescan between steps can move a
     /// different book under the same row.
@@ -129,7 +127,7 @@ impl BookBuildResume {
     }
 }
 
-pub(crate) struct ReaderCacheScratch<'a> {
+pub struct ReaderCacheScratch<'a> {
     tail: &'a mut [u8; READER_TAIL_SCRATCH],
     header: &'a mut [u8; READER_HEADER_SCRATCH],
     name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
@@ -220,9 +218,76 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
     }
 }
 
+/// A region of the reader's scratch memory as raw parts.
+#[derive(Clone, Copy, Debug)]
+pub struct RawParts {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+/// Every region of the reader's scratch memory. The firmware's sync session
+/// loans them to the radio until the reset that ends the session.
+#[derive(Clone, Copy, Debug)]
+pub struct ScratchRegions {
+    pub xhtml: RawParts,
+    pub opf: RawParts,
+    pub compressed: RawParts,
+    pub container: RawParts,
+    pub tail: RawParts,
+    /// The zip inflate state's own allocation.
+    pub inflate: RawParts,
+    /// The separate decompressor allocation, empty when there is none.
+    pub decoder: RawParts,
+}
+
+impl ReaderCacheScratch<'static> {
+    /// Consume the scratch into the raw parts of its backing memory. Each
+    /// pointer addresses a distinct `'static` allocation that only this
+    /// scratch reached.
+    pub fn into_raw_regions(&'static mut self) -> ScratchRegions {
+        let decoder = match self.zip_inflate.take_decompressor() {
+            Some(decompressor) => RawParts {
+                ptr: (decompressor as *mut proto::epub::DecompressorOxide).cast::<u8>(),
+                len: core::mem::size_of::<proto::epub::DecompressorOxide>(),
+            },
+            None => RawParts {
+                ptr: core::ptr::null_mut(),
+                len: 0,
+            },
+        };
+        ScratchRegions {
+            xhtml: RawParts {
+                ptr: self.xhtml.as_mut_ptr(),
+                len: READER_XHTML_SCRATCH,
+            },
+            opf: RawParts {
+                ptr: self.opf.as_mut_ptr(),
+                len: READER_OPF_SCRATCH,
+            },
+            compressed: RawParts {
+                ptr: self.compressed.as_mut_ptr(),
+                len: READER_COMPRESSED_SCRATCH,
+            },
+            container: RawParts {
+                ptr: self.container.as_mut_ptr(),
+                len: READER_CONTAINER_SCRATCH,
+            },
+            tail: RawParts {
+                ptr: self.tail.as_mut_ptr(),
+                len: READER_TAIL_SCRATCH,
+            },
+            inflate: RawParts {
+                ptr: (self.zip_inflate as *mut ZipInflateScratch).cast::<u8>(),
+                len: core::mem::size_of::<ZipInflateScratch>(),
+            },
+            decoder,
+        }
+    }
+}
+
 impl<'a> ReaderCacheScratch<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         tail: &'a mut [u8; READER_TAIL_SCRATCH],
         header: &'a mut [u8; READER_HEADER_SCRATCH],
         name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
@@ -248,68 +313,9 @@ impl<'a> ReaderCacheScratch<'a> {
     }
 }
 
-/// Tears the built scratch down into the raw regions the sync session
-/// loans to the radio. One-way: the regions alias the scratch's borrowed
-/// arrays, the separate inflate decoder static, and its own struct storage
-/// (the inflate window is the bulk of it), so the scratch must never be used
-/// as a scratch again — only the session-ending software reset brings the
-/// reader pipeline back.
-#[allow(unsafe_code)]
-pub(crate) fn dismantle_scratch(
-    scratch: &'static mut ReaderCacheScratch<'static>,
-) -> crate::sync_mem::SyncLoan {
-    use crate::sync_mem::{RawRegion, SyncLoan};
-
-    // Raw field pointers first; they chain provenance through the field
-    // borrows into the separate backing statics, not into the struct.
-    let xhtml = RawRegion {
-        ptr: scratch.xhtml.as_mut_ptr(),
-        len: READER_XHTML_SCRATCH,
-    };
-    let opf_ptr = scratch.opf.as_mut_ptr();
-    let compressed_ptr = scratch.compressed.as_mut_ptr();
-    let container_ptr = scratch.container.as_mut_ptr();
-    let tail_ptr = scratch.tail.as_mut_ptr();
-
-    // The zip inflate static allocation becomes the wifi heap_a region.
-    let struct_region = RawRegion {
-        ptr: (scratch.zip_inflate as *mut ZipInflateScratch).cast::<u8>(),
-        len: core::mem::size_of::<ZipInflateScratch>(),
-    };
-
-    // The separate zip decompressor static becomes the wifi heap_c region.
-    let decoder_region = match scratch.zip_inflate.take_decompressor() {
-        Some(decompressor) => RawRegion {
-            ptr: (decompressor as *mut proto::epub::DecompressorOxide).cast::<u8>(),
-            len: core::mem::size_of::<proto::epub::DecompressorOxide>(),
-        },
-        None => RawRegion {
-            ptr: core::ptr::null_mut(),
-            len: 0,
-        },
-    };
-
-    // SAFETY: each pointer addresses a distinct 'static allocation whose
-    // only other path is the scratch struct this function retires.
-    unsafe {
-        SyncLoan {
-            heap_a: struct_region,
-            heap_b: xhtml,
-            heap_c: decoder_region,
-            tcp_rx: core::slice::from_raw_parts_mut(opf_ptr, READER_OPF_SCRATCH),
-            tcp_tx: core::slice::from_raw_parts_mut(compressed_ptr, READER_COMPRESSED_SCRATCH),
-            http_a: core::slice::from_raw_parts_mut(container_ptr, READER_CONTAINER_SCRATCH),
-            http_b: core::slice::from_raw_parts_mut(tail_ptr, READER_TAIL_SCRATCH),
-            wifi: None,
-            wifi_hint: None,
-            catalog_len: 0,
-        }
-    }
-}
-
 /// What an open or extend left for the caller to schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BookBuildOutcome {
+pub enum BookBuildOutcome {
     /// Nothing to schedule: served whole from cache, built to the end, or
     /// failed.
     Settled,
@@ -330,9 +336,8 @@ pub(crate) enum BookBuildOutcome {
 /// [`BackgroundStep::Finished`].
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_or_load_book_cache(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn build_or_load_book_cache(
+    card: &mut impl Card,
     library: &mut ReaderStore,
     index: usize,
     requested_chapter: u16,
@@ -345,7 +350,7 @@ pub(crate) fn build_or_load_book_cache(
     // finding the identical value again below is exactly the statement "the
     // cache answered and the walk still owns its records".
     let entry_resume = scratch.resume;
-    esp_println::println!(
+    slog!(
         "epub: cache open index {} chapter {} target {}",
         index,
         requested_chapter,
@@ -363,22 +368,23 @@ pub(crate) fn build_or_load_book_cache(
     // the load below rewrites the store around it.
     let source_identity = (entry.source_hash, entry.byte_size);
 
-    let status = sd_session::with_root(epd, sd_cs, |root| {
-        build_or_load_book_cache_from_root(
-            root,
-            library,
-            index,
-            requested_chapter,
-            target_pages,
-            scratch,
-            font_metrics,
-        )
-    })
-    .unwrap_or_else(|err| {
-        esp_println::println!("epub: session failed: {:?}", err);
-        set_preview_error(library, session_error_label(err));
-        BookLoadStatus::Error
-    });
+    let status = card
+        .with_root(|root| {
+            build_or_load_book_cache_from_root(
+                root,
+                library,
+                index,
+                requested_chapter,
+                target_pages,
+                scratch,
+                font_metrics,
+            )
+        })
+        .unwrap_or_else(|err| {
+            slog!("epub: session failed: {:?}", err);
+            set_preview_error(library, session_error_label(err));
+            BookLoadStatus::Error
+        });
 
     library.finish_book_load(index, requested_chapter, status);
     // A walk only survives if it is still this book's and the open ended Ready.
@@ -407,13 +413,13 @@ pub(crate) fn build_or_load_book_cache(
 /// resume whose files may be gone, and the next open of that row would report
 /// [`BookBuildOutcome::Carried`] and schedule steps over a cache that no longer
 /// exists.
-pub(crate) fn clear_build_resume(scratch: &mut ReaderCacheScratch<'_>) {
+pub fn clear_build_resume(scratch: &mut ReaderCacheScratch<'_>) {
     scratch.resume = None;
 }
 
 /// What one background build step left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BackgroundStep {
+pub enum BackgroundStep {
     /// More spine to walk; call again.
     Continued,
     /// The walk reached the end of the book. The store's totals are final and
@@ -478,9 +484,8 @@ fn step_ending(library: &ReaderStore, index: usize, current_page: u32) -> Backgr
 /// asked to go: each step ends by putting that page's section back in the one
 /// text arena the build borrows.
 #[inline(never)]
-pub(crate) fn continue_book_build(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn continue_book_build(
+    card: &mut impl Card,
     library: &mut ReaderStore,
     current_page: u32,
     scratch: &mut ReaderCacheScratch<'_>,
@@ -494,7 +499,7 @@ pub(crate) fn continue_book_build(
         return BackgroundStep::Abandoned;
     };
     let Some(entry) = library.catalog_entry(resume.index as usize) else {
-        esp_println::println!("epub: build continue lost catalog entry, dropping");
+        slog!("epub: build continue lost catalog entry, dropping");
         return BackgroundStep::Abandoned;
     };
     if !resume.belongs_to(
@@ -504,17 +509,17 @@ pub(crate) fn continue_book_build(
     ) {
         // A rescan moved a different book under this row. Building its spine
         // into the previous book's section table would corrupt both.
-        esp_println::println!("epub: build continue entry changed, dropping");
+        slog!("epub: build continue entry changed, dropping");
         return BackgroundStep::Abandoned;
     }
     let mut display_name = String::<64>::new();
     let _ = display_name.push_str(&entry.display_name);
     let Some((at, path)) = book_locator(library, resume.index as usize) else {
-        esp_println::println!("epub: build continue lost locator, dropping");
+        slog!("epub: build continue lost locator, dropping");
         return BackgroundStep::Abandoned;
     };
 
-    let step = sd_session::with_root(epd, sd_cs, |root| {
+    let step = card.with_root(|root| {
         // The file borrows the directory the walk opened, so the step runs
         // inside the walk rather than carrying a handle out of it.
         let ran = upload_store::library::with_book_at(root, at, &path, |dir, alias| {
@@ -540,7 +545,7 @@ pub(crate) fn continue_book_build(
         match ran.ok().flatten().flatten() {
             Some(outcome) => StepAttempt::Ran(outcome),
             None => {
-                esp_println::println!("epub: build continue open failed");
+                slog!("epub: build continue open failed");
                 StepAttempt::NeverBegan(ReaderCacheError::MissingSpine)
             }
         }
@@ -558,7 +563,7 @@ pub(crate) fn continue_book_build(
         // the next open rebuilds. Whether the *reader* can be told anything now
         // is a separate question, and only the store can answer it.
         Ok(StepAttempt::Ran(Err(err))) => {
-            esp_println::println!("epub: build continue failed: {:?}", err);
+            slog!("epub: build continue failed: {:?}", err);
             scratch.resume = None;
             step_ending(library, resume.index as usize, current_page)
         }
@@ -566,12 +571,12 @@ pub(crate) fn continue_book_build(
         // was taken on the way in and has to go back, or the walk it describes
         // dies of the bookkeeping rather than the fault.
         Ok(StepAttempt::NeverBegan(err)) => {
-            esp_println::println!("epub: build continue never began: {:?}", err);
+            slog!("epub: build continue never began: {:?}", err);
             scratch.resume = Some(resume);
             BackgroundStep::Retry
         }
         Err(err) => {
-            esp_println::println!("epub: build continue session failed: {:?}", err);
+            slog!("epub: build continue session failed: {:?}", err);
             scratch.resume = Some(resume);
             BackgroundStep::Retry
         }
@@ -579,7 +584,7 @@ pub(crate) fn continue_book_build(
 }
 
 #[inline(never)]
-pub(crate) fn build_or_load_book_cache_from_root<
+pub fn build_or_load_book_cache_from_root<
     D,
     T,
     const MAX_DIRS: usize,
@@ -598,8 +603,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    esp_println::println!("epub: card init begin");
-    esp_println::println!("epub: open root");
+    slog!("epub: card init begin");
+    slog!("epub: open root");
     let mut display_name = String::<64>::new();
     let Some(entry) = library.catalog_entry(index) else {
         return BookLoadStatus::Error;
@@ -610,7 +615,7 @@ where
     let catalog_index = index.min(u16::MAX as usize) as u16;
     let _ = display_name.push_str(&entry.display_name);
     let located = book_locator(library, index);
-    esp_println::println!(
+    slog!(
         "epub: catalog entry display='{}' at='{}'",
         display_name,
         located.as_ref().map_or("", |(_, path)| path.as_str()),
@@ -628,8 +633,8 @@ where
         root: *at,
         locator: path.as_str(),
     });
-    esp_println::println!("epub: stage ResolveCatalogEntry key={}", cache_key.as_str());
-    esp_println::println!(
+    slog!("epub: stage ResolveCatalogEntry key={}", cache_key.as_str());
+    slog!(
         "epub: stage TryV2BookIndexFast page={}",
         target_pages as u32
     );
@@ -675,7 +680,7 @@ where
             // no index written, the next open cannot skip this question.
             library.set_layout_bound_unmet(!within_bound);
             if !within_bound {
-                esp_println::println!(
+                slog!(
                     "epub: over the layout bound and the card would not free one; no index this open"
                 );
             }
@@ -738,7 +743,7 @@ where
         // not there, but neither can be read, and the reader is told the same
         // thing either way.
         if load_result.is_none() {
-            esp_println::println!("epub: open failed");
+            slog!("epub: open failed");
             set_preview_error(library, "FILE");
         }
         status_for_load_result(load_result, library)
@@ -779,7 +784,7 @@ where
 /// whose bytes are recorded on some later open, and one that is never
 /// opened long enough is one a move cannot find again, which is the state
 /// every book was in before.
-pub(crate) struct SourceEvidenceJob {
+pub struct SourceEvidenceJob {
     place: EvidencePlace,
     offset: u32,
     started: Instant,
@@ -796,7 +801,7 @@ pub(crate) struct SourceEvidenceJob {
 /// renumbers, and not a `BookId`, which a copy the scan has left in
 /// question does not have yet.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct EvidencePlace {
+pub struct EvidencePlace {
     at: BookRoot,
     locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
     len: u32,
@@ -815,7 +820,7 @@ impl EvidencePlace {
 
 /// What one slice of that reading did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EvidenceStep {
+pub enum EvidenceStep {
     /// More of the book to read; call again.
     Continued,
     /// The stream was read whole and the claim now says what it held, or
@@ -836,7 +841,7 @@ const EVIDENCE_SLICE_BYTES: u32 = 192 * 1024;
 
 impl SourceEvidenceJob {
     /// The copy this is reading.
-    pub(crate) fn place(&self) -> &EvidencePlace {
+    pub fn place(&self) -> &EvidencePlace {
         &self.place
     }
 }
@@ -848,7 +853,7 @@ impl SourceEvidenceJob {
 /// has to outlive one, and rather than a [`proto::identity::BookId`], since
 /// a book whose adoption a scan is still deciding has no id yet and its
 /// bytes are worth reading all the same.
-pub(crate) fn evidence_place(library: &ReaderStore) -> Option<EvidencePlace> {
+pub fn evidence_place(library: &ReaderStore) -> Option<EvidencePlace> {
     let index = library.active_index()?;
     let len = library.catalog_entry(index)?.byte_size;
     if len == 0 {
@@ -868,7 +873,7 @@ pub(crate) fn evidence_place(library: &ReaderStore) -> Option<EvidencePlace> {
 ///
 /// No card access: whether the claim already records the bytes is the first
 /// slice's business, so arming costs an open nothing.
-pub(crate) fn evidence_job(library: &ReaderStore) -> Option<SourceEvidenceJob> {
+pub fn evidence_job(library: &ReaderStore) -> Option<SourceEvidenceJob> {
     Some(SourceEvidenceJob {
         place: evidence_place(library)?,
         offset: 0,
@@ -880,11 +885,7 @@ pub(crate) fn evidence_job(library: &ReaderStore) -> Option<SourceEvidenceJob> {
 /// Read the next slice of a book whose bytes are not recorded yet, and
 /// record them once the last slice is in.
 #[inline(never)]
-pub(crate) fn continue_source_evidence(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    job: &mut SourceEvidenceJob,
-) -> EvidenceStep {
+pub fn continue_source_evidence(card: &mut impl Card, job: &mut SourceEvidenceJob) -> EvidenceStep {
     let Ok(path) = LibraryPath::parse(job.place.locator.as_str()) else {
         return EvidenceStep::Abandoned;
     };
@@ -894,7 +895,7 @@ pub(crate) fn continue_source_evidence(
         root: job.place.at,
         locator: job.place.locator.as_str(),
     };
-    let slice = sd_session::with_root(epd, sd_cs, |root| {
+    let slice = card.with_root(|root| {
         // Asked once, on the first slice: a book whose bytes are already
         // recorded is most of a library most of the time.
         if job.offset == 0
@@ -955,7 +956,7 @@ pub(crate) fn continue_source_evidence(
             // A claim that would not take it costs a later scan the chance
             // to find this copy again, and costs this reader nothing.
             Err(_) => {
-                esp_println::println!("storage: could not record what this copy is");
+                slog!("storage: could not record what this copy is");
                 EvidenceStep::Abandoned
             }
         }
@@ -1046,9 +1047,8 @@ where
 /// there and cards are meant to move between the two. Writing both keeps that
 /// promise without making the global copy authoritative — see `book_position`
 /// in the display task for the precedence the read side applies.
-pub(crate) fn store_app_state(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn store_app_state(
+    card: &mut impl Card,
     library: &ReaderStore,
     record: AppStateRecord,
     may_replace_place: bool,
@@ -1064,7 +1064,7 @@ pub(crate) fn store_app_state(
     if app_core::ReaderSource::from_book_id(record.book_id).is_sd()
         && (record.source_hash, record.source_size) == (0, 0)
     {
-        esp_println::println!(
+        slog!(
             "storage: refusing a global record with no source identity book_id={}",
             record.book_id
         );
@@ -1074,7 +1074,7 @@ pub(crate) fn store_app_state(
     // per-book position beside that book's cache, so switching books does
     // not abandon the previous one's place.
     let sd_index = app_core::ReaderSource::from_book_id(record.book_id).sd_index();
-    sd_session::with_root(epd, sd_cs, |root| {
+    card.with_root(|root| {
         let position = if library
             .loaded_book_snapshot()
             .is_some_and(|l| (record.source_hash, record.source_size) == l.identity)
@@ -1093,9 +1093,7 @@ pub(crate) fn store_app_state(
                     match files::write_position_file(root, &owner, record.chapter, record.screen) {
                         Ok(()) => Ok(()),
                         Err(files::ClaimDenied::Foreign) => {
-                            esp_println::println!(
-                                "storage: position write refused by a foreign claim"
-                            );
+                            slog!("storage: position write refused by a foreign claim");
                             Ok(())
                         }
                         Err(files::ClaimDenied::Fault) => Err(()),
@@ -1127,9 +1125,8 @@ pub(crate) fn store_app_state(
 /// page, which is exactly what it exists to prevent. Built-in books have no
 /// position file and owe nothing, so they succeed.
 #[inline(never)]
-pub(crate) fn store_book_position(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn store_book_position(
+    card: &mut impl Card,
     library: &ReaderStore,
     record: AppStateRecord,
     may_replace_place: bool,
@@ -1137,47 +1134,48 @@ pub(crate) fn store_book_position(
     let Some(_) = app_core::ReaderSource::from_book_id(record.book_id).sd_index() else {
         return true;
     };
-    let stored = sd_session::with_root(epd, sd_cs, |root| {
-        if library
-            .loaded_book_snapshot()
-            .is_some_and(|l| (record.source_hash, record.source_size) == l.identity)
-        {
-            files::close_out_loaded_book(root, library, record, may_replace_place)
-        } else {
-            let identity = (record.source_hash, record.source_size);
-            if identity == (0, 0) {
-                esp_println::println!("storage: departing book has no source identity");
-                return Err(());
-            }
-            let Some((at, path, _, _)) = resolve_record_location(root, identity) else {
-                esp_println::println!(
-                    "storage: no single catalog record for hash={:08x} size={}",
-                    identity.0,
-                    identity.1
-                );
-                return Err(());
-            };
-            let key = proto::cache::cache_key_from(identity.0);
-            let owner = proto::cache::CacheOwner {
-                key: key.as_str(),
-                root: at,
-                locator: path.as_str(),
-            };
-            match files::write_position_file(root, &owner, record.chapter, record.screen) {
-                Ok(()) => Ok(()),
-                Err(files::ClaimDenied::Foreign) => {
-                    esp_println::println!("storage: departing position refused by a foreign claim");
-                    Ok(())
+    let stored = card
+        .with_root(|root| {
+            if library
+                .loaded_book_snapshot()
+                .is_some_and(|l| (record.source_hash, record.source_size) == l.identity)
+            {
+                files::close_out_loaded_book(root, library, record, may_replace_place)
+            } else {
+                let identity = (record.source_hash, record.source_size);
+                if identity == (0, 0) {
+                    slog!("storage: departing book has no source identity");
+                    return Err(());
                 }
-                Err(files::ClaimDenied::Fault) => Err(()),
+                let Some((at, path, _, _)) = resolve_record_location(root, identity) else {
+                    slog!(
+                        "storage: no single catalog record for hash={:08x} size={}",
+                        identity.0,
+                        identity.1
+                    );
+                    return Err(());
+                };
+                let key = proto::cache::cache_key_from(identity.0);
+                let owner = proto::cache::CacheOwner {
+                    key: key.as_str(),
+                    root: at,
+                    locator: path.as_str(),
+                };
+                match files::write_position_file(root, &owner, record.chapter, record.screen) {
+                    Ok(()) => Ok(()),
+                    Err(files::ClaimDenied::Foreign) => {
+                        slog!("storage: departing position refused by a foreign claim");
+                        Ok(())
+                    }
+                    Err(files::ClaimDenied::Fault) => Err(()),
+                }
             }
-        }
-    })
-    .ok()
-    .is_some_and(|result| result.is_ok());
+        })
+        .ok()
+        .is_some_and(|result| result.is_ok());
 
     if !stored {
-        esp_println::println!(
+        slog!(
             "storage: failed to store departing position for book_id={}",
             record.book_id
         );
@@ -1192,12 +1190,8 @@ pub(crate) fn store_book_position(
 /// already written when it was last read, and the open resolved the position
 /// from it, so rewriting it here would only copy it back onto itself.
 #[inline(never)]
-pub(crate) fn store_global_state(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    record: AppStateRecord,
-) -> bool {
-    sd_session::with_root(epd, sd_cs, |root| files::write_state_file(root, record))
+pub fn store_global_state(card: &mut impl Card, record: AppStateRecord) -> bool {
+    card.with_root(|root| files::write_state_file(root, record))
         .ok()
         .is_some_and(|result| result.is_ok())
 }
@@ -1211,7 +1205,7 @@ pub(crate) fn store_global_state(
 /// adopted by the open that reads this. A legacy position names a page under
 /// whatever layout wrote it, which is all an older card holds.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum SavedPlace {
+pub enum SavedPlace {
     Place {
         anchor: proto::anchor::ContentAnchor,
         /// Whether the content the anchor was resolved against is still the
@@ -1237,7 +1231,7 @@ impl SavedPlace {
     /// For a place that is the spine item's first page: the item is known
     /// from the anchor, and which page inside it needs a pagination that this
     /// open has yet to build. [`resolve_place`] refines it once there is one.
-    pub(crate) fn provisional(self) -> (u16, u32) {
+    pub fn provisional(self) -> (u16, u32) {
         match self {
             Self::Place { anchor, .. } => (anchor.spine, 0),
             Self::Page { chapter, page } => (chapter, page),
@@ -1256,15 +1250,10 @@ impl SavedPlace {
 /// written by earlier firmware resumes where it left off. The next save
 /// publishes a place.
 #[inline(never)]
-pub(crate) fn load_place(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    library: &ReaderStore,
-    index: usize,
-) -> Option<SavedPlace> {
+pub fn load_place(card: &mut impl Card, library: &ReaderStore, index: usize) -> Option<SavedPlace> {
     let entry = library.catalog_entry(index)?;
     let identity = (entry.source_hash, entry.byte_size);
-    sd_session::with_root(epd, sd_cs, |root| {
+    card.with_root(|root| {
         let (at, path, display_name, cat_copy_id) = record_location(root, index, identity)?;
         let key = proto::cache::cache_key_from(identity.0);
         let owner = proto::cache::CacheOwner {
@@ -1303,7 +1292,7 @@ pub(crate) fn load_place(
 
 /// What a stored place asks the open to do next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PlaceTarget {
+pub enum PlaceTarget {
     /// The page the place resolves to.
     Page(u32),
     /// The index stops before the place. Build at least this far and ask
@@ -1329,9 +1318,8 @@ pub(crate) enum PlaceTarget {
 /// that happened to be in RAM would answer with another book's geometry, or
 /// with this book's under the settings the reader just left.
 #[inline(never)]
-pub(crate) fn resolve_place(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn resolve_place(
+    card: &mut impl Card,
     library: &ReaderStore,
     index: usize,
     place: SavedPlace,
@@ -1339,7 +1327,7 @@ pub(crate) fn resolve_place(
     // The one place that reads the card again rather than resolving what it
     // was handed. The refusal budget above this bounds the asking.
     let place = match place {
-        SavedPlace::Unreadable => match load_place(epd, sd_cs, library, index) {
+        SavedPlace::Unreadable => match load_place(card, library, index) {
             Some(SavedPlace::Unreadable) | None => return PlaceTarget::Unavailable,
             Some(read) => read,
         },
@@ -1362,7 +1350,7 @@ pub(crate) fn resolve_place(
         if let (Some(progression), false) = (progression, partial) {
             let total = library.advertised_page_count();
             let page = decode_progression(progression, total);
-            esp_println::println!(
+            slog!(
                 "restore: the source changed; resuming near {}/{}",
                 page,
                 total
@@ -1374,7 +1362,7 @@ pub(crate) fn resolve_place(
         // opens at the top of it rather than at the top of the book.
         return match library.first_page_of_spine(anchor.spine) {
             Some(page) => {
-                esp_println::println!(
+                slog!(
                     "restore: the source changed and no whole-book length is known; \
                      resuming at spine {}",
                     anchor.spine
@@ -1404,29 +1392,30 @@ pub(crate) fn resolve_place(
     if partial && section + 1 >= library.book_section_count() {
         return PlaceTarget::Extend(library.advertised_page_count());
     }
-    let resolved = sd_session::with_root(epd, sd_cs, |root| {
-        let (at, path, _, _) = record_location(root, index, identity)?;
-        let key = proto::cache::cache_key_from(identity.0);
-        let owner = proto::cache::CacheOwner {
-            key: key.as_str(),
-            root: at,
-            locator: path.as_str(),
-        };
-        // By section, not by spine. One spine item can hold several sections,
-        // and the file is named for the section; the header checks then
-        // confirm the file is this item of this copy under this layout.
-        let within = files::page_of_anchor_in_section(
-            root,
-            &owner,
-            library,
-            identity,
-            record.section,
-            anchor,
-        )?;
-        Some(record.start_page.saturating_add(u32::from(within)))
-    })
-    .ok()
-    .flatten();
+    let resolved = card
+        .with_root(|root| {
+            let (at, path, _, _) = record_location(root, index, identity)?;
+            let key = proto::cache::cache_key_from(identity.0);
+            let owner = proto::cache::CacheOwner {
+                key: key.as_str(),
+                root: at,
+                locator: path.as_str(),
+            };
+            // By section, not by spine. One spine item can hold several sections,
+            // and the file is named for the section; the header checks then
+            // confirm the file is this item of this copy under this layout.
+            let within = files::page_of_anchor_in_section(
+                root,
+                &owner,
+                library,
+                identity,
+                record.section,
+                anchor,
+            )?;
+            Some(record.start_page.saturating_add(u32::from(within)))
+        })
+        .ok()
+        .flatten();
     match resolved {
         Some(page) => {
             // Log successful place resolution telemetry.
@@ -1449,9 +1438,8 @@ pub(crate) fn resolve_place(
 /// Load the book's full chapter list from TOC.BIN into the reader's section
 /// buffer for the Chapters overview. The reading section reloads on exit.
 #[inline(never)]
-pub(crate) fn load_chapters_into_store(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn load_chapters_into_store(
+    card: &mut impl Card,
     library: &mut ReaderStore,
     index: usize,
     selection: usize,
@@ -1469,7 +1457,7 @@ pub(crate) fn load_chapters_into_store(
     // Center the window on the selection so scrolling either way has slack
     // before the next reload.
     let window_start = selection.saturating_sub(reader_cache::store::TOC_WINDOW_CAPACITY / 2);
-    sd_session::with_root(epd, sd_cs, |root| {
+    card.with_root(|root| {
         let owner = proto::cache::CacheOwner {
             key: key.as_str(),
             root: at,
@@ -1483,9 +1471,8 @@ pub(crate) fn load_chapters_into_store(
 /// Make the TOC window cover the Chapters rows visible around `selection`,
 /// reloading it from TOC.BIN only on a miss — the overview analogue of
 /// `ensure_folder_page`. Cheap when the window already covers.
-pub(crate) fn ensure_toc_window(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn ensure_toc_window(
+    card: &mut impl Card,
     library: &mut ReaderStore,
     index: usize,
     selection: usize,
@@ -1496,52 +1483,41 @@ pub(crate) fn ensure_toc_window(
     if library.toc_window_covers(first_visible, ui::render::toc_visible_rows(portrait)) {
         return true;
     }
-    load_chapters_into_store(epd, sd_cs, library, index, selection)
+    load_chapters_into_store(card, library, index, selection)
 }
 
 #[inline(never)]
-pub(crate) fn store_wifi_credentials(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn store_wifi_credentials(
+    card: &mut impl Card,
     record: proto::nvm::WifiCredentialsRecord,
 ) -> bool {
-    sd_session::with_root(epd, sd_cs, |root| {
-        files::write_wifi_file(root, record).is_ok()
-    })
-    .unwrap_or(false)
+    card.with_root(|root| files::write_wifi_file(root, record).is_ok())
+        .unwrap_or(false)
 }
 
 #[inline(never)]
-pub(crate) fn store_wifi_ap_hint(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    record: proto::nvm::WifiApHintRecord,
-) -> bool {
-    sd_session::with_root(epd, sd_cs, |root| {
-        files::write_wifi_hint_file(root, record).is_ok()
-    })
-    .unwrap_or(false)
+pub fn store_wifi_ap_hint(card: &mut impl Card, record: proto::nvm::WifiApHintRecord) -> bool {
+    card.with_root(|root| files::write_wifi_hint_file(root, record).is_ok())
+        .unwrap_or(false)
 }
 
 #[inline(never)]
-pub(crate) fn load_wifi_ap_hint(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-) -> Option<proto::nvm::WifiApHintRecord> {
+pub fn load_wifi_ap_hint(card: &mut impl Card) -> Option<proto::nvm::WifiApHintRecord> {
     // Not point-free: passing the function directly fixes its `Directory`
     // lifetime to one region, and `with_root` needs a `for<'a>` caller.
     #[allow(clippy::redundant_closure)]
-    sd_session::with_root(epd, sd_cs, |root| files::read_wifi_hint_file(root))
+    card.with_root(|root| files::read_wifi_hint_file(root))
         .ok()
         .flatten()
 }
 
 #[inline(never)]
-pub(crate) fn forget_wifi_credentials(epd: &mut Epd, sd_cs: &mut Output<'static>) -> bool {
+pub fn forget_wifi_credentials(card: &mut impl Card) -> bool {
     // Not point-free: passing the function directly fixes its `Directory`
     // lifetime to one region, and `with_root` needs a `for<'a>` caller.
     #[allow(clippy::redundant_closure)]
-    sd_session::with_root(epd, sd_cs, |root| files::delete_wifi_file(root)).unwrap_or(false)
+    card.with_root(|root| files::delete_wifi_file(root))
+        .unwrap_or(false)
 }
 
 /// Delete one catalog row's rebuildable cache (sections, BOOK/TOC/COVER and
@@ -1552,12 +1528,7 @@ pub(crate) fn forget_wifi_credentials(epd: &mut Epd, sd_cs: &mut Output<'static>
 /// next open takes the ordinary cache-miss rebuild path instead of
 /// answering from RAM.
 #[inline(never)]
-pub(crate) fn clear_book_cache(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    library: &mut ReaderStore,
-    index: u16,
-) -> bool {
+pub fn clear_book_cache(card: &mut impl Card, library: &mut ReaderStore, index: u16) -> bool {
     let index = index as usize;
     let resolved = match library.catalog_entry(index) {
         Some(entry) => Some((
@@ -1569,7 +1540,7 @@ pub(crate) fn clear_book_cache(
         // window, so read it off the card directly rather than through
         // `load_active_entry`, which would publish it as the active entry and
         // evict the open book's.
-        None => crate::library_sd::read_row_cache_identity(epd, sd_cs, index),
+        None => crate::library_sd::read_row_cache_identity(card, index),
     };
     let Some((cache_key, source_hash, source_size)) = resolved else {
         return false;
@@ -1578,63 +1549,65 @@ pub(crate) fn clear_book_cache(
     // two differ: a refusal touches nothing, while a partial pass can take
     // BOOK.BIN and stall on a section, and the resident state has to be
     // dropped in that case as surely as in the clean one.
-    let (attempted, cleared) = sd_session::with_root(epd, sd_cs, |root| {
-        // The row is a specific book, so its exact ownership is checkable
-        // where the sweep's is not: a full 32-bit twin passes the header
-        // identity test below, and without this gate the wrong row could
-        // clear the claim holder's cache. Unclaimed directories fall through
-        // to the identity test, which is all pre-claim caches ever had.
-        if let Some((at, path, _, _)) = record_location(root, index, (source_hash, source_size)) {
-            let owner = proto::cache::CacheOwner {
-                key: cache_key.as_str(),
-                root: at,
-                locator: path.as_str(),
-            };
-            match files::cache_dir_claim(root, &owner) {
-                files::ClaimState::MineActive
-                | files::ClaimState::MineReleased
-                | files::ClaimState::Unclaimed => {}
-                files::ClaimState::OtherActive
-                | files::ClaimState::OtherReleased
-                | files::ClaimState::Fault => return (false, false),
-            }
-        }
-        match files::read_cache_header(root, cache_key.as_str()) {
-            files::CacheHeader::Present(header) => {
-                if header.source_hash != source_hash || header.source_size != source_size {
-                    // Whatever sits under this key is not this book's cache;
-                    // refuse rather than delete another book's data.
-                    return (false, false);
+    let (attempted, cleared) = card
+        .with_root(|root| {
+            // The row is a specific book, so its exact ownership is checkable
+            // where the sweep's is not: a full 32-bit twin passes the header
+            // identity test below, and without this gate the wrong row could
+            // clear the claim holder's cache. Unclaimed directories fall through
+            // to the identity test, which is all pre-claim caches ever had.
+            if let Some((at, path, _, _)) = record_location(root, index, (source_hash, source_size))
+            {
+                let owner = proto::cache::CacheOwner {
+                    key: cache_key.as_str(),
+                    root: at,
+                    locator: path.as_str(),
+                };
+                match files::cache_dir_claim(root, &owner) {
+                    files::ClaimState::MineActive
+                    | files::ClaimState::MineReleased
+                    | files::ClaimState::Unclaimed => {}
+                    files::ClaimState::OtherActive
+                    | files::ClaimState::OtherReleased
+                    | files::ClaimState::Fault => return (false, false),
                 }
             }
-            // An index that will not read cannot say whose cache this is, and
-            // a key is 28 bits of hash — a collision is a case the format
-            // admits. Fail closed: a corrupt or briefly unreadable BOOK.BIN
-            // belonging to another book must not be answered by deleting it.
-            files::CacheHeader::Unreadable => return (false, false),
-            // No index at all is different. Nothing usable is there for
-            // anyone, so sweeping the shells a truncated pass left behind
-            // costs the colliding book nothing it had not already lost — and
-            // its position files are never swept regardless.
-            files::CacheHeader::Absent => {}
-        }
-        //
-        // The delete reports on every file it was supposed to remove, not
-        // just the index: a pass that took BOOK.BIN but stalled on a section
-        // has freed no space and left a directory the sweep will keep
-        // tripping over, and telling the user "cache cleared" for that is a
-        // lie they cannot check.
-        let emptied = files::empty_cache_dir(root, cache_key.as_str());
-        (
-            true,
-            emptied
-                && matches!(
-                    files::read_cache_header(root, cache_key.as_str()),
-                    files::CacheHeader::Absent
-                ),
-        )
-    })
-    .unwrap_or((false, false));
+            match files::read_cache_header(root, cache_key.as_str()) {
+                files::CacheHeader::Present(header) => {
+                    if header.source_hash != source_hash || header.source_size != source_size {
+                        // Whatever sits under this key is not this book's cache;
+                        // refuse rather than delete another book's data.
+                        return (false, false);
+                    }
+                }
+                // An index that will not read cannot say whose cache this is, and
+                // a key is 28 bits of hash — a collision is a case the format
+                // admits. Fail closed: a corrupt or briefly unreadable BOOK.BIN
+                // belonging to another book must not be answered by deleting it.
+                files::CacheHeader::Unreadable => return (false, false),
+                // No index at all is different. Nothing usable is there for
+                // anyone, so sweeping the shells a truncated pass left behind
+                // costs the colliding book nothing it had not already lost — and
+                // its position files are never swept regardless.
+                files::CacheHeader::Absent => {}
+            }
+            //
+            // The delete reports on every file it was supposed to remove, not
+            // just the index: a pass that took BOOK.BIN but stalled on a section
+            // has freed no space and left a directory the sweep will keep
+            // tripping over, and telling the user "cache cleared" for that is a
+            // lie they cannot check.
+            let emptied = files::empty_cache_dir(root, cache_key.as_str());
+            (
+                true,
+                emptied
+                    && matches!(
+                        files::read_cache_header(root, cache_key.as_str()),
+                        files::CacheHeader::Absent
+                    ),
+            )
+        })
+        .unwrap_or((false, false));
     // Keyed on the attempt, not the verdict. A half-finished delete leaves
     // the resident sections, index, TOC, and cover describing files that are
     // already gone; answering the next read from that RAM would strand the
@@ -1658,41 +1631,34 @@ pub(crate) fn clear_book_cache(
 }
 
 #[inline(never)]
-pub(crate) fn load_wifi_credentials(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-) -> Option<proto::nvm::WifiCredentialsRecord> {
+pub fn load_wifi_credentials(card: &mut impl Card) -> Option<proto::nvm::WifiCredentialsRecord> {
     // Not point-free: passing the function directly fixes its `Directory`
     // lifetime to one region, and `with_root` needs a `for<'a>` caller.
     #[allow(clippy::redundant_closure)]
-    sd_session::with_root(epd, sd_cs, |root| files::read_wifi_file(root))
+    card.with_root(|root| files::read_wifi_file(root))
         .ok()
         .flatten()
 }
 
 /// Kept out of line for the same stack discipline as the store side.
 #[inline(never)]
-pub(crate) fn load_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>) -> Option<AppStateRecord> {
+pub fn load_app_state(card: &mut impl Card) -> Option<AppStateRecord> {
     // Not point-free: the generic fn item fails the closure's HRTB check.
     #[allow(clippy::redundant_closure)]
-    sd_session::with_root(epd, sd_cs, |root| files::read_state_file(root))
+    card.with_root(|root| files::read_state_file(root))
         .ok()
         .flatten()
 }
 
 #[inline(never)]
-pub(crate) fn load_custom_font_manifest(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    library: &mut ReaderStore,
-) {
+pub fn load_custom_font_manifest(card: &mut impl Card, library: &mut ReaderStore) {
     if display::font::builtin_custom_available() {
         library.set_custom_font(
             Some(display::font::builtin_custom_name()),
             display::font::builtin_custom_identity(),
             &[],
         );
-        esp_println::println!(
+        slog!(
             "font: builtin custom '{}' identity={:016x}",
             display::font::builtin_custom_name(),
             display::font::builtin_custom_identity()
@@ -1703,11 +1669,12 @@ pub(crate) fn load_custom_font_manifest(
     // `Directory` lifetime to one specific region, and `with_root` needs a
     // `for<'a>` caller. Clippy suggests a form that does not compile.
     #[allow(clippy::redundant_closure)]
-    let manifest = sd_session::with_root(epd, sd_cs, |root| files::read_custom_font_manifest(root))
+    let manifest = card
+        .with_root(|root| files::read_custom_font_manifest(root))
         .ok()
         .flatten();
     if let Some(manifest) = manifest {
-        esp_println::println!(
+        slog!(
             "font: custom '{}' identity={:016x}",
             manifest.name.as_str(),
             manifest.identity
@@ -1718,7 +1685,7 @@ pub(crate) fn load_custom_font_manifest(
             &manifest.faces[..manifest.face_count],
         );
     } else {
-        esp_println::println!("font: no custom font pack");
+        slog!("font: no custom font pack");
         library.set_custom_font(None, 0, &[]);
     }
 }
@@ -1730,9 +1697,8 @@ pub(crate) fn load_custom_font_manifest(
 /// reducer, else `None` when nothing changed (or the chapter map is not
 /// resident, e.g. a built-in book).
 #[inline(never)]
-pub(crate) fn track_reading_chapter(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn track_reading_chapter(
+    card: &mut impl Card,
     global_page: u32,
     library: &mut ReaderStore,
 ) -> Option<u16> {
@@ -1744,7 +1710,7 @@ pub(crate) fn track_reading_chapter(
         return None;
     }
     let index = library.loaded_index?;
-    load_chapter_title(epd, sd_cs, index, current, library);
+    load_chapter_title(card, index, current, library);
     Some(current)
 }
 
@@ -1754,9 +1720,8 @@ pub(crate) fn track_reading_chapter(
 /// Tags the title with the book's source identity; a colophon shows it only for
 /// that book.
 #[inline(never)]
-pub(crate) fn load_chapter_title(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn load_chapter_title(
+    card: &mut impl Card,
     index: usize,
     chapter: u16,
     library: &mut ReaderStore,
@@ -1769,15 +1734,16 @@ pub(crate) fn load_chapter_title(
     // A book with no locator is not found, the same as one whose title would
     // not read: either way the fallback below runs.
     let found = match book_locator(library, index) {
-        Some((at, path)) => sd_session::with_root(epd, sd_cs, |root| {
-            let owner = proto::cache::CacheOwner {
-                key: cache_key.as_str(),
-                root: at,
-                locator: path.as_str(),
-            };
-            files::read_v2_toc_chapter_title(root, &owner, source_identity, chapter, library)
-        })
-        .unwrap_or(false),
+        Some((at, path)) => card
+            .with_root(|root| {
+                let owner = proto::cache::CacheOwner {
+                    key: cache_key.as_str(),
+                    root: at,
+                    locator: path.as_str(),
+                };
+                files::read_v2_toc_chapter_title(root, &owner, source_identity, chapter, library)
+            })
+            .unwrap_or(false),
         None => false,
     };
     if !found {
@@ -1791,12 +1757,7 @@ pub(crate) fn load_chapter_title(
 /// the Home progress bar has a denominator before the book is opened. Returns 0
 /// if unavailable (caller leaves the bar on its fallback).
 #[inline(never)]
-pub(crate) fn restore_book_page_count(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    index: usize,
-    library: &ReaderStore,
-) -> u32 {
+pub fn restore_book_page_count(card: &mut impl Card, index: usize, library: &ReaderStore) -> u32 {
     let Some(entry) = library.catalog_entry(index) else {
         return 0;
     };
@@ -1805,7 +1766,7 @@ pub(crate) fn restore_book_page_count(
     let Some((at, path)) = book_locator(library, index) else {
         return 0;
     };
-    sd_session::with_root(epd, sd_cs, |root| {
+    card.with_root(|root| {
         let owner = proto::cache::CacheOwner {
             key: cache_key.as_str(),
             root: at,
@@ -1849,9 +1810,7 @@ where
             // the reducer clamps the reader to the advertised count. Rebuild
             // instead; the rebuild is progressive, so the first page still
             // arrives in about a second.
-            esp_println::println!(
-                "epub: v2 {label} book index unfinished with no build running; rebuilding"
-            );
+            slog!("epub: v2 {label} book index unfinished with no build running; rebuilding");
             false
         }
         BookIndexLoadResult::Hit { .. } => {
@@ -1872,7 +1831,7 @@ where
                         library,
                     );
                     let cover = files::load_v2_cover_cache(root, owner, library);
-                    esp_println::println!(
+                    slog!(
                         "epub: v2 {label} book cache ready after {} ms (total={} section_pages={} toc={} cover={:?})",
                         started.elapsed().as_millis(),
                         library.advertised_page_count(),
@@ -1883,17 +1842,17 @@ where
                     true
                 }
                 other => {
-                    esp_println::println!("epub: {label} book index section load {:?}", other);
+                    slog!("epub: {label} book index section load {:?}", other);
                     false
                 }
             }
         }
         BookIndexLoadResult::Invalid => {
-            esp_println::println!("epub: v2 {label} book index invalid");
+            slog!("epub: v2 {label} book index invalid");
             false
         }
         BookIndexLoadResult::Miss => {
-            esp_println::println!("epub: v2 {label} book index miss");
+            slog!("epub: v2 {label} book index miss");
             false
         }
     }
@@ -1910,7 +1869,7 @@ fn status_for_load_result(
     match result {
         Some(Ok(())) => BookLoadStatus::Ready,
         Some(Err(err)) => {
-            esp_println::println!("epub: load failed: {:?}", err);
+            slog!("epub: load failed: {:?}", err);
             set_preview_error_from_error(library, err);
             BookLoadStatus::Error
         }
@@ -1984,15 +1943,15 @@ fn report_publish(
     label: &str,
     open_started: Instant,
     spine_started: Instant,
-    io_start: crate::sd_session::sd_stats::Snapshot,
+    io_start: crate::sd_stats::Snapshot,
     section_write_micros: u64,
     cover: Option<files::CoverLoadResult>,
     sections: usize,
     total_pages: u32,
     book_partial: bool,
 ) {
-    esp_println::println!("epub: stage PublishLoaded");
-    esp_println::println!(
+    slog!("epub: stage PublishLoaded");
+    slog!(
         "epub: {label} book cache ready after {} ms (total={} sections={} partial={} cover={:?} key {})",
         open_started.elapsed().as_millis(),
         total_pages,
@@ -2001,7 +1960,7 @@ fn report_publish(
         cover,
         cache_key
     );
-    let io = crate::sd_session::sd_stats::snapshot().since(io_start);
+    let io = crate::sd_stats::snapshot().since(io_start);
     bench_log!(
         "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={}",
         open_started.elapsed().as_millis(),
@@ -2088,10 +2047,10 @@ where
         locator: locator.as_str(),
     };
 
-    esp_println::println!("epub: stage OpenSdFile len={}", source_len);
+    slog!("epub: stage OpenSdFile len={}", source_len);
     let requested_global_page = target_pages as u32;
 
-    esp_println::println!("epub: zip open len={}", source_len);
+    slog!("epub: zip open len={}", source_len);
     let reader = SdFileReadAt {
         file,
         len: source_len,
@@ -2099,7 +2058,7 @@ where
         read_bytes: 0,
     };
     let zip = ZipStream::new(reader, scratch.tail)?;
-    esp_println::println!(
+    slog!(
         "epub: zip ready after {} ms",
         open_started.elapsed().as_millis()
     );
@@ -2175,9 +2134,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let io_start = crate::sd_session::sd_stats::snapshot();
+    let io_start = crate::sd_stats::snapshot();
     let mut section_write_micros: u64 = 0;
-    esp_println::println!("epub: stage ParseContainerAndOpf");
+    slog!("epub: stage ParseContainerAndOpf");
     // ~260 B stack local: copying the OPF path out releases the borrow on
     // scratch.container so the capture stage below can reuse that buffer
     // during the spine walk. Memory delta: +260 B in the EPUB-open frame;
@@ -2203,7 +2162,7 @@ where
     let opf_path = opf_path_buf.as_str();
 
     let opf_entry = zip.find_entry(opf_path, scratch.header, scratch.name)?;
-    esp_println::println!(
+    slog!(
         "epub: opf compressed={} uncompressed={}",
         opf_entry.compressed_size,
         opf_entry.uncompressed_size
@@ -2215,7 +2174,7 @@ where
         &mut *scratch.zip_inflate,
     )?;
     if !opf_complete {
-        esp_println::println!(
+        slog!(
             "epub: opf prefix truncated at {} of {} bytes",
             opf_len,
             opf_entry.uncompressed_size
@@ -2224,7 +2183,7 @@ where
     let opf_xml =
         core::str::from_utf8(&scratch.opf[..opf_len]).map_err(|_| ReaderCacheError::Utf8)?;
     let package = parse_opf(opf_xml, BookId(2), source_path, 0, opf_path)?;
-    esp_println::println!(
+    slog!(
         "epub: opf parsed after {} ms (spine={} truncated={})",
         open_started.elapsed().as_millis(),
         package.spine.len(),
@@ -2267,20 +2226,20 @@ where
             toc_record_count,
             &scratch.xhtml[..toc_bytes],
         );
-        esp_println::println!(
+        slog!(
             "epub: toc.bin wrote {} chapter(s) ok={}",
             toc_record_count,
             wrote_toc
         );
     }
-    esp_println::println!(
+    slog!(
         "epub: toc parsed after {} ms ({} item(s))",
         open_started.elapsed().as_millis(),
         library.toc_count()
     );
     let css_rules = CssRules::new();
 
-    esp_println::println!("epub: stage BuildV2BookCache");
+    slog!("epub: stage BuildV2BookCache");
     let spine_started = Instant::now();
     let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
     // A continuation adopts the counters of the steps before it and the
@@ -2339,7 +2298,7 @@ where
     // sections walk below only open what already exists.
     let cache_dirs_ok = files::ensure_v2_cache_dirs(root, owner).is_ok();
     if !cache_dirs_ok {
-        esp_println::println!("cache: v2 ensure dirs failed key={}", owner.key);
+        slog!("cache: v2 ensure dirs failed key={}", owner.key);
     }
     // Capture the push_block stream into CONT.BIN alongside the build, so a
     // type-settings change can replay it without re-parsing the EPUB. The
@@ -2380,7 +2339,7 @@ where
     //
     // `Ok(Some(next_spine))` means the walk suspended and owes a continuation
     // from that spine item; `Ok(None)` means it reached the end of the book.
-    let walk = files::with_v2_sections_dir(root, owner, |sections_dir| {
+    let walk = files::with_v2_sections_dir_for_writer(root, owner, |sections_dir| {
         for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
             *index >= start_spine_index
                 && *index >= resume_spine_index
@@ -2393,11 +2352,11 @@ where
             }
             saw_spine = true;
             resolve_epub_href(opf_path, spine.href.of(package.opf_text), &mut xhtml_path)?;
-            esp_println::println!("epub: find spine {}", xhtml_path.as_str());
+            slog!("epub: find spine {}", xhtml_path.as_str());
             let Ok(xhtml_entry) = zip.find_entry(&xhtml_path, scratch.header, scratch.name) else {
                 continue;
             };
-            esp_println::println!(
+            slog!(
                 "epub: spine {} compressed={} uncompressed={}",
                 xhtml_path.as_str(),
                 xhtml_entry.compressed_size,
@@ -2414,7 +2373,7 @@ where
                 xhtml_entry.uncompressed_size,
                 walked_this_step,
             ) {
-                esp_println::println!(
+                slog!(
                     "epub: slice yields before spine {} ({} B)",
                     spine_u16,
                     xhtml_entry.uncompressed_size
@@ -2482,7 +2441,7 @@ where
                 Err(_) if parse_error.is_some() => {
                     let err = parse_error.take().expect("parse error recorded");
                     if capture_sink.inner.stopped {
-                        esp_println::println!(
+                        slog!(
                             "epub: bounded open stopped at spine {} after {} section(s): {:?}",
                             spine_index,
                             *capture_sink.inner.section_count,
@@ -2571,7 +2530,7 @@ where
             )
             .map_err(ReaderCacheError::from)
             .inspect(|published| {
-                esp_println::println!(
+                slog!(
                     "epub: build continue next_spine={} sections={} published={} pages={} step_ms={}",
                     next_spine,
                     section_count,
@@ -2594,7 +2553,7 @@ where
         content_dir.as_ref(),
         walk.is_ok() && !book_partial && section_count > 0 && total_pages > 0,
     );
-    esp_println::println!("epub: content capture kept={}", content_kept);
+    slog!("epub: content capture kept={}", content_kept);
     walk?;
 
     if section_count > 0 && total_pages > 0 {
@@ -2668,7 +2627,7 @@ where
                 // is finished work that this failure says nothing about, and
                 // CONT.BIN is settings-independent: taking it would turn the
                 // next open from a replay into a full re-parse.
-                let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
+                let _ = files::empty_layout_cache(root, owner, library.layout_key());
                 Err(ReaderCacheError::IndexWrite)
             }
         }
@@ -2800,10 +2759,10 @@ where
         0,
     );
     if published.outcome != publish::BookPublishOutcome::Ready {
-        esp_println::println!("epub: reindex publish failed, falling back");
+        slog!("epub: reindex publish failed, falling back");
         return false;
     }
-    esp_println::println!(
+    slog!(
         "epub: reindexed {} section(s) for this layout in {} ms",
         count,
         started.elapsed().as_millis()
@@ -2847,7 +2806,7 @@ where
     }
 
     let open_started = Instant::now();
-    let io_start = crate::sd_session::sd_stats::snapshot();
+    let io_start = crate::sd_stats::snapshot();
     let spine_started = Instant::now();
     scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
     let sections = &mut *scratch.book_sections;
@@ -2857,7 +2816,7 @@ where
     let mut book_partial = false;
     let mut section_write_micros: u64 = 0;
 
-    let replayed = files::with_v2_sections_dir(root, owner, |sections_dir| {
+    let replayed = files::with_v2_sections_dir_for_writer(root, owner, |sections_dir| {
         // One open serves both the header validation and the record
         // stream; the handle stays live for the whole replay.
         files::with_v2_content_file(root, owner, Mode::ReadOnly, |file| {
@@ -2884,7 +2843,7 @@ where
                 return Err(ReplayFail::Bail);
             }
             library.clear_cover();
-            esp_println::println!("epub: stage ReplayContentCache");
+            slog!("epub: stage ReplayContentCache");
             let visible_page_capacity = library.page_capacity().max(1);
             let generate_toc_from_headings = library.toc_count() == 0;
             replay_content_records(
@@ -2913,12 +2872,12 @@ where
     match replayed {
         Err(ReplayFail::Bail) => return false,
         Err(ReplayFail::Corrupt) => {
-            esp_println::println!("epub: content replay failed, falling back to full build");
+            slog!("epub: content replay failed, falling back to full build");
             files::delete_v2_content_file(root, owner);
             return false;
         }
         Ok(()) if section_count == 0 || total_pages == 0 => {
-            esp_println::println!("epub: content replay failed, falling back to full build");
+            slog!("epub: content replay failed, falling back to full build");
             files::delete_v2_content_file(root, owner);
             return false;
         }
@@ -2956,8 +2915,8 @@ where
         // rewrites it either way. Scoped to the layout: the full build that
         // follows reads CONT.BIN, and another layout's pagination is not
         // implicated in this one's failure.
-        esp_println::println!("epub: content replay publishing failed, falling back to full build");
-        let _ = files::empty_layout_cache(root, owner.key, library.layout_key());
+        slog!("epub: content replay publishing failed, falling back to full build");
+        let _ = files::empty_layout_cache(root, owner, library.layout_key());
         return false;
     }
     true
@@ -3126,7 +3085,7 @@ where
         let Ok(toc_entry) = zip.find_entry(&toc_path, scratch.header, scratch.name) else {
             continue;
         };
-        esp_println::println!(
+        slog!(
             "epub: toc entry {} compressed={} uncompressed={}",
             toc_path.as_str(),
             toc_entry.compressed_size,
@@ -3173,7 +3132,7 @@ where
         };
 
         if parse_ok && (sink.record_count > 0 || sink.library.toc_count() > 0) {
-            esp_println::println!(
+            slog!(
                 "epub: toc streamed {} chapter(s) ({} resident) from {} overflow={}",
                 sink.record_count,
                 sink.library.toc_count(),
@@ -3182,10 +3141,10 @@ where
             );
             return sink.record_count;
         }
-        esp_println::println!("epub: toc parse failed for {}", toc_path.as_str());
+        slog!("epub: toc parse failed for {}", toc_path.as_str());
         sink.library.clear_toc();
     }
-    esp_println::println!("epub: toc unavailable, chapters fall back to spine");
+    slog!("epub: toc unavailable, chapters fall back to spine");
     0
 }
 
@@ -3233,7 +3192,7 @@ where
     fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
         if self.read_ops >= EPUB_OPEN_READ_OP_LIMIT || self.read_bytes >= EPUB_OPEN_READ_BYTE_LIMIT
         {
-            esp_println::println!(
+            slog!(
                 "epub: open read budget exceeded ops={} bytes={} at offset={} request={}",
                 self.read_ops,
                 self.read_bytes,
@@ -3261,7 +3220,7 @@ where
                     self.read_ops = self.read_ops.saturating_add(1);
                     self.read_bytes = self.read_bytes.saturating_add(count as u32);
                     if attempt > 0 {
-                        esp_println::println!(
+                        slog!(
                             "epub: read_at recovered at {} len {} attempt {}",
                             offset,
                             read_len,
@@ -3279,7 +3238,7 @@ where
             }
         }
         let err = last_err.expect("read_at records an error before retry exhaustion");
-        esp_println::println!(
+        slog!(
             "epub: read_at failed at {} len {}: {:?}",
             offset,
             read_len,

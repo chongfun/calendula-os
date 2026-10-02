@@ -782,16 +782,35 @@ whose locator is definitively gone retires: the cache is reclaimed, and the
 reading position stays in its directory, waiting for the book to come back to
 where it was.
 
-Moves therefore do not carry a reading position, and the full-file witness is
-not computed either. It could only ever narrow a search, since a digest
-identifies bytes rather than a copy, so it waits on the same thing the carry
-does: durable library identity, the record of which copy a file is, written
-before the operation rather than inferred after it. The pure parts are built and tested
-against that arrival: the candidate search, the verdict rule that refuses
-every inference available today, `carry_position`, and the version 2 claim
-that has somewhere to put evidence. None of them runs on the card.
+Only the scan proves a move. A catalog rebuild matches a departed ledger
+record to a new row by size, then by hashing the row's bytes. A proved move
+carries the legacy reading position, the pagination
+(`reader_cache::files::carry_for_move`) and the saved reader state to the new
+key. The new claim's evidence is the digest the scan already computed, so the
+book is hashed once.
 
-That record now exists, though nothing hangs from it yet. The library ledger,
+The pagination moves by directory entry, through the fork's short-name
+`move_file_in_dir`: each resident layout's sections, then the content
+stream, the chapter list and the cover, and `BOOK.BIN` last. A carry cut
+short leaves the new key with no index, and the old key with a gap the
+loader already handles. Every header but the cover's names the `(source_hash,
+size)` of the book's place, and loaders refuse a header for another place.
+So the carry then rewrites that one header sector per file, sections first
+and the index last: an index that reads under the new place vouches only for
+sections that do too.
+
+The carry runs inside the identity join, before the ledger commits the move,
+so a reset retries it. It leaves the departed directory's claim in place,
+since the retry reads it. A refused carry does not fail the scan: the copy
+keeps its `BookId`, whatever was not carried is lost to the new key, and
+the book builds again. A FAT move is two writes, and a cut between them
+leaves one chain under two names. While a carry is in flight each side holds
+a zero-length marker naming the other, `<new key>.MVD` in the departed
+directory and `<old key>.LNK` in the destination. Any reclaim of a marked
+directory first removes the names the other side also holds, then frees the
+rest, so one name survives per chain.
+
+The library ledger,
 `/READER/LEDGERA.BIN` and `LEDGERB.BIN`, adopts every physical EPUB the scan
 catalogues under a `BookId`: sixteen random bytes from the hardware RNG,
 minted once, derived from nothing on the card, and bound by the ledger to the
@@ -955,7 +974,7 @@ A repaired locator on its own would leave the reader's place behind, since
 a position is filed under the place a book was read from. So the scan
 reports each copy it finds again, before it writes the ledger, and the
 firmware carries the position from the old directory to the new one,
-reading the destination once more to say what it is vouching for. Reporting
+reusing the digest the scan computed to say what it is vouching for. Reporting
 before the write costs a reset nothing: the record is still missing and the
 row still unadopted, so the next scan finds the same move and carries the
 same place again. A card that refuses the carry itself is the one case this
@@ -1284,8 +1303,9 @@ interfaces:
 ```text
 fw::board_guard         wrong-board refusal: SD diagnostic, then halt
 fw::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sleep
-fw::library_sd          FAT scan, SD chip-select handling, and file discovery
-fw::sd_session          SD session open/close and the upload write pump
+storage::library_sd     FAT scan, catalog, ledger and move carry (host-tested)
+storage::book_build     book open, cache build and replay, saved state (host-tested)
+fw::sd_session          SD session open/close, the storage::card::Card impl, uploads
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
 fw::reader_cache_files  cache/state/credential/label file records on the card
 fw::reader_layout       page indexing, line wrapping, style markers, measurements

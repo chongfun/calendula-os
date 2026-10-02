@@ -98,7 +98,9 @@ use proto::identity::{
     LEDGER_JOURNAL_SLOT_BYTES, LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
 };
 use proto::library_path::{BookRoot, MAX_PATH_BYTES};
-use proto::source::{encode_cached_record, parse_record, CachedSourceDigest, SOURCE_RECORD_BYTES};
+use proto::source::{
+    encode_cached_record, parse_record, CachedSourceDigest, SourceDigest, SOURCE_RECORD_BYTES,
+};
 
 /// The two generations, under the cache root.
 pub const LEDGER_FILES: [&str; 2] = ["LEDGERA.BIN", "LEDGERB.BIN"];
@@ -878,6 +880,9 @@ pub struct FoundAgain<'a> {
     pub was: (BookRoot, &'a str, u32),
     /// Where it is, as the row that holds it has it.
     pub now: (BookRoot, &'a str, u32),
+    /// The digest that proved the move, computed from the bytes at `now`.
+    /// Callers reuse it instead of hashing the book again.
+    pub digest: SourceDigest,
 }
 
 /// What the directory a copy keeps its reading place in says its bytes
@@ -1033,6 +1038,7 @@ fn move_slot_of_row(table: &[u8], slots: usize, row: u16) -> Option<usize> {
 /// ledger either committed, in which case they are right, or did not, in
 /// which case the caller must not commit the catalog either, and the next
 /// scan starts over from the generation that stands.
+#[expect(clippy::too_many_arguments)] // The card, the rows, working memory, and three things only the firmware has: randomness, the carry, and the SHA unit.
 pub fn assign_book_ids<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     catalog: &File<'_, D, T, MD, MF, MV>,
@@ -1041,6 +1047,7 @@ pub fn assign_book_ids<D, T, const MD: usize, const MF: usize, const MV: usize>(
     random: &mut impl FnMut() -> u32,
     ledger: Option<Ledger>,
     found_again: &mut dyn FnMut(&FoundAgain<'_>),
+    engine: &mut dyn proto::source::Sha256Engine,
 ) -> Result<Assignment, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1143,6 +1150,9 @@ where
     let mut slots = 0usize;
     let capacity = (keys.len() / MOVE_ENTRY_BYTES).min(MOVES_CONSIDERED);
     let table = &mut keys[..capacity * MOVE_ENTRY_BYTES];
+    // The digest each slot matched, kept as computed. A digest decoded from
+    // the byte table is only a record and proves nothing. About 3 KB.
+    let mut proved: [Option<SourceDigest>; MOVES_CONSIDERED] = [None; MOVES_CONSIDERED];
     if let Some(live) = live {
         if missing_records > 0 && new_rows > 0 && capacity > 0 {
             for_each_record(root, &live, &mut |index, entry| {
@@ -1215,7 +1225,7 @@ where
             // any of those copies' bytes, so the length stops being
             // decidable and every copy of it is left alone. The file is
             // adopted in its own right, as it would have been.
-            let Ok(Some(found)) = crate::replace::digest_at(root, at, locator) else {
+            let Ok(Some(found)) = crate::replace::digest_at(root, at, locator, engine) else {
                 move_undecidable(table, slots, byte_size, &mut assigned.unreadable);
                 continue;
             };
@@ -1241,6 +1251,7 @@ where
                 } else if entry[MOVE_MATCHES] == 0 {
                     entry[MOVE_MATCHES] = 1;
                     entry[MOVE_ROW..MOVE_MATCHES].copy_from_slice(&(row as u16).to_le_bytes());
+                    proved[slot] = Some(found);
                 }
             }
         }
@@ -1250,7 +1261,7 @@ where
     // a second file holding the same bytes makes one ambiguous, and
     // a caller acting on a move that turns out to be two would file a
     // reader's place under another book.
-    for slot in 0..slots {
+    for (slot, proved) in proved.iter().enumerate().take(slots) {
         let entry = move_entry(table, slot);
         // The same test the ledger is written by. A copy with one match and
         // a file nobody read is not a copy that has been found: telling a
@@ -1259,6 +1270,10 @@ where
         if !move_settled(entry) {
             continue;
         }
+        // A settled slot had exactly one match, which set this.
+        let Some(digest) = *proved else {
+            continue;
+        };
         let row = move_u16(entry, MOVE_ROW) as usize;
         seek_row(catalog, row)?;
         if !read_exact(catalog, &mut record)? {
@@ -1286,6 +1301,7 @@ where
                 u32::from_le_bytes(entry[MOVE_SIZE..MOVE_ID].try_into().expect("four bytes")),
             ),
             now: (at, locator, byte_size),
+            digest,
         });
     }
 

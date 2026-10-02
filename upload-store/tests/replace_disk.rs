@@ -302,11 +302,19 @@ thread_local! {
     /// What the scan reported finding again, most recent scan last: the id
     /// that was kept, where it was, and where it is now.
     static FOUND_AGAIN: RefCell<Vec<(BookId, String, String)>> = const { RefCell::new(Vec::new()) };
+    /// The digest each of those reports carried, in the same order.
+    static FOUND_DIGESTS: RefCell<Vec<SourceDigest>> = const { RefCell::new(Vec::new()) };
 }
 
 /// What the scans since the last call reported, and clear it.
 fn found_again() -> Vec<(BookId, String, String)> {
+    FOUND_DIGESTS.with(|seen| seen.borrow_mut().clear());
     FOUND_AGAIN.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
+}
+
+/// Take the digests the scans reported since the last call.
+fn found_digests() -> Vec<SourceDigest> {
+    FOUND_DIGESTS.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
 }
 
 /// One row of the catalog a scan would write.
@@ -367,7 +375,9 @@ fn scan_minting(
                 seen.borrow_mut()
                     .push((found.id, found.was.1.to_owned(), found.now.1.to_owned()))
             });
+            FOUND_DIGESTS.with(|seen| seen.borrow_mut().push(found.digest));
         },
+        &mut proto::source::SoftSha256::new(),
     )?;
     encode_catalog_header(rows.len() as u16, &mut header);
     file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
@@ -441,7 +451,8 @@ fn recover(root: &Dir<'_>, books: &Dir<'_>) -> Recovery {
     reclaim::recover(root, Some(books)).expect("reclaim settles");
     let outcome = install::recover_installs(root, books);
     assert!(outcome.complete, "the install journal settles: {outcome:?}");
-    replace::recover(root).expect("the library intent resolves or refuses")
+    replace::recover(root, &mut proto::source::SoftSha256::new())
+        .expect("the library intent resolves or refuses")
 }
 
 fn digest_agrees(recorded: Option<CachedSourceDigest>, bytes: &[u8]) -> bool {
@@ -976,7 +987,7 @@ fn a_card_root_replacement_is_answered_on_a_card_with_no_shelf() {
     // parked.
     overwrite_at(&root, BookRoot::CardRoot, LOOSE, &new);
     assert_eq!(
-        replace::recover(&root),
+        replace::recover(&root, &mut proto::source::SoftSha256::new()),
         Ok(Recovery::Settled(Landing::New)),
         "the new bytes at the place are the new landing"
     );
@@ -1036,7 +1047,7 @@ fn a_refused_replacement_leaves_the_install_journal_reporting_nothing() {
     assert!(!outcome.had_intent, "and reports no intent of its own");
     assert!(!outcome.touched_shelf, "and changed nothing on the shelf");
     assert_eq!(
-        replace::recover(&root),
+        replace::recover(&root, &mut proto::source::SoftSha256::new()),
         Ok(Recovery::Refused),
         "while the library intent cannot say what stands at the place"
     );
@@ -2427,6 +2438,12 @@ fn a_sideloaded_copy_that_was_read_is_found_again_where_it_went() {
     assert_eq!(assigned.minted, 0);
     assert_eq!(ids[0], Some(id), "under the id it was adopted with");
 
+    // The report carries the digest of the bytes at the new place.
+    assert_eq!(
+        found_digests(),
+        vec![digest_of(&bytes)],
+        "the proof is handed on"
+    );
     // And the move is reported with both places, so what is filed under the
     // old one can be carried to the new one.
     assert_eq!(

@@ -1650,6 +1650,18 @@ pub enum LibraryEvent {
         font_family: u8,
         front_buttons: u8,
     },
+    /// The saved reading settings, sent when the saved book is no longer in
+    /// the catalog. Without them the next save writes the defaults over the
+    /// reader's settings.
+    SettingsRestored {
+        reading_orientation: u8,
+        refresh_policy: u8,
+        font_size: u8,
+        line_spacing: u8,
+        font_weight: u8,
+        font_family: u8,
+        front_buttons: u8,
+    },
     /// A `ClearBookCache` settled. `ok` is false when the row was stale (the
     /// catalog changed under it), could not be resolved, its identity did not
     /// match the cache on card, or something rebuildable survived the delete.
@@ -2005,6 +2017,7 @@ impl LibraryEvent {
     /// - `CacheCleared` settles a per-book action's `LibraryMenu::Busy`, which
     ///   holds the whole Library list still while it waits.
     /// - `Restored` is what the boot render waits for before drawing.
+    ///   `SettingsRestored` replaces it when the saved book is gone.
     ///
     /// The senders route on this, so an event that settles something is
     /// protected by naming it here rather than by every call site
@@ -2017,6 +2030,7 @@ impl LibraryEvent {
                 | Self::BookOpenUnreadable { .. }
                 | Self::CacheCleared { .. }
                 | Self::Restored { .. }
+                | Self::SettingsRestored { .. }
                 // The three that settle a `LibraryBrowse`. Dropping one
                 // leaves the Library rail waiting on a move that already
                 // happened, with no second press able to start another.
@@ -2809,6 +2823,45 @@ impl ReaderState {
         self
     }
 
+    /// Adopt the saved reading settings, skipping any that do not decode.
+    #[allow(clippy::too_many_arguments)] // One per setting the record carries, decoded here and nowhere else.
+    fn adopt_saved_settings(
+        &mut self,
+        reading_orientation: u8,
+        refresh_policy: u8,
+        font_size: u8,
+        line_spacing: u8,
+        font_weight: u8,
+        font_family: u8,
+        front_buttons: u8,
+    ) {
+        if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
+            self.orientation = orientation;
+        }
+        if let Some(policy) = refresh_policy_from_u8(refresh_policy) {
+            self.refresh_policy = policy;
+        }
+        if let Some(size) = FontSize::from_u8(font_size) {
+            self.font_size = size;
+        }
+        if let Some(spacing) = LineSpacing::from_u8(line_spacing) {
+            self.line_spacing = spacing;
+        }
+        if let Some(weight) = FontWeight::from_u8(font_weight) {
+            self.font_weight = weight;
+        }
+        if let Some(family) = FontFamily::from_u8(font_family) {
+            self.font_family = if family == FontFamily::Custom && !self.custom_font_available {
+                FontFamily::Literata
+            } else {
+                family
+            };
+        }
+        if let Some(front) = front_buttons_from_u8(front_buttons) {
+            self.front_buttons = front;
+        }
+    }
+
     pub fn apply_library_event(mut self, ctx: ReducerContext, event: LibraryEvent) -> Self {
         match event {
             LibraryEvent::Scanned {
@@ -3087,32 +3140,35 @@ impl ReaderState {
                     self.selection = chapter;
                 }
                 self.read_request_pending = false;
-                if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
-                    self.orientation = orientation;
-                }
-                if let Some(policy) = refresh_policy_from_u8(refresh_policy) {
-                    self.refresh_policy = policy;
-                }
-                if let Some(size) = FontSize::from_u8(font_size) {
-                    self.font_size = size;
-                }
-                if let Some(spacing) = LineSpacing::from_u8(line_spacing) {
-                    self.line_spacing = spacing;
-                }
-                if let Some(weight) = FontWeight::from_u8(font_weight) {
-                    self.font_weight = weight;
-                }
-                if let Some(family) = FontFamily::from_u8(font_family) {
-                    self.font_family =
-                        if family == FontFamily::Custom && !self.custom_font_available {
-                            FontFamily::Literata
-                        } else {
-                            family
-                        };
-                }
-                if let Some(front) = front_buttons_from_u8(front_buttons) {
-                    self.front_buttons = front;
-                }
+                self.adopt_saved_settings(
+                    reading_orientation,
+                    refresh_policy,
+                    font_size,
+                    line_spacing,
+                    font_weight,
+                    font_family,
+                    front_buttons,
+                );
+                self.dirty = Rect::FULL;
+            }
+            LibraryEvent::SettingsRestored {
+                reading_orientation,
+                refresh_policy,
+                font_size,
+                line_spacing,
+                font_weight,
+                font_family,
+                front_buttons,
+            } => {
+                self.adopt_saved_settings(
+                    reading_orientation,
+                    refresh_policy,
+                    font_size,
+                    line_spacing,
+                    font_weight,
+                    font_family,
+                    front_buttons,
+                );
                 self.dirty = Rect::FULL;
             }
         }
@@ -6668,6 +6724,112 @@ mod tests {
         );
         assert_eq!(fresh.view, AppView::Reading);
         assert_eq!(fresh.book_id, ReaderSource::sd(1).book_id());
+    }
+
+    /// Picking a book the catalog lacks makes storage rescan, answer with the
+    /// book's new row, then relist the folder. The folder keeps its own row
+    /// count, not the catalog total `Scanned` carried.
+    #[test]
+    fn a_book_picked_before_a_rescan_opens_and_its_folder_keeps_its_rows() {
+        let waiting = press(in_folder(0, 1, 0), Button::Confirm);
+        let outstanding = waiting.library_browse.request_id().expect("a move is out");
+        let rebuilt = waiting.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 56,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        let opened = rebuilt.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: outstanding,
+                index: 7,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(opened.view, AppView::Reading);
+        assert_eq!(opened.book_id, ReaderSource::sd(7).book_id());
+        assert!(opened.library_browse.is_idle());
+
+        let listed = opened.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH,
+                depth: 1,
+                count: 1,
+                books: 1,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.view, AppView::Reading, "the book stays open");
+        assert_eq!(listed.book_id, opened.book_id);
+        assert_eq!(
+            (
+                listed.library_depth,
+                listed.library_count,
+                listed.library_books
+            ),
+            (1, 1, 1),
+            "the folder's own rows, not the catalog total"
+        );
+    }
+
+    /// The book, place and view stay as they were.
+    #[test]
+    fn saved_settings_restore_without_their_book() {
+        let before = in_library(0, 3);
+        let restored = before.apply_library_event(
+            CTX,
+            LibraryEvent::SettingsRestored {
+                reading_orientation: 1,
+                refresh_policy: 2,
+                font_size: 2,
+                line_spacing: 2,
+                font_weight: 1,
+                font_family: 1,
+                front_buttons: 1,
+            },
+        );
+        // Every field differs from the boot default, or adopting it proves nothing.
+        assert_ne!(before.orientation, restored.orientation);
+        assert_ne!(before.refresh_policy, restored.refresh_policy);
+        assert_ne!(before.font_size, restored.font_size);
+        assert_ne!(before.line_spacing, restored.line_spacing);
+        assert_ne!(before.font_weight, restored.font_weight);
+        assert_ne!(before.font_family, restored.font_family);
+        assert_ne!(before.front_buttons, restored.front_buttons);
+        assert_eq!(
+            restored.orientation,
+            DisplayOrientation::LandscapeButtonsTop
+        );
+        assert_eq!(restored.front_buttons, FrontButtons::PagesLeft);
+        assert_eq!(restored.font_size, FontSize::Large);
+        assert_eq!(restored.font_family, FontFamily::Merriweather);
+        assert_eq!(restored.line_spacing, LineSpacing::Relaxed);
+        assert_eq!(restored.font_weight, FontWeight::Heavy);
+        assert_eq!(restored.refresh_policy, RefreshPolicy::FullEveryTen);
+        assert_eq!(
+            (
+                restored.book_id,
+                restored.chapter,
+                restored.page,
+                restored.view
+            ),
+            (before.book_id, before.chapter, before.page, before.view),
+            "no book came back, so none is named"
+        );
+        assert!(LibraryEvent::SettingsRestored {
+            reading_orientation: 0,
+            refresh_policy: 0,
+            font_size: 0,
+            line_spacing: 0,
+            font_weight: 0,
+            font_family: 0,
+            front_buttons: 0,
+        }
+        .must_be_delivered());
     }
 
     /// A row that cannot be acted on ends the wait and moves nothing.

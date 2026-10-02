@@ -285,6 +285,7 @@ fn scan(
         random,
         ledger,
         &mut |_| {},
+        &mut proto::source::SoftSha256::new(),
     )?;
     encode_catalog_header(rows.len() as u16, &mut header);
     file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;

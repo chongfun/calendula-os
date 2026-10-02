@@ -8,6 +8,7 @@ members = [
     "fw",
     "upload-store",
     "reader-cache",
+    "storage",
 ]
 resolver = "2"
 
@@ -16,10 +17,10 @@ resolver = "2"
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
-# Our fork: chongfun/embedded-sdmmc-rs, branch
-# calendula/long-names-and-error-fidelity.
+# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/multi-block-read,
+# which is calendula/long-names-and-error-fidelity plus nine commits.
 # Upstream v0.10, plus Jon-Vii's create_file_in_dir_lfn so wireless uploads land
-# under a real filename instead of an 8.3 alias, plus six changes of ours.
+# under a real filename instead of an 8.3 alias, plus eight changes of ours.
 #
 # Two are the same bug in different clothes: a FAT read that failed was
 # reported as a file that is absent, and elsewhere as a disk that is full.
@@ -75,16 +76,33 @@ resolver = "2"
 # crate-internal there, because a handle read back from an open directory is not
 # one its holder should close. See upload-store's reclaim module.
 #
-# Regression coverage for all six of our changes lives in the fork, not here:
+# The seventh is move_file_in_dir and link_file_in_dir, short-name versions of
+# the long-name move and link. The long-name move would file BOOK.BIN as
+# BOOK~1.BIN, and cache files open by short name. reader-cache uses these to
+# move a book's pagination when the scan proves the book moved.
+#
+# The eighth is File::read_blocks: one device call per run of contiguous
+# blocks, read straight into the caller's buffer. read takes one call per
+# block, and hashing an 11.7 MB book on the X3 drops from 13.7 s to 8.0 s.
+# The SPI multi-block read now sends CMD12 whenever CMD18 was attempted,
+# even on failure, and multi-block writes always send their stop token.
+#
+# The branch also treats a write that reported an error as one that may have
+# landed, since a card can take a sector and then fail its busy wait or CMD13.
+# Move, make_dir and the long-name writer now check the disk before undoing,
+# and truncation no longer undercounts free clusters.
+#
+# Regression coverage for all eight of our changes lives in the fork, not here:
 # tests/fat_chain_errors.rs for the error-propagation fixes, tests/move_file.rs
-# for the move, the link, and the recorded cluster, tests/free_clusters.rs for
-# the reclaim primitives. A bump that loses them would still compile against
-# this workspace, so re-run the fork's suite when moving the rev. There is no upstream issue or PR to track: the fork we branched from
-# is unmaintained, so this rev is where these fixes live.
+# for the move, the link, the recorded cluster, and the short-named pair,
+# tests/free_clusters.rs for the reclaim primitives, tests/read_file.rs for
+# read_blocks. A bump that loses them would still compile here, so run the
+# fork's suite when moving the rev. The fork we branched from is unmaintained,
+# so there is no upstream issue or PR to track.
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "6e7dbe1689da507979a2647a7a6fa3ee033407ff", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "caa03a587cc37951af366be9c0c99836da813647", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an

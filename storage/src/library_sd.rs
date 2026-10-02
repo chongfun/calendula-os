@@ -1,9 +1,7 @@
-use crate::display_flush::Epd;
-use crate::sd_session;
+use crate::card::Card;
 use core::ops::ControlFlow;
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, LfnBuffer, Mode, TimeSource};
-use esp_hal::gpio::Output;
 use heapless::String;
 use reader_cache::store::{derive_catalog_label, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 
@@ -11,7 +9,7 @@ use reader_cache::store::{derive_catalog_label, LibraryScanStatus, ReaderStore, 
 /// diagnostics alike (see `crate::probe_report`). One definition, shared with
 /// the upload journal and the reader cache: two spellings of this directory
 /// is two halves of the firmware disagreeing about where the card is.
-pub(crate) use proto::cache::CACHE_ROOT_DIR as CATALOG_ROOT_DIR;
+pub use proto::cache::CACHE_ROOT_DIR as CATALOG_ROOT_DIR;
 use proto::cache::CATALOG_FILE;
 use proto::catalog::{
     catalog_count, catalog_file_len, catalog_identity_staged, catalog_record_identity,
@@ -68,7 +66,7 @@ enum CatalogFault {
 /// rebuilding it is the repair. A catalog that would not answer says nothing
 /// about the card, and rebuilding on it would retire a usable snapshot
 /// because one read failed.
-pub(crate) enum CatalogRow {
+pub enum CatalogRow {
     /// The catalog holds this place, at this row.
     Found(u16),
     /// The catalog was read through and holds no such place. Also a catalog
@@ -102,107 +100,125 @@ impl CatalogFault {
 }
 
 #[inline(never)]
-pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &mut ReaderStore) {
+pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) {
     let start = Instant::now();
-    esp_println::println!("sd: scan start");
+    slog!("sd: scan start");
     library.status = LibraryScanStatus::Scanning;
 
-    let status = sd_session::with_root(epd, sd_cs, |root| {
-        esp_println::println!("sd: card init begin");
-        esp_println::println!("sd: open root");
-        library.status = LibraryScanStatus::Scanning;
-        let reconciled = reconcile_interrupted_uploads(root);
-        // The scanner knows nothing of installs in flight, so a shelf with
-        // one pending may list whichever copy the interrupted swap left —
-        // possibly the book about to be replaced. That is still a real book,
-        // and listing it beats handing a cold-booted reader an empty library,
-        // which a record this build cannot read would do for good. So the
-        // catalog is published either way and `scan_ok` below carries the
-        // unreconciled state; the next mount finds the record still standing
-        // and rebuilds rather than trusting the snapshot.
-        //
-        // The resident catalog is cleared only once a scan is actually going
-        // to run. Clearing first would make the fallback below meaningless —
-        // it keeps the in-memory catalog when a scan fails, and an emptied
-        // one is never non-empty — so a card that would not answer would take
-        // the reader's whole shelf rather than postponing the rebuild.
-        let scanned = if !reconciled.shelf_readable {
-            esp_println::println!("sd: shelf unreadable; keeping the catalog for the next mount");
-            Err(())
-        } else if !reconciled.may_mutate {
-            // A reclaim that did not settle leaves cluster numbers recorded
-            // and possibly already free. Writing the catalog would allocate,
-            // and could be handed one of them; the replay that eventually
-            // runs would then free it back out of `CATALOG.BIN`. The
-            // resident catalog is left alone and the next mount tries again.
-            esp_println::println!("sd: storage recovery unfinished; not rebuilding the catalog");
-            Err(())
-        } else {
-            // The ledger is asked first, before the resident catalog is
-            // cleared or CATALOG.BIN is truncated. A ledger that refuses is
-            // durable identity state this build will not guess about, and
-            // the one safe answer is to change nothing: the committed catalog
-            // keeps serving the shelf as it was, and the next mount asks
-            // again.
-            match upload_store::ledger::open(root) {
-                Err(fault) => {
-                    esp_println::println!(
-                        "sd: library ledger {:?}; keeping the catalog for the next mount",
-                        fault
-                    );
-                    Err(())
-                }
-                Ok(ledger) => {
-                    // The 16 KB section text arena doubles as the scan's
-                    // staging and identity scratch: a scan runs from the
-                    // storage dispatcher (boot or an explicit refresh), never
-                    // while a page render is reading the arena, and the
-                    // section window is invalidated below so a stale page
-                    // can't be served from clobbered text afterwards.
-                    library.clear_catalog();
-                    write_catalog_streaming(root, library.arena_as_scratch(), ledger)
-                }
-            }
-        };
-        let status = match scanned {
-            Ok(0) => LibraryScanStatus::Empty,
-            Ok(count) => {
-                esp_println::println!("sd: catalog written, {} epub(s)", count);
-                // Re-open and fully validate the finalized catalog (header,
-                // version, length, first window) before it is allowed to
-                // drive destructive orphan reclamation: a torn or
-                // misbehaving write must never convince the sweep that
-                // still-present books are gone. This also reloads the
-                // header count + first list window from the file just
-                // written, so the streaming readers and the store agree.
-                if read_catalog_window(root, library, 0).is_err() {
-                    LibraryScanStatus::Error
-                } else {
-                    // Drop the cached data of books no longer on the card:
-                    // this is the one moment the full book set is known and
-                    // the catalog is proven fresh. Not while an install is
-                    // pending: a parked predecessor is off the shelf but its
-                    // cache is still wanted, and a rollback would bring the
-                    // book back bare.
-                    if reconciled.outcome.complete {
-                        sweep_orphan_caches(root, library.arena_as_scratch());
+    let status = card
+        .with_root(|root| {
+            slog!("sd: card init begin");
+            slog!("sd: open root");
+            library.status = LibraryScanStatus::Scanning;
+            let reconciled = reconcile_interrupted_uploads(root);
+            // The scanner knows nothing of installs in flight, so a shelf with
+            // one pending may list whichever copy the interrupted swap left —
+            // possibly the book about to be replaced. That is still a real book,
+            // and listing it beats handing a cold-booted reader an empty library,
+            // which a record this build cannot read would do for good. So the
+            // catalog is published either way and `scan_ok` below carries the
+            // unreconciled state; the next mount finds the record still standing
+            // and rebuilds rather than trusting the snapshot.
+            //
+            // The resident catalog is cleared only once a scan is actually going
+            // to run. Clearing first would make the fallback below meaningless —
+            // it keeps the in-memory catalog when a scan fails, and an emptied
+            // one is never non-empty — so a card that would not answer would take
+            // the reader's whole shelf rather than postponing the rebuild.
+            let scanned = if !reconciled.shelf_readable {
+                slog!("sd: shelf unreadable; keeping the catalog for the next mount");
+                Err(())
+            } else if !reconciled.may_mutate {
+                // A reclaim that did not settle leaves cluster numbers recorded
+                // and possibly already free. Writing the catalog would allocate,
+                // and could be handed one of them; the replay that eventually
+                // runs would then free it back out of `CATALOG.BIN`. The
+                // resident catalog is left alone and the next mount tries again.
+                slog!("sd: storage recovery unfinished; not rebuilding the catalog");
+                Err(())
+            } else {
+                // The ledger is asked first, before the resident catalog is
+                // cleared or CATALOG.BIN is truncated. A ledger that refuses is
+                // durable identity state this build will not guess about, and
+                // the one safe answer is to change nothing: the committed catalog
+                // keeps serving the shelf as it was, and the next mount asks
+                // again.
+                match upload_store::ledger::open(root) {
+                    Err(fault) => {
+                        slog!(
+                            "sd: library ledger {:?}; keeping the catalog for the next mount",
+                            fault
+                        );
+                        Err(())
                     }
-                    LibraryScanStatus::Ready
+                    Ok(ledger) => {
+                        // The 16 KB section text arena doubles as the scan's
+                        // staging and identity scratch: a scan runs from the
+                        // storage dispatcher (boot or an explicit refresh), never
+                        // while a page render is reading the arena, and the
+                        // section window is invalidated below so a stale page
+                        // can't be served from clobbered text afterwards.
+                        library.clear_catalog();
+                        let follow = library.identities_to_follow();
+                        let mut followed = heapless::Vec::new();
+                        let written = write_catalog_streaming(
+                            root,
+                            library.arena_as_scratch(),
+                            ledger,
+                            follow,
+                            &mut followed,
+                        );
+                        for moved in &followed {
+                            library.follow_move(
+                                moved.was,
+                                moved.now,
+                                moved.root,
+                                moved.locator.as_str(),
+                            );
+                        }
+                        written
+                    }
                 }
-            }
-            Err(()) => LibraryScanStatus::Error,
-        };
-        // The arena held scan (and sweep) scratch, not section text: drop
-        // the resident section (and any Chapters TOC window) so nothing
-        // renders from it.
-        library.clear_lines();
-        library.set_text_holds_toc(false);
-        (status, reconciled.outcome.complete)
-    })
-    .unwrap_or_else(|err| {
-        esp_println::println!("sd: session failed: {:?}", err);
-        (LibraryScanStatus::Error, false)
-    });
+            };
+            let status = match scanned {
+                Ok(0) => LibraryScanStatus::Empty,
+                Ok(count) => {
+                    slog!("sd: catalog written, {} epub(s)", count);
+                    // Re-open and fully validate the finalized catalog (header,
+                    // version, length, first window) before it is allowed to
+                    // drive destructive orphan reclamation: a torn or
+                    // misbehaving write must never convince the sweep that
+                    // still-present books are gone. This also reloads the
+                    // header count + first list window from the file just
+                    // written, so the streaming readers and the store agree.
+                    if read_catalog_window(root, library, 0).is_err() {
+                        LibraryScanStatus::Error
+                    } else {
+                        // Drop the cached data of books no longer on the card:
+                        // this is the one moment the full book set is known and
+                        // the catalog is proven fresh. Not while an install is
+                        // pending: a parked predecessor is off the shelf but its
+                        // cache is still wanted, and a rollback would bring the
+                        // book back bare.
+                        if reconciled.outcome.complete {
+                            sweep_orphan_caches(root, library.arena_as_scratch());
+                        }
+                        LibraryScanStatus::Ready
+                    }
+                }
+                Err(()) => LibraryScanStatus::Error,
+            };
+            // The arena held scan (and sweep) scratch, not section text: drop
+            // the resident section (and any Chapters TOC window) so nothing
+            // renders from it.
+            library.clear_lines();
+            library.set_text_holds_toc(false);
+            (status, reconciled.outcome.complete)
+        })
+        .unwrap_or_else(|err| {
+            slog!("sd: session failed: {:?}", err);
+            (LibraryScanStatus::Error, false)
+        });
     let (status, reconciled) = status;
     // The scan's own verdict, taken before the fallback below can replace it.
     // That fallback keeps the UI on an older in-memory catalog when a scan
@@ -219,7 +235,7 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
     } else {
         status
     };
-    esp_println::println!("sd: scan complete, {} epub(s)", library.catalog_count());
+    slog!("sd: scan complete, {} epub(s)", library.catalog_count());
     bench_log!(
         "bench: storage_catalog action=scan ok={} status={:?} count={} elapsed_ms={} t_ms={}",
         scan_ok,
@@ -287,7 +303,7 @@ where
             // write a catalog.
             match upload_store::reclaim::recover(root, None) {
                 #[cfg(feature = "powercut-selftest")]
-                Ok(true) => esp_println::println!("powercut: recovery replayed a reclaim"),
+                Ok(true) => slog!("powercut: recovery replayed a reclaim"),
                 Ok(_) => {}
                 Err(error) => {
                     // Nothing else is touched. Clearing a truncated install
@@ -298,7 +314,7 @@ where
                     // deliberately infers nothing from the other slot -- so
                     // answering it by writing to a second journal would take
                     // back the fail-stop it just asked for.
-                    esp_println::println!(
+                    slog!(
                         "sd: a reclaim is unfinished and there is no shelf ({:?})",
                         error
                     );
@@ -333,24 +349,21 @@ where
             // there to read a landing from, so this resolves what it can and
             // refuses the rest rather than refusing everything.
             let settled = if complete {
-                match upload_store::replace::recover(root) {
+                match crate::platform::with_sha256(|engine| {
+                    upload_store::replace::recover(root, engine)
+                }) {
                     Ok(upload_store::replace::Recovery::Nothing) => true,
                     Ok(upload_store::replace::Recovery::Settled(landed)) => {
-                        esp_println::println!("sd: settled a replacement in flight ({:?})", landed);
+                        slog!("sd: settled a replacement in flight ({:?})", landed);
                         had_intent = true;
                         true
                     }
                     Ok(upload_store::replace::Recovery::Refused) => {
-                        esp_println::println!(
-                            "sd: a replacement is unresolved; not rebuilding the catalog"
-                        );
+                        slog!("sd: a replacement is unresolved; not rebuilding the catalog");
                         false
                     }
                     Err(fault) => {
-                        esp_println::println!(
-                            "sd: library ledger {:?}; not rebuilding the catalog",
-                            fault
-                        );
+                        slog!("sd: library ledger {:?}; not rebuilding the catalog", fault);
                         false
                     }
                 }
@@ -360,17 +373,14 @@ where
                 match upload_store::replace::read(root) {
                     Ok(None) => true,
                     Ok(Some(_)) => {
-                        esp_println::println!(
+                        slog!(
                             "sd: a replacement stands over an unfinished install; \
                              not rebuilding the catalog"
                         );
                         false
                     }
                     Err(fault) => {
-                        esp_println::println!(
-                            "sd: library ledger {:?}; not rebuilding the catalog",
-                            fault
-                        );
+                        slog!("sd: library ledger {:?}; not rebuilding the catalog", fault);
                         false
                     }
                 }
@@ -390,7 +400,7 @@ where
             };
         }
         Err(_) => {
-            esp_println::println!("sd: shelf unreadable; recovery cannot report it clean");
+            slog!("sd: shelf unreadable; recovery cannot report it clean");
             // Not knowing whether an install is in flight is not the same as
             // knowing there is none, and a cached catalog must not be
             // trusted on the strength of a shelf that would not open.
@@ -414,10 +424,10 @@ where
     // journal this build cannot read, which is what the refusal below says.
     match upload_store::reclaim::recover(root, Some(&books)) {
         #[cfg(feature = "powercut-selftest")]
-        Ok(true) => esp_println::println!("powercut: recovery replayed a reclaim"),
+        Ok(true) => slog!("powercut: recovery replayed a reclaim"),
         Ok(_) => {}
         Err(error) => {
-            esp_println::println!("sd: a reclaim is unfinished ({:?})", error);
+            slog!("sd: a reclaim is unfinished ({:?})", error);
             return Reconciled {
                 outcome: upload_store::install::InstallRecovery {
                     touched_shelf: false,
@@ -433,26 +443,24 @@ where
     }
     let mut outcome = upload_store::install::recover_installs(root, &books);
     #[cfg(feature = "powercut-selftest")]
-    crate::powercut::report_recovery(&outcome);
+    crate::platform::report_install_recovery(&outcome);
     if outcome.touched_shelf {
-        esp_println::println!("sd: finished an interrupted install");
+        slog!("sd: finished an interrupted install");
     }
     // The library's own transaction, after the filesystem's and not before.
     // A replacement whose intent still stands has a destination the
     // filesystem has now settled, and the ledger has to be told what that
     // means before any scan reads the place as a stranger and mints for it.
     if outcome.complete {
-        match upload_store::replace::recover(root) {
+        match crate::platform::with_sha256(|engine| upload_store::replace::recover(root, engine)) {
             Ok(upload_store::replace::Recovery::Nothing) => {}
             Ok(upload_store::replace::Recovery::Settled(landed)) => {
-                esp_println::println!("sd: settled a replacement in flight ({:?})", landed);
+                slog!("sd: settled a replacement in flight ({:?})", landed);
                 // The shelf changed under whatever snapshot predates it.
                 outcome.had_intent = true;
             }
             Ok(upload_store::replace::Recovery::Refused) => {
-                esp_println::println!(
-                    "sd: a replacement is unresolved; not rebuilding the catalog"
-                );
+                slog!("sd: a replacement is unresolved; not rebuilding the catalog");
                 return Reconciled {
                     outcome,
                     shelf_readable: true,
@@ -460,7 +468,7 @@ where
                 };
             }
             Err(fault) => {
-                esp_println::println!("sd: library ledger {:?}; not rebuilding the catalog", fault);
+                slog!("sd: library ledger {:?}; not rebuilding the catalog", fault);
                 return Reconciled {
                     outcome,
                     shelf_readable: true,
@@ -477,7 +485,7 @@ where
         match upload_store::replace::read(root) {
             Ok(None) => {}
             Ok(Some(_)) => {
-                esp_println::println!(
+                slog!(
                     "sd: a replacement stands over an unfinished install; \
                      not rebuilding the catalog"
                 );
@@ -488,7 +496,7 @@ where
                 };
             }
             Err(fault) => {
-                esp_println::println!("sd: library ledger {:?}; not rebuilding the catalog", fault);
+                slog!("sd: library ledger {:?}; not rebuilding the catalog", fault);
                 return Reconciled {
                     outcome,
                     shelf_readable: true,
@@ -499,7 +507,7 @@ where
     }
     if !outcome.swept {
         // Invisible to the reader either way; the next mount tries again.
-        esp_println::println!("sd: could not clear every leftover upload file");
+        slog!("sd: could not clear every leftover upload file");
     }
     // Only worth reopening the journal when recovery did not settle: a record
     // this build cannot read is one of the reasons it would not.
@@ -509,7 +517,7 @@ where
             Ok(upload_store::install::IntentState::Unrecognized)
         )
     {
-        esp_println::println!(
+        slog!(
             "sd: {}/{} is from a build this one cannot read; \
              uploads and deletes are refused until it is resolved",
             CATALOG_ROOT_DIR,
@@ -523,7 +531,7 @@ where
         // serve the library over a transient card error would cost the
         // reader their whole shelf to fix something that is not visible to
         // them.
-        esp_println::println!("sd: an install is still in flight; retrying next mount");
+        slog!("sd: an install is still in flight; retrying next mount");
     }
     Reconciled {
         outcome,
@@ -533,13 +541,9 @@ where
 }
 
 #[inline(never)]
-pub(crate) fn load_catalog_cache(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    library: &mut ReaderStore,
-) -> bool {
+pub fn load_catalog_cache(card: &mut impl Card, library: &mut ReaderStore) -> bool {
     let start = Instant::now();
-    esp_println::println!("sd: catalog cache load start");
+    slog!("sd: catalog cache load start");
     library.clear_catalog();
     // A valid header (even an empty catalog) counts as loaded; anything else
     // returns false so the caller runs a fresh scan. The *reason* is carried
@@ -549,7 +553,7 @@ pub(crate) fn load_catalog_cache(
     // with no snapshot prints one right before the scan that builds it.
     // `.is_ok()` here reported every outcome — refused read, bad seek, torn
     // file — as that same benign miss.
-    let outcome = sd_session::with_root(epd, sd_cs, |root| {
+    let outcome = card.with_root(|root| {
         // Before the shelf is served from a cached catalog: a cache hit
         // skips the scan entirely, so this is the only place an interrupted
         // upload gets reconciled on an ordinary boot.
@@ -616,12 +620,12 @@ pub(crate) fn load_catalog_cache(
         LibraryScanStatus::Ready
     };
     if loaded {
-        esp_println::println!(
+        slog!(
             "sd: catalog cache loaded {} epub(s)",
             library.catalog_count()
         );
     } else {
-        esp_println::println!("sd: catalog cache unavailable");
+        slog!("sd: catalog cache unavailable");
     }
     // `ok` keeps its original meaning — the snapshot loaded — so captures
     // that predate `result` still read the same way.
@@ -716,6 +720,15 @@ fn fold_walk_entry(
 /// finding each next subfolder re-iterates its parent; a directory with `s`
 /// subfolders is read `s + 1` times per pass. That multiplier is the number
 /// to watch before reaching for the derived index.
+/// A book the store holds by place that the scan proved moved, kept for
+/// [`ReaderStore::follow_move`] once the scan's borrow of the store ends.
+struct FollowedMove {
+    was: (u32, u32),
+    now: (u32, u32),
+    root: BookRoot,
+    locator: String<{ proto::library_path::MAX_PATH_BYTES }>,
+}
+
 fn write_catalog_streaming<
     D,
     T,
@@ -726,6 +739,8 @@ fn write_catalog_streaming<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     scratch: &mut [u8],
     ledger: Option<upload_store::ledger::Ledger>,
+    follow: [(u32, u32); 2],
+    followed: &mut heapless::Vec<FollowedMove, 2>,
 ) -> Result<u16, ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -761,7 +776,7 @@ where
     // the whole book set: the list stops at the count, and the orphan sweep
     // reclaims every cache whose identity is missing from it.
     let Some(count) = catalog_count(counted) else {
-        esp_println::println!(
+        slog!(
             "sd: {} epub(s) is past the {} this catalog can hold",
             counted,
             proto::catalog::CATALOG_MAX_BOOKS
@@ -851,23 +866,18 @@ where
     // could lose. A refusal leaves the placeholder header in place, which is
     // a rescan next mount, the same as any other interrupted scan.
     let identity_start = Instant::now();
-    let rng = esp_hal::rng::Rng::new();
     // A copy found again in a new place keeps its id, and the place the
     // reader left it at is filed under where it used to be, so the two are
     // brought together here. Reported before the ledger is written, so a
     // reset between the two leaves a card whose next scan reports the same
     // move and carries the same place again.
     let mut carry = |found: &upload_store::ledger::FoundAgain<'_>| {
-        let was_key = proto::cache::cache_key_from(proto::cache::source_hash_at(
-            found.was.0,
-            found.was.1,
-            found.was.2,
-        ));
-        let now_key = proto::cache::cache_key_from(proto::cache::source_hash_at(
-            found.now.0,
-            found.now.1,
-            found.now.2,
-        ));
+        // Cache headers are bound to the place's hash and size, and the key
+        // is 28 bits of that hash. The carry re-binds from one pair to the other.
+        let was_hash = proto::cache::source_hash_at(found.was.0, found.was.1, found.was.2);
+        let now_hash = proto::cache::source_hash_at(found.now.0, found.now.1, found.now.2);
+        let was_key = proto::cache::cache_key_from(was_hash);
+        let now_key = proto::cache::cache_key_from(now_hash);
         let was = proto::cache::CacheOwner {
             key: was_key.as_str(),
             root: found.was.0,
@@ -878,63 +888,139 @@ where
             root: found.now.0,
             locator: found.now.1,
         };
-        match reader_cache::files::carry_position_for_move(root, &was, &now) {
-            Ok(true) => esp_println::println!("sd: carried a reading place to '{}'", found.now.1),
-            Ok(false) => {}
-            // A place that could not be carried is a place lost, not a scan
-            // that failed: the copy has its id back either way, and the
-            // book opens at its beginning rather than not at all. The one
-            // case this bridge does not cover, and deliberately: failing
-            // the scan would let a card that cannot write a cache stop the
-            // library being rebuilt. It goes when positions hang from the
-            // id and a repaired locator keeps the place with nothing to
-            // copy.
-            Err(_) => {
-                esp_println::println!("sd: could not carry a reading place to '{}'", found.now.1)
+        // The open or loaded book: the store follows it to its new place
+        // once the scan returns.
+        if (was_hash, found.was.2) != (0, 0) && follow.contains(&(was_hash, found.was.2)) {
+            let mut locator = String::new();
+            if locator.push_str(found.now.1).is_ok() {
+                let _ = followed.push(FollowedMove {
+                    was: (was_hash, found.was.2),
+                    now: (now_hash, found.now.2),
+                    root: found.now.0,
+                    locator,
+                });
             }
         }
+        let carry_start = Instant::now();
+        let carry_io = crate::sd_stats::snapshot();
+        // A failed carry loses the place or pagination but not the scan: the
+        // copy keeps its id and the book builds again. The carry's markers
+        // keep the sweep safe over whatever it did not finish.
+        let carried = reader_cache::files::carry_for_move(
+            root,
+            &was,
+            &now,
+            found.digest,
+            (was_hash, found.was.2),
+            (now_hash, found.now.2),
+        );
+        // The saved reader state names its book by place and holds the
+        // reading settings, so it moves too or the next restore loses both.
+        match reader_cache::files::carry_app_state_for_move(
+            root,
+            (was_hash, found.was.2),
+            (now_hash, found.now.2),
+        ) {
+            Ok(true) => {
+                slog!("sd: carried the saved reader state to '{}'", found.now.1)
+            }
+            Ok(false) => {}
+            Err(()) => slog!(
+                "sd: could not carry the saved reader state to '{}'",
+                found.now.1
+            ),
+        }
+        // Report the place and the pagination separately; one failing says
+        // nothing about the other.
+        let (place_ok, place) = match carried.place {
+            Ok(carried) => (true, carried),
+            Err(_) => (false, false),
+        };
+        let (pagination_ok, moved, unlinked, restamped) = match carried.pagination {
+            Ok(Some(pagination)) => (
+                true,
+                pagination.moved,
+                pagination.unlinked,
+                pagination.restamped,
+            ),
+            Ok(None) => (true, 0, 0, 0),
+            Err(_) => (false, 0, 0, 0),
+        };
+        if place {
+            slog!("sd: carried a reading place to '{}'", found.now.1);
+        } else if !place_ok {
+            slog!("sd: could not carry a reading place to '{}'", found.now.1);
+        }
+        if pagination_ok && (moved > 0 || unlinked > 0 || restamped > 0) {
+            slog!(
+                "sd: carried pagination to '{}': {} moved, {} unlinked, {} re-bound",
+                found.now.1,
+                moved,
+                unlinked,
+                restamped
+            );
+        } else if !pagination_ok {
+            slog!("sd: could not carry pagination to '{}'", found.now.1);
+        }
+        let io = crate::sd_stats::snapshot().since(carry_io);
+        bench_log!(
+            "bench: storage_move_carry place_ok={} place={} pagination_ok={} moved={} unlinked={} restamped={} rd_blocks={} wr_blocks={} elapsed_ms={} t_ms={}",
+            place_ok,
+            place,
+            pagination_ok,
+            moved,
+            unlinked,
+            restamped,
+            io.read_blocks,
+            io.write_blocks,
+            carry_start.elapsed().as_millis(),
+            Instant::now().as_millis()
+        );
     };
-    let assigned = upload_store::ledger::assign_book_ids(
-        root,
-        &file,
-        count,
-        scratch,
-        &mut || rng.random(),
-        ledger,
-        &mut carry,
-    )
+    let assigned = crate::platform::with_sha256(|engine| {
+        upload_store::ledger::assign_book_ids(
+            root,
+            &file,
+            count,
+            scratch,
+            &mut crate::platform::random_u32,
+            ledger,
+            &mut carry,
+            engine,
+        )
+    })
     .map_err(|fault| {
-        esp_println::println!("sd: library ledger refused: {:?}", fault);
+        slog!("sd: library ledger refused: {:?}", fault);
     })?;
     if assigned.minted > 0 {
-        esp_println::println!("sd: adopted {} new book(s)", assigned.minted);
+        slog!("sd: adopted {} new book(s)", assigned.minted);
     }
     if assigned.retired > 0 {
-        esp_println::println!(
+        slog!(
             "sd: let go of {} book(s) long missing from the card",
             assigned.retired
         );
     }
     if assigned.duplicates > 0 {
-        esp_println::println!(
+        slog!(
             "sd: the ledger names {} row(s) more than once",
             assigned.duplicates
         );
     }
     if assigned.repaired > 0 {
-        esp_println::println!(
+        slog!(
             "sd: found {} book(s) again in a new place",
             assigned.repaired
         );
     }
     if assigned.ambiguous > 0 {
-        esp_println::println!(
+        slog!(
             "sd: {} book(s) could be more than one copy, so their places were left alone",
             assigned.ambiguous
         );
     }
     if assigned.unreadable > 0 {
-        esp_println::println!(
+        slog!(
             "sd: {} book(s) were left alone because a file of their length could not be read",
             assigned.unreadable
         );
@@ -1048,7 +1134,7 @@ where
 }
 
 /// Read a single catalog record by absolute index.
-pub(crate) fn read_catalog_record_at<
+pub fn read_catalog_record_at<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1112,7 +1198,7 @@ where
 /// hash and two legal books can share it, so a hinted or first match could
 /// be the other one. Ruling out a second match requires reading every record,
 /// and resolution refuses if zero or more than one record matches.
-pub(crate) fn find_catalog_record<
+pub fn find_catalog_record<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1322,20 +1408,29 @@ where
     }
 }
 
-pub(crate) use reader_cache::browse::Listing;
+pub use reader_cache::browse::Listing;
 
 /// What the row a reader pressed turned out to be, once the catalog has had
 /// its say about a book.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RowChoice {
+///
+/// `Stale` carries the whole locator, a few hundred bytes, as
+/// [`reader_cache::browse::RowChoice`] does: there is no allocator, and the
+/// value lives for one press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum RowChoice {
     /// A folder, now listed.
     Entered(Listing),
     /// A book, at this catalog row.
     Book(u16),
-    /// The row named a book the card holds and the catalog does not, which
-    /// is a catalog written before somebody edited the card on a computer.
-    /// The caller rescans and asks again.
-    Stale,
+    /// The card holds the row's book and the catalog does not, because the
+    /// card changed on a computer. The caller rescans and finds the book by
+    /// its new place.
+    Stale {
+        at: BookRoot,
+        locator: proto::library_path::LibraryPath,
+        size: u32,
+    },
     /// Gone since the listing, unnameable from here, or a card that would
     /// not answer. Nothing moved.
     Failed,
@@ -1346,18 +1441,16 @@ pub(crate) enum RowChoice {
 /// cover them. Windowed the way the catalog snapshot is, and called before
 /// each Library render.
 #[inline(never)]
-pub(crate) fn ensure_folder_page(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn ensure_folder_page(
+    card: &mut impl Card,
     library: &mut ReaderStore,
     selection: u16,
     portrait: bool,
 ) {
     let started = Instant::now();
-    let read = sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache::browse::ensure_page(library, root, selection, portrait)
-    })
-    .unwrap_or(false);
+    let read = card
+        .with_root(|root| reader_cache::browse::ensure_page(library, root, selection, portrait))
+        .unwrap_or(false);
     // Only the crossings. A scroll inside the loaded page reads nothing, and
     // logging those would bury the number this is here to show under one line
     // per Library paint.
@@ -1383,9 +1476,8 @@ pub(crate) fn ensure_folder_page(
 /// place would be wrong too, since two legal locators at one size can
 /// collide in it and a reader who picked a row has already said which book.
 #[inline(never)]
-pub(crate) fn choose_library_row(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn choose_library_row(
+    card: &mut impl Card,
     library: &mut ReaderStore,
     index: u16,
     portrait: bool,
@@ -1393,9 +1485,8 @@ pub(crate) fn choose_library_row(
     let started = Instant::now();
     #[cfg(feature = "bench-selftest")]
     let _ = upload_store::library::walk_probe::take();
-    let chosen = sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache::browse::choose_row(library, root, index, portrait)
-    });
+    let chosen =
+        card.with_root(|root| reader_cache::browse::choose_row(library, root, index, portrait));
     match chosen {
         Ok(reader_cache::browse::RowChoice::Entered(listing)) => {
             // Entering is the number the folder-size question is about: it
@@ -1413,17 +1504,14 @@ pub(crate) fn choose_library_row(
             RowChoice::Entered(listing)
         }
         Ok(reader_cache::browse::RowChoice::Book { at, locator, size }) => {
-            match find_index_by_locator(epd, sd_cs, at, locator.as_str(), size) {
+            match find_index_by_locator(card, at, locator.as_str(), size) {
                 CatalogRow::Found(index) => RowChoice::Book(index),
                 CatalogRow::Unreadable => {
                     // The card would not answer about the catalog. That is
                     // not evidence the catalog is behind the card, and
                     // rebuilding on it would retire a usable snapshot
                     // because one read failed.
-                    esp_println::println!(
-                        "library: catalog would not answer for {}",
-                        locator.as_str()
-                    );
+                    slog!("library: catalog would not answer for {}", locator.as_str());
                     RowChoice::Failed
                 }
                 CatalogRow::Rebuild => {
@@ -1432,12 +1520,12 @@ pub(crate) fn choose_library_row(
                     // snapshot that still loads, and a computer can add or
                     // move books while the device is off. Browsing walks the
                     // card and finds them; only the catalog has to catch up.
-                    esp_println::println!(
+                    slog!(
                         "library: {} at {} bytes is not in the catalog, which is stale",
                         locator.as_str(),
                         size
                     );
-                    RowChoice::Stale
+                    RowChoice::Stale { at, locator, size }
                 }
             }
         }
@@ -1449,20 +1537,18 @@ pub(crate) fn choose_library_row(
 /// left: by name where the parent still holds it, else on the row it was
 /// entered from.
 #[inline(never)]
-pub(crate) fn leave_library_folder(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn leave_library_folder(
+    card: &mut impl Card,
     library: &mut ReaderStore,
     portrait: bool,
 ) -> Option<Listing> {
     let started = Instant::now();
     #[cfg(feature = "bench-selftest")]
     let _ = upload_store::library::walk_probe::take();
-    let listed = sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache::browse::leave_folder(library, root, portrait)
-    })
-    .ok()
-    .flatten();
+    let listed = card
+        .with_root(|root| reader_cache::browse::leave_folder(library, root, portrait))
+        .ok()
+        .flatten();
     // Leaving walks the whole parent past the returning name before it
     // commits, so this is the other end of the folder-size question: it grows
     // with the parent rather than with the folder being left.
@@ -1505,19 +1591,15 @@ fn log_folder_walks() {}
 /// so the reading path's `catalog_entry(index)` resolves without depending on
 /// the list window. Idempotent when already active.
 #[inline(never)]
-pub(crate) fn load_active_entry(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    library: &mut ReaderStore,
-    index: usize,
-) -> bool {
+pub fn load_active_entry(card: &mut impl Card, library: &mut ReaderStore, index: usize) -> bool {
     if library.active_index() == Some(index) {
         return true;
     }
     // The record carries the title persisted at scan/open, so the active
     // book's fallback label (Home colophon before a reopen) matches what the
     // list shows without any per-book cache probe.
-    let resolved = sd_session::with_root(epd, sd_cs, |root| read_catalog_record_at(root, index))
+    let resolved = card
+        .with_root(|root| read_catalog_record_at(root, index))
         .ok()
         .flatten();
     match resolved {
@@ -1549,12 +1631,12 @@ pub(crate) fn load_active_entry(
 /// row has no business evicting that, so it reads what it needs and leaves
 /// the store alone.
 #[inline(never)]
-pub(crate) fn read_row_cache_identity(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn read_row_cache_identity(
+    card: &mut impl Card,
     index: usize,
 ) -> Option<(String<{ proto::cache::CACHE_KEY_BYTES }>, u32, u32)> {
-    let record = sd_session::with_root(epd, sd_cs, |root| read_catalog_record_at(root, index))
+    let record = card
+        .with_root(|root| read_catalog_record_at(root, index))
         .ok()
         .flatten()?;
     Some((
@@ -1571,7 +1653,7 @@ pub(crate) fn read_row_cache_identity(
 /// may have been rewritten under a stale index -- then the identity resolves
 /// the true index) and only when the stored title actually differs, so the
 /// common reopen costs one record read and no write.
-pub(crate) fn update_catalog_title<
+pub fn update_catalog_title<
     D,
     T,
     const MAX_DIRS: usize,
@@ -1665,14 +1747,13 @@ where
 /// the same 32 bits can also collide between two current books, and a
 /// hinted or first match could be the other one.
 #[inline(never)]
-pub(crate) fn find_index_by_identity(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn find_index_by_identity(
+    card: &mut impl Card,
     source_hash: u32,
     byte_size: u32,
     legacy: bool,
 ) -> Option<u16> {
-    sd_session::with_root(epd, sd_cs, |root| {
+    card.with_root(|root| {
         if legacy {
             find_in_catalog_by_legacy_identity(root, source_hash, byte_size)
         } else {
@@ -1692,19 +1773,16 @@ pub(crate) fn find_index_by_identity(
 /// it through the identity would manufacture the ambiguity and then fail on
 /// it, leaving two perfectly good books unopenable.
 #[inline(never)]
-pub(crate) fn find_index_by_locator(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
+pub fn find_index_by_locator(
+    card: &mut impl Card,
     at: BookRoot,
     locator: &str,
     byte_size: u32,
 ) -> CatalogRow {
     // A session that would not open is a card that did not answer, which is
     // the same unknown as a refused read.
-    sd_session::with_root(epd, sd_cs, |root| {
-        find_in_catalog_at(root, at, locator, byte_size)
-    })
-    .unwrap_or(CatalogRow::Unreadable)
+    card.with_root(|root| find_in_catalog_at(root, at, locator, byte_size))
+        .unwrap_or(CatalogRow::Unreadable)
 }
 
 /// Empty every book cache under CACHE2 whose book is no longer in the freshly
@@ -1746,7 +1824,7 @@ fn sweep_orphan_caches<
         sweep_cache_batch(root, keys, scratch, staged, truncated, &mut swept);
     });
     if swept > 0 {
-        esp_println::println!("cache: swept {} orphan cache(s)", swept);
+        slog!("cache: swept {} orphan cache(s)", swept);
     }
 }
 
@@ -1915,12 +1993,8 @@ fn listing_size_field(record: &CatalogRecord) -> String<16> {
 /// prove untouched, and a size is the difference between "a book with this
 /// name exists" and "the book that was written is the book that is there".
 #[inline(never)]
-pub(crate) fn write_catalog_listing(
-    epd: &mut Epd,
-    sd_cs: &mut Output<'static>,
-    out: &mut [u8],
-) -> usize {
-    sd_session::with_root(epd, sd_cs, |root| {
+pub fn write_catalog_listing(card: &mut impl Card, out: &mut [u8]) -> usize {
+    card.with_root(|root| {
         with_catalog_file(root, |file, count| {
             seek_to_record(file, 0)?;
             let mut record = [0u8; CATALOG_RECORD_BYTES];
@@ -2003,7 +2077,8 @@ pub(crate) fn write_catalog_listing(
     .unwrap_or(0)
 }
 
-pub(crate) fn open_or_make_dir<
+#[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
+pub fn open_or_make_dir<
     'a,
     D,
     T,
