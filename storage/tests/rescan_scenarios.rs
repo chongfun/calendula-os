@@ -139,13 +139,14 @@ fn a_refused_write_before_the_rescan_refuses_the_pick() {
 
 /// A catalog refresh while the card keeps refusing the position write. Each
 /// refusal leaves the refresh owed to a background slice, which the firmware
-/// runs only after a backoff, instead of putting it straight back on the
-/// queue. Once the card takes writes, the refresh scans and the page is kept.
+/// runs only after a backoff that grows with each refusal, instead of putting
+/// it straight back on the queue. Once the card takes writes, the refresh
+/// scans and the page is kept.
 #[test]
 fn a_refresh_over_a_refusing_card_waits_for_a_background_slice() {
     let (card, mut device) = second_book_read_with_a_book_added();
     let before = device.log.len();
-    card.disk.refuse_next_writes(3);
+    card.disk.refuse_next_writes(u32::MAX);
     device.send(StorageCommand::RefreshCatalog);
     device.run_queued();
     let scanned = |device: &Device| {
@@ -170,6 +171,14 @@ fn a_refresh_over_a_refusing_card_waits_for_a_background_slice() {
         "page 9 is still owed"
     );
 
+    // Each refused retry backs off further than the last.
+    for refusals in 2..=3 {
+        assert!(device.task.catalog_refresh.owed);
+        device.step_background();
+        device.run_queued();
+        assert_eq!(device.task.background_attempts(), refusals);
+    }
+    card.disk.refuse_next_writes(0);
     device.settle();
     assert!(
         scanned(&device),
@@ -284,6 +293,10 @@ fn a_retried_refresh_whose_scan_fails_settles_like_any_refresh() {
     );
     assert_ne!(device.store.catalog_count(), books + 1, "its scan failed");
     assert!(!device.task.catalog_refresh.owed, "and it is settled");
+    assert_eq!(
+        device.task.catalog_refresh.refusals, 0,
+        "with its refusals spent"
+    );
 
     card.disk.refuse_next_writes(0);
     let before = device.log.len();
@@ -294,4 +307,12 @@ fn a_retried_refresh_whose_scan_fails_settles_like_any_refresh() {
             .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
         "nothing retries it"
     );
+
+    // A later refresh refused once backs off as a first refusal.
+    device.turn(1);
+    card.disk.refuse_next_writes(1);
+    device.send(StorageCommand::RefreshCatalog);
+    device.run_queued();
+    assert!(device.task.catalog_refresh.owed);
+    assert_eq!(device.task.background_attempts(), 1);
 }

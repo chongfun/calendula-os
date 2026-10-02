@@ -720,6 +720,21 @@ impl Device {
         while self.handle_one() {}
     }
 
+    /// Run one background slice, as the firmware does after its wait.
+    pub fn step_background(&mut self) {
+        self.task.background_step(
+            &mut self.card,
+            &mut self.host,
+            &mut self.store,
+            &mut self.metrics,
+            self.last_render,
+        );
+        self.deliver();
+        while let Some(command) = self.host.requeued.pop_front() {
+            self.queue.push_back(command);
+        }
+    }
+
     fn handle_one(&mut self) -> bool {
         let Some(command) = self.queue.pop_front() else {
             return false;

@@ -1040,6 +1040,9 @@ pub fn handle_storage_command(
                 catalog_refresh.refusals = catalog_refresh.refusals.saturating_add(1);
                 return;
             }
+            // Past the write, this is an ordinary refresh whatever its scan
+            // did, so the refused writes' backoff is spent.
+            *catalog_refresh = CatalogRefresh::default();
             restore_saved_state(card, host, sd_library, state_restored, false);
             host.send(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),
