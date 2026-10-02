@@ -3,6 +3,8 @@
 
 use embedded_sdmmc::{Directory, TimeSource, Timestamp};
 
+use crate::progress::{ProgressSink, Silent};
+
 /// Why a session did not reach the root directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionError {
@@ -51,4 +53,13 @@ pub trait Card {
         &mut self,
         f: impl for<'a> FnOnce(&Root<'a, Self::Device<'a>>) -> R,
     ) -> Result<R, SessionError>;
+
+    /// [`Card::with_root`], with somewhere for `f` to report progress. A card
+    /// with nobody watching hands it [`Silent`].
+    fn with_root_reporting<R>(
+        &mut self,
+        f: impl for<'a> FnOnce(&Root<'a, Self::Device<'a>>, &mut dyn ProgressSink) -> R,
+    ) -> Result<R, SessionError> {
+        self.with_root(|root| f(root, &mut Silent))
+    }
 }

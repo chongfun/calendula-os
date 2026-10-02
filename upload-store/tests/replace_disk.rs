@@ -304,6 +304,13 @@ thread_local! {
     static FOUND_AGAIN: RefCell<Vec<(BookId, String, String)>> = const { RefCell::new(Vec::new()) };
     /// The digest each of those reports carried, in the same order.
     static FOUND_DIGESTS: RefCell<Vec<SourceDigest>> = const { RefCell::new(Vec::new()) };
+    /// What the scans said of their progress.
+    static PROGRESS: RefCell<Vec<ledger::AssignProgress>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take the progress the scans reported since the last call.
+fn progress() -> Vec<ledger::AssignProgress> {
+    PROGRESS.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
 }
 
 /// What the scans since the last call reported, and clear it.
@@ -378,6 +385,7 @@ fn scan_minting(
             FOUND_DIGESTS.with(|seen| seen.borrow_mut().push(found.digest));
         },
         &mut proto::source::SoftSha256::new(),
+        &mut |step| PROGRESS.with(|seen| seen.borrow_mut().push(step)),
     )?;
     encode_catalog_header(rows.len() as u16, &mut header);
     file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
@@ -2431,9 +2439,33 @@ fn a_sideloaded_copy_that_was_read_is_found_again_where_it_went() {
 
     let moved = "Herbert, Frank - Dune.epub";
     rename_on_shelf(&root, BOOK, moved);
+    let _ = progress();
     let (assigned, ids) =
         scan_minting(&root, &[(BookRoot::Library, moved, size)], &mut random).unwrap();
     assert_eq!(assigned.repaired, 1, "found again: {assigned:?}");
+    // The progress says the join is done, how much the proof will read, and
+    // then each block of it, rising to the copy's length.
+    let steps = progress();
+    let hashed: Vec<u64> = steps
+        .iter()
+        .filter_map(|step| match step {
+            ledger::AssignProgress::Hashed { bytes } => Some(*bytes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        steps[..2],
+        [
+            ledger::AssignProgress::Matched { rows: 1 },
+            ledger::AssignProgress::Proving {
+                bytes: u64::from(size)
+            },
+        ],
+        "{steps:?}"
+    );
+    assert!(hashed.len() > 1, "{steps:?}");
+    assert!(hashed.windows(2).all(|pair| pair[0] < pair[1]), "{steps:?}");
+    assert_eq!(hashed.last(), Some(&u64::from(size)));
     assert_eq!(assigned.hashed, 1);
     assert_eq!(assigned.minted, 0);
     assert_eq!(ids[0], Some(id), "under the id it was adopted with");
