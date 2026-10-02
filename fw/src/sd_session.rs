@@ -8,7 +8,6 @@ use app_core::DisplayCommand;
 use core::sync::atomic::{AtomicU8, Ordering};
 use embassy_futures::select::{select, Either};
 use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
 use embedded_sdmmc::embedded_sdmmc_types::sdcard::CardType;
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
@@ -17,6 +16,7 @@ use esp_hal::gpio::Output;
 use esp_hal::spi::master::{Config as SpiConfig, SpiDmaBus};
 use esp_hal::time::Rate;
 use esp_hal::Async;
+use storage::progress::{ProgressSink, Silent};
 
 /// SD SPI-mode identification must run at 100-400 kHz; data transfer is
 /// specced to 25 MHz. The shared bus otherwise runs at the active panel's
@@ -74,11 +74,16 @@ impl DelayNs for SdDelay {
     }
 }
 
-pub(crate) struct SdSpiDevice<'a, SPI, CS> {
-    pub(crate) spi: &'a mut SPI,
-    pub(crate) cs: &'a mut CS,
+/// The card's end of the shared bus. It holds the whole panel bus rather
+/// than its SPI half, so a repaint between card operations can reach the
+/// panel's pins through the card without ending the session.
+pub(crate) struct SdSpiDevice<'a> {
+    pub(crate) epd: &'a mut Epd,
+    pub(crate) cs: &'a mut Output<'static>,
     pub(crate) delay: SdDelay,
 }
+
+type SdSpiBus = SpiDmaBus<'static, Async>;
 
 /// Also sizes the shared bus's RX DMA buffer in main.rs: SD traffic is the
 /// only read path on SPI2 (the EPD is write-only), and every SD operation
@@ -136,20 +141,13 @@ fn sd_spi_pace(iterations: u32) {
     }
 }
 
-impl<SPI, CS> embedded_hal::spi::ErrorType for SdSpiDevice<'_, SPI, CS>
-where
-    SPI: embedded_hal::spi::ErrorType,
-{
-    type Error = SPI::Error;
+impl embedded_hal::spi::ErrorType for SdSpiDevice<'_> {
+    type Error = <SdSpiBus as embedded_hal::spi::ErrorType>::Error;
 }
 
-impl<SPI, CS> SpiDevice for SdSpiDevice<'_, SPI, CS>
-where
-    SPI: BlockingSpiBus<u8>,
-    CS: OutputPin,
-{
+impl SpiDevice for SdSpiDevice<'_> {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
-        let _ = self.cs.set_low();
+        self.cs.set_low();
         let mut result = Ok(());
 
         for operation in operations {
@@ -169,38 +167,41 @@ where
             }
         }
 
-        let _ = self.spi.flush();
-        let _ = self.cs.set_high();
+        let _ = BlockingSpiBus::flush(self.bus());
+        self.cs.set_high();
         result
     }
 }
 
-impl<SPI, CS> SdSpiDevice<'_, SPI, CS>
-where
-    SPI: BlockingSpiBus<u8>,
-{
-    fn read_with_sd_clocks(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
+type SdSpiError = <SdSpiBus as embedded_hal::spi::ErrorType>::Error;
+
+impl SdSpiDevice<'_> {
+    fn bus(&mut self) -> &mut SdSpiBus {
+        self.epd.spi_mut()
+    }
+
+    fn read_with_sd_clocks(&mut self, buffer: &mut [u8]) -> Result<(), SdSpiError> {
         for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
             with_sd_bounce(|bounce| {
-                self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+                BlockingSpiBus::transfer_in_place(self.bus(), &mut bounce.0[..chunk.len()])?;
                 chunk.copy_from_slice(&bounce.0[..chunk.len()]);
-                Ok(())
+                Ok::<(), SdSpiError>(())
             })?;
         }
         Ok(())
     }
 
-    fn write_chunked(&mut self, buffer: &[u8]) -> Result<(), SPI::Error> {
+    fn write_chunked(&mut self, buffer: &[u8]) -> Result<(), SdSpiError> {
         for chunk in buffer.chunks(SD_SPI_CHUNK_BYTES) {
             with_sd_bounce(|bounce| {
                 bounce.0[..chunk.len()].copy_from_slice(chunk);
-                self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])
+                BlockingSpiBus::transfer_in_place(self.bus(), &mut bounce.0[..chunk.len()])
             })?;
         }
         Ok(())
     }
 
-    fn transfer_chunked(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), SPI::Error> {
+    fn transfer_chunked(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), SdSpiError> {
         let common = read.len().min(write.len());
         let (read_common, read_tail) = read.split_at_mut(common);
         let (write_common, write_tail) = write.split_at(common);
@@ -211,10 +212,9 @@ where
         {
             with_sd_bounce(|bounce| {
                 bounce.0[..write_chunk.len()].copy_from_slice(write_chunk);
-                self.spi
-                    .transfer_in_place(&mut bounce.0[..write_chunk.len()])?;
+                BlockingSpiBus::transfer_in_place(self.bus(), &mut bounce.0[..write_chunk.len()])?;
                 read_chunk.copy_from_slice(&bounce.0[..read_chunk.len()]);
-                Ok(())
+                Ok::<(), SdSpiError>(())
             })?;
         }
         if !read_tail.is_empty() {
@@ -226,36 +226,61 @@ where
         Ok(())
     }
 
-    fn transfer_in_place_chunked(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
+    fn transfer_in_place_chunked(&mut self, buffer: &mut [u8]) -> Result<(), SdSpiError> {
         for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
             with_sd_bounce(|bounce| {
                 bounce.0[..chunk.len()].copy_from_slice(chunk);
-                self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+                BlockingSpiBus::transfer_in_place(self.bus(), &mut bounce.0[..chunk.len()])?;
                 chunk.copy_from_slice(&bounce.0[..chunk.len()]);
-                Ok(())
+                Ok::<(), SdSpiError>(())
             })?;
         }
         Ok(())
     }
 }
 
-type SdSpi<'a> = SdSpiDevice<'a, SpiDmaBus<'static, Async>, Output<'static>>;
-
-type SdCardDevice<'a> = CountingDevice<SdCard<SdSpi<'a>, SdDelay>>;
+type SdCardDevice<'a> = CountingDevice<SdCard<SdSpiDevice<'a>, SdDelay>>;
 pub(crate) type SdRoot<'a> = Directory<'a, SdCardDevice<'a>, StaticTime, 8, 8, 1>;
 
 pub(crate) use storage::card::SessionError as SdSessionError;
+
+/// Paints on the panel between card operations, while a session holds the
+/// bus: a rescan's progress.
+pub(crate) trait SessionPainter {
+    /// Show that the work is `percent` done, through `epd`, which is clocked
+    /// for the panel with the card deselected for the length of the call.
+    fn paint(&mut self, epd: &mut Epd, percent: u8);
+}
 
 /// The firmware's card: one SPI session per closure, the bus taken from the
 /// panel for its length and handed back after.
 pub(crate) struct FwCard<'a> {
     epd: &'a mut Epd,
     sd_cs: &'a mut Output<'static>,
+    /// Lent the bus when the storage code reports progress mid-session.
+    painter: Option<&'a mut dyn SessionPainter>,
 }
 
 /// The card behind the panel's bus, for the storage code.
 pub(crate) fn card<'a>(epd: &'a mut Epd, sd_cs: &'a mut Output<'static>) -> FwCard<'a> {
-    FwCard { epd, sd_cs }
+    FwCard {
+        epd,
+        sd_cs,
+        painter: None,
+    }
+}
+
+/// [`card`], with `painter` lent the bus whenever a session reports progress.
+pub(crate) fn card_reporting<'a>(
+    epd: &'a mut Epd,
+    sd_cs: &'a mut Output<'static>,
+    painter: &'a mut dyn SessionPainter,
+) -> FwCard<'a> {
+    FwCard {
+        epd,
+        sd_cs,
+        painter: Some(painter),
+    }
 }
 
 impl storage::card::Card for FwCard<'_> {
@@ -269,6 +294,57 @@ impl storage::card::Card for FwCard<'_> {
         f: impl for<'a> FnOnce(&SdRoot<'a>) -> R,
     ) -> Result<R, SdSessionError> {
         with_root(self.epd, self.sd_cs, f)
+    }
+
+    fn with_root_reporting<R>(
+        &mut self,
+        f: impl for<'a> FnOnce(&SdRoot<'a>, &mut dyn ProgressSink) -> R,
+    ) -> Result<R, SdSessionError> {
+        with_session(self.epd, self.sd_cs, reborrow(&mut self.painter), f)
+    }
+}
+
+/// A shorter loan of a painter, for one session attempt of several.
+fn reborrow<'s>(
+    painter: &'s mut Option<&mut dyn SessionPainter>,
+) -> Option<&'s mut dyn SessionPainter> {
+    match painter {
+        Some(painter) => Some(&mut **painter),
+        None => None,
+    }
+}
+
+/// The sink a painting session hands the storage code. A report borrows the
+/// card's device from the volume manager to reach the bus, which leaves the
+/// manager's block cache and open handles as they were.
+struct LentBus<'v, 'd, 'p> {
+    volume_mgr: &'v VolumeManager<SdCardDevice<'d>, StaticTime, 8, 8, 1>,
+    painter: &'p mut dyn SessionPainter,
+}
+
+impl ProgressSink for LentBus<'_, '_, '_> {
+    fn now_ms(&mut self) -> u64 {
+        embassy_time::Instant::now().as_millis()
+    }
+
+    fn report(&mut self, percent: u8) {
+        let painter = &mut *self.painter;
+        // Reports come only between card operations, so the manager's
+        // device is free to borrow and the card is idle. SD CS stays high
+        // while the panel has the bus.
+        self.volume_mgr.device(|counting| {
+            counting.0.spi(|sd| {
+                sd.cs.set_high();
+                let _ = sd.bus().apply_config(
+                    &SpiConfig::default().with_frequency(Rate::from_hz(DISPLAY_FREQ_HZ)),
+                );
+                painter.paint(&mut *sd.epd, percent);
+                sd.epd.deselect_display();
+                let _ = sd.bus().apply_config(
+                    &SpiConfig::default().with_frequency(Rate::from_mhz(SD_DATA_FREQ_MHZ)),
+                );
+            })
+        });
     }
 }
 
@@ -307,13 +383,22 @@ fn forget_card_warmth() {
     WARM_CARD_CODE.store(WARM_CARD_NONE, Ordering::Relaxed);
 }
 
-/// Kept out of line: the VolumeManager/SdCard session state is multi-KB
-/// and must not be pooled into every caller's frame.
-#[inline(never)]
 pub(crate) fn with_root<R>(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     f: impl for<'a> FnOnce(&SdRoot<'a>) -> R,
+) -> Result<R, SdSessionError> {
+    with_session(epd, sd_cs, None, |root, _| f(root))
+}
+
+/// Kept out of line: the VolumeManager/SdCard session state is multi-KB
+/// and must not be pooled into every caller's frame.
+#[inline(never)]
+fn with_session<R>(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    mut painter: Option<&mut dyn SessionPainter>,
+    f: impl for<'a> FnOnce(&SdRoot<'a>, &mut dyn ProgressSink) -> R,
 ) -> Result<R, SdSessionError> {
     epd.deselect_display();
     sd_cs.set_high();
@@ -327,14 +412,20 @@ pub(crate) fn with_root<R>(
     let mut pending = Some(f);
     let mut result = Err(SdSessionError::CardInit);
     if let Some(card_type) = remembered_card_type() {
-        result = run_sd_session(epd, sd_cs, Some(card_type), &mut pending);
+        result = run_sd_session(
+            epd,
+            sd_cs,
+            Some(card_type),
+            reborrow(&mut painter),
+            &mut pending,
+        );
         if result.is_err() {
             esp_println::println!("sd: warm reuse failed, cold retry");
             forget_card_warmth();
         }
     }
     if pending.is_some() {
-        result = run_sd_session(epd, sd_cs, None, &mut pending);
+        result = run_sd_session(epd, sd_cs, None, painter, &mut pending);
     }
 
     esp_println::println!("sd: session exit");
@@ -355,10 +446,11 @@ fn run_sd_session<R, F>(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     assume_init: Option<CardType>,
+    painter: Option<&mut dyn SessionPainter>,
     f: &mut Option<F>,
 ) -> Result<R, SdSessionError>
 where
-    F: for<'a> FnOnce(&SdRoot<'a>) -> R,
+    F: for<'a> FnOnce(&SdRoot<'a>, &mut dyn ProgressSink) -> R,
 {
     // Identification phase: 400 kHz with at least 74 wake clocks while no
     // chip select is asserted, per the SD spec and embedded-sdmmc's docs.
@@ -374,7 +466,7 @@ where
     }
 
     let spi = SdSpiDevice {
-        spi: epd.spi_mut(),
+        epd: &mut *epd,
         cs: sd_cs,
         delay: SdDelay,
     };
@@ -404,7 +496,7 @@ where
     // session.
     card.spi(|device| {
         let _ = device
-            .spi
+            .bus()
             .apply_config(&SpiConfig::default().with_frequency(Rate::from_mhz(SD_DATA_FREQ_MHZ)));
     });
     let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
@@ -420,7 +512,16 @@ where
                 esp_println::println!("sd: root open");
                 let root = Directory::new(raw_root, &volume_mgr);
                 let callback = f.take().expect("sd session callback present");
-                let value = callback(&root);
+                let value = match painter {
+                    Some(painter) => callback(
+                        &root,
+                        &mut LentBus {
+                            volume_mgr: &volume_mgr,
+                            painter,
+                        },
+                    ),
+                    None => callback(&root, &mut Silent),
+                };
                 esp_println::println!("sd: root callback done");
                 drop(root);
                 let _ = volume_mgr.close_volume(raw_volume);
@@ -457,7 +558,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     }
 
     let spi = SdSpiDevice {
-        spi: epd.spi_mut(),
+        epd: &mut *epd,
         cs: sd_cs,
         delay: SdDelay,
     };
@@ -472,7 +573,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     }
     card.spi(|device| {
         let _ = device
-            .spi
+            .bus()
             .apply_config(&SpiConfig::default().with_frequency(Rate::from_mhz(SD_DATA_FREQ_MHZ)));
     });
     let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
