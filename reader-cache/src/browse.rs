@@ -364,6 +364,7 @@ where
     let mut card_failed = false;
     let mut cursor = None;
     while skip < usize::from(total) {
+        let before = cursor.clone();
         let filled = match listing
             .page(card_root, counts, skip, &mut window, &mut cursor)
             .ok()
@@ -385,6 +386,15 @@ where
             store.browse_mut().note_row(row, listed.child.name.as_str());
             row = row.saturating_add(1);
         }
+        // The page the cursor stands in, kept at both ends so the page read
+        // below seeks a few rows from one of them rather than from the top
+        // of a sorted region.
+        let selection = usize::from(store.browse().selection());
+        if (skip..skip + filled).contains(&selection) {
+            for end in [before.as_ref(), cursor.as_ref()].into_iter().flatten() {
+                store.record_folder_checkpoint(end);
+            }
+        }
         skip += filled;
     }
     if card_failed {
@@ -393,7 +403,8 @@ where
     let walked = skip.min(usize::from(total));
     store.browse_mut().set_count(walked as u16);
     let selection = store.browse().selection();
-    store.clear_folder_page();
+    // The resident page is still the empty one cleared above; the
+    // checkpoints the walk left are what the read below seeks from.
     if let Some(start) = page_start(store, selection, portrait) {
         read_page(store, card_root, &listing, start)?;
     }

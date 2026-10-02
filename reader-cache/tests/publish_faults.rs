@@ -7297,3 +7297,135 @@ fn sequential_page_refills_cost_one_directory_scan_each() {
         );
     }
 }
+
+/// A page behind the resident one, or at the far end of the folder, seeks
+/// from the nearest row it knows rather than from the top of a sorted
+/// region: one walk to find where it starts, one to fill, however deep it
+/// lands. Wrapping from the first row to the last is one press, and so is
+/// each row of scrolling back up.
+#[test]
+fn wrapping_and_scrolling_back_cost_two_directory_walks_each() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    root.make_dir_in_dir("BOOKS").expect("mkdir");
+    let shelf = open_child(&root, "BOOKS");
+    shelf.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = open_child(&shelf, "Fiction");
+    // Written out of order, so a page that skipped by card order would show
+    // the wrong names.
+    for index in 0..120usize {
+        let file = fiction
+            .create_file_in_dir_lfn(&std::format!("Book {:03}.epub", index * 7 % 120))
+            .expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+    let mut store = Box::new(ReaderStore::new());
+    reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+    let folder = store.browse().count() - 1;
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, folder, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+    let last = store.browse().count() - 1;
+    assert_eq!(last, 119);
+
+    // One walk: the next page, seeking from the row before it.
+    disk.reads.set(0);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 16, true
+    ));
+    let walk = disk.reads.get();
+
+    let shows = |store: &ReaderStore, row: usize| {
+        store
+            .folder_row(row)
+            .map(|resident| resident.name.as_str().to_owned())
+    };
+    disk.reads.set(0);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, last, true
+    ));
+    let wrapped = disk.reads.get();
+    assert!(
+        wrapped <= 2 * walk + 2,
+        "wrapping to the last row read {wrapped} blocks against {walk} for one walk",
+    );
+    assert_eq!(shows(&store, 119).as_deref(), Some("Book 119.epub"));
+
+    for selection in (80..last).rev() {
+        disk.reads.set(0);
+        if !reader_cache::browse::ensure_page(&mut store, &root, selection, true) {
+            continue;
+        }
+        let read = disk.reads.get();
+        assert!(
+            read <= 2 * walk + 2,
+            "scrolling back to {selection} read {read} blocks against {walk} for one walk",
+        );
+        let top = ui::render::library_scroll_start(usize::from(selection), 120, true);
+        assert_eq!(
+            shows(&store, top),
+            Some(std::format!("Book {top:03}.epub")),
+            "the page scrolled back to shows the row it is at",
+        );
+    }
+}
+
+/// Going up walks the whole parent to find the folder it left, and the page
+/// it then reads around that folder seeks from the walk's own rows rather
+/// than from the top of the region: a return to the middle of 200 folders
+/// costs the walk, the count, and two walks for the page.
+#[test]
+fn leaving_a_folder_reads_its_landing_page_from_the_walk() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    root.make_dir_in_dir("BOOKS").expect("mkdir");
+    let shelf = open_child(&root, "BOOKS");
+    shelf.make_dir_in_dir_lfn("Shelves").expect("mkdir");
+    let shelves = open_child(&shelf, "Shelves");
+    for index in 0..200usize {
+        shelves
+            .make_dir_in_dir_lfn(&std::format!("Shelf {:03}", index * 7 % 200))
+            .expect("mkdir");
+    }
+    let mut store = Box::new(ReaderStore::new());
+    reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+    let folder = store.browse().count() - 1;
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, folder, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+    disk.reads.set(0);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 16, true
+    ));
+    let walk = disk.reads.get();
+    store.browse_mut().move_by(100);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 100, true
+    ));
+    let name = |store: &ReaderStore| {
+        store
+            .folder_row(100)
+            .map(|row| row.name.as_str().to_owned())
+    };
+    assert_eq!(name(&store).as_deref(), Some("Shelf 100"));
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, 100, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+
+    disk.reads.set(0);
+    let left = reader_cache::browse::leave_folder(&mut store, &root, true).expect("leaves");
+    let read = disk.reads.get();
+    assert_eq!(left.selection, 100);
+    assert_eq!(name(&store).as_deref(), Some("Shelf 100"));
+    let pages = 200u32.div_ceil(16);
+    assert!(
+        read <= (pages + 4) * walk,
+        "leaving read {read} blocks against {walk} for one walk and {pages} pages",
+    );
+}

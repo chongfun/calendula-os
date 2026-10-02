@@ -670,15 +670,23 @@ deterministic tie-breaking on exact case and alias). The rows are
 read from the card a page at a time through
 `upload_store::library::page_library_rows`, so what a folder costs in
 RAM is one screenful whatever its size, and scrolling inside a loaded page
-reads nothing. Paging forward reuses lower-bound sort cursors and checkpoints
-retained in `ReaderStore` across refills so late pages cost approximately
-one directory walk. Entering one is not constant, though: showing books above
-folders means knowing the split before a row number means anything, so
-`count_library_rows` walks the whole directory once before the first page is
-filled, taking the split from `count_children_split`. Measured on an X3 at
-1,129 books, entering a folder costs 41 ms plus 0.356 ms per row and paging
-inside it is flat at about 35 ms, so the ordering is affordable and no derived
-index is warranted. Where the reader is lives in
+reads nothing. Sorting without storage proportional to the folder is paid
+for in walks: a page walks the whole directory once to fill, plus once per
+window's worth of rows between it and the nearest row it already knows.
+`ReaderStore` keeps the resident rows and a few checkpoints from earlier pages
+as those known rows, and a page seeks backward from one as readily as forward,
+or from either end of its region, so scrolling either way, wrapping to the
+last row and going back up to a folder each cost one or two walks. A page far
+from every known row, such as the one a relist after a rescan reads, costs a
+walk per window's worth of rows from the nearer end of its region. Entering a
+folder is not constant either: showing books above folders means knowing the
+split before a row number means anything, so `count_library_rows` walks the
+whole directory once before the first page is filled, taking the split from
+`count_children_split`. Measured on an X3 at 1,129 books before rows were
+sorted, entering a folder cost 41 ms plus 0.356 ms per row and paging inside
+it was flat at about 35 ms. A page is now a whole walk, so those figures, and
+the conclusion that no derived index is warranted, want measuring again. Where
+the reader is lives in
 `app_core::browse::Browse` inside the display task's store rather than in the
 reducer's `Copy` state.
 

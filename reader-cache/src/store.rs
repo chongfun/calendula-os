@@ -16,6 +16,9 @@ pub use proto::upload::derive_catalog_label;
 /// little above `ui::render::library_visible_rows(true)` so ordinary scrolling stays
 /// inside one loaded window and only crossings re-read the card.
 pub const LIBRARY_WINDOW: usize = 16;
+/// Listing checkpoints [`ReaderStore`] keeps for a folder, each about 150
+/// bytes on the device.
+const FOLDER_CHECKPOINTS: usize = 8;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
 /// Longest current-chapter title kept resident for the Home/sleep colophon;
 /// read on demand from TOC.BIN as the chapter changes.
@@ -150,7 +153,9 @@ impl LibraryBookEntry {
 /// label.
 pub struct FolderRow {
     pub name: String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
-    pub alias: Option<embedded_sdmmc::ShortFileName>,
+    /// The 8.3 alias, which breaks ties between names in the listing's sort
+    /// order and so lets a later page seek from this row.
+    pub alias: embedded_sdmmc::ShortFileName,
     pub is_dir: bool,
     /// Bytes, from the directory entry; zero for a folder. Pairs with the
     /// locator to give a book the identity its catalog row was written under.
@@ -168,7 +173,7 @@ impl FolderRow {
     pub const fn new() -> Self {
         Self {
             name: String::new(),
-            alias: None,
+            alias: embedded_sdmmc::ShortFileName::this_dir(),
             is_dir: false,
             size: 0,
             at: proto::library_path::BookRoot::Library,
@@ -257,7 +262,10 @@ pub struct ReaderStore {
     folder_rows: [FolderRow; LIBRARY_WINDOW],
     folder_start: usize,
     folder_len: usize,
-    folder_checkpoints: [Option<upload_store::library::ListingCursor>; 8],
+    /// Rows earlier pages of this listing ended on, so a page the resident
+    /// rows are far from can still seek from somewhere near it. A ring,
+    /// oldest overwritten first.
+    folder_checkpoints: [Option<upload_store::library::ListingCursor>; FOLDER_CHECKPOINTS],
     folder_checkpoint_next: usize,
     /// Bumped every time browsing is repositioned by something other than a
     /// move the reader asked for, which today means a scan's forced return to
@@ -441,7 +449,7 @@ impl ReaderStore {
             folder_rows: [const { FolderRow::new() }; LIBRARY_WINDOW],
             folder_start: 0,
             folder_len: 0,
-            folder_checkpoints: [const { None }; 8],
+            folder_checkpoints: [const { None }; FOLDER_CHECKPOINTS],
             folder_checkpoint_next: 0,
             browse_epoch: 0,
             folder_counts: upload_store::library::RowCounts {
@@ -795,7 +803,7 @@ impl ReaderStore {
         let slot = &mut self.folder_rows[self.folder_len];
         slot.name.clear();
         let _ = slot.name.push_str(name);
-        slot.alias = Some(alias);
+        slot.alias = alias;
         slot.is_dir = is_dir;
         slot.size = size;
         slot.at = at;
@@ -811,56 +819,44 @@ impl ReaderStore {
         self.folder_rows().get(offset)
     }
 
-    /// What lower bound the resident folder rows or checkpoints can supply for `start`, if any.
+    /// The known row nearest the page at `start`, for the listing to seek
+    /// from: a resident row or a checkpoint in the same region, before or
+    /// after it. `None` when nothing is in that region, or `start` opens it.
     pub fn folder_cursor_for(&self, start: usize) -> Option<upload_store::library::ListingCursor> {
-        if start == 0 {
+        let counts = self.folder_counts;
+        let (region, offset) = counts.locate(start)?;
+        if offset == 0 {
             return None;
         }
-        let counts = self.folder_counts;
-        // Check if start - 1 or a recent row in folder_rows is resident.
-        if self.folder_len > 0 {
-            let target_row = (start - 1).min(self.folder_start + self.folder_len - 1);
-            if target_row >= self.folder_start {
-                let offset = target_row - self.folder_start;
-                let row = &self.folder_rows[offset];
-                if let Some(alias) = row.alias {
-                    let (region_idx, skip) = if target_row < counts.shelf_books {
-                        (0, target_row + 1)
-                    } else if target_row < counts.shelf_books + counts.root_books {
-                        (1, target_row - counts.shelf_books + 1)
-                    } else {
-                        (2, target_row - counts.shelf_books - counts.root_books + 1)
-                    };
-                    return Some(upload_store::library::ListingCursor {
-                        region_idx,
-                        skip,
-                        name: row.name.clone(),
-                        alias,
-                    });
-                }
+        let mut nearest: Option<(usize, usize)> = None;
+        for index in self.folder_start..self.folder_start + self.folder_len {
+            let Some((row_region, row_offset)) = counts.locate(index) else {
+                continue;
+            };
+            let distance = (row_offset + 1).abs_diff(offset);
+            if row_region == region && nearest.is_none_or(|(_, best)| distance < best) {
+                nearest = Some((index, distance));
             }
         }
-
-        // Otherwise check historical checkpoints.
-        let (target_region, target_skip) = if start <= counts.shelf_books {
-            (0, start)
-        } else if start <= counts.shelf_books + counts.root_books {
-            (1, start - counts.shelf_books)
-        } else {
-            (2, start - counts.shelf_books - counts.root_books)
-        };
-
-        let mut best: Option<&upload_store::library::ListingCursor> = None;
-        for cp in self.folder_checkpoints.iter().flatten() {
-            if cp.region_idx == target_region && cp.skip <= target_skip {
-                match best {
-                    Some(b) if b.skip < cp.skip => best = Some(cp),
-                    None => best = Some(cp),
-                    _ => {}
-                }
+        let checkpoint = self
+            .folder_checkpoints
+            .iter()
+            .flatten()
+            .filter_map(|cursor| Some((cursor, cursor.distance_to(counts, start)?)))
+            .min_by_key(|&(_, distance)| distance);
+        match (nearest, checkpoint) {
+            (Some((_, row)), Some((cursor, at))) if at < row => Some(cursor.clone()),
+            (Some((index, _)), _) => {
+                let row = &self.folder_rows[index - self.folder_start];
+                upload_store::library::ListingCursor::after_row(
+                    counts,
+                    index,
+                    row.name.as_str(),
+                    row.alias,
+                )
             }
+            (None, checkpoint) => checkpoint.map(|(cursor, _)| cursor.clone()),
         }
-        best.cloned()
     }
 
     /// Record a listing checkpoint for subsequent page refills.
@@ -880,7 +876,7 @@ impl ReaderStore {
     pub fn clear_folder_page(&mut self) {
         self.folder_start = 0;
         self.folder_len = 0;
-        self.folder_checkpoints = [const { None }; 8];
+        self.folder_checkpoints = [const { None }; FOLDER_CHECKPOINTS];
         self.folder_checkpoint_next = 0;
     }
 
@@ -3143,7 +3139,7 @@ mod tests {
         assert!(store.folder_checkpoints.iter().all(|c| c.is_none()));
         assert_eq!(store.folder_checkpoint_next, 0);
         for row in store.folder_rows.iter() {
-            assert!(row.alias.is_none());
+            assert_eq!(row.alias, embedded_sdmmc::ShortFileName::this_dir());
             assert_eq!(row.name.len(), 0);
             assert_eq!(row.size, 0);
             assert!(!row.is_dir);

@@ -13,7 +13,7 @@ use proto::library_path::{BookRoot, LibraryPath};
 use upload_store::library::{
     count_children, count_children_split, count_library_rows, entry_in, for_each_child,
     open_library_root, page_library_rows, page_library_rows_with_cursor, with_book, with_book_at,
-    with_dir, LibraryRow, RowCounts,
+    with_dir, LibraryRow, ListingCursor, RowCounts,
 };
 
 const BLOCK_BYTES: usize = 512;
@@ -1238,6 +1238,99 @@ fn library_rows_are_sorted_a_to_z() {
             ("Sci-Fi", true),
         ]
     );
+}
+
+/// A page lands on the same rows whichever known row it seeks from: none,
+/// one before it, or one after it, so a backward seek or one from the far
+/// end of a region cannot show a page shifted from the walk. Names go on
+/// out of order and in mixed case, and the window is narrower than most
+/// seeks, so a seek takes several walks.
+#[test]
+fn a_page_shows_the_same_rows_whichever_row_it_seeks_from() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    for index in 0..30usize {
+        let shuffled = index * 7 % 30;
+        let name = if shuffled % 3 == 0 {
+            format!("book {shuffled:02}.epub")
+        } else {
+            format!("Book {shuffled:02}.epub")
+        };
+        let file = books.create_file_in_dir_lfn(&name).expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+    for index in 0..9usize {
+        books
+            .make_dir_in_dir_lfn(&format!("Shelf {:02}", index * 4 % 9))
+            .expect("mkdir");
+    }
+    for index in 0..5usize {
+        let file = root
+            .create_file_in_dir_lfn(&format!("Loose {:02}.epub", index * 3 % 5))
+            .expect("create");
+        file.close().expect("close");
+    }
+
+    let counts = count_library_rows(&root, &path(""))
+        .expect("walk")
+        .expect("a directory");
+    let expected = walk_rows(&root, "", 16);
+    assert_eq!(expected.len(), 44);
+    let names: Vec<&str> = expected.iter().map(|(name, _, _)| name.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted[..30].sort_by_key(|name| name.to_ascii_lowercase());
+    assert_eq!(names, sorted, "the shelf's books come back A to Z");
+    let cursor_after = |row: usize| {
+        let dir = if expected[row].2 == BookRoot::CardRoot {
+            &root
+        } else {
+            &books
+        };
+        let alias = entry_in(dir, names[row])
+            .expect("read")
+            .expect("present")
+            .alias;
+        ListingCursor::after_row(counts, row, names[row], alias)
+    };
+
+    let width = 4;
+    let mut window = vec![LibraryRow::default(); width];
+    for skip in 0..names.len() {
+        let want = &names[skip..(skip + width).min(names.len())];
+        let mut anchors = vec![None];
+        for row in [
+            0,
+            skip.saturating_sub(1),
+            skip + 1,
+            skip + 9,
+            names.len() - 1,
+        ] {
+            if row < names.len() {
+                anchors.push(cursor_after(row));
+            }
+        }
+        for anchor in anchors {
+            let mut cursor = anchor.clone();
+            let filled = page_library_rows_with_cursor(
+                &root,
+                &path(""),
+                counts,
+                skip,
+                &mut window,
+                &mut cursor,
+            )
+            .expect("walk")
+            .expect("a directory");
+            let got: Vec<&str> = window[..filled]
+                .iter()
+                .map(|row| row.child.name.as_str())
+                .collect();
+            assert_eq!(got, want, "page at {skip} seeking from {anchor:?}");
+        }
+    }
 }
 
 /// A short name is ISO-8859-1 on the card, and the driver renders each byte as
