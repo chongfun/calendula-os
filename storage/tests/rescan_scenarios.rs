@@ -534,8 +534,8 @@ fn catalog_identity(device: &Device, index: usize) -> (u32, u32) {
 /// either every resident row is there and matches the file, or none is.
 #[test]
 fn a_reload_cut_short_after_a_failed_write_leaves_no_partial_catalog() {
-    let mut cut_reloads = 0;
-    for landed in 0..200 {
+    let (mut cut_reloads, mut swept) = (0, false);
+    'writes: for landed in 0..200 {
         let mut finished = false;
         for reads in 0..200 {
             let card = Card::blank();
@@ -551,7 +551,8 @@ fn a_reload_cut_short_after_a_failed_write_leaves_no_partial_catalog() {
             device.send(StorageCommand::RefreshCatalog);
             device.run_queued();
             if !card.disk.failed() {
-                return assert!(cut_reloads > 0, "some reload was cut short");
+                swept = true;
+                break 'writes;
             }
             if !card.disk.read_failed() {
                 finished = true;
@@ -582,5 +583,6 @@ fn a_reload_cut_short_after_a_failed_write_leaves_no_partial_catalog() {
         }
         assert!(finished, "after {landed} writes the reads ran out first");
     }
-    panic!("the refresh made more writes than the sweep covers");
+    assert!(swept, "the refresh made more writes than the sweep covers");
+    assert!(cut_reloads > 0, "some reload was cut short");
 }
