@@ -123,14 +123,14 @@ impl<'s> ScanProgress<'s> {
                 self.matched = rows;
                 self.advance(new * MATCH_MS_PER_BOOK);
             }
-            AssignProgress::Proving { bytes } => {
+            AssignProgress::Proving { bytes, rows } => {
                 // Whatever of the join was not reported is done now.
                 let unreported = self.books.saturating_sub(self.matched);
                 self.matched = self.books;
                 self.advance(unreported * MATCH_MS_PER_BOOK);
                 self.hash_planned = bytes;
-                // A copy proved is a copy carried, one per file expected.
-                let carries = if bytes > 0 { CARRY_MS } else { 0 };
+                // A copy proved is a copy carried, at most one per row.
+                let carries = u64::from(rows) * CARRY_MS;
                 let left = bytes / HASH_BYTES_PER_MS
                     + carries
                     + self.books * WRITE_MS_PER_BOOK
@@ -138,8 +138,8 @@ impl<'s> ScanProgress<'s> {
                 self.revise(left);
             }
             AssignProgress::Hashed { bytes } => {
-                // Past the plan, the search earns nothing more: a second file
-                // of one length is work the estimate did not hold.
+                // The plan is every row the search can hash, so past it is
+                // nothing it planned for.
                 let bytes = bytes.min(self.hash_planned);
                 let new = bytes.saturating_sub(self.hashed);
                 if new >= HASH_BYTES_PER_MS {
@@ -267,7 +267,7 @@ mod tests {
         progress.assign(AssignProgress::Matched { rows: 1_100 });
         let before_hash = progress.percent();
         let bytes = 11_700_000;
-        progress.assign(AssignProgress::Proving { bytes });
+        progress.assign(AssignProgress::Proving { bytes, rows: 1 });
         assert_eq!(
             progress.percent(),
             before_hash,
@@ -302,7 +302,7 @@ mod tests {
         for rows in (100..=1_000).step_by(100) {
             progress.assign(AssignProgress::Matched { rows });
         }
-        progress.assign(AssignProgress::Proving { bytes: 0 });
+        progress.assign(AssignProgress::Proving { bytes: 0, rows: 0 });
         progress.assigned();
         assert!(progress.percent() >= 90, "{}", progress.percent());
         assert!(progress.percent() <= MAX_REPORTED_PERCENT);
@@ -322,13 +322,37 @@ mod tests {
         assert!(sink.reports().is_empty(), "{:?}", sink.reports());
     }
 
+    /// Two moves, hashed and carried, leave only the ledger write and the
+    /// catalog: the percentage is near the end before them, not stuck where
+    /// a one-carry estimate would leave it.
+    #[test]
+    fn two_moves_hashed_and_carried_reach_the_end() {
+        let mut sink = Ticking::new(5_000);
+        let mut progress = ScanProgress::new(&mut sink, 60);
+        progress.counted(60);
+        progress.walked(60);
+        progress.assign(AssignProgress::Matched { rows: 60 });
+        progress.assign(AssignProgress::Proving {
+            bytes: 17_000_000,
+            rows: 2,
+        });
+        progress.assign(AssignProgress::Hashed { bytes: 17_000_000 });
+        progress.carried();
+        progress.carried();
+        assert!(progress.percent() >= 95, "{}", progress.percent());
+        assert!(progress.percent() <= MAX_REPORTED_PERCENT);
+    }
+
     /// More hashing than planned holds the percentage rather than running it
     /// past the phases still to come.
     #[test]
     fn an_overrun_hash_holds_its_share() {
         let mut sink = Ticking::new(5_000);
         let mut progress = ScanProgress::new(&mut sink, 10);
-        progress.assign(AssignProgress::Proving { bytes: 1_000_000 });
+        progress.assign(AssignProgress::Proving {
+            bytes: 1_000_000,
+            rows: 1,
+        });
         progress.assign(AssignProgress::Hashed { bytes: 1_000_000 });
         let planned = progress.percent();
         progress.assign(AssignProgress::Hashed { bytes: 5_000_000 });

@@ -2458,7 +2458,8 @@ fn a_sideloaded_copy_that_was_read_is_found_again_where_it_went() {
         [
             ledger::AssignProgress::Matched { rows: 1 },
             ledger::AssignProgress::Proving {
-                bytes: u64::from(size)
+                bytes: u64::from(size),
+                rows: 1
             },
         ],
         "{steps:?}"
@@ -2934,5 +2935,54 @@ fn a_copy_nobody_read_takes_the_bytes_seen_at_its_own_place() {
     assert_eq!(
         found_again(),
         vec![(id, BOOK.to_owned(), "Elsewhere.epub".to_owned())],
+    );
+}
+
+/// A deleted copy that was read keeps its digest in the ledger, so the move
+/// search holds it as a copy that could have moved. With no new file of its
+/// length on the card, nothing of that length is hashed, so the plan the
+/// progress reports leaves it out.
+#[test]
+fn the_move_plan_counts_only_lengths_a_new_file_has() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let kept = body(1, 3_000);
+    let gone = body(2, 5_000);
+    let gone_name = "Gone.epub";
+    sideload(&books, BOOK, &kept);
+    sideload(&books, gone_name, &gone);
+    let rows = [
+        (BookRoot::Library, BOOK, kept.len() as u32),
+        (BookRoot::Library, gone_name, gone.len() as u32),
+    ];
+    let mut random = words();
+    scan_minting(&root, &rows, &mut random).unwrap();
+    note_open(&root, BookRoot::Library, BOOK, &kept);
+    note_open(&root, BookRoot::Library, gone_name, &gone);
+    let _ = found_again();
+
+    // One moved, the other deleted.
+    let moved = "Herbert, Frank - Dune.epub";
+    rename_on_shelf(&root, BOOK, moved);
+    let _ = progress();
+    let (assigned, _) = scan_minting(
+        &root,
+        &[(BookRoot::Library, moved, kept.len() as u32)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(assigned.repaired, 1, "{assigned:?}");
+    let planned: Vec<u64> = progress()
+        .iter()
+        .filter_map(|step| match step {
+            ledger::AssignProgress::Proving { bytes, .. } => Some(*bytes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        planned,
+        vec![kept.len() as u64],
+        "the deleted copy's length has no file"
     );
 }

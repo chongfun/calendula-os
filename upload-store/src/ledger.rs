@@ -893,11 +893,9 @@ pub struct FoundAgain<'a> {
 pub enum AssignProgress {
     /// `rows` rows have been joined against the ledger by place.
     Matched { rows: u16 },
-    /// The move search will read about `bytes` of files to prove moves. An
-    /// estimate: one file per distinct length a missing copy had, which a
-    /// second file of that length overruns and a length nobody holds
-    /// undershoots.
-    Proving { bytes: u64 },
+    /// The move search will read at most `bytes` of files to prove moves, in
+    /// `rows` new rows of a length some missing copy had.
+    Proving { bytes: u64, rows: u16 },
     /// `bytes` of files read for the move search so far, in this scan.
     Hashed { bytes: u64 },
 }
@@ -999,15 +997,6 @@ fn move_entry(table: &[u8], slot: usize) -> &[u8] {
 
 fn move_u16(entry: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([entry[at], entry[at + 1]])
-}
-
-/// The length of the copy a slot is looking for.
-fn move_size(table: &[u8], slot: usize) -> u32 {
-    u32::from_le_bytes(
-        move_entry(table, slot)[MOVE_SIZE..MOVE_ID]
-            .try_into()
-            .expect("four bytes"),
-    )
 }
 
 /// Whether files of `byte_size` still say anything about this copy: one
@@ -1266,17 +1255,27 @@ where
             })?;
         }
     }
-    // One file per distinct length is the usual move: the copy itself.
-    let mut bytes = 0u64;
-    for slot in 0..slots {
-        let size = move_size(table, slot);
-        if move_awaits(table, slot, size)
-            && !(0..slot).any(|earlier| move_awaits(table, earlier, size))
-        {
-            bytes = bytes.saturating_add(u64::from(size));
+    // The search below hashes every new row of a length a copy awaits, so
+    // the plan is those rows. A copy deleted rather than moved has no row of
+    // its length and adds nothing.
+    let (mut bytes, mut rows) = (0u64, 0u16);
+    if slots > 0 {
+        seek_row(catalog, 0)?;
+        for _ in 0..count as usize {
+            if !read_exact(catalog, &mut record)? {
+                return Err(LedgerFault::Device);
+            }
+            if catalog_record_book_id(&record).is_some() {
+                continue;
+            }
+            let (_, _, byte_size) = catalog_record_at(&record).ok_or(LedgerFault::Record)?;
+            if (0..slots).any(|slot| move_awaits(table, slot, byte_size)) {
+                bytes = bytes.saturating_add(u64::from(byte_size));
+                rows = rows.saturating_add(1);
+            }
         }
     }
-    progress(AssignProgress::Proving { bytes });
+    progress(AssignProgress::Proving { bytes, rows });
     let mut engine = Counted {
         engine,
         progress,
