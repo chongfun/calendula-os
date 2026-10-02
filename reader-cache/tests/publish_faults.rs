@@ -5179,10 +5179,13 @@ fn raw_short_name(name: &str) -> [u8; 11] {
 fn blocks_holding_slots(disk: &SharedDisk, names: &[String]) -> Vec<u32> {
     let raws: Vec<[u8; 11]> = names.iter().map(|n| raw_short_name(n)).collect();
     let data = disk.data.borrow();
-    data.chunks_exact(BLOCK_BYTES)
+    let (blocks, _) = data.as_chunks::<BLOCK_BYTES>();
+    blocks
+        .iter()
         .enumerate()
         .filter(|(_, block)| {
-            block.chunks_exact(DIR_ENTRY_BYTES).any(|slot| {
+            let (slots, _) = block.as_chunks::<DIR_ENTRY_BYTES>();
+            slots.iter().any(|slot| {
                 raws.iter()
                     .any(|raw| slot[1..11] == raw[1..11] && (slot[0] == raw[0] || slot[0] == 0xE5))
             })
