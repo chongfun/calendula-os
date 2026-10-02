@@ -52,6 +52,7 @@ impl std::error::Error for DiskError {}
 pub struct Disk {
     bytes: Rc<RefCell<Vec<u8>>>,
     writes: Rc<Cell<u64>>,
+    refuse_writes: Rc<Cell<u32>>,
 }
 
 impl Disk {
@@ -59,6 +60,12 @@ impl Disk {
     /// rebuilt without relying on log lines.
     pub fn writes(&self) -> u64 {
         self.writes.get()
+    }
+
+    /// Refuse the next `count` write commands, landing nothing, as a card
+    /// with a passing fault does.
+    pub fn refuse_next_writes(&self, count: u32) {
+        self.refuse_writes.set(count);
     }
 }
 
@@ -75,6 +82,10 @@ impl BlockDevice for Disk {
     }
 
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
+        if self.refuse_writes.get() > 0 {
+            self.refuse_writes.set(self.refuse_writes.get() - 1);
+            return Err(DiskError);
+        }
         let mut bytes = self.bytes.borrow_mut();
         for (i, block) in blocks.iter().enumerate() {
             let at = (start.0 as usize + i) * BLOCK_BYTES;
@@ -116,6 +127,7 @@ impl Card {
             disk: Disk {
                 bytes: Rc::new(RefCell::new(image)),
                 writes: Rc::new(Cell::new(0)),
+                refuse_writes: Rc::new(Cell::new(0)),
             },
         }
     }
@@ -752,6 +764,12 @@ impl Device {
 
     /// Move the cursor to the row named `name` and press Confirm.
     pub fn choose(&mut self, name: &str) {
+        self.point_at(name);
+        self.press(Button::Confirm);
+    }
+
+    /// Move the cursor to the row named `name`.
+    pub fn point_at(&mut self, name: &str) {
         let rows = self.rows();
         let index = rows
             .iter()
@@ -764,7 +782,6 @@ impl Device {
         while usize::from(self.app.selection) > start + index {
             self.press(Button::Previous);
         }
-        self.press(Button::Confirm);
     }
 
     /// Turn `pages` pages forward.

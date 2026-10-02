@@ -35,6 +35,27 @@ fn open_after_boot(card: &Card, folder: &str, name: &str) -> Device {
     device
 }
 
+/// A folder of two books, then a book added at the card root while the
+/// device is off. The reader opens the second folder book and reads to page
+/// 9, which is still coalesced: the card holds an older page.
+fn second_book_read_with_a_book_added() -> (Card, Device) {
+    let card = Card::blank();
+    card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
+    card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
+    Device::wake(&card).sleep();
+    card.put(ADDED, &epub("Added", 4, 3));
+
+    let mut device = open_after_boot(&card, "Shelf", SECOND);
+    device.turn(9);
+    assert_eq!(device.app.page, 9);
+    assert_eq!(
+        device.task.pending_progress.map(|record| record.screen),
+        Some(9),
+        "page 9 is still coalesced when the reader leaves"
+    );
+    (card, device)
+}
+
 /// The recipe owed by the departing-book close-out on the X3. A computer adds
 /// a book at the card root while the device is off, so the boot keeps a
 /// catalog that lacks it. The reader opens the second book of a folder and
@@ -44,21 +65,8 @@ fn open_after_boot(card: &Card, folder: &str, name: &str) -> Device {
 /// page has to reach it, not the book now holding its old row.
 #[test]
 fn a_rescan_under_the_open_book_saves_its_page_to_it() {
-    let card = Card::blank();
-    card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
-    card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
-    Device::wake(&card).sleep();
-    card.put(ADDED, &epub("Added", 4, 3));
-
-    let mut device = open_after_boot(&card, "Shelf", SECOND);
+    let (card, mut device) = second_book_read_with_a_book_added();
     let row_before = device.app.book_id;
-    device.turn(9);
-    assert_eq!(device.app.page, 9);
-    assert_eq!(
-        device.task.pending_progress.map(|record| record.screen),
-        Some(9),
-        "page 9 is still coalesced when the reader leaves, so the card holds an older page"
-    );
     to_library_root(&mut device);
     device.choose(ADDED);
     assert!(
@@ -84,6 +92,45 @@ fn a_rescan_under_the_open_book_saves_its_page_to_it() {
         device.app.page, 0,
         "the book now at the second's old row was not given its page"
     );
+    device.sleep();
+
+    let device = open_after_boot(&card, "Shelf", SECOND);
+    assert_eq!(device.app.page, 9, "the second book kept its page");
+}
+
+/// The write before the rescan is refused. The scan would drop the pages that
+/// turn page 9 into a place, so the pick is refused instead, and the next pick
+/// writes the page before it scans.
+#[test]
+fn a_refused_write_before_the_rescan_refuses_the_pick() {
+    let (card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    device.point_at(ADDED);
+    let before = device.log.len();
+    card.disk.refuse_next_writes(1);
+    device.press(Button::Confirm);
+    let events = &device.log[before..];
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::RowFailed { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "no scan dropped the pages: {events:?}"
+    );
+    assert_eq!(device.app.view, AppView::Library);
+    assert_eq!(
+        device.task.pending_progress.map(|record| record.screen),
+        Some(9),
+        "page 9 is still owed"
+    );
+
+    device.choose(ADDED);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
     device.sleep();
 
     let device = open_after_boot(&card, "Shelf", SECOND);

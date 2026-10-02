@@ -1003,13 +1003,16 @@ pub fn handle_storage_command(
             host.send(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
-            scan_books_after_flush(
+            if !scan_books_after_flush(
                 card,
                 sd_library,
                 pending_progress,
                 last_progress_write,
                 pending_place,
-            );
+            ) {
+                host.requeue(StorageCommand::RefreshCatalog);
+                return;
+            }
             restore_saved_state(card, host, sd_library, state_restored, false);
             host.send(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),
@@ -1698,13 +1701,18 @@ pub fn handle_storage_command(
                     // cannot be opened. Only a card edited since the last
                     // scan pays for this, once, which is what keeps every
                     // other boot on the warm snapshot.
-                    scan_books_after_flush(
+                    if !scan_books_after_flush(
                         card,
                         sd_library,
                         pending_progress,
                         last_progress_write,
                         pending_place,
-                    );
+                    ) {
+                        // Nothing moved, and the page is still resident for
+                        // the next pick to write.
+                        host.send_required(&LibraryEvent::RowFailed { request_id });
+                        return;
+                    }
                     restore_saved_state(card, host, sd_library, state_restored, true);
                     host.send(&LibraryEvent::Scanned {
                         count: sd_library.catalog_count_u16(),
@@ -2094,26 +2102,29 @@ pub fn restore_saved_state(
     });
 }
 
-/// Scan the card after writing any coalesced position. The scan borrows the
-/// text arena and drops the resident pages, after which a save cannot find
-/// the anchor of the reader's page and its place record goes unwritten.
+/// Scan the card after writing any coalesced position, or not at all. The
+/// scan borrows the text arena and drops the resident pages, after which the
+/// reader's page has no anchor and its place record cannot be written. False
+/// when the write was refused, which leaves it owed and the pages resident.
 fn scan_books_after_flush(
     card: &mut impl Card,
     sd_library: &mut ReaderStore,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     pending_place: &mut Option<PendingPlace>,
-) {
-    // A refused flush stays owed. The scan goes ahead: the catalog is what
-    // the reader is waiting on.
-    let _ = flush_pending_progress(
+) -> bool {
+    if !flush_pending_progress(
         card,
         sd_library,
         pending_progress,
         last_progress_write,
         pending_place,
-    );
+    ) {
+        slog!("sd: the reading position would not save; not scanning over it");
+        return false;
+    }
     crate::library_sd::scan_books(card, sd_library);
+    true
 }
 
 pub fn flush_pending_progress(
