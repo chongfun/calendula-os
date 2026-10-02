@@ -835,7 +835,8 @@ its size, where a move per name walked six times, and writes each source
 block once and each destination block twice: the new entries first under a
 free mark, then the mark lifted, so a sector the card took only the front of
 shows a free slot or a whole entry, not a name over another file's cluster.
-Each batch links every name before unlinking any. A carry cut
+The index's single move writes its entry the same way. Each batch links
+every name before unlinking any. A carry cut
 short leaves the new key with no index, and the old key with a gap the
 loader already handles. Every header but the cover's names the `(source_hash,
 size)` of the book's place, and loaders refuse a header for another place.

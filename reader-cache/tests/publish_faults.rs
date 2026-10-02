@@ -5174,24 +5174,25 @@ fn raw_short_name(name: &str) -> [u8; 11] {
     raw
 }
 
-/// The blocks of the card holding a directory slot under one of `names`,
-/// live or deleted: the directory sectors those entries were ever in.
-fn blocks_holding_slots(disk: &SharedDisk, names: &[String]) -> Vec<u32> {
+/// Every directory slot on the card under one of `names`, live or deleted,
+/// as `(block, slot)`: the sectors and slots those entries were ever in.
+fn slots_holding(disk: &SharedDisk, names: &[String]) -> Vec<(u32, usize)> {
     let raws: Vec<[u8; 11]> = names.iter().map(|n| raw_short_name(n)).collect();
     let data = disk.data.borrow();
     let (blocks, _) = data.as_chunks::<BLOCK_BYTES>();
-    blocks
-        .iter()
-        .enumerate()
-        .filter(|(_, block)| {
-            let (slots, _) = block.as_chunks::<DIR_ENTRY_BYTES>();
-            slots.iter().any(|slot| {
-                raws.iter()
-                    .any(|raw| slot[1..11] == raw[1..11] && (slot[0] == raw[0] || slot[0] == 0xE5))
-            })
-        })
-        .map(|(block, _)| block as u32)
-        .collect()
+    let mut found = Vec::new();
+    for (block, bytes) in blocks.iter().enumerate() {
+        let (slots, _) = bytes.as_chunks::<DIR_ENTRY_BYTES>();
+        for (slot, entry) in slots.iter().enumerate() {
+            if raws
+                .iter()
+                .any(|raw| entry[1..11] == raw[1..11] && (entry[0] == raw[0] || entry[0] == 0xE5))
+            {
+                found.push((block as u32, slot));
+            }
+        }
+    }
+    found
 }
 
 /// Whether the directory under `key` holds a marker of this kind: a
@@ -5690,8 +5691,10 @@ fn published_book_of(
 /// finishes. Cuts fall at a slot's first byte, inside the name, at the
 /// attributes, the cluster and the size, for every slot a write changes.
 ///
-/// The book-level files, markers and claim are written one entry per
-/// sector by the single move and the file creates, as before this batch,
+/// `BOOK.BIN` moves alone through the single move, which writes its entry
+/// the same two-pass way, so its slot is swept too: a tear there must not
+/// show the index under the new key before every section. The markers and
+/// the claim are file creates with one write per entry, as before this PR,
 /// and the header tear above skips directory sectors; neither is swept here.
 #[test]
 fn a_carry_torn_inside_any_directory_entry_is_finished_by_the_retry() {
@@ -5700,13 +5703,14 @@ fn a_carry_torn_inside_any_directory_entry_is_finished_by_the_retry() {
     const CUTS: [usize; 8] = [0, 1, 11, 12, 20, 26, 28, 31];
     let sections = SECTIONS as u16;
     let section_names: Vec<String> = (0..sections).map(section_name).collect();
+    let index_name = vec![proto::cache::CACHE_BOOK_FILE.to_string()];
 
-    // A clean carry, every write logged, says which writes fill the
-    // sectors the section entries leave or land in, and what a directory
-    // may list along the way. A new directory's first block, `.` and `..`,
-    // is the make_dir's single write, not the batch's.
+    // A clean carry, every write logged, says which writes fill the sectors
+    // the section entries leave or land in, which touch the index's slot,
+    // and what a directory may list along the way. A new directory's first
+    // block, `.` and `..`, is the make_dir's single write, not the batch's.
     let mut allowed: Vec<String>;
-    let targets: Vec<(u32, u16)> = {
+    let targets: Vec<(u32, u16, bool)> = {
         let disk = new_card();
         let mgr = open_mgr(&disk);
         let root = open_root(&mgr);
@@ -5728,23 +5732,42 @@ fn a_carry_torn_inside_any_directory_entry_is_finished_by_the_retry() {
         allowed.extend(names_under(&root, NOW.key));
         allowed.push(format!("{}.{FORWARD_MARKER}", NOW.key));
         allowed.push(format!("{KEY}.{BACK_MARKER}"));
-        let blocks = blocks_holding_slots(&disk, &section_names);
+        let section_blocks: Vec<u32> = slots_holding(&disk, &section_names)
+            .into_iter()
+            .map(|(block, _)| block)
+            .collect();
+        let index_slots = slots_holding(&disk, &index_name);
         let log = disk.write_log.borrow();
         log.iter()
-            .filter(|(_, block, mask, makes_dir)| {
-                *mask != 0 && !*makes_dir && blocks.contains(block)
+            .filter(|(_, _, _, makes_dir)| !*makes_dir)
+            .filter_map(|(index, block, mask, _)| {
+                // Every changed slot of a section sector; of a book
+                // sector, the index's slot alone.
+                let index_mask = index_slots
+                    .iter()
+                    .filter(|(b, _)| b == block)
+                    .fold(0u16, |acc, (_, slot)| acc | (1 << slot));
+                let mask = if section_blocks.contains(block) {
+                    *mask
+                } else {
+                    *mask & index_mask
+                };
+                (mask != 0).then_some((*index, mask, mask & index_mask != 0))
             })
-            .map(|(index, _, mask, _)| (*index, *mask))
             .collect()
     };
     assert!(
-        targets.iter().any(|(_, mask)| mask.count_ones() >= 14),
+        targets.iter().any(|(_, mask, _)| mask.count_ones() >= 14),
         "no write filled a sector with the batch's entries, so the sweep misses the batched link"
+    );
+    assert!(
+        targets.iter().any(|(_, _, index)| *index),
+        "no write touched the index's slot, so the sweep misses the single move"
     );
 
     let mut partial = 0usize;
     let mut twins = 0usize;
-    for (index, mask) in targets {
+    for (index, mask, _) in targets {
         for slot in (0..BLOCK_BYTES / DIR_ENTRY_BYTES).filter(|slot| mask & (1 << slot) != 0) {
             for cut in CUTS {
                 let context = format!("write {index} slot {slot} cut {cut}");
