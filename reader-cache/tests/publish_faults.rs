@@ -40,6 +40,8 @@ use reader_cache::store::{
 };
 
 const BLOCK_BYTES: usize = 512;
+/// One FAT directory entry.
+const DIR_ENTRY_BYTES: usize = 32;
 /// 16 MiB card: big enough that fatfs picks FAT16 and small enough to stay fast.
 const DISK_BLOCKS: u32 = 32 * 1024;
 const PART_START_BLOCK: u32 = 64;
@@ -98,6 +100,11 @@ struct FaultPlan {
     /// `tear_write_after` bytes, and lose every later write. Counting only header
     /// sectors aims the tear at the identity rewrites, not at directory entries.
     tear_header_write_in: Cell<Option<u32>>,
+    /// Tear the write with this number, counted from the card's first, after
+    /// `tear_write_after` bytes, and lose every later write. A dry run with
+    /// `log_writes` on numbers the writes, so a tear can be aimed at the
+    /// directory sectors the carry fills, which the header tear leaves alone.
+    tear_write_at: Cell<Option<u32>>,
     /// Refuse every write to these blocks while they are listed, so one directory
     /// can refuse an update another accepts.
     fail_writes_to: RefCell<Vec<u32>>,
@@ -127,6 +134,14 @@ struct FaultyDisk {
     /// Blocks asked for, as the firmware's `sd_stats` counts them.
     read_blocks: Cell<u32>,
     write_blocks: Cell<u32>,
+    /// While on, record each write's number, first block, which of the
+    /// block's sixteen 32-byte slots it changed, and whether it is a new
+    /// directory's first block, `.` and `..` over free slots.
+    log_writes: Cell<bool>,
+    write_log: RefCell<Vec<(u32, u32, u16, bool)>>,
+    /// Whether the last `tear_write_at` landed a sector part new and part
+    /// old: the state neither a whole write nor a refused one produces.
+    tear_was_partial: Cell<bool>,
 }
 
 /// The test holds one `Rc` handle for arming faults while the `VolumeManager`
@@ -187,6 +202,40 @@ impl BlockDevice for SharedDisk {
         {
             return Err(DiskError);
         }
+        if self.log_writes.get() {
+            let data = self.data.borrow();
+            let at = start.0 as usize * BLOCK_BYTES;
+            let mut mask = 0u16;
+            for slot in 0..BLOCK_BYTES / DIR_ENTRY_BYTES {
+                let from = slot * DIR_ENTRY_BYTES;
+                let to = from + DIR_ENTRY_BYTES;
+                if data[at + from..at + to] != blocks[0][from..to] {
+                    mask |= 1 << slot;
+                }
+            }
+            let makes_dir = blocks[0][0] == b'.' && (data[at] == 0 || data[at] == 0xE5);
+            drop(data);
+            self.write_log
+                .borrow_mut()
+                .push((index, start.0, mask, makes_dir));
+        }
+        if self.fault.tear_write_at.get() == Some(index) {
+            self.fault.tear_write_at.set(None);
+            let bytes = self
+                .fault
+                .tear_write_after
+                .take()
+                .unwrap_or(0)
+                .min(BLOCK_BYTES);
+            let mut data = self.data.borrow_mut();
+            let at = start.0 as usize * BLOCK_BYTES;
+            let old = &data[at..at + BLOCK_BYTES];
+            self.tear_was_partial
+                .set(old[..bytes] != blocks[0][..bytes] && old[bytes..] != blocks[0][bytes..]);
+            data[at..at + bytes].copy_from_slice(&blocks[0][..bytes]);
+            self.fault.fail_writes_from.set(Some(index + 1));
+            return Err(DiskError);
+        }
         if self.fault.tear_header_write_in.get().is_some() {
             let header = proto::cache::decode_book_v2_header(&blocks[0][..56]).is_ok()
                 || proto::cache::decode_section_v2_header(&blocks[0][..56]).is_ok()
@@ -201,12 +250,15 @@ impl BlockDevice for SharedDisk {
                 self.fault.fail_writes_from.set(Some(index + 1));
                 return Err(DiskError);
             }
-        } else if let Some(bytes) = self.fault.tear_write_after.take() {
-            let mut data = self.data.borrow_mut();
-            let at = start.0 as usize * BLOCK_BYTES;
-            let landed = bytes.min(BLOCK_BYTES);
-            data[at..at + landed].copy_from_slice(&blocks[0][..landed]);
-            return Err(DiskError);
+        } else if self.fault.tear_write_at.get().is_none() {
+            // An armed `tear_write_at` keeps the byte count for its write.
+            if let Some(bytes) = self.fault.tear_write_after.take() {
+                let mut data = self.data.borrow_mut();
+                let at = start.0 as usize * BLOCK_BYTES;
+                let landed = bytes.min(BLOCK_BYTES);
+                data[at..at + landed].copy_from_slice(&blocks[0][..landed]);
+                return Err(DiskError);
+            }
         }
         if FaultPlan::take_fault(&self.fault.fail_write_in) {
             return Err(DiskError);
@@ -276,6 +328,9 @@ fn new_card() -> SharedDisk {
         reads: Cell::new(0),
         read_blocks: Cell::new(0),
         write_blocks: Cell::new(0),
+        log_writes: Cell::new(false),
+        write_log: RefCell::new(Vec::new()),
+        tear_was_partial: Cell::new(false),
     }))
 }
 
@@ -4996,9 +5051,10 @@ fn cluster_of(dir: &Dir<'_>, name: &str) -> Option<embedded_sdmmc::ClusterId> {
         .map(|entry| entry.cluster)
 }
 
-/// Every data name the carry moves, including the fixture's three sections.
-fn carried_names() -> Vec<(bool, String)> {
-    let mut names: Vec<(bool, String)> = (0..3u16).map(|n| (true, section_name(n))).collect();
+/// Every data name a carry of a book of `sections` sections moves: the
+/// sections, then the book-level files with the index last.
+fn carried_names_for(sections: u16) -> Vec<(bool, String)> {
+    let mut names: Vec<(bool, String)> = (0..sections).map(|n| (true, section_name(n))).collect();
     for name in [
         proto::cache::CACHE_CONTENT_FILE,
         proto::cache::CACHE_TOC_FILE,
@@ -5011,17 +5067,27 @@ fn carried_names() -> Vec<(bool, String)> {
 }
 
 /// The first cluster of each carried name under `key`, `None` where the name
-/// is absent. Reads the directory rather than any header.
+/// is absent, for the fixture's three sections.
 fn carried_clusters(root: &Dir<'_>, key: &str) -> Vec<Option<embedded_sdmmc::ClusterId>> {
+    carried_clusters_for(root, key, 3)
+}
+
+/// [`carried_clusters`] for a book of `sections` sections, in the order of
+/// [`carried_names_for`]. Reads the directory rather than any header.
+fn carried_clusters_for(
+    root: &Dir<'_>,
+    key: &str,
+    sections: u16,
+) -> Vec<Option<embedded_sdmmc::ClusterId>> {
     let Some(book) = book_dir_by_key(root, key) else {
-        return vec![None; carried_names().len()];
+        return vec![None; carried_names_for(sections).len()];
     };
-    let sections = book.open_dir(proto::cache::CACHE_SECTIONS_DIR).ok();
-    carried_names()
+    let sections_dir = book.open_dir(proto::cache::CACHE_SECTIONS_DIR).ok();
+    carried_names_for(sections)
         .iter()
         .map(|(in_sections, name)| {
             if *in_sections {
-                sections.as_ref().and_then(|dir| cluster_of(dir, name))
+                sections_dir.as_ref().and_then(|dir| cluster_of(dir, name))
             } else {
                 cluster_of(&book, name)
             }
@@ -5054,16 +5120,75 @@ fn shared_chains(root: &Dir<'_>, a: &str, b: &str) -> usize {
 }
 
 fn twin_pairs_between(root: &Dir<'_>, a: &str, b: &str) -> usize {
-    let old = carried_clusters(root, a);
-    let new = carried_clusters(root, b);
+    twin_pairs_for(root, a, b, 3)
+}
+
+/// [`twin_pairs_between`] for a book of `sections` sections.
+fn twin_pairs_for(root: &Dir<'_>, a: &str, b: &str, sections: u16) -> usize {
+    let old = carried_clusters_for(root, a, sections);
+    let new = carried_clusters_for(root, b, sections);
     let mut twins = 0;
-    for ((in_old, in_new), (_, name)) in old.iter().zip(new.iter()).zip(carried_names()) {
+    for ((in_old, in_new), (_, name)) in old.iter().zip(new.iter()).zip(carried_names_for(sections))
+    {
         if let (Some(a), Some(b)) = (in_old, in_new) {
             assert_eq!(a, b, "{name} is in both directories on different chains");
             twins += 1;
         }
     }
     twins
+}
+
+/// Every name a directory lists, as a reader sees it, but `.` and `..`.
+fn dir_names(dir: &Dir<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    dir.iterate_dir(|entry| {
+        let name = entry.name.to_string();
+        if name != "." && name != ".." {
+            names.push(name);
+        }
+        core::ops::ControlFlow::Continue(())
+    })
+    .expect("list the directory");
+    names
+}
+
+/// Every name listed under `key`: the book directory's and its `SECTIONS/`.
+fn names_under(root: &Dir<'_>, key: &str) -> Vec<String> {
+    let Some(book) = book_dir_by_key(root, key) else {
+        return Vec::new();
+    };
+    let mut names = dir_names(&book);
+    if let Ok(sections) = book.open_dir(proto::cache::CACHE_SECTIONS_DIR) {
+        names.extend(dir_names(&sections));
+    }
+    names
+}
+
+/// `name` as a directory slot stores it: eight bytes of base, three of
+/// extension, space padded.
+fn raw_short_name(name: &str) -> [u8; 11] {
+    let (base, ext) = name.split_once('.').unwrap_or((name, ""));
+    let mut raw = [b' '; 11];
+    raw[..base.len()].copy_from_slice(base.as_bytes());
+    raw[8..8 + ext.len()].copy_from_slice(ext.as_bytes());
+    raw
+}
+
+/// The blocks of the card holding a directory slot under one of `names`,
+/// live or deleted: the directory sectors those entries were ever in.
+fn blocks_holding_slots(disk: &SharedDisk, names: &[String]) -> Vec<u32> {
+    let raws: Vec<[u8; 11]> = names.iter().map(|n| raw_short_name(n)).collect();
+    let data = disk.data.borrow();
+    data.chunks_exact(BLOCK_BYTES)
+        .enumerate()
+        .filter(|(_, block)| {
+            block.chunks_exact(DIR_ENTRY_BYTES).any(|slot| {
+                raws.iter()
+                    .any(|raw| slot[1..11] == raw[1..11] && (slot[0] == raw[0] || slot[0] == 0xE5))
+            })
+        })
+        .map(|(block, _)| block as u32)
+        .collect()
 }
 
 /// Whether the directory under `key` holds a marker of this kind: a
@@ -5532,6 +5657,229 @@ fn a_cut_move_with_a_legacy_position_is_finished_by_the_retry() {
             );
         }
     }
+}
+
+/// [`published_book`] with `sections` sections: a book whose section files
+/// fill one listing batch and spill into a second directory block.
+fn published_book_of(
+    root: &Dir<'_>,
+    store: &mut ReaderStore,
+    sections: usize,
+) -> (Vec<BookV2SectionRecord>, u32) {
+    let records = build_book(root, store, sections);
+    write_cover(root);
+    let pages = total_pages(&records);
+    store.begin_book_load();
+    let outcome =
+        publish::publish_book_cache(root, &OWNER, IDENTITY, 0, store, &records, pages, false, 0);
+    assert_eq!(outcome.outcome, BookPublishOutcome::Ready);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    (records, pages)
+}
+
+/// Tear each write to the section directories inside its entries, then lose
+/// every later write, as a card that took the front of a sector before power
+/// went. The batched link packs sixteen entries into a sector, so a tear can
+/// land whole earlier entries and part of the next. The fork writes each
+/// such block twice, the entries first under a free mark and then the mark
+/// lifted, so a remount lists a free slot or a whole entry: no name the
+/// carry did not write, no name on another file's chain, and the retry
+/// finishes. Cuts fall at a slot's first byte, inside the name, at the
+/// attributes, the cluster and the size, for every slot a write changes.
+///
+/// The book-level files, markers and claim are written one entry per
+/// sector by the single move and the file creates, as before this batch,
+/// and the header tear above skips directory sectors; neither is swept here.
+#[test]
+fn a_carry_torn_inside_any_directory_entry_is_finished_by_the_retry() {
+    // One listing batch, spanning two directory blocks on each side.
+    const SECTIONS: usize = 16;
+    const CUTS: [usize; 8] = [0, 1, 11, 12, 20, 26, 28, 31];
+    let sections = SECTIONS as u16;
+    let section_names: Vec<String> = (0..sections).map(section_name).collect();
+
+    // A clean carry, every write logged, says which writes fill the
+    // sectors the section entries leave or land in, and what a directory
+    // may list along the way. A new directory's first block, `.` and `..`,
+    // is the make_dir's single write, not the batch's.
+    let mut allowed: Vec<String>;
+    let targets: Vec<(u32, u16)> = {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        let mut store = new_store();
+        let _ = published_book_of(&root, &mut store, SECTIONS);
+        allowed = names_under(&root, KEY);
+        disk.log_writes.set(true);
+        files::carry_pagination(
+            &root,
+            &OWNER,
+            &NOW,
+            hashed(b"the book"),
+            IDENTITY,
+            identity_at(&NOW),
+        )
+        .expect("the clean carry is not refused")
+        .expect("there was something to carry");
+        disk.log_writes.set(false);
+        allowed.extend(names_under(&root, NOW.key));
+        allowed.push(format!("{}.{FORWARD_MARKER}", NOW.key));
+        allowed.push(format!("{KEY}.{BACK_MARKER}"));
+        let blocks = blocks_holding_slots(&disk, &section_names);
+        let log = disk.write_log.borrow();
+        log.iter()
+            .filter(|(_, block, mask, makes_dir)| {
+                *mask != 0 && !*makes_dir && blocks.contains(block)
+            })
+            .map(|(index, _, mask, _)| (*index, *mask))
+            .collect()
+    };
+    assert!(
+        targets.iter().any(|(_, mask)| mask.count_ones() >= 14),
+        "no write filled a sector with the batch's entries, so the sweep misses the batched link"
+    );
+
+    let mut partial = 0usize;
+    let mut twins = 0usize;
+    for (index, mask) in targets {
+        for slot in (0..BLOCK_BYTES / DIR_ENTRY_BYTES).filter(|slot| mask & (1 << slot) != 0) {
+            for cut in CUTS {
+                let context = format!("write {index} slot {slot} cut {cut}");
+                let disk = new_card();
+                let pages;
+                let last_page;
+                let before;
+                {
+                    let mgr = open_mgr(&disk);
+                    let root = open_root(&mgr);
+                    let mut store = new_store();
+                    let (records, total) = published_book_of(&root, &mut store, SECTIONS);
+                    pages = total;
+                    last_page = records[SECTIONS - 1].start_page;
+                    before = carried_clusters_for(&root, KEY, sections);
+                    disk.fault.tear_write_at.set(Some(index));
+                    disk.fault
+                        .tear_write_after
+                        .set(Some(slot * DIR_ENTRY_BYTES + cut));
+                    let first = files::carry_pagination(
+                        &root,
+                        &OWNER,
+                        &NOW,
+                        hashed(b"the book"),
+                        IDENTITY,
+                        identity_at(&NOW),
+                    );
+                    assert!(
+                        disk.fault.tear_write_at.get().is_none(),
+                        "{context}: the carry made fewer writes than the clean run"
+                    );
+                    assert!(
+                        first.is_err(),
+                        "{context}: a carry cut by power loss says so"
+                    );
+                    disk.fault.fail_writes_from.set(None);
+                    if disk.tear_was_partial.get() {
+                        partial += 1;
+                    }
+                }
+                // The card as a reset leaves it.
+                {
+                    let mgr = open_mgr(&disk);
+                    let root = open_root(&mgr);
+                    for key in [KEY, NOW.key] {
+                        for name in names_under(&root, key) {
+                            assert!(
+                                allowed.contains(&name),
+                                "{context}: {key} lists {name:?}, which no carry writes"
+                            );
+                        }
+                    }
+                    let old = carried_clusters_for(&root, KEY, sections);
+                    let new = carried_clusters_for(&root, NOW.key, sections);
+                    for (((was, old), new), (_, name)) in before
+                        .iter()
+                        .zip(&old)
+                        .zip(&new)
+                        .zip(carried_names_for(sections))
+                    {
+                        // The fixture has no content stream or chapter list.
+                        let Some(was) = was else {
+                            continue;
+                        };
+                        match (old, new) {
+                            (None, None) => panic!("{context}: {name} lost every name"),
+                            (Some(old), Some(new)) => {
+                                assert_eq!(
+                                    old, new,
+                                    "{context}: {name} is under both keys on different chains"
+                                );
+                                assert_eq!(old, was, "{context}: {name} stands on another chain");
+                                twins += 1;
+                            }
+                            (Some(kept), None) | (None, Some(kept)) => {
+                                assert_eq!(kept, was, "{context}: {name} stands on another chain");
+                            }
+                        }
+                    }
+                    if new[SECTIONS + 3].is_some() {
+                        assert!(
+                            new[..SECTIONS].iter().all(Option::is_some),
+                            "{context}: the index is under the new key before every section"
+                        );
+                    }
+
+                    files::carry_pagination(
+                        &root,
+                        &OWNER,
+                        &NOW,
+                        hashed(b"the book"),
+                        IDENTITY,
+                        identity_at(&NOW),
+                    )
+                    .unwrap_or_else(|denied| {
+                        panic!("{context}: the retry was refused: {denied:?}")
+                    });
+                    let after = carried_clusters_for(&root, NOW.key, sections);
+                    assert_eq!(
+                        after.iter().flatten().count(),
+                        SECTIONS + 2,
+                        "{context}: the retry brought the sections, the index and the cover across"
+                    );
+                    assert!(
+                        carried_clusters_for(&root, KEY, sections)
+                            .iter()
+                            .all(Option::is_none),
+                        "{context}: the retry left nothing behind"
+                    );
+                    assert_eq!(
+                        twin_pairs_for(&root, KEY, NOW.key, sections),
+                        0,
+                        "{context}"
+                    );
+                    assert!(
+                        !marker_present(&root, KEY, FORWARD_MARKER),
+                        "{context}: forward marker left"
+                    );
+                    assert!(
+                        !marker_present(&root, NOW.key, BACK_MARKER),
+                        "{context}: back marker left"
+                    );
+                    for cluster in after.into_iter().flatten() {
+                        assert!(
+                            chain_is_allocated(&root, cluster),
+                            "{context}: a carried chain was freed"
+                        );
+                    }
+                    assert_loads_under(&root, &NOW, identity_at(&NOW), pages, last_page);
+                }
+            }
+        }
+    }
+    assert!(
+        partial > 0,
+        "no tear left a sector part new and part old, so nothing inside an entry was tested"
+    );
+    assert!(twins > 0, "no tear left a chain under two names");
 }
 
 /// Return a remounted disk where a cut left one chain under two names.

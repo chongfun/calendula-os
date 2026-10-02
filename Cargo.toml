@@ -17,8 +17,8 @@ resolver = "2"
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
-# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/batched-move,
-# which is calendula/long-names-and-error-fidelity plus ten commits.
+# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/batched-move-torn,
+# which is calendula/long-names-and-error-fidelity plus eleven commits.
 # Upstream v0.10, plus Jon-Vii's create_file_in_dir_lfn so wireless uploads land
 # under a real filename instead of an 8.3 alias, plus nine changes of ours.
 #
@@ -88,10 +88,14 @@ resolver = "2"
 # even on failure, and multi-block writes always send their stop token.
 #
 # The ninth is move_files_in_dir: the short-name move for up to 16 names in
-# four directory walks and one write per block touched, where single moves
-# walk six times per name. On the host, the moves in a carry of 147 section
-# files fall from 6,366 block reads and 344 writes to 504 and 88. Every link
-# lands before any unlink, so a cut leaves twins the carry's markers resolve.
+# four directory walks, two writes per destination block filled and one per
+# source block, where single moves walk six times and write twice per name.
+# On the host, the moves in a carry of 147 section files fall from 6,366
+# block reads and 344 writes to 504 and 107. Every link lands before any
+# unlink, so a cut leaves twins the carry's markers resolve, and each
+# destination block is written first with its entries under a free mark and
+# then with the mark lifted, so a sector torn at any byte shows a reader a
+# free slot or a whole entry, not a name over another file's cluster.
 #
 # The branch also treats a write that reported an error as one that may have
 # landed, since a card can take a sector and then fail its busy wait or CMD13.
@@ -100,8 +104,8 @@ resolver = "2"
 #
 # Regression coverage for all nine of our changes lives in the fork, not here:
 # tests/fat_chain_errors.rs for the error-propagation fixes, tests/move_file.rs
-# for the move, the link, the recorded cluster, the short-named pair and the
-# batched move,
+# for the move, the link, the recorded cluster, the short-named pair, the
+# batched move and its torn-sector sweep,
 # tests/free_clusters.rs for the reclaim primitives, tests/read_file.rs for
 # read_blocks. A bump that loses them would still compile here, so run the
 # fork's suite when moving the rev. The fork we branched from is unmaintained,
@@ -109,7 +113,7 @@ resolver = "2"
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "fba95e5a04e53a83bb91db3a12d20bd53832ea57", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "14db18c62d0fd5afaf0fdb39dda6b48dab36f513", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an
