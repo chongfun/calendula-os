@@ -34,7 +34,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 # Bytes. The largest legitimate frame today is build_book_cache at ~13,840 --
 # while ensure_epub_scratch leaves a ~10,512-byte residual frame from
@@ -68,15 +70,15 @@ IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def pinned_objdump() -> str | None:
-    """The llvm-objdump of the toolchain rustup resolves for this repo.
+def pinned_toolchain() -> str | None:
+    """Root of the toolchain rustup resolves for this repo, or None without rustup.
 
     `rustup which rustc` run from the repo root honours rust-toolchain.toml and
-    a RUSTUP_TOOLCHAIN override alike, so the disassembly comes from the same
-    release that compiled the binary. Scanning every installed toolchain and
-    taking the last one sorted `stable-...` after `1.99.0-...`, which is exactly
-    the laptop that has both and would have read a pinned build with the other
-    release's tools.
+    a RUSTUP_TOOLCHAIN override alike, so the tools come from the same release
+    that compiled the binary. Scanning every installed toolchain and taking the
+    last one sorted `stable-...` after `1.99.0-...`, which is exactly the laptop
+    that has both and would have read a pinned build with the other release's
+    disassembler.
     """
     try:
         rustc = subprocess.run(
@@ -89,17 +91,43 @@ def pinned_objdump() -> str | None:
         ).stdout.strip()
     except OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired:
         return None
-    toolchain = os.path.dirname(os.path.dirname(rustc))
+    return os.path.dirname(os.path.dirname(rustc))
+
+
+def toolchain_objdump(toolchain: str) -> str:
+    """That toolchain's llvm-objdump, or the path it will have once installed.
+
+    Once rustup has named the toolchain, a missing llvm-tools component must
+    fail the run with that path in the message, not hand the binary to another
+    release's disassembler. The caller's subprocess error is the report.
+    """
     hits = sorted(glob.glob(f"{toolchain}/lib/rustlib/*/bin/llvm-objdump"))
-    return hits[-1] if hits else None
+    if hits:
+        return hits[-1]
+    host = "<host>"
+    try:
+        for line in subprocess.run(
+            [os.path.join(toolchain, "bin", "rustc"), "-vV"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.splitlines():
+            if line.startswith("host: "):
+                host = line.removeprefix("host: ").strip()
+    except OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired:
+        pass
+    return os.path.join(toolchain, "lib", "rustlib", host, "bin", "llvm-objdump")
 
 
 def find_objdump() -> str:
     if os.environ.get("LLVM_OBJDUMP"):
         return os.environ["LLVM_OBJDUMP"]
-    pinned = pinned_objdump()
-    if pinned:
-        return pinned
+    toolchain = pinned_toolchain()
+    if toolchain is not None:
+        return toolchain_objdump(toolchain)
+    # No rustup at all: any installed llvm-objdump is better than none, and the
+    # report names which one ran.
     rustup = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")
     hits = sorted(glob.glob(f"{rustup}/toolchains/*/lib/rustlib/*/bin/llvm-objdump"))
     if hits:
@@ -346,6 +374,49 @@ def main() -> int:
         )
         return 1
     return 0
+
+
+class TestToolResolution(unittest.TestCase):
+    def test_pinned_toolchain_with_llvm_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tc:
+            tool = os.path.join(tc, "lib", "rustlib", "x-y-z", "bin", "llvm-objdump")
+            os.makedirs(os.path.dirname(tool))
+            open(tool, "w").close()
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=tc),
+            ):
+                self.assertEqual(find_objdump(), tool)
+
+    # The resolved toolchain lacking llvm-tools must surface as that toolchain's
+    # missing path, never as a quiet switch to whichever other toolchain has one.
+    def test_pinned_toolchain_without_llvm_tools_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tc, tempfile.TemporaryDirectory() as home:
+            other = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(other)
+            open(os.path.join(other, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=tc),
+            ):
+                chosen = find_objdump()
+            self.assertTrue(chosen.startswith(tc), chosen)
+            self.assertFalse(os.path.exists(chosen))
+
+    def test_without_rustup_scans_installed_toolchains(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            tool = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(tool)
+            open(os.path.join(tool, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=None),
+            ):
+                self.assertEqual(find_objdump(), os.path.join(tool, "llvm-objdump"))
+
+    def test_env_override_wins(self) -> None:
+        with mock.patch.dict(os.environ, {"LLVM_OBJDUMP": "/x/objdump"}, clear=True):
+            self.assertEqual(find_objdump(), "/x/objdump")
 
 
 class TestStackFrames(unittest.TestCase):
