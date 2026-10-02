@@ -334,8 +334,8 @@ fn opens_from_the_kept_catalog(device: &mut Device, folder: &str, name: &str) {
 }
 
 /// A stale-row pick scans, and the card refuses every write the scan makes.
-/// The reader stays on the catalog it had, under the same epoch, and opens
-/// its books without another scan.
+/// The reader stays on the catalog it had, reloaded from the card under a new
+/// epoch, and opens its books without another scan.
 #[test]
 fn a_failed_scan_by_a_pick_keeps_the_old_catalog() {
     let (card, mut device) = second_book_read_with_a_book_added();
@@ -346,7 +346,6 @@ fn a_failed_scan_by_a_pick_keeps_the_old_catalog() {
         .task
         .flush_pending_progress(&mut device.card, &mut device.store));
     let books = device.store.catalog_count();
-    let epoch = device.store.catalog_epoch();
     assert_eq!(books, 2);
     card.disk.refuse_next_writes(u32::MAX);
 
@@ -361,8 +360,11 @@ fn a_failed_scan_by_a_pick_keeps_the_old_catalog() {
         &device.log[before..]
     );
     assert_eq!(device.store.catalog_count(), books, "the old catalog stays");
-    assert_eq!(device.store.catalog_epoch(), epoch, "and is not renumbered");
-    assert_eq!(device.app.catalog_epoch, epoch);
+    assert_eq!(
+        device.app.catalog_epoch,
+        device.store.catalog_epoch(),
+        "the app is on the rows reloaded from the card"
+    );
 
     card.disk.refuse_next_writes(0);
     device.settle();
@@ -383,14 +385,16 @@ fn a_refresh_over_a_refusing_card_keeps_the_old_catalog() {
 
     let mut device = Device::wake(&card);
     let books = device.store.catalog_count();
-    let epoch = device.store.catalog_epoch();
     assert_eq!(books, 2);
     card.disk.refuse_next_writes(u32::MAX);
     device.send(StorageCommand::RefreshCatalog);
     device.run_queued();
     assert_eq!(device.store.catalog_count(), books, "the old catalog stays");
-    assert_eq!(device.store.catalog_epoch(), epoch, "and is not renumbered");
-    assert_eq!(device.app.catalog_epoch, epoch);
+    assert_eq!(
+        device.app.catalog_epoch,
+        device.store.catalog_epoch(),
+        "the app is on the rows reloaded from the card"
+    );
 
     card.disk.refuse_next_writes(0);
     device.settle();
@@ -430,7 +434,6 @@ fn a_refresh_failing_partway_keeps_the_old_catalog_only_while_the_card_does() {
         card.put(ADDED, &epub("Added", 4, 3));
 
         let mut device = Device::wake(&card);
-        let epoch = device.store.catalog_epoch();
         assert_eq!(device.store.catalog_count(), 2);
         card.disk.fail_after_writes(landed);
         device.send(StorageCommand::RefreshCatalog);
@@ -439,7 +442,11 @@ fn a_refresh_failing_partway_keeps_the_old_catalog_only_while_the_card_does() {
             3 => break,
             2 => {
                 kept += 1;
-                assert_eq!(device.store.catalog_epoch(), epoch, "after {landed} writes");
+                assert_eq!(
+                    device.app.catalog_epoch,
+                    device.store.catalog_epoch(),
+                    "after {landed} writes"
+                );
                 card.disk.refuse_next_writes(0);
                 device.settle();
                 device.open_library();
@@ -453,4 +460,59 @@ fn a_refresh_failing_partway_keeps_the_old_catalog_only_while_the_card_does() {
     }
     assert!(kept > 0, "some failures came before the truncation");
     assert!(cleared > 0, "and some after it");
+}
+
+/// A refresh over a card that lands each write in turn and then reports it
+/// failed, after a computer replaced one book with another so the count is
+/// unchanged. Whatever the failure leaves in CATALOG.BIN, the resident rows
+/// are that file's rows, and an epoch the app agrees on.
+#[test]
+fn a_write_that_lands_and_fails_leaves_the_rows_the_file_holds() {
+    let mut landed_new = 0;
+    for landed in 0.. {
+        let card = Card::blank();
+        card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
+        card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
+        Device::wake(&card).sleep();
+        card.delete(&format!("BOOKS/Shelf/{SECOND}"));
+        card.put("BOOKS/Shelf/Gamma.epub", &epub("Gamma", 6, 4));
+
+        let mut device = Device::wake(&card);
+        let before: Vec<_> = (0..device.store.catalog_count())
+            .map(|i| catalog_identity(&device, i))
+            .collect();
+        card.disk.land_then_fail_after(landed);
+        device.send(StorageCommand::RefreshCatalog);
+        device.run_queued();
+        if !card.disk.failed() {
+            break;
+        }
+        let on_card: Vec<_> = (0..)
+            .map_while(|i| {
+                card.session(|root| storage::library_sd::read_catalog_record_at(root, i))
+                    .map(|record| (record.source_hash, record.byte_size))
+            })
+            .collect();
+        let resident: Vec<_> = (0..device.store.catalog_count())
+            .map(|i| catalog_identity(&device, i))
+            .collect();
+        assert_eq!(resident, on_card, "after {landed} writes");
+        assert_eq!(
+            device.app.catalog_epoch,
+            device.store.catalog_epoch(),
+            "after {landed} writes"
+        );
+        if !on_card.is_empty() && on_card != before {
+            landed_new += 1;
+        }
+    }
+    assert!(
+        landed_new > 0,
+        "some failures left the new catalog on the card"
+    );
+}
+
+fn catalog_identity(device: &Device, index: usize) -> (u32, u32) {
+    let entry = device.store.catalog_entry(index).expect("a resident row");
+    (entry.source_hash, entry.byte_size)
 }

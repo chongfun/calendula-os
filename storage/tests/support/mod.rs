@@ -54,6 +54,8 @@ pub struct Disk {
     writes: Rc<Cell<u64>>,
     refuse_writes: Rc<Cell<u32>>,
     fail_after: Rc<Cell<Option<u32>>>,
+    land_failing: Rc<Cell<bool>>,
+    failed: Rc<Cell<bool>>,
 }
 
 impl Disk {
@@ -75,6 +77,21 @@ impl Disk {
     pub fn fail_after_writes(&self, count: u32) {
         self.refuse_writes.set(0);
         self.fail_after.set(Some(count));
+        self.land_failing.set(false);
+        self.failed.set(false);
+    }
+
+    /// Land the next `count` write commands, then land one more and report it
+    /// failed, as a card whose busy wait fails after it took the data does.
+    /// Writes after that one land normally.
+    pub fn land_then_fail_after(&self, count: u32) {
+        self.fail_after_writes(count);
+        self.land_failing.set(true);
+    }
+
+    /// Whether a write has failed since the last fault was set.
+    pub fn failed(&self) -> bool {
+        self.failed.get()
     }
 }
 
@@ -95,16 +112,26 @@ impl BlockDevice for Disk {
             self.refuse_writes.set(self.refuse_writes.get() - 1);
             return Err(DiskError);
         }
+        let mut fail = false;
         if let Some(left) = self.fail_after.get() {
             if left == 0 {
-                return Err(DiskError);
+                self.failed.set(true);
+                if !self.land_failing.get() {
+                    return Err(DiskError);
+                }
+                self.fail_after.set(None);
+                fail = true;
+            } else {
+                self.fail_after.set(Some(left - 1));
             }
-            self.fail_after.set(Some(left - 1));
         }
         let mut bytes = self.bytes.borrow_mut();
         for (i, block) in blocks.iter().enumerate() {
             let at = (start.0 as usize + i) * BLOCK_BYTES;
             bytes[at..at + BLOCK_BYTES].copy_from_slice(&block[..]);
+        }
+        if fail {
+            return Err(DiskError);
         }
         self.writes.set(self.writes.get() + blocks.len() as u64);
         Ok(())
@@ -144,6 +171,8 @@ impl Card {
                 writes: Rc::new(Cell::new(0)),
                 refuse_writes: Rc::new(Cell::new(0)),
                 fail_after: Rc::new(Cell::new(None)),
+                land_failing: Rc::new(Cell::new(false)),
+                failed: Rc::new(Cell::new(false)),
             },
         }
     }

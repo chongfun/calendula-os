@@ -123,10 +123,10 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
             // unreconciled state; the next mount finds the record still standing
             // and rebuilds rather than trusting the snapshot.
             //
-            // The resident catalog is cleared only once a new one is on the card,
-            // or a failed write has taken the old file with it. The fallback
-            // below keeps a non-empty catalog when a scan fails, so clearing any
-            // earlier would cost the reader their shelf for a refused write.
+            // The resident catalog is replaced only once the catalog write has
+            // run, by whatever CATALOG.BIN then holds. The fallback below keeps a
+            // non-empty catalog when a scan fails, so clearing any earlier would
+            // cost the reader their shelf for a refused write.
             let scanned = if !reconciled.shelf_readable {
                 slog!("sd: shelf unreadable; keeping the catalog for the next mount");
                 Err(())
@@ -177,14 +177,13 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
                                 moved.locator.as_str(),
                             );
                         }
-                        // The resident rows page from CATALOG.BIN, so a failed
-                        // write keeps them only while that file still checks out
-                        // as the catalog they were read from.
-                        let kept = written.is_err()
-                            && with_catalog_file(root, |_, count| Ok(count))
-                                == Ok(library.catalog_count_u16());
-                        if !kept {
-                            library.clear_catalog();
+                        library.clear_catalog();
+                        // A failed write may have landed anyway, so the card can
+                        // hold the old catalog or the new one. Rows page from
+                        // CATALOG.BIN, so serve whichever validates, under the
+                        // new epoch, rather than guess which it is.
+                        if written.is_err() {
+                            let _ = read_catalog_window(root, library, 0);
                         }
                         written
                     }
