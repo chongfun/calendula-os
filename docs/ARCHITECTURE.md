@@ -670,7 +670,9 @@ deterministic tie-breaking on exact case and alias). The rows are
 read from the card a page at a time through
 `upload_store::library::page_library_rows`, so what a folder costs in
 RAM is one screenful whatever its size, and scrolling inside a loaded page
-reads nothing. Entering one is not constant, though: showing books above
+reads nothing. Paging forward reuses lower-bound sort cursors and checkpoints
+retained in `ReaderStore` across refills so late pages cost approximately
+one directory walk. Entering one is not constant, though: showing books above
 folders means knowing the split before a row number means anything, so
 `count_library_rows` walks the whole directory once before the first page is
 filled, taking the split from `count_children_split`. Measured on an X3 at
