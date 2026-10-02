@@ -1032,12 +1032,12 @@ pub fn handle_storage_command(
                 pending_progress,
                 last_progress_write,
                 pending_place,
+                catalog_refresh,
             ) {
                 catalog_refresh.owed = true;
                 catalog_refresh.refusals = catalog_refresh.refusals.saturating_add(1);
                 return;
             }
-            catalog_refresh.refusals = 0;
             restore_saved_state(card, host, sd_library, state_restored, false);
             host.send(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),
@@ -1732,6 +1732,7 @@ pub fn handle_storage_command(
                         pending_progress,
                         last_progress_write,
                         pending_place,
+                        catalog_refresh,
                     ) {
                         // Nothing moved, and the page is still resident for
                         // the next pick to write.
@@ -2137,6 +2138,7 @@ fn scan_books_after_flush(
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     pending_place: &mut Option<PendingPlace>,
+    catalog_refresh: &mut CatalogRefresh,
 ) -> bool {
     if !flush_pending_progress(
         card,
@@ -2149,6 +2151,8 @@ fn scan_books_after_flush(
         return false;
     }
     crate::library_sd::scan_books(card, sd_library);
+    // This scan is the refresh any refused one was owed.
+    *catalog_refresh = CatalogRefresh::default();
     true
 }
 

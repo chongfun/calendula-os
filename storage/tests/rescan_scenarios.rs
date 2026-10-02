@@ -184,3 +184,26 @@ fn a_refresh_over_a_refusing_card_waits_for_a_background_slice() {
     let device = open_after_boot(&card, "Shelf", SECOND);
     assert_eq!(device.app.page, 9, "the second book kept its page");
 }
+
+/// A refresh is owed when a stale-row pick scans first. That scan settles the
+/// refresh, so no background slice scans again.
+#[test]
+fn a_scan_by_a_pick_settles_an_owed_refresh() {
+    let (card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    device.point_at(ADDED);
+    card.disk.refuse_next_writes(1);
+    device.send(StorageCommand::RefreshCatalog);
+    device.run_queued();
+    assert!(device.task.catalog_refresh.owed);
+
+    let before = device.log.len();
+    device.press(Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    let scans = device.log[before..]
+        .iter()
+        .filter(|event| matches!(event, LibraryEvent::Scanned { .. }))
+        .count();
+    assert_eq!(scans, 1, "one scan, not a second for the owed refresh");
+    assert!(!device.task.catalog_refresh.owed);
+}
