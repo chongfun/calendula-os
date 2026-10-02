@@ -728,6 +728,8 @@ fn a_failed_scan_by_a_pick_keeps_the_old_catalog() {
     let before = device.log.len();
     device.press_only(Button::Confirm);
     device.run_queued();
+    // The pick paints its note and leaves the scan to the loop.
+    device.rescan();
     assert!(
         device.log[before..]
             .iter()
