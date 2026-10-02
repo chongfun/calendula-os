@@ -70,34 +70,18 @@ const BACKGROUND_SLICE_MS: u64 = 400;
 /// walk that survived from one that was replaced.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BookBuildResume {
-    /// Catalog row the build is walking. Re-resolved (and re-checked against
-    /// `source_identity`) at every step: a rescan between steps can move a
-    /// different book under the same row.
-    index: u16,
     source_identity: (u32, u32),
-    /// First spine item the next step must build. Always a boundary — the
-    /// walk cannot suspend inside an item.
-    next_spine: u16,
-    section_count: u16,
     total_pages: u32,
-    book_partial: bool,
-    /// Decided once, from the TOC the first step parsed. A continuation never
-    /// re-reads the TOC, so it cannot re-derive this.
-    generate_toc_from_headings: bool,
-    /// Whether CONT.BIN is still being captured, and how many spine groups it
-    /// holds. Once false it stays false for the rest of the build.
-    content_ok: bool,
+    index: u16,
+    next_spine: u16,
+    total_spines: u16,
+    section_count: u16,
     content_spine_count: u16,
-    /// Sections already written into the on-disk index. The walk's own frontier
-    /// runs ahead of this between publishes; see `publish::INDEX_PUBLISH_SECTIONS`.
     published_sections: u16,
-    /// The layout this walk is paginating for.
-    ///
-    /// Part of what makes a resume ours, now that a book can hold a stored
-    /// pagination per layout. Without it, a walk suspended while building one
-    /// layout would be resumed by a step whose writers derive another, and the
-    /// second copy would be overwritten a section at a time by the first.
     layout: u8,
+    book_partial: bool,
+    generate_toc_from_headings: bool,
+    content_ok: bool,
 }
 
 // The size the doc above quotes, checked rather than remembered: this rides in
@@ -124,6 +108,10 @@ impl BookBuildResume {
         self.index as usize == index
             && self.source_identity == source_identity
             && self.layout == layout
+    }
+
+    pub fn progress(&self) -> proto::progress::JobProgress {
+        proto::progress::JobProgress::new(self.next_spine, self.total_spines)
     }
 }
 
@@ -321,11 +309,11 @@ pub enum BookBuildOutcome {
     Settled,
     /// A progressive build published this book early and owes background
     /// steps. Its index spans only the pages built so far.
-    Started,
+    Started(proto::progress::JobProgress),
     /// A background build for this book was already running and still is —
     /// this call answered from the cache without disturbing it. The caller
     /// keeps the handle it already has.
-    Carried,
+    Carried(proto::progress::JobProgress),
 }
 
 /// Kept out of line: the storage dispatcher's frame must stay small, and the
@@ -350,7 +338,6 @@ pub fn build_or_load_book_cache(
     // finding the identical value again below is exactly the statement "the
     // cache answered and the walk still owns its records".
     let entry_resume = scratch.resume;
-    let entry_progress = library.build_progress_permille();
     slog!(
         "epub: cache open index {} chapter {} target {}",
         index,
@@ -363,7 +350,6 @@ pub fn build_or_load_book_cache(
         set_preview_error(library, "BAD INDEX");
         library.set_reader_status(BookLoadStatus::Error);
         scratch.resume = None;
-        library.set_build_progress_permille(None);
         return BookBuildOutcome::Settled;
     };
     // Read before the load: it is the identity a surviving walk must match, and
@@ -399,14 +385,13 @@ pub fn build_or_load_book_cache(
             .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
     if !live {
         scratch.resume = None;
-        library.set_build_progress_permille(None);
         return BookBuildOutcome::Settled;
     }
+    let resume = scratch.resume.expect("live implies resume is Some");
     if scratch.resume == entry_resume {
-        library.set_build_progress_permille(entry_progress);
-        BookBuildOutcome::Carried
+        BookBuildOutcome::Carried(resume.progress())
     } else {
-        BookBuildOutcome::Started
+        BookBuildOutcome::Started(resume.progress())
     }
 }
 
@@ -425,7 +410,7 @@ pub fn clear_build_resume(scratch: &mut ReaderCacheScratch<'_>) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundStep {
     /// More spine to walk; call again.
-    Continued,
+    Continued(proto::progress::JobProgress),
     /// The walk reached the end of the book. The store's totals are final and
     /// the reader's page is resident, so this is the one outcome worth
     /// announcing.
@@ -556,8 +541,8 @@ pub fn continue_book_build(
     });
     match step {
         Ok(StepAttempt::Ran(Ok(()))) => {
-            if scratch.resume.is_some() {
-                BackgroundStep::Continued
+            if let Some(resume) = scratch.resume {
+                BackgroundStep::Continued(resume.progress())
             } else {
                 BackgroundStep::Finished
             }
@@ -1625,7 +1610,6 @@ pub fn clear_book_cache(card: &mut impl Card, library: &mut ReaderStore, index: 
             library.clear_toc();
             library.set_text_holds_toc(false);
             library.set_reader_status(BookLoadStatus::Empty);
-            library.set_build_progress_permille(None);
         }
         if library.current_index() == Some(index) {
             // COVER.BIN is gone; the resident cover regenerates on rebuild.
@@ -2481,23 +2465,20 @@ where
         // Suspending, not finishing: flush what the capture staged but leave
         // its header incomplete for the next step to append to.
         let (content_ok, content_spine_count) = content.suspend();
-        let total_spines = package.spine.len().max(1);
-        let permille = ((next_spine as u32 * 1000) / total_spines as u32).min(1000) as u16;
-        library.set_build_progress_permille(Some(permille));
+        let total_spines = package.spine.len().min(u16::MAX as usize) as u16;
         let mut state = BookBuildResume {
-            index: catalog_index,
             source_identity,
-            next_spine,
-            section_count: section_count.min(u16::MAX as usize) as u16,
             total_pages,
+            index: catalog_index,
+            next_spine,
+            total_spines,
+            section_count: section_count.min(u16::MAX as usize) as u16,
+            content_spine_count,
+            published_sections: 0,
+            layout: library.layout_key(),
             book_partial,
             generate_toc_from_headings,
             content_ok,
-            content_spine_count,
-            // Replaced below by whichever tail runs; a first open always
-            // publishes, a continuation only past the batching threshold.
-            published_sections: 0,
-            layout: library.layout_key(),
         };
         return if resume.is_none() {
             publish::publish_first_open(

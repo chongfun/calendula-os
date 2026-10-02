@@ -629,11 +629,9 @@ rule (`ui::reading::READING_PROGRESS_RULE_WIDTH`) immediately beside the
 page-in-chapter counter. The progress indicator itself schedules no additional
 screen refreshes or per-step repaints, updating as the reader turns pages
 (though existing completion and frontier announcements may still trigger a
-repaint). Once background pagination completes, the rule is omitted. On cold
-first open, the centered bookplate loading screen displays a 240px progress
-rule below the title and author. The book index holds up to
-`MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a longer book caches
-`partial`.
+repaint). Once background pagination completes, the rule is omitted. The book
+index holds up to `MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a
+longer book caches `partial`.
 
 Pages break by one rule, and every path reads it from `ui::reading`: a block
 opens a new page when its ink would cross the bottom of the page box, or it

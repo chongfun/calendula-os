@@ -495,14 +495,6 @@ impl WebEmulator {
             if !source.author.is_empty() {
                 draw_centered(&mut self.fb, literata(FontStyle::Italic), source.author, author_y);
             }
-            const LOADING_RULE_WIDTH: i16 = 240;
-            let rule_x = (WIDTH as i16 - LOADING_RULE_WIDTH) / 2;
-            let rule_y = if source.author.is_empty() {
-                title_y + 44
-            } else {
-                author_y + 44
-            };
-            ui::render::progress_rule(&mut self.fb, rule_x, rule_y, LOADING_RULE_WIDTH, 0);
             return;
         }
         let store = self.store.as_ref().unwrap();

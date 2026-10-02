@@ -516,7 +516,7 @@ pub fn draw_reading_page_counter_with_progress(
     fb: &mut Framebuffer,
     label: &str,
     left: bool,
-    progress: Option<u16>,
+    progress: Option<proto::progress::JobProgress>,
 ) {
     // Frame-relative, not panel-relative: the portrait page's footer sits
     // at the bottom of the upright frame. Landscape frames keep the
@@ -532,7 +532,7 @@ pub fn draw_reading_page_counter_with_progress(
     };
     draw_text(fb, font, label, x, baseline, false);
 
-    if let Some(permille) = progress {
+    if let Some(job) = progress {
         let rule_x = if left {
             x + width + 16
         } else {
@@ -543,7 +543,7 @@ pub fn draw_reading_page_counter_with_progress(
             rule_x,
             baseline - 4,
             READING_PROGRESS_RULE_WIDTH,
-            permille,
+            job.permille(),
         );
     }
 }
@@ -1409,7 +1409,12 @@ mod tests {
         let mut fb_progress = Framebuffer::new();
         fb_progress.set_frame(FbFrame::Landscape);
         fb_progress.clear(true);
-        draw_reading_page_counter_with_progress(&mut fb_progress, "1/2", false, Some(500));
+        draw_reading_page_counter_with_progress(
+            &mut fb_progress,
+            "1/2",
+            false,
+            Some(proto::progress::JobProgress::new(5, 10)),
+        );
 
         assert_ne!(fb_none.bytes(), fb_progress.bytes());
 
@@ -1422,7 +1427,12 @@ mod tests {
         let mut fb_left_prog = Framebuffer::new();
         fb_left_prog.set_frame(FbFrame::LandscapeFlipped);
         fb_left_prog.clear(true);
-        draw_reading_page_counter_with_progress(&mut fb_left_prog, "1/2", true, Some(500));
+        draw_reading_page_counter_with_progress(
+            &mut fb_left_prog,
+            "1/2",
+            true,
+            Some(proto::progress::JobProgress::new(5, 10)),
+        );
 
         assert_ne!(fb_left_none.bytes(), fb_left_prog.bytes());
     }

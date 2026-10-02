@@ -167,10 +167,11 @@ fn carried_foreground_load_preserves_build_progress() {
 
     assert_eq!(device.app.view, AppView::Reading);
     assert!(device.task.background_owed(&device.store));
-    let initial_progress = device.store.build_progress_permille();
-    assert!(
-        initial_progress.is_some() && initial_progress.unwrap() > 0,
-        "first open suspended and recorded progress: {initial_progress:?}"
+    let initial_progress = device.store.background_build_progress(device.app.book_id);
+    assert_eq!(
+        initial_progress,
+        Some(proto::progress::JobProgress::new(1, 6)),
+        "first open suspended at spine 1 of 6"
     );
 
     // Exercise the documented fast-hit / Carried path:
@@ -186,13 +187,17 @@ fn carried_foreground_load_preserves_build_progress() {
         scratch,
         &mut device.metrics,
     );
-    assert_eq!(outcome, storage::book_build::BookBuildOutcome::Carried);
+    assert_eq!(
+        outcome,
+        storage::book_build::BookBuildOutcome::Carried(initial_progress.unwrap())
+    );
 
     // Re-arm / preserve background build handle via apply_build_outcome.
     storage::task::apply_build_outcome(
         &mut device.task.background_build,
         outcome,
         device.app.book_id,
+        &mut device.store,
     );
 
     // Invariant: background build is still live and progress value is preserved across Carried load.
@@ -201,7 +206,7 @@ fn carried_foreground_load_preserves_build_progress() {
         "background build must remain alive"
     );
     assert_eq!(
-        device.store.build_progress_permille(),
+        device.store.background_build_progress(device.app.book_id),
         initial_progress,
         "build progress must be preserved across Carried foreground load"
     );
@@ -209,7 +214,10 @@ fn carried_foreground_load_preserves_build_progress() {
     // When the remaining background steps settle and the build finishes, progress clears.
     device.settle();
     assert!(!device.task.background_owed(&device.store));
-    assert_eq!(device.store.build_progress_permille(), None);
+    assert_eq!(
+        device.store.background_build_progress(device.app.book_id),
+        None
+    );
 
     // A subsequent load of the settled cache returns Settled and leaves progress None.
     let scratch = device.host.ensure_scratch(&mut device.task.epub_scratch);
@@ -226,5 +234,8 @@ fn carried_foreground_load_preserves_build_progress() {
         settled_outcome,
         storage::book_build::BookBuildOutcome::Settled
     );
-    assert_eq!(device.store.build_progress_permille(), None);
+    assert_eq!(
+        device.store.background_build_progress(device.app.book_id),
+        None
+    );
 }

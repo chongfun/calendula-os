@@ -194,9 +194,6 @@ where
     // Adopting the cover belongs here, on every successful publish, including
     // the provisional one a progressive open makes.
     let cover = files::load_v2_cover_cache(root, cache_key, library);
-    if resume_spine == 0 {
-        library.set_build_progress_permille(None);
-    }
     PublishReport {
         outcome: BookPublishOutcome::Ready,
         cover: Some(cover),

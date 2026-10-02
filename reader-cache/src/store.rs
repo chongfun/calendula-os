@@ -337,7 +337,7 @@ pub struct ReaderStore {
     pub current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
-    pub(crate) build_progress_permille: Option<u16>,
+    pub(crate) build_progress: Option<proto::progress::BuildProgressView>,
     pub(crate) layout_bound_unmet: bool,
     pub(crate) book_section_count: usize,
     pub(crate) book_sections: [BookV2SectionRecord; MAX_BOOK_SECTIONS],
@@ -490,7 +490,7 @@ impl ReaderStore {
             current_section_page_count: 0,
             book_cache_ready: false,
             book_cache_partial: false,
-            build_progress_permille: None,
+            build_progress: None,
             layout_bound_unmet: false,
             book_section_count: 0,
             book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
@@ -1820,12 +1820,28 @@ impl ReaderStore {
         self.book_cache_partial
     }
 
-    pub fn build_progress_permille(&self) -> Option<u16> {
-        self.build_progress_permille
+    /// Structural background build progress for `book_id`, projected for rendering.
+    /// Returns `None` if no progress is recorded or if recorded progress belongs
+    /// to another book.
+    pub fn background_build_progress(&self, book_id: u32) -> Option<proto::progress::JobProgress> {
+        self.build_progress.and_then(|view| {
+            if view.book_id == book_id {
+                Some(view.progress())
+            } else {
+                None
+            }
+        })
     }
 
-    pub fn set_build_progress_permille(&mut self, permille: Option<u16>) {
-        self.build_progress_permille = permille;
+    /// Set or clear the background build progress projection.
+    ///
+    /// Managed exclusively by `StorageTask` as the build lifecycle advances;
+    /// generic cache operations like `clear_book_index` do not alter it.
+    pub fn set_background_build_progress(
+        &mut self,
+        progress: Option<proto::progress::BuildProgressView>,
+    ) {
+        self.build_progress = progress;
     }
 
     /// `true` when the card holds more layouts of this book than the bound
@@ -3164,22 +3180,29 @@ mod tests {
     }
 
     #[test]
-    fn build_progress_permille_lifecycle() {
-        let mut store = Box::new(ReaderStore::new());
-        assert_eq!(store.build_progress_permille(), None);
+    fn background_build_progress_lifecycle() {
+        use proto::progress::{BuildProgressView, JobProgress};
 
-        store.set_build_progress_permille(Some(450));
-        assert_eq!(store.build_progress_permille(), Some(450));
+        let mut store = Box::new(ReaderStore::new());
+        assert_eq!(store.background_build_progress(1), None);
+
+        let progress = JobProgress::new(45, 100);
+        store.set_background_build_progress(Some(BuildProgressView::new(1, progress)));
+
+        // Matches book_id 1
+        assert_eq!(store.background_build_progress(1), Some(progress));
+        // Mismatched book_id returns None
+        assert_eq!(store.background_build_progress(2), None);
 
         // clear_book_index() clears the resident section window, not build progress
         store.clear_book_index();
-        assert_eq!(store.build_progress_permille(), Some(450));
+        assert_eq!(store.background_build_progress(1), Some(progress));
 
         // begin_book_load() clears section records for reloading, not build progress
         store.begin_book_load();
-        assert_eq!(store.build_progress_permille(), Some(450));
+        assert_eq!(store.background_build_progress(1), Some(progress));
 
-        store.set_build_progress_permille(None);
-        assert_eq!(store.build_progress_permille(), None);
+        store.set_background_build_progress(None);
+        assert_eq!(store.background_build_progress(1), None);
     }
 }
