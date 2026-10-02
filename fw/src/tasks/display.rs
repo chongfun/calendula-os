@@ -64,6 +64,11 @@ static EPUB_DECOMPRESSOR: static_cell::StaticCell<proto::epub::DecompressorOxide
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
+/// Own panel and card I/O, servicing display commands before deferred rescans
+/// and book-build slices. Sleep refuses any pick still waiting on a rescan.
+///
+/// `deep_sleep_wake` means the panel retained a settled sleep image;
+/// `probe_diag` is the boot probe report to write to the card.
 #[embassy_executor::task]
 pub async fn run(
     mut epd: Epd,
@@ -809,6 +814,9 @@ pub async fn run(
 
 /// Flush a plate already drawn into `fb`: a frame painted ahead of work that
 /// blocks this task, which nobody waits on, so it owes no event.
+/// An identical fast frame is skipped. A successful flush waits for panel
+/// settling and updates the saved frame; a failed flush invalidates the
+/// planner and prestage state without returning an error.
 async fn flush_plate(
     epd: &mut Epd,
     fb: &Framebuffer,
@@ -912,18 +920,9 @@ async fn storage_command_while_free(rescan_owed: bool) -> StorageCommand {
 /// Ready when the loop should run the work it owes itself: a pick's rescan, or
 /// a slice of a suspended book build.
 ///
-/// The gate is the same one storage answers to, for the same reason: both can
-/// produce a settling event, and the holder has one slot. It also stands down
-/// for a sync session, whose loan takes the scratch the build is walking out
-/// of.
-///
-/// And it stands down for the Chapters overview. That screen borrows the same
-/// single text arena the build writes through, and says so with
-/// `text_holds_toc`; a slice would quietly take the arena back, and the
-/// overview only reloads its window while that flag is still set — so the
-/// chapter list would go stale with nothing to restore it until the reader
-/// left the screen. The walk simply waits, which costs nothing: leaving
-/// Chapters reloads the reading section anyway.
+/// `None` stays pending forever. The caller excludes work while a settling
+/// event is held or a sync session is active, and excludes build slices while
+/// the Chapters overview holds the text arena.
 ///
 /// The wait is what makes an otherwise always-ready branch safe to sit in a
 /// `select`. Returning immediately would let this task run slice after slice
@@ -1443,6 +1442,10 @@ fn last_portrait(planner: &RefreshPlanner) -> bool {
         .unwrap_or(true)
 }
 
+/// Build a sleep-screen request and load its book metadata from the card.
+/// A pending position outranks saved state; otherwise the book's own position
+/// takes precedence over the global record. Returns `None` when no usable
+/// record or unambiguous catalog match can be read. Invalid settings use defaults.
 fn sleep_request_from_saved_state(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,

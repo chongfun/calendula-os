@@ -78,6 +78,12 @@ impl Scenario {
         Ok(toml::from_str(&text)?)
     }
 
+    /// Apply the storage-hold setting and scripted steps to the emulator,
+    /// processing each step's button, library event, then sync event.
+    ///
+    /// Returns the first parsing error or missing request for a completion or
+    /// rescan notice. Changes already applied remain; expectations are checked
+    /// separately by [`Self::assert`].
     pub fn run(&self, emu: &mut Emulator) -> Result<(), String> {
         emu.set_hold_storage(self.hold_storage);
         for step in &self.steps {
@@ -115,6 +121,9 @@ impl Scenario {
         Ok(())
     }
 
+    /// Check the specified expectations against the emulator without changing it.
+    /// Returns the first invalid expectation or mismatch as an error message;
+    /// omitted expectations impose no constraint.
     pub fn assert(&self, emu: &Emulator) -> Result<(), String> {
         let state = emu.state();
         if let Some(view) = &self.expect.view {

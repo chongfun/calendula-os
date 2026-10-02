@@ -1811,6 +1811,10 @@ fn stroke_rect_direct(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     fill_rect(fb, Rect::new(x + w - 1, y, 1, h), false);
 }
 
+/// Write a shell preview with fixed sample data and the requested selection.
+/// Creates or overwrites `{name}.pbm`, `{name}.png`, and a presentation PNG in
+/// `out`: `-upright.png` for Home, Library, Settings, or Wireless, otherwise
+/// `-panel.png`. Propagates file and PNG encoding errors; earlier files remain.
 fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> std::io::Result<()> {
     let mut fb = Framebuffer::new();
     // Rows rather than paths: the Library lists a folder now, and a row is

@@ -16,6 +16,8 @@ use embassy_time::{Duration, Instant};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
 
+/// Own the reader state and dispatch input, storage replies, and display
+/// acknowledgements, coalescing repaints while a render is in flight.
 #[embassy_executor::task]
 pub async fn run() {
     esp_println::println!("app: started");
@@ -616,6 +618,8 @@ async fn handle_library_event(
     true
 }
 
+/// Whether folding `event` from `state` into `folded` calls for a repaint.
+/// Rescan notices return false because the display task paints their plate.
 fn library_event_affects_view(
     state: &ReaderState,
     folded: &ReaderState,

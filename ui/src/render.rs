@@ -373,8 +373,8 @@ enum LibraryFooterLine {
 ///
 /// The teaching line is the only thing here that promises a press, so it
 /// only appears when that press opens the sheet. A move through the tree
-/// swallows it exactly as the sheet being up already redirects it, and
-/// neither wait has a note of its own to show instead.
+/// swallows it exactly as the sheet being up already redirects it. An action
+/// note takes priority, followed by a rescan notice; other waits show position.
 fn library_footer_line(
     menu: app_core::LibraryMenu,
     move_pending: bool,
@@ -425,6 +425,9 @@ fn library_rail(in_folder: bool, menu: app_core::LibraryMenu, move_pending: bool
     }
 }
 
+/// Clear and draw the Library's resident rows, selection, controls, and footer.
+/// Unavailable or empty listings show a status note; rows outside the resident
+/// window stay blank. Action and rescan notices replace the position footer.
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     let layout = shell_layout(shell);

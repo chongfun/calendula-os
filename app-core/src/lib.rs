@@ -2481,6 +2481,9 @@ impl ReaderState {
         self.wifi_ssid_len > 0
     }
 
+    /// Return the state after recording a sample and applying its button to
+    /// the current view. Library picks enter a wait for storage; Back leaves
+    /// that wait for Home. The caller dispatches the resulting work.
     pub fn apply_input(self, ctx: ReducerContext, event: InputEvent) -> Self {
         let InputEvent::Sample {
             button: raw_button,
@@ -2888,6 +2891,11 @@ impl ReaderState {
         }
     }
 
+    /// Fold a storage event into the reader state and clamp the Library cursor.
+    ///
+    /// Rescan notices affect only the matching pending pick. A scan clears
+    /// its rescan notice but leaves the pick waiting for its row answer.
+    /// The caller handles book-open rollback, storage dispatch, and repainting.
     pub fn apply_library_event(mut self, ctx: ReducerContext, event: LibraryEvent) -> Self {
         match event {
             LibraryEvent::Scanned {
@@ -3264,6 +3272,8 @@ impl ReaderState {
         }
     }
 
+    /// Snapshot the current view, reading settings, and Library waits for a
+    /// render. `requested_at_ms` is zero until the sender stamps the request.
     pub fn render_request(self, kind: RenderKind) -> RenderRequest {
         RenderRequest {
             kind,

@@ -107,7 +107,8 @@ impl StorageTask {
     ///
     /// A pick that needs a rescan comes back unfinished, so the caller can
     /// paint before the scan holds the card. Pass it to [`Self::rescan`], or
-    /// to [`Self::abandon_rescan`] when the panel is about to sleep.
+    /// to [`Self::abandon_rescan`] when the panel is about to sleep. Finish or
+    /// abandon that pick before handling another storage command.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     #[must_use = "a pick waits on this rescan; run it with StorageTask::rescan or refuse it with abandon_rescan"]
@@ -141,9 +142,15 @@ impl StorageTask {
         self.pending_rescan.as_ref().map(|_| OwedRescan(()))
     }
 
-    /// Finish a pick that [`Self::handle`] left owing a rescan: scan, then
-    /// answer the pick from the new catalog. A pick the app no longer waits
-    /// on, by [`Host::waiting_on_pick`], is refused without a scan.
+    /// Finish a pick that [`Self::handle`] left owing a rescan: attempt the
+    /// scan, then answer the pick from the available catalog.
+    ///
+    /// Sends `RowFailed` without scanning if the app no longer waits on the
+    /// pick, by [`Host::waiting_on_pick`], or pending progress cannot be saved.
+    /// After a scan attempt, sends `Scanned` even if the old catalog was retained.
+    /// A missing or unreadable row sends `RowFailed` and relists the root; a found
+    /// row sends `RowIsBook` and relists the current folder. `portrait` selects
+    /// the listing's layout.
     #[inline(never)]
     pub fn rescan(
         &mut self,
@@ -1048,6 +1055,11 @@ pub fn apply_build_outcome(
     }
 }
 
+/// Apply one admitted storage command, updating the store and reporting
+/// outcomes through `host`. `portrait` selects the folder listing's layout.
+/// A stale pick whose progress flush succeeds is announced and retained in
+/// `pending_rescan` for the caller to finish after painting its progress plate.
+///
 /// Kept out of line so the task loop's poll frame stays small; the storage
 /// arms below carry multi-KB scratch and run near the stack floor.
 #[inline(never)]
