@@ -722,6 +722,20 @@ that did not come from resolving a row carry no fence, since their index comes
 from the app's own active book and refusing those would refuse a boot restore
 whose scan the app has not folded yet.
 
+A pick of a book the card holds and the catalog does not (a computer added or
+moved books while the device was off) rescans before it answers, and that scan
+holds the card, and the bus the panel shares, for about 12 s on a 1,100-book X3
+card. So the pick runs in two halves. `StorageTask::handle` writes any
+coalesced position, sends `LibraryEvent::Rescanning`, keeps the pick, and
+returns an `OwedRescan` token the caller cannot drop without a compile warning. The
+display task then paints the Library frame already on the glass with an
+"updating the library..." footer, one fast refresh, and only then calls
+`StorageTask::rescan`, which scans and answers with `Scanned` and the row. The
+app folds `Rescanning` into the pick's wait without asking for a frame, since
+one would only run after the scan, and `Scanned` clears it. The kept pick holds the
+book's locator in the storage task, which lives in the display task's future:
+152 bytes more of it on both boards, and 80 bytes more of its poll frame.
+
 Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
 435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
 book set, and stays what the orphan sweep judges against, the wifi shelf

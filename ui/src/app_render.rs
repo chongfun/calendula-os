@@ -99,6 +99,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         .unwrap_or(""),
         library_menu: request.library_menu,
         library_move_pending: request.library_move_pending,
+        library_rescanning: request.library_rescanning,
     };
     render_shell(fb, &shell);
 }

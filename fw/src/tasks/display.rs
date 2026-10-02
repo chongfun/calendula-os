@@ -495,15 +495,27 @@ pub async fn run(
                             Ok(command) => match sleep.drained(&command) {
                                 Drained::Apply => {
                                     esp_println::println!("storage: draining before sleep");
-                                    storage_task.handle(
+                                    let portrait = last_portrait(&refresh_planner);
+                                    let owed = storage_task.handle(
                                         command,
                                         &mut crate::sd_session::card(&mut epd, &mut sd_cs),
                                         &mut FwHost,
                                         sd_library,
                                         font_metrics,
                                         &mut sync_session,
-                                        last_portrait(&refresh_planner),
+                                        portrait,
                                     );
+                                    // No note: the panel is about to show the
+                                    // sleep image. The pick is still answered.
+                                    if let Some(owed) = owed {
+                                        storage_task.rescan(
+                                            owed,
+                                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                                            &mut FwHost,
+                                            sd_library,
+                                            portrait,
+                                        );
+                                    }
                                     sleep.applied();
                                     may_keep_draining = holder().sleep_may_proceed();
                                 }
@@ -714,65 +726,125 @@ pub async fn run(
                             refresh_planner.last_request(),
                         ) {
                             crate::views::render(fb, loading_request, sd_library);
-                            let mode = refresh_planner.mode_for(loading_request);
-                            // The plate draws the Reading view for the page
-                            // being built, which is often the page already on
-                            // the glass: an extend of the section in front of
-                            // the reader repaints what they are looking at.
-                            // Measured 32 of 32 identical over two device
-                            // runs, 435 ms each. Nobody waits on the plate, so
-                            // a skip owes no event and no planner update.
-                            if refresh_planner.screen_on()
-                                && refresh_planner.last_request().is_some()
-                                && mode == RefreshMode::Fast
-                                && fb.bytes() == prev_fb.bytes()
-                            {
-                                bench_log!(
-                                    "bench: plate skipped=true t_ms={}",
-                                    Instant::now().as_millis(),
-                                );
-                            } else if let Ok(settle) = display_flush::flush(
+                            flush_plate(
                                 &mut epd,
                                 fb,
                                 prev_fb,
-                                refresh_planner.screen_on(),
-                                mode,
-                                prev_prestaged,
+                                &mut refresh_planner,
+                                &mut prev_prestaged,
+                                loading_request,
                             )
-                            .await
-                            {
-                                // Held, not deferred like the render path's: no
-                                // prestage follows a plate, so there is no
-                                // nearer owner for the interval than here.
-                                settle.wait().await;
-                                refresh_planner.record_render(loading_request, mode);
-                                prev_fb.copy_from(fb);
-                                prev_prestaged = false;
-                            } else {
-                                // No Settled/Failed events here — the app isn't
-                                // waiting on this opportunistic plate — but the
-                                // panel state is as unknown as after any failed
-                                // flush: drop the prestage claim and the
-                                // planner's screen model.
-                                esp_println::println!("display: loading plate flush failed");
-                                prev_prestaged = false;
-                                refresh_planner.record_failure();
-                            }
+                            .await;
                         }
                     }
-                    storage_task.handle(
+                    let portrait = last_portrait(&refresh_planner);
+                    let owed = storage_task.handle(
                         command,
                         &mut crate::sd_session::card(&mut epd, &mut sd_cs),
                         &mut FwHost,
                         sd_library,
                         font_metrics,
                         &mut sync_session,
-                        last_portrait(&refresh_planner),
+                        portrait,
                     );
+                    if let Some(owed) = owed {
+                        // A pick of a book the catalog does not know yet. Its
+                        // rescan holds the card, and with it the bus, for
+                        // about 12 s on a large library, so say so first.
+                        if let Some(note) = rescan_plate_request(&refresh_planner) {
+                            crate::library_sd::ensure_folder_page(
+                                &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                                sd_library,
+                                note.selection,
+                                portrait,
+                            );
+                            crate::views::render(fb, note, sd_library);
+                            flush_plate(
+                                &mut epd,
+                                fb,
+                                prev_fb,
+                                &mut refresh_planner,
+                                &mut prev_prestaged,
+                                note,
+                            )
+                            .await;
+                        }
+                        storage_task.rescan(
+                            owed,
+                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                            &mut FwHost,
+                            sd_library,
+                            portrait,
+                        );
+                    }
                 }
             },
         }
     }
+}
+
+/// Flush a plate already drawn into `fb`: a frame painted ahead of work that
+/// blocks this task, which nobody waits on, so it owes no event.
+async fn flush_plate(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &mut Framebuffer,
+    refresh_planner: &mut RefreshPlanner,
+    prev_prestaged: &mut bool,
+    request: RenderRequest,
+) {
+    let mode = refresh_planner.mode_for(request);
+    // A plate is often the frame already on the glass: an extend of the
+    // section in front of the reader repaints what they are looking at.
+    // Measured 32 of 32 identical over two device runs, 435 ms each. Nobody
+    // waits on the plate, so a skip owes no planner update either.
+    if refresh_planner.screen_on()
+        && refresh_planner.last_request().is_some()
+        && mode == RefreshMode::Fast
+        && fb.bytes() == prev_fb.bytes()
+    {
+        bench_log!(
+            "bench: plate skipped=true t_ms={}",
+            Instant::now().as_millis()
+        );
+    } else if let Ok(settle) = display_flush::flush(
+        epd,
+        fb,
+        prev_fb,
+        refresh_planner.screen_on(),
+        mode,
+        *prev_prestaged,
+    )
+    .await
+    {
+        // Held, not deferred like the render path's: no prestage follows a
+        // plate, so there is no nearer owner for the interval than here.
+        settle.wait().await;
+        refresh_planner.record_render(request, mode);
+        prev_fb.copy_from(fb);
+        *prev_prestaged = false;
+    } else {
+        // The panel state is as unknown as after any failed flush: drop the
+        // prestage claim and the planner's screen model.
+        esp_println::println!("display: plate flush failed");
+        *prev_prestaged = false;
+        refresh_planner.record_failure();
+    }
+}
+
+/// The Library frame to paint before a pick's rescan: the one on the glass,
+/// with the note. None when the screen is off or shows something else.
+fn rescan_plate_request(refresh_planner: &RefreshPlanner) -> Option<RenderRequest> {
+    if !refresh_planner.screen_on() {
+        return None;
+    }
+    let mut request = refresh_planner.last_request()?;
+    if request.view != AppView::Library {
+        return None;
+    }
+    request.library_move_pending = true;
+    request.library_rescanning = true;
+    Some(request)
 }
 
 /// Places the settling event [`send_required_library_event`] could not, once
@@ -1408,6 +1480,7 @@ fn sleep_request_from_saved_state(
         reading_sheet: false,
         library_menu: app_core::LibraryMenu::None,
         library_move_pending: false,
+        library_rescanning: false,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

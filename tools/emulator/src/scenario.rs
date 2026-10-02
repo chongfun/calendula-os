@@ -62,6 +62,7 @@ struct Expect {
     reading_sheet: Option<bool>,
     library_menu: Option<String>,
     library_count: Option<u16>,
+    library_rescanning: Option<bool>,
     last_button: Option<String>,
     last_refresh: Option<String>,
     panel_sleeping: Option<bool>,
@@ -95,6 +96,13 @@ impl Scenario {
                         request_id,
                         ok: step.ok.unwrap_or(true),
                     }
+                } else if library.eq_ignore_ascii_case("Rescanning") {
+                    let request_id = emu
+                        .state()
+                        .library_browse
+                        .request_id()
+                        .ok_or("Rescanning with no pick in flight")?;
+                    LibraryEvent::Rescanning { request_id }
                 } else {
                     parse_library_event(library, step)?
                 };
@@ -212,6 +220,13 @@ impl Scenario {
         }
         if let Some(library_count) = self.expect.library_count {
             expect_eq("library_count", library_count, state.library_count)?;
+        }
+        if let Some(rescanning) = self.expect.library_rescanning {
+            expect_eq(
+                "library_rescanning",
+                rescanning,
+                state.library_browse.rescanning(),
+            )?;
         }
         if let Some(last_button) = &self.expect.last_button {
             let expected = parse_button(last_button)?;

@@ -98,6 +98,67 @@ fn a_rescan_under_the_open_book_saves_its_page_to_it() {
     assert_eq!(device.app.page, 9, "the second book kept its page");
 }
 
+/// The rescan a stale pick owes takes seconds on a large library, so the
+/// Library says so first. The note is announced before the scan, is on the
+/// frame the firmware paints while it still has the bus, and is gone once the
+/// scan lands. A pick the catalog already knows announces nothing.
+#[test]
+fn a_pick_that_rescans_says_so_before_the_scan_and_clears_after() {
+    let (_card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    let before = device.log.len();
+    device.choose(ADDED);
+    let events = &device.log[before..];
+    let at = |wanted: fn(&LibraryEvent) -> bool| {
+        events
+            .iter()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("missing event: {events:?}"))
+    };
+    let rescanning = at(|event| matches!(event, LibraryEvent::Rescanning { .. }));
+    let scanned = at(|event| matches!(event, LibraryEvent::Scanned { .. }));
+    let answered = at(|event| matches!(event, LibraryEvent::RowIsBook { .. }));
+    assert!(
+        rescanning < scanned && scanned < answered,
+        "announced, scanned, answered: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, LibraryEvent::Rescanning { .. }))
+            .count(),
+        1,
+        "{events:?}"
+    );
+
+    let [Some(frame)] = device.before_rescan[..] else {
+        panic!("one frame before one rescan: {:?}", device.before_rescan);
+    };
+    assert_eq!(frame.view, AppView::Library);
+    assert!(
+        frame.library_rescanning,
+        "the note is on screen as the scan starts"
+    );
+    assert!(frame.library_move_pending, "and the list is held");
+
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert!(!device.app.library_browse.rescanning(), "the note is gone");
+
+    // The catalog knows every book now, so a pick goes straight to its book.
+    to_library_root(&mut device);
+    let before = device.log.len();
+    device.choose(ADDED);
+    assert_eq!(device.app.view, AppView::Reading);
+    assert!(
+        !device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Rescanning { .. })),
+        "{:?}",
+        &device.log[before..]
+    );
+    assert_eq!(device.before_rescan.len(), 1);
+}
+
 /// The write before the rescan is refused. The scan would drop the pages that
 /// turn page 9 into a place, so the pick is refused instead, and the next pick
 /// writes the page before it scans.
@@ -122,6 +183,13 @@ fn a_refused_write_before_the_rescan_refuses_the_pick() {
             .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
         "no scan dropped the pages: {events:?}"
     );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Rescanning { .. })),
+        "no note promised a scan that did not run: {events:?}"
+    );
+    assert!(device.before_rescan.is_empty());
     assert_eq!(device.app.view, AppView::Library);
     assert_eq!(
         device.task.pending_progress.map(|record| record.screen),

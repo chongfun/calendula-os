@@ -687,6 +687,10 @@ fn library_event_affects_view(
         // the fold cannot see it, so a repaint that waited on the fold moving
         // would leave the panel showing rows the store no longer has.
         crate::LibraryEvent::LibraryUnreadable { .. } => true,
+        // The display task paints this note itself, before the scan. A render
+        // asked for here would run only after the scan, over the new catalog,
+        // and `Scanned` already owes the frame that replaces the note.
+        crate::LibraryEvent::Rescanning { .. } => false,
         crate::LibraryEvent::FolderListed { .. }
         | crate::LibraryEvent::RowIsBook { .. }
         | crate::LibraryEvent::RowFailed { .. } => {

@@ -639,6 +639,8 @@ pub struct Device {
     queue: VecDeque<StorageCommand>,
     next_request_id: u32,
     last_render: Option<RenderRequest>,
+    /// The frame on screen as each rescan began.
+    pub before_rescan: Vec<Option<RenderRequest>>,
 }
 
 impl Device {
@@ -659,6 +661,7 @@ impl Device {
             queue: VecDeque::new(),
             next_request_id: 1,
             last_render: None,
+            before_rescan: Vec::new(),
         };
         device.render();
         // The app asks for the catalog once the first frame settles.
@@ -811,7 +814,7 @@ impl Device {
             return false;
         };
         let portrait = app_core::is_portrait(self.app.orientation);
-        self.task.handle(
+        let owed = self.task.handle(
             command,
             &mut self.card,
             &mut self.host,
@@ -821,6 +824,18 @@ impl Device {
             portrait,
         );
         self.deliver();
+        if let Some(owed) = owed {
+            // The firmware paints here, before the scan holds the card.
+            self.before_rescan.push(self.last_render);
+            self.task.rescan(
+                owed,
+                &mut self.card,
+                &mut self.host,
+                &mut self.store,
+                portrait,
+            );
+            self.deliver();
+        }
         true
     }
 

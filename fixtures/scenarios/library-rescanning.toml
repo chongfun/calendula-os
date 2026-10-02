@@ -1,0 +1,31 @@
+# A pick of a book the catalog does not know yet, because a computer added
+# it while the device was off. The storage task rescans the card before it
+# can answer, which takes seconds on a large library, so the footer says
+# the library is being updated and the key rail drops to home alone.
+#
+# The emulated card answers a pick at once, so this scenario holds storage
+# to keep the wait on screen.
+hold_storage = true
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 3
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+library = "Rescanning"
+
+[expect]
+view = "Library"
+selection = 1
+pending_storage = "ChooseLibraryRow"
+library_count = 3
+library_rescanning = true

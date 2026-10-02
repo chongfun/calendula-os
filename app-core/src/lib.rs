@@ -331,6 +331,9 @@ pub struct RenderRequest {
     /// held still until the card answers, and the reducer swallows every
     /// press but Back, so the rail has to stop offering the rest.
     pub library_move_pending: bool,
+    /// The pick in flight is waiting on a rescan of the card, which takes
+    /// seconds on a large library; the footer says so.
+    pub library_rescanning: bool,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -1164,6 +1167,7 @@ pub fn library_browse_command_for_transition(
             index,
             request_id,
             browse_epoch,
+            ..
         } => Some(StorageCommand::ChooseLibraryRow {
             request_id,
             index,
@@ -1724,6 +1728,12 @@ pub enum LibraryEvent {
     RowFailed {
         request_id: u32,
     },
+    /// The chosen row is a book the catalog does not know yet, and the scan
+    /// that finds it is about to start. A refresh: the pick's own answer
+    /// settles the wait, so a dropped one costs only the note.
+    Rescanning {
+        request_id: u32,
+    },
     /// The library could not be listed at all: the card answered the scan and
     /// then stopped answering for the rows. Carries the position generation
     /// the failed relist moved to, for the reason
@@ -2102,6 +2112,10 @@ pub enum LibraryBrowse {
         /// and a listing from the newer position outranks a move from the
         /// older one, whose row number now means something else.
         browse_epoch: u32,
+        /// The row is a book the catalog does not know yet, and the card is
+        /// being rescanned to find it. Set by `Rescanning`, cleared by
+        /// `Scanned`.
+        rescanning: bool,
     },
     /// Back was pressed below the root, and storage is listing the parent.
     Leaving { request_id: u32, browse_epoch: u32 },
@@ -2130,6 +2144,17 @@ impl LibraryBrowse {
 
     pub const fn is_idle(self) -> bool {
         matches!(self, Self::Idle)
+    }
+
+    /// Whether the pick in flight is waiting on a rescan of the card.
+    pub const fn rescanning(self) -> bool {
+        matches!(
+            self,
+            Self::Choosing {
+                rescanning: true,
+                ..
+            }
+        )
     }
 }
 
@@ -2631,6 +2656,7 @@ impl ReaderState {
                         index: self.selection,
                         request_id: next.library_request_seq,
                         browse_epoch: self.library_browse_epoch,
+                        rescanning: false,
                     };
                 }
             }
@@ -2905,6 +2931,11 @@ impl ReaderState {
                 if matches!(self.library_menu, LibraryMenu::Sheet { .. }) {
                     self.library_menu = LibraryMenu::None;
                 }
+                // The scan a pick was waiting on is over. The pick itself
+                // still waits for its answer.
+                if let LibraryBrowse::Choosing { rescanning, .. } = &mut self.library_browse {
+                    *rescanning = false;
+                }
             }
             LibraryEvent::Loaded {
                 book_id,
@@ -3098,6 +3129,21 @@ impl ReaderState {
                     self.dirty = Rect::FULL;
                 }
             }
+            LibraryEvent::Rescanning { request_id } => {
+                // Only for the pick still waiting: one walked away from has
+                // nobody to tell.
+                if let LibraryBrowse::Choosing {
+                    request_id: outstanding,
+                    rescanning,
+                    ..
+                } = &mut self.library_browse
+                {
+                    if *outstanding == request_id && !*rescanning {
+                        *rescanning = true;
+                        self.dirty = Rect::FULL;
+                    }
+                }
+            }
             LibraryEvent::RowFailed { request_id } => {
                 if self.library_browse.request_id() == Some(request_id) {
                     // Nothing moved. The rows on screen are the rows that are
@@ -3232,6 +3278,7 @@ impl ReaderState {
             reading_sheet: self.reading_sheet,
             library_menu: self.library_menu,
             library_move_pending: !self.library_browse.is_idle(),
+            library_rescanning: self.library_browse.rescanning(),
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -5110,7 +5157,7 @@ mod tests {
     }
 
     /// The rest: the next event or the next render makes a dropped one good.
-    fn refresh_events() -> [LibraryEvent; 3] {
+    fn refresh_events() -> [LibraryEvent; 4] {
         [
             LibraryEvent::Scanned {
                 count: 4,
@@ -5122,6 +5169,9 @@ mod tests {
                 chapter: 0,
                 page: 0,
             },
+            // The pick's own answer settles its wait; this only says why
+            // the wait is long.
+            LibraryEvent::Rescanning { request_id: 1 },
         ]
     }
 
@@ -5785,7 +5835,8 @@ mod tests {
             LibraryBrowse::Choosing {
                 index: 1,
                 request_id: 1,
-                browse_epoch: EPOCH
+                browse_epoch: EPOCH,
+                rescanning: false
             }
         );
         assert_eq!(
@@ -5832,7 +5883,8 @@ mod tests {
             LibraryBrowse::Choosing {
                 index: 2,
                 request_id: 1,
-                browse_epoch: EPOCH
+                browse_epoch: EPOCH,
+                rescanning: false
             }
         );
 
@@ -5854,6 +5906,86 @@ mod tests {
         assert!(listed.library_browse.is_idle());
     }
 
+    /// A pick whose book the catalog does not know yet waits on a rescan,
+    /// and the Library says so until the scan lands.
+    #[test]
+    fn a_pick_waiting_on_a_rescan_says_so_until_the_scan_lands() {
+        let picked = press(in_library(0, 2), Button::Confirm);
+        assert!(!picked.render_request(RenderKind::Page).library_rescanning);
+
+        let rescanning =
+            picked.apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 1 });
+        assert!(rescanning.library_browse.rescanning());
+        let frame = rescanning.render_request(RenderKind::Page);
+        assert!(
+            frame.library_rescanning,
+            "the footer says the card is being read"
+        );
+        assert!(frame.library_move_pending, "and the list is still held");
+        assert_eq!(rescanning.view, AppView::Library);
+
+        // The scan is over; the pick still waits for its answer.
+        let scanned = rescanning.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 3,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert!(!scanned.library_browse.rescanning());
+        assert!(!scanned.render_request(RenderKind::Page).library_rescanning);
+        assert_eq!(scanned.library_browse.request_id(), Some(1));
+
+        let reading = scanned.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id: 1,
+                index: 2,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(reading.view, AppView::Reading);
+        assert!(!reading.render_request(RenderKind::Page).library_rescanning);
+    }
+
+    /// A pick refused after its rescan clears the note with the wait.
+    #[test]
+    fn a_refused_pick_after_a_rescan_clears_the_note() {
+        let rescanning = press(in_library(0, 2), Button::Confirm)
+            .apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 1 });
+        let refused =
+            rescanning.apply_library_event(CTX, LibraryEvent::RowFailed { request_id: 1 });
+        assert!(refused.library_browse.is_idle());
+        assert!(!refused.render_request(RenderKind::Page).library_rescanning);
+    }
+
+    /// A rescan announced for a pick nobody is waiting on any more changes
+    /// nothing: not after Back, and not for an older press.
+    #[test]
+    fn a_rescan_for_a_pick_walked_away_from_changes_nothing() {
+        let picked = press(in_library(0, 2), Button::Confirm);
+        let home = press(picked, Button::Back);
+        assert_eq!(
+            home.apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 1 }),
+            home
+        );
+        assert_eq!(
+            picked.apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 7 }),
+            picked,
+            "another press's rescan"
+        );
+        // Nor does a folder being left.
+        let leaving = press(in_folder(0, 2, 0), Button::Back);
+        assert!(matches!(
+            leaving.library_browse,
+            LibraryBrowse::Leaving { .. }
+        ));
+        assert_eq!(
+            leaving.apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 1 }),
+            leaving
+        );
+    }
+
     /// The whole sequence, because pinning only the classification let the
     /// arming be reverted without a test noticing.
     ///
@@ -5873,6 +6005,7 @@ mod tests {
             index: 2,
             request_id: 4,
             browse_epoch: EPOCH,
+            rescanning: false,
         };
 
         let reading = library.apply_library_event(
@@ -5947,6 +6080,7 @@ mod tests {
             index: 4,
             request_id: 4,
             browse_epoch: EPOCH,
+            rescanning: false,
         };
 
         let reading = choosing.apply_library_event(
@@ -6311,6 +6445,7 @@ mod tests {
             index: 1,
             request_id: 4,
             browse_epoch: EPOCH,
+            rescanning: false,
         };
         let opened = state.apply_library_event(
             CTX,
@@ -7534,6 +7669,21 @@ mod tests {
         request.selection = 1;
 
         assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+    }
+
+    /// The rescan note swaps only the footer line under a held list, so it
+    /// rides a fast refresh: it is painted while the reader waits.
+    #[test]
+    fn refresh_plan_keeps_the_rescan_note_fast() {
+        let mut planner = RefreshPlanner::new();
+        let picked = press(in_library(1, 4), Button::Confirm);
+        planner.record_render(picked.render_request(RenderKind::Page), RefreshMode::Full);
+
+        let note = picked
+            .apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 1 })
+            .render_request(RenderKind::Page);
+        assert!(note.library_rescanning);
+        assert_eq!(planner.mode_for(note), RefreshMode::Fast);
     }
 
     /// Every step of the actions sheet covers or uncovers list rows, so each
