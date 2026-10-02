@@ -165,10 +165,10 @@ pub enum RemoveStatus {
 /// Remove a file without leaking its FAT cluster chain.
 ///
 /// The pinned embedded-sdmmc delete only marks the directory entry deleted; it
-/// does not release the file's clusters. `Mode::ReadWriteTruncate` calls
-/// `truncate_cluster_chain`, which walks and frees the cluster chain and writes
-/// the zeroed directory entry before returning (embedded-sdmmc d26892f,
-/// `VolumeManager::open_file_in_dir`).
+/// does not release the file's clusters. `Mode::ReadWriteTruncate` frees every
+/// cluster after the first and keeps the first, which the entry still names.
+/// So the first cluster is read from the entry beforehand and freed once the
+/// entry is gone.
 ///
 /// # This is not safe to interrupt
 ///
@@ -202,6 +202,11 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let first = match directory.find_directory_entry(name) {
+        Ok(entry) => entry.cluster,
+        Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
+        Err(_) => return RemoveStatus::Failed,
+    };
     {
         match directory.open_file_in_dir(name, Mode::ReadWriteTruncate) {
             Ok(file) => {
@@ -214,10 +219,16 @@ where
         }
     }
     match directory.delete_entry_in_dir(name) {
-        Ok(()) => RemoveStatus::Removed,
-        Err(embedded_sdmmc::Error::NotFound) => RemoveStatus::Absent,
-        Err(_) => RemoveStatus::Failed,
+        Ok(()) => {}
+        Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
+        Err(_) => return RemoveStatus::Failed,
     }
+    // Nothing names the first cluster now. A refused free leaks it, the same
+    // cost as an interrupted removal, and the name is gone either way.
+    if first != embedded_sdmmc::ClusterId::EMPTY {
+        let _ = directory.free_cluster(first);
+    }
+    RemoveStatus::Removed
 }
 
 /// Remove `name` from the cache root, and report whether it is provably gone.
