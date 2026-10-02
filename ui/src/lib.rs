@@ -162,6 +162,8 @@ pub struct UiShell<'a> {
     /// The move is a pick waiting on a rescan of the card; the footer says
     /// so in place of the position line.
     pub library_rescanning: bool,
+    /// How far that rescan has got, once it has said.
+    pub library_rescan_percent: Option<u8>,
 }
 
 #[cfg(test)]
@@ -207,6 +209,7 @@ mod tests {
             library_menu: app_core::LibraryMenu::None,
             library_move_pending: false,
             library_rescanning: false,
+            library_rescan_percent: None,
         };
         for rendered in [format!("{status:?}"), format!("{shell:?}")] {
             assert!(

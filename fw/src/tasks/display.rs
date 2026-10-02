@@ -16,6 +16,7 @@ use app_core::{
 };
 use core::cell::Cell;
 use core::sync::atomic::Ordering;
+use core::task::{Context, Poll, Waker};
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use embassy_futures::select::{select, select5, Either, Either5};
@@ -218,12 +219,26 @@ pub async fn run(
             Either5::Fifth(()) => match due {
                 Some(OwedWork::Rescan) => {
                     if let Some(owed) = owed_rescan.take() {
+                        let portrait = last_portrait(&refresh_planner);
+                        // The scan lends the bus back to the panel to show
+                        // its progress, from inside its card session.
+                        let mut painter = RescanPainter {
+                            fb,
+                            prev_fb,
+                            refresh_planner: &mut refresh_planner,
+                            prev_prestaged: &mut prev_prestaged,
+                            waker: own_waker().await,
+                        };
                         storage_task.rescan(
                             owed,
-                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                            &mut crate::sd_session::card_reporting(
+                                &mut epd,
+                                &mut sd_cs,
+                                &mut painter,
+                            ),
                             &mut FwHost,
                             sd_library,
-                            last_portrait(&refresh_planner),
+                            portrait,
                         );
                     }
                 }
@@ -861,6 +876,74 @@ async fn flush_plate(
         esp_println::println!("display: plate flush failed");
         *prev_prestaged = false;
         refresh_planner.record_failure();
+    }
+}
+
+/// Repaints the rescan note's percentage while the scan holds the card.
+///
+/// Called from inside the scan's card session, between card operations,
+/// with the bus clocked for the panel and the card deselected. The rows
+/// cannot be redrawn there (the scan has the catalog and the arena they
+/// come from), so only the note's line is redrawn, over the frame on the
+/// glass, and flushed on a fast refresh.
+struct RescanPainter<'a> {
+    fb: &'a mut Framebuffer,
+    prev_fb: &'a mut Framebuffer,
+    refresh_planner: &'a mut RefreshPlanner,
+    prev_prestaged: &'a mut bool,
+    /// This task's own waker, for polling the flush to completion.
+    waker: Waker,
+}
+
+impl crate::sd_session::SessionPainter for RescanPainter<'_> {
+    fn paint(&mut self, epd: &mut Epd, percent: u8) {
+        let Some(request) = self.refresh_planner.rescan_progress_frame(percent) else {
+            return;
+        };
+        let start = Instant::now();
+        // The glass, which a fast refresh diffs against.
+        self.fb.copy_from(self.prev_fb);
+        ui::app_render::render_library_rescan_progress(self.fb, request);
+        poll_to_completion(
+            flush_plate(
+                epd,
+                self.fb,
+                self.prev_fb,
+                self.refresh_planner,
+                self.prev_prestaged,
+                request,
+            ),
+            &self.waker,
+        );
+        bench_log!(
+            "bench: rescan_progress percent={} elapsed_ms={} t_ms={}",
+            percent,
+            start.elapsed().as_millis(),
+            Instant::now().as_millis()
+        );
+    }
+}
+
+/// The waker of the task awaiting this, without yielding.
+async fn own_waker() -> Waker {
+    core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await
+}
+
+/// Drive `future` to completion from synchronous code that holds the
+/// executor anyway: the scan, which runs for seconds without yielding.
+///
+/// Polled with this task's own waker, since embassy-time files its timers
+/// under the task a waker names and refuses any other. The spin lasts one
+/// flush and replaces no work: nothing else can run until the scan returns.
+/// The wakes it collects only poll the task once more after the scan.
+fn poll_to_completion<F: core::future::Future>(future: F, waker: &Waker) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    let mut cx = Context::from_waker(waker);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -1512,6 +1595,7 @@ fn sleep_request_from_saved_state(
         library_menu: app_core::LibraryMenu::None,
         library_move_pending: false,
         library_rescanning: false,
+        library_rescan_percent: None,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

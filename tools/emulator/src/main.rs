@@ -467,6 +467,35 @@ impl Emulator {
         }
     }
 
+    /// A rescan's progress repaint, as the firmware's display task paints it
+    /// mid-scan: only the note's line is redrawn over the frame on the glass,
+    /// on a fast refresh, and only while that frame is the note.
+    pub fn rescan_progress(&mut self, percent: u8) -> bool {
+        let Some(request) = self.refresh_planner.rescan_progress_frame(percent) else {
+            return false;
+        };
+        self.fb.copy_from(&self.prev_fb);
+        ui::app_render::render_library_rescan_progress(&mut self.fb, request);
+        let mode = self.refresh_planner.mode_for(request);
+        let flushed = self
+            .panel
+            .flush(&self.fb, &self.prev_fb, mode, self.prev_prestaged)
+            .expect("panel flush");
+        self.refresh_planner.record_render(request, mode);
+        self.prev_fb.copy_from(&self.fb);
+        // A plate: held, and no prestage follows it.
+        self.panel.settle(flushed.settle_ms).expect("panel settle");
+        self.prev_prestaged = false;
+        true
+    }
+
+    /// The percentage the frame on the glass shows, if it is a rescan note.
+    pub fn rescan_percent_shown(&self) -> Option<u8> {
+        self.refresh_planner
+            .last_request()
+            .and_then(|request| request.library_rescan_percent)
+    }
+
     pub fn sync_event(&mut self, event: app_core::SyncEvent) {
         self.state = self.state.apply_sync_event(event);
         self.render(app_core::RenderKind::Page);

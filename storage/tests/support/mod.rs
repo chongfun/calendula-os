@@ -26,6 +26,7 @@ use reader_cache::store::ReaderStore;
 use storage::book_build::ReaderCacheScratch;
 use storage::card::{Root, SessionError, StaticTime};
 use storage::custom_font::MetricCache;
+use storage::progress::{ProgressSink, Silent};
 use storage::task::{Host, OwedRescan, StorageTask};
 
 // ---------------------------------------------------------------------------
@@ -438,6 +439,69 @@ fn put_under(root: &Dir<'_>, folders: &[&str], name: &str, bytes: &[u8]) {
 /// the firmware opens one per SPI session.
 pub struct SessionCard {
     pub disk: Disk,
+    /// What a watching panel would have been asked to show.
+    pub progress: ProgressLog,
+}
+
+/// Every progress report a session made, as the firmware's panel would get
+/// them, on a clock that moves a fixed step each time it is read.
+#[derive(Default)]
+pub struct ProgressLog {
+    /// Milliseconds the clock moves per read; `None` is nobody watching,
+    /// which hands the scan the silent sink the firmware's other cards do.
+    pub step_ms: Option<u64>,
+    now_ms: u64,
+    /// One entry per reporting session: each report's clock and percent.
+    pub sessions: Vec<Vec<(u64, u8)>>,
+}
+
+impl ProgressLog {
+    /// Every report, across sessions.
+    pub fn reports(&self) -> Vec<(u64, u8)> {
+        self.sessions.iter().flatten().copied().collect()
+    }
+}
+
+type Manager = VolumeManager<Disk, StaticTime, 8, 8, 1>;
+
+/// The firmware's sink, on the host: it borrows the volume manager's device
+/// for each report as the firmware does to reach the bus, so a report made
+/// while a card operation holds the manager panics here as it would there.
+struct Recording<'m> {
+    mgr: &'m Manager,
+    log: &'m mut ProgressLog,
+    step_ms: u64,
+}
+
+impl ProgressSink for Recording<'_> {
+    fn now_ms(&mut self) -> u64 {
+        self.log.now_ms += self.step_ms;
+        self.log.now_ms
+    }
+
+    fn report(&mut self, percent: u8) {
+        self.mgr.device(|_| ());
+        let at = self.log.now_ms;
+        self.log
+            .sessions
+            .last_mut()
+            .expect("a reporting session")
+            .push((at, percent));
+    }
+}
+
+impl SessionCard {
+    fn open<R>(
+        &mut self,
+        f: impl FnOnce(&Manager, &Root<'_, Disk>, &mut ProgressLog) -> R,
+    ) -> Result<R, SessionError> {
+        let mgr: Manager = VolumeManager::new_with_limits(self.disk.clone(), StaticTime, 5000);
+        let volume = mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| SessionError::Volume)?;
+        let root = volume.open_root_dir().map_err(|_| SessionError::Root)?;
+        Ok(f(&mgr, &root, &mut self.progress))
+    }
 }
 
 impl storage::card::Card for SessionCard {
@@ -450,13 +514,20 @@ impl storage::card::Card for SessionCard {
         &mut self,
         f: impl for<'a> FnOnce(&Root<'a, Disk>) -> R,
     ) -> Result<R, SessionError> {
-        let mgr: VolumeManager<Disk, StaticTime, 8, 8, 1> =
-            VolumeManager::new_with_limits(self.disk.clone(), StaticTime, 5000);
-        let volume = mgr
-            .open_volume(VolumeIdx(0))
-            .map_err(|_| SessionError::Volume)?;
-        let root = volume.open_root_dir().map_err(|_| SessionError::Root)?;
-        Ok(f(&root))
+        self.open(|_, root, _| f(root))
+    }
+
+    fn with_root_reporting<R>(
+        &mut self,
+        f: impl for<'a> FnOnce(&Root<'a, Disk>, &mut dyn ProgressSink) -> R,
+    ) -> Result<R, SessionError> {
+        self.open(|mgr, root, log| match log.step_ms {
+            None => f(root, &mut Silent),
+            Some(step_ms) => {
+                log.sessions.push(Vec::new());
+                f(root, &mut Recording { mgr, log, step_ms })
+            }
+        })
     }
 }
 
@@ -725,6 +796,7 @@ impl Device {
         let mut device = Device {
             card: SessionCard {
                 disk: card.disk.clone(),
+                progress: ProgressLog::default(),
             },
             store: Box::new(ReaderStore::new()),
             metrics: Box::new(MetricCache::new()),

@@ -760,6 +760,36 @@ nothing the app queued against the old catalog runs against a new one. A pick
 the reader waits for scans as before, and a newer pick made during the note
 gets its own.
 
+The note then counts up, "updating the library... 40%", repainted at most
+every 2 s on a fast refresh from inside the scan's one card session. The scan
+calls `Card::with_root_reporting`, and `storage::progress::ScanProgress` turns
+what it learns into a percentage: catalog rows written, ledger rows joined,
+then, when a move has to be proved, bytes hashed against the moved copy's
+length (`upload_store::ledger::AssignProgress`, counted through the SHA
+engine), then each carry. The weights are X3 milliseconds from one measured
+scan (13.3 s, 8.7 s of it the hash), and a revision of the estimate keeps the
+percentage earned, so it only rises; it stops at 99 and the frame after the
+scan replaces it. Reports come only between card operations, not inside a
+block transfer or a directory iteration, and the rate limit counts from the
+end of the last repaint. On the device, `FwCard` built by `card_reporting`
+hands the scan a sink that borrows the card's device from the open
+`VolumeManager` (`VolumeManager::device`, then `SdCard::spi`), which reaches
+the panel bus through `SdSpiDevice`, now holding the whole `Epd`. With SD CS
+high it restores the panel clock, and `RescanPainter` redraws only the note's
+line over a copy of the glass (`ui::app_render::render_library_rescan_progress`:
+the rows cannot be redrawn, since the scan holds the catalog and the arena)
+and flushes it with `flush_plate`, polled to completion with the display
+task's own waker, because the scan holds the executor anyway and embassy-time
+files timers only under a task's waker. Then it deselects the panel and
+restores the card clock. The volume manager's block cache and open handles
+are untouched, and the card, deselected between operations, carries on. A
+repaint costs about 380 ms on the X3, so a 13 s scan pays about 1.5 s for five
+of them. The planner gates it (`RefreshPlanner::rescan_progress_frame`): only
+over the note, only rising, and only on a fast refresh or the one-flicker
+clean a FullEveryTen policy has come due for. The paint runs at the
+bottom of the scan's hash, the deepest point of the scan: about 24 KB with the
+display task's poll frame, against the X3's 32 KB stack region.
+
 Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
 435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
 book set, and stays what the orphan sweep judges against, the wifi shelf

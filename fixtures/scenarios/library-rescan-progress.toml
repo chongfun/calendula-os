@@ -1,0 +1,35 @@
+# The rescan note from library-rescanning, repainted by the display task
+# mid-scan to say how far the scan has got. The repaint redraws only the
+# note's line over the frame on the glass, on a fast refresh, while the
+# storage task lends the bus between card operations.
+hold_storage = true
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 3
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+library = "Rescanning"
+
+[[steps]]
+rescan_percent = 12
+
+[[steps]]
+rescan_percent = 40
+
+[expect]
+view = "Library"
+selection = 1
+pending_storage = "ChooseLibraryRow"
+library_rescanning = true
+rescan_percent = 40
+last_refresh = "Fast"

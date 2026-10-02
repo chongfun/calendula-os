@@ -42,6 +42,8 @@ struct Step {
     books: Option<u16>,
     depth: Option<u8>,
     selection: Option<u16>,
+    /// A rescan's progress repaint, as the display task paints it mid-scan.
+    rescan_percent: Option<u8>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -63,6 +65,7 @@ struct Expect {
     library_menu: Option<String>,
     library_count: Option<u16>,
     library_rescanning: Option<bool>,
+    rescan_percent: Option<u8>,
     last_button: Option<String>,
     last_refresh: Option<String>,
     panel_sleeping: Option<bool>,
@@ -116,6 +119,11 @@ impl Scenario {
             }
             if let Some(sync) = &step.sync {
                 emu.sync_event(parse_sync_event(sync, step)?);
+            }
+            if let Some(percent) = step.rescan_percent {
+                if !emu.rescan_progress(percent) {
+                    return Err(format!("no rescan note on the glass to show {percent}% on"));
+                }
             }
         }
         Ok(())
@@ -236,6 +244,9 @@ impl Scenario {
                 rescanning,
                 state.library_browse.rescanning(),
             )?;
+        }
+        if let Some(percent) = self.expect.rescan_percent {
+            expect_eq("rescan_percent", Some(percent), emu.rescan_percent_shown())?;
         }
         if let Some(last_button) = &self.expect.last_button {
             let expected = parse_button(last_button)?;

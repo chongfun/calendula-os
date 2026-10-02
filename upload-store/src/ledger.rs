@@ -885,6 +885,46 @@ pub struct FoundAgain<'a> {
     pub digest: SourceDigest,
 }
 
+/// How far [`assign_book_ids`] has got, for a caller that shows it.
+///
+/// Told only between card operations: a caller may lend the bus to the
+/// panel while it has one of these, and nothing on the card is in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssignProgress {
+    /// `rows` rows have been joined against the ledger by place.
+    Matched { rows: u16 },
+    /// The move search will read at most `bytes` of files to prove moves, and
+    /// can carry at most `carries` copies: for each length, the fewer of the
+    /// new rows and the missing copies of that length.
+    Proving { bytes: u64, carries: u16 },
+    /// `bytes` of files read for the move search so far, in this scan.
+    Hashed { bytes: u64 },
+}
+
+/// The SHA unit, counting what passes through it for [`AssignProgress`].
+struct Counted<'e, 'p> {
+    engine: &'e mut dyn proto::source::Sha256Engine,
+    progress: &'p mut dyn FnMut(AssignProgress),
+    bytes: u64,
+}
+
+impl proto::source::Sha256Engine for Counted<'_, '_> {
+    fn start(&mut self) {
+        self.engine.start();
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.engine.update(bytes);
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        // Between two block reads of the file, so the card is idle.
+        (self.progress)(AssignProgress::Hashed { bytes: self.bytes });
+    }
+
+    fn finish(&mut self) -> [u8; proto::source::SHA256_BYTES] {
+        self.engine.finish()
+    }
+}
+
 /// What the directory a copy keeps its reading place in says its bytes
 /// were, when it says anything.
 ///
@@ -1038,7 +1078,12 @@ fn move_slot_of_row(table: &[u8], slots: usize, row: u16) -> Option<usize> {
 /// ledger either committed, in which case they are right, or did not, in
 /// which case the caller must not commit the catalog either, and the next
 /// scan starts over from the generation that stands.
-#[expect(clippy::too_many_arguments)] // The card, the rows, working memory, and three things only the firmware has: randomness, the carry, and the SHA unit.
+///
+/// `progress` hears how far the join and the move search have got, between
+/// card operations; see [`AssignProgress`]. The move search reports every
+/// block it hashes, so a caller that shows progress keeps the work per call
+/// small.
+#[expect(clippy::too_many_arguments)] // The card, the rows, working memory, and four things only the firmware has: randomness, the carry, the SHA unit, and somewhere to show progress.
 pub fn assign_book_ids<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     catalog: &File<'_, D, T, MD, MF, MV>,
@@ -1048,6 +1093,7 @@ pub fn assign_book_ids<D, T, const MD: usize, const MF: usize, const MV: usize>(
     ledger: Option<Ledger>,
     found_again: &mut dyn FnMut(&FoundAgain<'_>),
     engine: &mut dyn proto::source::Sha256Engine,
+    progress: &mut dyn FnMut(AssignProgress),
 ) -> Result<Assignment, LedgerFault>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1124,6 +1170,9 @@ where
                 Ok(())
             })?;
             slice_start = slice_end;
+            progress(AssignProgress::Matched {
+                rows: slice_end as u16,
+            });
         }
     }
 
@@ -1207,6 +1256,51 @@ where
             })?;
         }
     }
+    // The search below hashes every new row of a length a copy awaits, so
+    // the plan is those rows. A copy deleted rather than moved has no row of
+    // its length and adds nothing.
+    let mut bytes = 0u64;
+    // New rows of each awaited length, counted on that length's first slot.
+    let mut rows_of = [0u8; MOVES_CONSIDERED];
+    if slots > 0 {
+        seek_row(catalog, 0)?;
+        for _ in 0..count as usize {
+            if !read_exact(catalog, &mut record)? {
+                return Err(LedgerFault::Device);
+            }
+            if catalog_record_book_id(&record).is_some() {
+                continue;
+            }
+            let (_, _, byte_size) = catalog_record_at(&record).ok_or(LedgerFault::Record)?;
+            if let Some(first) = (0..slots).find(|slot| move_awaits(table, *slot, byte_size)) {
+                bytes = bytes.saturating_add(u64::from(byte_size));
+                rows_of[first] = rows_of[first].saturating_add(1);
+            }
+        }
+    }
+    // A length carries at most as many copies as it has rows, and a copy
+    // with no row of its length carries nothing.
+    let mut carries = 0u16;
+    for (slot, &rows) in rows_of[..slots].iter().enumerate() {
+        if rows == 0 {
+            continue;
+        }
+        let size = u32::from_le_bytes(
+            move_entry(table, slot)[MOVE_SIZE..MOVE_ID]
+                .try_into()
+                .expect("four bytes"),
+        );
+        let copies = (slot..slots)
+            .filter(|other| move_awaits(table, *other, size))
+            .count();
+        carries = carries.saturating_add(copies.min(usize::from(rows)) as u16);
+    }
+    progress(AssignProgress::Proving { bytes, carries });
+    let mut engine = Counted {
+        engine,
+        progress,
+        bytes: 0,
+    };
     if slots > 0 {
         seek_row(catalog, 0)?;
         for row in 0..count as usize {
@@ -1225,7 +1319,7 @@ where
             // any of those copies' bytes, so the length stops being
             // decidable and every copy of it is left alone. The file is
             // adopted in its own right, as it would have been.
-            let Ok(Some(found)) = crate::replace::digest_at(root, at, locator, engine) else {
+            let Ok(Some(found)) = crate::replace::digest_at(root, at, locator, &mut engine) else {
                 move_undecidable(table, slots, byte_size, &mut assigned.unreadable);
                 continue;
             };

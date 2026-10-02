@@ -1,4 +1,5 @@
 use crate::card::Card;
+use crate::progress::ScanProgress;
 use core::ops::ControlFlow;
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, LfnBuffer, Mode, TimeSource};
@@ -109,10 +110,12 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
     library.status = LibraryScanStatus::Scanning;
 
     let status = card
-        .with_root(|root| {
+        .with_root_reporting(|root, sink| {
             slog!("sd: card init begin");
             slog!("sd: open root");
             library.status = LibraryScanStatus::Scanning;
+            // The catalog being replaced is the first guess at the book count.
+            let mut progress = ScanProgress::new(sink, library.catalog_count());
             let reconciled = reconcile_interrupted_uploads(root);
             // The scanner knows nothing of installs in flight, so a shelf with
             // one pending may list whichever copy the interrupted swap left —
@@ -168,6 +171,7 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
                             ledger,
                             follow,
                             &mut followed,
+                            &mut progress,
                         );
                         for moved in &followed {
                             library.follow_move(
@@ -752,6 +756,7 @@ fn write_catalog_streaming<
     ledger: Option<upload_store::ledger::Ledger>,
     follow: [(u32, u32); 2],
     followed: &mut heapless::Vec<FollowedMove, 2>,
+    progress: &mut ScanProgress<'_>,
 ) -> Result<u16, ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -794,6 +799,7 @@ where
         );
         return Err(());
     };
+    progress.counted(counted);
 
     // Keep the header deliberately invalid while records are being written;
     // the real version and count are committed only after every directory
@@ -866,6 +872,8 @@ where
         file.write(&scratch[..batch_len * CATALOG_RECORD_BYTES])
             .map_err(|_| ())?;
         cursor += batch_len;
+        // Outside the walk, whose callbacks hold the volume manager.
+        progress.walked(batch_len);
     }
     if cursor != total {
         return Err(());
@@ -991,6 +999,12 @@ where
             Instant::now().as_millis()
         );
     };
+    // The ledger tells the carry and the progress apart; both report here.
+    let progress = core::cell::RefCell::new(progress);
+    let mut carry_reporting = |found: &upload_store::ledger::FoundAgain<'_>| {
+        carry(found);
+        progress.borrow_mut().carried();
+    };
     let assigned = crate::platform::with_sha256(|engine| {
         upload_store::ledger::assign_book_ids(
             root,
@@ -999,13 +1013,15 @@ where
             scratch,
             &mut crate::platform::random_u32,
             ledger,
-            &mut carry,
+            &mut carry_reporting,
             engine,
+            &mut |step| progress.borrow_mut().assign(step),
         )
     })
     .map_err(|fault| {
         slog!("sd: library ledger refused: {:?}", fault);
     })?;
+    progress.borrow_mut().assigned();
     if assigned.minted > 0 {
         slog!("sd: adopted {} new book(s)", assigned.minted);
     }
