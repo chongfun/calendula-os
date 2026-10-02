@@ -35,7 +35,9 @@ use proto::text::{TextAlign, TextRole};
 use reader_cache::files::{self, CacheLoadResult};
 use reader_cache::layout;
 use reader_cache::publish::{self, BookPublishOutcome, PublishError};
-use reader_cache::store::{BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD};
+use reader_cache::store::{
+    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
+};
 
 const BLOCK_BYTES: usize = 512;
 /// 16 MiB card: big enough that fatfs picks FAT16 and small enough to stay fast.
@@ -6567,23 +6569,40 @@ fn a_proven_move_leaves_saved_state_about_anything_else_alone() {
 
 /// Write `count` section files the way firmware before layout-named sections
 /// named them, `S000.BIN` up, into `key`'s `SECTIONS/`. Each opens with an
-/// old-version header and spans three clusters. Returns each chain's second
-/// cluster: the removal keeps a truncated file's first cluster, so the tail is
-/// what shows the chain was freed.
+/// old-version header and spans three clusters. Returns each file's whole
+/// chain, first cluster included: a removal has to free all of it.
 fn write_legacy_sections(
     disk: &SharedDisk,
     root: &Dir<'_>,
     key: &str,
     count: u16,
-) -> Vec<embedded_sdmmc::ClusterId> {
+) -> Vec<Vec<embedded_sdmmc::ClusterId>> {
     write_legacy_files(root, key, count, legacy_file_bytes(disk))
         .into_iter()
         .map(|first| {
-            root.next_cluster_in_chain(first)
-                .expect("the chain walks")
-                .expect("the file spans more than one cluster")
+            let chain = chain_from(root, first);
+            assert!(chain.len() > 2, "the file spans more than two clusters");
+            chain
         })
         .collect()
+}
+
+/// Every cluster of the chain starting at `first`, walked through the driver.
+fn chain_from(root: &Dir<'_>, first: embedded_sdmmc::ClusterId) -> Vec<embedded_sdmmc::ClusterId> {
+    let mut chain = vec![first];
+    let mut at = first;
+    while let Some(next) = root.next_cluster_in_chain(at).expect("the chain walks") {
+        chain.push(next);
+        at = next;
+    }
+    chain
+}
+
+/// Whether any cluster of a recorded chain is still allocated.
+fn any_allocated(root: &Dir<'_>, chain: &[embedded_sdmmc::ClusterId]) -> bool {
+    chain
+        .iter()
+        .any(|cluster| chain_is_allocated(root, *cluster))
 }
 
 /// Two clusters and a bit, on this card's geometry.
@@ -6598,6 +6617,18 @@ fn write_legacy_files(
     count: u16,
     bytes: usize,
 ) -> Vec<embedded_sdmmc::ClusterId> {
+    write_section_files(root, key, (0..count).map(|n| format!("S{n:03}.BIN")), bytes)
+}
+
+/// Files of `bytes` each under the given names in `key`'s `SECTIONS/`, each
+/// opening with an old-version header so a restamp leaves it alone. Returns
+/// first clusters.
+fn write_section_files(
+    root: &Dir<'_>,
+    key: &str,
+    names: impl Iterator<Item = String>,
+    bytes: usize,
+) -> Vec<embedded_sdmmc::ClusterId> {
     let book = book_dir_by_key(root, key).expect("the book directory");
     let sections = book
         .open_dir(proto::cache::CACHE_SECTIONS_DIR)
@@ -6605,17 +6636,45 @@ fn write_legacy_files(
     let mut body = vec![0x5Au8; bytes];
     body[..4].copy_from_slice(&proto::cache::CACHE_MAGIC.to_le_bytes());
     body[4..6].copy_from_slice(&0x1Au16.to_le_bytes());
-    (0..count)
-        .map(|n| {
-            let name = format!("S{n:03}.BIN");
+    names
+        .map(|name| {
             let file = sections
                 .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
-                .expect("legacy file creates");
-            file.write(&body).expect("legacy write");
-            file.close().expect("legacy close");
-            cluster_of(&sections, &name).expect("the legacy file is there")
+                .expect("section file creates");
+            file.write(&body).expect("section write");
+            file.close().expect("section close");
+            cluster_of(&sections, &name).expect("the file is there")
         })
         .collect()
+}
+
+/// The names a full book takes under `layout`, ordinals `from` up to the cap.
+fn layout_names(layout: u8, from: u16) -> impl Iterator<Item = String> {
+    (from..MAX_BOOK_SECTIONS as u16).map(move |ordinal| {
+        let mut name = heapless::String::<{ proto::cache::CACHE_SECTION_FILE_BYTES }>::new();
+        proto::cache::section_file_name(layout, ordinal, &mut name);
+        name.as_str().into()
+    })
+}
+
+/// How many files `key`'s `SECTIONS/` holds.
+fn section_file_count(root: &Dir<'_>, key: &str) -> usize {
+    let Some(book) = book_dir_by_key(root, key) else {
+        return 0;
+    };
+    let Ok(sections) = book.open_dir(proto::cache::CACHE_SECTIONS_DIR) else {
+        return 0;
+    };
+    let mut count = 0;
+    sections
+        .iterate_dir(|entry| {
+            if !entry.attributes.is_directory() {
+                count += 1;
+            }
+            core::ops::ControlFlow::Continue(())
+        })
+        .expect("iterate");
+    count
 }
 
 /// The legacy-shaped names in `key`'s `SECTIONS/`.
@@ -6669,9 +6728,9 @@ fn a_finished_build_reclaims_old_firmware_sections() {
         Vec::<String>::new(),
         "the old firmware's sections are gone"
     );
-    for cluster in legacy {
+    for chain in &legacy {
         assert!(
-            !chain_is_allocated(&root, cluster),
+            !any_allocated(&root, chain),
             "a legacy chain is still allocated: deleted without reclaiming"
         );
     }
@@ -6721,8 +6780,8 @@ fn a_carry_reclaims_old_firmware_sections_rather_than_moving_them() {
         Vec::<String>::new(),
         "nothing old was carried"
     );
-    for cluster in legacy {
-        assert!(!chain_is_allocated(&root, cluster), "a legacy chain leaked");
+    for chain in &legacy {
+        assert!(!any_allocated(&root, chain), "a legacy chain leaked");
     }
     assert_eq!(carried_clusters(&root, NOW.key), before);
     assert_loads_under(&root, &NOW, identity_at(&NOW), pages, records[2].start_page);
@@ -6801,12 +6860,12 @@ fn a_carry_cut_while_reclaiming_old_sections_is_finished_by_the_retry() {
                         "cut {cut} probe {probe}: a chain under {key} was freed"
                     );
                 }
-                // A removal cut partway can leak its own tail (see
+                // A removal cut partway can leak part of its own chain (see
                 // `remove_file_reclaiming_clusters`), and the carry stops at
                 // the first failure, so one file at most.
                 let leaked = legacy
                     .iter()
-                    .filter(|cluster| chain_is_allocated(&root, **cluster))
+                    .filter(|chain| any_allocated(&root, chain))
                     .count();
                 assert!(
                     leaked <= 1,
@@ -6869,10 +6928,8 @@ fn an_old_section_a_cut_carry_left_under_both_keys_is_unlinked_then_pruned() {
             .expect("older firmware's cut move leaves the name under both");
         let first = cluster_of(&from, "S001.BIN").expect("the departed name");
         assert_eq!(cluster_of(&to, "S001.BIN"), Some(first));
-        twin = root
-            .next_cluster_in_chain(first)
-            .expect("the chain walks")
-            .expect("the file spans more than one cluster");
+        twin = chain_from(&root, first);
+        assert!(twin.len() > 1, "the file spans more than one cluster");
     }
     let mgr = open_mgr(&disk);
     let root = open_root(&mgr);
@@ -6892,7 +6949,8 @@ fn an_old_section_a_cut_carry_left_under_both_keys_is_unlinked_then_pruned() {
         "the departed twin was unlinked, so the destination's name stands"
     );
     assert!(
-        chain_is_allocated(&root, twin),
+        twin.iter()
+            .all(|cluster| chain_is_allocated(&root, *cluster)),
         "and its chain was not freed"
     );
     for key in [KEY, NOW.key] {
@@ -6910,10 +6968,106 @@ fn an_old_section_a_cut_carry_left_under_both_keys_is_unlinked_then_pruned() {
     let pruned = files::prune_orphan_sections(&root, &NOW, default_layout_key(), 3);
     assert_eq!(pruned, 1);
     assert_eq!(legacy_names_under(&root, NOW.key), Vec::<String>::new());
-    assert!(!chain_is_allocated(&root, twin), "the chain is free now");
+    assert!(!any_allocated(&root, &twin), "the chain is free now");
     let mut store = new_store();
     assert_eq!(
         files::load_v2_book_index(&root, &NOW, identity_at(&NOW), &mut store),
         files::BookIndexLoadResult::Hit { unfinished: false }
     );
+}
+
+/// The carry settles a directory at its full size: a whole book under each
+/// resident layout, plus the old firmware's set, which no layout counts. One
+/// legacy name past the two layouts' budget used to leave the carry refused.
+#[test]
+fn a_carry_settles_two_full_layouts_and_the_old_firmware_set() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let (records, pages) = published_book(&root, &mut store);
+    let layout = default_layout_key();
+    let other = layout.wrapping_add(1);
+    // The fixture's three sections fill ordinals 0..3; the rest of this layout
+    // and all of the other one are plain files a restamp leaves alone.
+    let filler = write_section_files(
+        &root,
+        KEY,
+        layout_names(layout, 3).chain(layout_names(other, 0)),
+        100,
+    );
+    let legacy = write_legacy_files(&root, KEY, 1, 100);
+    let current = MAX_BOOK_SECTIONS * files::MAX_RESIDENT_LAYOUTS;
+    assert_eq!(section_file_count(&root, KEY), current + 1);
+
+    let carried = files::carry_pagination(
+        &root,
+        &OWNER,
+        &NOW,
+        hashed(b"the book"),
+        IDENTITY,
+        identity_at(&NOW),
+    )
+    .expect("the carry is not refused at the directory's full size")
+    .expect("there was something to carry");
+    assert_eq!(
+        carried,
+        files::CarriedPagination {
+            moved: (5 + filler.len()) as u16,
+            unlinked: 0,
+            restamped: 4,
+            reclaimed: 1
+        }
+    );
+    assert_eq!(
+        section_file_count(&root, KEY),
+        0,
+        "the departed directory emptied"
+    );
+    assert_eq!(
+        section_file_count(&root, NOW.key),
+        current,
+        "every current name arrived"
+    );
+    assert_eq!(legacy_names_under(&root, NOW.key), Vec::<String>::new());
+    assert!(
+        !chain_is_allocated(&root, legacy[0]),
+        "the old file's chain is free"
+    );
+    assert!(!marker_present(&root, KEY, FORWARD_MARKER));
+    assert!(!marker_present(&root, NOW.key, BACK_MARKER));
+    assert_loads_under(&root, &NOW, identity_at(&NOW), pages, records[2].start_page);
+}
+
+/// One finished build's prune clears a layout's whole orphan tail and the old
+/// firmware's set together, past what a budget for one population covers.
+#[test]
+fn a_finished_build_prunes_a_full_orphan_tail_and_the_old_firmware_set() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    build_book(&root, &mut store, 4);
+    let layout = default_layout_key();
+    let orphans = write_section_files(&root, KEY, layout_names(layout, 4), 100);
+    let legacy = write_legacy_files(&root, KEY, 46, 100);
+    assert_eq!(
+        section_file_count(&root, KEY),
+        4 + orphans.len() + legacy.len()
+    );
+
+    let pruned = files::prune_orphan_sections(&root, &OWNER, layout, 4);
+    assert_eq!(
+        pruned,
+        orphans.len() + legacy.len(),
+        "everything eligible went in one prune"
+    );
+    assert_eq!(section_file_count(&root, KEY), 4, "the kept sections stand");
+    assert!(sections_still_on_card(&root, 4));
+    for cluster in orphans.iter().chain(&legacy) {
+        assert!(
+            !chain_is_allocated(&root, *cluster),
+            "a pruned chain leaked"
+        );
+    }
 }

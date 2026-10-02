@@ -994,6 +994,11 @@ pub fn section_file_is_layout(name: &str, layout: u8) -> bool {
     layout_of_section_file(name) == Some(layout)
 }
 
+/// How many names [`is_legacy_section_file`] accepts, `S000.BIN` through
+/// `S999.BIN`. A sweep that frees them budgets its listing passes for all of
+/// them beside the current layouts, since no layout counts them.
+pub const MAX_LEGACY_SECTION_FILES: usize = 1000;
+
 /// Whether a name is a section file from firmware before layout-named
 /// sections: exactly `S` + three digits + `.BIN`, eight bytes. Nothing loads
 /// these, so they are reclaimable on sight. A current name is ten bytes, so

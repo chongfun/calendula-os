@@ -1377,10 +1377,16 @@ where
     Ok(blocked)
 }
 
+/// Every section file a `SECTIONS/` directory can hold: a full book under
+/// each resident layout, plus every old firmware name the sweeps free, which
+/// no layout counts. A sweep over the whole directory budgets its passes on
+/// this; one over a single layout's names on `MAX_BOOK_SECTIONS` alone.
+const MAX_SECTION_DIR_FILES: usize =
+    MAX_BOOK_SECTIONS * MAX_RESIDENT_LAYOUTS + proto::cache::MAX_LEGACY_SECTION_FILES;
+
 /// Passes enough to list every section file a directory can hold, plus one
 /// that proves it came back empty rather than ran out of budget.
-const SECTION_CARRY_PASSES: usize =
-    (MAX_BOOK_SECTIONS * MAX_RESIDENT_LAYOUTS).div_ceil(SECTION_SWEEP_BATCH) + 1;
+const SECTION_CARRY_PASSES: usize = MAX_SECTION_DIR_FILES.div_ceil(SECTION_SWEEP_BATCH) + 1;
 
 /// Move every section file from `from` to `to`, finishing any cut earlier.
 /// Returns what it did, or refuses on the first name it could not settle,
@@ -3751,8 +3757,11 @@ where
     // Same shape as `empty_sections_dir`: collect a bounded batch by listing,
     // delete it, and list again, because deleting while iterating is not
     // something the directory walk promises. The spare pass proves the tail
-    // is gone rather than merely out of budget.
-    let max_passes = MAX_BOOK_SECTIONS.div_ceil(SECTION_SWEEP_BATCH) + 1;
+    // is gone rather than merely out of budget. The population is one
+    // layout's orphans plus every old firmware name.
+    let max_passes = (MAX_BOOK_SECTIONS + proto::cache::MAX_LEGACY_SECTION_FILES)
+        .div_ceil(SECTION_SWEEP_BATCH)
+        + 1;
     for _ in 0..max_passes {
         let mut names: heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH> =
             heapless::Vec::new();
@@ -3787,8 +3796,8 @@ where
             return removed;
         }
         // Attempt every name in the batch, including the ones after a failure.
-        // `remove_file_reclaiming_clusters` opens, truncates, closes and then
-        // deletes, and a fault in any of those fails that one file without
+        // `remove_file_reclaiming_clusters` opens, truncates, closes, deletes
+        // and frees, and a fault in any of those fails that one file without
         // saying anything about the next — the card model these paths are
         // tested against injects exactly that, a single refused write followed
         // by writes that succeed. Abandoning the batch on the first failure
@@ -3857,9 +3866,10 @@ where
     T: TimeSource,
 {
     use core::fmt::Write;
-    // A full book is MAX_BOOK_SECTIONS files; the spare pass is what proves
-    // the directory came back empty rather than merely running out of budget.
-    let max_passes = MAX_BOOK_SECTIONS.div_ceil(SECTION_SWEEP_BATCH) + 1;
+    // Everything the directory can hold, under every resident layout and the
+    // old firmware's names; the spare pass is what proves the directory came
+    // back empty rather than merely running out of budget.
+    let max_passes = MAX_SECTION_DIR_FILES.div_ceil(SECTION_SWEEP_BATCH) + 1;
     for _ in 0..max_passes {
         let mut names: heapless::Vec<String<SHORT_NAME_BYTES>, SECTION_SWEEP_BATCH> =
             heapless::Vec::new();
