@@ -53,6 +53,11 @@ pub struct Disk {
     bytes: Rc<RefCell<Vec<u8>>>,
     writes: Rc<Cell<u64>>,
     refuse_writes: Rc<Cell<u32>>,
+    fail_after: Rc<Cell<Option<u32>>>,
+    land_failing: Rc<Cell<bool>>,
+    failed: Rc<Cell<bool>>,
+    read_fault: Rc<Cell<Option<u32>>>,
+    read_failed: Rc<Cell<bool>>,
 }
 
 impl Disk {
@@ -63,9 +68,44 @@ impl Disk {
     }
 
     /// Refuse the next `count` write commands, landing nothing, as a card
-    /// with a passing fault does.
+    /// with a passing fault does. Also lifts [`Self::fail_after_writes`].
     pub fn refuse_next_writes(&self, count: u32) {
         self.refuse_writes.set(count);
+        self.fail_after.set(None);
+    }
+
+    /// Land the next `count` write commands, then refuse every one after,
+    /// as a card that fails partway through a scan does.
+    pub fn fail_after_writes(&self, count: u32) {
+        self.refuse_writes.set(0);
+        self.fail_after.set(Some(count));
+        self.land_failing.set(false);
+        self.failed.set(false);
+    }
+
+    /// Land the next `count` write commands, then land one more and report it
+    /// failed, as a card whose busy wait fails after it took the data does.
+    /// Writes after that one land normally.
+    pub fn land_then_fail_after(&self, count: u32) {
+        self.fail_after_writes(count);
+        self.land_failing.set(true);
+    }
+
+    /// Whether a write has failed since the last fault was set.
+    pub fn failed(&self) -> bool {
+        self.failed.get()
+    }
+
+    /// Once a write has failed, answer `count` more reads and then refuse
+    /// one, as a card still faulting does. Reads after that answer normally.
+    pub fn refuse_read_after_the_failed_write(&self, count: u32) {
+        self.read_fault.set(Some(count));
+        self.read_failed.set(false);
+    }
+
+    /// Whether the read fault fired.
+    pub fn read_failed(&self) -> bool {
+        self.read_failed.get()
     }
 }
 
@@ -73,6 +113,16 @@ impl BlockDevice for Disk {
     type Error = DiskError;
 
     fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), DiskError> {
+        if self.failed.get() {
+            if let Some(left) = self.read_fault.get() {
+                if left == 0 {
+                    self.read_fault.set(None);
+                    self.read_failed.set(true);
+                    return Err(DiskError);
+                }
+                self.read_fault.set(Some(left - 1));
+            }
+        }
         let bytes = self.bytes.borrow();
         for (i, block) in blocks.iter_mut().enumerate() {
             let at = (start.0 as usize + i) * BLOCK_BYTES;
@@ -86,10 +136,26 @@ impl BlockDevice for Disk {
             self.refuse_writes.set(self.refuse_writes.get() - 1);
             return Err(DiskError);
         }
+        let mut fail = false;
+        if let Some(left) = self.fail_after.get() {
+            if left == 0 {
+                self.failed.set(true);
+                if !self.land_failing.get() {
+                    return Err(DiskError);
+                }
+                self.fail_after.set(None);
+                fail = true;
+            } else {
+                self.fail_after.set(Some(left - 1));
+            }
+        }
         let mut bytes = self.bytes.borrow_mut();
         for (i, block) in blocks.iter().enumerate() {
             let at = (start.0 as usize + i) * BLOCK_BYTES;
             bytes[at..at + BLOCK_BYTES].copy_from_slice(&block[..]);
+        }
+        if fail {
+            return Err(DiskError);
         }
         self.writes.set(self.writes.get() + blocks.len() as u64);
         Ok(())
@@ -128,6 +194,11 @@ impl Card {
                 bytes: Rc::new(RefCell::new(image)),
                 writes: Rc::new(Cell::new(0)),
                 refuse_writes: Rc::new(Cell::new(0)),
+                fail_after: Rc::new(Cell::new(None)),
+                land_failing: Rc::new(Cell::new(false)),
+                failed: Rc::new(Cell::new(false)),
+                read_fault: Rc::new(Cell::new(None)),
+                read_failed: Rc::new(Cell::new(false)),
             },
         }
     }
