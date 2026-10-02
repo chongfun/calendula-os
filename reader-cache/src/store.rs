@@ -337,6 +337,7 @@ pub struct ReaderStore {
     pub current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
+    pub(crate) build_progress_permille: Option<u16>,
     pub(crate) layout_bound_unmet: bool,
     pub(crate) book_section_count: usize,
     pub(crate) book_sections: [BookV2SectionRecord; MAX_BOOK_SECTIONS],
@@ -489,6 +490,7 @@ impl ReaderStore {
             current_section_page_count: 0,
             book_cache_ready: false,
             book_cache_partial: false,
+            build_progress_permille: None,
             layout_bound_unmet: false,
             book_section_count: 0,
             book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
@@ -1256,6 +1258,7 @@ impl ReaderStore {
         self.current_section_page_count = 0;
         self.book_cache_ready = false;
         self.book_cache_partial = false;
+        self.build_progress_permille = None;
         self.book_section_count = 0;
         for record in self.book_sections.iter_mut() {
             *record = EMPTY_BOOK_SECTION_RECORD;
@@ -1816,6 +1819,14 @@ impl ReaderStore {
     /// the book.
     pub fn book_index_is_partial(&self) -> bool {
         self.book_cache_partial
+    }
+
+    pub fn build_progress_permille(&self) -> Option<u16> {
+        self.build_progress_permille
+    }
+
+    pub fn set_build_progress_permille(&mut self, permille: Option<u16>) {
+        self.build_progress_permille = permille;
     }
 
     /// `true` when the card holds more layouts of this book than the bound
@@ -3151,5 +3162,23 @@ mod tests {
             assert_eq!(row.size, 0);
             assert!(!row.is_dir);
         }
+    }
+
+    #[test]
+    fn build_progress_permille_lifecycle() {
+        let mut store = Box::new(ReaderStore::new());
+        assert_eq!(store.build_progress_permille(), None);
+
+        store.set_build_progress_permille(Some(450));
+        assert_eq!(store.build_progress_permille(), Some(450));
+
+        store.clear_book_index();
+        assert_eq!(store.build_progress_permille(), None);
+
+        store.set_build_progress_permille(Some(800));
+        assert_eq!(store.build_progress_permille(), Some(800));
+
+        store.begin_book_load();
+        assert_eq!(store.build_progress_permille(), None);
     }
 }

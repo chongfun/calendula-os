@@ -2476,6 +2476,9 @@ where
         // Suspending, not finishing: flush what the capture staged but leave
         // its header incomplete for the next step to append to.
         let (content_ok, content_spine_count) = content.suspend();
+        let total_spines = package.spine.len().max(1);
+        let permille = ((next_spine as u32 * 1000) / total_spines as u32).min(1000) as u16;
+        library.set_build_progress_permille(Some(permille));
         let mut state = BookBuildResume {
             index: catalog_index,
             source_identity,

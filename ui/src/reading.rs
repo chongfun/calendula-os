@@ -497,6 +497,10 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
     });
 }
 
+/// The 100px apparatus progress rule shown beside the page counter while
+/// a book's cache is still being built in the background.
+pub const READING_PROGRESS_RULE_WIDTH: i16 = 100;
+
 /// Draw the page-in-chapter counter that completes the reading surface.
 /// Callers own the chapter-position calculation and formatting; this shared
 /// seam owns the exact font, right inset, and panel-relative baseline.
@@ -505,19 +509,43 @@ pub fn draw_reading_page_counter(fb: &mut Framebuffer, label: &str) {
 }
 
 pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left: bool) {
+    draw_reading_page_counter_with_progress(fb, label, left, None);
+}
+
+pub fn draw_reading_page_counter_with_progress(
+    fb: &mut Framebuffer,
+    label: &str,
+    left: bool,
+    progress: Option<u16>,
+) {
     // Frame-relative, not panel-relative: the portrait page's footer sits
     // at the bottom of the upright frame. Landscape frames keep the
     // historical panel numbers.
     let font = display::font::literata_small(FontStyle::Regular);
     let frame_right = fb.frame_width() as i16 - 8;
     let baseline = fb.frame_height() as i16 - 3;
+    let width = measure_text(font, label) as i16;
     let x = if left {
         READER_LEFT_X + 16
     } else {
-        let width = measure_text(font, label) as i16;
         frame_right - width - 16
     };
     draw_text(fb, font, label, x, baseline, false);
+
+    if let Some(permille) = progress {
+        let rule_x = if left {
+            x + width + 16
+        } else {
+            x - 16 - READING_PROGRESS_RULE_WIDTH
+        };
+        crate::render::progress_rule(
+            fb,
+            rule_x,
+            baseline - 4,
+            READING_PROGRESS_RULE_WIDTH,
+            permille,
+        );
+    }
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
@@ -1354,6 +1382,49 @@ mod tests {
         // The page box runs under the band too — body text keeps the
         // full-height page when the sheet is down.
         assert!(PageBox::PORTRAIT.bottom > sheet_top);
+    }
+
+    #[test]
+    fn reading_page_counter_with_no_progress_matches_plain_counter() {
+        let mut fb_plain = Framebuffer::new();
+        fb_plain.set_frame(FbFrame::Landscape);
+        fb_plain.clear(true);
+        draw_reading_page_counter_aligned(&mut fb_plain, "12/48", false);
+
+        let mut fb_prog = Framebuffer::new();
+        fb_prog.set_frame(FbFrame::Landscape);
+        fb_prog.clear(true);
+        draw_reading_page_counter_with_progress(&mut fb_prog, "12/48", false, None);
+
+        assert_eq!(fb_plain.bytes(), fb_prog.bytes());
+    }
+
+    #[test]
+    fn reading_page_counter_with_progress_draws_rule() {
+        let mut fb_none = Framebuffer::new();
+        fb_none.set_frame(FbFrame::Landscape);
+        fb_none.clear(true);
+        draw_reading_page_counter_with_progress(&mut fb_none, "1/2", false, None);
+
+        let mut fb_progress = Framebuffer::new();
+        fb_progress.set_frame(FbFrame::Landscape);
+        fb_progress.clear(true);
+        draw_reading_page_counter_with_progress(&mut fb_progress, "1/2", false, Some(500));
+
+        assert_ne!(fb_none.bytes(), fb_progress.bytes());
+
+        // Also verify left-aligned orientation (LandscapeButtonsTop)
+        let mut fb_left_none = Framebuffer::new();
+        fb_left_none.set_frame(FbFrame::LandscapeFlipped);
+        fb_left_none.clear(true);
+        draw_reading_page_counter_with_progress(&mut fb_left_none, "1/2", true, None);
+
+        let mut fb_left_prog = Framebuffer::new();
+        fb_left_prog.set_frame(FbFrame::LandscapeFlipped);
+        fb_left_prog.clear(true);
+        draw_reading_page_counter_with_progress(&mut fb_left_prog, "1/2", true, Some(500));
+
+        assert_ne!(fb_left_none.bytes(), fb_left_prog.bytes());
     }
 
     #[test]

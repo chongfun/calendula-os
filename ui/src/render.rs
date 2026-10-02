@@ -322,7 +322,7 @@ pub(crate) fn chapter_colophon_width(
 }
 
 /// The 1px rule with a 3px head filled to the reading position.
-pub(crate) fn progress_rule(fb: &mut Framebuffer, x: i16, y: i16, w: i16, permille: u16) {
+pub fn progress_rule(fb: &mut Framebuffer, x: i16, y: i16, w: i16, permille: u16) {
     hline(fb, x, y, w);
     let fill = ((w as i32 * permille.min(1000) as i32) / 1000) as i16;
     fill_rect(
@@ -582,34 +582,32 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     finish_working_screen(fb, shell, layout);
 }
 
-/// The rescan note, with how far the scan has got once it has said.
-fn rescan_note(percent: Option<u8>, buf: &mut [u8; 40]) -> &str {
-    let mut cursor = 0;
-    push_str(buf, &mut cursor, "updating the library\u{2026}");
-    if let Some(percent) = percent {
-        push_str(buf, &mut cursor, " ");
-        push_usize(buf, &mut cursor, usize::from(percent.min(100)));
-        push_str(buf, &mut cursor, "%");
-    }
-    core::str::from_utf8(&buf[..cursor]).unwrap_or("updating the library\u{2026}")
-}
+const RESCAN_NOTE: &str = "updating the library\u{2026}";
+const RESCAN_RULE_WIDTH: i16 = 200;
+/// Room either side of the rescan note and rule, for italic overhang.
+const RESCAN_NOTE_PAD: i16 = 8;
 
 // At the rows' size: the reader waits on this, so it has to be read.
 fn rescan_footer(fb: &mut Framebuffer, layout: ShellLayout, percent: Option<u8>) {
-    let mut buf = [0u8; 40];
+    let font = literata_small(FontStyle::Italic);
     draw_text_centered(
         fb,
-        literata(FontStyle::Italic),
-        rescan_note(percent, &mut buf),
+        font,
+        RESCAN_NOTE,
         layout.heading_cx,
-        layout.footer_y(),
+        layout.footer_y() - 10,
+    );
+    let permille = percent.map_or(0, |p| (p as u16) * 10);
+    progress_rule(
+        fb,
+        layout.heading_cx - RESCAN_RULE_WIDTH / 2,
+        layout.footer_y() + 6,
+        RESCAN_RULE_WIDTH,
+        permille,
     );
 }
 
-/// Room either side of the widest rescan note, for italic overhang.
-const RESCAN_NOTE_PAD: i16 = 6;
-
-/// Clear the rescan note's line, as wide as the note at 100 % and no wider,
+/// Clear the rescan note and progress rule, as wide as the rule and no wider,
 /// and draw it again at `percent`. The battery shares the line in
 /// landscape, so the clear stops short of the corner.
 pub(crate) fn redraw_rescan_footer(
@@ -618,18 +616,19 @@ pub(crate) fn redraw_rescan_footer(
     percent: Option<u8>,
 ) {
     let layout = ShellLayout::for_orientation(orientation);
-    let font = literata(FontStyle::Italic);
-    let mut buf = [0u8; 40];
-    let widest = measure_text(font, rescan_note(Some(100), &mut buf)) as i16;
+    let font = literata_small(FontStyle::Italic);
+    let text_w = measure_text(font, RESCAN_NOTE) as i16;
+    let widest = RESCAN_RULE_WIDTH.max(text_w);
     let x = layout.heading_cx - widest / 2 - RESCAN_NOTE_PAD;
-    let y = layout.footer_y() - font.baseline as i16;
+    let y = layout.footer_y() - 10 - font.baseline as i16 - 2;
+    let h = (font.baseline as i16 + 2) + 16 + 3 + 2;
     fill_rect(
         fb,
         Rect::new(
             x as u16,
             y as u16,
             (widest + 2 * RESCAN_NOTE_PAD) as u16,
-            u16::from(font.line_height),
+            h as u16,
         ),
         true,
     );
@@ -1760,24 +1759,10 @@ mod tests {
         assert!(second.is_empty());
     }
 
-    /// The note reads how far the rescan has got once the scan says, and
-    /// reads as before until then.
+    /// The note text is static while the progress rule below it carries the percentage.
     #[test]
-    fn the_rescan_note_carries_its_percent() {
-        let mut buf = [0u8; 40];
-        assert_eq!(rescan_note(None, &mut buf), "updating the library\u{2026}");
-        assert_eq!(
-            rescan_note(Some(40), &mut buf),
-            "updating the library\u{2026} 40%"
-        );
-        assert_eq!(
-            rescan_note(Some(0), &mut buf),
-            "updating the library\u{2026} 0%"
-        );
-        assert_eq!(
-            rescan_note(Some(250), &mut buf),
-            "updating the library\u{2026} 100%"
-        );
+    fn the_rescan_note_is_static() {
+        assert_eq!(RESCAN_NOTE, "updating the library\u{2026}");
     }
 
     fn rescan_shell(orientation: UiOrientation, percent: Option<u8>) -> UiShell<'static> {

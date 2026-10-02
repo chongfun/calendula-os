@@ -348,10 +348,11 @@ fn draw_reader_footer(
 
     let mut label = String::<32>::new();
     let _ = write!(label, "{}/{}", chapter_current, chapter_total);
-    ui::reading::draw_reading_page_counter_aligned(
+    ui::reading::draw_reading_page_counter_with_progress(
         fb,
         label.as_str(),
         request.orientation == DisplayOrientation::LandscapeButtonsTop,
+        sd_library.build_progress_permille(),
     );
 }
 
@@ -373,6 +374,16 @@ fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_libra
     if !author.is_empty() {
         draw_text_centered_truncated_local(fb, author_font, author, left, right, author_y);
     }
+
+    const LOADING_RULE_WIDTH: i16 = 240;
+    let rule_x = (fb.frame_width() as i16 - LOADING_RULE_WIDTH) / 2;
+    let rule_y = if author.is_empty() {
+        title_y + 44
+    } else {
+        author_y + 44
+    };
+    let permille = sd_library.build_progress_permille().unwrap_or(0);
+    ui::render::progress_rule(fb, rule_x, rule_y, LOADING_RULE_WIDTH, permille);
 }
 
 fn draw_sd_reader_error(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {

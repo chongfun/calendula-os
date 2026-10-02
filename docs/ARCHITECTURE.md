@@ -623,7 +623,13 @@ builder closes the current section and opens the next when its in-RAM arena
 fills, where the text budget (16 KB) is the binding limit for prose, well ahead
 of the block (384) and page (96) caps. Sections are invisible while reading: the
 reader walks across them seamlessly, and the footer page-in-chapter counter
-aggregates every section sharing a spine. The book index holds up to
+aggregates every section sharing a spine. While a book is building
+progressively in the background, the reading footer displays a 100px progress
+rule (`ui::reading::READING_PROGRESS_RULE_WIDTH`) immediately beside the
+page-in-chapter counter, advancing only on user-initiated page turns without
+unsolicited screen refreshes. Once background pagination completes, the rule
+is omitted. On cold first open, the centered bookplate loading screen displays
+a 240px progress rule below the title and author. The book index holds up to
 `MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a longer book caches
 `partial`.
 
@@ -777,7 +783,7 @@ nothing the app queued against the old catalog runs against a new one. A pick
 the reader waits for scans as before, and a newer pick made during the note
 gets its own.
 
-The note then counts up, "updating the library... 40%", repainted at most
+The note's progress rule then fills, repainted at most
 every 2 s on a fast refresh from inside the scan's one card session. The scan
 calls `Card::with_root_reporting`, and `storage::progress::ScanProgress` turns
 what it learns into a percentage: catalog rows written, ledger rows joined,

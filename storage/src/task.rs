@@ -443,7 +443,10 @@ impl StorageTask {
                     ..pending
                 });
             }
-            _ => self.background_build = None,
+            _ => {
+                self.background_build = None;
+                sd_library.set_build_progress_permille(None);
+            }
         }
         if finished {
             slog!(
