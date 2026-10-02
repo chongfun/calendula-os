@@ -118,7 +118,10 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
 
     Tracks `sp` through the straight-line instruction stream, following the
     small constant materialisations RISC-V needs for frames over 2 KB: `lui`
-    plus `addi` into a scratch register, then `sub sp, sp, reg`. Positive
+    plus `addi` into a scratch register, or `li` plus `slli` when the constant
+    has enough trailing zero bits for LLVM to prefer the two compressed
+    instructions (0x1700 becomes `li a2, 0x17; slli a2, a2, 0x8`), then
+    `sub sp, sp, reg`. Positive
     adjustments are treated as deallocation so an epilogue does not inflate the
     peak. Branches are ignored -- a frame this tool cares about is allocated in
     the prologue, and a loop that grew `sp` without bound would be a different
@@ -168,6 +171,19 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
             if ops[1] in regs:
                 try:
                     regs[ops[0]] = regs[ops[1]] + imm(ops[2])
+                except ValueError:
+                    regs.pop(ops[0], None)
+            else:
+                regs.pop(ops[0], None)
+        elif mnem == "li" and len(ops) == 2:
+            try:
+                regs[ops[0]] = imm(ops[1])
+            except ValueError:
+                regs.pop(ops[0], None)
+        elif mnem == "slli" and len(ops) == 3:
+            if ops[1] in regs:
+                try:
+                    regs[ops[0]] = regs[ops[1]] << imm(ops[2])
                 except ValueError:
                     regs.pop(ops[0], None)
             else:
@@ -312,6 +328,33 @@ class TestStackFrames(unittest.TestCase):
             ("sub", ["sp", "sp", "t0"]),
         ]
         self.assertEqual(frame_size(insns), 21504)
+
+    # rustc 1.99.0 materialised the display task's 0x1700-byte allocation this
+    # way instead of `lui`/`addi`: two compressed instructions where the
+    # constant's low eight bits are zero. The frame was 6,144 bytes on the
+    # device and the check failed closed on a tooling gap, not a real overflow.
+    def test_large_frame_li_slli_sub(self) -> None:
+        # Copied verbatim from the X4 release build of PR #115's display task.
+        lines = [
+            "4225d970: 7111         \taddi\tsp, sp, -0x100",
+            "4225d98c: 465d         \tli\ta2, 0x17",
+            "4225d98e: 0622         \tslli\ta2, a2, 0x8",
+            "4225d990: 40c10133     \tsub\tsp, sp, a2",
+            "4226211e: 455d         \tli\ta0, 0x17",
+            "42262120: 0422         \tslli\ta0, a0, 0x8",
+            "42262122: 00a10133     \tadd\tsp, sp, a0",
+            "4226213e: 6111         \taddi\tsp, sp, 0x100",
+        ]
+        insns = [parse_insn_line(line) for line in lines]
+        self.assertNotIn(None, insns)
+        self.assertEqual(frame_size(insns), 0x100 + 0x1700)
+
+    def test_slli_of_untracked_register_fails_closed(self) -> None:
+        insns = [
+            ("slli", ["a2", "a3", "0x8"]),
+            ("sub", ["sp", "sp", "a2"]),
+        ]
+        self.assertIsNone(frame_size(insns))
 
     def test_epilogue_does_not_increase_peak(self) -> None:
         insns = [
