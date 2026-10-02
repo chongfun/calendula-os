@@ -2273,7 +2273,7 @@ mod tests {
     /// Old firmware's `S000.BIN`..`S999.BIN` are legacy, and no name the
     /// current writer can produce is.
     #[test]
-    fn legacy_section_names_and_current_ones_never_meet() {
+    fn legacy_section_names_and_current_ones_do_not_meet() {
         for legacy in ["S000.BIN", "S045.BIN", "S999.BIN", "s012.bin"] {
             assert!(is_legacy_section_file(legacy), "{legacy}");
             assert_eq!(layout_of_section_file(legacy), None, "{legacy}");
