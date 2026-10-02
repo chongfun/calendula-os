@@ -785,7 +785,8 @@ restores the card clock. The volume manager's block cache and open handles
 are untouched, and the card, deselected between operations, carries on. A
 repaint costs about 380 ms on the X3, so a 13 s scan pays about 1.5 s for five
 of them. The planner gates it (`RefreshPlanner::rescan_progress_frame`): only
-over the note, only rising, only on a fast refresh. The paint runs at the
+over the note, only rising, and only on a fast refresh or the one-flicker
+clean a FullEveryTen policy has come due for. The paint runs at the
 bottom of the scan's hash, the deepest point of the scan: about 24 KB with the
 display task's poll frame, against the X3's 32 KB stack region.
 

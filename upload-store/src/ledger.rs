@@ -893,10 +893,10 @@ pub struct FoundAgain<'a> {
 pub enum AssignProgress {
     /// `rows` rows have been joined against the ledger by place.
     Matched { rows: u16 },
-    /// The move search will read at most `bytes` of files to prove moves, in
-    /// `rows` new rows of a length one of `copies` missing copies had. At most
-    /// one row per copy can be carried.
-    Proving { bytes: u64, rows: u16, copies: u16 },
+    /// The move search will read at most `bytes` of files to prove moves, and
+    /// can carry at most `carries` copies: for each length, the fewer of the
+    /// new rows and the missing copies of that length.
+    Proving { bytes: u64, carries: u16 },
     /// `bytes` of files read for the move search so far, in this scan.
     Hashed { bytes: u64 },
 }
@@ -1259,7 +1259,9 @@ where
     // The search below hashes every new row of a length a copy awaits, so
     // the plan is those rows. A copy deleted rather than moved has no row of
     // its length and adds nothing.
-    let (mut bytes, mut rows) = (0u64, 0u16);
+    let mut bytes = 0u64;
+    // New rows of each awaited length, counted on that length's first slot.
+    let mut rows_of = [0u8; MOVES_CONSIDERED];
     if slots > 0 {
         seek_row(catalog, 0)?;
         for _ in 0..count as usize {
@@ -1270,21 +1272,30 @@ where
                 continue;
             }
             let (_, _, byte_size) = catalog_record_at(&record).ok_or(LedgerFault::Record)?;
-            if (0..slots).any(|slot| move_awaits(table, slot, byte_size)) {
+            if let Some(first) = (0..slots).find(|slot| move_awaits(table, *slot, byte_size)) {
                 bytes = bytes.saturating_add(u64::from(byte_size));
-                rows = rows.saturating_add(1);
+                rows_of[first] = rows_of[first].saturating_add(1);
             }
         }
     }
-    let copies = (0..slots)
-        .filter(|slot| move_entry(table, *slot)[MOVE_STATE] != MOVE_AMBIGUOUS)
-        .count()
-        .min(usize::from(u16::MAX)) as u16;
-    progress(AssignProgress::Proving {
-        bytes,
-        rows,
-        copies,
-    });
+    // A length carries at most as many copies as it has rows, and a copy
+    // with no row of its length carries nothing.
+    let mut carries = 0u16;
+    for (slot, &rows) in rows_of[..slots].iter().enumerate() {
+        if rows == 0 {
+            continue;
+        }
+        let size = u32::from_le_bytes(
+            move_entry(table, slot)[MOVE_SIZE..MOVE_ID]
+                .try_into()
+                .expect("four bytes"),
+        );
+        let copies = (slot..slots)
+            .filter(|other| move_awaits(table, *other, size))
+            .count();
+        carries = carries.saturating_add(copies.min(usize::from(rows)) as u16);
+    }
+    progress(AssignProgress::Proving { bytes, carries });
     let mut engine = Counted {
         engine,
         progress,

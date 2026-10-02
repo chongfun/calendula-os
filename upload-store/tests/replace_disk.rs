@@ -2459,8 +2459,7 @@ fn a_sideloaded_copy_that_was_read_is_found_again_where_it_went() {
             ledger::AssignProgress::Matched { rows: 1 },
             ledger::AssignProgress::Proving {
                 bytes: u64::from(size),
-                rows: 1,
-                copies: 1
+                carries: 1
             },
         ],
         "{steps:?}"
@@ -2989,8 +2988,8 @@ fn the_move_plan_counts_only_lengths_a_new_file_has() {
 }
 
 /// Several new files share a missing copy's length. The search hashes each
-/// of them, but one copy can be carried at most once, so the plan reports one
-/// copy awaiting beside the rows it will read.
+/// of them, but one copy can be carried at most once, so the plan budgets one
+/// carry for the three rows it will read.
 #[test]
 fn the_move_plan_counts_the_copies_a_carry_can_settle() {
     let disk = new_card();
@@ -3020,16 +3019,63 @@ fn the_move_plan_counts_the_copies_a_carry_can_settle() {
     let _ = progress();
     let (assigned, _) = scan_minting(&root, &rows, &mut random).unwrap();
     assert_eq!(assigned.repaired, 0, "{assigned:?}");
-    let planned: Vec<(u64, u16, u16)> = progress()
+    assert_eq!(planned_carries(), vec![(3 * kept.len() as u64, 1)]);
+}
+
+/// The bytes and carries each scan since the last call planned.
+fn planned_carries() -> Vec<(u64, u16)> {
+    progress()
         .iter()
         .filter_map(|step| match step {
-            ledger::AssignProgress::Proving {
-                bytes,
-                rows,
-                copies,
-            } => Some((*bytes, *rows, *copies)),
+            ledger::AssignProgress::Proving { bytes, carries } => Some((*bytes, *carries)),
             _ => None,
         })
-        .collect();
-    assert_eq!(planned, vec![(3 * kept.len() as u64, 3, 1)]);
+        .collect()
+}
+
+/// Two copies go missing, of different lengths, and three new files arrive
+/// with the first copy's length only. The second copy has no row to be found
+/// in, so the plan budgets one carry, not two.
+#[test]
+fn a_missing_copy_with_no_row_of_its_length_budgets_no_carry() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let first = body(1, 3_000);
+    let second = body(2, 4_000);
+    let second_name = "Second.epub";
+    sideload(&books, BOOK, &first);
+    sideload(&books, second_name, &second);
+    let mut random = words();
+    scan_minting(
+        &root,
+        &[
+            (BookRoot::Library, BOOK, first.len() as u32),
+            (BookRoot::Library, second_name, second.len() as u32),
+        ],
+        &mut random,
+    )
+    .unwrap();
+    note_open(&root, BookRoot::Library, BOOK, &first);
+    note_open(&root, BookRoot::Library, second_name, &second);
+    let _ = found_again();
+
+    // The first copy moves, two strangers of its length arrive, and the
+    // second copy is deleted.
+    let moved = "Herbert, Frank - Dune.epub";
+    rename_on_shelf(&root, BOOK, moved);
+    let strangers = ["One.epub", "Two.epub"];
+    for (seed, name) in strangers.iter().enumerate() {
+        sideload(&books, name, &body(20 + seed as u8, first.len()));
+    }
+    let mut rows = vec![(BookRoot::Library, moved, first.len() as u32)];
+    rows.extend(
+        strangers
+            .iter()
+            .map(|name| (BookRoot::Library, *name, first.len() as u32)),
+    );
+    let _ = progress();
+    let (assigned, _) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 1, "{assigned:?}");
+    assert_eq!(planned_carries(), vec![(3 * first.len() as u64, 1)]);
 }
