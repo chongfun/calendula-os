@@ -52,6 +52,7 @@ impl std::error::Error for DiskError {}
 pub struct Disk {
     bytes: Rc<RefCell<Vec<u8>>>,
     writes: Rc<Cell<u64>>,
+    refuse_writes: Rc<Cell<u32>>,
 }
 
 impl Disk {
@@ -59,6 +60,12 @@ impl Disk {
     /// rebuilt without relying on log lines.
     pub fn writes(&self) -> u64 {
         self.writes.get()
+    }
+
+    /// Refuse the next `count` write commands, landing nothing, as a card
+    /// with a passing fault does.
+    pub fn refuse_next_writes(&self, count: u32) {
+        self.refuse_writes.set(count);
     }
 }
 
@@ -75,6 +82,10 @@ impl BlockDevice for Disk {
     }
 
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
+        if self.refuse_writes.get() > 0 {
+            self.refuse_writes.set(self.refuse_writes.get() - 1);
+            return Err(DiskError);
+        }
         let mut bytes = self.bytes.borrow_mut();
         for (i, block) in blocks.iter().enumerate() {
             let at = (start.0 as usize + i) * BLOCK_BYTES;
@@ -116,6 +127,7 @@ impl Card {
             disk: Disk {
                 bytes: Rc::new(RefCell::new(image)),
                 writes: Rc::new(Cell::new(0)),
+                refuse_writes: Rc::new(Cell::new(0)),
             },
         }
     }
@@ -597,6 +609,12 @@ impl Device {
 
     /// Press a button, and let both tasks run until neither owes anything.
     pub fn press(&mut self, button: Button) {
+        self.press_only(button);
+        self.settle();
+    }
+
+    /// Press a button and queue what it owes, running nothing.
+    pub fn press_only(&mut self, button: Button) {
         let previous = self.app;
         self.app = self.app.apply_input(CTX, InputEvent::button(button));
         let request_id = self.next_request_id;
@@ -613,7 +631,6 @@ impl Device {
             self.queue.push_back(command);
         }
         self.render();
-        self.settle();
     }
 
     /// The fold an open owes, stamped with the catalog a `RowIsBook` was
@@ -669,18 +686,7 @@ impl Device {
     /// background slices, each event folded into the app as it arrives.
     pub fn settle(&mut self) {
         for _ in 0..10_000 {
-            if let Some(command) = self.queue.pop_front() {
-                let portrait = app_core::is_portrait(self.app.orientation);
-                self.task.handle(
-                    command,
-                    &mut self.card,
-                    &mut self.host,
-                    &mut self.store,
-                    &mut self.metrics,
-                    &mut self.sync,
-                    portrait,
-                );
-                self.deliver();
+            if self.handle_one() {
                 continue;
             }
             if let Some(command) = self.host.requeued.pop_front() {
@@ -701,6 +707,50 @@ impl Device {
             return;
         }
         panic!("the storage task never went quiet");
+    }
+
+    /// Queue a storage command as if the storage task's channel received it.
+    pub fn send(&mut self, command: StorageCommand) {
+        self.queue.push_back(command);
+    }
+
+    /// Run the queued commands only: no requeued command and no background
+    /// slice, which the firmware reaches only after a wait.
+    pub fn run_queued(&mut self) {
+        while self.handle_one() {}
+    }
+
+    /// Run one background slice, as the firmware does after its wait.
+    pub fn step_background(&mut self) {
+        self.task.background_step(
+            &mut self.card,
+            &mut self.host,
+            &mut self.store,
+            &mut self.metrics,
+            self.last_render,
+        );
+        self.deliver();
+        while let Some(command) = self.host.requeued.pop_front() {
+            self.queue.push_back(command);
+        }
+    }
+
+    fn handle_one(&mut self) -> bool {
+        let Some(command) = self.queue.pop_front() else {
+            return false;
+        };
+        let portrait = app_core::is_portrait(self.app.orientation);
+        self.task.handle(
+            command,
+            &mut self.card,
+            &mut self.host,
+            &mut self.store,
+            &mut self.metrics,
+            &mut self.sync,
+            portrait,
+        );
+        self.deliver();
+        true
     }
 
     /// Fold the storage task's events into the app, as the app task does,
@@ -752,6 +802,12 @@ impl Device {
 
     /// Move the cursor to the row named `name` and press Confirm.
     pub fn choose(&mut self, name: &str) {
+        self.point_at(name);
+        self.press(Button::Confirm);
+    }
+
+    /// Move the cursor to the row named `name`.
+    pub fn point_at(&mut self, name: &str) {
         let rows = self.rows();
         let index = rows
             .iter()
@@ -764,7 +820,6 @@ impl Device {
         while usize::from(self.app.selection) > start + index {
             self.press(Button::Previous);
         }
-        self.press(Button::Confirm);
     }
 
     /// Turn `pages` pages forward.

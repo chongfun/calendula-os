@@ -59,6 +59,18 @@ pub struct StorageTask {
     pub pending_place: Option<PendingPlace>,
     pub evidence_settled: Option<book_build::EvidencePlace>,
     pub pending_evidence: Option<book_build::SourceEvidenceJob>,
+    pub catalog_refresh: CatalogRefresh,
+}
+
+/// A catalog refresh that waited on a refused position write. A background
+/// slice requeues it after the slice's backoff, so a card that keeps refusing
+/// is retried on a timer rather than straight away. Once the retry gets past
+/// the write it is an ordinary refresh: a scan that then fails is not retried,
+/// as no refresh's is. Any other scan that lands settles it first.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CatalogRefresh {
+    pub owed: bool,
+    pub refusals: u8,
 }
 
 impl StorageTask {
@@ -91,6 +103,7 @@ impl StorageTask {
             &mut self.state_restored,
             &mut self.background_build,
             &mut self.pending_place,
+            &mut self.catalog_refresh,
             portrait,
         );
     }
@@ -114,7 +127,8 @@ impl StorageTask {
     /// Whether this task owes itself a background slice: a walk, a waiting
     /// place, or reading the open book's bytes.
     pub fn background_owed(&self, sd_library: &ReaderStore) -> bool {
-        self.background_build.is_some()
+        self.catalog_refresh.owed
+            || self.background_build.is_some()
             || self
                 .pending_place
                 .as_ref()
@@ -134,6 +148,11 @@ impl StorageTask {
                     .filter(|waiting| !waiting.stopped)
                     .map_or(0, |waiting| waiting.refusals),
             )
+            .max(if self.catalog_refresh.owed {
+                self.catalog_refresh.refusals
+            } else {
+                0
+            })
     }
 
     /// Run one background slice. `last_request` is the last render, which
@@ -147,6 +166,11 @@ impl StorageTask {
         font_metrics: &mut crate::custom_font::MetricCache,
         last_request: Option<RenderRequest>,
     ) {
+        if self.catalog_refresh.owed {
+            self.catalog_refresh.owed = false;
+            host.requeue(StorageCommand::RefreshCatalog);
+            return;
+        }
         let Some(pending) = self.background_build else {
             // A place waiting on a card that refused a read, with no
             // walk to carry it. Its retry rides this slice instead:
@@ -918,6 +942,7 @@ pub fn handle_storage_command(
     state_restored: &mut StateRestore,
     background_build: &mut Option<BackgroundBuild>,
     pending_place: &mut Option<PendingPlace>,
+    catalog_refresh: &mut CatalogRefresh,
     portrait: bool,
 ) {
     // The session decides what may run: progress writes stay alive during a
@@ -1003,7 +1028,21 @@ pub fn handle_storage_command(
             host.send(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
-            crate::library_sd::scan_books(card, sd_library);
+            if !scan_books_after_flush(
+                card,
+                sd_library,
+                pending_progress,
+                last_progress_write,
+                pending_place,
+                catalog_refresh,
+            ) {
+                catalog_refresh.owed = true;
+                catalog_refresh.refusals = catalog_refresh.refusals.saturating_add(1);
+                return;
+            }
+            // Past the write, this is an ordinary refresh whatever its scan
+            // did, so the refused writes' backoff is spent.
+            *catalog_refresh = CatalogRefresh::default();
             restore_saved_state(card, host, sd_library, state_restored, false);
             host.send(&LibraryEvent::Scanned {
                 count: sd_library.catalog_count_u16(),
@@ -1692,7 +1731,19 @@ pub fn handle_storage_command(
                     // cannot be opened. Only a card edited since the last
                     // scan pays for this, once, which is what keeps every
                     // other boot on the warm snapshot.
-                    crate::library_sd::scan_books(card, sd_library);
+                    if !scan_books_after_flush(
+                        card,
+                        sd_library,
+                        pending_progress,
+                        last_progress_write,
+                        pending_place,
+                        catalog_refresh,
+                    ) {
+                        // Nothing moved, and the page is still resident for
+                        // the next pick to write.
+                        host.send_required(&LibraryEvent::RowFailed { request_id });
+                        return;
+                    }
                     restore_saved_state(card, host, sd_library, state_restored, true);
                     host.send(&LibraryEvent::Scanned {
                         count: sd_library.catalog_count_u16(),
@@ -2080,6 +2131,37 @@ pub fn restore_saved_state(
         font_family: record.font_family,
         front_buttons: record.front_buttons,
     });
+}
+
+/// Scan the card after writing any coalesced position, or not at all. The
+/// scan borrows the text arena and drops the resident pages, after which the
+/// reader's page has no anchor and its place record cannot be written. False
+/// when the write was refused, which leaves it owed and the pages resident.
+fn scan_books_after_flush(
+    card: &mut impl Card,
+    sd_library: &mut ReaderStore,
+    pending_progress: &mut Option<AppStateRecord>,
+    last_progress_write: &mut Option<Instant>,
+    pending_place: &mut Option<PendingPlace>,
+    catalog_refresh: &mut CatalogRefresh,
+) -> bool {
+    if !flush_pending_progress(
+        card,
+        sd_library,
+        pending_progress,
+        last_progress_write,
+        pending_place,
+    ) {
+        slog!("sd: the reading position would not save; not scanning over it");
+        return false;
+    }
+    // A scan that lands is the refresh any refused one was owed. One that
+    // fails leaves it as it was: still owed after a pick's scan, and settled
+    // by the RefreshCatalog arm after the refresh's own.
+    if crate::library_sd::scan_books(card, sd_library) {
+        *catalog_refresh = CatalogRefresh::default();
+    }
+    true
 }
 
 pub fn flush_pending_progress(

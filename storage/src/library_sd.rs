@@ -99,8 +99,11 @@ impl CatalogFault {
     }
 }
 
+/// Rebuild the catalog from the card. True only when the scan landed: an
+/// error, or a shelf an unfinished install leaves unreconciled, is false even
+/// where an older catalog stays on screen.
 #[inline(never)]
-pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) {
+pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
     let start = Instant::now();
     slog!("sd: scan start");
     library.status = LibraryScanStatus::Scanning;
@@ -244,6 +247,7 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) {
         start.elapsed().as_millis(),
         Instant::now().as_millis(),
     );
+    scan_ok
 }
 
 /// What one reconciliation pass found.
