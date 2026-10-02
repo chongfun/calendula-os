@@ -956,17 +956,6 @@ where
     listing.counts(card_root).map(Some)
 }
 
-/// The directories one Library listing works against, opened once.
-///
-/// A listing counts its rows and then fills a window from them, and the
-/// window is filled again for every page a caller walks through. Resolved
-/// separately, each of those halves opens the shelf by scanning the card
-/// root and then walks every component of the path again, once per half and
-/// again per region. That repetition was most of what entering or leaving a
-/// folder cost: three or four resolutions where one place is being read.
-///
-/// Held open instead. The handles live as long as the listing does, so the
-/// card is walked to the folder once and every count and page after that
 /// Position within a sorted directory listing, serving as a lower bound for subsequent pages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListingCursor {
