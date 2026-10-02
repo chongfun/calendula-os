@@ -556,6 +556,10 @@ pub struct TestHost {
     pub events: Vec<LibraryEvent>,
     pub latest_request: u32,
     pub requeued: VecDeque<StorageCommand>,
+    /// The Library move the app waits on, as the app task publishes it
+    /// before each yield: `Device` copies it from the reducer before a
+    /// rescan, after whatever the reader did while the note painted.
+    pub library_browse_request: Option<u32>,
 }
 
 impl Host for TestHost {
@@ -573,6 +577,10 @@ impl Host for TestHost {
 
     fn latest_reader_request_id(&self) -> u32 {
         self.latest_request
+    }
+
+    fn waiting_on_pick(&self, request_id: u32) -> bool {
+        self.library_browse_request == Some(request_id)
     }
 
     fn requeue(&mut self, command: StorageCommand) {
@@ -810,6 +818,15 @@ impl Device {
     }
 
     fn handle_one(&mut self) -> bool {
+        self.handle_one_with(|_| {})
+    }
+
+    /// Run the next queued command, with `during_note` as what the reader
+    /// does while the firmware paints the rescan note: between the two halves
+    /// of a pick that rescans, after the app has folded `Rescanning` and
+    /// before the scan holds the card. Presses there queue their commands
+    /// behind the scan, as the display task's channel would hold them.
+    pub fn handle_one_with(&mut self, during_note: impl FnOnce(&mut Device)) -> bool {
         let Some(command) = self.queue.pop_front() else {
             return false;
         };
@@ -825,8 +842,11 @@ impl Device {
         );
         self.deliver();
         if let Some(owed) = owed {
-            // The firmware paints here, before the scan holds the card.
+            // The firmware paints here, before the scan holds the card, and
+            // the app runs while the panel refreshes.
             self.before_rescan.push(self.last_render);
+            during_note(self);
+            self.host.library_browse_request = self.app.library_browse.request_id();
             self.task.rescan(
                 owed,
                 &mut self.card,

@@ -26,6 +26,11 @@ pub trait Host {
     fn send_loaded(&mut self, event: &LibraryEvent);
     /// The newest reader request the app has issued.
     fn latest_reader_request_id(&self) -> u32;
+    /// Whether the app is still waiting on the Library pick `request_id`.
+    /// Read between the note painted for a pick's rescan and the scan, where
+    /// the app has had its turn and nothing lets it run again before the
+    /// scan ends.
+    fn waiting_on_pick(&self, request_id: u32) -> bool;
     /// Put a command back on the storage queue for a later pass.
     fn requeue(&mut self, command: StorageCommand);
     /// The reader's scratch, built on first use.
@@ -133,7 +138,8 @@ impl StorageTask {
     }
 
     /// Finish a pick that [`Self::handle`] left owing a rescan: scan, then
-    /// answer the pick from the new catalog.
+    /// answer the pick from the new catalog. A pick the app no longer waits
+    /// on, by [`Host::waiting_on_pick`], is refused without a scan.
     #[inline(never)]
     pub fn rescan(
         &mut self,
@@ -152,6 +158,19 @@ impl StorageTask {
         else {
             return;
         };
+        // The note's refresh let the app run, and Back is the one press it
+        // takes while a pick waits. A pick walked away from gets no scan: the
+        // app may since have asked for its own book by the row it holds in
+        // this catalog, and a scan would renumber that row under it. Answered
+        // anyway, so a wait this host misjudged still ends.
+        if !host.waiting_on_pick(request_id) {
+            slog!(
+                "sd: pick request={} walked away from before its rescan",
+                request_id
+            );
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+            return;
+        }
         if !scan_books_after_flush(
             card,
             sd_library,

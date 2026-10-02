@@ -159,6 +159,171 @@ fn a_pick_that_rescans_says_so_before_the_scan_and_clears_after() {
     assert_eq!(device.before_rescan.len(), 1);
 }
 
+/// The note's refresh lets the app run before the scan, and Back is the one
+/// press a waiting pick takes. The reader presses it, then Continue on Home,
+/// which asks for the book being read by the row it holds in this catalog,
+/// unfenced. The scan would put the added book ahead of it, so that open
+/// would land on the first book under the second's number. Instead the pick
+/// walked away from is refused without a scan, Continue opens the same book
+/// at its page, and the next pick the reader waits for scans.
+#[test]
+fn back_during_the_note_skips_the_scan_so_continue_opens_the_same_book() {
+    let (card, mut device) = second_book_read_with_a_book_added();
+    let row_before = device.app.book_id;
+    let identity_before = device
+        .store
+        .loaded_book_identity(row_before)
+        .expect("the second book is loaded");
+    to_library_root(&mut device);
+    device.point_at(ADDED);
+    let before = device.log.len();
+    device.press_only(Button::Confirm);
+    device.handle_one_with(|device| {
+        assert!(device.app.library_browse.rescanning(), "the note is up");
+        device.press_only(Button::Back);
+        assert_eq!(device.app.view, AppView::Home);
+        assert!(device.app.library_browse.is_idle());
+        device.press_only(Button::Confirm);
+        assert_eq!(device.app.view, AppView::Reading, "continue reading");
+    });
+    device.settle();
+    let events = &device.log[before..];
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "no scan renumbered the catalog under the open: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::RowFailed { .. })),
+        "the pick walked away from is still answered: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::BookOpenFailed { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            LibraryEvent::Loaded { book_id, .. } if *book_id == row_before
+        )),
+        "continue opened the book by its row: {events:?}"
+    );
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.app.book_id, row_before);
+    assert_eq!(
+        device.store.loaded_book_identity(row_before),
+        Some(identity_before),
+        "and that row still named the same book"
+    );
+    assert_eq!(device.app.page, 9);
+    assert!(
+        device.before_rescan.len() == 1,
+        "{:?}",
+        device.before_rescan
+    );
+
+    // A pick the reader waits for scans as before.
+    to_library_root(&mut device);
+    let before = device.log.len();
+    device.choose(ADDED);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert!(device.log[before..]
+        .iter()
+        .any(|event| matches!(event, LibraryEvent::Scanned { .. })));
+    device.sleep();
+
+    // That scan did renumber: the second book no longer holds its old row.
+    let device = open_after_boot(&card, "Shelf", SECOND);
+    assert_ne!(device.app.book_id, row_before);
+    assert_eq!(device.app.page, 9, "the second book kept its page");
+}
+
+/// A press the waiting pick swallows during the note changes nothing, so the
+/// pick is still waited on and its scan runs.
+#[test]
+fn a_press_the_pick_swallows_during_the_note_leaves_its_scan_to_run() {
+    let (_card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    device.point_at(ADDED);
+    let before = device.log.len();
+    device.press_only(Button::Confirm);
+    device.handle_one_with(|device| {
+        device.press_only(Button::Next);
+        assert!(
+            device.app.library_browse.rescanning(),
+            "the press was swallowed"
+        );
+    });
+    device.settle();
+    assert!(
+        device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "{:?}",
+        &device.log[before..]
+    );
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert_eq!(device.app.page, 0, "the added book opened at its start");
+}
+
+/// Back during the note and a fresh pick of the same row: the first pick is
+/// refused unheard, and the second, which the reader waits for, scans once
+/// and opens the book.
+#[test]
+fn a_newer_pick_during_the_note_gets_the_scan_in_place_of_the_older() {
+    let (_card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    device.point_at(ADDED);
+    let row = device.app.selection;
+    let before = device.log.len();
+    device.press_only(Button::Confirm);
+    let first_pick = device
+        .app
+        .library_browse
+        .request_id()
+        .expect("a pick in flight");
+    device.handle_one_with(|device| {
+        device.press_only(Button::Back);
+        device.press_only(Button::Back);
+        assert_eq!(device.app.view, AppView::Library);
+        for _ in 0..row {
+            device.press_only(Button::Next);
+        }
+        assert_eq!(device.app.selection, row);
+        device.press_only(Button::Confirm);
+        assert_ne!(device.app.library_browse.request_id(), Some(first_pick));
+    });
+    device.settle();
+    let events = &device.log[before..];
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            LibraryEvent::RowFailed { request_id } if *request_id == first_pick
+        )),
+        "{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, LibraryEvent::Scanned { .. }))
+            .count(),
+        1,
+        "one scan, for the pick still waited on: {events:?}"
+    );
+    assert_eq!(
+        device.before_rescan.len(),
+        2,
+        "a note before each pick's rescan"
+    );
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert_eq!(device.app.page, 0, "the added book opened at its start");
+}
+
 /// The write before the rescan is refused. The scan would drop the pages that
 /// turn page 9 into a place, so the pick is refused instead, and the next pick
 /// writes the page before it scans.

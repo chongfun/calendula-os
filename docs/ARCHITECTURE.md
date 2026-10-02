@@ -736,6 +736,18 @@ one would only run after the scan, and `Scanned` clears it. The kept pick holds 
 book's locator in the storage task, which lives in the display task's future:
 152 bytes more of it on both boards, and 80 bytes more of its poll frame.
 
+The note's refresh is a yield, and the app runs during it. Back is the one
+press a waiting pick takes, and from Home the reader can then ask for the book
+being read by the row it holds, an unfenced open the scan would renumber
+under. So `StorageTask::rescan` first asks the host whether the app still
+waits on the pick (`LIBRARY_BROWSE_REQUEST_ID`, which the app task publishes
+at every fold that can end a Library wait, before it next yields), and refuses
+a pick walked away from without scanning. The answer holds through the scan:
+both tasks share the thread-mode executor and the scan does not await, so
+nothing the app queued against the old catalog runs against a new one. A pick
+the reader waits for scans as before, and a newer pick made during the note
+gets its own.
+
 Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
 435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
 book set, and stays what the orphan sweep judges against, the wifi shelf

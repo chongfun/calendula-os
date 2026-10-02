@@ -769,6 +769,10 @@ pub async fn run(
                             )
                             .await;
                         }
+                        // The refresh yielded, and the app may have walked
+                        // away from the pick. `rescan` asks before it scans,
+                        // and nothing lets the app run again before the scan
+                        // ends: one executor, and no await in the scan.
                         storage_task.rescan(
                             owed,
                             &mut crate::sd_session::card(&mut epd, &mut sd_cs),
@@ -1310,6 +1314,10 @@ impl storage::task::Host for FwHost {
 
     fn latest_reader_request_id(&self) -> u32 {
         LATEST_READER_REQUEST_ID.load(Ordering::Relaxed)
+    }
+
+    fn waiting_on_pick(&self, request_id: u32) -> bool {
+        crate::LIBRARY_BROWSE_REQUEST_ID.load(Ordering::Relaxed) == request_id
     }
 
     fn requeue(&mut self, command: StorageCommand) {
